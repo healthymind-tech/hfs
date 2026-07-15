@@ -71,6 +71,10 @@ pub struct PostgresBackend {
     pub(super) reindex_test_pause: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(super) reindex_test_entered: Option<Arc<tokio::sync::Notify>>,
+    /// Memoized subscription event fan-out: one LISTEN connection per
+    /// backend, spawned lazily by the first `subscription_fanout()` call
+    /// (which must happen inside a Tokio runtime) and stopped on drop.
+    subscription_fanout: std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>>,
 }
 
 impl Debug for PostgresBackend {
@@ -493,6 +497,7 @@ impl PostgresBackend {
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
             write_registry_cache: Arc::new(RwLock::new(HashMap::new())),
+            subscription_fanout: std::sync::OnceLock::new(),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -1154,6 +1159,14 @@ impl PostgresBackend {
     /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
     pub(crate) fn pool(&self) -> Pool {
         self.pool.clone()
+    }
+
+    /// Returns the memoization slot for the subscription event fan-out
+    /// (see the field docs on [`PostgresBackend`]).
+    pub(crate) fn fanout_slot(
+        &self,
+    ) -> &std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>> {
+        &self.subscription_fanout
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.

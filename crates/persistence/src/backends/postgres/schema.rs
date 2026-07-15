@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 48;
+pub const SCHEMA_VERSION: i32 = 49;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -445,6 +445,7 @@ async fn migrate_schema(
             45 => migrate_v45_to_v46(client).await?,
             46 => migrate_v46_to_v47(client).await?,
             47 => migrate_v47_to_v48(client).await?,
+            48 => migrate_v48_to_v49(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4950,6 +4951,144 @@ async fn migrate_v47_to_v48(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
+    Ok(())
+}
+
+/// v48 -> v49 (upstream v16 -> v17): Subscriptions cluster delivery (design doc §Class B, #170).
+///
+/// Four tables:
+/// - `subscription_state` — shared per-subscription counters/status (B4);
+///   rows are created lazily by the first upsert-increment so a Subscription
+///   update can never reset them.
+/// - `subscription_notification_events` — built websocket-channel bundles,
+///   loaded by the instances holding the sockets when a fan-out envelope
+///   arrives (B1; NOTIFY payloads cap at ~8KB so bundles never ride it).
+/// - `subscription_delivery_outbox` — durable push-channel deliveries under
+///   the cluster-jobs lease + fencing discipline plus a retry schedule (B5).
+/// - `subscription_ws_tokens` — single-use WebSocket binding tokens,
+///   redeemed with `DELETE … RETURNING` (B2).
+async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_state (
+                tenant_id            TEXT NOT NULL,
+                subscription_id      TEXT NOT NULL,
+                event_number         BIGINT NOT NULL DEFAULT 0,
+                consecutive_failures INT NOT NULL DEFAULT 0,
+                status               TEXT,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v48->v49 (subscription_state) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_notification_events (
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                event_number    BIGINT NOT NULL,
+                bundle          JSONB NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id, event_number)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v48->v49 (subscription_notification_events) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_notification_events_reap
+                 ON subscription_notification_events(created_at)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_sub_notification_events_reap: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_delivery_outbox (
+                id                BIGSERIAL PRIMARY KEY,
+                tenant_id         TEXT NOT NULL,
+                subscription_id   TEXT NOT NULL,
+                event_number      BIGINT,
+                notification_type TEXT NOT NULL,
+                bundle            JSONB NOT NULL,
+                attempts          INT NOT NULL DEFAULT 0,
+                next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status            TEXT NOT NULL DEFAULT 'queued',
+                last_error        TEXT,
+                worker_id         TEXT,
+                lease_expiry      TIMESTAMPTZ,
+                fencing_token     BIGINT NOT NULL DEFAULT 0,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at       TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v48->v49 (subscription_delivery_outbox) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_claim
+                 ON subscription_delivery_outbox(status, next_attempt_at, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_tenant
+                 ON subscription_delivery_outbox(tenant_id, subscription_id)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_tenant: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_ws_tokens (
+                token           TEXT PRIMARY KEY,
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                expires_at      TIMESTAMPTZ NOT NULL
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v48->v49 (subscription_ws_tokens) failed: {}",
+                e
+            ))
+        })?;
 
     Ok(())
 }
