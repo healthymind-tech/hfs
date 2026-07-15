@@ -1567,6 +1567,12 @@ async fn run() -> anyhow::Result<()> {
             bulk_submit_enabled: config.bulk_submit.enabled,
             bulk_submit_output_backend: &config.bulk_submit.output_backend,
             audit_backend: audit_config.backend,
+            // Feature-gated: a binary without the subscriptions feature
+            // cannot run the engine, so its configuration cannot hurt a
+            // cluster.
+            subscriptions_enabled: cfg!(feature = "subscriptions")
+                && config.subscriptions_enabled(),
+            subscriptions_fanout: &config.subscriptions_fanout,
         };
         if let Err(errors) = cluster::validate_cluster_config(&view) {
             for error in &errors {

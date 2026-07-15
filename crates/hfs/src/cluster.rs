@@ -41,6 +41,12 @@ pub struct ClusterConfigView<'a> {
     pub bulk_submit_output_backend: &'a str,
     /// `HFS_AUDIT_BACKEND` (`None` means audit is disabled).
     pub audit_backend: AuditBackend,
+    /// Whether the Subscriptions engine is enabled (resolved
+    /// `HFS_SUBSCRIPTIONS_ENABLED` AND the binary carries the feature —
+    /// a subsystem that cannot run cannot hurt a cluster).
+    pub subscriptions_enabled: bool,
+    /// Raw `HFS_SUBSCRIPTIONS_FANOUT` value ("" when unset).
+    pub subscriptions_fanout: &'a str,
 }
 
 /// Refuses configurations that cannot run as one of N instances.
@@ -118,6 +124,31 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
         );
     }
 
+    // B1-B5 (#170) — subscription reaction must be cluster-shared: an
+    // in-process fan-out silently drops notifications for every write routed
+    // to an instance that doesn't hold the registration.
+    if view.subscriptions_enabled {
+        if view.subscriptions_fanout.eq_ignore_ascii_case("memory") {
+            errors.push(
+                "HFS_CLUSTER=true is incompatible with HFS_SUBSCRIPTIONS_FANOUT=memory: \
+                 subscription registrations, sockets, and delivery state would be \
+                 per-instance, silently dropping notifications for writes served by other \
+                 instances. Remove the variable (it defaults to pg-notify when clustered) \
+                 or set HFS_SUBSCRIPTIONS_ENABLED=false."
+                    .to_string(),
+            );
+        }
+        if view.primary_backend != BackendKind::Postgres {
+            errors.push(
+                "HFS_CLUSTER=true with HFS_SUBSCRIPTIONS_ENABLED requires a postgres \
+                 primary backend: the subscriptions fan-out and shared delivery state ride \
+                 the primary database (LISTEN/NOTIFY), which this backend cannot provide. \
+                 Use a postgres primary or set HFS_SUBSCRIPTIONS_ENABLED=false."
+                    .to_string(),
+            );
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -143,6 +174,8 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "s3",
             audit_backend: AuditBackend::Database,
+            subscriptions_enabled: false,
+            subscriptions_fanout: "",
         }
     }
 
@@ -161,6 +194,8 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
             audit_backend: AuditBackend::File,
+            subscriptions_enabled: false,
+            subscriptions_fanout: "",
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
     }
@@ -168,6 +203,37 @@ mod tests {
     #[test]
     fn cluster_on_accepts_a_fully_shared_configuration() {
         assert_eq!(validate_cluster_config(&safe_cluster_view()), Ok(()));
+        // Subscriptions on a postgres primary (fanout unset → pg-notify) is
+        // the supported cluster shape.
+        let with_subscriptions = ClusterConfigView {
+            subscriptions_enabled: true,
+            ..safe_cluster_view()
+        };
+        assert_eq!(validate_cluster_config(&with_subscriptions), Ok(()));
+        let explicit_fanout = ClusterConfigView {
+            subscriptions_enabled: true,
+            subscriptions_fanout: "pg-notify",
+            ..safe_cluster_view()
+        };
+        assert_eq!(validate_cluster_config(&explicit_fanout), Ok(()));
+    }
+
+    #[test]
+    fn cluster_on_refuses_unsafe_subscriptions() {
+        let memory_fanout = ClusterConfigView {
+            subscriptions_enabled: true,
+            subscriptions_fanout: "memory",
+            ..safe_cluster_view()
+        };
+        let errors = validate_cluster_config(&memory_fanout).unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("HFS_SUBSCRIPTIONS_FANOUT")), "{errors:?}");
+        let non_postgres = ClusterConfigView {
+            subscriptions_enabled: true,
+            primary_backend: BackendKind::MongoDB,
+            ..safe_cluster_view()
+        };
+        let errors = validate_cluster_config(&non_postgres).unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("requires a postgres")), "{errors:?}");
     }
 
     /// The refusal table: one unsafe dimension at a time, each error naming
@@ -259,6 +325,8 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
             audit_backend: AuditBackend::File,
+            subscriptions_enabled: false,
+            subscriptions_fanout: "",
         };
         let errors = validate_cluster_config(&view).unwrap_err();
         assert_eq!(errors.len(), 6);
