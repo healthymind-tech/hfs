@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 47;
+pub const SCHEMA_VERSION: i32 = 48;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -444,6 +444,7 @@ async fn migrate_schema(
             }
             45 => migrate_v45_to_v46(client).await?,
             46 => migrate_v46_to_v47(client).await?,
+            47 => migrate_v47_to_v48(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4894,6 +4895,62 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v47 -> v48: Add the unified `cluster_jobs` table (upstream cluster design doc §4;
+/// upstream numbered it v14 -> v15 on `feat/cluster-capable-state`).
+///
+/// One shared queue for every async job surface that was process-local
+/// (SoF `$export` #169, search reindex A2), discriminated by `kind`. Claiming
+/// uses the same lease + fencing-token discipline as `bulk_export_jobs`
+/// (worker_id / lease_expiry / heartbeat_at / fencing_token columns and the
+/// `FOR UPDATE SKIP LOCKED` claim in `cluster_jobs.rs`); bulk export/submit
+/// deliberately stay on their own tables (resolved decision F3).
+async fn migrate_v47_to_v48(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_jobs (
+                id               TEXT PRIMARY KEY,
+                tenant_id        TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'queued',
+                payload          JSONB NOT NULL,
+                progress         JSONB,
+                result           JSONB,
+                error_message    TEXT,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                worker_id        TEXT,
+                lease_expiry     TIMESTAMPTZ,
+                heartbeat_at     TIMESTAMPTZ,
+                fencing_token    BIGINT NOT NULL DEFAULT 0,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at       TIMESTAMPTZ,
+                finished_at      TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v47->v48 failed: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_claim
+                 ON cluster_jobs(kind, status, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_tenant
+                 ON cluster_jobs(tenant_id, kind, created_at DESC)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
     Ok(())
 }
 

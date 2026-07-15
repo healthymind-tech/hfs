@@ -78,6 +78,7 @@ mod bulk_provider;
 mod bulk_submit;
 pub(crate) mod cached;
 mod cleanup;
+mod cluster_jobs;
 mod lock_protocol;
 mod login_sessions;
 mod package_registry;
