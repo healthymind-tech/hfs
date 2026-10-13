@@ -185,7 +185,8 @@
                   action="/ui/hts/value-sets/{{ id }}/expand"
                   hx-post="/ui/hts/value-sets/{{ id }}/expand"
                   hx-target="#hts-workbench-result"
-                  hx-swap="outerHTML">
+                  hx-swap="outerHTML"
+                  hx-disabled-elt="find button[type=submit]">
               <input type="hidden" name="filter" value="{{ result.requested_filter }}">
               <input type="hidden" name="count" value="{{ result.requested_count }}">
               <input type="hidden" name="offset" value="{{ result.next_offset() }}">

@@ -17,7 +17,8 @@
       action="/ui/hts/code-systems/{{ id }}/subsumes"
       hx-post="/ui/hts/code-systems/{{ id }}/subsumes"
       hx-target="#hts-workbench-result"
-      hx-swap="outerHTML"
+      hx-swap="outerHTML show:#hts-workbench-result:top"
+      hx-disabled-elt="find button[type=submit]"
       aria-labelledby="hts-workbench-input-heading">
   <div class="card-head">
     <h3 id="hts-workbench-input-heading">{{ chrome.i18n.t("hts-cs-subsumes-heading") }}</h3>

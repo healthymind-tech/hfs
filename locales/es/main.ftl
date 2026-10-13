@@ -1445,6 +1445,7 @@ hts-browser-page-prev = Página anterior
 hts-browser-page-next = Página siguiente
 hts-browser-goto-offset = Ir al desplazamiento
 hts-browser-goto = Ir
+hts-vs-expand-count-hint = Hasta 500 conceptos por página; use Desplazamiento o «Cargar más» para el resto.
 hts-vs-browser-showing-count = Mostrando { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets

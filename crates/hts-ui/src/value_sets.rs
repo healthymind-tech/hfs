@@ -555,6 +555,9 @@ impl ExpandResultView {
     }
 }
 
+/// The most concepts one `$expand` page renders; see `expand_run`.
+pub const EXPAND_MAX_COUNT: u32 = 500;
+
 async fn expand_run(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
@@ -566,7 +569,10 @@ async fn expand_run(
     let tree_mode = form_flag(&form, "mode", "tree");
     let mut params = ExpandParams {
         filter: opt(&form, "filter"),
-        count: parse_u32(&form, "count"),
+        // The UI renders every returned concept as a table row, so one page is
+        // capped: 1,302 rows at count=5000 made an 8,000-node, 67,000px-tall
+        // document. Offset and Load more still reach the rest.
+        count: parse_u32(&form, "count").map(|c| c.min(EXPAND_MAX_COUNT)),
         offset: parse_u32(&form, "offset"),
         display_language: opt(&form, "displayLanguage"),
         active_only: Some(form_checkbox(&form, "activeOnly")),

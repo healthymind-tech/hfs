@@ -1543,6 +1543,7 @@ hts-browser-page-prev = Previous page
 hts-browser-page-next = Next page
 hts-browser-goto-offset = Jump to offset
 hts-browser-goto = Go
+hts-vs-expand-count-hint = Up to 500 concepts per page; use Offset or Load more for the rest.
 hts-vs-browser-showing-count = Showing { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets
