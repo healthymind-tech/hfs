@@ -54,8 +54,13 @@
     opener = from || document.activeElement;
     document.body.classList.add("nav-open");
     setExpanded(true);
-    var first = sidebar.querySelector("[data-nav-close]") || focusables()[0];
-    if (first) first.focus();
+    /* The drawer becomes focusable only once the class above has been
+       applied by a style recalculation, so the move waits a frame. */
+    window.requestAnimationFrame(function () {
+      if (!isOpen()) return;
+      var first = sidebar.querySelector("[data-nav-close]") || focusables()[0];
+      if (first) first.focus();
+    });
   }
 
   function close(returnFocus) {

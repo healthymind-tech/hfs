@@ -604,167 +604,6 @@ a.nav-item:hover {
 }
 }
 
-/* ---------- Navigation drawer (phones and tablets) ----------
-   Below 1024px the fixed 76px rail took a fifth of a phone's width and could
-   only ever show icons: it expands on hover, which a touch screen does not
-   have, so a tap on an icon navigated blind. Here the sidebar becomes an
-   off-canvas drawer with its full labels, opened from a hamburger in the
-   topbar (`nav.js` owns the open state, Escape, the scrim and the focus
-   trap) and the content takes the whole width. Without JavaScript the full
-   sidebar stacks above the content instead, so nothing is unreachable. */
-
-.nav-toggle,
-.sidebar__close,
-.sidebar-scrim {
-  display: none;
-}
-
-@media (max-width: 1024px) {
-  body {
-    grid-template-columns: 1fr;
-  }
-
-  .pane {
-    grid-column: 1;
-  }
-
-  .sidebar {
-    width: min(295px, 86vw);
-    transform: translateX(-100%);
-    visibility: hidden;
-    transition: transform 0.2s ease, visibility 0.2s;
-  }
-
-  body.nav-open .sidebar {
-    transform: none;
-    visibility: visible;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
-  }
-
-  /* Keep the page under the drawer from scrolling behind it. */
-  body.nav-open {
-    overflow: hidden;
-  }
-
-  .sidebar-scrim {
-    display: block;
-    position: fixed;
-    inset: 0;
-    z-index: 39;
-    background: rgb(0 0 0 / 40%);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s ease;
-  }
-
-  body.nav-open .sidebar-scrim {
-    opacity: 1;
-    pointer-events: auto;
-  }
-
-  /* The hamburger: a 44px touch target at the topbar's left edge. */
-  .nav-toggle {
-    display: grid;
-    place-items: center;
-    width: 44px;
-    height: 44px;
-    margin-left: -8px;
-    padding: 0;
-    border: 1px solid transparent;
-    border-radius: 12px;
-    background: none;
-    color: var(--text-strong);
-    cursor: pointer;
-  }
-
-  .nav-toggle:hover {
-    background: var(--surface);
-    border-color: var(--surface-border);
-  }
-
-  .nav-toggle:focus-visible {
-    outline: 2px solid var(--accent-text);
-    outline-offset: 2px;
-  }
-
-  .nav-toggle svg {
-    width: 22px;
-    height: 22px;
-  }
-
-  /* The drawer's own close control, top-right, same 44px target. */
-  .sidebar__close {
-    display: grid;
-    place-items: center;
-    position: absolute;
-    top: 12px;
-    right: 12px;
-    width: 44px;
-    height: 44px;
-    padding: 0;
-    border: 1px solid transparent;
-    border-radius: 12px;
-    background: none;
-    color: var(--muted);
-    cursor: pointer;
-  }
-
-  .sidebar__close:hover {
-    color: var(--text-strong);
-    background: var(--surface);
-    border-color: var(--surface-border);
-  }
-
-  .sidebar__close:focus-visible {
-    outline: 2px solid var(--accent-text);
-    outline-offset: 2px;
-  }
-
-  .sidebar__close svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  /* Room for the close control beside the brand row. */
-  .sidebar .brand {
-    padding-right: 48px;
-  }
-
-  .topbar {
-    justify-content: space-between;
-    padding: 0 16px;
-  }
-
-  .content {
-    padding: 20px 16px 32px;
-  }
-
-  /* No JavaScript, no drawer: the whole sidebar sits above the content as
-     an ordinary block so every link is still a tap away. */
-  html:not(.js) .nav-toggle,
-  html:not(.js) .sidebar__close,
-  html:not(.js) .sidebar-scrim {
-    display: none;
-  }
-
-  html:not(.js) .sidebar {
-    position: static;
-    width: auto;
-    transform: none;
-    visibility: visible;
-    border-right: 0;
-    border-bottom: 1px solid var(--divider);
-    box-shadow: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .sidebar,
-  .sidebar-scrim {
-    transition: none;
-  }
-}
-
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
 
 .menu {
@@ -1129,6 +968,172 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
+}
+
+/* ---------- Navigation drawer (phones and tablets) ----------
+   Below 1024px the fixed 76px rail took a fifth of a phone's width and could
+   only ever show icons: it expands on hover, which a touch screen does not
+   have, so a tap on an icon navigated blind. Here the sidebar becomes an
+   off-canvas drawer with its full labels, opened from a hamburger in the
+   topbar (`nav.js` owns the open state, Escape, the scrim and the focus
+   trap) and the content takes the whole width. Without JavaScript the full
+   sidebar stacks above the content instead, so nothing is unreachable. */
+
+.nav-toggle,
+.sidebar__close,
+.sidebar-scrim {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  body {
+    grid-template-columns: 1fr;
+  }
+
+  .pane {
+    grid-column: 1;
+  }
+
+  .sidebar {
+    width: min(295px, 86vw);
+    transform: translateX(-100%);
+    visibility: hidden;
+    /* Visibility flips at the end of the slide-out and at the very start
+       of the slide-in (no delay below): a visibility transition would map
+       its first frame to `hidden`, and the focus nav.js moves into the
+       drawer on open would land on nothing. */
+    transition: transform 0.2s ease, visibility 0s linear 0.2s;
+  }
+
+  body.nav-open .sidebar {
+    transform: none;
+    visibility: visible;
+    transition-delay: 0s;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+  }
+
+  /* Keep the page under the drawer from scrolling behind it. */
+  body.nav-open {
+    overflow: hidden;
+  }
+
+  .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 39;
+    background: rgb(0 0 0 / 40%);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  body.nav-open .sidebar-scrim {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* The hamburger: a 44px touch target at the topbar's left edge. */
+  .nav-toggle {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    margin-left: -8px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: none;
+    color: var(--text-strong);
+    cursor: pointer;
+  }
+
+  .nav-toggle:hover {
+    background: var(--surface);
+    border-color: var(--surface-border);
+  }
+
+  .nav-toggle:focus-visible {
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+
+  .nav-toggle svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  /* The drawer's own close control, top-right, same 44px target. */
+  .sidebar__close {
+    display: grid;
+    place-items: center;
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .sidebar__close:hover {
+    color: var(--text-strong);
+    background: var(--surface);
+    border-color: var(--surface-border);
+  }
+
+  .sidebar__close:focus-visible {
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+
+  .sidebar__close svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* Room for the close control beside the brand row. */
+  .sidebar .brand {
+    padding-right: 48px;
+  }
+
+  .topbar {
+    justify-content: space-between;
+    padding: 0 16px;
+  }
+
+  .content {
+    padding: 20px 16px 32px;
+  }
+
+  /* No JavaScript, no drawer: the whole sidebar sits above the content as
+     an ordinary block so every link is still a tap away. */
+  html:not(.js) .nav-toggle,
+  html:not(.js) .sidebar__close,
+  html:not(.js) .sidebar-scrim {
+    display: none;
+  }
+
+  html:not(.js) .sidebar {
+    position: static;
+    width: auto;
+    transform: none;
+    visibility: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--divider);
+    box-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar-scrim {
+    transition: none;
+  }
 }
 
 /* App-shell rules live at the end of the file in @layer pages: they override
@@ -2192,7 +2197,19 @@ form.htmx-request .btn[type="submit"]::after,
 
 @media (max-width: 900px) {
   .stat-grid {
-    grid-template-columns: repeat(2, 1fr);
+    /* minmax(0, …): a `1fr` track never shrinks below its content, so two
+       tiles with long figures ran 14px past a 375px screen. */
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stat-grid > * {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .stat-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 }
@@ -2919,6 +2936,14 @@ form.htmx-request .btn[type="submit"]::after,
   }
 
   .toolbar .menu__panel--right.menu__panel--compact {
+    right: 0;
+    left: auto;
+  }
+
+  /* The account menu hangs from the topbar's right edge at every width: a
+     left-anchored 264px panel under an avatar at x≈330 ran off a 375px
+     screen (up to 196px in German). */
+  .topbar .menu__panel--right {
     right: 0;
     left: auto;
   }
