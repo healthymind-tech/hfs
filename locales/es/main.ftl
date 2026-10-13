@@ -28,6 +28,7 @@ language-label = Idioma
 language-en = Inglés
 language-es = Español
 language-de = Alemán
+language-zh-hant = Chino tradicional
 user-menu-label = Menú de la cuenta
 user-anonymous = Usuario anónimo
 user-local-hint = La autenticación está deshabilitada
@@ -147,6 +148,19 @@ tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conse
 tenants-row-provisioning = Aprovisionando… puede tardar un momento.
 tenants-row-failed = No se pudo aprovisionar el tenant.
 tenants-dismiss = Descartar
+# TODO review (machine translation)
+tenants-error-id-empty = El id del tenant no puede estar vacío.
+tenants-error-id-too-long = El id del tenant supera los { $max } caracteres.
+tenants-error-id-reserved = Ese id está reservado para recursos compartidos internos.
+tenants-error-id-invalid-character = El id del tenant solo puede contener letras, dígitos, '-', '_', '.' y '/'.
+tenants-error-id-empty-segment = El id del tenant no puede empezar ni terminar con '/' ni contener un segmento vacío.
+tenants-error-exists = El tenant '{ $id }' ya existe.
+tenants-error-provisioning = El tenant '{ $id }' ya se está aprovisionando.
+tenants-error-still-provisioning = El tenant '{ $id }' todavía se está aprovisionando.
+tenants-error-not-purged = El tenant '{ $id }' se dio de baja, pero sus datos NO se purgaron: { $detail }
+tenants-error-list = No se pudieron listar los tenants: { $detail }
+tenants-error-count = No se pudieron contar los recursos: { $detail }
+tenants-field-name-placeholder = Clínica Ejemplo
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants

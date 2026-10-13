@@ -8,7 +8,8 @@ one subdirectory per locale, in [Project Fluent](https://projectfluent.org/)
 locales/
 ├── en/main.ftl   ← SOURCE locale (canonical key set) — edit here first
 ├── es/main.ftl   ← Spanish
-└── de/main.ftl   ← German
+├── de/main.ftl   ← German
+└── zh-Hant/main.ftl ← Traditional Chinese (Taiwan); also negotiated for zh-TW, zh-Hant-TW and bare zh
 ```
 
 ## Rules of the road
