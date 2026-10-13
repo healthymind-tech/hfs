@@ -13,6 +13,7 @@
 //! | [`snomed_rf2`] | SNOMED CT RF2 (`.zip`) | NRC license required |
 //! | [`loinc_csv`] | LOINC CSV (`.zip`) | Free Regenstrief registration |
 //! | [`icd10_cm`] | ICD-10-CM tabular XML | Free (CMS / CDC) |
+//! | [`icd10_pcs`] | ICD-10-PCS order file (`icd10pcs_codes_YYYY.txt`, or the CMS ZIP) | Free (CMS) |
 //! | [`icd9_cm`]  | ICD-9-CM pipe-delimited text  | Free (public domain, retired 2015) |
 //! | [`rxnorm_rrf`] | RxNorm RRF (folder or `.zip`) | Free NLM Terms of Service |
 //! | [`ndc`] | FDA NDC Directory (`product.txt` or `.zip`) | Free (public domain) |
@@ -28,6 +29,7 @@ pub mod dicom;
 pub mod fhir_bundle;
 pub mod hl7_v2_tables;
 pub mod icd10_cm;
+pub mod icd10_pcs;
 pub mod icd9_cm;
 pub mod loinc_csv;
 pub mod mesh;

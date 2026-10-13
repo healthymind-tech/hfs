@@ -168,6 +168,9 @@ pub enum ImportFormat {
     /// ICD-10-CM tabular XML from CMS
     #[value(name = "icd10-cm")]
     Icd10Cm,
+    /// ICD-10-PCS order file (`icd10pcs_codes_YYYY.txt`) or CMS tables ZIP
+    #[value(name = "icd10-pcs")]
+    Icd10Pcs,
     /// ICD-9-CM pipe-delimited text from CMS (retired 2015, public domain)
     #[value(name = "icd9-cm")]
     Icd9Cm,
@@ -207,6 +210,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::SnomedRf2 => write!(f, "snomed-rf2"),
             ImportFormat::Loinc => write!(f, "loinc"),
             ImportFormat::Icd10Cm => write!(f, "icd10-cm"),
+            ImportFormat::Icd10Pcs => write!(f, "icd10-pcs"),
             ImportFormat::Icd9Cm => write!(f, "icd9-cm"),
             ImportFormat::Rxnorm => write!(f, "rxnorm"),
             ImportFormat::Ucum => write!(f, "ucum"),
@@ -226,6 +230,7 @@ impl fmt::Display for ImportFormat {
 /// Detection rules (in order):
 /// - `.tgz` / `.tar.gz` → [`ImportFormat::Hl7Npm`]
 /// - `.xml` containing "tabular" in the filename → [`ImportFormat::Icd10Cm`]
+/// - `.txt` containing "icd10pcs" in the filename → [`ImportFormat::Icd10Pcs`]
 /// - `.rrf` (case-insensitive) → [`ImportFormat::Rxnorm`]
 /// - directory → [`ImportFormat::Rxnorm`]
 /// - `.zip` → peeks into the archive to distinguish formats
@@ -253,6 +258,10 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     // MeSH XML (e.g. mesh2025.xml, desc2025.xml).
     if name.ends_with(".xml") && (name.contains("mesh") || name.starts_with("desc")) {
         return Some(ImportFormat::Mesh);
+    }
+    // ICD-10-PCS order file (e.g. icd10pcs_codes_2025.txt).
+    if name.ends_with(".txt") && name.contains("icd10pcs") {
+        return Some(ImportFormat::Icd10Pcs);
     }
     // NCI Thesaurus flat text.
     if name.ends_with(".txt") && name.contains("thesaurus") {
@@ -288,6 +297,7 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
 /// - Ends with `loinctable.csv` → LOINC
 /// - Ends with `rxnconso.rrf` → RxNorm
 /// - Ends with `.xml` and contains `tabular` → ICD-10-CM
+/// - Ends with `.txt` and contains `icd10pcs` → ICD-10-PCS
 /// - Otherwise → `None` (user must pass `--format`)
 fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
     let file = std::fs::File::open(path).ok()?;
@@ -321,6 +331,10 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         }
         if entry_name.ends_with(".xml") && entry_name.contains("tabular") {
             return Some(ImportFormat::Icd10Cm);
+        }
+        // CMS ICD-10-PCS tables ZIP (icd10pcs_codes_2025.txt + optional tables XML).
+        if entry_name.ends_with(".txt") && entry_name.contains("icd10pcs") {
+            return Some(ImportFormat::Icd10Pcs);
         }
         if entry_name.contains("_desc_long_dx") || entry_name.contains("_desc_short_dx") {
             return Some(ImportFormat::Icd9Cm);
@@ -449,6 +463,37 @@ mod tests {
             detect_format(Path::new("icd10cm_tabular_2025.xml")),
             Some(ImportFormat::Icd10Cm)
         );
+    }
+
+    #[test]
+    fn detect_txt_icd10pcs_returns_icd10_pcs() {
+        assert_eq!(
+            detect_format(Path::new("icd10pcs_codes_2025.txt")),
+            Some(ImportFormat::Icd10Pcs)
+        );
+        assert_eq!(
+            detect_format(Path::new("/x/ICD10PCS_Codes_2026.TXT")),
+            Some(ImportFormat::Icd10Pcs)
+        );
+        // A generic .txt still needs --format.
+        assert_eq!(detect_format(Path::new("codes.txt")), None);
+    }
+
+    #[test]
+    fn detect_zip_icd10pcs_order_file() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.as_file_mut());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("icd10pcsCodesFile.pdf", opts).unwrap();
+            zip.write_all(b"%PDF").unwrap();
+            zip.start_file("icd10pcs_codes_2025.txt", opts).unwrap();
+            zip.write_all(b"0DTJ0ZZ Resection of Appendix, Open Approach\r\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd10Pcs));
     }
 
     #[test]
@@ -598,6 +643,7 @@ mod tests {
         assert_eq!(ImportFormat::SnomedRf2.to_string(), "snomed-rf2");
         assert_eq!(ImportFormat::Loinc.to_string(), "loinc");
         assert_eq!(ImportFormat::Icd10Cm.to_string(), "icd10-cm");
+        assert_eq!(ImportFormat::Icd10Pcs.to_string(), "icd10-pcs");
         assert_eq!(ImportFormat::Icd9Cm.to_string(), "icd9-cm");
         assert_eq!(ImportFormat::Rxnorm.to_string(), "rxnorm");
         assert_eq!(ImportFormat::Ucum.to_string(), "ucum");
