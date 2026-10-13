@@ -435,7 +435,8 @@ fn loinc_release_version_from_entry(entry_path: &str) -> Option<String> {
     for segment in entry_path.split('/') {
         let lower = segment.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("loinc_") {
-            let ver = rest.trim();
+            // Accept the archive file name too (`Loinc_2.80.zip`).
+            let ver = rest.trim().trim_end_matches(".zip");
             if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 return Some(ver.to_string());
             }
@@ -468,7 +469,18 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
             // `LoincUniversalLabOrdersValueSet.csv` would be false positives
             // for a looser prefix match.
             if filename == "loinc.csv" || filename == "loinctable.csv" {
-                if loinc_path.is_none() {
+                // Official ZIPs (≥ 2.74) also ship a copy of the main table as
+                // `AccessoryFiles/PanelsAndForms/Loinc.csv`, and it sorts
+                // *before* `LoincTable/Loinc.csv`. Prefer the entry living
+                // under a `LoincTable/` directory; otherwise first match wins.
+                let under_loinc_table = lower.contains("loinctable/");
+                let replace = match &loinc_path {
+                    None => true,
+                    Some(current) => {
+                        under_loinc_table && !current.to_lowercase().contains("loinctable/")
+                    }
+                };
+                if replace {
                     release_version = loinc_release_version_from_entry(&name);
                     loinc_path = Some(name);
                 }
@@ -485,6 +497,16 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
     }
 
     lv_variants.sort();
+
+    // Current official ZIPs have no `Loinc_<ver>/` top-level folder — the
+    // version is only in the archive name (`Loinc_2.80.zip`). Fall back to it
+    // so `CodeSystem.version` is never left empty.
+    if release_version.is_none() {
+        release_version = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(loinc_release_version_from_entry);
+    }
 
     Ok(LoincArchivePaths {
         loinc_table: loinc_path.ok_or_else(|| {
@@ -1562,6 +1584,44 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         .await
         .unwrap();
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
+    }
+
+    #[test]
+    fn loinc_release_version_from_zip_file_name() {
+        assert_eq!(
+            super::loinc_release_version_from_entry("Loinc_2.80.zip").as_deref(),
+            Some("2.80")
+        );
+        assert_eq!(super::loinc_release_version_from_entry("Loinc_.zip"), None);
+    }
+
+    #[test]
+    fn find_loinc_paths_prefers_loinc_table_dir_and_zip_name_version() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("Loinc_2.80.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default();
+            // Sorted before LoincTable/ exactly like the official archive.
+            zip.start_file("AccessoryFiles/PanelsAndForms/Loinc.csv", opts)
+                .unwrap();
+            zip.write_all(b"\"LOINC_NUM\"\n").unwrap();
+            zip.start_file(
+                "AccessoryFiles/ComponentHierarchyBySystem/ComponentHierarchyBySystem.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"PATH_TO_ROOT,SEQUENCE,IMMEDIATE_PARENT,CODE,CODE_TEXT\n")
+                .unwrap();
+            zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
+            zip.write_all(b"\"LOINC_NUM\"\n").unwrap();
+            zip.finish().unwrap();
+        }
+        let paths = super::find_loinc_paths(&zip_path).unwrap();
+        assert_eq!(paths.loinc_table, "LoincTable/Loinc.csv");
+        assert_eq!(paths.release_version.as_deref(), Some("2.80"));
     }
 
     #[test]
