@@ -112,7 +112,7 @@
           removed on 2026-08-31: `.lang-switcher` has no rule anywhere in
           `crates/ui/assets/app.css`, so those links rendered unstyled, and
           HFS's topbar never had them. Only the markup went — the `?lang=`
-          negotiation and the `hts_lang` cookie behind it (`src/i18n.rs`) are
+          negotiation and the shared `hfs_lang` cookie behind it (`src/i18n.rs`) are
           untouched and still drive the options in their new home.
 
           A further control used to sit ahead of these: a "dialect: en"

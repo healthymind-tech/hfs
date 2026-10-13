@@ -64,13 +64,28 @@ fluent_templates::static_loader! {
 static EN: LanguageIdentifier = langid!("en");
 static ES: LanguageIdentifier = langid!("es");
 static DE: LanguageIdentifier = langid!("de");
+static ZH_HANT: LanguageIdentifier = langid!("zh-Hant");
 
 /// Locales the UI can render, in switcher order. `en` first: it is the
 /// source locale and the default.
-static SUPPORTED: [&LanguageIdentifier; 3] = [&EN, &ES, &DE];
+static SUPPORTED: [&LanguageIdentifier; 4] = [&EN, &ES, &DE, &ZH_HANT];
 
-/// Name of the cookie the language switcher sets via `?lang=`.
-const LANG_COOKIE: &str = "hfs_lang";
+/// Language ranges that name a supported locale under another tag, matched
+/// (lower-cased) after the exact set at every truncation step of
+/// [`match_supported`]. Traditional Chinese is tagged `zh-TW` by most
+/// browsers and `zh-Hant`/`zh-Hant-TW` by the rest; a bare `zh` has no
+/// script to go on and lands on the only Chinese catalog we ship.
+const ALIASES: [(&str, &LanguageIdentifier); 4] = [
+    ("zh-tw", &ZH_HANT),
+    ("zh-hk", &ZH_HANT),
+    ("zh-mo", &ZH_HANT),
+    ("zh", &ZH_HANT),
+];
+
+/// Name of the cookie the language switcher sets via `?lang=` — shared with
+/// the HTS console (`helios_ui_chrome::LANG_COOKIE`), so one choice follows
+/// the operator across both products.
+const LANG_COOKIE: &str = helios_ui_chrome::LANG_COOKIE;
 
 /// The locale negotiated for the current request.
 ///
@@ -182,7 +197,8 @@ fn accept_language(headers: &HeaderMap) -> Option<&'static LanguageIdentifier> {
 
 /// RFC 4647 §3.4 Lookup of one language range against the supported set:
 /// try the full tag, then progressively truncate subtags (`de-CH-1996` →
-/// `de-CH` → `de`).
+/// `de-CH` → `de`; `zh-Hant-TW` → `zh-Hant`). Each step also consults
+/// [`ALIASES`], so `zh-TW` lands on `zh-Hant` instead of falling through.
 fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
     let tag = tag.trim().to_ascii_lowercase();
     let mut range = tag.as_str();
@@ -191,6 +207,9 @@ fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
             .iter()
             .find(|supported| supported.to_string().eq_ignore_ascii_case(range))
         {
+            return Some(locale);
+        }
+        if let Some((_, locale)) = ALIASES.iter().find(|(alias, _)| *alias == range) {
             return Some(locale);
         }
         let idx = range.rfind('-')?;
@@ -383,6 +402,36 @@ mod tests {
         let map = headers(&[(header::ACCEPT_LANGUAGE, "de-DE, de;q=0.9, en;q=0.7")]);
         let (locale, _) = negotiate(&Uri::from_static("/ui"), &map);
         assert_eq!(locale, &DE, "de-DE must truncate to supported de");
+    }
+
+    #[test]
+    fn traditional_chinese_tags_all_negotiate_zh_hant() {
+        // Browsers send `zh-TW` (region, no script), `zh-Hant`/`zh-Hant-TW`
+        // (script), or a bare `zh`: every one must reach the one Chinese
+        // catalog, and the rendered tag stays the canonical `zh-Hant`.
+        for header in ["zh-TW", "zh-Hant", "zh-Hant-TW", "zh", "zh-HK,en;q=0.5", "ZH-tw"] {
+            let map = headers(&[(header::ACCEPT_LANGUAGE, header)]);
+            let (locale, _) = negotiate(&Uri::from_static("/ui"), &map);
+            assert_eq!(locale, &ZH_HANT, "{header} must negotiate zh-Hant");
+            assert_eq!(locale.to_string(), "zh-Hant");
+        }
+        // `?lang=` and the cookie accept the same spellings.
+        let (locale, explicit) = negotiate(&Uri::from_static("/ui?lang=zh-TW"), &HeaderMap::new());
+        assert_eq!(locale, &ZH_HANT);
+        assert!(explicit);
+        let map = headers(&[(header::COOKIE, "hfs_lang=zh-Hant")]);
+        let (locale, _) = negotiate(&Uri::from_static("/ui"), &map);
+        assert_eq!(locale, &ZH_HANT);
+    }
+
+    #[test]
+    fn zh_hant_catalog_renders_and_falls_back_to_english() {
+        let zh = I18n { locale: &ZH_HANT };
+        assert_eq!(zh.t("nav-resources"), "資源");
+        assert_eq!(zh.t("language-zh-hant"), "繁體中文");
+        assert_eq!(zh.t_arg("resource-count", "count", 1_200), "1,200筆資源");
+        // An unknown key still degrades to the key, through the `en` fallback.
+        assert_eq!(zh.t("no-such-key"), "no-such-key");
     }
 
     #[test]
@@ -709,7 +758,7 @@ mod tests {
 
         let en = keys("en");
         assert!(!en.is_empty());
-        for locale in ["es", "de"] {
+        for locale in ["es", "de", "zh-Hant"] {
             assert_eq!(
                 en,
                 keys(locale),

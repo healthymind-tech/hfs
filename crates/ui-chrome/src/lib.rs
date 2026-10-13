@@ -101,6 +101,13 @@ pub mod json_view;
 /// browser's own `toLocaleString` (`crates/ui/assets/number.js`).
 pub mod number;
 
+/// Name of the cookie the language switcher's `?lang=` persists its choice
+/// in. One cookie for both products: HFS and HTS present one console to an
+/// operator, so picking a language in one must carry over to the other.
+/// (HTS used to write its own `hts_lang`; its negotiation still reads that
+/// name as a fallback so an existing choice is not lost.)
+pub const LANG_COOKIE: &str = "hfs_lang";
+
 /// The localisation surface the shared chrome needs from its host.
 ///
 /// Both products already own a fluent-backed i18n type; this trait is the
@@ -112,18 +119,20 @@ pub mod number;
 /// `&dyn ChromeLabels`), which keeps the template a single monomorphisation
 /// shared by both binaries.
 pub trait ChromeLabels {
-    /// The BCP-47 language tag currently in effect, e.g. `"en"`, `"es"`, `"de"`.
+    /// The BCP-47 language tag currently in effect, e.g. `"en"`, `"es"`,
+    /// `"de"`, `"zh-Hant"`.
     ///
     /// The language segmented control marks exactly the matching entry with
     /// `aria-current="true"`. A tag this crate does not offer simply leaves all
-    /// three unmarked; that is a valid state, not an error.
+    /// four unmarked; that is a valid state, not an error.
     fn lang(&self) -> String;
 
     /// Resolve a message key to display text in [`lang`](ChromeLabels::lang).
     ///
     /// The keys the chrome asks for are `user-menu-label`, `user-anonymous`,
     /// `user-local-hint`, `language-label`, `language-en`, `language-es`,
-    /// `language-de`, and `user-logout`, plus `json-view-toggle-fold` for
+    /// `language-de`, `language-zh-hant`, and `user-logout`, plus
+    /// `json-view-toggle-fold` for
     /// [`json_view::render`]. A consumer missing any of them will render
     /// whatever its bundle's fallback produces.
     ///
