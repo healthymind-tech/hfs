@@ -25,14 +25,39 @@ use helios_fhir_validator::{
     Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy, ValidationError,
     ValidationOptions, Validator, dotted_to_fhirpath,
 };
+use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
+use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Per-tenant, per-version profile registries fed from stored
 /// StructureDefinitions.
 type TenantProfileMap = DashMap<(String, FhirVersion), Arc<RwLock<SchemaRegistry>>>;
+
+/// Outcome of a startup profile rehydration pass
+/// ([`ValidationService::rehydrate_stored_profiles`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileRehydrationReport {
+    /// Tenants scanned.
+    pub tenants: usize,
+    /// StructureDefinitions folded into a registry.
+    pub registered: usize,
+    /// StructureDefinitions read but not registered (conversion failure, or
+    /// a core canonical with `HFS_VALIDATION_SHADOW_CORE=false`).
+    pub skipped: usize,
+    /// Storage failures; a non-zero count means some tenant's profiles may be
+    /// missing until they are re-written.
+    pub storage_errors: usize,
+    /// Wall-clock duration of the pass.
+    pub elapsed: Duration,
+}
+
+/// Pages a cursor can advance before a tenant scan is abandoned (a backend
+/// whose cursor never advances must not spin forever).
+const MAX_REHYDRATION_PAGES: usize = 10_000;
 
 /// Write-path behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -324,6 +349,178 @@ impl ValidationService {
             Err(e) => {
                 warn!(tenant = %tenant, "stored StructureDefinition failed to convert: {e}");
                 false
+            }
+        }
+    }
+
+    /// Drop a stored StructureDefinition from the tenant's profile registry
+    /// (called after a successful StructureDefinition delete). Returns `true`
+    /// if a definition under `url` was registered.
+    pub fn remove_stored_profile(&self, tenant: &str, version: FhirVersion, url: &str) -> bool {
+        let Some(registries) = &self.tenant_profiles else {
+            return false;
+        };
+        let Some(registry) = registries.get(&(tenant.to_string(), version)) else {
+            return false;
+        };
+        let removed = registry
+            .write()
+            .expect("tenant profile registry lock")
+            .remove(url);
+        if removed {
+            debug!(tenant = %tenant, url = %url, "tenant profile unregistered");
+        }
+        removed
+    }
+
+    /// Whether stored StructureDefinitions feed profile registries at all
+    /// (`HFS_VALIDATION_STORED_PROFILES`).
+    pub fn stored_profiles_enabled(&self) -> bool {
+        self.tenant_profiles.is_some()
+    }
+
+    /// Replay every stored StructureDefinition into the profile registries
+    /// — the startup mirror of the write-handler path. Before this existed
+    /// the registries were in-memory only, so every restart silently
+    /// forgot every uploaded profile until it was re-written.
+    ///
+    /// Pages through storage with [`ExportDataProvider::fetch_export_batch`]
+    /// (the one enumeration primitive every backend implements, deleted
+    /// resources already filtered out) for the default tenant plus every
+    /// registered tenant, then reads each page back through
+    /// [`ResourceStorage::read_batch`] so the definition is registered under
+    /// the FHIR version it was stored with — exactly as the write path did.
+    ///
+    /// Errors are absorbed and counted, never propagated: one tenant's
+    /// storage failure must not stop the others, one malformed
+    /// StructureDefinition must not stop the scan.
+    pub async fn rehydrate_stored_profiles<S>(
+        &self,
+        storage: &S,
+        default_tenant: &str,
+        batch_size: u32,
+    ) -> ProfileRehydrationReport
+    where
+        S: ResourceStorage + ExportDataProvider + ?Sized,
+    {
+        let started = Instant::now();
+        let mut report = ProfileRehydrationReport::default();
+        if self.tenant_profiles.is_none() {
+            debug!("stored profiles disabled; skipping profile rehydration");
+            return report;
+        }
+        let batch_size = batch_size.max(1);
+
+        let mut tenants: BTreeSet<String> = BTreeSet::new();
+        tenants.insert(default_tenant.to_string());
+        if storage.supports_tenant_registry() {
+            match storage.list_tenants().await {
+                Ok(records) => tenants.extend(records.into_iter().map(|r| r.id)),
+                Err(e) => {
+                    warn!(error = %e, "listing tenants for profile rehydration failed; default tenant only");
+                    report.storage_errors += 1;
+                }
+            }
+        }
+        report.tenants = tenants.len();
+
+        for tenant_id in &tenants {
+            self.rehydrate_tenant_profiles(storage, tenant_id, batch_size, &mut report)
+                .await;
+        }
+
+        report.elapsed = started.elapsed();
+        if report.storage_errors == 0 {
+            info!(
+                tenants = report.tenants,
+                registered = report.registered,
+                skipped = report.skipped,
+                elapsed_ms = report.elapsed.as_millis() as u64,
+                "stored StructureDefinitions rehydrated into the profile registry"
+            );
+        } else {
+            warn!(
+                tenants = report.tenants,
+                registered = report.registered,
+                skipped = report.skipped,
+                storage_errors = report.storage_errors,
+                elapsed_ms = report.elapsed.as_millis() as u64,
+                "profile rehydration incomplete; some stored profiles may not resolve until re-written"
+            );
+        }
+        report
+    }
+
+    async fn rehydrate_tenant_profiles<S>(
+        &self,
+        storage: &S,
+        tenant_id: &str,
+        batch_size: u32,
+        report: &mut ProfileRehydrationReport,
+    ) where
+        S: ResourceStorage + ExportDataProvider + ?Sized,
+    {
+        const TYPE: &str = "StructureDefinition";
+        /// Just enough of an exported line to address the row again.
+        #[derive(serde::Deserialize)]
+        struct IdOnly {
+            id: String,
+        }
+
+        let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+        let mut request = ExportRequest::system();
+        request.resource_types = vec![TYPE.to_string()];
+        request.batch_size = batch_size;
+
+        let mut cursor: Option<String> = None;
+        for page in 0.. {
+            if page >= MAX_REHYDRATION_PAGES {
+                warn!(tenant = %tenant_id, pages = page, "stopping profile rehydration at the page backstop");
+                report.storage_errors += 1;
+                return;
+            }
+            let batch = match storage
+                .fetch_export_batch(&tenant, &request, TYPE, cursor.as_deref(), batch_size)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    warn!(tenant = %tenant_id, error = %e, "paging stored StructureDefinitions failed");
+                    report.storage_errors += 1;
+                    return;
+                }
+            };
+            let ids: Vec<String> = batch
+                .lines
+                .iter()
+                .filter_map(|line| serde_json::from_str::<IdOnly>(line).ok().map(|r| r.id))
+                .collect();
+            if !ids.is_empty() {
+                let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                match storage.read_batch(&tenant, TYPE, &id_refs).await {
+                    Ok(stored) => {
+                        for sd in &stored {
+                            if self.upsert_stored_profile(
+                                tenant_id,
+                                sd.fhir_version(),
+                                sd.content(),
+                            ) {
+                                report.registered += 1;
+                            } else {
+                                report.skipped += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(tenant = %tenant_id, error = %e, "reading stored StructureDefinitions failed");
+                        report.storage_errors += 1;
+                        return;
+                    }
+                }
+            }
+            match batch.next_cursor {
+                Some(next) if !batch.is_last => cursor = Some(next),
+                _ => return,
             }
         }
     }

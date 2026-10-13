@@ -508,6 +508,14 @@ pub struct ValidationConfig {
     /// `hl7.fhir.r4.core` package must not replace the base types the
     /// validator was built with.
     pub shadow_core: bool,
+    /// Replay stored StructureDefinitions into the profile registries at
+    /// startup (`HFS_VALIDATION_REHYDRATE`, default `true`). Without it the
+    /// registries are empty after every restart until each profile is
+    /// re-written.
+    pub rehydrate: bool,
+    /// StructureDefinitions fetched per storage round-trip during startup
+    /// rehydration (`HFS_VALIDATION_REHYDRATE_BATCH_SIZE`, default 100).
+    pub rehydrate_batch_size: u32,
 }
 
 impl Default for ValidationConfig {
@@ -523,6 +531,8 @@ impl Default for ValidationConfig {
             terminology_fail: "open".to_string(),
             stored_profiles: true,
             shadow_core: false,
+            rehydrate: true,
+            rehydrate_batch_size: 100,
         }
     }
 }
@@ -569,6 +579,12 @@ impl ValidationConfig {
                 .unwrap_or(d.terminology_fail),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
             shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
+            rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
+            rehydrate_batch_size: env_u64(
+                "HFS_VALIDATION_REHYDRATE_BATCH_SIZE",
+                u64::from(d.rehydrate_batch_size),
+            )
+            .clamp(1, u64::from(u32::MAX)) as u32,
         }
     }
 

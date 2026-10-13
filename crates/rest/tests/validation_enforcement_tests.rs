@@ -541,3 +541,232 @@ async fn shadow_core_opt_in_lets_a_stored_core_canonical_win() {
         "HFS_VALIDATION_SHADOW_CORE=true must let the stored definition override: {outcome:#}"
     );
 }
+
+/// A differential profile constraining Patient: birthDate 1..1.
+fn birthdate_profile(id: &str) -> Value {
+    json!({
+        "resourceType": "StructureDefinition",
+        "id": id,
+        "url": format!("http://example.org/StructureDefinition/{id}"),
+        "name": "MustHaveBirthDate",
+        "status": "active",
+        "kind": "resource",
+        "abstract": false,
+        "type": "Patient",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "derivation": "constraint",
+        "differential": {
+            "element": [
+                { "id": "Patient", "path": "Patient" },
+                { "id": "Patient.birthDate", "path": "Patient.birthDate", "min": 1 }
+            ]
+        }
+    })
+}
+
+/// Whether `$validate?profile=<url>` currently resolves the profile.
+async fn profile_resolves(server: &TestServer, url: &str) -> bool {
+    let response = server
+        .post(&format!("/Patient/$validate?profile={url}"))
+        .json(&json!({ "resourceType": "Patient" }))
+        .await;
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    let issues = outcome["issue"].as_array().expect("issues");
+    let unresolved = issues.iter().any(|i| {
+        i["code"] == "not-supported"
+            && i["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("could not resolve profile"))
+    });
+    let enforced = issues
+        .iter()
+        .any(|i| i["code"] == "required" && i["expression"][0] == "Patient.birthDate");
+    assert_ne!(unresolved, enforced, "{outcome:#}");
+    enforced
+}
+
+/// H2: deleting a StructureDefinition must take it out of the profile
+/// registry (there was no remove path at all — a deleted profile kept
+/// validating until the next restart).
+#[tokio::test]
+async fn deleting_a_stored_profile_unregisters_it() {
+    let server = create_test_server("off").await;
+    let url = "http://example.org/StructureDefinition/del-me";
+
+    let response = server
+        .put("/StructureDefinition/del-me")
+        .json(&birthdate_profile("del-me"))
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+    assert!(profile_resolves(&server, url).await);
+
+    server
+        .delete("/StructureDefinition/del-me")
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+    assert!(
+        !profile_resolves(&server, url).await,
+        "a deleted profile must no longer resolve"
+    );
+
+    // Re-uploading brings it back; a conditional delete removes it again.
+    let response = server
+        .put("/StructureDefinition/del-me")
+        .json(&birthdate_profile("del-me"))
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+    assert!(profile_resolves(&server, url).await);
+    server
+        .delete(&format!("/StructureDefinition?url={url}"))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+    assert!(!profile_resolves(&server, url).await);
+}
+
+#[tokio::test]
+async fn bundle_delete_of_a_stored_profile_unregisters_it() {
+    let server = create_test_server("off").await;
+    let url_a = "http://example.org/StructureDefinition/bundle-a";
+    let url_b = "http://example.org/StructureDefinition/bundle-b";
+    for id in ["bundle-a", "bundle-b"] {
+        let response = server
+            .put(&format!("/StructureDefinition/{id}"))
+            .json(&birthdate_profile(id))
+            .await;
+        assert!(response.status_code().is_success(), "{}", response.text());
+    }
+    assert!(profile_resolves(&server, url_a).await);
+    assert!(profile_resolves(&server, url_b).await);
+
+    for bundle_type in ["batch", "transaction"] {
+        let response = server
+            .post("/")
+            .json(&json!({
+                "resourceType": "Bundle",
+                "type": bundle_type,
+                "entry": [
+                    { "request": { "method": "DELETE", "url": "StructureDefinition/bundle-a" } },
+                    { "request": { "method": "DELETE", "url": format!("StructureDefinition?url={url_b}") } }
+                ]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert!(
+            !profile_resolves(&server, url_a).await,
+            "{bundle_type}: instance DELETE"
+        );
+        assert!(
+            !profile_resolves(&server, url_b).await,
+            "{bundle_type}: conditional DELETE"
+        );
+        for id in ["bundle-a", "bundle-b"] {
+            let response = server
+                .put(&format!("/StructureDefinition/{id}"))
+                .json(&birthdate_profile(id))
+                .await;
+            assert!(response.status_code().is_success(), "{}", response.text());
+        }
+    }
+}
+
+/// H2: a fresh process over the same database must know the stored profiles
+/// without every one of them being re-written.
+#[tokio::test]
+async fn stored_profiles_are_rehydrated_from_storage_on_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("fhir.db");
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let open_backend = || {
+        let backend = SqliteBackend::with_config(
+            &db_path,
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("sqlite backend");
+        backend.init_schema().expect("schema");
+        Arc::new(backend)
+    };
+    let config = || ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "test-tenant".to_string(),
+        ..ServerConfig::for_testing()
+    };
+    let url = "http://example.org/StructureDefinition/survives-restart";
+
+    // Process 1: upload the profile (plus one that is deleted again, and a
+    // core canonical that must stay excluded).
+    {
+        let state = helios_rest::AppState::new(open_backend(), config());
+        let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("server");
+        for id in ["survives-restart", "deleted-before-restart"] {
+            let response = server
+                .put(&format!("/StructureDefinition/{id}"))
+                .json(&birthdate_profile(id))
+                .await;
+            assert!(response.status_code().is_success(), "{}", response.text());
+        }
+        server
+            .delete("/StructureDefinition/deleted-before-restart")
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let response = server
+            .put("/StructureDefinition/Patient")
+            .json(&core_patient_requiring_birthdate())
+            .await;
+        assert!(response.status_code().is_success(), "{}", response.text());
+        assert!(profile_resolves(&server, url).await);
+    }
+
+    // Process 2: a new AppState over the same file. Nothing is known until
+    // the replay runs (the router builder does not spawn it — `build_app`
+    // does); after the replay the profile resolves.
+    let backend = open_backend();
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config());
+    let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(
+        state.clone(),
+    ))
+    .expect("server");
+    assert!(
+        !profile_resolves(&server, url).await,
+        "registries start empty in a new process"
+    );
+
+    let report = state
+        .validation()
+        .rehydrate_stored_profiles(backend.as_ref(), "test-tenant", 1)
+        .await;
+    assert_eq!(report.tenants, 1, "{report:?}");
+    assert_eq!(
+        report.registered, 1,
+        "only the live, non-core profile: {report:?}"
+    );
+    assert_eq!(
+        report.skipped, 1,
+        "the core canonical is skipped: {report:?}"
+    );
+    assert_eq!(report.storage_errors, 0, "{report:?}");
+    assert!(
+        profile_resolves(&server, url).await,
+        "rehydrated profile resolves"
+    );
+    assert!(
+        !profile_resolves(
+            &server,
+            "http://example.org/StructureDefinition/deleted-before-restart"
+        )
+        .await,
+        "deleted profiles are not resurrected"
+    );
+}

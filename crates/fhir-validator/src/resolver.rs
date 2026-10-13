@@ -122,6 +122,20 @@ impl SchemaRegistry {
         }
     }
 
+    /// Remove the schema reachable under `reference`, together with every
+    /// other key (url, name, explicit key) that aliases the same schema.
+    ///
+    /// Returns `true` if something was removed. Removing an alias that
+    /// pointed at a schema also registered under a *different* schema's key
+    /// only drops the aliases of the schema actually found.
+    pub fn remove(&mut self, reference: &str) -> bool {
+        let Some(target) = self.map.get(reference).cloned() else {
+            return false;
+        };
+        self.map.retain(|_, schema| !Arc::ptr_eq(schema, &target));
+        true
+    }
+
     /// Build a registry from `(key, schema)` pairs.
     pub fn from_named(iter: impl IntoIterator<Item = (String, FhirSchema)>) -> Self {
         let mut reg = Self::new();
@@ -225,6 +239,27 @@ mod tests {
             }),
             "a schema without a url cannot be registered by url"
         );
+    }
+
+    #[test]
+    fn remove_drops_every_alias_of_the_schema() {
+        let mut reg = SchemaRegistry::new();
+        reg.insert_named("PatKey", named("Patient"));
+        reg.insert(named("Observation"));
+        assert_eq!(reg.len(), 5);
+
+        assert!(reg.remove("http://example.org/Patient"));
+        assert!(reg.resolve("PatKey").is_none());
+        assert!(reg.resolve("Patient").is_none());
+        assert!(reg.resolve("http://example.org/Patient").is_none());
+        assert!(
+            reg.resolve("http://example.org/Observation").is_some(),
+            "unrelated schemas are untouched"
+        );
+        assert_eq!(reg.len(), 2);
+
+        assert!(!reg.remove("http://example.org/Patient"), "already gone");
+        assert!(!reg.remove("never-there"));
     }
 
     #[test]

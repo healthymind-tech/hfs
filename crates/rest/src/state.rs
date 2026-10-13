@@ -339,6 +339,12 @@ impl<S: ResourceStorage> AppState<S> {
         &self.validation
     }
 
+    /// The validation service as a shared handle, for background work such
+    /// as the startup profile rehydration that outlives a request.
+    pub fn validation_shared(&self) -> Arc<crate::validation::ValidationService> {
+        Arc::clone(&self.validation)
+    }
+
     /// Sets the SQL-on-FHIR runner for this application state.
     ///
     /// Typically called at startup after creating the state, once the runner has been

@@ -233,9 +233,7 @@ use tower_http::{
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
-use tracing::info;
-#[cfg(feature = "subscriptions")]
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Creates the Axum application with default configuration.
 ///
@@ -701,6 +699,11 @@ where
     )
     .with_write_observability(observability.clone());
 
+    // Stored StructureDefinitions are replayed into the profile registries
+    // (the registries are in-memory; without this every restart forgot
+    // every uploaded profile until it was re-written).
+    spawn_profile_rehydration(state.validation_shared(), Arc::clone(&storage_arc), &config);
+
     // Persistence-layer operations. Absent capabilities leave the handler to
     // report 501 rather than the route to 404 — the endpoint exists on every
     // deployment, it just cannot always be served.
@@ -1165,6 +1168,45 @@ impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscr
             .collect();
         SubscriptionsSnapshot { rows }
     }
+}
+
+/// Spawns the startup replay of stored StructureDefinitions into the
+/// validation service's profile registries.
+///
+/// Same funnel and same reasoning as [`spawn_subscription_rehydration`]:
+/// `build_app` is the one place every backend start path passes through that
+/// holds both the storage handle and the service. It runs in the background
+/// so a large profile store never delays binding the port; the pass is
+/// CPU-bound (a few hundred StructureDefinitions convert in well under a
+/// second) and logs its count and duration when done.
+fn spawn_profile_rehydration<S>(
+    validation: Arc<validation::ValidationService>,
+    storage: Arc<S>,
+    config: &ServerConfig,
+) where
+    S: ResourceStorage + helios_persistence::core::ExportDataProvider + Send + Sync + 'static,
+{
+    if !config.validation.rehydrate {
+        info!("Profile rehydration is DISABLED (HFS_VALIDATION_REHYDRATE=false)");
+        return;
+    }
+    if !validation.stored_profiles_enabled() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        warn!(
+            "No Tokio runtime available at app construction; skipping profile rehydration. \
+             Stored StructureDefinitions will not validate until re-written."
+        );
+        return;
+    }
+    let default_tenant = config.default_tenant.clone();
+    let batch_size = config.validation.rehydrate_batch_size;
+    tokio::spawn(async move {
+        validation
+            .rehydrate_stored_profiles(storage.as_ref(), &default_tenant, batch_size)
+            .await;
+    });
 }
 
 /// Spawns the startup rehydration of the subscription engine (issue #305).
