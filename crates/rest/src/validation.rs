@@ -63,6 +63,9 @@ pub struct ValidationService {
     /// Per-tenant profile overlays, fed from stored StructureDefinition
     /// writes. `None` disables the feature.
     tenant_profiles: Option<TenantProfileMap>,
+    /// Allow stored StructureDefinitions to override embedded core
+    /// definitions with the same canonical URL (`HFS_VALIDATION_SHADOW_CORE`).
+    shadow_core: bool,
 }
 
 impl Default for ValidationService {
@@ -76,6 +79,7 @@ impl Default for ValidationService {
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
+            shadow_core: false,
         }
     }
 }
@@ -130,6 +134,7 @@ impl ValidationService {
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
+            shadow_core: config.shadow_core,
         }
     }
 
@@ -246,31 +251,79 @@ impl ValidationService {
     /// (called after successful StructureDefinition writes). Conversion
     /// failures are logged, never fatal — the write itself already
     /// succeeded.
-    pub fn upsert_stored_profile(&self, tenant: &str, version: FhirVersion, sd: &Value) {
+    ///
+    /// Registration rules (#H4):
+    /// - A canonical URL the embedded core pack already defines is **not**
+    ///   registered unless `HFS_VALIDATION_SHADOW_CORE=true`: importing
+    ///   `hl7.fhir.r4.core` must not replace the base types and core
+    ///   profiles the validator shipped with.
+    /// - Profiles and extensions (`derivation: constraint`) are indexed by
+    ///   URL only. Nothing references a profile by *name*, while element
+    ///   `type`s resolve base types by name — so a `name` alias would let
+    ///   `rendering-xhtml` (`name: "xhtml"`) shadow the primitive `xhtml`.
+    /// - Other definitions (specializations, logical models) keep their
+    ///   name alias unless that name is already a core type.
+    ///
+    /// Returns `true` when the definition ended up in the registry.
+    pub fn upsert_stored_profile(&self, tenant: &str, version: FhirVersion, sd: &Value) -> bool {
         let Some(registries) = &self.tenant_profiles else {
-            return;
+            return false;
         };
+        let core = helios_fhir_validator::packs::core_registry(version);
+        let url = sd.get("url").and_then(Value::as_str);
+        if !self.shadow_core
+            && let Some(url) = url
+            && core.resolve(url).is_some()
+        {
+            debug!(
+                tenant = %tenant,
+                url = %url,
+                "stored StructureDefinition matches an embedded core definition; not registered \
+                 (set HFS_VALIDATION_SHADOW_CORE=true to override core definitions)"
+            );
+            return false;
+        }
         match helios_fhir_validator::converter::convert(sd) {
             Ok(conversion) => {
                 for w in &conversion.warnings {
                     warn!(tenant = %tenant, "profile conversion warning: {w}");
                 }
+                let schema = conversion.schema;
+                let is_constraint = schema.derivation.as_deref() == Some("constraint")
+                    || schema.kind.as_deref()
+                        == Some(helios_fhir_validator::schema::kind::EXTENSION);
+                let name_is_core_type = schema
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| core.resolve(name).is_some());
                 let registry = registries
                     .entry((tenant.to_string(), version))
                     .or_insert_with(|| Arc::new(RwLock::new(SchemaRegistry::new())))
                     .clone();
-                let inserted = registry
-                    .write()
-                    .expect("tenant profile registry lock")
-                    .insert(conversion.schema);
-                if inserted {
-                    debug!(tenant = %tenant, url = ?sd.get("url"), "tenant profile registered");
+                let mut registry = registry.write().expect("tenant profile registry lock");
+                let inserted = if is_constraint || name_is_core_type {
+                    if name_is_core_type && !is_constraint {
+                        warn!(
+                            tenant = %tenant,
+                            url = ?url,
+                            name = ?schema.name,
+                            "stored StructureDefinition is named like a core type; registered by url only"
+                        );
+                    }
+                    registry.insert_by_url(schema)
                 } else {
-                    warn!(tenant = %tenant, "stored StructureDefinition has neither url nor name; not registered");
+                    registry.insert(schema)
+                };
+                if inserted {
+                    debug!(tenant = %tenant, url = ?url, "tenant profile registered");
+                } else {
+                    warn!(tenant = %tenant, "stored StructureDefinition has no url; not registered");
                 }
+                inserted
             }
             Err(e) => {
                 warn!(tenant = %tenant, "stored StructureDefinition failed to convert: {e}");
+                false
             }
         }
     }

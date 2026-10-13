@@ -784,11 +784,13 @@ where
                         .read(tenant.context(), &resource_type, &id)
                         .await
                     {
-                        Ok(Some(stored)) => state.validation().upsert_stored_profile(
-                            tenant.tenant_id(),
-                            stored.fhir_version(),
-                            stored.content(),
-                        ),
+                        Ok(Some(stored)) => {
+                            state.validation().upsert_stored_profile(
+                                tenant.tenant_id(),
+                                stored.fhir_version(),
+                                stored.content(),
+                            );
+                        }
                         Ok(None) => {
                             warn!(resource_id = %id, "committed PATCH target missing during profile refresh")
                         }

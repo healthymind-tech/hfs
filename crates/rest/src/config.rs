@@ -502,6 +502,12 @@ pub struct ValidationConfig {
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
+    /// Let a stored StructureDefinition whose canonical URL is already
+    /// defined by the embedded core pack (`http://hl7.org/fhir/StructureDefinition/…`)
+    /// override the embedded definition. Off by default: importing the
+    /// `hl7.fhir.r4.core` package must not replace the base types the
+    /// validator was built with.
+    pub shadow_core: bool,
 }
 
 impl Default for ValidationConfig {
@@ -516,6 +522,7 @@ impl Default for ValidationConfig {
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
             stored_profiles: true,
+            shadow_core: false,
         }
     }
 }
@@ -561,6 +568,7 @@ impl ValidationConfig {
             terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+            shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
         }
     }
 

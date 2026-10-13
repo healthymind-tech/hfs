@@ -11,6 +11,14 @@ use helios_rest::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
 use serde_json::{Value, json};
 
 async fn create_test_server(mode: &str) -> TestServer {
+    create_test_server_with(ValidationConfig {
+        mode: mode.to_string(),
+        ..Default::default()
+    })
+    .await
+}
+
+async fn create_test_server_with(validation: ValidationConfig) -> TestServer {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -33,10 +41,7 @@ async fn create_test_server(mode: &str) -> TestServer {
         },
         base_url: "http://localhost:8080".to_string(),
         default_tenant: "test-tenant".to_string(),
-        validation: ValidationConfig {
-            mode: mode.to_string(),
-            ..Default::default()
-        },
+        validation,
         ..ServerConfig::for_testing()
     };
 
@@ -350,4 +355,189 @@ async fn enforce_mode_honors_meta_profile_claims() {
         }))
         .await;
     assert_eq!(response.status_code(), 201, "{}", response.text());
+}
+
+/// A minimal stand-in for `hl7.fhir.r4.core`'s `rendering-xhtml` extension:
+/// an extension whose `name` is `xhtml`, the same as the primitive type.
+fn xhtml_named_extension() -> Value {
+    json!({
+        "resourceType": "StructureDefinition",
+        "id": "rendering-xhtml",
+        "url": "http://example.org/StructureDefinition/rendering-xhtml",
+        "name": "xhtml",
+        "status": "active",
+        "kind": "complex-type",
+        "abstract": false,
+        "context": [{ "type": "element", "expression": "Element" }],
+        "type": "Extension",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "derivation": "constraint",
+        "differential": {
+            "element": [
+                { "id": "Extension", "path": "Extension", "short": "String equivalent with html markup" },
+                { "id": "Extension.extension", "path": "Extension.extension", "max": "0" },
+                { "id": "Extension.url", "path": "Extension.url",
+                  "fixedUri": "http://example.org/StructureDefinition/rendering-xhtml" },
+                { "id": "Extension.value[x]", "path": "Extension.value[x]", "min": 1,
+                  "type": [{ "code": "string" }] }
+            ]
+        }
+    })
+}
+
+fn patient_with_narrative() -> Value {
+    json!({
+        "resourceType": "Patient",
+        "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Hello</div>"
+        },
+        "name": [{ "family": "X" }]
+    })
+}
+
+fn error_issues(outcome: &Value) -> Vec<Value> {
+    outcome["issue"]
+        .as_array()
+        .map(|issues| {
+            issues
+                .iter()
+                .filter(|i| i["severity"] == "error")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// H4: a stored extension whose `name` collides with a core type must not be
+/// resolvable by that name — `Narrative.div` (type `xhtml`) kept resolving to
+/// the `rendering-xhtml` extension schema and every narrative failed with
+/// "expected object, got string".
+#[tokio::test]
+async fn stored_extension_named_like_a_core_type_does_not_shadow_it() {
+    let server = create_test_server("off").await;
+
+    // Narrative validates clean before the upload…
+    let response = server
+        .post("/Patient/$validate")
+        .json(&patient_with_narrative())
+        .await;
+    response.assert_status_ok();
+    let before: Value = response.json();
+    assert!(error_issues(&before).is_empty(), "{before:#}");
+
+    let response = server
+        .put("/StructureDefinition/rendering-xhtml")
+        .json(&xhtml_named_extension())
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+
+    // …and still does afterwards.
+    let response = server
+        .post("/Patient/$validate")
+        .json(&patient_with_narrative())
+        .await;
+    response.assert_status_ok();
+    let after: Value = response.json();
+    assert!(
+        error_issues(&after).is_empty(),
+        "a stored extension named 'xhtml' must not shadow the xhtml type: {after:#}"
+    );
+
+    // The extension itself is still registered under its canonical URL.
+    let response = server
+        .post("/Patient/$validate?profile=http://example.org/StructureDefinition/rendering-xhtml")
+        .json(&patient_with_narrative())
+        .await;
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    assert!(
+        !outcome["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "not-supported"),
+        "the extension must resolve by url: {outcome:#}"
+    );
+}
+
+/// A StructureDefinition carrying a core canonical URL (what importing the
+/// `hl7.fhir.r4.core` package produces) must not replace the embedded
+/// definition.
+fn core_patient_requiring_birthdate() -> Value {
+    json!({
+        "resourceType": "StructureDefinition",
+        "id": "Patient",
+        "url": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "name": "Patient",
+        "status": "active",
+        "kind": "resource",
+        "abstract": false,
+        "type": "Patient",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/DomainResource",
+        "derivation": "specialization",
+        "differential": {
+            "element": [
+                { "id": "Patient", "path": "Patient" },
+                { "id": "Patient.birthDate", "path": "Patient.birthDate", "min": 1, "max": "1",
+                  "type": [{ "code": "date" }] }
+            ]
+        }
+    })
+}
+
+#[tokio::test]
+async fn core_canonicals_do_not_override_embedded_definitions() {
+    let server = create_test_server("off").await;
+    let response = server
+        .put("/StructureDefinition/Patient")
+        .json(&core_patient_requiring_birthdate())
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+
+    for path in [
+        "/Patient/$validate",
+        "/Patient/$validate?profile=http://hl7.org/fhir/StructureDefinition/Patient",
+    ] {
+        let response = server
+            .post(path)
+            .json(&json!({ "resourceType": "Patient", "name": [{ "family": "X" }] }))
+            .await;
+        response.assert_status_ok();
+        let outcome: Value = response.json();
+        assert!(
+            error_issues(&outcome).is_empty(),
+            "{path}: the embedded Patient definition must win over the stored core canonical: {outcome:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shadow_core_opt_in_lets_a_stored_core_canonical_win() {
+    let server = create_test_server_with(ValidationConfig {
+        shadow_core: true,
+        ..Default::default()
+    })
+    .await;
+    let response = server
+        .put("/StructureDefinition/Patient")
+        .json(&core_patient_requiring_birthdate())
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+
+    // The stored definition is reachable by its canonical URL. (The root
+    // resource type itself still resolves by *name* to the embedded schema —
+    // stored definitions never take a core type's name alias.)
+    let response = server
+        .post("/Patient/$validate?profile=http://hl7.org/fhir/StructureDefinition/Patient")
+        .json(&json!({ "resourceType": "Patient", "name": [{ "family": "X" }] }))
+        .await;
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    assert!(
+        error_issues(&outcome)
+            .iter()
+            .any(|i| i["code"] == "required" && i["expression"][0] == "Patient.birthDate"),
+        "HFS_VALIDATION_SHADOW_CORE=true must let the stored definition override: {outcome:#}"
+    );
 }
