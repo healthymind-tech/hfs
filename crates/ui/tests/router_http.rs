@@ -925,9 +925,16 @@ async fn page_wires_the_hover_rail_nav() {
         .unwrap();
     let html = body_text(response).await;
 
-    // The rail expands on hover (#438): no toggle button, no state script.
-    assert!(!html.contains("nav.js"));
+    // The rail expands on hover (#438): no pinned/collapsed state and no
+    // toggle for it. The one script the chrome carries is the responsive
+    // drawer below the tablet breakpoint, where there is no hover at all.
     assert!(!html.contains("data-toggle-nav"));
+    assert!(html.contains("/ui/assets/nav.js"));
+    assert!(html.contains(
+        r#"class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false""#
+    ));
+    assert!(html.contains(r#"class="sidebar__close" data-nav-close"#));
+    assert!(html.contains(r#"class="sidebar-scrim" data-nav-scrim"#));
     // Labels are wrapped so the resting rail can hide them (a11y-safe).
     assert!(html.contains("nav-item__label"));
     // The Batch & Data entries from the design: Import and Export.

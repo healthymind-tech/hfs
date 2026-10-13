@@ -585,6 +585,8 @@ rail-count-approximate = Aproximado: contado a partir de las escrituras reciente
 queries-saved-group = Guardadas
 
 nav-collapse = Colapsar menú
+nav-menu-open = Abrir el menú de navegación
+nav-menu-close = Cerrar el menú de navegación
 
 batch-heading = Batch / Transaction
 batch-lede = Sube un Bundle FHIR, revisa las acciones que va a ejecutar, ejecútalo contra este servidor y lee el resultado de cada entrada.

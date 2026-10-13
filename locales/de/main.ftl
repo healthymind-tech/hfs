@@ -585,6 +585,8 @@ rail-count-approximate = Näherungswert: aus den jüngsten Schreibvorgängen gez
 queries-saved-group = Gespeichert
 
 nav-collapse = Menü einklappen
+nav-menu-open = Navigationsmenü öffnen
+nav-menu-close = Navigationsmenü schließen
 
 batch-heading = Batch / Transaction
 batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, führe es gegen diesen Server aus und lies das Ergebnis jedes Eintrags.
