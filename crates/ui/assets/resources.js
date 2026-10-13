@@ -13,6 +13,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
   function fhirHeaders(extra) {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -328,7 +342,7 @@
     subject.textContent = type + "/" + id;
     openModal();
     editorBody.innerHTML = "";
-    fetch("/" + type + "/" + id, { headers: fhirHeaders() })
+    fetch(fhirUrl("/" + type + "/" + id), { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
       .then(renderEditor)
       .then(function () { if (unsaved) unsaved.reset(); })
@@ -408,7 +422,7 @@
       var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
       if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
       var creating = !current.id;
-      var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
+      var url = fhirUrl(creating ? "/" + current.type : "/" + current.type + "/" + current.id);
       fetch(url, {
         method: creating ? "POST" : "PUT",
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
@@ -438,7 +452,7 @@
       return;
     }
     if (!window.confirm(messages.msgConfirmDelete)) return;
-    fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
+    fetch(fhirUrl("/" + current.type + "/" + current.id), { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
         if (r.ok || r.status === 204) {
           // The resource no longer exists — nothing to ask about.
@@ -469,7 +483,7 @@
     }
     document.getElementById("resource-history-subject").textContent =
       current.type + "/" + current.id;
-    fetch("/" + current.type + "/" + current.id + "/_history", {
+    fetch(fhirUrl("/" + current.type + "/" + current.id + "/_history"), {
       headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })

@@ -417,6 +417,34 @@ pub(crate) struct Status {
     /// every browser-originated FHIR call is refused, so the shell says so
     /// once instead of each page failing with the API's 401 text.
     bearer_only_auth: bool,
+    /// The path under which the FHIR API is reachable from the browser — the
+    /// path component of `HFS_BASE_URL`, without a trailing slash, so `""`
+    /// when the server sits at the origin root and `"/fhir"` behind a
+    /// reverse proxy that mounts it under a prefix. The layout emits it as
+    /// `<meta name="hfs-fhir-base">` and every browser-issued FHIR call is
+    /// built on it; before that, page scripts assumed the root and broke
+    /// behind any prefix.
+    fhir_base: String,
+}
+
+/// The browser-facing FHIR API path prefix for `public_base_url`
+/// (`HFS_BASE_URL`): its path with any trailing slash removed, so a root
+/// deployment yields `""` and `https://example.org/fhir/` yields `"/fhir"`.
+/// Only the path is taken, never the origin: the browser reaches the API on
+/// whatever host it reached the UI on, which may be a different name than
+/// the configured public one (a port-forward, a loopback check), and an
+/// origin mismatch would turn every call into a blocked cross-origin request.
+pub(crate) fn fhir_base_path(public_base_url: &str) -> String {
+    let path = match reqwest::Url::parse(public_base_url) {
+        Ok(url) => url.path().to_string(),
+        Err(_) => String::new(),
+    };
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// What the account menu shows for a signed-in user, derived once per request
@@ -582,6 +610,13 @@ impl Status {
     /// read (#344).
     pub(crate) fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+
+    /// The FHIR API path prefix for the `hfs-fhir-base` meta tag browser
+    /// calls read: `""` at the origin root, `"/fhir"` behind a prefix. See
+    /// [`fhir_base_path`].
+    pub(crate) fn fhir_base(&self) -> &str {
+        &self.fhir_base
     }
 
     /// The effective tenant's display label: its registry display name, or the
@@ -9150,6 +9185,7 @@ pub(crate) fn current_status(
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
         user: UserSummary::from_session(tenant.signed_in.as_ref()),
         bearer_only_auth: bearer_only_auth(),
+        fhir_base: fhir_base_path(&state.public_base_url),
     }
 }
 
@@ -9303,6 +9339,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -9491,6 +9528,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("en"),
         }
@@ -9686,6 +9724,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -9803,6 +9842,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -10671,7 +10711,19 @@ mod user_summary_tests {
             terminology: TerminologyNavigation::Unconfigured,
             user,
             bearer_only_auth: false,
+            fhir_base: String::new(),
         }
+    }
+
+    #[test]
+    fn fhir_base_path_is_the_public_base_urls_path_without_a_trailing_slash() {
+        assert_eq!(fhir_base_path("http://localhost:8080"), "");
+        assert_eq!(fhir_base_path("http://localhost:8080/"), "");
+        assert_eq!(fhir_base_path("https://example.org/fhir"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/fhir/"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/a/b/"), "/a/b");
+        // Not a URL at all: fall back to the root rather than guess.
+        assert_eq!(fhir_base_path("not a url"), "");
     }
 
     #[test]

@@ -7,8 +7,8 @@
 // (`/_user/settings`, an opaque JSON doc from #151); localStorage stays as a
 // fast-path cache so first paint never waits on the network. Precedence:
 // server setting -> localStorage cache -> OS preference -> light. When the
-// settings endpoint is unavailable (store not configured, offline), behavior
-// degrades to the old localStorage-only model.
+// settings endpoint is unavailable (store not configured, offline, or the
+// page never named one), behavior degrades to the old localStorage-only model.
 //
 // The toggle buttons in the top bar carry `data-set-theme="light|dark"`; a
 // single delegated listener keeps behavior in one pinned asset (see
@@ -24,7 +24,14 @@
   document.documentElement.classList.add("js");
 
   var KEY = "hfs-theme";
-  var SETTINGS = "/_user/settings";
+  // Where the settings document lives is the server's call: HFS stamps
+  // `<meta name="hfs-user-settings">` with the endpoint under its own API
+  // prefix (it is a FHIR-app route, so `/_user/settings` is wrong behind a
+  // `/fhir/` reverse-proxy mount), and a layout without the tag — HTS, which
+  // has no such endpoint — means the choice stays local to this browser
+  // instead of every page logging a 404.
+  var settingsMeta = document.querySelector('meta[name="hfs-user-settings"]');
+  var SETTINGS = settingsMeta ? settingsMeta.content : null;
 
   function valid(theme) {
     return theme === "light" || theme === "dark" ? theme : null;
@@ -58,7 +65,7 @@
 
   // 2. Reconcile with the server-side settings document (source of truth):
   //    a roamed choice from another device wins over the local cache.
-  if (window.fetch) {
+  if (window.fetch && SETTINGS) {
     fetch(SETTINGS, { headers: { Accept: "application/json" }, credentials: "same-origin" })
       .then(function (response) {
         return response.ok ? response.json() : null;
@@ -83,7 +90,7 @@
     if (!next) return;
     apply(next);
     cache(next);
-    if (window.fetch) {
+    if (window.fetch && SETTINGS) {
       fetch(SETTINGS, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },

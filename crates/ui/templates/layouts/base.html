@@ -8,6 +8,14 @@
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
+  <!-- Where the FHIR API lives, as seen from the browser: the path of
+       HFS_BASE_URL without a trailing slash — empty at the origin root,
+       "/fhir" behind a reverse proxy that mounts the server under a prefix.
+       Every page script builds its FHIR calls on this instead of assuming
+       the root; the per-user settings document (#151) is read from the
+       second tag, and a layout without it (HTS) means "no such endpoint". -->
+  <meta name="hfs-fhir-base" content="{{ status.fhir_base() }}">
+  <meta name="hfs-user-settings" content="{{ status.fhir_base() }}/_user/settings">
   <!-- No `defer`: the theme attribute must land on <html> before first paint,
        or the stored theme flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>

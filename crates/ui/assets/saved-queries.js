@@ -32,9 +32,27 @@
   var fhirSearchValue = window.HfsFhirSearchValue;
   if (!fhirSearchValue) throw new Error("FHIR search-value codec is missing");
 
-  var SETTINGS = "/_user/settings";
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
+  /* The per-user settings document (#151), where the server says it is
+     (`<meta name="hfs-user-settings">`, built on the same prefix). */
+  var SETTINGS =
+    (document.querySelector('meta[name="hfs-user-settings"]') || {}).content ||
+    fhirUrl("/_user/settings");
   function fhirHeaders() {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -190,7 +208,9 @@
     if (!parsed) return null;
     var text = (raw || "").trim().replace(/^GET\s+/i, "");
     try {
-      var url = new URL(text, window.location.href);
+      /* A root-relative path is resolved under the API prefix, so the
+         resource links built from `baseUrl` point where the fetch went. */
+      var url = new URL(fhirUrl(text), window.location.href);
       var segments = url.pathname.split("/").filter(Boolean);
       segments.pop();
       url.pathname = "/" + segments.join("/");
@@ -3145,7 +3165,7 @@
       window.open(path, "_blank", "noopener");
     } else {
       var search = beginSearch();
-      fetch(withTotal(path), {
+      fetch(fhirUrl(withTotal(path)), {
         headers: fhirHeaders(),
         credentials: "same-origin",
         signal: search.controller.signal,

@@ -9,6 +9,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
 
   document.addEventListener("click", function (event) {
     var btn = event.target.closest ? event.target.closest("[data-crud-delete]") : null;
@@ -20,7 +34,7 @@
     /* The shared busy state (#679); the guard is per-button, so unrelated
        rows stay independently deletable. */
     window.hfsBusy.during([btn], function () {
-      return fetch("/" + btn.dataset.type + "/" + btn.dataset.id, { method: "DELETE", headers: headers })
+      return fetch(fhirUrl("/" + btn.dataset.type + "/" + btn.dataset.id), { method: "DELETE", headers: headers })
         .then(function (response) {
           if (!response.ok) throw new Error("HTTP " + response.status);
           /* #1240: this redirect is the delete's own navigation, not an
