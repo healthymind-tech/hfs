@@ -537,6 +537,7 @@ editor-saved = 已儲存。
 unsaved-changes = 未儲存的變更
 unsaved-discard-confirm = 有尚未儲存的變更。要捨棄並關閉嗎？
 editor-load-error = 無法載入該資源。
+editor-load-not-found = 此伺服器上沒有 id 為 { $id } 的 { $type }，請確認 id 或返回清單。
 editor-confirm-delete = 要刪除此資源嗎？此動作無法復原。
 editor-invalid-json = 這不是有效的JSON，因此無法以表單編輯。你的文字未被更動。
 editor-source-hint = 直接編輯原始內容。切回引導式表單時會重新解析。
@@ -625,6 +626,9 @@ rail-count-approximate = 約略值：依最近的寫入計算，尚未與儲存�
 queries-saved-group = 已儲存
 
 nav-collapse = 收合選單
+nav-main = 主導覽
+nav-menu-close = 關閉導覽選單
+nav-menu-open = 開啟導覽選單
 
 batch-heading = 批次／交易
 batch-lede = 上傳FHIR Bundle，檢視它將執行的動作，對本伺服器執行，並查看每個項目的結果。
@@ -1547,6 +1551,13 @@ hts-vs-browser-filter-status = 狀態
 hts-vs-browser-filter-reset = 重設
 hts-vs-browser-empty = 沒有符合這些篩選條件的ValueSet。
 hts-vs-browser-load-more = 載入更多
+hts-vs-expand-count-hint = 每頁最多 500 個概念；其餘請使用位移或「載入更多」。
+hts-browser-goto = 前往
+hts-browser-goto-offset = 跳至位移
+hts-browser-page-next = 下一頁
+hts-browser-page-prev = 上一頁
+hts-browser-pager = 分頁
+hts-browser-of-total = ，共 { $total } 筆
 hts-vs-browser-showing-count = 顯示{ $count ->
     [one] { $count }個ValueSet
    *[other] { $count }個ValueSet
