@@ -90,6 +90,60 @@ async fn body_text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// Filtering through htmx rewrites the address: the rows fragment carries
+/// `HX-Push-Url` naming the page URL that reproduces its filters, so a
+/// reload, a bookmark or the back button land on the same list. A
+/// Load-more page (`_offset > 0`) carries none — appending rows must not
+/// rewrite the address to a middle page — and the default page size is
+/// left out of the pushed URL.
+#[tokio::test]
+async fn rows_fragment_pushes_the_filtered_page_url() {
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/rows?name=obs&title=&status=active&_count=25")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("HX-Push-Url")
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui/hts/value-sets?name=obs&status=active")
+    );
+
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/rows?name=obs&_count=50&_offset=50")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.headers().get("HX-Push-Url").is_none());
+
+    let response = app()
+        .oneshot(
+            axum::http::Request::get("/ui/hts/value-sets/rows?_count=50")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("HX-Push-Url")
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui/hts/value-sets?_count=50")
+    );
+}
+
 // ── In-process mock upstream ─────────────────────────────────────────────
 
 /// One captured request, in the order the mock saw it.

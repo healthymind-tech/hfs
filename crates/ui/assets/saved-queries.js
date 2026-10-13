@@ -3159,10 +3159,37 @@
     return path + (query ? "&" : q === -1 ? "?" : "") + "_total=accurate";
   }
 
+  /* Mirrors the running query into the Resources page's own URL
+   * (`?type=…&url=…`), the shape `locationSearchValue` already restores on
+   * load and on popstate, so a reload, a shared link and the back button all
+   * land on the same results instead of the page's default search. The type's
+   * own default (`/Type?_summary=true`, what a rail click runs) is spelled as
+   * a bare `?type=`, the same URL the rail link carries, so the common case
+   * stays short. `replaceState`, not `pushState`: a rail click already pushed
+   * its entry, and every refinement of one query belongs to that entry. */
+  function syncLocation(path) {
+    if (!document.getElementById("resources") || !window.history.replaceState) return;
+    var parsed = parseSearchUrl(path);
+    if (!parsed) return;
+    var params = new URLSearchParams();
+    params.set("type", parsed.type);
+    var isDefault =
+      /^\/[A-Za-z]+\?_summary=true$/.test(path) || path === "/" + parsed.type;
+    if (!isDefault) params.set("url", path);
+    var next = window.location.pathname + "?" + params.toString();
+    if (next === window.location.pathname + window.location.search) return;
+    try {
+      window.history.replaceState(window.history.state, "", next);
+    } catch (e) {
+      /* a URL the browser refuses is not worth failing the search over */
+    }
+  }
+
   function runSearch(path, record, context) {
     var requestedContext = context || resultContext(path);
+    syncLocation(path);
     if (!results.card) {
-      window.open(path, "_blank", "noopener");
+      window.open(fhirUrl(path), "_blank", "noopener");
     } else {
       var search = beginSearch();
       fetch(fhirUrl(withTotal(path)), {
