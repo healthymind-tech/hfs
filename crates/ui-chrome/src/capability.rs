@@ -1369,7 +1369,10 @@ mod datetime_display_tests {
             format_fhir_datetime("2026-10-13T12:00:43.504193199+00:00"),
             "2026-10-13 12:00:43 UTC"
         );
-        assert_eq!(format_fhir_datetime("2026-10-13T12:00:43Z"), "2026-10-13 12:00:43 UTC");
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T12:00:43Z"),
+            "2026-10-13 12:00:43 UTC"
+        );
         assert_eq!(
             format_fhir_datetime("2026-10-13T08:00:43.1-04:00"),
             "2026-10-13 08:00:43 UTC-04:00"

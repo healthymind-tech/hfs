@@ -712,7 +712,11 @@ impl CsBrowserPage {
         if self.filters.offset == 0 {
             None
         } else {
-            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
         }
     }
 }
@@ -1840,7 +1844,11 @@ impl VsBrowserPage {
         if self.filters.offset == 0 {
             None
         } else {
-            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
         }
     }
 }
@@ -2893,7 +2901,11 @@ impl CmBrowserPage {
         if self.filters.offset == 0 {
             None
         } else {
-            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
         }
     }
 }
@@ -5902,12 +5914,18 @@ mod paging_tests {
             filters.page_url_at(&50),
             "/ui/hts/value-sets?name=obs&status=active&_offset=50"
         );
-        assert_eq!(filters.page_url_at(&0), "/ui/hts/value-sets?name=obs&status=active");
+        assert_eq!(
+            filters.page_url_at(&0),
+            "/ui/hts/value-sets?name=obs&status=active"
+        );
         let bare = CmBrowserFilters {
             count: 50,
             ..CmBrowserFilters::default()
         };
         assert_eq!(bare.page_url_at(&0), "/ui/hts/concept-maps?_count=50");
-        assert_eq!(CsBrowserFilters::default().page_url_at(&0), "/ui/hts/code-systems");
+        assert_eq!(
+            CsBrowserFilters::default().page_url_at(&0),
+            "/ui/hts/code-systems"
+        );
     }
 }

@@ -404,12 +404,18 @@ mod tests {
             (header::ACCEPT_LANGUAGE, "de"),
         ]);
         let (locale, explicit) = negotiate(&Uri::from_static("/ui/hts"), &map);
-        assert_eq!(locale, &ES, "a choice saved before the cookie merge survives");
+        assert_eq!(
+            locale, &ES,
+            "a choice saved before the cookie merge survives"
+        );
         assert!(!explicit);
 
         let map = headers(&[(header::COOKIE, "hts_lang=es; hfs_lang=zh-Hant")]);
         let (locale, _) = negotiate(&Uri::from_static("/ui/hts"), &map);
-        assert_eq!(locale, &ZH_HANT, "the shared cookie wins over the legacy one");
+        assert_eq!(
+            locale, &ZH_HANT,
+            "the shared cookie wins over the legacy one"
+        );
     }
 
     #[test]
