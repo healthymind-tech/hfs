@@ -260,7 +260,10 @@ fn signed_out_renders_no_sign_out_link() {
 /// is current, and it is the one matching `ChromeLabels::lang()`.
 #[test]
 fn exactly_one_language_is_marked_current() {
-    for lang in ["en", "es", "de"] {
+    // The catalog key is the tag lower-cased (`language-zh-hant`), the
+    // `?lang=` value keeps the BCP 47 casing (`zh-Hant`).
+    const LANGS: [&str; 4] = ["en", "es", "de", "zh-Hant"];
+    for lang in LANGS {
         let out = render(lang, UserIdentity::default());
 
         assert_eq!(
@@ -270,15 +273,17 @@ fn exactly_one_language_is_marked_current() {
         );
         assert!(
             out.contains(&format!(
-                "<a href=\"?lang={lang}\" aria-current=\"true\" aria-label=\"[language-{lang}]\">"
+                "<a href=\"?lang={lang}\" aria-current=\"true\" aria-label=\"[language-{}]\">",
+                lang.to_ascii_lowercase()
             )),
             "lang={lang}: the matching entry must be the current one:\n{out}"
         );
 
-        for other in ["en", "es", "de"].iter().filter(|o| **o != lang) {
+        for other in LANGS.iter().filter(|o| **o != lang) {
             assert!(
                 out.contains(&format!(
-                    "<a href=\"?lang={other}\" aria-label=\"[language-{other}]\">"
+                    "<a href=\"?lang={other}\" aria-label=\"[language-{}]\">",
+                    other.to_ascii_lowercase()
                 )),
                 "lang={lang}: entry {other} must render without aria-current"
             );

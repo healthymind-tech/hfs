@@ -8053,7 +8053,7 @@ async fn user_menu_carries_language_and_the_signed_out_state() {
     let html = body_text(response).await;
     assert!(html.contains("menu--user"));
     assert!(!html.contains("lang-switcher"));
-    for lang in ["en", "es", "de"] {
+    for lang in ["en", "es", "de", "zh-Hant"] {
         assert!(
             html.contains(&format!("?lang={lang}")),
             "missing ?lang={lang}"

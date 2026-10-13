@@ -179,7 +179,7 @@ const ROUTES: &[Route] = &[
 
 /// Locales the fixture matrix walks. Matches the switcher order in
 /// [`crates/hts-ui/src/i18n.rs`] and the workspace catalog set.
-const LOCALES: &[&str] = &["en", "es", "de"];
+const LOCALES: &[&str] = &["en", "es", "de", "zh-Hant"];
 
 /// HX-Request booleans the matrix walks. The Phase 1 dashboard renders the
 /// same body in both modes (full-page + fragment collapse to identical

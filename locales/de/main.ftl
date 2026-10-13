@@ -28,6 +28,7 @@ language-label = Sprache
 language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
+language-zh-hant = Chinesisch (traditionell)
 user-menu-label = Kontomenü
 user-anonymous = Anonymer Benutzer
 user-local-hint = Authentifizierung ist deaktiviert
@@ -147,6 +148,19 @@ tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten b
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
 tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
+# TODO review (machine translation)
+tenants-error-id-empty = Die Mandanten-ID darf nicht leer sein.
+tenants-error-id-too-long = Die Mandanten-ID überschreitet { $max } Zeichen.
+tenants-error-id-reserved = Diese ID ist für interne gemeinsame Ressourcen reserviert.
+tenants-error-id-invalid-character = Die Mandanten-ID darf nur Buchstaben, Ziffern, '-', '_', '.' und '/' enthalten.
+tenants-error-id-empty-segment = Die Mandanten-ID darf nicht mit '/' beginnen oder enden und kein leeres Segment enthalten.
+tenants-error-exists = Der Mandant '{ $id }' existiert bereits.
+tenants-error-provisioning = Der Mandant '{ $id }' wird bereits bereitgestellt.
+tenants-error-still-provisioning = Der Mandant '{ $id }' wird noch bereitgestellt.
+tenants-error-not-purged = Der Mandant '{ $id }' wurde abgemeldet, aber seine Daten wurden NICHT gelöscht: { $detail }
+tenants-error-list = Mandanten konnten nicht aufgelistet werden: { $detail }
+tenants-error-count = Ressourcen konnten nicht gezählt werden: { $detail }
+tenants-field-name-placeholder = Beispielklinik
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants

@@ -73,6 +73,8 @@ bug, and it is only avoidable if every layer reads the same `RequestLocale`.
 
 1. **Explicit override** — `?lang=` query param or a `hfs_lang` cookie set by the
    language switcher. Lets a user read in a language other than their browser's.
+   The cookie is shared by the HFS and HTS consoles (one product, one choice);
+   HTS still reads its pre-merge `hts_lang` cookie as a fallback.
 2. **Saved user preference** — from `feat/user-ui-settings` (a per-user setting),
    when authenticated.
 3. **`Accept-Language`** — RFC 4647 lookup against our supported set.
@@ -294,7 +296,9 @@ rules of the road in §3.3 have been violated.
 
 ## 10. Deliverables in this branch
 
-- `locales/{en,es,de}/main.ftl` — seeded UI message catalogs (source + two).
+- `locales/{en,es,de,zh-Hant}/main.ftl` — UI message catalogs (source + three;
+  `zh-Hant` is Traditional Chinese for Taiwan and is also what `zh-TW`,
+  `zh-Hant-TW` and a bare `zh` negotiate to).
 - `locales/README.md` — catalog conventions.
 - `docs/multi-language.md` — this document.
 

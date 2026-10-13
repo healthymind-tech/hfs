@@ -714,7 +714,7 @@ that one CSS rule.
 ## Error wording (#677)
 
 Errors follow one convention across the Fluent catalogs
-(`locales/{en,es,de}/main.ftl`) and the OperationOutcome diagnostics that
+(`locales/{en,es,de,zh-Hant}/main.ftl`) and the OperationOutcome diagnostics that
 `crates/rest/src/error.rs` renders into them:
 
 - Full-sentence errors end with a terminal period; fragments, labels, and
@@ -1125,7 +1125,7 @@ falls through to the normal REST surface.
 All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ftl`
 (workspace root, embedded at compile time). Negotiation order: `?lang=` → the
 `hfs_lang` cookie → `Accept-Language` (RFC 4647 Lookup) → `en`. Supported today:
-`en`, `es`, `de`. A key missing from a translation falls back to its English
+`en`, `es`, `de`, `zh-Hant` (also negotiated for `zh-TW`, `zh-Hant-TW`, bare `zh`). A key missing from a translation falls back to its English
 string, and `catalogs_share_the_same_key_set` fails the build-time test suite if
 the catalogs drift apart. See `docs/multi-language.md`.
 

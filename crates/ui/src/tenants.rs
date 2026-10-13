@@ -199,23 +199,19 @@ pub struct DeleteQuery {
 /// the single reservation authority shared with the `/admin/tenants` API, the
 /// request-time tenant extractor, and the storage-layer lifecycle guard, so this
 /// page cannot drift from them (issue #317).
-fn validate_id(id: &str) -> Result<(), String> {
+fn validate_id(i18n: &I18n, id: &str) -> Result<(), String> {
     use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId, TenantIdError};
 
     TenantId::parse(id).map(|_| ()).map_err(|e| match e {
-        TenantIdError::Empty => "Tenant id must not be empty.".to_string(),
-        TenantIdError::TooLong { .. } => {
-            format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters.")
-        }
-        TenantIdError::ReservedSegment { .. } => {
-            "That id is reserved for internal shared resources.".to_string()
-        }
-        TenantIdError::InvalidCharacter { .. } => {
-            "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string()
-        }
-        TenantIdError::EmptySegment => {
-            "Tenant id must not begin or end with '/' or contain an empty segment.".to_string()
-        }
+        TenantIdError::Empty => i18n.t("tenants-error-id-empty"),
+        TenantIdError::TooLong { .. } => i18n.t_arg(
+            "tenants-error-id-too-long",
+            "max",
+            MAX_TENANT_ID_LEN.to_string(),
+        ),
+        TenantIdError::ReservedSegment { .. } => i18n.t("tenants-error-id-reserved"),
+        TenantIdError::InvalidCharacter { .. } => i18n.t("tenants-error-id-invalid-character"),
+        TenantIdError::EmptySegment => i18n.t("tenants-error-id-empty-segment"),
         // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
         // back to its own `Display` rather than failing to compile here.
         other => other.to_string(),
@@ -227,6 +223,7 @@ fn validate_id(id: &str) -> Result<(), String> {
 /// reflected in the registry, filtered by the search term (matches id or
 /// display name, case-insensitive).
 async fn load_rows(
+    i18n: &I18n,
     storage: &Arc<dyn ResourceStorage>,
     q: &str,
     jobs: &HashMap<String, Provisioning>,
@@ -234,11 +231,11 @@ async fn load_rows(
     let registered = storage
         .list_tenants()
         .await
-        .map_err(|e| format!("Failed to list tenants: {e}"))?;
+        .map_err(|e| i18n.t_arg("tenants-error-list", "detail", e.to_string()))?;
     let counts: HashMap<String, u64> = storage
         .count_by_tenant()
         .await
-        .map_err(|e| format!("Failed to count resources: {e}"))?
+        .map_err(|e| i18n.t_arg("tenants-error-count", "detail", e.to_string()))?
         .into_iter()
         .collect();
 
@@ -365,7 +362,7 @@ pub async fn page(
     };
 
     let jobs = state.provisioning.lock().unwrap().clone();
-    let (rows, error) = match load_rows(storage, &query.q, &jobs).await {
+    let (rows, error) = match load_rows(&i18n, storage, &query.q, &jobs).await {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e)),
     };
@@ -404,7 +401,7 @@ pub async fn rows(
         });
     };
     let jobs = state.provisioning.lock().unwrap().clone();
-    let (rows, error) = match load_rows(storage, &query.q, &jobs).await {
+    let (rows, error) = match load_rows(&i18n, storage, &query.q, &jobs).await {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e)),
     };
@@ -493,13 +490,13 @@ pub async fn create(
     // using the ordinary banner.
     let load = |err: Option<String>| async {
         let jobs = state.provisioning.lock().unwrap().clone();
-        match load_rows(storage, "", &jobs).await {
+        match load_rows(&i18n, storage, "", &jobs).await {
             Ok(rows) => create_response(i18n, rows, None, err),
             Err(e) => create_response(i18n, Vec::new(), Some(e), err),
         }
     };
 
-    if let Err(msg) = validate_id(&id) {
+    if let Err(msg) = validate_id(&i18n, &id) {
         return load(Some(msg)).await;
     }
     let display_name = {
@@ -512,7 +509,7 @@ pub async fn create(
     };
 
     match storage.get_tenant(&id).await {
-        Ok(Some(_)) => return load(Some(format!("Tenant '{id}' already exists."))).await,
+        Ok(Some(_)) => return load(Some(i18n.t_arg("tenants-error-exists", "id", id.clone()))).await,
         Ok(None) => {}
         Err(e) => return load(Some(e.to_string())).await,
     }
@@ -539,7 +536,12 @@ pub async fn create(
         }
     };
     if already_in_flight {
-        return load(Some(format!("Tenant '{id}' is already being provisioned."))).await;
+        return load(Some(i18n.t_arg(
+            "tenants-error-provisioning",
+            "id",
+            id.clone(),
+        )))
+        .await;
     }
 
     // Provision in the background: the claimed row above reports progress,
@@ -622,7 +624,7 @@ pub async fn delete(
 
     let load = |err: Option<String>| async {
         let jobs = state.provisioning.lock().unwrap().clone();
-        match load_rows(storage, "", &jobs).await {
+        match load_rows(&i18n, storage, "", &jobs).await {
             Ok(rows) => rows_response(i18n, rows, err),
             Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
         }
@@ -638,7 +640,7 @@ pub async fn delete(
     // `/ui/*` being mounted outside the auth layer is deliberately untouched
     // here; the storage-layer guard in `helios-persistence` backs this up
     // regardless of how the route is reached.
-    if let Err(message) = validate_id(&id) {
+    if let Err(message) = validate_id(&i18n, &id) {
         return load(Some(message)).await;
     }
 
@@ -667,7 +669,12 @@ pub async fn delete(
     };
     match outcome {
         JobOutcome::InFlight => {
-            return load(Some(format!("Tenant '{id}' is still being provisioned."))).await;
+            return load(Some(i18n.t_arg(
+                "tenants-error-still-provisioning",
+                "id",
+                id.clone(),
+            )))
+            .await;
         }
         JobOutcome::Dismissed => return load(None).await,
         JobOutcome::None => {}
@@ -694,8 +701,12 @@ pub async fn delete(
                 }
                 None
             }
-            Err(e) => Some(format!(
-                "Tenant '{id}' was deregistered but its data was NOT purged: {e}"
+            Err(e) => Some(i18n.t_arg2(
+                "tenants-error-not-purged",
+                "id",
+                id.clone(),
+                "detail",
+                e.to_string(),
             )),
         }
     } else {
@@ -743,7 +754,7 @@ mod provisioning_row_tests {
             },
         );
 
-        let rows = load_rows(&storage, "", &jobs).await.expect("rows");
+        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs).await.expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1, "one row per tenant, not one per source");
         assert!(acme[0].provisioning, "the provisioning row wins");
@@ -756,7 +767,7 @@ mod provisioning_row_tests {
                 message: "boom".to_string(),
             },
         );
-        let rows = load_rows(&storage, "", &jobs).await.expect("rows");
+        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs).await.expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1);
         assert!(!acme[0].provisioning);

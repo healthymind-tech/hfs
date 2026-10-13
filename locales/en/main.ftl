@@ -30,6 +30,7 @@ language-label = Language
 language-en = English
 language-es = Spanish
 language-de = German
+language-zh-hant = Traditional Chinese
 user-menu-label = Account menu
 user-anonymous = Anonymous user
 user-local-hint = Authentication is disabled
@@ -150,6 +151,19 @@ tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept un
 tenants-row-provisioning = Provisioning… this may take a moment.
 tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
+# Submit-time errors on the Add Tenant form (#317 mirrors the API's id rules).
+tenants-error-id-empty = Tenant id must not be empty.
+tenants-error-id-too-long = Tenant id exceeds { $max } characters.
+tenants-error-id-reserved = That id is reserved for internal shared resources.
+tenants-error-id-invalid-character = Tenant id may contain only letters, digits, '-', '_', '.', and '/'.
+tenants-error-id-empty-segment = Tenant id must not begin or end with '/' or contain an empty segment.
+tenants-error-exists = Tenant '{ $id }' already exists.
+tenants-error-provisioning = Tenant '{ $id }' is already being provisioned.
+tenants-error-still-provisioning = Tenant '{ $id }' is still being provisioned.
+tenants-error-not-purged = Tenant '{ $id }' was deregistered but its data was NOT purged: { $detail }
+tenants-error-list = Failed to list tenants: { $detail }
+tenants-error-count = Failed to count resources: { $detail }
+tenants-field-name-placeholder = Acme Health
 
 tenant-heading = Tenants
 tenant-all = All tenants

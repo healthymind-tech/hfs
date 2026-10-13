@@ -275,7 +275,7 @@ scroll-to-selection on arrival — recents are server-rendered, not client-side.
 ### i18n
 
 Negotiation order: `?lang=` → `hfs_lang` cookie → `Accept-Language` (RFC 4647
-Lookup) → `en`. Locales are `en`, `es`, `de` at `locales/<locale>/main.ftl`
+Lookup) → `en`. Locales are `en`, `es`, `de`, `zh-Hant` at `locales/<locale>/main.ftl`
 (repo root, embedded at compile time). A key missing from a translation falls back
 to English. Tests enforce key-set parity across locales. See `docs/multi-language.md`.
 

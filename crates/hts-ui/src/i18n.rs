@@ -3,7 +3,7 @@
 //! One locale is negotiated per request and carried in request extensions as
 //! [`RequestLocale`]; templates resolve catalog keys against it through the
 //! [`I18n`] helper. Policy mirrors `crates/ui/src/i18n.rs`: explicit `?lang=`
-//! override (persisted in the `hts_lang` cookie by the language switcher) →
+//! override (persisted in the `hfs_lang` cookie by the language switcher) →
 //! cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!
 //! Catalogs live in `locales/<locale>/main.ftl` at the workspace root (reached
@@ -13,8 +13,11 @@
 //! `en` is the source locale and the final fallback: a key missing from a
 //! translation renders its English string, never a blank or a crash.
 //!
-//! Cookie name is `hts_lang` (distinct from HFS's `hfs_lang`) so that when
-//! both binaries share a domain their language preferences do not collide.
+//! The cookie is the one HFS writes (`helios_ui_chrome::LANG_COOKIE`,
+//! `hfs_lang`): the two consoles present one product, so a language picked in
+//! either follows the operator to the other. HTS used to keep its own
+//! `hts_lang`; that name is still read as a fallback so a choice saved before
+//! the change is not lost, but it is no longer written.
 
 use axum::{
     extract::{FromRequestParts, Request},
@@ -67,13 +70,25 @@ fluent_templates::static_loader! {
 static EN: LanguageIdentifier = langid!("en");
 static ES: LanguageIdentifier = langid!("es");
 static DE: LanguageIdentifier = langid!("de");
+static ZH_HANT: LanguageIdentifier = langid!("zh-Hant");
 
 /// Locales the HTS UI can render, in switcher order.
-static SUPPORTED: [&LanguageIdentifier; 3] = [&EN, &ES, &DE];
+static SUPPORTED: [&LanguageIdentifier; 4] = [&EN, &ES, &DE, &ZH_HANT];
 
-/// Cookie the language switcher sets via `?lang=`. Distinct from HFS's cookie
-/// so the two binaries can coexist on one domain without cross-influence.
-const LANG_COOKIE: &str = "hts_lang";
+/// Language ranges that name a supported locale under another tag — see
+/// `crates/ui/src/i18n.rs`, which carries the identical table.
+const ALIASES: [(&str, &LanguageIdentifier); 4] = [
+    ("zh-tw", &ZH_HANT),
+    ("zh-hk", &ZH_HANT),
+    ("zh-mo", &ZH_HANT),
+    ("zh", &ZH_HANT),
+];
+
+/// Cookie the language switcher sets via `?lang=` — the same one HFS uses.
+const LANG_COOKIE: &str = helios_ui_chrome::LANG_COOKIE;
+
+/// The cookie HTS wrote before the two consoles shared one; read-only now.
+const LEGACY_LANG_COOKIE: &str = "hts_lang";
 
 /// The locale negotiated for the current request.
 ///
@@ -103,7 +118,8 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestLocale {
 
 /// Middleware: negotiate the request locale once and expose it in request
 /// extensions. When the choice came from an explicit `?lang=` (the language
-/// switcher), persist it in the `hts_lang` cookie so it survives navigation.
+/// switcher), persist it in the shared `hfs_lang` cookie so it survives
+/// navigation — in this console and in HFS.
 pub async fn negotiate_locale(mut request: Request, next: Next) -> Response {
     let (locale, explicit) = negotiate(request.uri(), request.headers());
     request.extensions_mut().insert(RequestLocale(locale));
@@ -144,19 +160,22 @@ fn query_lang(uri: &Uri) -> Option<String> {
         .find_map(|pair| pair.strip_prefix("lang=").map(str::to_owned))
 }
 
-/// `hts_lang` cookie value, if any.
+/// The shared `hfs_lang` cookie value, else the legacy `hts_lang` one, if any.
 fn cookie_lang(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            pair.trim()
-                .strip_prefix(LANG_COOKIE)?
-                .strip_prefix('=')
-                .map(str::to_owned)
-        })
+    let value_of = |name: &str| {
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(';'))
+            .find_map(|pair| {
+                pair.trim()
+                    .strip_prefix(name)?
+                    .strip_prefix('=')
+                    .map(str::to_owned)
+            })
+    };
+    value_of(LANG_COOKIE).or_else(|| value_of(LEGACY_LANG_COOKIE))
 }
 
 /// Best supported locale for the `Accept-Language` header, if any: ranges in
@@ -184,7 +203,8 @@ fn accept_language(headers: &HeaderMap) -> Option<&'static LanguageIdentifier> {
 
 /// RFC 4647 §3.4 Lookup of one language range against the supported set:
 /// try the full tag, then progressively truncate subtags (`de-CH-1996` →
-/// `de-CH` → `de`).
+/// `de-CH` → `de`; `zh-Hant-TW` → `zh-Hant`), consulting [`ALIASES`] at
+/// each step so `zh-TW` lands on `zh-Hant`.
 fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
     let tag = tag.trim().to_ascii_lowercase();
     let mut range = tag.as_str();
@@ -195,10 +215,11 @@ fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
         {
             return Some(locale);
         }
-        match range.rfind('-') {
-            Some(idx) => range = &range[..idx],
-            None => return None,
+        if let Some((_, locale)) = ALIASES.iter().find(|(alias, _)| *alias == range) {
+            return Some(locale);
         }
+        let idx = range.rfind('-')?;
+        range = &range[..idx];
     }
 }
 
@@ -366,14 +387,46 @@ mod tests {
     }
 
     #[test]
-    fn hts_lang_cookie_beats_accept_language() {
+    fn shared_hfs_lang_cookie_beats_accept_language() {
         let map = headers(&[
-            (header::COOKIE, "session=abc; hts_lang=es"),
+            (header::COOKIE, "session=abc; hfs_lang=es"),
             (header::ACCEPT_LANGUAGE, "de"),
         ]);
         let (locale, explicit) = negotiate(&Uri::from_static("/ui/hts"), &map);
         assert_eq!(locale, &ES);
         assert!(!explicit);
+    }
+
+    #[test]
+    fn legacy_hts_lang_cookie_is_still_read_but_loses_to_the_shared_one() {
+        let map = headers(&[
+            (header::COOKIE, "session=abc; hts_lang=es"),
+            (header::ACCEPT_LANGUAGE, "de"),
+        ]);
+        let (locale, explicit) = negotiate(&Uri::from_static("/ui/hts"), &map);
+        assert_eq!(locale, &ES, "a choice saved before the cookie merge survives");
+        assert!(!explicit);
+
+        let map = headers(&[(header::COOKIE, "hts_lang=es; hfs_lang=zh-Hant")]);
+        let (locale, _) = negotiate(&Uri::from_static("/ui/hts"), &map);
+        assert_eq!(locale, &ZH_HANT, "the shared cookie wins over the legacy one");
+    }
+
+    #[test]
+    fn traditional_chinese_tags_all_negotiate_zh_hant() {
+        for header in ["zh-TW", "zh-Hant", "zh-Hant-TW", "zh", "zh-HK,en;q=0.5"] {
+            let map = headers(&[(header::ACCEPT_LANGUAGE, header)]);
+            let (locale, _) = negotiate(&Uri::from_static("/ui/hts"), &map);
+            assert_eq!(locale, &ZH_HANT, "{header} must negotiate zh-Hant");
+        }
+        let (locale, explicit) =
+            negotiate(&Uri::from_static("/ui/hts?lang=zh-TW"), &HeaderMap::new());
+        assert_eq!(locale, &ZH_HANT);
+        assert!(explicit);
+        let zh = I18n { locale: &ZH_HANT };
+        assert_eq!(zh.lang(), "zh-Hant");
+        assert_eq!(zh.t("hts-nav-home"), "首頁");
+        assert_eq!(zh.t("no-such-key"), "no-such-key");
     }
 
     #[test]
@@ -464,12 +517,13 @@ mod tests {
         // shipped locales via the Fluent loader so the assertion travels
         // with any future locale additions.
         let mojibake_pairs = ["Ã©", "Ã¡", "Ã±", "â€", "Ã¢", "Â "];
-        for locale in [&EN, &ES, &DE] {
+        for locale in [&EN, &ES, &DE, &ZH_HANT] {
             let i18n = I18n { locale };
             for key in [
                 "language-en",
                 "language-es",
                 "language-de",
+                "language-zh-hant",
                 "home-lede",
                 "hts-nav-home",
             ] {
