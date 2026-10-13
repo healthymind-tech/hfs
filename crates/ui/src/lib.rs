@@ -1494,6 +1494,7 @@ pub fn mount_with_body_limit(
         outbound_auth,
         fhir_version,
         terminology,
+        None,
         public_base_url,
         max_body_size,
         false,
