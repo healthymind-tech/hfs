@@ -103,6 +103,38 @@ async fn home_serves_full_page_at_ui_hts() {
     );
 }
 
+/// An unknown path under the mount used to get axum's bare `404` — no body,
+/// no content-type — which a browser renders as a blank tab. It now gets the
+/// shell-wrapped not-found page: still `404`, but HTML with a title, a
+/// language, the sidebar and a way home.
+#[tokio::test]
+async fn unknown_paths_render_the_not_found_page_inside_the_shell() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/this-does-not-exist")
+                .header("Accept-Language", "de")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let ctype = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "content-type was {ctype:?}");
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"<html lang="de">"#), "{html}");
+    assert!(html.contains(r#"class="sidebar""#), "the shell must be present");
+    assert!(html.contains(r#"href="/ui/hts""#), "a way home must be offered");
+    assert!(!html.contains("not-found-title"), "the catalog key must resolve");
+    assert!(html.contains("Nicht gefunden") || html.contains("nicht gefunden"), "{html}");
+}
+
 #[tokio::test]
 async fn home_trailing_slash_redirects_to_canonical() {
     // `/ui/hts/` (trailing slash) must 308-redirect to the canonical

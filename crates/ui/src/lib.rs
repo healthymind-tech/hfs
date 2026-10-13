@@ -1900,6 +1900,14 @@ pub fn mount_with_conformance_source_and_runtime(
         router = router.route("/ui/search", get(search));
     }
 
+    // Every other path under the mount is a page that does not exist: answer
+    // with the shell-wrapped not-found page. Without this the request fell
+    // through to the FHIR app, which treated `ui` as a resource type and
+    // answered a JSON OperationOutcome — no title, no language, no way back.
+    // Static segments win over the wildcard, so `/ui/assets/*` still reaches
+    // the embedded asset service.
+    router = router.route("/ui/{*rest}", get(ui_not_found));
+
     let state = WebState {
         version: hfs_version,
         sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
@@ -2906,6 +2914,18 @@ async fn resources(
         max_recent: rail_state::MAX_RECENT,
         builder_url,
     })
+}
+
+/// The not-found page for any `/ui/...` path no route answers.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let back_label = i18n.t("nav-home");
+    render_not_found(current_status(&state, rv.0, &rt), i18n, "", "/ui", back_label)
 }
 
 /// Terminology setup state (#611). The sidebar links here when the environment

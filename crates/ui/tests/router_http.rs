@@ -1119,6 +1119,75 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
     assert_eq!(body_text(response).await, "fhir handled");
 }
 
+/// An unknown `/ui/...` path used to fall through to the FHIR app, which read
+/// `ui` as a resource type and answered a JSON OperationOutcome: no title, no
+/// `lang`, no navigation, and axe flagged it twice as serious. It now renders
+/// the shell-wrapped not-found page with a `404`. The asset service and the
+/// FHIR fall-through for non-`/ui` paths are unaffected.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_not_found_page() {
+    let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
+    let app = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/this-page-does-not-exist")
+                .header("Accept-Language", "es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let ctype = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<html lang="es">"#), "{html}");
+    assert!(html.contains("No encontrado"), "{html}");
+    assert!(html.contains(r#"class="sidebar""#));
+    assert!(html.contains(r#"href="/ui""#));
+
+    // Nested unknown paths too.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/nope/deeper").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Assets and the FHIR surface keep their own routes.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/assets/app.css").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(body_text(response).await, "fhir handled");
+}
+
 /// #896: the bare root redirects a browser to the UI home.
 #[tokio::test]
 async fn root_redirects_to_ui() {
