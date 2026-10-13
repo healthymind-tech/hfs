@@ -12,7 +12,7 @@
 ></div>
 {% endif %}
 
-<table class="data-table">
+<table class="data-table data-table--stack">
   <thead>
     <tr>
       <th class="col-tenant">{{ i18n.t("tenants-col-tenant") }}</th>
@@ -40,20 +40,20 @@
         </span>
       </td>
       {% if row.provisioning %}
-      <td class="col-num">
+      <td class="col-num" data-label="{{ i18n.t("tenants-col-resources") }}">
         <span class="busy-status" role="status">
           <span class="spinner" aria-hidden="true"></span>
           {{ i18n.t("tenants-row-provisioning") }}
         </span>
       </td>
-      <td>—</td>
-      <td class="col-actions"></td>
+      <td data-label="{{ i18n.t("tenants-col-created") }}">—</td>
+      <td class="col-actions" data-label="{{ i18n.t("tenants-col-actions") }}"></td>
       {% else if let Some(msg) = row.failed %}
-      <td class="col-num">
+      <td class="col-num" data-label="{{ i18n.t("tenants-col-resources") }}">
         <span class="tag tag--danger" title="{{ msg }}">{{ i18n.t("tenants-row-failed") }}</span>
       </td>
-      <td>—</td>
-      <td class="col-actions">
+      <td data-label="{{ i18n.t("tenants-col-created") }}">—</td>
+      <td class="col-actions" data-label="{{ i18n.t("tenants-col-actions") }}">
         <button
           type="button"
           class="icon-button icon-button--danger"
@@ -66,9 +66,9 @@
         </button>
       </td>
       {% else %}
-      <td class="col-num">{{ row.resources_human(i18n) }}</td>
-      <td>{{ row.created_date() }}</td>
-      <td class="col-actions">
+      <td class="col-num" data-label="{{ i18n.t("tenants-col-resources") }}">{{ row.resources_human(i18n) }}</td>
+      <td data-label="{{ i18n.t("tenants-col-created") }}">{{ row.created_date() }}</td>
+      <td class="col-actions" data-label="{{ i18n.t("tenants-col-actions") }}">
         <button
           type="button"
           class="icon-button icon-button--danger"

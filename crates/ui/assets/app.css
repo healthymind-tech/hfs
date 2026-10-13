@@ -1638,6 +1638,13 @@ html.js .needs-js {
   margin-bottom: 16px;
 }
 
+@media (max-width: 900px) {
+  .toolbar {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+}
+
 /* Same scale as .card-head h3 — a toolbar is the in-card section header. */
 .toolbar__title {
   display: flex;
@@ -1667,7 +1674,8 @@ html.js .needs-js {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
+  flex: 1 1 160px;
+  min-width: 0;
   height: 42px;
   padding: 0 14px;
   background: var(--input-bg, var(--surface));
@@ -3361,14 +3369,137 @@ details.json-fold[open] > summary .icon {
 
 /* Data table */
 
+/* The one responsive pattern every data table shares. Wide screens are
+   unchanged. Below 900px a table keeps a sane minimum width and the wrapper
+   scrolls sideways instead of the browser squeezing every column down to a
+   few characters (the hts lists' URL column was 49px wide at 768px): the
+   wrapper is keyboard-focusable (`tabindex="0"` in the templates — axe's
+   scrollable-region-focusable) and paints scroll shadows on whichever edge
+   has more to show (Lea Verou's local/scroll background-attachment trick,
+   which works because cells are transparent). Below 640px a table marked
+   `.data-table--stack` turns each row into a labelled card instead, with
+   `td[data-label]` supplying the column name — the lists an operator
+   actually reads on a phone (hts CodeSystems/ValueSets/ConceptMaps, hfs
+   Tenants) carry it. */
 .table-wrap {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  background:
+    linear-gradient(to right, var(--surface) 40%, rgb(255 255 255 / 0%)) left / 32px 100% no-repeat,
+    linear-gradient(to left, var(--surface) 40%, rgb(255 255 255 / 0%)) right / 32px 100% no-repeat,
+    linear-gradient(to right, rgb(0 0 0 / 14%), rgb(0 0 0 / 0%)) left / 14px 100% no-repeat,
+    linear-gradient(to left, rgb(0 0 0 / 14%), rgb(0 0 0 / 0%)) right / 14px 100% no-repeat;
+  background-attachment: local, local, scroll, scroll;
+}
+
+.table-wrap:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: -2px;
 }
 
 .data-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+}
+
+/* Long canonical URLs wrap at any point inside their own cell, but the cell
+   never shrinks below a readable width nor grows past a sane one. */
+.data-table .url {
+  display: inline-block;
+  min-width: 14ch;
+  max-width: 40ch;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .table-wrap > .data-table:not(.data-table--stack) {
+    min-width: 600px;
+  }
+}
+
+@media (max-width: 640px) {
+  .data-table--stack,
+  .data-table--stack tbody,
+  .data-table--stack tr {
+    display: block;
+  }
+
+  /* The header row still names the columns for assistive tech; each cell
+     repeats its own label visually below. */
+  .data-table--stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .data-table--stack tbody tr {
+    padding: 10px 14px 12px;
+    border-bottom: 1px solid var(--surface-border);
+  }
+
+  .data-table--stack tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .data-table--stack td {
+    display: grid;
+    grid-template-columns: minmax(6em, 30%) minmax(0, 1fr);
+    gap: 2px 12px;
+    align-items: baseline;
+    padding: 3px 0;
+    border-bottom: 0;
+  }
+
+  .data-table--stack td[data-label]::before {
+    content: attr(data-label);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* The name cell is the card's title: full width, no label, allowed to
+     wrap (the desktop rule truncates it to one line). */
+  .data-table--stack td.col-name,
+  .data-table--stack td.col-tenant {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: none;
+    white-space: normal;
+    font-weight: 500;
+    padding-bottom: 6px;
+  }
+
+  .data-table--stack td.col-name::before,
+  .data-table--stack td.col-tenant::before {
+    content: none;
+  }
+
+  /* An empty actions cell (a tenant still provisioning) shows no label. */
+  .data-table--stack td.col-actions:empty {
+    display: none;
+  }
+
+  .data-table--stack .data-table__empty td {
+    display: block;
+  }
+
+  .data-table--stack .data-table__empty td::before {
+    content: none;
+  }
+
+  .data-table--stack tbody tr:not(.data-table__empty):hover td {
+    background: none;
+  }
+
+  .data-table--stack .url {
+    min-width: 0;
+    max-width: none;
+  }
 }
 
 .data-table th {

@@ -28,8 +28,8 @@
   {% endif %}
 
   <section class="card">
-    <div class="table-wrap">
-      <table class="data-table" aria-describedby="hts-vs-browser-heading">
+    <div class="table-wrap" tabindex="0">
+      <table class="data-table data-table--stack" aria-describedby="hts-vs-browser-heading">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-browser-table-caption") }}</caption>
         <thead>
           <tr>
@@ -60,10 +60,10 @@
                     {%- endif %}
                   </a>
                 </td>
-                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
-                <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
-                <td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-version") }}">{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-status") }}">
                   {% if row.status.is_empty() %}
                     &mdash;
                   {% else %}

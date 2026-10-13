@@ -36,8 +36,8 @@
   {% endif %}
 
   <section class="card">
-    <div class="table-wrap">
-      <table class="data-table" aria-describedby="hts-cm-browser-heading">
+    <div class="table-wrap" tabindex="0">
+      <table class="data-table data-table--stack" aria-describedby="hts-cm-browser-heading">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-cm-browser-table-caption") }}</caption>
         <thead>
           <tr>
@@ -68,9 +68,9 @@
                     {%- endif %}
                   </a>
                 </td>
-                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
-                <td>
+                <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-mapping") }}">
                   {#-
                     Stacked mapping cell: prefix labels (`S:` / `T:`) let
                     a screen reader announce "S colon <uri>", and the
@@ -90,7 +90,7 @@
                     </span>
                   </div>
                 </td>
-                <td>
+                <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-status") }}">
                   {% if row.status.is_empty() %}
                     &mdash;
                   {% else %}
