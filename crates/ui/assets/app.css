@@ -1707,6 +1707,11 @@ html.js .needs-js {
 
 .toolbar__search input {
   flex: 1;
+  /* An input's intrinsic width (~200px) must not hold its label open past
+     the card: with four filters in a row at 768px the last one ran 8px off
+     the page. */
+  min-width: 0;
+  width: 100%;
   border: 0;
   background: none;
   outline: none;
