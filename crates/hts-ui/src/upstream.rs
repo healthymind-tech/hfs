@@ -616,10 +616,10 @@ impl CsBrowserFilters {
             ("title", &self.title),
             ("status", &self.status),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         if self.effective_count() != Self::DEFAULT_COUNT {
@@ -1751,10 +1751,10 @@ impl VsBrowserFilters {
             ("title", &self.title),
             ("status", &self.status),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         if self.effective_count() != Self::DEFAULT_COUNT {
@@ -2776,10 +2776,10 @@ impl CmBrowserFilters {
             ("target", &self.target),
             ("status", &self.status),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         if self.effective_count() != Self::DEFAULT_COUNT {

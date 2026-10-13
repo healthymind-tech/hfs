@@ -241,10 +241,10 @@ impl BrowserRowsView {
             ("target", &self.filters.target),
             ("status", &self.filters.status),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         if self.filters.effective_count() != CmBrowserFilters::DEFAULT_COUNT {
