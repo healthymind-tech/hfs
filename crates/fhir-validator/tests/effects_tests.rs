@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, DeferredConstraint, EffectHandlers,
-    FhirSchema, SchemaRegistry, Severity, TerminologyError, TerminologyProvider, ValidationOptions,
-    Validator,
+    FhirSchema, SchemaRegistry, Severity, TerminologyError, TerminologyFailMode,
+    TerminologyProvider, ValidationOptions, Validator,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -124,6 +124,22 @@ impl TerminologyProvider for AllowList {
 /// Always-erroring terminology stub.
 struct Down;
 
+/// A server that does not know the value set.
+struct NoSuchValueSet;
+
+#[async_trait]
+impl TerminologyProvider for NoSuchValueSet {
+    async fn validate_code(
+        &self,
+        value_set: &str,
+        _coded: &CodedValue,
+    ) -> Result<bool, TerminologyError> {
+        Err(TerminologyError::unknown_value_set(format!(
+            "{value_set} not found"
+        )))
+    }
+}
+
 #[async_trait]
 impl TerminologyProvider for Down {
     async fn validate_code(
@@ -131,7 +147,7 @@ impl TerminologyProvider for Down {
         _value_set: &str,
         _coded: &CodedValue,
     ) -> Result<bool, TerminologyError> {
-        Err(TerminologyError("connection refused".to_string()))
+        Err(TerminologyError::new("connection refused"))
     }
 }
 
@@ -314,7 +330,7 @@ async fn terminology_outage_fail_open_and_closed() {
 
     let closed = EffectHandlers {
         terminology: Some(&down),
-        terminology_fail_closed: true,
+        terminology_fail: TerminologyFailMode::Closed,
         ..Default::default()
     };
     let errors = validator()
@@ -355,4 +371,80 @@ async fn no_handlers_means_structural_only() {
             "message": "bogus is unknown"
         }])
     );
+}
+
+/// `ClosedRequired` tells an outage (still a warning) from a value set the
+/// server does not know (an error: the required binding can never be met
+/// until the terminology is loaded).
+#[tokio::test]
+async fn closed_required_escalates_unknown_value_sets_only() {
+    let resource = json!({ "resourceType": "Patient", "gender": "male" });
+
+    let down = Down;
+    let outage = EffectHandlers {
+        terminology: Some(&down),
+        terminology_fail: TerminologyFailMode::ClosedRequired,
+        ..Default::default()
+    };
+    let errors = validator()
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &outage,
+        )
+        .await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].severity,
+        Severity::Warning,
+        "an outage stays a warning"
+    );
+
+    let missing = NoSuchValueSet;
+    let unknown = EffectHandlers {
+        terminology: Some(&missing),
+        terminology_fail: TerminologyFailMode::ClosedRequired,
+        ..Default::default()
+    };
+    let errors = validator()
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &unknown,
+        )
+        .await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].severity,
+        Severity::Error,
+        "an unknown value set on a required binding is an error"
+    );
+    assert!(
+        errors[0].message.contains("not found"),
+        "{}",
+        errors[0].message
+    );
+
+    // Plain `Closed` and `Open` are unchanged for the unknown-value-set case.
+    for (mode, severity) in [
+        (TerminologyFailMode::Closed, Severity::Error),
+        (TerminologyFailMode::Open, Severity::Warning),
+    ] {
+        let handlers = EffectHandlers {
+            terminology: Some(&missing),
+            terminology_fail: mode,
+            ..Default::default()
+        };
+        let errors = validator()
+            .validate(
+                &resource,
+                FhirVersion::R4,
+                &ValidationOptions::default(),
+                &handlers,
+            )
+            .await;
+        assert_eq!(errors[0].severity, severity, "{mode:?}");
+    }
 }

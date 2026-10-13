@@ -492,12 +492,17 @@ pub struct ValidationConfig {
     pub suppress_constraints: Vec<String>,
     /// Terminology binding checking: `embedded` (default — offline checks
     /// against the FHIR core value sets embedded in helios-fhir-validator),
-    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
+    /// `remote` (embedded core value sets first, then
+    /// `HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code` for everything
+    /// the pack cannot judge), `remote-only` (every binding goes to the
+    /// server), or `off`.
     pub terminology: String,
     /// Per-check terminology timeout, in milliseconds.
     pub terminology_timeout_ms: u64,
-    /// Terminology outages: `open` (warn and proceed) or `closed`
-    /// (treat as validation errors).
+    /// Terminology failures on required bindings: `open` (warn and proceed),
+    /// `closed` (every failure is an error, outages included), or
+    /// `closed-required` (a ValueSet the server does not know is an error,
+    /// an outage is a warning).
     pub terminology_fail: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
@@ -603,15 +608,21 @@ impl ValidationConfig {
                 self.unknown_profile
             ));
         }
-        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
+        if !matches!(
+            self.terminology.as_str(),
+            "off" | "embedded" | "remote" | "remote-only"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote|remote-only)",
                 self.terminology
             ));
         }
-        if !matches!(self.terminology_fail.as_str(), "open" | "closed") {
+        if !matches!(
+            self.terminology_fail.as_str(),
+            "open" | "closed" | "closed-required"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed)",
+                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed|closed-required)",
                 self.terminology_fail
             ));
         }
@@ -1887,10 +1898,15 @@ impl ServerConfig {
         }
 
         // Remote terminology checking needs a terminology server to call.
-        if self.validation.terminology == "remote" && self.terminology_server.is_none() {
-            errors.push(
-                "HFS_VALIDATION_TERMINOLOGY=remote requires HFS_TERMINOLOGY_SERVER".to_string(),
-            );
+        if matches!(
+            self.validation.terminology.as_str(),
+            "remote" | "remote-only"
+        ) && self.terminology_server.is_none()
+        {
+            errors.push(format!(
+                "HFS_VALIDATION_TERMINOLOGY={} requires HFS_TERMINOLOGY_SERVER",
+                self.validation.terminology
+            ));
         }
 
         if errors.is_empty() {

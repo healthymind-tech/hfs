@@ -114,8 +114,9 @@ impl CoreTerminology {
 
     /// `Some(true)` in-set, `Some(false)` definitely out, `None` can't judge
     /// offline (value set not embedded, or shape not coded). This is the sync
-    /// core both `validate_code` and the editor's binding check share.
-    fn member(&self, value_set: &str, coded: &CodedValue) -> Option<bool> {
+    /// core both `validate_code` and the editor's binding check share, and
+    /// what [`CompositeTerminologyProvider`] consults before going remote.
+    pub fn member(&self, value_set: &str, coded: &CodedValue) -> Option<bool> {
         match coded {
             CodedValue::Code(code) => self.contains(value_set, None, code),
             CodedValue::Coding(coding) => {
@@ -205,6 +206,40 @@ impl TerminologyProvider for CoreTerminology {
     }
 }
 
+/// Embedded core terminology first, a remote server second.
+///
+/// The embedded value sets answer every binding they enumerate — the FHIR
+/// core `required` bindings (`Patient.gender`, `Observation.status`, …) —
+/// offline, in-process, with no version-suffix pitfalls. Only bindings the
+/// pack cannot judge (IG value sets, SNOMED/LOINC-backed sets, filtered
+/// includes) go to the remote server. Base bindings are therefore always
+/// checked, even when the terminology server is down or lacks the core
+/// value sets, and the server sees a fraction of the traffic.
+pub struct CompositeTerminologyProvider {
+    embedded: Arc<CoreTerminology>,
+    remote: Arc<dyn TerminologyProvider>,
+}
+
+impl CompositeTerminologyProvider {
+    pub fn new(embedded: Arc<CoreTerminology>, remote: Arc<dyn TerminologyProvider>) -> Self {
+        Self { embedded, remote }
+    }
+}
+
+#[async_trait]
+impl TerminologyProvider for CompositeTerminologyProvider {
+    async fn validate_code(
+        &self,
+        value_set: &str,
+        coded: &CodedValue,
+    ) -> Result<bool, TerminologyError> {
+        match self.embedded.member(value_set, coded) {
+            Some(verdict) => Ok(verdict),
+            None => self.remote.validate_code(value_set, coded).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +279,58 @@ mod tests {
             .await
             .unwrap();
         assert!(res, "an unembedded value set must not be disproved offline");
+    }
+
+    /// Records what reaches it and answers `false`.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TerminologyProvider for Recording {
+        async fn validate_code(
+            &self,
+            value_set: &str,
+            _coded: &CodedValue,
+        ) -> Result<bool, TerminologyError> {
+            self.0.lock().unwrap().push(value_set.to_string());
+            Ok(false)
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn composite_answers_core_sets_locally_and_delegates_the_rest() {
+        let remote = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let provider = CompositeTerminologyProvider::new(
+            core_terminology(FhirVersion::R4),
+            Arc::clone(&remote) as Arc<dyn TerminologyProvider>,
+        );
+        // Core set, with the version suffix the HL7 StructureDefinitions carry.
+        let gender = "http://hl7.org/fhir/ValueSet/administrative-gender|4.0.1";
+        assert!(
+            provider
+                .validate_code(gender, &CodedValue::Code("male".into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .validate_code(gender, &CodedValue::Code("masculino".into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            remote.0.lock().unwrap().is_empty(),
+            "embedded sets never reach the remote server"
+        );
+
+        // An IG value set the pack does not know goes remote.
+        let ig = "https://twcore.mohw.gov.tw/ig/twcore/ValueSet/identifier-type-tw";
+        assert!(
+            !provider
+                .validate_code(ig, &CodedValue::Code("MR".into()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(remote.0.lock().unwrap().as_slice(), [ig.to_string()]);
     }
 }

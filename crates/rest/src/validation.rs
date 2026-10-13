@@ -21,9 +21,10 @@ use dashmap::DashMap;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
-    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, SchemaRegistry, SchemaResolver,
-    Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy, ValidationError,
-    ValidationOptions, Validator, dotted_to_fhirpath,
+    CodedValue, CompositeResolver, CompositeTerminologyProvider, EffectHandlers, ErrorKind,
+    SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyFailMode,
+    TerminologyProvider, UnknownProfilePolicy, ValidationError, ValidationOptions, Validator,
+    dotted_to_fhirpath,
 };
 use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -80,8 +81,8 @@ pub struct ValidationService {
     /// Constraint ids never evaluated (default: `dom-6`, the narrative
     /// warning that fires on almost every machine-generated resource).
     suppress_constraints: Vec<String>,
-    /// Escalate terminology-service failures to errors.
-    terminology_fail_closed: bool,
+    /// How terminology-service failures on required bindings are reported.
+    terminology_fail: TerminologyFailMode,
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
@@ -100,7 +101,7 @@ impl Default for ValidationService {
             constraint_evaluator: Some(FhirPathConstraintEvaluator::new()),
             terminology: None,
             suppress_constraints: vec!["dom-6".to_string()],
-            terminology_fail_closed: false,
+            terminology_fail: TerminologyFailMode::Open,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
@@ -137,7 +138,16 @@ impl ValidationService {
         };
         let terminology: Option<Arc<dyn TerminologyProvider>> =
             match (config.terminology.as_str(), terminology_server) {
-                ("remote", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
+                // Embedded core value sets answer the FHIR base bindings
+                // offline; everything they cannot judge goes to the server.
+                ("remote", Some(base)) => Some(Arc::new(CompositeTerminologyProvider::new(
+                    helios_fhir_validator::core_terminology(version),
+                    Arc::new(RemoteTerminologyProvider::new(
+                        base.to_string(),
+                        Duration::from_millis(config.terminology_timeout_ms),
+                    )),
+                ))),
+                ("remote-only", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
                     base.to_string(),
                     Duration::from_millis(config.terminology_timeout_ms),
                 ))),
@@ -150,12 +160,17 @@ impl ValidationService {
                 }
                 _ => None,
             };
+        let terminology_fail = match config.terminology_fail.as_str() {
+            "closed" => TerminologyFailMode::Closed,
+            "closed-required" => TerminologyFailMode::ClosedRequired,
+            _ => TerminologyFailMode::Open,
+        };
         Self {
             mode,
             constraint_evaluator: config.constraints.then(FhirPathConstraintEvaluator::new),
             terminology,
             suppress_constraints: config.suppress_constraints.clone(),
-            terminology_fail_closed: config.terminology_fail == "closed",
+            terminology_fail,
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
@@ -203,7 +218,7 @@ impl ValidationService {
                 .map(|e| e as &dyn helios_fhir_validator::ConstraintEvaluator),
             terminology: self.terminology.as_deref(),
             suppress_constraints: &self.suppress_constraints,
-            terminology_fail_closed: self.terminology_fail_closed,
+            terminology_fail: self.terminology_fail,
         };
         validator
             .validate(resource, version, &opts, &handlers)
@@ -561,10 +576,28 @@ pub struct RemoteTerminologyProvider {
     client: reqwest::Client,
     /// `(valueSet, coded-token)` → validity, cached for [`CACHE_TTL`].
     cache: DashMap<String, (bool, Instant)>,
+    /// ValueSets the server answered "not found" for, cached for
+    /// [`UNKNOWN_VALUE_SET_TTL`] so one missing IG value set costs one
+    /// round-trip per TTL instead of one per coded element.
+    unknown_value_sets: DashMap<String, Instant>,
 }
 
 /// How long `$validate-code` verdicts are cached.
 const CACHE_TTL: Duration = Duration::from_secs(300);
+/// How long a "ValueSet not found" answer is remembered.
+const UNKNOWN_VALUE_SET_TTL: Duration = Duration::from_secs(60);
+
+/// Splits a canonical `url|version` reference into its parts. HL7's own
+/// StructureDefinitions bind to versioned canonicals
+/// (`…/ValueSet/observation-status|4.0.1`); a server matching `url` literally
+/// would never find them.
+pub fn split_canonical(reference: &str) -> (&str, Option<&str>) {
+    match reference.split_once('|') {
+        Some((url, version)) if !version.is_empty() => (url, Some(version)),
+        Some((url, _)) => (url, None),
+        None => (reference, None),
+    }
+}
 
 impl RemoteTerminologyProvider {
     /// `base_url` is the terminology server root (e.g. `http://hts:8090`).
@@ -576,11 +609,19 @@ impl RemoteTerminologyProvider {
                 .build()
                 .expect("reqwest client builds"),
             cache: DashMap::new(),
+            unknown_value_sets: DashMap::new(),
         }
     }
 
+    /// The `$validate-code` Parameters for one check: `url` (version
+    /// stripped) plus `valueSetVersion` when the binding named one, and the
+    /// coded value in its own shape.
     fn payload(value_set: &str, coded: &CodedValue) -> Value {
-        let mut parameter = vec![json!({ "name": "url", "valueUri": value_set })];
+        let (url, version) = split_canonical(value_set);
+        let mut parameter = vec![json!({ "name": "url", "valueUri": url })];
+        if let Some(version) = version {
+            parameter.push(json!({ "name": "valueSetVersion", "valueString": version }));
+        }
         match coded {
             CodedValue::Code(code) => {
                 parameter.push(json!({ "name": "inferSystem", "valueBoolean": true }));
@@ -595,6 +636,30 @@ impl RemoteTerminologyProvider {
             }
         }
         json!({ "resourceType": "Parameters", "parameter": parameter })
+    }
+
+    /// Classifies a non-2xx answer: a `404`, or an OperationOutcome whose
+    /// issue says `not-found`, means the server does not know the value set;
+    /// anything else is treated as the service being unavailable.
+    fn classify_failure(url: &str, status: reqwest::StatusCode, body: &str) -> TerminologyError {
+        let message = format!("{url} returned {status}");
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return TerminologyError::unknown_value_set(message);
+        }
+        if status.is_client_error()
+            && let Ok(outcome) = serde_json::from_str::<Value>(body)
+            && outcome
+                .get("issue")
+                .and_then(Value::as_array)
+                .is_some_and(|issues| {
+                    issues
+                        .iter()
+                        .any(|i| i.get("code").and_then(Value::as_str) == Some("not-found"))
+                })
+        {
+            return TerminologyError::unknown_value_set(message);
+        }
+        TerminologyError::new(message)
     }
 }
 
@@ -612,6 +677,13 @@ impl TerminologyProvider for RemoteTerminologyProvider {
                 return Ok(verdict);
             }
         }
+        if let Some(at) = self.unknown_value_sets.get(value_set)
+            && at.elapsed() < UNKNOWN_VALUE_SET_TTL
+        {
+            return Err(TerminologyError::unknown_value_set(format!(
+                "value set '{value_set}' is not known to the terminology server (cached)"
+            )));
+        }
 
         let url = format!("{}/ValueSet/$validate-code", self.base_url);
         let response = self
@@ -620,17 +692,21 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             .json(&Self::payload(value_set, coded))
             .send()
             .await
-            .map_err(|e| TerminologyError(format!("request to {url} failed: {e}")))?;
-        if !response.status().is_success() {
-            return Err(TerminologyError(format!(
-                "{url} returned {}",
-                response.status()
-            )));
+            .map_err(|e| TerminologyError::new(format!("request to {url} failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let error = Self::classify_failure(&url, status, &body);
+            if error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet {
+                self.unknown_value_sets
+                    .insert(value_set.to_string(), Instant::now());
+            }
+            return Err(error);
         }
         let body: Value = response
             .json()
             .await
-            .map_err(|e| TerminologyError(format!("invalid $validate-code response: {e}")))?;
+            .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
         let verdict = body
             .get("parameter")
             .and_then(Value::as_array)
@@ -641,12 +717,128 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             })
             .and_then(|p| p.get("valueBoolean"))
             .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                TerminologyError("no boolean 'result' parameter in response".to_string())
-            })?;
+            .ok_or_else(|| TerminologyError::new("no boolean 'result' parameter in response"))?;
 
         self.cache.insert(key, (verdict, Instant::now()));
         Ok(verdict)
+    }
+}
+
+#[cfg(test)]
+mod remote_provider_tests {
+    use super::*;
+
+    fn names_and_values(payload: &Value) -> Vec<(String, Value)> {
+        payload["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let name = p["name"].as_str().unwrap().to_string();
+                let value = p
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| k.starts_with("value"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                (name, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_canonical_separates_url_and_version() {
+        assert_eq!(
+            split_canonical("http://hl7.org/fhir/ValueSet/observation-status|4.0.1"),
+            (
+                "http://hl7.org/fhir/ValueSet/observation-status",
+                Some("4.0.1")
+            )
+        );
+        assert_eq!(
+            split_canonical("http://hl7.org/fhir/ValueSet/observation-status"),
+            ("http://hl7.org/fhir/ValueSet/observation-status", None)
+        );
+        assert_eq!(split_canonical("http://x/vs|"), ("http://x/vs", None));
+    }
+
+    #[test]
+    fn payload_sends_version_as_value_set_version() {
+        let payload = RemoteTerminologyProvider::payload(
+            "http://hl7.org/fhir/ValueSet/observation-status|4.0.1",
+            &CodedValue::Code("final".into()),
+        );
+        assert_eq!(
+            names_and_values(&payload),
+            vec![
+                (
+                    "url".into(),
+                    json!("http://hl7.org/fhir/ValueSet/observation-status")
+                ),
+                ("valueSetVersion".into(), json!("4.0.1")),
+                ("inferSystem".into(), json!(true)),
+                ("code".into(), json!("final")),
+            ]
+        );
+
+        let payload = RemoteTerminologyProvider::payload(
+            "http://example.org/ValueSet/plain",
+            &CodedValue::Coding(json!({ "system": "http://s", "code": "c" })),
+        );
+        assert_eq!(
+            names_and_values(&payload),
+            vec![
+                ("url".into(), json!("http://example.org/ValueSet/plain")),
+                (
+                    "coding".into(),
+                    json!({ "system": "http://s", "code": "c" })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn failures_are_classified() {
+        use helios_fhir_validator::TerminologyErrorKind;
+        let url = "http://hts/ValueSet/$validate-code";
+        assert_eq!(
+            RemoteTerminologyProvider::classify_failure(url, reqwest::StatusCode::NOT_FOUND, "")
+                .kind(),
+            TerminologyErrorKind::UnknownValueSet
+        );
+        let outcome = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{ "severity": "error", "code": "not-found" }]
+        })
+        .to_string();
+        assert_eq!(
+            RemoteTerminologyProvider::classify_failure(
+                url,
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                &outcome
+            )
+            .kind(),
+            TerminologyErrorKind::UnknownValueSet
+        );
+        assert_eq!(
+            RemoteTerminologyProvider::classify_failure(
+                url,
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                &outcome
+            )
+            .kind(),
+            TerminologyErrorKind::Unavailable
+        );
+        assert_eq!(
+            RemoteTerminologyProvider::classify_failure(
+                url,
+                reqwest::StatusCode::BAD_REQUEST,
+                "not json"
+            )
+            .kind(),
+            TerminologyErrorKind::Unavailable
+        );
     }
 }
 
