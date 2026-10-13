@@ -129,10 +129,22 @@ async fn unknown_paths_render_the_not_found_page_inside_the_shell() {
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains(r#"<html lang="de">"#), "{html}");
-    assert!(html.contains(r#"class="sidebar""#), "the shell must be present");
-    assert!(html.contains(r#"href="/ui/hts""#), "a way home must be offered");
-    assert!(!html.contains("not-found-title"), "the catalog key must resolve");
-    assert!(html.contains("Nicht gefunden") || html.contains("nicht gefunden"), "{html}");
+    assert!(
+        html.contains(r#"class="sidebar""#),
+        "the shell must be present"
+    );
+    assert!(
+        html.contains(r#"href="/ui/hts""#),
+        "a way home must be offered"
+    );
+    assert!(
+        !html.contains("not-found-title"),
+        "the catalog key must resolve"
+    );
+    assert!(
+        html.contains("Nicht gefunden") || html.contains("nicht gefunden"),
+        "{html}"
+    );
 }
 
 #[tokio::test]

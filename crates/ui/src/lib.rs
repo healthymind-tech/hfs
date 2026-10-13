@@ -2991,7 +2991,13 @@ async fn ui_not_found(
 ) -> Response {
     let i18n = I18n::new(locale);
     let back_label = i18n.t("nav-home");
-    render_not_found(current_status(&state, rv.0, &rt), i18n, "", "/ui", back_label)
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        back_label,
+    )
 }
 
 /// Terminology setup state (#611). The sidebar links here when the environment
@@ -10907,7 +10913,11 @@ mod terminology_navigation_tests {
     #[test]
     fn an_explicit_public_url_wins() {
         assert_eq!(
-            link(Some("http://hts:8090"), Some("https://fhir.example.org/ui/hts")).as_deref(),
+            link(
+                Some("http://hts:8090"),
+                Some("https://fhir.example.org/ui/hts")
+            )
+            .as_deref(),
             Some("https://fhir.example.org/ui/hts")
         );
         // Explicit but unusable: invalid, not silently replaced.
@@ -10928,7 +10938,11 @@ mod terminology_navigation_tests {
             "http://172.16.0.9:8090",
             "http://[::1]:8090",
         ] {
-            assert_eq!(link(Some(internal), None).as_deref(), Some("/ui/hts"), "{internal}");
+            assert_eq!(
+                link(Some(internal), None).as_deref(),
+                Some("/ui/hts"),
+                "{internal}"
+            );
         }
     }
 

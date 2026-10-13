@@ -1169,7 +1169,11 @@ async fn unknown_ui_paths_render_the_not_found_page() {
     // Nested unknown paths too.
     let response = app
         .clone()
-        .oneshot(Request::get("/ui/sql/nope/deeper").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/ui/sql/nope/deeper")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1177,7 +1181,11 @@ async fn unknown_ui_paths_render_the_not_found_page() {
     // Assets and the FHIR surface keep their own routes.
     let response = app
         .clone()
-        .oneshot(Request::get("/ui/assets/app.css").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/ui/assets/app.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
