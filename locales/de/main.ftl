@@ -527,6 +527,7 @@ editor-saved = Gespeichert.
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
 editor-load-error = Diese Ressource konnte nicht geladen werden.
+editor-load-not-found = Auf diesem Server gibt es keine Ressource { $type } mit der ID { $id } — prüfen Sie die ID oder gehen Sie zur Liste zurück.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
@@ -599,6 +600,9 @@ rail-count-approximate = Näherungswert: aus den jüngsten Schreibvorgängen gez
 queries-saved-group = Gespeichert
 
 nav-collapse = Menü einklappen
+nav-menu-open = Navigationsmenü öffnen
+nav-menu-close = Navigationsmenü schließen
+nav-main = Hauptnavigation
 
 batch-heading = Batch / Transaction
 batch-lede = Lade ein FHIR-Bundle hoch, prüfe die auszuführenden Aktionen, führe es gegen diesen Server aus und lies das Ergebnis jedes Eintrags.
@@ -1454,6 +1458,13 @@ hts-vs-browser-filter-status = Status
 hts-vs-browser-filter-reset = Zurücksetzen
 hts-vs-browser-empty = Keine ValueSets für diese Filter.
 hts-vs-browser-load-more = Mehr laden
+hts-browser-of-total = von { $total }
+hts-browser-pager = Seiten
+hts-browser-page-prev = Vorherige Seite
+hts-browser-page-next = Nächste Seite
+hts-browser-goto-offset = Zu Offset springen
+hts-browser-goto = Los
+hts-vs-expand-count-hint = Höchstens 500 Konzepte pro Seite; für den Rest Offset oder „Mehr laden“ verwenden.
 hts-vs-browser-showing-count = Zeige { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets

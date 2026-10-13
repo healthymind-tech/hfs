@@ -222,6 +222,42 @@ impl BrowserRowsView {
         self.result.as_ref().ok()
     }
 
+    /// The page URL that reproduces this fragment's filters on a hard load:
+    /// what the rows handler hands htmx in `HX-Push-Url`, so filtering
+    /// updates the location and a reload, a bookmark or the back button
+    /// land on the same list instead of the unfiltered default. `None` for
+    /// a Load-more page (`_offset > 0`): appending rows refines the view in
+    /// place and must not rewrite the address to a middle page.
+    fn page_url(&self) -> Option<String> {
+        if self.filters.offset > 0 {
+            return None;
+        }
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.filters.url),
+            ("name", &self.filters.name),
+            ("title", &self.filters.title),
+            ("source", &self.filters.source),
+            ("target", &self.filters.target),
+            ("status", &self.filters.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.filters.effective_count() != CmBrowserFilters::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.filters.effective_count().to_string());
+        }
+        let query = ser.finish();
+        Some(if query.is_empty() {
+            "/ui/hts/concept-maps".to_owned()
+        } else {
+            format!("/ui/hts/concept-maps?{query}")
+        })
+    }
+
     /// See `code_systems::BrowserRowsView::status_url`. `source` /
     /// `target` are no longer offered as inputs (HTS drops them), but a
     /// hand-written URL that carries them still round-trips through the
@@ -287,13 +323,19 @@ async fn browser_rows(
     locale: RequestLocale,
 ) -> Response {
     let view = load_browser_view(&state, form).await;
+    let push_url = view.page_url();
     let chrome = Chrome {
         i18n: I18n::new(locale),
         active_page: "concept-maps",
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    render(BrowserRowsTemplate { chrome, view }.render())
+    let mut response = render(BrowserRowsTemplate { chrome, view }.render());
+    // Filtering through htmx keeps the address honest (see `page_url`).
+    if let Some(url) = push_url.and_then(|u| axum::http::HeaderValue::from_str(&u).ok()) {
+        response.headers_mut().insert("HX-Push-Url", url);
+    }
+    response
 }
 
 async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRowsView {
@@ -304,6 +346,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
             result: Ok(CmBrowserPage {
                 rows: Vec::new(),
                 filters: CmBrowserFilters::default(),
+                total: None,
             }),
             count_over_max: true,
         };

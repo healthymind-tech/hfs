@@ -28,8 +28,8 @@
   {% endif %}
 
   <section class="card">
-    <div class="table-wrap">
-      <table class="data-table" aria-describedby="hts-vs-browser-heading">
+    <div class="table-wrap" tabindex="0">
+      <table class="data-table data-table--stack" aria-describedby="hts-vs-browser-heading">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-browser-table-caption") }}</caption>
         <thead>
           <tr>
@@ -60,10 +60,10 @@
                     {%- endif %}
                   </a>
                 </td>
-                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
-                <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
-                <td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-version") }}">{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-status") }}">
                   {% if row.status.is_empty() %}
                     &mdash;
                   {% else %}
@@ -84,20 +84,48 @@
         Stable foot id + hx-select-oob: see hts-cs-rows.html. Same stale-
         button duplication bug otherwise.
       -#}
-      <div class="table-foot" id="hts-vs-rows-foot">
+      <div class="table-foot" id="hts-vs-rows-foot" aria-live="polite">
         <span>
           {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count()) }}
+          {% if let Some(total) = page.total %} · {{ chrome.i18n.t_arg("hts-browser-of-total", "total", *total) }}{% endif %}
         </span>
-        {% if let Some(next) = page.next_offset() %}
-          <button type="button" class="btn"
+        {#-
+          Paging: Load more appends in place (its button is disabled while
+          the request runs and `list-paging.js` moves focus to the first
+          appended row); Previous/Next are real page links, so they work
+          without JavaScript and give the back button a page; the offset
+          form jumps anywhere in a 21k-row list.
+        -#}
+        <nav class="table-foot__pager" aria-label="{{ chrome.i18n.t("hts-browser-pager") }}">
+          {% if let Some(prev) = page.prev_offset() %}
+          <a class="btn" href="{{ view.filters.page_url_at(prev) }}" rel="prev">{{ chrome.i18n.t("hts-browser-page-prev") }}</a>
+          {% endif %}
+          {% if let Some(next) = page.next_offset() %}
+          <button type="button" class="btn" data-load-more
                   hx-get="{{ view.filters.load_more_url(next) }}"
                   hx-target="#hts-vs-rows tbody"
                   hx-swap="beforeend"
                   hx-select="#hts-vs-rows tbody > tr"
-                  hx-select-oob="#hts-vs-rows-foot">
+                  hx-select-oob="#hts-vs-rows-foot"
+                  hx-disabled-elt="this">
             {{ chrome.i18n.t("hts-vs-browser-load-more") }}
           </button>
-        {% endif %}
+          <a class="btn" href="{{ view.filters.page_url_at(next) }}" rel="next">{{ chrome.i18n.t("hts-browser-page-next") }}</a>
+          {% endif %}
+          <form class="table-foot__goto" method="get" action="/ui/hts/value-sets">
+            <input type="hidden" name="url" value="{% if let Some(v) = view.filters.url %}{{ v }}{% endif %}">
+            <input type="hidden" name="version" value="{% if let Some(v) = view.filters.version %}{{ v }}{% endif %}">
+            <input type="hidden" name="name" value="{% if let Some(v) = view.filters.name %}{{ v }}{% endif %}">
+            <input type="hidden" name="title" value="{% if let Some(v) = view.filters.title %}{{ v }}{% endif %}">
+            <input type="hidden" name="status" value="{% if let Some(v) = view.filters.status %}{{ v }}{% endif %}">
+            <input type="hidden" name="_count" value="{{ view.filters.effective_count() }}">
+            <label>
+              <span>{{ chrome.i18n.t("hts-browser-goto-offset") }}</span>
+              <input type="number" name="_offset" min="0" step="{{ view.filters.effective_count() }}" value="{{ view.filters.offset }}" inputmode="numeric">
+            </label>
+            <button type="submit" class="btn">{{ chrome.i18n.t("hts-browser-goto") }}</button>
+          </form>
+        </nav>
       </div>
       {% endif %}
     {% endif %}

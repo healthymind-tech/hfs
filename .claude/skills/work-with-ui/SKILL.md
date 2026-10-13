@@ -239,6 +239,8 @@ The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
 |---|---|
 | `HFS_DATA_DIR` | Spec bundle behind the SearchParameter / CompartmentDefinition viewers |
 | `HFS_TERMINOLOGY_SERVER` | Backs `/ui/editor/expand` (binding lookups in the editor) |
+| `HFS_TERMINOLOGY_PUBLIC_URL` | The sidebar's Terminology link. Unset: `/ui/hts` on the UI's own origin when `HFS_TERMINOLOGY_SERVER` names an internal host (loopback, private range, single-label name), else that URL |
+| `HFS_BASE_URL` | Its *path* is stamped as `<meta name="hfs-fhir-base">` (and `hfs-user-settings`), the prefix every browser-issued FHIR call is built on — `/fhir` behind a reverse proxy that mounts the API under one |
 | `HFS_NL_SEARCH_ENABLED` | Registers `/ui/search` and the NL toggle |
 | `HFS_NL_SEARCH_API_KEY` | Whether NL search is configured vs. showing its setup state |
 | `HFS_NL_SEARCH_MODEL` | Shown in the setup state |

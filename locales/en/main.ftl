@@ -539,6 +539,7 @@ editor-saved = Saved.
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
 editor-load-error = Could not load that resource.
+editor-load-not-found = No { $type } with id { $id } exists on this server — check the id, or go back to the list.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
@@ -627,6 +628,9 @@ rail-count-approximate = Approximate: counted from recent writes and still being
 queries-saved-group = Saved
 
 nav-collapse = Collapse Menu
+nav-menu-open = Open navigation menu
+nav-menu-close = Close navigation menu
+nav-main = Main navigation
 
 batch-heading = Batch / Transaction
 batch-lede = Upload a FHIR Bundle, review the actions it will run, execute it against this server, and read the outcome of every entry.
@@ -1549,6 +1553,13 @@ hts-vs-browser-filter-status = Status
 hts-vs-browser-filter-reset = Reset
 hts-vs-browser-empty = No ValueSets match these filters.
 hts-vs-browser-load-more = Load more
+hts-browser-of-total = of { $total }
+hts-browser-pager = Pages
+hts-browser-page-prev = Previous page
+hts-browser-page-next = Next page
+hts-browser-goto-offset = Jump to offset
+hts-browser-goto = Go
+hts-vs-expand-count-hint = Up to 500 concepts per page; use Offset or Load more for the rest.
 hts-vs-browser-showing-count = Showing { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets

@@ -527,6 +527,7 @@ editor-saved = Guardado.
 unsaved-changes = Cambios sin guardar
 unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
 editor-load-error = No se pudo cargar ese recurso.
+editor-load-not-found = No existe ningún { $type } con id { $id } en este servidor — compruebe el id o vuelva a la lista.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
@@ -599,6 +600,9 @@ rail-count-approximate = Aproximado: contado a partir de las escrituras reciente
 queries-saved-group = Guardadas
 
 nav-collapse = Colapsar menú
+nav-menu-open = Abrir el menú de navegación
+nav-menu-close = Cerrar el menú de navegación
+nav-main = Navegación principal
 
 batch-heading = Batch / Transaction
 batch-lede = Sube un Bundle FHIR, revisa las acciones que va a ejecutar, ejecútalo contra este servidor y lee el resultado de cada entrada.
@@ -1451,6 +1455,13 @@ hts-vs-browser-filter-status = Estado
 hts-vs-browser-filter-reset = Restablecer
 hts-vs-browser-empty = Ningún ValueSet coincide con estos filtros.
 hts-vs-browser-load-more = Cargar más
+hts-browser-of-total = de { $total }
+hts-browser-pager = Páginas
+hts-browser-page-prev = Página anterior
+hts-browser-page-next = Página siguiente
+hts-browser-goto-offset = Ir al desplazamiento
+hts-browser-goto = Ir
+hts-vs-expand-count-hint = Hasta 500 conceptos por página; use Desplazamiento o «Cargar más» para el resto.
 hts-vs-browser-showing-count = Mostrando { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets

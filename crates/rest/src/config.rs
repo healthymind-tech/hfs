@@ -32,6 +32,7 @@
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
+//! | `HFS_TERMINOLOGY_PUBLIC_URL` | (none) | Browser-reachable URL for the web UI's Terminology link; defaults to `/ui/hts` when `HFS_TERMINOLOGY_SERVER` is an internal host |
 //! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
 //! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
 //! | `HFS_VALIDATION_UNKNOWN_PROFILE` | warn | Unresolvable profiles: warn, error, or ignore |
@@ -1537,6 +1538,17 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
     pub terminology_server: Option<String>,
 
+    /// Browser-reachable URL of the terminology server's console, for the
+    /// web UI's "Terminology" link. `HFS_TERMINOLOGY_SERVER` is where *this
+    /// process* calls the terminology server — behind a reverse proxy that is
+    /// an internal address (`http://hts:8090`) a browser cannot open. When
+    /// unset, the UI links to `/ui/hts` on its own origin whenever
+    /// `HFS_TERMINOLOGY_SERVER` names a loopback, private or single-label
+    /// host, and to `HFS_TERMINOLOGY_SERVER` itself otherwise.
+    /// Example: `https://fhir.example.org/ui/hts`
+    #[arg(long, env = "HFS_TERMINOLOGY_PUBLIC_URL")]
+    pub terminology_public_url: Option<String>,
+
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
@@ -1655,6 +1667,7 @@ impl Default for ServerConfig {
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
+            terminology_public_url: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
@@ -1930,6 +1943,7 @@ impl ServerConfig {
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
+            terminology_public_url: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),

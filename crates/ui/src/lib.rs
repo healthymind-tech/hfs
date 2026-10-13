@@ -194,6 +194,11 @@ struct WebState {
     /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
     /// configured â€” powers the editor's live `$expand` pickers (#365).
     terminology: Option<String>,
+    /// Browser-reachable terminology console URL (`HFS_TERMINOLOGY_PUBLIC_URL`),
+    /// when one is configured — the sidebar's Terminology link. Distinct from
+    /// `terminology`, which is where *this process* calls the server and is
+    /// often an internal address a browser cannot open.
+    terminology_public_url: Option<String>,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
@@ -417,6 +422,34 @@ pub(crate) struct Status {
     /// every browser-originated FHIR call is refused, so the shell says so
     /// once instead of each page failing with the API's 401 text.
     bearer_only_auth: bool,
+    /// The path under which the FHIR API is reachable from the browser — the
+    /// path component of `HFS_BASE_URL`, without a trailing slash, so `""`
+    /// when the server sits at the origin root and `"/fhir"` behind a
+    /// reverse proxy that mounts it under a prefix. The layout emits it as
+    /// `<meta name="hfs-fhir-base">` and every browser-issued FHIR call is
+    /// built on it; before that, page scripts assumed the root and broke
+    /// behind any prefix.
+    fhir_base: String,
+}
+
+/// The browser-facing FHIR API path prefix for `public_base_url`
+/// (`HFS_BASE_URL`): its path with any trailing slash removed, so a root
+/// deployment yields `""` and `https://example.org/fhir/` yields `"/fhir"`.
+/// Only the path is taken, never the origin: the browser reaches the API on
+/// whatever host it reached the UI on, which may be a different name than
+/// the configured public one (a port-forward, a loopback check), and an
+/// origin mismatch would turn every call into a blocked cross-origin request.
+pub(crate) fn fhir_base_path(public_base_url: &str) -> String {
+    let path = match reqwest::Url::parse(public_base_url) {
+        Ok(url) => url.path().to_string(),
+        Err(_) => String::new(),
+    };
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// What the account menu shows for a signed-in user, derived once per request
@@ -460,29 +493,69 @@ enum TerminologyNavigation {
 }
 
 impl TerminologyNavigation {
-    fn from_config(value: Option<&str>) -> Self {
-        let Some(raw) = value else {
+    /// The browser destination for the Terminology link.
+    ///
+    /// `server` is `HFS_TERMINOLOGY_SERVER`, where this process calls the
+    /// terminology server; `public` is `HFS_TERMINOLOGY_PUBLIC_URL`, an
+    /// explicit browser-reachable console URL. The public one wins when set
+    /// and valid. Without it, a server URL whose host is one a browser could
+    /// never reach — loopback, a private range, or a single-label name such
+    /// as the `hts` of a container network — is replaced by `/ui/hts` on the
+    /// UI's own origin, the path the reverse proxy in front of both consoles
+    /// conventionally serves it at; a public server URL is linked as before.
+    fn from_config(server: Option<&str>, public: Option<&str>) -> Self {
+        if let Some(public) = public {
+            return match Self::browser_safe(public) {
+                Some(url) => Self::Valid(url),
+                None => Self::Invalid,
+            };
+        }
+        let Some(raw) = server else {
             return Self::Unconfigured;
         };
-
-        if raw.is_empty() || raw.trim() != raw {
-            return Self::Invalid;
+        match Self::browser_safe(raw) {
+            Some(url) if Self::is_internal_host(&url) => Self::Valid("/ui/hts".to_string()),
+            Some(url) => Self::Valid(url),
+            None => Self::Invalid,
         }
+    }
 
-        let Ok(url) = reqwest::Url::parse(raw) else {
-            return Self::Invalid;
-        };
+    /// `raw` when it is a clean absolute HTTP(S) URL with no credentials,
+    /// query or fragment (#611).
+    fn browser_safe(raw: &str) -> Option<String> {
+        if raw.is_empty() || raw.trim() != raw {
+            return None;
+        }
+        let url = reqwest::Url::parse(raw).ok()?;
         let valid = matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none();
+        valid.then(|| raw.to_string())
+    }
 
-        if valid {
-            Self::Valid(raw.to_string())
-        } else {
-            Self::Invalid
+    /// Whether the URL's host is one only this process can reach: loopback,
+    /// an RFC 1918 / link-local address, or a bare single-label hostname (a
+    /// Docker service name, never a public DNS name).
+    fn is_internal_host(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if let Some(domain) = parsed.domain() {
+            let domain = domain.trim_end_matches('.');
+            return domain.eq_ignore_ascii_case("localhost") || !domain.contains('.');
+        }
+        let Some(host) = parsed.host_str() else {
+            return true;
+        };
+        match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+            Err(_) => true,
         }
     }
 }
@@ -582,6 +655,13 @@ impl Status {
     /// read (#344).
     pub(crate) fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+
+    /// The FHIR API path prefix for the `hfs-fhir-base` meta tag browser
+    /// calls read: `""` at the origin root, `"/fhir"` behind a prefix. See
+    /// [`fhir_base_path`].
+    pub(crate) fn fhir_base(&self) -> &str {
+        &self.fhir_base
     }
 
     /// The effective tenant's display label: its registry display name, or the
@@ -1414,6 +1494,7 @@ pub fn mount_with_body_limit(
         outbound_auth,
         fhir_version,
         terminology,
+        None,
         public_base_url,
         max_body_size,
         false,
@@ -1440,6 +1521,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1464,6 +1546,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        terminology_public_url,
         public_base_url,
         max_body_size,
         tenant_path_routing,
@@ -1578,6 +1661,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        None,
         public_base_url.clone(),
         max_body_size,
         tenant_path_routing,
@@ -1603,6 +1687,7 @@ pub fn mount_with_conformance_source_and_runtime(
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1865,6 +1950,14 @@ pub fn mount_with_conformance_source_and_runtime(
         router = router.route("/ui/search", get(search));
     }
 
+    // Every other path under the mount is a page that does not exist: answer
+    // with the shell-wrapped not-found page. Without this the request fell
+    // through to the FHIR app, which treated `ui` as a resource type and
+    // answered a JSON OperationOutcome — no title, no language, no way back.
+    // Static segments win over the wildcard, so `/ui/assets/*` still reaches
+    // the embedded asset service.
+    router = router.route("/ui/{*rest}", get(ui_not_found));
+
     let state = WebState {
         version: hfs_version,
         sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
@@ -1880,6 +1973,7 @@ pub fn mount_with_conformance_source_and_runtime(
         fhir_version,
         default_tenant,
         terminology,
+        terminology_public_url,
         public_base_url,
         self_base_url,
         outbound_auth,
@@ -2871,6 +2965,18 @@ async fn resources(
         max_recent: rail_state::MAX_RECENT,
         builder_url,
     })
+}
+
+/// The not-found page for any `/ui/...` path no route answers.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let back_label = i18n.t("nav-home");
+    render_not_found(current_status(&state, rv.0, &rt), i18n, "", "/ui", back_label)
 }
 
 /// Terminology setup state (#611). The sidebar links here when the environment
@@ -9147,9 +9253,13 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
-        terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
+        terminology: TerminologyNavigation::from_config(
+            state.terminology.as_deref(),
+            state.terminology_public_url.as_deref(),
+        ),
         user: UserSummary::from_session(tenant.signed_in.as_ref()),
         bearer_only_auth: bearer_only_auth(),
+        fhir_base: fhir_base_path(&state.public_base_url),
     }
 }
 
@@ -9303,6 +9413,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -9491,6 +9602,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("en"),
         }
@@ -9686,6 +9798,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -9803,6 +9916,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -10671,7 +10785,19 @@ mod user_summary_tests {
             terminology: TerminologyNavigation::Unconfigured,
             user,
             bearer_only_auth: false,
+            fhir_base: String::new(),
         }
+    }
+
+    #[test]
+    fn fhir_base_path_is_the_public_base_urls_path_without_a_trailing_slash() {
+        assert_eq!(fhir_base_path("http://localhost:8080"), "");
+        assert_eq!(fhir_base_path("http://localhost:8080/"), "");
+        assert_eq!(fhir_base_path("https://example.org/fhir"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/fhir/"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/a/b/"), "/a/b");
+        // Not a URL at all: fall back to the root rather than guess.
+        assert_eq!(fhir_base_path("not a url"), "");
     }
 
     #[test]
@@ -10747,5 +10873,61 @@ mod user_summary_tests {
             .unwrap();
         assert!(!html.contains("user-menu__out"), "{html}");
         assert!(!html.contains("/ui/logout"), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod terminology_navigation_tests {
+    use super::TerminologyNavigation;
+
+    fn link(server: Option<&str>, public: Option<&str>) -> Option<String> {
+        match TerminologyNavigation::from_config(server, public) {
+            TerminologyNavigation::Valid(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_public_url_wins() {
+        assert_eq!(
+            link(Some("http://hts:8090"), Some("https://fhir.example.org/ui/hts")).as_deref(),
+            Some("https://fhir.example.org/ui/hts")
+        );
+        // Explicit but unusable: invalid, not silently replaced.
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("http://hts:8090"), Some("not a url")),
+            TerminologyNavigation::Invalid
+        ));
+    }
+
+    #[test]
+    fn internal_server_hosts_never_reach_the_browser() {
+        for internal in [
+            "http://hts:8090",
+            "http://localhost:8090",
+            "http://127.0.0.1:8090",
+            "http://10.0.0.5:8090",
+            "http://192.168.1.20",
+            "http://172.16.0.9:8090",
+            "http://[::1]:8090",
+        ] {
+            assert_eq!(link(Some(internal), None).as_deref(), Some("/ui/hts"), "{internal}");
+        }
+    }
+
+    #[test]
+    fn a_public_server_url_is_linked_as_is() {
+        assert_eq!(
+            link(Some("https://tx.fhir.org/r4"), None).as_deref(),
+            Some("https://tx.fhir.org/r4")
+        );
+        assert!(matches!(
+            TerminologyNavigation::from_config(None, None),
+            TerminologyNavigation::Unconfigured
+        ));
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("ftp://hts"), None),
+            TerminologyNavigation::Invalid
+        ));
     }
 }

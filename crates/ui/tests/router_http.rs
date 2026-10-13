@@ -768,6 +768,62 @@ fn assert_recent_types_are_pinned_above_the_list(html: &str) {
     );
 }
 
+/// Mounts the UI with the given `HFS_BASE_URL`: what the browser-facing API
+/// prefix meta is derived from.
+fn app_with_public_base(public_base_url: &str) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        public_base_url.to_string(),
+        None,
+    )
+}
+
+/// Behind a reverse proxy that mounts the FHIR API under a prefix
+/// (`HFS_BASE_URL=https://host/fhir`), the page scripts used to call
+/// `/Patient` at the origin root and get the proxy's 404 for every search,
+/// read, save and history load. The layout now stamps the prefix — path only,
+/// never the configured host, so the browser stays same-origin — and the
+/// per-user settings endpoint under it; a root deployment stamps an empty
+/// prefix and behaves exactly as before.
+#[tokio::test]
+async fn layout_stamps_the_fhir_api_prefix_from_the_public_base_url() {
+    let response = app_with_public_base("https://fhir.example.org/fhir/")
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"<meta name="hfs-fhir-base" content="/fhir">"#),
+        "prefix meta missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<meta name="hfs-user-settings" content="/fhir/_user/settings">"#),
+        "settings meta missing: {html}"
+    );
+    assert!(
+        !html.contains("fhir.example.org"),
+        "the configured host must never reach the browser"
+    );
+
+    let response = app_with_public_base("http://localhost:8080")
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<meta name="hfs-fhir-base" content="">"#));
+    assert!(html.contains(r#"<meta name="hfs-user-settings" content="/_user/settings">"#));
+}
+
 #[tokio::test]
 async fn index_serves_the_full_landing_page() {
     let response = app()
@@ -869,9 +925,16 @@ async fn page_wires_the_hover_rail_nav() {
         .unwrap();
     let html = body_text(response).await;
 
-    // The rail expands on hover (#438): no toggle button, no state script.
-    assert!(!html.contains("nav.js"));
+    // The rail expands on hover (#438): no pinned/collapsed state and no
+    // toggle for it. The one script the chrome carries is the responsive
+    // drawer below the tablet breakpoint, where there is no hover at all.
     assert!(!html.contains("data-toggle-nav"));
+    assert!(html.contains("/ui/assets/nav.js"));
+    assert!(html.contains(
+        r#"class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false""#
+    ));
+    assert!(html.contains(r#"class="sidebar__close" data-nav-close"#));
+    assert!(html.contains(r#"class="sidebar-scrim" data-nav-scrim"#));
     // Labels are wrapped so the resting rail can hide them (a11y-safe).
     assert!(html.contains("nav-item__label"));
     // The Batch & Data entries from the design: Import and Export.
@@ -1053,6 +1116,75 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "fhir handled");
+}
+
+/// An unknown `/ui/...` path used to fall through to the FHIR app, which read
+/// `ui` as a resource type and answered a JSON OperationOutcome: no title, no
+/// `lang`, no navigation, and axe flagged it twice as serious. It now renders
+/// the shell-wrapped not-found page with a `404`. The asset service and the
+/// FHIR fall-through for non-`/ui` paths are unaffected.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_not_found_page() {
+    let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
+    let app = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/this-page-does-not-exist")
+                .header("Accept-Language", "es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let ctype = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<html lang="es">"#), "{html}");
+    assert!(html.contains("No encontrado"), "{html}");
+    assert!(html.contains(r#"class="sidebar""#));
+    assert!(html.contains(r#"href="/ui""#));
+
+    // Nested unknown paths too.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/nope/deeper").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Assets and the FHIR surface keep their own routes.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/assets/app.css").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     assert_eq!(body_text(response).await, "fhir handled");
 }
 

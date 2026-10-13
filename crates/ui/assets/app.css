@@ -545,7 +545,12 @@ a.nav-item:hover {
  * visually hidden but kept in the accessibility tree so screen readers still
  * announce them; a `title` on each item gives a hover tooltip, and hovering
  * or focusing the rail expands it in place.
+ *
+ * Wide screens only: below the drawer breakpoint (see "Navigation drawer"
+ * further down) there is no pointer to hover with, so the rail gives way to
+ * an off-canvas drawer that always shows its labels.
  */
+@media (min-width: 1025px) {
 .sidebar:not(:hover):not(:focus-within) {
   width: 76px;
   padding: 20px 14px;
@@ -596,6 +601,7 @@ a.nav-item:hover {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
 }
 
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
@@ -789,7 +795,7 @@ button.menu__option {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 3px;
+  padding: 0;
   background: var(--surface);
   border: 1px solid var(--surface-border);
   border-radius: 16px;
@@ -799,10 +805,11 @@ button.menu__option {
 .theme-toggle button {
   display: grid;
   place-items: center;
-  /* WCAG 2.2 AA, SC 2.5.8 (Target Size Minimum): each toggle is a >=24x24
-     target. The icon inside stays small; only the hit area grows. */
-  width: 24px;
-  height: 24px;
+  /* 44x44 targets (WCAG 2.5.5 / the 44px touch guidance both platforms
+     publish; 2.5.8's 24px floor was too small to hit on a phone). The icon
+     inside stays small; only the hit area grows. */
+  width: 44px;
+  height: 44px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 50%;
@@ -834,9 +841,19 @@ button.menu__option {
 }
 
 /* The user menu (#725): the avatar doubles as the disclosure summary; the
-   panel hangs off the topbar's right edge at a width for a name + email. */
+   panel hangs off the topbar's right edge at a width for a name + email —
+   never wider than the screen it is on (at 375px it used to overflow the
+   page by up to 196px in German). */
 .menu--user .menu__panel {
+  left: auto;
+  right: 0;
   width: 264px;
+  max-width: calc(100vw - 28px);
+}
+
+.user-menu__name,
+.user-menu__hint {
+  overflow-wrap: anywhere;
 }
 
 .topbar__avatar-img {
@@ -898,7 +915,11 @@ button.menu__option {
 
 .user-menu__seg a {
   flex: 1;
-  padding: 6px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 500;
@@ -924,6 +945,7 @@ button.menu__option {
   display: flex;
   align-items: center;
   justify-content: center;
+  min-height: 44px;
   gap: 8px;
   width: calc(100% - 4px);
   margin: 4px 2px 2px;
@@ -946,6 +968,172 @@ button.menu__option {
 .content {
   flex: 1;
   padding: 24px 32px 32px;
+}
+
+/* ---------- Navigation drawer (phones and tablets) ----------
+   Below 1024px the fixed 76px rail took a fifth of a phone's width and could
+   only ever show icons: it expands on hover, which a touch screen does not
+   have, so a tap on an icon navigated blind. Here the sidebar becomes an
+   off-canvas drawer with its full labels, opened from a hamburger in the
+   topbar (`nav.js` owns the open state, Escape, the scrim and the focus
+   trap) and the content takes the whole width. Without JavaScript the full
+   sidebar stacks above the content instead, so nothing is unreachable. */
+
+.nav-toggle,
+.sidebar__close,
+.sidebar-scrim {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  body {
+    grid-template-columns: 1fr;
+  }
+
+  .pane {
+    grid-column: 1;
+  }
+
+  .sidebar {
+    width: min(295px, 86vw);
+    transform: translateX(-100%);
+    visibility: hidden;
+    /* Visibility flips at the end of the slide-out and at the very start
+       of the slide-in (no delay below): a visibility transition would map
+       its first frame to `hidden`, and the focus nav.js moves into the
+       drawer on open would land on nothing. */
+    transition: transform 0.2s ease, visibility 0s linear 0.2s;
+  }
+
+  body.nav-open .sidebar {
+    transform: none;
+    visibility: visible;
+    transition-delay: 0s;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+  }
+
+  /* Keep the page under the drawer from scrolling behind it. */
+  body.nav-open {
+    overflow: hidden;
+  }
+
+  .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 39;
+    background: rgb(0 0 0 / 40%);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  body.nav-open .sidebar-scrim {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* The hamburger: a 44px touch target at the topbar's left edge. */
+  .nav-toggle {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    margin-left: -8px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: none;
+    color: var(--text-strong);
+    cursor: pointer;
+  }
+
+  .nav-toggle:hover {
+    background: var(--surface);
+    border-color: var(--surface-border);
+  }
+
+  .nav-toggle:focus-visible {
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+
+  .nav-toggle svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  /* The drawer's own close control, top-right, same 44px target. */
+  .sidebar__close {
+    display: grid;
+    place-items: center;
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .sidebar__close:hover {
+    color: var(--text-strong);
+    background: var(--surface);
+    border-color: var(--surface-border);
+  }
+
+  .sidebar__close:focus-visible {
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+
+  .sidebar__close svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* Room for the close control beside the brand row. */
+  .sidebar .brand {
+    padding-right: 48px;
+  }
+
+  .topbar {
+    justify-content: space-between;
+    padding: 0 16px;
+  }
+
+  .content {
+    padding: 20px 16px 32px;
+  }
+
+  /* No JavaScript, no drawer: the whole sidebar sits above the content as
+     an ordinary block so every link is still a tap away. */
+  html:not(.js) .nav-toggle,
+  html:not(.js) .sidebar__close,
+  html:not(.js) .sidebar-scrim {
+    display: none;
+  }
+
+  html:not(.js) .sidebar {
+    position: static;
+    width: auto;
+    transform: none;
+    visibility: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--divider);
+    box-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar-scrim {
+    transition: none;
+  }
 }
 
 /* App-shell rules live at the end of the file in @layer pages: they override
@@ -1471,6 +1659,13 @@ html.js .needs-js {
   margin-bottom: 16px;
 }
 
+@media (max-width: 900px) {
+  .toolbar {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+}
+
 /* Same scale as .card-head h3 — a toolbar is the in-card section header. */
 .toolbar__title {
   display: flex;
@@ -1500,7 +1695,8 @@ html.js .needs-js {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
+  flex: 1 1 160px;
+  min-width: 0;
   height: 42px;
   padding: 0 14px;
   background: var(--input-bg, var(--surface));
@@ -1511,6 +1707,11 @@ html.js .needs-js {
 
 .toolbar__search input {
   flex: 1;
+  /* An input's intrinsic width (~200px) must not hold its label open past
+     the card: with four filters in a row at 768px the last one ran 8px off
+     the page. */
+  min-width: 0;
+  width: 100%;
   border: 0;
   background: none;
   outline: none;
@@ -1720,6 +1921,36 @@ select.field__input {
 .btn[aria-busy="true"]::after {
   content: "";
   flex: none;
+}
+
+/* The same ring for htmx-driven forms: while a request is in flight htmx
+   marks the form `.htmx-request`, and `hx-disabled-elt` has already
+   disabled the submit button, so the button shows it is working instead of
+   looking merely greyed out (the hts workbenches' Run, the lists' Load
+   more). */
+form.htmx-request .btn[type="submit"],
+.btn.htmx-request {
+  cursor: progress;
+}
+
+form.htmx-request .btn[type="submit"]::after,
+.btn.htmx-request::after {
+  content: "";
+  flex: none;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--outline);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  form.htmx-request .btn[type="submit"]::after,
+  .btn.htmx-request::after {
+    animation: none;
+  }
 }
 
 /* A button busy.js can mark busy carries .btn--busy-slot, so the ring's
@@ -1971,7 +2202,19 @@ select.field__input {
 
 @media (max-width: 900px) {
   .stat-grid {
-    grid-template-columns: repeat(2, 1fr);
+    /* minmax(0, …): a `1fr` track never shrinks below its content, so two
+       tiles with long figures ran 14px past a 375px screen. */
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stat-grid > * {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .stat-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 }
@@ -2701,6 +2944,14 @@ select.field__input {
     right: 0;
     left: auto;
   }
+
+  /* The account menu hangs from the topbar's right edge at every width: a
+     left-anchored 264px panel under an avatar at x≈330 ran off a 375px
+     screen (up to 196px in German). */
+  .topbar .menu__panel--right {
+    right: 0;
+    left: auto;
+  }
 }
 
 }
@@ -3194,14 +3445,137 @@ details.json-fold[open] > summary .icon {
 
 /* Data table */
 
+/* The one responsive pattern every data table shares. Wide screens are
+   unchanged. Below 900px a table keeps a sane minimum width and the wrapper
+   scrolls sideways instead of the browser squeezing every column down to a
+   few characters (the hts lists' URL column was 49px wide at 768px): the
+   wrapper is keyboard-focusable (`tabindex="0"` in the templates — axe's
+   scrollable-region-focusable) and paints scroll shadows on whichever edge
+   has more to show (Lea Verou's local/scroll background-attachment trick,
+   which works because cells are transparent). Below 640px a table marked
+   `.data-table--stack` turns each row into a labelled card instead, with
+   `td[data-label]` supplying the column name — the lists an operator
+   actually reads on a phone (hts CodeSystems/ValueSets/ConceptMaps, hfs
+   Tenants) carry it. */
 .table-wrap {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  background:
+    linear-gradient(to right, var(--surface) 40%, rgb(255 255 255 / 0%)) left / 32px 100% no-repeat,
+    linear-gradient(to left, var(--surface) 40%, rgb(255 255 255 / 0%)) right / 32px 100% no-repeat,
+    linear-gradient(to right, rgb(0 0 0 / 14%), rgb(0 0 0 / 0%)) left / 14px 100% no-repeat,
+    linear-gradient(to left, rgb(0 0 0 / 14%), rgb(0 0 0 / 0%)) right / 14px 100% no-repeat;
+  background-attachment: local, local, scroll, scroll;
+}
+
+.table-wrap:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: -2px;
 }
 
 .data-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+}
+
+/* Long canonical URLs wrap at any point inside their own cell, but the cell
+   never shrinks below a readable width nor grows past a sane one. */
+.data-table .url {
+  display: inline-block;
+  min-width: 14ch;
+  max-width: 40ch;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .table-wrap > .data-table:not(.data-table--stack) {
+    min-width: 600px;
+  }
+}
+
+@media (max-width: 640px) {
+  .data-table--stack,
+  .data-table--stack tbody,
+  .data-table--stack tr {
+    display: block;
+  }
+
+  /* The header row still names the columns for assistive tech; each cell
+     repeats its own label visually below. */
+  .data-table--stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .data-table--stack tbody tr {
+    padding: 10px 14px 12px;
+    border-bottom: 1px solid var(--surface-border);
+  }
+
+  .data-table--stack tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .data-table--stack td {
+    display: grid;
+    grid-template-columns: minmax(6em, 30%) minmax(0, 1fr);
+    gap: 2px 12px;
+    align-items: baseline;
+    padding: 3px 0;
+    border-bottom: 0;
+  }
+
+  .data-table--stack td[data-label]::before {
+    content: attr(data-label);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* The name cell is the card's title: full width, no label, allowed to
+     wrap (the desktop rule truncates it to one line). */
+  .data-table--stack td.col-name,
+  .data-table--stack td.col-tenant {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: none;
+    white-space: normal;
+    font-weight: 500;
+    padding-bottom: 6px;
+  }
+
+  .data-table--stack td.col-name::before,
+  .data-table--stack td.col-tenant::before {
+    content: none;
+  }
+
+  /* An empty actions cell (a tenant still provisioning) shows no label. */
+  .data-table--stack td.col-actions:empty {
+    display: none;
+  }
+
+  .data-table--stack .data-table__empty td {
+    display: block;
+  }
+
+  .data-table--stack .data-table__empty td::before {
+    content: none;
+  }
+
+  .data-table--stack tbody tr:not(.data-table__empty):hover td {
+    background: none;
+  }
+
+  .data-table--stack .url {
+    min-width: 0;
+    max-width: none;
+  }
 }
 
 .data-table th {
@@ -3391,6 +3765,41 @@ tr:hover .result-id__copy,
   padding: 10px 14px;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* Paging controls in the foot: Previous/Next page links and the Load-more
+   button side by side, then a compact jump-to-offset form. Everything wraps
+   on a narrow screen. */
+.table-foot__pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.table-foot__goto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.table-foot__goto label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.table-foot__goto input {
+  width: 8ch;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--input-bg, var(--surface));
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .pagination {
@@ -5049,6 +5458,28 @@ tr:hover .result-id__copy,
   display: flex;
 }
 
+/* Phones and small tablets: one column. Side by side, each card was about
+   100px wide at 375px — the JSON wrapped one character to a line and the
+   View Definitions page overflowed by 151px. Stacked, the editor keeps its
+   own height cap per pane instead of the shared 70vh row. */
+@media (max-width: 900px) {
+  .editor__layout,
+  .editor__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .editor__grid--stretch {
+    flex-direction: column;
+    max-height: none;
+  }
+
+  .editor__grid--stretch > .card,
+  .editor__grid--stretch > .needs-js {
+    flex: 0 0 auto;
+    max-height: 70vh;
+  }
+}
+
 .editor__grid--stretch > .card,
 .editor__grid--stretch > .needs-js {
   flex: 1 1 0;
@@ -5839,6 +6270,20 @@ details.card > summary.card-head::-webkit-details-marker {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 0;
+}
+
+/* On a phone the action buttons drop under the title instead of pushing
+   the row past the viewport (View Definitions overflowed by 59px with its
+   three buttons beside the heading). */
+@media (max-width: 640px) {
+  .page-head--row {
+    flex-wrap: wrap;
+  }
+
+  .page-head--row .page-head__actions {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
 }
 
 .filter-rail__item--on {

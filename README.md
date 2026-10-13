@@ -291,6 +291,7 @@ compressed when the client sends `Accept-Encoding`.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_TERMINOLOGY_SERVER` | *(none)* | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions (`memberOf`, `subsumes`) |
+| `HFS_TERMINOLOGY_PUBLIC_URL` | *(none)* | Browser-reachable URL for the web UI's Terminology link (the server-side URL above is often an internal address); defaults to `/ui/hts` on the UI's own origin when `HFS_TERMINOLOGY_SERVER` names an internal host |
 
 **Elasticsearch**
 

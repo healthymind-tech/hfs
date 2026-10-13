@@ -47,7 +47,8 @@
       action="/ui/hts/value-sets/{{ id }}/expand"
       hx-post="/ui/hts/value-sets/{{ id }}/expand"
       hx-target="#hts-workbench-result"
-      hx-swap="outerHTML"
+      hx-swap="outerHTML show:#hts-workbench-result:top"
+      hx-disabled-elt="find button[type=submit]"
       aria-labelledby="hts-workbench-input-heading">
   <div class="card-head">
     <h3 id="hts-workbench-input-heading">{{ chrome.i18n.t("hts-vs-expand-heading") }}</h3>
@@ -74,7 +75,8 @@
     <div class="builder-grid">
       <div class="field">
         <label class="field__label" for="expand-count">{{ chrome.i18n.t("hts-vs-expand-count") }}</label>
-        <input class="field__input" id="expand-count" name="count" type="number" min="0" value="50" autocomplete="off">
+        <input class="field__input" id="expand-count" name="count" type="number" min="0" max="500" value="50" autocomplete="off" aria-describedby="expand-count-hint">
+        <p class="field__hint" id="expand-count-hint">{{ chrome.i18n.t("hts-vs-expand-count-hint") }}</p>
       </div>
       <div class="field">
         <label class="field__label" for="expand-offset">{{ chrome.i18n.t("hts-vs-expand-offset") }}</label>

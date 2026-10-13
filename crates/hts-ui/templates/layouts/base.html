@@ -11,9 +11,16 @@
   <script src="/ui/hts/assets/theme.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/hts/assets/htmx.min.js" defer></script>
+  <!-- The responsive navigation drawer (phones and tablets), shared with HFS. -->
+  <script src="/ui/hts/assets/nav.js" defer></script>
+  <!-- Load more: moves focus to the first appended row (list-paging.js). -->
+  <script src="/ui/hts/assets/list-paging.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
+    <button type="button" class="sidebar__close" data-nav-close aria-label="{{ chrome.i18n.t("nav-menu-close") }}">
+      {% include "icons/x.svg" %}
+    </button>
     <div class="brand">
       <img class="brand__logo" src="/ui/hts/assets/logo.png" alt="">
       <div class="brand__text">
@@ -24,7 +31,7 @@
 
     <hr class="divider">
 
-    <nav class="nav">
+    <nav class="nav" aria-label="{{ chrome.i18n.t("nav-main") }}">
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-work") }}</div>
       <a class="nav-item" href="/ui/hts"{% if chrome.active_page == "home" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>
@@ -93,8 +100,15 @@
     </div>
   </aside>
 
+  <div class="sidebar-scrim" data-nav-scrim></div>
+
   <div class="pane">
     <header class="topbar">
+      <!-- Below the drawer breakpoint the sidebar is off-canvas; this opens it
+           (nav.js). Hidden on wide screens, where the rail is always there. -->
+      <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ chrome.i18n.t("nav-menu-open") }}">
+        {% include "icons/menu.svg" %}
+      </button>
       <div class="topbar__tools">
         {#-
           Two controls, in HFS's order — see `crates/ui/templates/layouts/base.html`:

@@ -601,6 +601,40 @@ impl CsBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/code-systems/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/code-systems".to_owned()
+        } else {
+            format!("/ui/hts/code-systems?{query}")
+        }
+    }
 }
 
 /// One row of the CS browser table (§7.2 wireframe).
@@ -644,6 +678,10 @@ impl CsBrowserRow {
 pub struct CsBrowserPage {
     pub rows: Vec<CsBrowserRow>,
     pub filters: CsBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
 }
 
 impl CsBrowserPage {
@@ -666,6 +704,16 @@ impl CsBrowserPage {
     /// latest page size alone (which would regress to "Showing 9").
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+        }
     }
 }
 
@@ -990,6 +1038,7 @@ impl UpstreamClient {
         Ok(CsBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
         })
     }
 
@@ -1687,6 +1736,40 @@ impl VsBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/value-sets/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/value-sets".to_owned()
+        } else {
+            format!("/ui/hts/value-sets?{query}")
+        }
+    }
 }
 
 /// One row of the VS browser table (§7.4 mirror of §7.2 wireframe).
@@ -1726,6 +1809,10 @@ impl VsBrowserRow {
 pub struct VsBrowserPage {
     pub rows: Vec<VsBrowserRow>,
     pub filters: VsBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
 }
 
 impl VsBrowserPage {
@@ -1745,6 +1832,16 @@ impl VsBrowserPage {
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+        }
     }
 }
 
@@ -2065,6 +2162,7 @@ impl UpstreamClient {
         Ok(VsBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
         })
     }
 
@@ -2662,6 +2760,41 @@ impl CmBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/concept-maps/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("source", &self.source),
+            ("target", &self.target),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/concept-maps".to_owned()
+        } else {
+            format!("/ui/hts/concept-maps?{query}")
+        }
+    }
 }
 
 /// One row of the CM browser table (§7.5 wireframe row shape).
@@ -2733,6 +2866,10 @@ impl CmBrowserRow {
 pub struct CmBrowserPage {
     pub rows: Vec<CmBrowserRow>,
     pub filters: CmBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
 }
 
 impl CmBrowserPage {
@@ -2748,6 +2885,16 @@ impl CmBrowserPage {
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(self.filters.offset.saturating_sub(self.filters.effective_count()))
+        }
     }
 }
 
@@ -3018,6 +3165,7 @@ impl UpstreamClient {
         Ok(CmBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
         })
     }
 
@@ -4497,6 +4645,7 @@ mod tests {
     fn browser_page_next_offset_stops_when_rows_are_short() {
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 5],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 0,
@@ -4507,6 +4656,7 @@ mod tests {
 
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 25],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 50,
@@ -4521,6 +4671,7 @@ mod tests {
         // First page: offset 0, 25 rows → "Showing 25".
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 25],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 0,
@@ -4532,6 +4683,7 @@ mod tests {
         // Load-more page: offset 25, 9 rows → "Showing 34" (not 9).
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 9],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 25,
@@ -5712,5 +5864,50 @@ mod concept_plane_tests {
         };
         assert!(!manual.is_conflict());
         assert_eq!(manual.tag_modifier(), "muted");
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn prev_offset_steps_back_one_page_and_stops_at_the_start() {
+        let mut page = VsBrowserPage {
+            rows: Vec::new(),
+            total: Some(21_334),
+            filters: VsBrowserFilters {
+                count: 25,
+                offset: 50,
+                ..VsBrowserFilters::default()
+            },
+        };
+        assert_eq!(page.prev_offset(), Some(25));
+        page.filters.offset = 10;
+        assert_eq!(page.prev_offset(), Some(0));
+        page.filters.offset = 0;
+        assert_eq!(page.prev_offset(), None);
+    }
+
+    #[test]
+    fn page_url_at_carries_filters_and_omits_defaults() {
+        let filters = VsBrowserFilters {
+            name: Some("obs".to_owned()),
+            status: Some("active".to_owned()),
+            count: 25,
+            offset: 0,
+            ..VsBrowserFilters::default()
+        };
+        assert_eq!(
+            filters.page_url_at(&50),
+            "/ui/hts/value-sets?name=obs&status=active&_offset=50"
+        );
+        assert_eq!(filters.page_url_at(&0), "/ui/hts/value-sets?name=obs&status=active");
+        let bare = CmBrowserFilters {
+            count: 50,
+            ..CmBrowserFilters::default()
+        };
+        assert_eq!(bare.page_url_at(&0), "/ui/hts/concept-maps?_count=50");
+        assert_eq!(CsBrowserFilters::default().page_url_at(&0), "/ui/hts/code-systems");
     }
 }

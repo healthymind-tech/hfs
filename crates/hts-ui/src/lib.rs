@@ -175,9 +175,39 @@ pub fn router(state: Arc<HtsUiState>) -> Router {
         .merge(raw_json_fragment::concept_fragment_routes())
         .merge(raw_json_fragment::workbench_fragment_routes())
         .nest_service("/hts/assets", ServeEmbed::<Assets>::new())
+        // Anything else under the mount is a page that does not exist: answer
+        // with the shell-wrapped not-found page rather than axum's empty 404,
+        // which a browser shows as a blank tab with no title or language.
+        .fallback(not_found_page)
         .with_state(state)
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
         .layer(AutoVaryLayer)
+}
+
+/// The generic "not found" page, `404` inside the full chrome.
+#[derive(askama::Template)]
+#[template(path = "pages/not-found.html")]
+struct NotFoundPage<'a> {
+    chrome: Chrome<'a>,
+}
+
+async fn not_found_page(
+    axum::extract::State(state): axum::extract::State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+) -> Response {
+    let page = NotFoundPage {
+        chrome: Chrome {
+            i18n: I18n::new(locale),
+            active_page: "",
+            fhir_version: state.fhir_version,
+            version: state.version,
+        },
+    };
+    let mut response = render_page(askama::Template::render(&page));
+    if response.status() == axum::http::StatusCode::OK {
+        *response.status_mut() = axum::http::StatusCode::NOT_FOUND;
+    }
+    response
 }
 
 // ── Page context ────────────────────────────────────────────────────────────

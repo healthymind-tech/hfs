@@ -32,9 +32,27 @@
   var fhirSearchValue = window.HfsFhirSearchValue;
   if (!fhirSearchValue) throw new Error("FHIR search-value codec is missing");
 
-  var SETTINGS = "/_user/settings";
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
+  /* The per-user settings document (#151), where the server says it is
+     (`<meta name="hfs-user-settings">`, built on the same prefix). */
+  var SETTINGS =
+    (document.querySelector('meta[name="hfs-user-settings"]') || {}).content ||
+    fhirUrl("/_user/settings");
   function fhirHeaders() {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -190,7 +208,9 @@
     if (!parsed) return null;
     var text = (raw || "").trim().replace(/^GET\s+/i, "");
     try {
-      var url = new URL(text, window.location.href);
+      /* A root-relative path is resolved under the API prefix, so the
+         resource links built from `baseUrl` point where the fetch went. */
+      var url = new URL(fhirUrl(text), window.location.href);
       var segments = url.pathname.split("/").filter(Boolean);
       segments.pop();
       url.pathname = "/" + segments.join("/");
@@ -3139,13 +3159,40 @@
     return path + (query ? "&" : q === -1 ? "?" : "") + "_total=accurate";
   }
 
+  /* Mirrors the running query into the Resources page's own URL
+   * (`?type=…&url=…`), the shape `locationSearchValue` already restores on
+   * load and on popstate, so a reload, a shared link and the back button all
+   * land on the same results instead of the page's default search. The type's
+   * own default (`/Type?_summary=true`, what a rail click runs) is spelled as
+   * a bare `?type=`, the same URL the rail link carries, so the common case
+   * stays short. `replaceState`, not `pushState`: a rail click already pushed
+   * its entry, and every refinement of one query belongs to that entry. */
+  function syncLocation(path) {
+    if (!document.getElementById("resources") || !window.history.replaceState) return;
+    var parsed = parseSearchUrl(path);
+    if (!parsed) return;
+    var params = new URLSearchParams();
+    params.set("type", parsed.type);
+    var isDefault =
+      /^\/[A-Za-z]+\?_summary=true$/.test(path) || path === "/" + parsed.type;
+    if (!isDefault) params.set("url", path);
+    var next = window.location.pathname + "?" + params.toString();
+    if (next === window.location.pathname + window.location.search) return;
+    try {
+      window.history.replaceState(window.history.state, "", next);
+    } catch (e) {
+      /* a URL the browser refuses is not worth failing the search over */
+    }
+  }
+
   function runSearch(path, record, context) {
     var requestedContext = context || resultContext(path);
+    syncLocation(path);
     if (!results.card) {
-      window.open(path, "_blank", "noopener");
+      window.open(fhirUrl(path), "_blank", "noopener");
     } else {
       var search = beginSearch();
-      fetch(withTotal(path), {
+      fetch(fhirUrl(withTotal(path)), {
         headers: fhirHeaders(),
         credentials: "same-origin",
         signal: search.controller.signal,

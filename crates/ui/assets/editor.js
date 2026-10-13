@@ -22,6 +22,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
   function fhirHeaders(extra) {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -236,12 +250,16 @@
           if (unsaved) unsaved.reset();
         });
     }
-    return fetch("/" + resourceType + "/" + resourceId, {
+    return fetch(fhirUrl("/" + resourceType + "/" + resourceId), {
       headers: fhirHeaders(),
     })
       .then(function (response) {
         if (!response.ok) throw new Error(String(response.status));
         return response.json();
+      })
+      .then(function (resource) {
+        setLoaded(true);
+        return resource;
       })
       .then(function (resource) {
         subject.textContent =
@@ -257,9 +275,34 @@
           if (unsaved) unsaved.reset();
         });
       })
-      .catch(function () {
-        say(messages.msgLoadError, "error");
+      .catch(function (error) {
+        /* Nothing loaded, so there is nothing to save or delete: the action
+           bar goes inert and the Versions rail is hidden instead of showing
+           live buttons over an empty editor. A 404 is told apart from every
+           other failure, because "no such id" and "the server is down" call
+           for different next steps. */
+        setLoaded(false);
+        var notFound = error && error.message === "404";
+        say(
+          notFound && messages.msgLoadNotFound
+            ? messages.msgLoadNotFound
+                .replace("{type}", resourceType)
+                .replace("{id}", resourceId)
+            : messages.msgLoadError + (error && /^\d{3}$/.test(error.message) ? " (HTTP " + error.message + ")" : ""),
+          "error"
+        );
       });
+  }
+
+  /* Whether a resource is on screen to act on: Save and Delete are only
+     offered for a loaded document (or a new one being composed). */
+  var saveBtn = document.getElementById("editor-save");
+  var deleteBtn = document.getElementById("editor-delete");
+  var versionsCard = document.getElementById("editor-versions");
+  function setLoaded(loaded) {
+    if (saveBtn) saveBtn.disabled = !loaded;
+    if (deleteBtn) deleteBtn.disabled = !loaded || !resourceId;
+    if (versionsCard) versionsCard.hidden = !loaded || !resourceId;
   }
 
   /* Renders a document into the editor body (JSON + form). */
@@ -282,7 +325,7 @@
 
   function loadVersions() {
     if (!versionsHost || !resourceId) return;
-    fetch("/" + resourceType + "/" + resourceId + "/_history", {
+    fetch(fhirUrl("/" + resourceType + "/" + resourceId + "/_history"), {
       headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -537,7 +580,7 @@
       }
 
       var isNew = !parsed.id;
-      var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+      var url = fhirUrl("/" + resourceType + (isNew ? "" : "/" + parsed.id));
 
       fetch(url, {
         method: isNew ? "POST" : "PUT",
@@ -589,7 +632,7 @@
     if (!parsed.id) return;
     if (!window.confirm(messages.msgConfirmDelete)) return;
 
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
+    fetch(fhirUrl("/" + resourceType + "/" + parsed.id), { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
         if (response.ok) {
           if (window.HfsUnsaved) window.HfsUnsaved.suspend();

@@ -1,0 +1,19 @@
+{% extends "layouts/base.html" %}
+
+{#
+  The "not found" page: every `/ui/hts/...` path no route answers renders this
+  inside the full shell — sidebar, topbar, language — with a way back to Home,
+  instead of the bare 404 with an empty body the router used to return (a blank
+  tab in the browser, no `<title>`, no `lang`). Same shape and the same catalog
+  keys as HFS's `pages/not-found.html`, so the two consoles say the same thing.
+#}
+
+{% block title %}{{ chrome.i18n.t("not-found-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1 class="page-head__title">{{ chrome.i18n.t("not-found-title") }}</h1>
+</header>
+<div class="card notice">{{ chrome.i18n.t("not-found-text") }}</div>
+<a class="btn" href="/ui/hts">{{ chrome.i18n.t("hts-nav-home") }}</a>
+{% endblock %}
