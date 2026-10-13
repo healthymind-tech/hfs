@@ -513,6 +513,7 @@ editor-saved = Gespeichert.
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
 editor-load-error = Diese Ressource konnte nicht geladen werden.
+editor-load-not-found = Auf diesem Server gibt es keine Ressource { $type } mit der ID { $id } — prüfen Sie die ID oder gehen Sie zur Liste zurück.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.

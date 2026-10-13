@@ -525,6 +525,7 @@ editor-saved = Saved.
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
 editor-load-error = Could not load that resource.
+editor-load-not-found = No { $type } with id { $id } exists on this server — check the id, or go back to the list.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.

@@ -513,6 +513,7 @@ editor-saved = Guardado.
 unsaved-changes = Cambios sin guardar
 unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
 editor-load-error = No se pudo cargar ese recurso.
+editor-load-not-found = No existe ningún { $type } con id { $id } en este servidor — compruebe el id o vuelva a la lista.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.

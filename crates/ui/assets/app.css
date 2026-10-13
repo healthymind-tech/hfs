@@ -5412,6 +5412,28 @@ tr:hover .result-id__copy,
   display: flex;
 }
 
+/* Phones and small tablets: one column. Side by side, each card was about
+   100px wide at 375px — the JSON wrapped one character to a line and the
+   View Definitions page overflowed by 151px. Stacked, the editor keeps its
+   own height cap per pane instead of the shared 70vh row. */
+@media (max-width: 900px) {
+  .editor__layout,
+  .editor__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .editor__grid--stretch {
+    flex-direction: column;
+    max-height: none;
+  }
+
+  .editor__grid--stretch > .card,
+  .editor__grid--stretch > .needs-js {
+    flex: 0 0 auto;
+    max-height: 70vh;
+  }
+}
+
 .editor__grid--stretch > .card,
 .editor__grid--stretch > .needs-js {
   flex: 1 1 0;

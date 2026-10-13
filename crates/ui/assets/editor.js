@@ -258,6 +258,10 @@
         return response.json();
       })
       .then(function (resource) {
+        setLoaded(true);
+        return resource;
+      })
+      .then(function (resource) {
         subject.textContent =
           resourceType +
           "/" +
@@ -271,9 +275,34 @@
           if (unsaved) unsaved.reset();
         });
       })
-      .catch(function () {
-        say(messages.msgLoadError, "error");
+      .catch(function (error) {
+        /* Nothing loaded, so there is nothing to save or delete: the action
+           bar goes inert and the Versions rail is hidden instead of showing
+           live buttons over an empty editor. A 404 is told apart from every
+           other failure, because "no such id" and "the server is down" call
+           for different next steps. */
+        setLoaded(false);
+        var notFound = error && error.message === "404";
+        say(
+          notFound && messages.msgLoadNotFound
+            ? messages.msgLoadNotFound
+                .replace("{type}", resourceType)
+                .replace("{id}", resourceId)
+            : messages.msgLoadError + (error && /^\d{3}$/.test(error.message) ? " (HTTP " + error.message + ")" : ""),
+          "error"
+        );
       });
+  }
+
+  /* Whether a resource is on screen to act on: Save and Delete are only
+     offered for a loaded document (or a new one being composed). */
+  var saveBtn = document.getElementById("editor-save");
+  var deleteBtn = document.getElementById("editor-delete");
+  var versionsCard = document.getElementById("editor-versions");
+  function setLoaded(loaded) {
+    if (saveBtn) saveBtn.disabled = !loaded;
+    if (deleteBtn) deleteBtn.disabled = !loaded || !resourceId;
+    if (versionsCard) versionsCard.hidden = !loaded || !resourceId;
   }
 
   /* Renders a document into the editor body (JSON + form). */
