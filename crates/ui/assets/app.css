@@ -3691,6 +3691,41 @@ tr:hover .result-id__copy,
   color: var(--muted);
 }
 
+/* Paging controls in the foot: Previous/Next page links and the Load-more
+   button side by side, then a compact jump-to-offset form. Everything wraps
+   on a narrow screen. */
+.table-foot__pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.table-foot__goto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.table-foot__goto label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.table-foot__goto input {
+  width: 8ch;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--input-bg, var(--surface));
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
 .pagination {
   display: flex;
   flex-wrap: wrap;

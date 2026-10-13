@@ -1442,6 +1442,12 @@ hts-vs-browser-filter-status = Status
 hts-vs-browser-filter-reset = Zurücksetzen
 hts-vs-browser-empty = Keine ValueSets für diese Filter.
 hts-vs-browser-load-more = Mehr laden
+hts-browser-of-total = von { $total }
+hts-browser-pager = Seiten
+hts-browser-page-prev = Vorherige Seite
+hts-browser-page-next = Nächste Seite
+hts-browser-goto-offset = Zu Offset springen
+hts-browser-goto = Los
 hts-vs-browser-showing-count = Zeige { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets
