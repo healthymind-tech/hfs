@@ -218,10 +218,8 @@ fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
         if let Some((_, locale)) = ALIASES.iter().find(|(alias, _)| *alias == range) {
             return Some(locale);
         }
-        match range.rfind('-') {
-            Some(idx) => range = &range[..idx],
-            None => return None,
-        }
+        let idx = range.rfind('-')?;
+        range = &range[..idx];
     }
 }
 
