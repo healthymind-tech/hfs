@@ -194,6 +194,11 @@ struct WebState {
     /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
     /// configured â€” powers the editor's live `$expand` pickers (#365).
     terminology: Option<String>,
+    /// Browser-reachable terminology console URL (`HFS_TERMINOLOGY_PUBLIC_URL`),
+    /// when one is configured — the sidebar's Terminology link. Distinct from
+    /// `terminology`, which is where *this process* calls the server and is
+    /// often an internal address a browser cannot open.
+    terminology_public_url: Option<String>,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
@@ -488,29 +493,69 @@ enum TerminologyNavigation {
 }
 
 impl TerminologyNavigation {
-    fn from_config(value: Option<&str>) -> Self {
-        let Some(raw) = value else {
+    /// The browser destination for the Terminology link.
+    ///
+    /// `server` is `HFS_TERMINOLOGY_SERVER`, where this process calls the
+    /// terminology server; `public` is `HFS_TERMINOLOGY_PUBLIC_URL`, an
+    /// explicit browser-reachable console URL. The public one wins when set
+    /// and valid. Without it, a server URL whose host is one a browser could
+    /// never reach — loopback, a private range, or a single-label name such
+    /// as the `hts` of a container network — is replaced by `/ui/hts` on the
+    /// UI's own origin, the path the reverse proxy in front of both consoles
+    /// conventionally serves it at; a public server URL is linked as before.
+    fn from_config(server: Option<&str>, public: Option<&str>) -> Self {
+        if let Some(public) = public {
+            return match Self::browser_safe(public) {
+                Some(url) => Self::Valid(url),
+                None => Self::Invalid,
+            };
+        }
+        let Some(raw) = server else {
             return Self::Unconfigured;
         };
-
-        if raw.is_empty() || raw.trim() != raw {
-            return Self::Invalid;
+        match Self::browser_safe(raw) {
+            Some(url) if Self::is_internal_host(&url) => Self::Valid("/ui/hts".to_string()),
+            Some(url) => Self::Valid(url),
+            None => Self::Invalid,
         }
+    }
 
-        let Ok(url) = reqwest::Url::parse(raw) else {
-            return Self::Invalid;
-        };
+    /// `raw` when it is a clean absolute HTTP(S) URL with no credentials,
+    /// query or fragment (#611).
+    fn browser_safe(raw: &str) -> Option<String> {
+        if raw.is_empty() || raw.trim() != raw {
+            return None;
+        }
+        let url = reqwest::Url::parse(raw).ok()?;
         let valid = matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none();
+        valid.then(|| raw.to_string())
+    }
 
-        if valid {
-            Self::Valid(raw.to_string())
-        } else {
-            Self::Invalid
+    /// Whether the URL's host is one only this process can reach: loopback,
+    /// an RFC 1918 / link-local address, or a bare single-label hostname (a
+    /// Docker service name, never a public DNS name).
+    fn is_internal_host(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if let Some(domain) = parsed.domain() {
+            let domain = domain.trim_end_matches('.');
+            return domain.eq_ignore_ascii_case("localhost") || !domain.contains('.');
+        }
+        let Some(host) = parsed.host_str() else {
+            return true;
+        };
+        match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+            Err(_) => true,
         }
     }
 }
@@ -1475,6 +1520,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1499,6 +1545,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        terminology_public_url,
         public_base_url,
         max_body_size,
         tenant_path_routing,
@@ -1613,6 +1660,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        None,
         public_base_url.clone(),
         max_body_size,
         tenant_path_routing,
@@ -1638,6 +1686,7 @@ pub fn mount_with_conformance_source_and_runtime(
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1923,6 +1972,7 @@ pub fn mount_with_conformance_source_and_runtime(
         fhir_version,
         default_tenant,
         terminology,
+        terminology_public_url,
         public_base_url,
         self_base_url,
         outbound_auth,
@@ -9202,7 +9252,10 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
-        terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
+        terminology: TerminologyNavigation::from_config(
+            state.terminology.as_deref(),
+            state.terminology_public_url.as_deref(),
+        ),
         user: UserSummary::from_session(tenant.signed_in.as_ref()),
         bearer_only_auth: bearer_only_auth(),
         fhir_base: fhir_base_path(&state.public_base_url),
@@ -10819,5 +10872,61 @@ mod user_summary_tests {
             .unwrap();
         assert!(!html.contains("user-menu__out"), "{html}");
         assert!(!html.contains("/ui/logout"), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod terminology_navigation_tests {
+    use super::TerminologyNavigation;
+
+    fn link(server: Option<&str>, public: Option<&str>) -> Option<String> {
+        match TerminologyNavigation::from_config(server, public) {
+            TerminologyNavigation::Valid(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_public_url_wins() {
+        assert_eq!(
+            link(Some("http://hts:8090"), Some("https://fhir.example.org/ui/hts")).as_deref(),
+            Some("https://fhir.example.org/ui/hts")
+        );
+        // Explicit but unusable: invalid, not silently replaced.
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("http://hts:8090"), Some("not a url")),
+            TerminologyNavigation::Invalid
+        ));
+    }
+
+    #[test]
+    fn internal_server_hosts_never_reach_the_browser() {
+        for internal in [
+            "http://hts:8090",
+            "http://localhost:8090",
+            "http://127.0.0.1:8090",
+            "http://10.0.0.5:8090",
+            "http://192.168.1.20",
+            "http://172.16.0.9:8090",
+            "http://[::1]:8090",
+        ] {
+            assert_eq!(link(Some(internal), None).as_deref(), Some("/ui/hts"), "{internal}");
+        }
+    }
+
+    #[test]
+    fn a_public_server_url_is_linked_as_is() {
+        assert_eq!(
+            link(Some("https://tx.fhir.org/r4"), None).as_deref(),
+            Some("https://tx.fhir.org/r4")
+        );
+        assert!(matches!(
+            TerminologyNavigation::from_config(None, None),
+            TerminologyNavigation::Unconfigured
+        ));
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("ftp://hts"), None),
+            TerminologyNavigation::Invalid
+        ));
     }
 }

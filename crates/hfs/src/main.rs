@@ -1127,6 +1127,7 @@ fn mount_ui(
         outbound_auth,
         config.default_fhir_version,
         config.terminology_server.clone(),
+        config.terminology_public_url.clone(),
         config.base_url.clone(),
         config.max_body_size,
         config.multitenancy.routing_mode.supports_url_path(),

@@ -772,6 +772,7 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        None,
         "http://localhost:8080".to_string(),
         10 * 1024 * 1024,
         false,
