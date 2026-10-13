@@ -465,6 +465,7 @@ mod selfcall_tests {
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
+            terminology_public_url: None,
             settings: None,
             bulk_provider: None,
             write_observer: None,
