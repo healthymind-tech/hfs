@@ -33,7 +33,7 @@
       <div class="detail__field"><span>{{ i18n.t("cap-summary-fhir-version") }}</span><div>{% if !summary.fhir_version.is_empty() %}{{ summary.fhir_version }}{% else %}&mdash;{% endif %}</div></div>
       <div class="detail__field"><span>{{ i18n.t("cap-summary-status") }}</span><div>{% if !summary.status.is_empty() %}{{ summary.status }}{% else %}&mdash;{% endif %}</div></div>
       <div class="detail__field"><span>{{ i18n.t("cap-summary-kind") }}</span><div>{% if !summary.kind.is_empty() %}{{ summary.kind }}{% else %}&mdash;{% endif %}</div></div>
-      <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{% if !summary.date.is_empty() %}{{ summary.date }}{% else %}&mdash;{% endif %}</div></div>
+      <div class="detail__field"><span>{{ i18n.t("cap-summary-date") }}</span><div>{% if !summary.date.is_empty() %}<time datetime="{{ summary.date }}">{{ summary.date_display() }}</time>{% else %}&mdash;{% endif %}</div></div>
       <div class="detail__field"><span>{{ i18n.t("cap-summary-formats") }}</span><div>{% if !summary.formats.is_empty() %}{{ summary.formats.join(", ") }}{% else %}&mdash;{% endif %}</div></div>
     </div>
   </div>

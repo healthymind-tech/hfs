@@ -27,7 +27,7 @@
     <div class="kv-grid" style="margin-bottom:14px">
       <div class="detail__field detail__field--wide">
         <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
-        <code>{{ view.raw.request_url }}</code>
+        <code>{{ view.raw.request_path() }}</code>
       </div>
     </div>
     {% endif %}

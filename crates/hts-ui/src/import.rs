@@ -264,10 +264,14 @@ async fn import_page(
     )
 }
 
-/// Upstream URL the Bundle is POSTed to. Shared by the review step and
-/// the transport-failure status view so both name the same endpoint.
+/// The endpoint the Bundle is POSTed to, as shown to the operator: the path
+/// only. The upstream origin is where *this process* reaches HTS — loopback,
+/// or an internal service name behind a reverse proxy — and leaking it onto
+/// the page told an external operator about a host they can never open.
+/// Shared by the review step and the transport-failure status view so both
+/// name the same endpoint.
 fn import_target_url(state: &HtsUiState) -> String {
-    format!("{}/import", state.upstream.base_url())
+    crate::raw_fold::public_path(&format!("{}/import", state.upstream.base_url())).to_string()
 }
 
 async fn probe_degraded(state: &HtsUiState) -> Option<&'static str> {

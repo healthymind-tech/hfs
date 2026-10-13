@@ -956,7 +956,7 @@ button.menu__option {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 3px;
+  padding: 0;
   background: var(--surface);
   border: 1px solid var(--surface-border);
   border-radius: 16px;
@@ -966,10 +966,11 @@ button.menu__option {
 .theme-toggle button {
   display: grid;
   place-items: center;
-  /* WCAG 2.2 AA, SC 2.5.8 (Target Size Minimum): each toggle is a >=24x24
-     target. The icon inside stays small; only the hit area grows. */
-  width: 24px;
-  height: 24px;
+  /* 44x44 targets (WCAG 2.5.5 / the 44px touch guidance both platforms
+     publish; 2.5.8's 24px floor was too small to hit on a phone). The icon
+     inside stays small; only the hit area grows. */
+  width: 44px;
+  height: 44px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 50%;
@@ -1001,9 +1002,19 @@ button.menu__option {
 }
 
 /* The user menu (#725): the avatar doubles as the disclosure summary; the
-   panel hangs off the topbar's right edge at a width for a name + email. */
+   panel hangs off the topbar's right edge at a width for a name + email —
+   never wider than the screen it is on (at 375px it used to overflow the
+   page by up to 196px in German). */
 .menu--user .menu__panel {
+  left: auto;
+  right: 0;
   width: 264px;
+  max-width: calc(100vw - 28px);
+}
+
+.user-menu__name,
+.user-menu__hint {
+  overflow-wrap: anywhere;
 }
 
 .topbar__avatar-img {
@@ -1065,7 +1076,11 @@ button.menu__option {
 
 .user-menu__seg a {
   flex: 1;
-  padding: 6px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 500;
@@ -1091,6 +1106,7 @@ button.menu__option {
   display: flex;
   align-items: center;
   justify-content: center;
+  min-height: 44px;
   gap: 8px;
   width: calc(100% - 4px);
   margin: 4px 2px 2px;

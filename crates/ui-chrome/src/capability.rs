@@ -151,6 +151,44 @@ pub struct CapabilitySummary {
     pub formats: Vec<String>,
 }
 
+impl CapabilitySummary {
+    /// `date` for a human: a FHIR `dateTime` such as
+    /// `2026-10-13T12:00:43.504193199+00:00` reads as `2026-10-13 12:00:43 UTC`
+    /// (fractional seconds dropped, `Z`/`+00:00` spelled as UTC, any other
+    /// offset kept); a date-only or oddly shaped value is passed through
+    /// untouched. The template keeps the raw value in `<time datetime>`.
+    pub fn date_display(&self) -> String {
+        format_fhir_datetime(&self.date)
+    }
+}
+
+/// See [`CapabilitySummary::date_display`]. Pure string shaping, so this crate
+/// stays free of a date library.
+pub fn format_fhir_datetime(raw: &str) -> String {
+    let Some((date, rest)) = raw.split_once('T') else {
+        return raw.to_string();
+    };
+    if date.len() != 10 || !date.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return raw.to_string();
+    }
+    // Split the clock from the offset: the first `Z`, `+` or `-` after it.
+    let offset_at = rest.find(['Z', '+', '-']);
+    let (clock, offset) = match offset_at {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let clock = clock.split('.').next().unwrap_or(clock);
+    if clock.len() < 5 || !clock.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return raw.to_string();
+    }
+    let zone = match offset {
+        "" => String::new(),
+        "Z" | "+00:00" | "-00:00" => " UTC".to_string(),
+        other => format!(" UTC{other}"),
+    };
+    format!("{date} {clock}{zone}")
+}
+
 /// One system-level interaction (`rest[].interaction[]`).
 #[derive(Clone, Debug, Default)]
 pub struct SystemInteraction {
@@ -1318,5 +1356,32 @@ mod tests {
         assert!(!html.contains("data-capability-json-actions"));
         assert!(!html.contains("data-capability-json-expand-all"));
         assert!(!html.contains("data-capability-json-body"));
+    }
+}
+
+#[cfg(test)]
+mod datetime_display_tests {
+    use super::format_fhir_datetime;
+
+    #[test]
+    fn instants_read_as_date_clock_and_zone() {
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T12:00:43.504193199+00:00"),
+            "2026-10-13 12:00:43 UTC"
+        );
+        assert_eq!(format_fhir_datetime("2026-10-13T12:00:43Z"), "2026-10-13 12:00:43 UTC");
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T08:00:43.1-04:00"),
+            "2026-10-13 08:00:43 UTC-04:00"
+        );
+        assert_eq!(format_fhir_datetime("2026-10-13T12:00"), "2026-10-13 12:00");
+    }
+
+    #[test]
+    fn anything_else_passes_through() {
+        assert_eq!(format_fhir_datetime("2026-08-24"), "2026-08-24");
+        assert_eq!(format_fhir_datetime(""), "");
+        assert_eq!(format_fhir_datetime("yesterday"), "yesterday");
+        assert_eq!(format_fhir_datetime("2026-10-13Tnoon"), "2026-10-13Tnoon");
     }
 }
