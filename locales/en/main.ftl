@@ -616,6 +616,7 @@ queries-saved-group = Saved
 nav-collapse = Collapse Menu
 nav-menu-open = Open navigation menu
 nav-menu-close = Close navigation menu
+nav-main = Main navigation
 
 batch-heading = Batch / Transaction
 batch-lede = Upload a FHIR Bundle, review the actions it will run, execute it against this server, and read the outcome of every entry.

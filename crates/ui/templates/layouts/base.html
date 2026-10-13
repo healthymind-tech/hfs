@@ -82,7 +82,7 @@
 
     <hr class="divider">
 
-    <nav class="nav">
+    <nav class="nav" aria-label="{{ i18n.t("nav-main") }}">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
       <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>

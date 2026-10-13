@@ -6267,6 +6267,20 @@ details.card > summary.card-head::-webkit-details-marker {
   margin-top: 0;
 }
 
+/* On a phone the action buttons drop under the title instead of pushing
+   the row past the viewport (View Definitions overflowed by 59px with its
+   three buttons beside the heading). */
+@media (max-width: 640px) {
+  .page-head--row {
+    flex-wrap: wrap;
+  }
+
+  .page-head--row .page-head__actions {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+}
+
 .filter-rail__item--on {
   background: var(--accent-soft);
   color: var(--text-strong);
