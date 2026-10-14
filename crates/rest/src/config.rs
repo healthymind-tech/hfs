@@ -471,6 +471,164 @@ impl BulkExportConfig {
     }
 }
 
+/// FHIR package (Implementation Guide) manager configuration.
+///
+/// See `docs/ops/ig-packages.md` for the operator guide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageConfig {
+    /// Enables the package administration API (`/admin/packages`) and the
+    /// console page (`/ui/packages`) — `HFS_ADMIN_UI`, default `false`.
+    /// Installing and removing packages are administrative actions; until
+    /// SMART/OIDC admin scopes land they sit behind this explicit switch.
+    /// `HFS_PACKAGES` startup installs run regardless.
+    pub admin_ui: bool,
+    /// Online package registries — `HFS_PACKAGE_REGISTRY`: `on` (default:
+    /// packages.fhir.org, falling back to packages2.fhir.org), `off` (no
+    /// network access at all: upload and the local cache only), or a
+    /// comma-separated list of npm-compatible mirror base URLs used instead
+    /// of the public registries.
+    pub registry: RegistryMode,
+    /// Marketplace index (FHIR/ig-registry `fhir-ig-list.json`) URL —
+    /// `HFS_PACKAGE_MARKETPLACE`; `off` disables it. Ignored when the
+    /// registry is `off`.
+    pub marketplace_url: Option<String>,
+    /// Packages to install at startup when missing —
+    /// `HFS_PACKAGES=name#version,name#version`.
+    pub startup: Vec<String>,
+    /// Package cache directory — `HFS_PACKAGE_CACHE_DIR`. Unset: next to the
+    /// SQLite database file, else `<HFS_DATA_DIR or ./data>/packages`.
+    pub cache_dir: Option<std::path::PathBuf>,
+    /// Largest accepted `.tgz` (compressed), bytes — `HFS_PACKAGE_MAX_SIZE`,
+    /// default 256 MiB.
+    pub max_size: u64,
+    /// Largest total unpacked size of one package, bytes —
+    /// `HFS_PACKAGE_MAX_UNPACKED`, default 1 GiB.
+    pub max_unpacked: u64,
+    /// Largest single file inside a package, bytes —
+    /// `HFS_PACKAGE_MAX_ENTRY`, default 64 MiB.
+    pub max_entry: u64,
+}
+
+/// Where the package manager looks for packages online.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryMode {
+    /// No network access.
+    Off,
+    /// packages.fhir.org first, packages2.fhir.org as fallback.
+    Public,
+    /// Operator-provided npm-compatible mirrors, tried in order.
+    Mirrors(Vec<String>),
+}
+
+/// The public registries tried by [`RegistryMode::Public`], in order.
+pub const PUBLIC_PACKAGE_REGISTRIES: &[&str] = &[
+    "https://packages.fhir.org",
+    "https://packages2.fhir.org/packages",
+];
+
+/// Default marketplace index.
+pub const DEFAULT_PACKAGE_MARKETPLACE: &str =
+    "https://raw.githubusercontent.com/FHIR/ig-registry/master/fhir-ig-list.json";
+
+impl RegistryMode {
+    /// Parses `HFS_PACKAGE_REGISTRY`.
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "on" | "true" | "1" | "public" | "default" => Self::Public,
+            "off" | "false" | "0" | "none" => Self::Off,
+            _ => Self::Mirrors(
+                trimmed
+                    .split(',')
+                    .map(|u| u.trim().trim_end_matches('/').to_string())
+                    .filter(|u| !u.is_empty())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Registry base URLs to try, in order (empty when off).
+    pub fn sources(&self) -> Vec<String> {
+        match self {
+            Self::Off => Vec::new(),
+            Self::Public => PUBLIC_PACKAGE_REGISTRIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Self::Mirrors(urls) => urls.clone(),
+        }
+    }
+
+    /// Whether any online access is allowed.
+    pub fn is_online(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The label the admin API reports (`off`, `public`, `mirror`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Public => "public",
+            Self::Mirrors(_) => "mirror",
+        }
+    }
+}
+
+impl Default for PackageConfig {
+    fn default() -> Self {
+        Self {
+            admin_ui: false,
+            registry: RegistryMode::Public,
+            marketplace_url: Some(DEFAULT_PACKAGE_MARKETPLACE.to_string()),
+            startup: Vec::new(),
+            cache_dir: None,
+            max_size: 256 * 1024 * 1024,
+            max_unpacked: 1024 * 1024 * 1024,
+            max_entry: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl PackageConfig {
+    /// Loads the package-manager configuration from the environment.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        let bytes = |key: &str, default: u64| {
+            env(key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            admin_ui: env("HFS_ADMIN_UI")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(d.admin_ui),
+            registry: env("HFS_PACKAGE_REGISTRY")
+                .map(|v| RegistryMode::parse(&v))
+                .unwrap_or(d.registry),
+            marketplace_url: match env("HFS_PACKAGE_MARKETPLACE") {
+                Some(v) if v.trim().eq_ignore_ascii_case("off") => None,
+                Some(v) => Some(v.trim().to_string()),
+                None => d.marketplace_url,
+            },
+            startup: env("HFS_PACKAGES")
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cache_dir: env("HFS_PACKAGE_CACHE_DIR").map(std::path::PathBuf::from),
+            max_size: bytes("HFS_PACKAGE_MAX_SIZE", d.max_size),
+            max_unpacked: bytes("HFS_PACKAGE_MAX_UNPACKED", d.max_unpacked),
+            max_entry: bytes("HFS_PACKAGE_MAX_ENTRY", d.max_entry),
+        }
+    }
+}
+
 /// Resource validation configuration, loaded from `HFS_VALIDATION_*`
 /// environment variables.
 ///
@@ -1611,6 +1769,11 @@ pub struct ServerConfig {
     /// Resource validation configuration (loaded from environment variables).
     #[arg(skip)]
     pub validation: ValidationConfig,
+
+    /// FHIR package (IG) manager configuration (`HFS_PACKAGE_*`,
+    /// `HFS_PACKAGES`, `HFS_ADMIN_UI`; loaded from environment variables).
+    #[arg(skip)]
+    pub packages: PackageConfig,
 }
 
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
@@ -1629,6 +1792,7 @@ impl ServerConfig {
         config.bulk_export = BulkExportConfig::from_env();
         config.bulk_submit = BulkSubmitConfig::from_env();
         config.validation = ValidationConfig::from_env();
+        config.packages = PackageConfig::from_env();
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
@@ -1719,6 +1883,7 @@ impl Default for ServerConfig {
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
+            packages: PackageConfig::default(),
         }
     }
 }
@@ -1739,6 +1904,7 @@ impl ServerConfig {
         config.bulk_submit = BulkSubmitConfig::from_env();
         // Load validation config from environment
         config.validation = ValidationConfig::from_env();
+        config.packages = PackageConfig::from_env();
         config
     }
 
@@ -2000,6 +2166,7 @@ impl ServerConfig {
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
+            packages: PackageConfig::default(),
         }
     }
 

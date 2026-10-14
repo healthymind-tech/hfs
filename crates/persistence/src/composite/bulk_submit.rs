@@ -546,6 +546,10 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.sof_runner()
     }
 
+    fn package_store(&self) -> Option<Arc<dyn crate::core::PackageStore>> {
+        self.composite.package_store()
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,

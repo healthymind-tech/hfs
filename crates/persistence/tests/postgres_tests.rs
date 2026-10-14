@@ -2655,6 +2655,81 @@ mod postgres_integration {
             .expect("Failed to create PostgresBackend")
     }
 
+    /// The installed-package registry (lazily created tables): rows round
+    /// trip, resource rows upsert by key, delete cascades, tenants are
+    /// isolated, and two backends racing the first use both succeed.
+    #[tokio::test]
+    async fn postgres_package_registry_round_trip() {
+        use helios_persistence::core::{PackageRecord, PackageResourceRecord, PackageStore};
+        let a = create_backend().await;
+        let b = create_backend().await;
+        let tenant = format!("pkg_{}", uuid::Uuid::new_v4().simple());
+        let other = format!("pkg_{}", uuid::Uuid::new_v4().simple());
+        let record = |name: &str| PackageRecord {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            status: "installed".to_string(),
+            installed_at: chrono::Utc::now(),
+            document: json!({"title": name, "resolved": {"x": "y#1"}}),
+        };
+        let row = |id: &str, pre: bool| PackageResourceRecord {
+            target: "hfs".to_string(),
+            resource_type: "StructureDefinition".to_string(),
+            resource_id: id.to_string(),
+            url: Some(format!("http://example.org/{id}")),
+            version: None,
+            preexisting: pre,
+        };
+        let (pa, pb) = (record("a.pkg"), record("b.pkg"));
+        let (ra, rb) = tokio::join!(a.put_package(&tenant, &pa), b.put_package(&tenant, &pb));
+        ra.unwrap();
+        rb.unwrap();
+        a.put_package(&other, &record("a.pkg")).await.unwrap();
+        a.add_package_resources(
+            &tenant,
+            "a.pkg",
+            "1.0.0",
+            &[row("x", false), row("y", false)],
+        )
+        .await
+        .unwrap();
+        b.add_package_resources(&tenant, "b.pkg", "1.0.0", &[row("y", false)])
+            .await
+            .unwrap();
+        a.add_package_resources(&tenant, "a.pkg", "1.0.0", &[row("x", true)])
+            .await
+            .unwrap();
+
+        let listed = b.list_packages(&tenant).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["a.pkg", "b.pkg"]
+        );
+        assert_eq!(listed[0].document["resolved"]["x"], "y#1");
+        let mine = a
+            .package_resources(&tenant, Some(("a.pkg", "1.0.0")))
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 2);
+        assert!(
+            mine.iter()
+                .any(|r| r.resource.resource_id == "x" && r.resource.preexisting)
+        );
+        assert_eq!(a.package_resources(&tenant, None).await.unwrap().len(), 3);
+
+        a.delete_package(&tenant, "a.pkg", "1.0.0").await.unwrap();
+        assert!(
+            a.get_package(&tenant, "a.pkg", "1.0.0")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let left = a.package_resources(&tenant, None).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].package_name, "b.pkg");
+        assert_eq!(a.list_packages(&other).await.unwrap().len(), 1);
+    }
+
     /// Creates a tenant with a unique ID suffix to isolate tests sharing the same database.
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());

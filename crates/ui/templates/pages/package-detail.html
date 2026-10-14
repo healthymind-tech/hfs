@@ -1,0 +1,79 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ name }}#{{ version }} — {{ i18n.t("packages-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <p class="page-head__back"><a href="/ui/packages">← {{ i18n.t("packages-back") }}</a></p>
+  <h1 class="page-head__title" id="pkg-detail-title">{{ name }} <span class="muted">#{{ version }}</span></h1>
+  <p class="page-head__lede" id="pkg-detail-lede"></p>
+</section>
+
+{% if !enabled %}
+<div class="card notice" id="pkg-disabled">{{ i18n.t("packages-disabled") }}</div>
+{% else %}
+<!--
+  One installed package: metadata, resolved dependencies and dependents,
+  resources by type (linking into the Resources browser), upgrade, and
+  removal with a typed-name confirmation. Filled by packages.js from
+  `GET [base]/admin/packages/{name}/{version}`.
+-->
+<div id="pkg-detail" class="pkg" data-name="{{ name }}" data-version="{{ version }}">
+  <p class="busy-status" id="pkg-detail-busy" role="status"><span class="spinner" aria-hidden="true"></span><span>{{ i18n.t("packages-detail-loading") }}</span></p>
+  <div class="notice notice--warn" id="pkg-detail-error" hidden></div>
+
+  <div id="pkg-detail-body" hidden>
+    <div class="pkg-actions">
+      <button type="button" class="btn" id="pkg-upgrade"><span class="icon">{% include "icons/import.svg" %}</span> {{ i18n.t("packages-upgrade") }}</button>
+      <button type="button" class="btn btn--danger" id="pkg-remove"><span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("packages-remove") }}</button>
+      <span class="muted" id="pkg-upgrade-note" aria-live="polite"></span>
+    </div>
+
+    <section class="card">
+      <div class="card-head"><h3><span class="icon">{% include "icons/package.svg" %}</span> {{ i18n.t("packages-detail-meta") }}</h3></div>
+      <dl class="kv-grid pkg-meta" id="pkg-meta"></dl>
+    </section>
+
+    <div class="pkg-columns">
+      <section class="card">
+        <div class="card-head"><h3><span class="icon">{% include "icons/hierarchy.svg" %}</span> {{ i18n.t("packages-detail-dependencies") }}</h3></div>
+        <ul class="pkg-deps" id="pkg-deps"></ul>
+      </section>
+      <section class="card">
+        <div class="card-head"><h3><span class="icon">{% include "icons/layers-platforms.svg" %}</span> {{ i18n.t("packages-detail-dependents") }}</h3></div>
+        <ul class="pkg-deps" id="pkg-dependents"></ul>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("packages-detail-resources") }}</h3>
+        <span class="card-head__meta muted" id="pkg-resources-count"></span>
+      </div>
+      <div class="pkg-types" id="pkg-types"></div>
+    </section>
+  </div>
+
+  <dialog class="pkg-dialog" id="pkg-remove-dialog" aria-labelledby="pkg-remove-title">
+    <form method="dialog" class="pkg-dialog__form" id="pkg-remove-form" novalidate>
+      <h2 class="pkg-dialog__title" id="pkg-remove-title"></h2>
+      <p>{{ i18n.t("packages-remove-lede") }}</p>
+      <div class="notice notice--warn" id="pkg-remove-blocked" hidden></div>
+      <label class="field">
+        <span class="field__label" id="pkg-remove-label"></span>
+        <input class="field__input" type="text" id="pkg-remove-input" autocomplete="off" spellcheck="false" autocapitalize="off">
+      </label>
+      <p class="busy-status" id="pkg-remove-status" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+      <div class="notice notice--warn" id="pkg-remove-error" hidden></div>
+      <div class="pkg-dialog__actions">
+        <button type="button" class="btn" id="pkg-remove-cancel">{{ i18n.t("packages-cancel") }}</button>
+        <button type="submit" class="btn btn--danger" id="pkg-remove-submit" disabled>{{ i18n.t("packages-remove-submit") }}</button>
+      </div>
+    </form>
+  </dialog>
+
+{% include "partials/packages-messages.html" %}
+</div>
+<script src="/ui/assets/packages.js" defer></script>
+{% endif %}
+{% endblock %}

@@ -1111,6 +1111,9 @@ fn mount_ui(
         moving_secs: u32::try_from(config.dashboard_refresh_secs).unwrap_or(u32::MAX),
         settled_secs: u32::try_from(config.dashboard_idle_refresh_secs).unwrap_or(u32::MAX),
     });
+    // IG Packages page and nav entry follow the same switch as the
+    // `/admin/packages` API (`HFS_ADMIN_UI`).
+    helios_ui::set_package_admin(config.packages.admin_ui);
     helios_ui::mount_with_body_limit_and_tenant_routing(
         app,
         env!("CARGO_PKG_VERSION"),

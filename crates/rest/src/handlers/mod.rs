@@ -17,6 +17,7 @@
 //! - `dashboard_counts` - The dashboard counters' post-commit write observer
 //! - `write_event` - Reporting committed writes to the post-commit write observer
 
+pub mod admin_packages;
 pub mod admin_tenants;
 pub mod batch;
 pub mod bulk_common;

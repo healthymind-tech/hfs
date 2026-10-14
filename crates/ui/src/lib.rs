@@ -89,7 +89,7 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Query, RawQuery, State},
+    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -561,6 +561,12 @@ impl TerminologyNavigation {
 }
 
 impl Status {
+    /// Whether FHIR package administration is enabled (`HFS_ADMIN_UI`), so
+    /// the nav links the IG Packages page.
+    pub(crate) fn package_admin(&self) -> bool {
+        package_admin()
+    }
+
     /// Display label (`"R4"`, `"R5"`, â€¦) of the request's effective FHIR
     /// version â€” the user's stored choice when one is set, else the server
     /// default. Rendered by the sidebar selector and the dashboard's
@@ -1355,6 +1361,31 @@ struct ValidatePage {
     max_body_size: usize,
 }
 
+/// FHIR package (IG) management (/ui/packages): a static shell whose
+/// packages.js drives the admin API (`/admin/packages`) — the Installed list,
+/// the marketplace, `.tgz` upload and the install wizard.
+#[derive(Template)]
+#[template(path = "pages/packages.html")]
+struct PackagesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// `HFS_ADMIN_UI`: when off the page explains how to enable it.
+    enabled: bool,
+}
+
+/// One installed package (/ui/packages/{name}/{version}).
+#[derive(Template)]
+#[template(path = "pages/package-detail.html")]
+struct PackageDetailPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    enabled: bool,
+    name: String,
+    version: String,
+}
+
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
 #[derive(Template)]
 #[template(path = "partials/json-view.html")]
@@ -1798,6 +1829,10 @@ pub fn mount_with_conformance_source_and_runtime(
                 },
             ),
         )
+        // FHIR package (IG) management: install, upgrade and remove IGs
+        // from the registries, the marketplace or an uploaded .tgz.
+        .route("/ui/packages", get(packages_page))
+        .route("/ui/packages/{name}/{version}", get(package_detail_page))
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -3429,6 +3464,54 @@ async fn validate_page(
         i18n: I18n::new(locale),
         active_page: "validate",
         max_body_size,
+    })
+}
+
+/// The IG Packages page: the shell only; packages.js calls the admin API.
+async fn packages_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(PackagesPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "packages",
+        enabled: package_admin(),
+    })
+}
+
+/// One installed package. The name and version are only echoed into data
+/// attributes (auto-escaped) for the script; a package that is not
+/// installed is reported by the script from the API's 404.
+async fn package_detail_page(
+    State(state): State<WebState>,
+    Path((name, version)): Path<(String, String)>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let safe = |s: &str, extra: &[u8]| {
+        !s.is_empty()
+            && s.len() <= 214
+            && s.as_bytes()[0].is_ascii_alphanumeric()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    if !safe(&name, b".-_") || !safe(&version, b".-+_") {
+        let back = i18n.t("packages-back");
+        return render_not_found(status, i18n, "packages", "/ui/packages", back);
+    }
+    render(PackageDetailPage {
+        status,
+        i18n,
+        active_page: "packages",
+        enabled: package_admin(),
+        name,
+        version,
     })
 }
 
@@ -8450,6 +8533,25 @@ fn dashboard_refresh() -> DashboardRefresh {
         .unwrap_or_default()
 }
 
+static PACKAGE_ADMIN: RwLock<bool> = RwLock::new(false);
+
+/// Record whether FHIR package administration is enabled
+/// (`HFS_ADMIN_UI=true`): the nav then links `/ui/packages` and the page
+/// offers install and remove. Called once from the server's startup; the
+/// most recent call wins. The admin API (`/admin/packages`) enforces the same
+/// switch on its own, so this only decides what the console shows.
+pub fn set_package_admin(enabled: bool) {
+    *PACKAGE_ADMIN
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+fn package_admin() -> bool {
+    *PACKAGE_ADMIN
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
 
 /// Record whether the server runs with authentication enabled and no
@@ -10891,6 +10993,22 @@ mod user_summary_tests {
             bearer_only_auth: false,
             fhir_base: String::new(),
         }
+    }
+
+    #[test]
+    fn packages_page_explains_how_to_enable_it_when_admin_is_off() {
+        let html = PackagesPage {
+            status: status_with(None),
+            i18n: I18n::new(RequestLocale::default()),
+            active_page: "packages",
+            enabled: false,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains(r#"id="pkg-disabled""#));
+        assert!(html.contains("HFS_ADMIN_UI=true"));
+        assert!(!html.contains(r#"id="pkg-app""#));
+        assert!(!html.contains("packages.js"));
     }
 
     #[test]

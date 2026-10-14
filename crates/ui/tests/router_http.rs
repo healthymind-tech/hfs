@@ -8499,3 +8499,126 @@ async fn theme_switcher_is_one_button_labelled_per_locale() {
         assert!(html.contains("data-label-dark="), "{lang}");
     }
 }
+
+/// IG Packages (`/ui/packages`): with package administration on
+/// (`HFS_ADMIN_UI`), a full page in the shell, current in the nav (which
+/// every page — and so the phone drawer, the same `<aside>` — carries), with
+/// the three tabs, the install wizard's four steps, the stacked tables, the
+/// page script and its rendered messages. Only ever switched on here: the
+/// switch is process-wide, and the "off" rendering is a lib unit test.
+#[tokio::test]
+async fn packages_page_serves_tabs_wizard_and_nav_entry() {
+    helios_ui::set_package_admin(true);
+    let response = app()
+        .oneshot(Request::get("/ui/packages").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"href="/ui/packages" aria-current="page""#));
+    assert!(html.contains(r#"id="pkg-app""#));
+    for tab in ["installed", "market", "upload"] {
+        assert!(
+            html.contains(&format!(r#"data-pkg-tab="{tab}""#)),
+            "tab {tab}"
+        );
+        assert!(
+            html.contains(&format!(r#"id="pkg-pane-{tab}""#)),
+            "pane {tab}"
+        );
+    }
+    for step in ["tree", "options", "progress", "result"] {
+        assert!(
+            html.contains(&format!(r#"id="pkg-step-{step}""#)),
+            "step {step}"
+        );
+    }
+    assert!(html.contains(r#"class="data-table data-table--stack pkg-table""#));
+    assert!(html.contains(r#"class="table-wrap" tabindex="0""#));
+    assert!(html.contains(r#"accept=".tgz,.tar.gz,application/gzip,application/x-gzip""#));
+    assert!(html.contains(r#"src="/ui/assets/packages.js""#));
+    assert!(html.contains(r#"name="dependencyPolicy" value="newer" checked"#));
+    // Rendered copy, not just the attribute name.
+    assert!(html.contains(r#"data-m-action-embedded="built into the server""#));
+    assert!(html.contains(r#"data-m-remove-confirm="Type %name% to confirm""#));
+
+    // Every other page links it.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let home = body_text(response).await;
+    assert!(home.contains(r#"<a class="nav-item" href="/ui/packages""#));
+    assert!(!home.contains(r#"href="/ui/packages" aria-current"#));
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/packages?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zh = body_text(response).await;
+    assert!(zh.contains("IG 套件"), "{zh}");
+    assert!(zh.contains("瀏覽市集"));
+    assert!(zh.contains(r#"data-m-action-embedded="伺服器內建""#));
+}
+
+/// One installed package (`/ui/packages/{name}/{version}`): the shell with
+/// the name and version for the script, the remove dialog with its typed
+/// confirmation, and a 404 page for names that are not package names.
+#[tokio::test]
+async fn package_detail_page_carries_the_package_and_rejects_odd_names() {
+    helios_ui::set_package_admin(true);
+    let response = app()
+        .oneshot(
+            Request::get("/ui/packages/tw.gov.mohw.twcore/1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-name="tw.gov.mohw.twcore" data-version="1.0.0""#));
+    assert!(html.contains(r#"<dialog class="pkg-dialog" id="pkg-remove-dialog""#));
+    assert!(html.contains(r#"id="pkg-remove-submit" disabled"#));
+    assert!(html.contains(r#"href="/ui/packages" aria-current="page""#));
+    assert!(html.contains(r#"src="/ui/assets/packages.js""#));
+
+    for bad in [
+        "/ui/packages/bad%20name/1.0.0",
+        "/ui/packages/a/1%3Cscript%3E",
+        "/ui/packages/.hidden/1",
+    ] {
+        let response = app()
+            .oneshot(Request::get(bad).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{bad}");
+    }
+}
+
+/// The page script is served from the embedded assets and only ever writes
+/// remote package metadata as text.
+#[tokio::test]
+async fn packages_script_is_served_and_builds_dom_as_text() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/packages.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("/admin/packages"));
+    assert!(js.contains("registry/marketplace"));
+    assert!(
+        !js.contains("innerHTML"),
+        "remote data must not be parsed as HTML"
+    );
+}
