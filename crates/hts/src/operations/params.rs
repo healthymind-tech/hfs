@@ -50,6 +50,24 @@ pub fn find_str_param(params: &[Value], name: &str) -> Option<String> {
         .and_then(extract_any_string_value)
 }
 
+/// Return the boolean value of the first parameter named `name`, accepting
+/// both the POST encoding (`valueBoolean`) and the GET encoding produced by
+/// [`query_params_to_fhir_params`] (`valueString` / `valueCode` of `"true"` /
+/// `"false"`). `None` when absent or not a recognisable boolean.
+pub fn find_bool_param(params: &[Value], name: &str) -> Option<bool> {
+    let p = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?;
+    if let Some(b) = p.get("valueBoolean").and_then(|v| v.as_bool()) {
+        return Some(b);
+    }
+    match extract_any_string_value(p)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Collect the string values of **all** parameters named `name` (handles
 /// repeated parameters such as `property` in `$lookup`).
 pub fn collect_str_params(params: &[Value], name: &str) -> Vec<String> {
@@ -393,6 +411,88 @@ pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn find_bool_param_accepts_boolean_and_string_forms() {
+        let params = vec![
+            json!({"name": "a", "valueBoolean": true}),
+            json!({"name": "b", "valueString": "false"}),
+            json!({"name": "c", "valueCode": "true"}),
+            json!({"name": "d", "valueString": "yes"}),
+        ];
+        assert_eq!(find_bool_param(&params, "a"), Some(true));
+        assert_eq!(find_bool_param(&params, "b"), Some(false));
+        assert_eq!(find_bool_param(&params, "c"), Some(true));
+        assert_eq!(find_bool_param(&params, "d"), None);
+        assert_eq!(find_bool_param(&params, "e"), None);
+    }
+
+    #[test]
+    fn split_canonical_handles_plain_piped_and_empty_version() {
+        assert_eq!(split_canonical("http://x/vs"), ("http://x/vs", None));
+        assert_eq!(
+            split_canonical("http://x/vs|2.0"),
+            ("http://x/vs", Some("2.0"))
+        );
+        assert_eq!(split_canonical("http://x/vs|"), ("http://x/vs", None));
+        // Only the first pipe separates url from version.
+        assert_eq!(
+            split_canonical("http://x/vs|1|2"),
+            ("http://x/vs", Some("1|2"))
+        );
+    }
+
+    #[test]
+    fn normalize_canonical_promotes_piped_version() {
+        let mut params = vec![json!({"name": "url", "valueUri": "http://x/vs|2.0"})];
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params[0]["valueUri"], "http://x/vs");
+        assert_eq!(
+            find_str_param(&params, "valueSetVersion").as_deref(),
+            Some("2.0")
+        );
+    }
+
+    #[test]
+    fn normalize_canonical_is_a_no_op_without_pipe() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://x/vs"}),
+            json!({"name": "valueSetVersion", "valueString": "1.0"}),
+        ];
+        let before = params.clone();
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params, before);
+    }
+
+    #[test]
+    fn normalize_canonical_accepts_agreeing_explicit_version() {
+        let mut params = vec![
+            json!({"name": "url", "valueString": "http://x/vs|1.0"}),
+            json!({"name": "valueSetVersion", "valueString": "1.0"}),
+        ];
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0]["valueString"], "http://x/vs");
+    }
+
+    #[test]
+    fn normalize_canonical_rejects_conflicting_versions() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://x/vs|1.0"}),
+            json!({"name": "valueSetVersion", "valueString": "2.0"}),
+        ];
+        let err =
+            normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap_err();
+        assert!(matches!(err, HtsError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[test]
+    fn normalize_canonical_drops_version_when_no_slot() {
+        let mut params = vec![json!({"name": "source", "valueUri": "http://x/vs|3"})];
+        normalize_canonical_params(&mut params, "source", None).unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["valueUri"], "http://x/vs");
+    }
 
     #[test]
     fn extract_parameter_array_ok() {

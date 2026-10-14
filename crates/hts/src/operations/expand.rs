@@ -55,8 +55,8 @@ use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
-    collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    collect_resource_params, extract_parameter_array, find_bool_param, find_resource_param,
+    find_str_param, normalize_canonical_params, parse_query_string, query_params_to_fhir_params,
 };
 
 /// Standards-status codes that warrant a `warning-<status>` expansion
@@ -2163,11 +2163,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
         .collect();
 
     // ── Populate designations (only if explicitly requested) ─────────────────
-    let include_designations = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("includeDesignations"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    // Accept the GET spelling (`includeDesignations=true`) as well as the
+    // POST `valueBoolean`.
+    let include_designations = find_bool_param(&params, "includeDesignations").unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
         // After base designations are loaded, append any supplement-derived
@@ -2585,11 +2583,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     //   - the source VS has `compose.inactive: false` (FHIR R5)
     // Post-filter using the freshly-populated inactive flag and adjust
     // `total` to match.
-    let active_only_request = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let active_only_request = find_bool_param(&params, "activeOnly").unwrap_or(false);
     let compose_inactive_false = source_vs
         .as_ref()
         .and_then(|vs| vs.get("compose"))
