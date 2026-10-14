@@ -752,7 +752,7 @@ GZ11ZZZ Psychological Tests, Personality and Behavioral\r\n";
             Some("Psychological Tests")
         );
         // Axis 4+ labels are never keyed.
-        assert!(axis.labels.get("0DTJ").is_none());
+        assert!(!axis.labels.contains_key("0DTJ"));
 
         let concepts = parse_codes_file(CODES_TXT.as_bytes(), &axis, &mut errors).unwrap();
         assert_eq!(find(&concepts, "GZ").display, "None");
