@@ -274,3 +274,52 @@ fn spec_example_narratives_pass_html_checks() {
         divs.len()
     );
 }
+
+/// dom-3 (contained resources must be referenced) runs: it applies the
+/// `as()` function to a collection.
+#[tokio::test]
+async fn dom_3_flags_unreferenced_contained_resources() {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let suppress = suppress();
+    let mut h = handlers(&evaluator);
+    h.suppress_constraints = &suppress;
+    let dom3 = |errors: &[helios_fhir_validator::ValidationError]| {
+        errors
+            .iter()
+            .filter(|e| e.extra.get("constraint") == Some(&json!("dom-3")))
+            .map(|e| (e.severity, e.message.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let unreferenced = json!({
+        "resourceType": "Patient",
+        "contained": [{ "resourceType": "Organization", "id": "org1", "name": "Unref" }]
+    });
+    let errors = validator
+        .validate(
+            &unreferenced,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &h,
+        )
+        .await;
+    let found = dom3(&errors);
+    assert_eq!(found.len(), 1, "{errors:#?}");
+    assert_eq!(found[0].0, helios_fhir_validator::Severity::Error);
+
+    let referenced = json!({
+        "resourceType": "Patient",
+        "contained": [{ "resourceType": "Organization", "id": "org1", "name": "Ref" }],
+        "managingOrganization": { "reference": "#org1" }
+    });
+    let errors = validator
+        .validate(
+            &referenced,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &h,
+        )
+        .await;
+    assert!(dom3(&errors).is_empty(), "{errors:#?}");
+}

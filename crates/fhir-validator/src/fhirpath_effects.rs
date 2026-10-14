@@ -34,6 +34,7 @@ use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint}
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath::{EvaluationContext, EvaluationResult};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -76,7 +77,7 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         constraints
             .iter()
             .map(|c| {
-                let combined = combine(c.path, effective_expression(c.id, c.expression));
+                let combined = combine(c.path, &effective_expression(c.id, c.expression));
                 self.evaluate_one(&combined, &context)
             })
             .collect()
@@ -108,19 +109,29 @@ impl FhirPathConstraintEvaluator {
     }
 }
 
-/// The expression actually evaluated for a constraint. R4 through R5 give
-/// the two narrative invariants the same expression, `htmlChecks()`, though
-/// they state different rules: `txt-1` the allowed elements and attributes,
-/// `txt-2` "SHALL have some non-whitespace content". Evaluating `txt-2` as
-/// written would re-check `txt-1` and leave the content rule unchecked, so
-/// it runs `htmlChecks2()`, the content check (the HL7 validator's name for
-/// it). R6 folds both rules into `txt-1` and has no `txt-2`.
-fn effective_expression<'a>(id: &str, expression: &'a str) -> &'a str {
+/// The expression actually evaluated for a constraint.
+///
+/// - R4 through R5 give the two narrative invariants the same expression,
+///   `htmlChecks()`, though they state different rules: `txt-1` the allowed
+///   elements and attributes, `txt-2` "SHALL have some non-whitespace
+///   content". Evaluating `txt-2` as written would re-check `txt-1` and leave
+///   the content rule unchecked, so it runs `htmlChecks2()`, the content
+///   check (the HL7 validator's name for it). R6 folds both rules into
+///   `txt-1` and has no `txt-2`.
+/// - The `as(type)` *function* filters a collection by type in the HL7
+///   validator, and invariants rely on it: dom-3 applies it to
+///   `%resource.descendants()`. helios-fhirpath follows the FHIRPath
+///   spec's singleton rule and fails, so dom-3 never ran. The function form
+///   is evaluated as `ofType(type)`, which is the same on a single item and
+///   filters a collection; the `as` operator is left alone.
+fn effective_expression<'a>(id: &str, expression: &'a str) -> Cow<'a, str> {
     if id == "txt-2" && expression.trim() == "htmlChecks()" {
-        "htmlChecks2()"
-    } else {
-        expression
+        return Cow::Borrowed("htmlChecks2()");
     }
+    if expression.contains(".as(") {
+        return Cow::Owned(expression.replace(".as(", ".ofType("));
+    }
+    Cow::Borrowed(expression)
 }
 
 /// Build the combined focus+invariant expression from a dotted validator
@@ -205,9 +216,27 @@ mod tests {
 
     #[test]
     fn txt_2_checks_content_not_names() {
-        assert_eq!(effective_expression("txt-2", "htmlChecks()"), "htmlChecks2()");
-        assert_eq!(effective_expression("txt-1", "htmlChecks()"), "htmlChecks()");
+        assert_eq!(
+            effective_expression("txt-2", "htmlChecks()"),
+            "htmlChecks2()"
+        );
+        assert_eq!(
+            effective_expression("txt-1", "htmlChecks()"),
+            "htmlChecks()"
+        );
         assert_eq!(effective_expression("txt-2", "other()"), "other()");
+    }
+
+    #[test]
+    fn as_function_filters_like_of_type() {
+        assert_eq!(
+            effective_expression("dom-3", "%resource.descendants().as(canonical)"),
+            "%resource.descendants().ofType(canonical)"
+        );
+        assert_eq!(
+            effective_expression("x-1", "(value as Quantity).exists()"),
+            "(value as Quantity).exists()"
+        );
     }
 
     #[test]
