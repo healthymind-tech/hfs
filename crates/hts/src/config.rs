@@ -79,6 +79,14 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_MAX_BODY_SIZE", default_value = "10485760")]
     pub max_body_size: usize,
 
+    /// Seconds a request may run before HTS answers `408`. Bundle imports
+    /// into a large database (SNOMED + LOINC) can take longer than the
+    /// default; when one times out its write still runs to completion and
+    /// holds the SQLite write lock, so later writes fail with
+    /// "database is locked". Mirrors `HFS_REQUEST_TIMEOUT`.
+    #[arg(long, env = "HTS_REQUEST_TIMEOUT", default_value = "30")]
+    pub request_timeout: u64,
+
     /// Maximum number of codes allowed in a single ValueSet expansion.
     /// Requests that would exceed this limit receive HTTP 422 with issue
     /// code `too-costly`.
@@ -196,6 +204,7 @@ impl Default for HtsConfig {
             enable_cors: true,
             cors_origins: "*".into(),
             max_body_size: 10 * 1024 * 1024, // 10MB
+            request_timeout: 30,
             max_expansion_size: 10_000,
             auto_supplements: true,
             bootstrap_dir: String::new(),

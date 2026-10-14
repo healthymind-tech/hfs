@@ -306,7 +306,7 @@ where
         .layer(cors)
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
+            Duration::from_secs(config.request_timeout.max(1)),
         ))
         .layer(TraceLayer::new_for_http())
 }
