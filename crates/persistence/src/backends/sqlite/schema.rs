@@ -31,7 +31,7 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
     ),
     (
         "idx_search_token",
-        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code, resource_key) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
     ),
     (
         "idx_search_date",
@@ -150,6 +150,100 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
         );
     }
 
+    ensure_keyed_token_index(conn)?;
+
+    Ok(())
+}
+
+/// A database whose `search_index` has at most this many rows (by its highest
+/// rowid, which costs one b-tree descent to read) has `idx_search_token`
+/// rebuilt with `resource_key` at startup without being asked: well under a
+/// couple of seconds even on a spinning disk.
+const KEYED_TOKEN_INDEX_AUTO_MAX_ROWS: i64 = 500_000;
+
+/// Opts a larger database into the `idx_search_token` rebuild at startup.
+pub(crate) const KEYED_TOKEN_INDEX_ENV: &str = "HFS_SQLITE_REBUILD_TOKEN_INDEX";
+
+/// The statement that brings an existing `idx_search_token` up to date: drop
+/// it and create it as [`SEARCH_VALUE_INDEXES`] defines it.
+pub(crate) fn keyed_token_index_sql() -> String {
+    let create = SEARCH_VALUE_INDEXES
+        .iter()
+        .find(|(name, _)| *name == "idx_search_token")
+        .map(|(_, sql)| sql.replace("IF NOT EXISTS ", ""))
+        .expect("idx_search_token is a search value index");
+    format!("DROP INDEX IF EXISTS idx_search_token; {create};")
+}
+
+/// Brings `idx_search_token` up to its current definition, which ends in
+/// `resource_key`.
+///
+/// Without that column every token membership reads each matching row's
+/// `resource_key` from the table: `Observation?code=<17,837 matches>
+/// &_summary=count` spent ~50 of its ~73 ms there on the 527k-resource
+/// benchmark database, and it is ~22 ms with the column in the index, which
+/// then answers the membership alone. The index is otherwise unchanged (same
+/// columns before it, same partial predicate), so it serves every lookup it
+/// served before.
+///
+/// Rebuilding is a full pass over the token rows (3.66M rows took ~10 s on
+/// NVMe), which a spinning disk must not pay unannounced at startup. So an
+/// existing index is rebuilt here only on a small database (at most
+/// [`KEYED_TOKEN_INDEX_AUTO_MAX_ROWS`] rows), or when the operator sets
+/// [`KEYED_TOKEN_INDEX_ENV`]; otherwise this logs the statement to run and
+/// leaves the index as it is. Searches give the same answers either way. A
+/// bulk index rebuild (which drops and recreates the value indexes) also
+/// creates it in its current form. No schema version is involved.
+fn ensure_keyed_token_index(conn: &Connection) -> StorageResult<()> {
+    let columns: Vec<String> = match conn.prepare("PRAGMA index_info(idx_search_token)") {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| row.get::<_, String>(2))
+            .and_then(|rows| rows.collect())
+            .map_err(|e| migration_err(format!("read idx_search_token columns: {e}")))?,
+        Err(e) => return Err(migration_err(format!("read idx_search_token columns: {e}"))),
+    };
+    if columns.is_empty() || columns.iter().any(|c| c == "resource_key") {
+        // Missing altogether (a bulk rebuild in flight recreates it), or
+        // already current.
+        return Ok(());
+    }
+    let max_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM search_index",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| migration_err(format!("size search_index: {e}")))?;
+    let opted_in = std::env::var(KEYED_TOKEN_INDEX_ENV)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    let sql = keyed_token_index_sql();
+    if max_rowid > KEYED_TOKEN_INDEX_AUTO_MAX_ROWS && !opted_in {
+        tracing::warn!(
+            search_index_rows = max_rowid,
+            statement = %sql,
+            "idx_search_token predates resource_key: token searches and counts read every \
+             match's row from search_index. Run the statement against the database while HFS \
+             is stopped, or set {KEYED_TOKEN_INDEX_ENV}=true to have HFS run it at the next \
+             start (it rebuilds the token index: ~10 s per 3.7M token rows on NVMe, longer on \
+             a spinning disk)"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        search_index_rows = max_rowid,
+        "rebuilding idx_search_token with resource_key"
+    );
+    let started = std::time::Instant::now();
+    conn.execute_batch(&format!("BEGIN IMMEDIATE; {sql} COMMIT;"))
+        .map_err(|e| {
+            let _ = conn.execute_batch("ROLLBACK");
+            migration_err(format!("rebuild idx_search_token: {e}"))
+        })?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "rebuilt idx_search_token with resource_key"
+    );
     Ok(())
 }
 
@@ -3196,6 +3290,57 @@ mod tests {
             SEARCH_VALUE_INDEXES.len()
         );
         assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
+    }
+
+    /// An `idx_search_token` from before `resource_key` joined it is brought up
+    /// to date at startup on a small database, and the result is the
+    /// definition a fresh database gets.
+    #[test]
+    fn a_small_database_gets_the_keyed_token_index_at_startup() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let token_columns = |conn: &Connection| -> Vec<String> {
+            conn.prepare("PRAGMA index_info(idx_search_token)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            token_columns(&conn).last().map(String::as_str),
+            Some("resource_key")
+        );
+
+        conn.execute_batch(
+            "DROP INDEX idx_search_token;
+             CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
+        )
+        .unwrap();
+        assert!(!token_columns(&conn).contains(&"resource_key".to_string()));
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(
+            token_columns(&conn),
+            [
+                "tenant_id",
+                "resource_type",
+                "param_name",
+                "value_token_system",
+                "value_token_code",
+                "resource_key"
+            ]
+        );
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_search_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL")
+        );
     }
 
     /// A database upgraded through the ladder must end up with exactly the
