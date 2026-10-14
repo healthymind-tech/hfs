@@ -160,6 +160,7 @@ pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
 pub mod middleware;
+pub mod packages;
 pub(crate) mod public_url;
 pub(crate) mod rate_limit;
 pub mod responses;
@@ -971,6 +972,34 @@ where
     let console_admin_state = state.clone();
     let admin_tenants_state = state.clone();
 
+    // The FHIR package (IG) manager (`/admin/packages`, `HFS_PACKAGES`).
+    // Its registry lives in the backend's own database when the backend has
+    // registry tables (SQLite, PostgreSQL), else in a JSON file in the
+    // package cache directory.
+    let package_store: Arc<dyn helios_persistence::core::PackageStore> =
+        match storage_arc.package_store() {
+            Some(store) => store,
+            None => Arc::new(packages::store::FilePackageStore::at(
+                packages::manager::cache_dir(&config).join("registry.json"),
+            )),
+        };
+    let package_manager = Arc::new(packages::PackageManager::new(
+        &config,
+        packages::ManagerDeps {
+            storage: Arc::clone(&storage_arc) as Arc<dyn ResourceStorage>,
+            store: package_store,
+            validation: state.validation_shared(),
+            observers: Arc::clone(state.write_observer()),
+            audit: state.audit_sink().cloned(),
+            audit_source: state.audit_source_observer().to_string(),
+        },
+    ));
+    if config.packages.admin_ui {
+        info!("Package administration is ENABLED (HFS_ADMIN_UI=true): /admin/packages");
+    }
+    package_manager.spawn_startup();
+    let package_upload_limit = usize::try_from(config.packages.max_size).unwrap_or(usize::MAX);
+
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
@@ -1044,7 +1073,11 @@ where
     // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
     // tier as `console/metrics/tenants`: system-context scope + authentication.
     let admin_console = routing::console_metrics::admin_routes(console_admin_state)
-        .merge(routing::admin_tenants::routes(admin_tenants_state));
+        .merge(routing::admin_tenants::routes(admin_tenants_state))
+        .merge(routing::admin_packages::routes(
+            package_manager,
+            package_upload_limit,
+        ));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
             .route_layer(axum::middleware::from_fn_with_state(

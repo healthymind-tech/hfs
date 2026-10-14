@@ -112,7 +112,15 @@ aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)
-reqwest = { version = "0.12", features = ["json", "gzip"] }
+# `rustls-tls`: the package manager downloads FHIR packages over HTTPS with a
+# pure-Rust TLS stack (already in the graph through helios-ui's reqwest).
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"] }
+
+# FHIR package (IG) manager: `.tgz` archives are read in memory (never
+# extracted) and checked against the registry's SHA-1 shasum. Both crates are
+# already in the lock file (helios-hts reads the same archives).
+tar = "0.4"
+sha1 = "0.10"
 
 # JWT signing for the bulk-submit outbound SMART Backend Services client.
 jsonwebtoken = "9"
