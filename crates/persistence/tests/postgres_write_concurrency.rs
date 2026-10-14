@@ -475,3 +475,55 @@ async fn bundle_full_text_survives_an_oversized_resource() {
     assert_eq!(matches("betaword").await, vec!["small-b"]);
     assert_eq!(matches("lexeme00000000").await, vec!["huge"]);
 }
+
+/// Bundles that must take the exclusive gate (here: one `ifNoneExist` entry
+/// each) run one at a time. Waiting their turn is not an error: the wait is
+/// bounded separately from `statement_timeout`, so with a 1.5 s statement
+/// timeout eight serialised bundles still all commit.
+#[tokio::test]
+async fn exclusive_gate_waits_are_not_cut_off_by_statement_timeout() {
+    let pg = shared_pg().await;
+    let backend = Arc::new(
+        PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 16,
+            statement_timeout_ms: 1_500,
+            data_dir: Some(data_dir()),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    backend.init_schema().await.unwrap();
+    let tenant = tenant("gatewait");
+
+    let mut tasks = Vec::new();
+    for client in 0..8 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut entries: Vec<BundleEntry> = (0..800)
+                .map(|n| post_patient_entry(&format!("q{client}"), n))
+                .collect();
+            entries[0].if_none_exist = Some(format!("identifier=http://example.org/q|{client}"));
+            entries[0].resource.as_mut().unwrap()["identifier"] =
+                json!([{"system": "http://example.org/q", "value": client.to_string()}]);
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("client {client}: {e}"))
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        8 * 800
+    );
+}

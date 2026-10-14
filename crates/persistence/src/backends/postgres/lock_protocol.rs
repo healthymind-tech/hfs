@@ -129,6 +129,17 @@ where
     Ok(keys)
 }
 
+/// How long a writer may wait for the tenant gate and its resource keys.
+///
+/// Lock waits used to run under the session's `statement_timeout` (30 s by
+/// default), which bounds how long one statement may *work*, not how long a
+/// writer may queue. Behind bundles that legitimately hold the exclusive gate
+/// in turn — conditional or SearchParameter bundles under load — the queue
+/// outlasted it and writers failed 500 "rolled back" although nothing was
+/// wrong. The wait now has its own, longer bound; the statements after it run
+/// under the caller's timeout again.
+const LOCK_WAIT_TIMEOUT_MS: u64 = 600_000;
+
 /// Runs advisory-lock statements as one simple-query message.
 ///
 /// `query_one("SELECT pg_advisory_xact_lock($1, $2)", …)` with a `&str` is
@@ -153,7 +164,16 @@ async fn advisory_xact_locks(
     } else {
         "pg_advisory_xact_lock"
     };
-    let mut sql = String::with_capacity((keys.len() + 1) * 58);
+    let mut sql = String::with_capacity((keys.len() + 4) * 58 + 160);
+    // Wait under LOCK_WAIT_TIMEOUT_MS, not the session's statement_timeout,
+    // then put back exactly the value the caller had.
+    writeln!(
+        sql,
+        "SELECT set_config('hfs.saved_statement_timeout', current_setting('statement_timeout'), true);"
+    )
+    .expect("writing to String cannot fail");
+    writeln!(sql, "SET LOCAL statement_timeout = {LOCK_WAIT_TIMEOUT_MS};")
+        .expect("writing to String cannot fail");
     writeln!(
         sql,
         "SELECT {gate_fn}({TENANT_GATE_NAMESPACE}, {gate_key});"
@@ -166,6 +186,11 @@ async fn advisory_xact_locks(
         )
         .expect("writing to String cannot fail");
     }
+    writeln!(
+        sql,
+        "SELECT set_config('statement_timeout', current_setting('hfs.saved_statement_timeout'), true);"
+    )
+    .expect("writing to String cannot fail");
     client
         .batch_execute(&sql)
         .await
