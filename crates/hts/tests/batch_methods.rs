@@ -39,9 +39,9 @@ fn statuses(body: &Value) -> Vec<String> {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn batch_creates_reads_operates_updates_and_deletes() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
 
     // 1. Create both resources through the batch endpoint.
     let (st, body) = app
@@ -148,9 +148,9 @@ async fn batch_creates_reads_operates_updates_and_deletes() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn batch_entry_without_method_defaults_to_post_and_bad_entries_are_isolated() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
     app.post_fhir("/CodeSystem", code_system().to_string())
         .await;
 

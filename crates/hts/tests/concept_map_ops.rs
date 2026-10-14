@@ -52,9 +52,9 @@ async fn translate(app: &TestApp, cm_url: &str, source_system: &str, code: &str)
 // ── R4 ConceptMap translation ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r4_arm_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R4, bundles::ANATOMY_CS_URL, "arm").await;
@@ -64,9 +64,9 @@ async fn translate_r4_arm_returns_snomed_code() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r4_leg_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R4, bundles::ANATOMY_CS_URL, "leg").await;
@@ -76,9 +76,9 @@ async fn translate_r4_leg_returns_snomed_code() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r4_unmapped_code_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // 'head' has no mapping in the R4 ConceptMap
@@ -90,9 +90,9 @@ async fn translate_r4_unmapped_code_returns_false() {
 // ── R4B ConceptMap translation ────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r4b_arm_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4b_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R4B, bundles::ANATOMY_CS_URL, "arm").await;
@@ -104,9 +104,9 @@ async fn translate_r4b_arm_returns_snomed_code() {
 // ── R5 ConceptMap translation (relationship field) ────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r5_arm_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r5_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R5, bundles::ANATOMY_CS_URL, "arm").await;
@@ -119,9 +119,9 @@ async fn translate_r5_arm_returns_snomed_code() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r5_leg_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r5_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R5, bundles::ANATOMY_CS_URL, "leg").await;
@@ -133,9 +133,9 @@ async fn translate_r5_leg_returns_snomed_code() {
 // ── R6 ConceptMap translation ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r6_arm_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r6_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R6, bundles::ANATOMY_CS_URL, "arm").await;
@@ -145,9 +145,9 @@ async fn translate_r6_arm_returns_snomed_code() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_r6_leg_returns_snomed_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r6_bundle()).await;
 
     let (result, code) = translate(&app, bundles::CM_URL_R6, bundles::ANATOMY_CS_URL, "leg").await;
@@ -162,9 +162,9 @@ async fn translate_r6_leg_returns_snomed_code() {
 // the TX benchmark preflight treats the test as "skip" rather than "fail".
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_unknown_concept_map_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -180,9 +180,9 @@ async fn translate_unknown_concept_map_returns_404() {
 // ── GET /ConceptMap (search) ──────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_concept_maps_no_filter_returns_bundle() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ConceptMap").await;
@@ -195,9 +195,9 @@ async fn search_concept_maps_no_filter_returns_bundle() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_concept_maps_by_url_returns_match() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let url = format!("/ConceptMap?url={}", bundles::CM_URL_R4);
@@ -210,9 +210,9 @@ async fn search_concept_maps_by_url_returns_match() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_concept_maps_unknown_url_returns_empty() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app
@@ -225,9 +225,9 @@ async fn search_concept_maps_unknown_url_returns_empty() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_concept_maps_by_name() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ConceptMap?name=AnatomyMapR4").await;
@@ -239,9 +239,9 @@ async fn search_concept_maps_by_name() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_concept_maps_pagination() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ConceptMap?_count=1").await;
@@ -257,9 +257,9 @@ async fn search_concept_maps_pagination() {
 // ── Instance-level: /ConceptMap/{id}/$translate ───────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_post_returns_same_as_system_level() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // System-level
@@ -305,9 +305,9 @@ async fn translate_by_id_post_returns_same_as_system_level() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_get_returns_match() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app
@@ -331,9 +331,9 @@ async fn translate_by_id_get_returns_match() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[

@@ -8,7 +8,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use helios_hts::backends::SqliteTerminologyBackend;
+mod common;
+
 use helios_hts::config::HtsConfig;
 use helios_hts::state::AppState;
 use serde_json::{Value, json};
@@ -22,16 +23,62 @@ struct Env {
     import_dir: std::path::PathBuf,
 }
 
-fn env(admin: bool) -> Env {
+/// The backend label `/admin` reports for the store under test.
+fn backend_label() -> &'static str {
+    if common::pg_mode() {
+        "postgres"
+    } else {
+        "sqlite"
+    }
+}
+
+async fn env(admin: bool) -> Env {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("hts.db");
     let import_dir = dir.path().join("import");
     std::fs::create_dir_all(&import_dir).unwrap();
-    let backend = SqliteTerminologyBackend::new(db.to_str().unwrap()).unwrap();
-    let pool = backend.pool().clone();
-    let state = AppState::new(backend).with_hts_pool(pool);
-    let config = HtsConfig {
-        database_url: db.to_string_lossy().into_owned(),
+    #[cfg(feature = "postgres")]
+    if common::pg_mode() {
+        let url = common::fresh_pg_database().await;
+        let backend = helios_hts::backends::PostgresTerminologyBackend::new(&url)
+            .await
+            .unwrap();
+        let state = AppState::new(backend);
+        let config = HtsConfig {
+            storage_backend: "postgres".into(),
+            database_url: url,
+            ..env_config(&dir, &import_dir, admin)
+        };
+        let app = helios_hts::server::create_app(&config, state);
+        return Env {
+            _dir: dir,
+            app,
+            import_dir,
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let db = dir.path().join("hts.db");
+        let backend =
+            helios_hts::backends::SqliteTerminologyBackend::new(db.to_str().unwrap()).unwrap();
+        let pool = backend.pool().clone();
+        let state = AppState::new(backend).with_hts_pool(pool);
+        let config = HtsConfig {
+            database_url: db.to_string_lossy().into_owned(),
+            ..env_config(&dir, &import_dir, admin)
+        };
+        let app = helios_hts::server::create_app(&config, state);
+        Env {
+            _dir: dir,
+            app,
+            import_dir,
+        }
+    }
+    #[cfg(not(feature = "sqlite"))]
+    panic!("no backend")
+}
+
+fn env_config(dir: &tempfile::TempDir, import_dir: &std::path::Path, admin: bool) -> HtsConfig {
+    HtsConfig {
         admin_ui: admin,
         admin_data_dir: dir.path().join("admin").to_string_lossy().into_owned(),
         import_dir: import_dir.to_string_lossy().into_owned(),
@@ -39,12 +86,6 @@ fn env(admin: bool) -> Env {
         upload_chunk_size: 64 * 1024,
         disk_headroom: 0,
         ..HtsConfig::default()
-    };
-    let app = helios_hts::server::create_app(&config, state);
-    Env {
-        _dir: dir,
-        app,
-        import_dir,
     }
 }
 
@@ -163,12 +204,12 @@ async fn upload(app: &Router, name: &str, data: &[u8]) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_import_pin_delete_round_trip() {
-    let e = env(true);
+    let e = env(true).await;
     let app = &e.app;
 
     let (s, status) = send(app, "GET", "/admin", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(status["backend"], "sqlite");
+    assert_eq!(status["backend"], backend_label());
     let (_, formats) = send(app, "GET", "/admin/formats", None).await;
     assert!(
         formats["formats"]
@@ -436,7 +477,7 @@ async fn upload_import_pin_delete_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_import_is_rolled_back_and_queued_jobs_cancel() {
-    let e = env(true);
+    let e = env(true).await;
     let app = &e.app;
     std::fs::write(e.import_dir.join("a.json"), bundle("1.0.0", 10)).unwrap();
     // Queue two compaction jobs ahead so the import stays queued long enough
@@ -478,9 +519,9 @@ async fn cancelled_import_is_rolled_back_and_queued_jobs_cancel() {
     assert_eq!(s, StatusCode::CONFLICT, "finished jobs cannot be cancelled");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_api_is_off_by_default() {
-    let e = env(false);
+    let e = env(false).await;
     let (s, _) = send(&e.app, "GET", "/admin", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _) = send(&e.app, "GET", "/ui/hts/api/admin/formats", None).await;

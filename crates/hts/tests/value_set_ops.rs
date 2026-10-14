@@ -10,9 +10,9 @@ use common::{TestApp, bundles};
 // ── $expand ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_returns_all_included_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::LIMBS_VS_URL)]);
@@ -40,9 +40,9 @@ async fn expand_returns_all_included_codes() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_unknown_value_set_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", "http://hts.test/vs/no-such-vs")]);
@@ -52,9 +52,9 @@ async fn expand_unknown_value_set_returns_404() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_with_count_limits_results() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // Request only 1 result
@@ -112,9 +112,9 @@ const ISA_HIERARCHY_BUNDLE: &str = r#"{
 /// ValueSet wholly includes an is-a CodeSystem, the expansion nests children
 /// under their parent (FHIR default; IG `version/vs-expand-versionless`).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_codesystem_nests_by_default() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -144,9 +144,9 @@ async fn expand_is_a_codesystem_nests_by_default() {
 
 /// `excludeNested=true` keeps the same is-a CodeSystem expansion FLAT.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_codesystem_flat_with_exclude_nested() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -171,9 +171,9 @@ async fn expand_is_a_codesystem_flat_with_exclude_nested() {
 /// An include carrying an `is-a` filter designates a hierarchy subtree, so an
 /// unpaged expansion of it nests by default (IG `search/search-filter-yes`).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_nests_by_default() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let (status, body) = app
@@ -203,9 +203,9 @@ async fn expand_is_a_filter_nests_by_default() {
 /// honour `count` — otherwise `count=10` over a SNOMED root reads ~10^5 concepts
 /// and returns all of them (regression guard for issue #227).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_stays_flat_when_paged() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = isa_filter_expand(&[r#"{"name":"count","valueInteger":2}"#]);
@@ -224,9 +224,9 @@ async fn expand_is_a_filter_stays_flat_when_paged() {
 /// `search/search-filter-yes` fixture filters on `"data"` and still expects the
 /// matches nested under `data-exchange`. Mirrors that fixture locally.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_with_text_filter_still_nests() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(DATA_EXCHANGE_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -305,9 +305,9 @@ fn isa_filter_expand(extra: &[&str]) -> String {
 // ── $validate-code (ValueSet) ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_included_code_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -331,9 +331,9 @@ async fn vs_validate_code_included_code_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_excluded_code_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // 'head' is NOT in the limbs ValueSet (which only includes limb, arm, leg)
@@ -364,9 +364,9 @@ async fn vs_validate_code_excluded_code_returns_false() {
 ///
 /// Covers the IG `version-code-v10-vs10-response-parameters` fixture.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_version_echoes_requested_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     // Import a bundle with two versions of the same CodeSystem plus a
     // ValueSet that pins version 1.0.0.
@@ -464,9 +464,9 @@ async fn vs_validate_code_version_echoes_requested_version() {
 // ── GET /ValueSet (search) ────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_no_filter_returns_bundle() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet").await;
@@ -479,9 +479,9 @@ async fn search_value_sets_no_filter_returns_bundle() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_by_url_returns_match() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let url = format!("/ValueSet?url={}", bundles::LIMBS_VS_URL);
@@ -494,9 +494,9 @@ async fn search_value_sets_by_url_returns_match() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_unknown_url_returns_empty() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app
@@ -509,9 +509,9 @@ async fn search_value_sets_unknown_url_returns_empty() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_by_name() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet?name=LimbsVS").await;
@@ -523,9 +523,9 @@ async fn search_value_sets_by_name() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_pagination() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet?_count=1").await;
@@ -541,9 +541,9 @@ async fn search_value_sets_pagination() {
 // ── Instance-level: /ValueSet/{id}/$expand ────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_post_returns_same_as_system_level() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // System-level
@@ -588,9 +588,9 @@ async fn expand_by_id_post_returns_same_as_system_level() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_get_returns_expansion() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet/limbs/$expand").await;
@@ -602,9 +602,9 @@ async fn expand_by_id_get_returns_expansion() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, _) = app
@@ -620,9 +620,9 @@ async fn expand_by_id_unknown_id_returns_404() {
 // ── Instance-level: /ValueSet/{id}/$validate-code ────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_by_id_post_included_code_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -645,9 +645,9 @@ async fn vs_validate_by_id_post_included_code_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -664,7 +664,7 @@ async fn vs_validate_by_id_unknown_id_returns_404() {
 // ── too-costly expansion limit ────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_exceeds_limit_returns_422_too_costly() {
     use axum::{body::Body, http::Request};
     use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
@@ -721,9 +721,9 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_coding_in_set_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -759,9 +759,9 @@ async fn vs_validate_coding_in_set_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_one_match_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -796,9 +796,9 @@ async fn vs_validate_codeable_concept_one_match_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_no_match_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -842,9 +842,9 @@ async fn vs_validate_codeable_concept_no_match_returns_false() {
 /// Hierarchy: limb → arm, leg.  `body` (parent of `limb`) is not in the
 /// expansion, so `limb` becomes the single root with arm + leg nested under it.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_hierarchical_returns_nested_tree() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = serde_json::json!({
@@ -881,9 +881,9 @@ async fn expand_hierarchical_returns_nested_tree() {
 
 /// $expand with `hierarchical=false` (or absent) returns the flat list unchanged.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_hierarchical_false_returns_flat_list() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = serde_json::json!({
@@ -912,9 +912,9 @@ async fn expand_hierarchical_false_returns_flat_list() {
 
 /// $expand with `Accept: application/fhir+xml` should return valid FHIR XML.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_xml_response_contains_valueset_root() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::LIMBS_VS_URL)]);
@@ -935,9 +935,9 @@ async fn expand_xml_response_contains_valueset_root() {
 /// $expand with a URL that matches `CodeSystem.valueSet` (no explicit ValueSet
 /// resource) returns all codes in that CodeSystem.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_implicit_vs_returns_all_cs_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::IMPLICIT_VS_URL)]);
@@ -960,9 +960,9 @@ async fn expand_implicit_vs_returns_all_cs_codes() {
 
 /// The `total` in the expansion equals the number of codes in the CodeSystem.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_implicit_vs_total_matches_concept_count() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::IMPLICIT_VS_URL)]);

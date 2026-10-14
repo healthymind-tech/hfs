@@ -313,20 +313,10 @@ async fn crud_delete_also_removes_translate_data() {
     let del = app.delete_fhir(&format!("/ConceptMap/{id}")).await;
     assert_eq!(del, StatusCode::NO_CONTENT);
 
-    // Translate after delete → result=false (map no longer indexed)
+    // Translate after delete → 404: the named map is gone (same contract as
+    // SQLite, where an unknown `url` is "not loaded", not "no match").
     let (status, body) = app.post_fhir("/ConceptMap/$translate", tx).await;
-    assert_eq!(status, StatusCode::OK);
-    let result = body["parameter"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "result")
-        .and_then(|p| p["valueBoolean"].as_bool())
-        .unwrap_or(false);
-    assert!(
-        !result,
-        "translate should return false after delete, got: {body}"
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
