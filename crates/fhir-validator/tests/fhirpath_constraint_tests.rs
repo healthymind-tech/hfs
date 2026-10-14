@@ -323,3 +323,36 @@ async fn dom_3_flags_unreferenced_contained_resources() {
         .await;
     assert!(dom3(&errors).is_empty(), "{errors:#?}");
 }
+
+/// An invariant that evaluates to empty on a nested node passes, as at the
+/// root: ref-1 on a logical (identifier-only) reference is `{} or {}`.
+#[tokio::test]
+async fn empty_invariant_results_pass_on_nested_nodes() {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let suppress = suppress();
+    let mut h = handlers(&evaluator);
+    h.suppress_constraints = &suppress;
+    let ref1 = |subject: serde_json::Value| {
+        let validator = &validator;
+        let h = &h;
+        async move {
+            let obs = json!({
+                "resourceType": "Observation", "status": "final",
+                "code": {"text": "t"}, "subject": subject
+            });
+            validator
+                .validate(&obs, FhirVersion::R4, &ValidationOptions::default(), h)
+                .await
+                .into_iter()
+                .filter(|e| e.extra.get("constraint") == Some(&json!("ref-1")))
+                .count()
+        }
+    };
+    assert_eq!(
+        ref1(json!({"identifier": {"system": "http://x", "value": "1"}})).await,
+        0
+    );
+    assert_eq!(ref1(json!({"display": "someone"})).await, 0);
+    assert_eq!(ref1(json!({"reference": "#nope"})).await, 1);
+}

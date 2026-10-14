@@ -4,17 +4,21 @@
 //! `helios_fhir` model (the `crates/sof` pattern) — helios-fhirpath
 //! evaluates against typed resources, not raw JSON. Each constraint is then
 //! evaluated as one combined expression: for a constraint attached below
-//! the root, the validator path is rendered as a relative FHIRPath and the
-//! invariant is wrapped in `.all(...)`:
+//! the root, the validator path is rendered as a relative FHIRPath, and the
+//! invariant runs per node inside `.all(...)`, coerced with `allTrue()`:
 //!
 //! ```text
 //! path Patient.contact.0, expr "name.exists() or telecom.exists()"
-//!   → contact[0].all(name.exists() or telecom.exists())
+//!   → contact[0].all((name.exists() or telecom.exists()).allTrue())
 //! ```
 //!
-//! `all()` gives the correct per-node focus *and* the FHIR invariant
-//! semantics for absent nodes (empty collection → pass). Root-attached
-//! constraints evaluate as-is.
+//! `all()` gives the per-node focus and passes an absent node. `allTrue()`
+//! turns a node's empty result into a pass, as FHIR invariant semantics
+//! require for every node, not only the root: `all()` alone wants each
+//! criterion to be `true`, so ref-1 on a logical, identifier-only reference
+//! (`{} or {}`) was reported as a violation. (`select(...).allTrue()` has the
+//! same semantics but measured twice as slow in helios-fhirpath.)
+//! Root-attached constraints evaluate as-is.
 //!
 //! Result coercion (FHIRPath 5.1.1 / FHIR invariant semantics): empty →
 //! pass; a single boolean → itself; anything else → not evaluable
@@ -135,7 +139,7 @@ fn effective_expression<'a>(id: &str, expression: &'a str) -> Cow<'a, str> {
 }
 
 /// Build the combined focus+invariant expression from a dotted validator
-/// path (`Patient.contact.0` → `contact[0].all(<expr>)`).
+/// path (`Patient.contact.0` → `contact[0].all((<expr>).allTrue())`).
 fn combine(path: &str, expression: &str) -> String {
     let mut relative = String::new();
     for segment in path.split('.').skip(1) {
@@ -153,7 +157,7 @@ fn combine(path: &str, expression: &str) -> String {
     if relative.is_empty() {
         expression.to_string()
     } else {
-        format!("{relative}.all({expression})")
+        format!("{relative}.all(({expression}).allTrue())")
     }
 }
 
@@ -244,11 +248,11 @@ mod tests {
         assert_eq!(combine("Patient", "name.exists()"), "name.exists()");
         assert_eq!(
             combine("Patient.contact.0", "name.exists() or telecom.exists()"),
-            "contact[0].all(name.exists() or telecom.exists())"
+            "contact[0].all((name.exists() or telecom.exists()).allTrue())"
         );
         assert_eq!(
             combine("Patient.name.2.given", "length() < 10"),
-            "name[2].given.all(length() < 10)"
+            "name[2].given.all((length() < 10).allTrue())"
         );
     }
 }
