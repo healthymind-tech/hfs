@@ -348,6 +348,7 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
     // Clone the Arcs up front: keyword validators need `&mut ctx` while the
     // set is borrowed, and Arc clones are cheap.
     let schemas: Vec<Arc<FhirSchema>> = set.schemas().cloned().collect();
+    let primitive_set = schemas.iter().any(|s| s.is_primitive());
     for schema in &schemas {
         if schema.is_primitive() {
             super::primitives::validate_primitive(ctx, schema, data);
@@ -398,7 +399,11 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 });
             }
         }
-        if schema.elements.is_some() && !data.is_object() {
+        // `elements` on a primitive element (a profile constraining
+        // `code.extension`, like TW Core's identifier-suffix on
+        // `identifier.type.coding.code`) describe its `_code` sidecar, not
+        // the JSON value: a string there is not a wrong container.
+        if schema.elements.is_some() && !data.is_object() && !primitive_set {
             ctx.error(
                 ErrorKind::Type,
                 errors::msg_expected_object_comma(errors::json_type_name(data)),
@@ -995,6 +1000,35 @@ mod tests {
         let missing = slice_errors(&obs(json!([{"coding": [other]}])));
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(missing[0].path, "Observation.category");
+    }
+
+    /// A profile that constrains a primitive's extensions gives the
+    /// primitive element `elements`; the JSON string is still fine.
+    #[test]
+    fn elements_on_a_primitive_element_accept_the_primitive() {
+        use crate::engine::Validator;
+        use crate::resolver::SchemaRegistry;
+        let mut registry = SchemaRegistry::new();
+        registry.insert_named(
+            "code",
+            serde_json::from_value(json!({"kind": "primitive-type"})).unwrap(),
+        );
+        registry.insert_named(
+            "Thing",
+            serde_json::from_value(json!({"elements": {
+                "resourceType": {"type": "code"},
+                "c": {"type": "code", "elements": {"extension": {"type": "code", "array": true}}}
+            }}))
+            .unwrap(),
+        );
+        let validator = Validator::new(Arc::new(registry));
+        let errors = validator
+            .validate_sync(
+                &json!({"resourceType": "Thing", "c": "x"}),
+                &crate::ValidationOptions::default(),
+            )
+            .errors;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
