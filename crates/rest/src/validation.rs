@@ -777,6 +777,66 @@ impl TerminologyProvider for RemoteTerminologyProvider {
     }
 }
 
+// ---------------------------------------------------------------------
+// OperationOutcome mapping
+// ---------------------------------------------------------------------
+
+/// Map one validator issue onto an OperationOutcome issue.
+pub fn to_outcome_issue(error: &ValidationError) -> Issue {
+    let code = match error.kind {
+        ErrorKind::Required => IssueType::Required,
+        ErrorKind::FixedValue | ErrorKind::PatternValue | ErrorKind::PrimitiveValue => {
+            IssueType::Value
+        }
+        ErrorKind::FhirpathConstraint => IssueType::Invariant,
+        // A known extension outside its declared context (#615): invalid
+        // content by placement, not a structural malformation.
+        ErrorKind::ExtensionContext => IssueType::Invalid,
+        ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
+        ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
+        // Everything structural: unknown-element, shape, cardinality,
+        // slicing, choices, wrong container type.
+        ErrorKind::UnknownElement
+        | ErrorKind::NotArray
+        | ErrorKind::NotSingular
+        | ErrorKind::Type
+        | ErrorKind::Excluded
+        | ErrorKind::Min
+        | ErrorKind::Max
+        | ErrorKind::SliceCardinality
+        | ErrorKind::SliceUnmatched
+        | ErrorKind::SliceOrder
+        | ErrorKind::Choice
+        | ErrorKind::ChoiceExcluded => IssueType::Structure,
+    };
+    let severity = match error.severity {
+        Severity::Error => IssueSeverity::Error,
+        Severity::Warning => IssueSeverity::Warning,
+    };
+    Issue::new(severity, code, error.message.clone())
+        .with_expression(dotted_to_fhirpath(&error.path))
+}
+
+/// Build the `$validate` OperationOutcome: the mapped issues, or the
+/// canonical all-clear information issue when there are none.
+pub fn validation_outcome(errors: &[ValidationError]) -> Value {
+    let mut builder = OperationOutcomeBuilder::new();
+    if errors.is_empty() {
+        builder = builder.information(IssueType::Informational, "Validation successful");
+    } else {
+        for error in errors {
+            builder = builder.add_issue(to_outcome_issue(error));
+        }
+    }
+    builder.build()
+}
+
+/// Whether any issue is error severity (drives `$validate` reporting and
+/// enforce-mode rejection).
+pub fn has_errors(errors: &[ValidationError]) -> bool {
+    errors.iter().any(|e| e.severity == Severity::Error)
+}
+
 #[cfg(test)]
 mod remote_provider_tests {
     use super::*;
@@ -893,64 +953,4 @@ mod remote_provider_tests {
             TerminologyErrorKind::Unavailable
         );
     }
-}
-
-// ---------------------------------------------------------------------
-// OperationOutcome mapping
-// ---------------------------------------------------------------------
-
-/// Map one validator issue onto an OperationOutcome issue.
-pub fn to_outcome_issue(error: &ValidationError) -> Issue {
-    let code = match error.kind {
-        ErrorKind::Required => IssueType::Required,
-        ErrorKind::FixedValue | ErrorKind::PatternValue | ErrorKind::PrimitiveValue => {
-            IssueType::Value
-        }
-        ErrorKind::FhirpathConstraint => IssueType::Invariant,
-        // A known extension outside its declared context (#615): invalid
-        // content by placement, not a structural malformation.
-        ErrorKind::ExtensionContext => IssueType::Invalid,
-        ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
-        ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
-        // Everything structural: unknown-element, shape, cardinality,
-        // slicing, choices, wrong container type.
-        ErrorKind::UnknownElement
-        | ErrorKind::NotArray
-        | ErrorKind::NotSingular
-        | ErrorKind::Type
-        | ErrorKind::Excluded
-        | ErrorKind::Min
-        | ErrorKind::Max
-        | ErrorKind::SliceCardinality
-        | ErrorKind::SliceUnmatched
-        | ErrorKind::SliceOrder
-        | ErrorKind::Choice
-        | ErrorKind::ChoiceExcluded => IssueType::Structure,
-    };
-    let severity = match error.severity {
-        Severity::Error => IssueSeverity::Error,
-        Severity::Warning => IssueSeverity::Warning,
-    };
-    Issue::new(severity, code, error.message.clone())
-        .with_expression(dotted_to_fhirpath(&error.path))
-}
-
-/// Build the `$validate` OperationOutcome: the mapped issues, or the
-/// canonical all-clear information issue when there are none.
-pub fn validation_outcome(errors: &[ValidationError]) -> Value {
-    let mut builder = OperationOutcomeBuilder::new();
-    if errors.is_empty() {
-        builder = builder.information(IssueType::Informational, "Validation successful");
-    } else {
-        for error in errors {
-            builder = builder.add_issue(to_outcome_issue(error));
-        }
-    }
-    builder.build()
-}
-
-/// Whether any issue is error severity (drives `$validate` reporting and
-/// enforce-mode rejection).
-pub fn has_errors(errors: &[ValidationError]) -> bool {
-    errors.iter().any(|e| e.severity == Severity::Error)
 }
