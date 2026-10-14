@@ -384,6 +384,7 @@ pub async fn import_loinc_csv(
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 
+        crate::import::progress::report_batch(i + 1, num_batches);
         eprintln!(
             "[{FORMAT}] concept batch {}/{num_batches} — +{} concepts (total: {})",
             i + 1,
