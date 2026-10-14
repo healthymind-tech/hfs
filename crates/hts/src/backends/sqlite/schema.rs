@@ -614,6 +614,75 @@ fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::
     Ok(())
 }
 
+/// One-time backfill: derive `concept_hierarchy` edges from stored
+/// `subsumedBy` / `parent` concept properties for CodeSystems that were
+/// imported before the parser recognised `subsumedBy` as a hierarchy edge
+/// (the HL7 v3 code systems on terminology.hl7.org — v3-ActCode etc. — use a
+/// flat concept list with `subsumedBy`). Without this, `is-a` filters such as
+/// the Encounter.class binding (`_ActEncounterCode`) and `$subsumes` see no
+/// hierarchy until the package is re-imported.
+///
+/// Only systems with far fewer hierarchy rows than property edges are touched
+/// (so a correctly imported system is left alone); their closure rows are
+/// dropped so `migrate_concept_closure` rebuilds them on the same start.
+/// Uses the `bootstrap_imports` sentinel pattern of [`migrate_icd9cm_reimport`].
+pub fn migrate_property_hierarchy(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+
+    const MARKER: &str = "#migration:hierarchy-from-subsumedby-p1b";
+
+    let already_ran: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    let affected: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT c.system_id
+             FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             WHERE cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+             GROUP BY c.system_id
+             HAVING COUNT(*) > 2 * (SELECT COUNT(*) FROM concept_hierarchy h
+                                    WHERE h.system_id = c.system_id)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for sid in &affected {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT c.system_id, cp.value, c.code
+             FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             WHERE c.system_id = ?1
+               AND cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+               AND cp.value <> c.code",
+            [sid],
+        )?;
+        conn.execute("DELETE FROM concept_closure WHERE system_id = ?1", [sid])?;
+        tracing::info!(
+            system_id = %sid,
+            edges = inserted,
+            "Derived concept_hierarchy edges from subsumedBy/parent properties"
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [MARKER],
+    )?;
+    Ok(())
+}
+
 /// One-time backfill for issue #802: the ICD-9-CM importer previously
 /// required a pipe delimiter that the real bundled CMS file never has, so
 /// every code silently failed to parse and the file was still recorded as a

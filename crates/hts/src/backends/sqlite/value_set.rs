@@ -4258,6 +4258,25 @@ fn apply_compose_filters(
             continue;
         }
 
+        // Slow path for is-a / descendent-of with no prior bounded set: read
+        // the subtree straight from `concept_closure` (falling back to the
+        // hierarchy CTE when the closure has not been built for this system).
+        // This never goes through the ECL tokenizer, so codes that are not
+        // valid ECL tokens — THO's `_ActEncounterCode`-style abstract codes —
+        // work like any other code.
+        if property_norm == "concept" && (op == "is-a" || op == "descendent-of") {
+            let concepts =
+                query_descendants_full(conn, system_url, system_id, value, op == "is-a")?;
+            match result.as_mut() {
+                Some(prev) => {
+                    let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                    prev.retain(|c| keep.contains(&c.code));
+                }
+                None => result = Some(concepts),
+            }
+            continue;
+        }
+
         // Slow path: no prior bounded set — compute the full ECL expansion.
         let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
         let concepts: Vec<ExpansionContains> = resolved
@@ -4698,6 +4717,74 @@ fn query_all_concepts_in_system(
             contains: vec![],
         })
         .collect())
+}
+
+/// Every descendant of `root_code` (plus the root itself when `include_self`).
+///
+/// Reads `concept_closure` (one indexed range scan). When the closure has not
+/// been built for this system yet — a CodeSystem written moments ago, or a
+/// database that predates the closure table — falls back to the recursive
+/// `concept_hierarchy` walk the ECL evaluator uses, so the answer is the same
+/// either way. Bypasses the ECL tokenizer entirely, which matters for codes
+/// that are not valid ECL tokens (THO's `_ActEncounterCode`).
+fn query_descendants_full(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+    include_self: bool,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let closure_built: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_closure WHERE system_id = ?1)",
+            [system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if closure_built {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concept_closure cc
+                 JOIN   concepts c ON c.system_id = cc.system_id AND c.code = cc.descendant_code
+                 WHERE  cc.system_id = ?1 AND cc.ancestor_code = ?2
+                   AND  (cc.descendant_code != ?2 OR ?3)",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![system_id, root_code, i64::from(include_self)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(rows
+            .into_iter()
+            .map(|(code, display)| bare_contains(system_url, code, display))
+            .collect());
+    }
+    let resolved = ecl::evaluator::fetch_descendants(conn, system_id, root_code, include_self)?;
+    Ok(resolved
+        .into_values()
+        .map(|c| bare_contains(system_url, c.code, c.display))
+        .collect())
+}
+
+/// An `expansion.contains` entry carrying only `system`/`code`/`display`.
+fn bare_contains(system_url: &str, code: String, display: Option<String>) -> ExpansionContains {
+    ExpansionContains {
+        system: system_url.to_owned(),
+        version: None,
+        code,
+        display,
+        is_abstract: None,
+        inactive: None,
+        designations: vec![],
+        properties: vec![],
+        extensions: vec![],
+        contains: vec![],
+    }
 }
 
 /// Returns the subset of `candidates` that are descendants (or self, when

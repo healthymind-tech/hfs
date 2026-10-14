@@ -320,6 +320,42 @@ BEGIN
         VALUES ('#migration:icd9cm-space-delimited-802', '', 0);
     END IF;
 END $$;
+
+-- ── Hierarchy from subsumedBy/parent properties (fork P1-B) ────────────────────
+-- Mirrors sqlite `migrate_property_hierarchy`: CodeSystems imported before the
+-- parser recognised `subsumedBy` as a parent edge (THO v3-*) get their
+-- concept_hierarchy derived from the stored properties; their closure rows are
+-- dropped so `migrate_concept_closure_pg` (run right after apply) rebuilds them.
+DO $$
+DECLARE
+    sid text;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM bootstrap_imports WHERE path = '#migration:hierarchy-from-subsumedby-p1b'
+    ) THEN
+        FOR sid IN
+            SELECT c.system_id
+              FROM concept_properties cp
+              JOIN concepts c ON c.id = cp.concept_id
+             WHERE cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+             GROUP BY c.system_id
+            HAVING COUNT(*) > 2 * (SELECT COUNT(*) FROM concept_hierarchy h
+                                    WHERE h.system_id = c.system_id)
+        LOOP
+            INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+            SELECT c.system_id, cp.value, c.code
+              FROM concept_properties cp
+              JOIN concepts c ON c.id = cp.concept_id
+             WHERE c.system_id = sid
+               AND cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+               AND cp.value <> c.code
+            ON CONFLICT DO NOTHING;
+            DELETE FROM concept_closure WHERE system_id = sid;
+        END LOOP;
+        INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+        VALUES ('#migration:hierarchy-from-subsumedby-p1b', '', 0);
+    END IF;
+END $$;
 ";
 
 /// Apply the HTS PostgreSQL schema to the given client connection.
