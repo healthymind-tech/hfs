@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use futures::StreamExt;
@@ -45,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::hts::HtsClient;
+use super::hts::{HtsClient, ImportOutcome};
 use super::jobs::{Job, JobKind, JobStatus, JobTable, JobView};
 use super::registry::{Registry, RegistrySource};
 use super::resolver::{InstallMode, NodeAction, Plan, PlanRequest, resolve};
@@ -1257,7 +1258,7 @@ impl PackageManager {
             }
         }
         let resource_type = chunk[0].resource_type.clone();
-        match client.import(&resources).await {
+        match import_with_retry(client, resources).await {
             Ok(outcome) => {
                 for (e, existed) in chunk.iter().zip(checks) {
                     let resource_id = hts_key(e);
@@ -1838,9 +1839,99 @@ fn suffixed_id(id: &str, version: &str) -> String {
     format!("{}-{}", &id[..id.len().min(keep)], &hash[..8])
 }
 
+/// Whether a terminology-server failure is transient: a request that ran
+/// past the server's timeout, or a write that waited out SQLite's busy
+/// timeout behind one (the timed-out write keeps the lock until it ends).
+fn is_transient_terminology_error(message: &str) -> bool {
+    message.contains("database is locked")
+        || message.contains("HTTP 408")
+        || message.contains("HTTP 503")
+        || message.contains("HTTP 504")
+}
+
+/// The canonical URL quoted in a per-resource `/import` error
+/// (`ValueSet 'http://…' import failed: …`).
+fn quoted_url(message: &str) -> Option<&str> {
+    let start = message.find('\'')? + 1;
+    let len = message[start..].find('\'')?;
+    Some(&message[start..start + len])
+}
+
+/// Imports into the terminology server, retrying transient failures with
+/// backoff: the whole batch when the request fails, otherwise only the
+/// resources whose own error was transient. The import is an upsert, so a
+/// retry of something that did land is harmless.
+async fn import_with_retry(
+    client: &HtsClient,
+    mut resources: Vec<Value>,
+) -> Result<ImportOutcome, String> {
+    const DELAYS: [u64; 4] = [5, 15, 30, 60];
+    let mut kept_errors: Vec<String> = Vec::new();
+    let mut imported = 0;
+    let mut status = 200;
+    for delay in DELAYS.into_iter().map(Some).chain([None]) {
+        let last = delay.is_none();
+        match client.import(&resources).await {
+            Err(err) if !last && is_transient_terminology_error(&err) => {}
+            Err(err) if kept_errors.is_empty() && imported == 0 => return Err(err),
+            Err(err) => {
+                kept_errors.push(err);
+                break;
+            }
+            Ok(outcome) => {
+                status = outcome.status;
+                imported += outcome.imported;
+                let (transient, permanent): (Vec<String>, Vec<String>) = outcome
+                    .errors
+                    .into_iter()
+                    .partition(|e| is_transient_terminology_error(e));
+                kept_errors.extend(permanent);
+                let retry: Vec<Value> = resources
+                    .into_iter()
+                    .filter(|r| {
+                        r.get("url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| transient.iter().any(|e| quoted_url(e) == Some(url)))
+                    })
+                    .collect();
+                if transient.is_empty() || last || retry.is_empty() {
+                    kept_errors.extend(transient);
+                    break;
+                }
+                resources = retry;
+            }
+        }
+        if let Some(secs) = delay {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+        }
+    }
+    Ok(ImportOutcome {
+        status,
+        imported,
+        errors: kept_errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_and_timeout_failures_are_retried_and_others_are_not() {
+        let locked = "ValueSet 'http://hl7.org/fhir/ValueSet/animal-species' import failed: Storage error: database is locked";
+        assert!(is_transient_terminology_error(locked));
+        assert!(is_transient_terminology_error(
+            "terminology import HTTP 408: "
+        ));
+        assert!(!is_transient_terminology_error(
+            "ValueSet 'http://x/vs' import failed: missing compose"
+        ));
+        assert_eq!(
+            quoted_url(locked),
+            Some("http://hl7.org/fhir/ValueSet/animal-species")
+        );
+        assert_eq!(quoted_url("terminology import HTTP 408: "), None);
+    }
 
     #[test]
     fn specs_parse_in_all_three_forms() {
