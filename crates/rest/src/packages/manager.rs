@@ -742,42 +742,19 @@ impl PackageManager {
         let key = format!("{name}#{version}");
         let mut list = Vec::new();
         let mut kinds: BTreeMap<&str, u64> = BTreeMap::new();
-        let mut unowned: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let ctx = Self::ctx(tenant);
+        // What is stored under each id now.
+        let mut by_type: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for e in hfs {
-            let Some(id) = e.id.as_deref() else { continue };
-            let k = (
-                TARGET_HFS.to_string(),
-                e.resource_type.clone(),
-                id.to_string(),
-            );
-            match owners.get(&k) {
-                Some(by) => {
-                    let others: Vec<&String> = by.iter().filter(|o| **o != key).collect();
-                    if others.is_empty() {
-                        continue;
-                    }
-                    let same_name = others
-                        .iter()
-                        .all(|o| o.split_once('#').is_some_and(|(n, _)| n == name));
-                    let kind = match (same_name, options.mode) {
-                        (true, InstallMode::Upgrade) => "replaces-version",
-                        (true, InstallMode::SideBySide) => "renamed",
-                        (false, _) => "shared",
-                    };
-                    *kinds.entry(kind).or_default() += 1;
-                    if list.len() < MAX_CONFLICTS {
-                        list.push(json!({"kind": kind, "resourceType": e.resource_type, "id": id, "url": e.url, "owners": others}));
-                    }
-                }
-                None => unowned
+            if let Some(id) = e.id.as_deref() {
+                by_type
                     .entry(e.resource_type.as_str())
                     .or_default()
-                    .push(id),
+                    .push(id);
             }
         }
-        // Resources already stored that no package owns: an operator's own.
-        let ctx = Self::ctx(tenant);
-        for (resource_type, ids) in unowned {
+        let mut stored: HashMap<(String, String), Value> = HashMap::new();
+        for (resource_type, ids) in by_type {
             for chunk in ids.chunks(100) {
                 if let Ok(found) = self
                     .deps
@@ -785,36 +762,70 @@ impl PackageManager {
                     .read_batch(&ctx, resource_type, chunk)
                     .await
                 {
-                    for stored in found {
-                        // The same artifact loaded by hand is adopted; any
-                        // other resource under the id is overwritten and
-                        // kept (never deleted) on uninstall.
-                        let entry = hfs.iter().find(|e| {
-                            e.resource_type == resource_type && e.id.as_deref() == Some(stored.id())
-                        });
-                        let text = |key: &str| {
-                            stored
-                                .content()
-                                .get(key)
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        };
-                        let same = entry
-                            .is_some_and(|e| text("url") == e.url && text("version") == e.version);
-                        let kind = if same {
-                            "adopts"
-                        } else {
-                            "overwrites-unmanaged"
-                        };
-                        *kinds.entry(kind).or_default() += 1;
-                        if !same && list.len() < MAX_CONFLICTS {
-                            list.push(json!({"kind": kind, "resourceType": resource_type, "id": stored.id(), "url": text("url"), "version": text("version")}));
-                        }
+                    for r in found {
+                        stored.insert(
+                            (resource_type.to_string(), r.id().to_string()),
+                            r.content().clone(),
+                        );
                     }
                 }
             }
         }
+        for e in hfs {
+            let Some(id) = e.id.as_deref() else { continue };
+            let Some(existing) = stored.get(&(e.resource_type.clone(), id.to_string())) else {
+                continue;
+            };
+            let k = (
+                TARGET_HFS.to_string(),
+                e.resource_type.clone(),
+                id.to_string(),
+            );
+            let others: Vec<&String> = owners
+                .get(&k)
+                .map(|by| by.iter().filter(|o| **o != key).collect())
+                .unwrap_or_default();
+            let url = text_of(existing, "url");
+            let kind = if e.url.is_some() && url != e.url {
+                "renamed-clash"
+            } else if !others.is_empty() {
+                let same_name = others
+                    .iter()
+                    .all(|o| o.split_once('#').is_some_and(|(n, _)| n == name));
+                match (same_name, options.mode) {
+                    (true, InstallMode::Upgrade) => "replaces-version",
+                    (true, InstallMode::SideBySide) => "renamed",
+                    (false, _) => "shared",
+                }
+            } else if owners.contains_key(&k) {
+                // Owned only by this very package (a reinstall).
+                continue;
+            } else if url == e.url && text_of(existing, "version") == e.version {
+                "adopts"
+            } else {
+                "overwrites-unmanaged"
+            };
+            *kinds.entry(kind).or_default() += 1;
+            if kind != "adopts" && list.len() < MAX_CONFLICTS {
+                list.push(json!({
+                    "kind": kind, "resourceType": e.resource_type, "id": id, "url": e.url,
+                    "storedUrl": url, "storedVersion": text_of(existing, "version"), "owners": others,
+                }));
+            }
+        }
         json!({"counts": kinds, "items": list})
+    }
+
+    async fn read_content(
+        &self,
+        ctx: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> Option<Value> {
+        match self.deps.storage.read(ctx, resource_type, id).await {
+            Ok(Some(r)) => Some(r.content().clone()),
+            _ => None,
+        }
     }
 
     async fn run_install(
@@ -1025,29 +1036,26 @@ impl PackageManager {
                     continue;
                 }
             };
+            // Identity follows the canonical: a different artifact already
+            // stored under this id (another IG's SearchParameter `Condition-code`,
+            // say) is never overwritten — this one gets `id-<hash of url>`.
+            let mut existing = self.read_content(&ctx, &e.resource_type, &id).await;
+            if let (Some(ex), Some(url)) = (&existing, e.url.as_deref())
+                && text_of(ex, "url").as_deref() != Some(url)
+            {
+                id = clash_id(&id, url);
+                existing = self.read_content(&ctx, &e.resource_type, &id).await;
+            }
             json["id"] = Value::from(id.clone());
             let k = (TARGET_HFS.to_string(), e.resource_type.clone(), id.clone());
             // A stored resource no package owns is the operator's — unless
             // it is this very artifact (same canonical and version, e.g.
             // loaded by a script before the package manager existed), which
             // the package adopts.
-            let foreign = if owners.contains_key(&k) {
-                false
-            } else {
-                match self.deps.storage.read(&ctx, &e.resource_type, &id).await {
-                    Ok(Some(existing)) => {
-                        let text = |key: &str| {
-                            existing
-                                .content()
-                                .get(key)
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        };
-                        !(text("url") == e.url && text("version") == e.version)
-                    }
-                    _ => false,
-                }
-            };
+            let foreign = !owners.contains_key(&k)
+                && existing.as_ref().is_some_and(|ex| {
+                    !(text_of(ex, "url") == e.url && text_of(ex, "version") == e.version)
+                });
             match self
                 .deps
                 .storage
@@ -1742,6 +1750,22 @@ fn id_from_path(path: &str) -> String {
     if id.is_empty() { "resource".into() } else { id }
 }
 
+fn text_of(resource: &Value, key: &str) -> Option<String> {
+    resource
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// `id-<8 hex of sha1(url)>` for a resource whose id is taken by a
+/// different canonical, kept within FHIR's 64 characters; deterministic, so
+/// a reinstall lands on the same id.
+fn clash_id(id: &str, url: &str) -> String {
+    let hash = super::tarball::sha1_hex(url.as_bytes());
+    let keep = 64 - 9;
+    format!("{}-{}", &id[..id.len().min(keep)], &hash[..8])
+}
+
 /// `id-version` for side-by-side installs, kept within FHIR's 64 characters.
 fn suffixed_id(id: &str, version: &str) -> String {
     let version: String = version
@@ -1800,6 +1824,19 @@ mod tests {
             suffixed_id("Patient-twcore", "1.0.0"),
             "Patient-twcore-1.0.0"
         );
+        let c = clash_id(
+            "Condition-code",
+            "https://twcore.mohw.gov.tw/ig/emr/SearchParameter/Condition-code",
+        );
+        assert_eq!(c.len(), "Condition-code".len() + 9);
+        assert_eq!(
+            c,
+            clash_id(
+                "Condition-code",
+                "https://twcore.mohw.gov.tw/ig/emr/SearchParameter/Condition-code"
+            )
+        );
+        assert_eq!(clash_id(&"y".repeat(64), "u").len(), 64);
         let long = "x".repeat(64);
         let s = suffixed_id(&long, "1.0.0");
         assert_eq!(s.len(), 64);

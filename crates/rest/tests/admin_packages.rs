@@ -496,3 +496,70 @@ async fn invalid_requests_are_rejected() {
         .json();
     assert_eq!(market["available"], false);
 }
+
+/// Two IGs that use the same id for different resources (TW Core and EMR
+/// both ship a `SearchParameter/Condition-code`) never overwrite each other:
+/// the second gets an id derived from its canonical, and removing it leaves
+/// the first intact.
+#[tokio::test]
+async fn id_clash_with_a_different_canonical_gets_its_own_id() {
+    let (server, _cache) = server(true);
+    upload(&server, base_v1(), "")
+        .await
+        .assert_status(StatusCode::OK);
+    install(&server, "acme.base#1.0.0").await;
+    let mut other = profile("acme-patient", "1.0.0", "gender");
+    other["url"] = json!("http://other.org/StructureDefinition/acme-patient");
+    let pkg = package(
+        "other.ig",
+        "1.0.0",
+        json!({}),
+        &[("StructureDefinition-acme-patient.json", other)],
+    );
+    upload(&server, pkg, "").await.assert_status(StatusCode::OK);
+    let plan: Value = server
+        .post("/admin/packages?wait=30")
+        .json(&json!({"package": "other.ig#1.0.0", "dryRun": true}))
+        .await
+        .json();
+    assert_eq!(
+        plan["result"]["packages"][0]["conflicts"]["counts"]["renamed-clash"], 1,
+        "{plan}"
+    );
+    let job = install(&server, "other.ig#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let detail: Value = server.get("/admin/packages/other.ig/1.0.0").await.json();
+    let new_id = detail["resources"]["StructureDefinition"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        new_id.starts_with("acme-patient-") && new_id.len() == "acme-patient".len() + 9,
+        "{new_id}"
+    );
+    let original: Value = server.get("/StructureDefinition/acme-patient").await.json();
+    assert_eq!(
+        original["url"],
+        "http://acme.org/StructureDefinition/acme-patient"
+    );
+    let renamed: Value = server
+        .get(&format!("/StructureDefinition/{new_id}"))
+        .await
+        .json();
+    assert_eq!(
+        renamed["url"],
+        "http://other.org/StructureDefinition/acme-patient"
+    );
+    let job: Value = server
+        .delete("/admin/packages/other.ig/1.0.0?wait=30")
+        .await
+        .json();
+    assert_eq!(job["status"], "succeeded");
+    server
+        .get("/StructureDefinition/acme-patient")
+        .await
+        .assert_status(StatusCode::OK);
+    assert!(has_error(
+        &validate(&server, "acme-patient", json!({"resourceType": "Patient"})).await
+    ));
+}
