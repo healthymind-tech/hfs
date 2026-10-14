@@ -4030,32 +4030,31 @@ fn apply_compose_filters(
     // candidate set from phase 1 to switch from a top-down tree expansion to
     // per-candidate ancestor walks; regex filters run last so they only need
     // to materialise the (already narrowed) candidate set.
-    // Treat `op="in"` with a single non-comma value identically to `op="="`
-    // — the IG `notSelectable/notSelectable-prop-in*` fixtures use
-    // `filter: { property: notSelectable, op: in, value: "true" }`. FHIR
-    // spec `in` is a comma-separated list; the single-value case is the
-    // common one and reduces cleanly to equality. (Multi-value `in`
-    // expansion remains TODO — those fixtures aren't currently in scope.)
+    // `op="in"` is a comma-separated list of values (FHIR spec); a single
+    // value reduces to `=` — the IG `notSelectable/notSelectable-prop-in*`
+    // fixtures use `filter: { property: notSelectable, op: in, value: "true" }`.
+    // Multi-value lists are the union of the per-value equalities
+    // (`query_property_in`), and `property=concept|code` means code membership.
     let (property_filters, mut rest): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        let value = f["value"].as_str().unwrap_or("");
-        let in_single_value = op == "in" && !value.contains(',');
-        (op == "=" || in_single_value) && property != "constraint"
+        (op == "=" || op == "in") && property != "constraint"
     });
-    // `not-in` (single-value) and `!=` filters select concepts whose property
-    // is NOT equal to the value (treating concepts with no such property as
-    // matching — they don't have notSelectable=true, so they pass).
-    // The IG `notSelectable/notSelectable-prop-out*` fixtures use
+    // `not-in` and `!=` filters select concepts whose property is NOT equal to
+    // any of the value(s) (treating concepts with no such property as matching
+    // — they don't have notSelectable=true, so they pass). The IG
+    // `notSelectable/notSelectable-prop-out*` fixtures use
     // `filter: { property: notSelectable, op: not-in, value: "true" }`.
     let (property_ne_filters, mut rest_ne): (Vec<_>, Vec<_>) = rest.drain(..).partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        let value = f["value"].as_str().unwrap_or("");
-        let not_in_single_value = op == "not-in" && !value.contains(',');
-        (op == "!=" || not_in_single_value) && property != "constraint"
+        (op == "!=" || op == "not-in") && property != "constraint"
     });
-    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_ne
+    // `exists`: concepts that have (value=true) / lack (value=false) the property.
+    let (property_exists_filters, mut rest_exists): (Vec<_>, Vec<_>) = rest_ne
+        .drain(..)
+        .partition(|f| f["op"].as_str() == Some("exists"));
+    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_exists
         .drain(..)
         .partition(|f| f["op"].as_str() == Some("regex"));
 
@@ -4073,7 +4072,15 @@ fn apply_compose_filters(
             (p == "concept" || p == "code") && (o == "is-a" || o == "descendent-of")
         }
     };
-    if !property_filters.is_empty() && one_isa_hier() {
+    let all_single_valued = property_filters
+        .iter()
+        .all(|f| f["op"].as_str() == Some("=") || !f["value"].as_str().unwrap_or("").contains(','));
+    if !property_filters.is_empty()
+        && property_ne_filters.is_empty()
+        && property_exists_filters.is_empty()
+        && all_single_valued
+        && one_isa_hier()
+    {
         let hf = &hierarchy_filters[0];
         let op = hf["op"].as_str().unwrap_or("");
         let root_code = hf["value"].as_str().unwrap_or("");
@@ -4107,12 +4114,23 @@ fn apply_compose_filters(
     let mut result: Option<Vec<ExpansionContains>> = None;
     let mut any_filter_seen = false;
 
-    // ── Phase 1: property equality filters ────────────────────────────────────
+    // ── Phase 1: property equality / `in` filters ─────────────────────────────
     for f in &property_filters {
         let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
         any_filter_seen = true;
-        let concepts = query_property_eq(conn, system_url, system_id, property, value)?;
+        let concepts = if op == "in" {
+            query_property_in(
+                conn,
+                system_url,
+                system_id,
+                property,
+                &split_filter_values(value),
+            )?
+        } else {
+            query_property_eq(conn, system_url, system_id, property, value)?
+        };
         match result.as_mut() {
             Some(prev) => {
                 let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
@@ -4130,13 +4148,21 @@ fn apply_compose_filters(
     // MINUS those returned by `query_property_eq` for the same (prop, val).
     for f in &property_ne_filters {
         let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
         any_filter_seen = true;
-        let excluded: HashSet<String> =
+        let matched = if op == "not-in" {
+            query_property_in(
+                conn,
+                system_url,
+                system_id,
+                property,
+                &split_filter_values(value),
+            )?
+        } else {
             query_property_eq(conn, system_url, system_id, property, value)?
-                .into_iter()
-                .map(|c| c.code)
-                .collect();
+        };
+        let excluded: HashSet<String> = matched.into_iter().map(|c| c.code).collect();
         match result.as_mut() {
             Some(prev) => {
                 prev.retain(|c| !excluded.contains(&c.code));
@@ -4149,6 +4175,36 @@ fn apply_compose_filters(
                     .filter(|c| !excluded.contains(&c.code))
                     .collect();
                 result = Some(kept);
+            }
+        }
+    }
+
+    // ── Phase 1.7: `exists` filters ───────────────────────────────────────────
+    // `value=true` keeps concepts that carry the property (any value);
+    // `value=false` keeps those that do not. `property=concept|code` is
+    // meaningless here (every concept has a code) and selects everything/nothing.
+    for f in &property_exists_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+        let want_present = parse_exists_value(value)?;
+        let having: HashSet<String> = if property == "concept" || property == "code" {
+            query_all_concepts_in_system(conn, system_url, system_id)?
+                .into_iter()
+                .map(|c| c.code)
+                .collect()
+        } else {
+            query_property_present(conn, system_id, property)?
+        };
+        match result.as_mut() {
+            Some(prev) => prev.retain(|c| having.contains(&c.code) == want_present),
+            None => {
+                let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                result = Some(
+                    all.into_iter()
+                        .filter(|c| having.contains(&c.code) == want_present)
+                        .collect(),
+                );
             }
         }
     }
@@ -4717,6 +4773,93 @@ fn query_all_concepts_in_system(
             contains: vec![],
         })
         .collect())
+}
+
+/// Split a FHIR compose-filter `value` for the list operators (`in`,
+/// `not-in`): comma-separated, whitespace-trimmed, empties dropped.
+fn split_filter_values(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Interpret the `value` of an `exists` filter. FHIR allows only `true` /
+/// `false`; anything else is a malformed ValueSet.
+fn parse_exists_value(value: &str) -> Result<bool, HtsError> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(HtsError::VsInvalid(format!(
+            "ValueSet compose filter with op='exists' requires value 'true' or 'false', got '{other}'"
+        ))),
+    }
+}
+
+/// Union of [`query_property_eq`] over every listed value — the FHIR `in`
+/// operator. `property=concept|code` selects the listed codes themselves.
+fn query_property_in(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    values: &[&str],
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    if property == "concept" || property == "code" {
+        let json_codes =
+            serde_json::to_string(values).map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concepts c
+                 WHERE  c.system_id = ?1
+                   AND  c.code IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([system_id, json_codes.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(rows
+            .into_iter()
+            .map(|(code, display)| bare_contains(system_url, code, display))
+            .collect());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<ExpansionContains> = Vec::new();
+    for v in values {
+        for c in query_property_eq(conn, system_url, system_id, property, v)? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Codes in `system_id` that carry at least one value for `property` — the
+/// FHIR `exists` operator.
+fn query_property_present(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+) -> Result<HashSet<String>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT DISTINCT c.code
+             FROM   concept_properties cp
+             JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+             WHERE  cp.property = ?2",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    stmt.query_map([system_id, property], |row| row.get::<_, String>(0))
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Every descendant of `root_code` (plus the root itself when `include_self`).
@@ -5391,16 +5534,49 @@ fn apply_compose_filters_to_candidates(
                 let valid = batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
             }
-            // `not-in` (single value) and `!=`: keep candidates whose
-            // `(property, value)` does NOT match. The IG `notSelectable/
+            // `in`: comma-separated list; union of the per-value matches.
+            // `property=concept|code` means code-list membership.
+            ("concept", "in") => {
+                let wanted: HashSet<&str> = split_filter_values(value).into_iter().collect();
+                candidates.retain(|c| wanted.contains(c.code.as_str()));
+            }
+            (_, "in") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let mut valid: HashSet<String> = HashSet::new();
+                for v in split_filter_values(value) {
+                    valid.extend(batch_property_eq_in_set(
+                        conn, system_id, property, v, &codes,
+                    )?);
+                }
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            // `not-in` / `!=`: keep candidates whose `(property, value)` does
+            // NOT match any listed value. The IG `notSelectable/
             // notSelectable-prop-out*` fixtures rely on `not-in` semantics
             // — concepts with no matching property entry pass too.
+            ("concept", "not-in") => {
+                let unwanted: HashSet<&str> = split_filter_values(value).into_iter().collect();
+                candidates.retain(|c| !unwanted.contains(c.code.as_str()));
+            }
             (_, "not-in") | (_, "!=") => {
-                if !value.contains(',') {
-                    let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
-                    let excluded =
-                        batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
-                    candidates.retain(|c| !excluded.contains(&c.code));
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let mut excluded: HashSet<String> = HashSet::new();
+                for v in split_filter_values(value) {
+                    excluded.extend(batch_property_eq_in_set(
+                        conn, system_id, property, v, &codes,
+                    )?);
+                }
+                candidates.retain(|c| !excluded.contains(&c.code));
+            }
+            (_, "exists") => {
+                let want_present = parse_exists_value(value)?;
+                if property_norm == "concept" {
+                    if !want_present {
+                        candidates.clear();
+                    }
+                } else {
+                    let having = query_property_present(conn, system_id, property)?;
+                    candidates.retain(|c| having.contains(&c.code) == want_present);
                 }
             }
             _ => {}

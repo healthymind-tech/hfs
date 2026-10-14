@@ -2942,12 +2942,46 @@ async fn apply_compose_filters_pg(
 
         let matches: Vec<(String, Option<String>)> = match op {
             "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
-            // Single-value `in` reduces to equality. Multi-value (comma-
-            // separated) `in` is a TODO: parity gap.
-            "in" if !value.contains(',') => {
-                pg_filter_property_eq(client, system_url, system_id, property, value).await?
+            // `in`: comma-separated list — union of the per-value equalities;
+            // `property=concept|code` means code-list membership. Mirrors the
+            // SQLite `query_property_in`.
+            "in" => {
+                let values = pg_split_filter_values(value);
+                if property == "concept" || property == "code" {
+                    pg_filter_codes_in(client, system_id, &values).await?
+                } else {
+                    let mut seen: HashSet<String> = HashSet::new();
+                    let mut out = Vec::new();
+                    for v in values {
+                        for row in pg_filter_property_eq(client, system_url, system_id, property, v)
+                            .await?
+                        {
+                            if seen.insert(row.0.clone()) {
+                                out.push(row);
+                            }
+                        }
+                    }
+                    out
+                }
             }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
+            // `generalizes`: ancestors-or-self of the value (closure, reverse direction).
+            "generalizes" => pg_filter_generalizes(client, system_url, system_id, value).await?,
+            // `exists`: concepts that carry (true) / lack (false) the property.
+            "exists" => {
+                let want_present = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(HtsError::VsInvalid(format!(
+                            "ValueSet compose filter with op='exists' requires value 'true' or \
+                             'false', got '{other}'"
+                        )));
+                    }
+                };
+                pg_filter_property_exists(client, system_url, system_id, property, want_present)
+                    .await?
+            }
             // `descendent-of` is `is-a` minus the root itself — strict subtree.
             // The IG `other/dual-filter` fixture uses
             // `op=descendent-of, value=AA` AND-intersected with property=A; PG
@@ -2964,8 +2998,31 @@ async fn apply_compose_filters_pg(
             // whose property is NOT this value (concepts without the
             // property pass). Drives notSelectable-prop-out* IG fixtures.
             "!=" => pg_filter_property_ne(client, system_url, system_id, property, value).await?,
-            "not-in" if !value.contains(',') => {
-                pg_filter_property_ne(client, system_url, system_id, property, value).await?
+            // `not-in`: a concept passes when it matches none of the listed
+            // values — the intersection of the per-value `!=` sets.
+            "not-in" => {
+                let values = pg_split_filter_values(value);
+                if property == "concept" || property == "code" {
+                    let unwanted: HashSet<&str> = values.iter().copied().collect();
+                    let mut all =
+                        pg_filter_property_ne(client, system_url, system_id, "", "").await?;
+                    all.retain(|(code, _)| !unwanted.contains(code.as_str()));
+                    all
+                } else {
+                    let mut acc: Option<Vec<(String, Option<String>)>> = None;
+                    for v in values {
+                        let ne = pg_filter_property_ne(client, system_url, system_id, property, v)
+                            .await?;
+                        acc = Some(match acc {
+                            None => ne,
+                            Some(prev) => {
+                                let keep: HashSet<String> = ne.into_iter().map(|r| r.0).collect();
+                                prev.into_iter().filter(|r| keep.contains(&r.0)).collect()
+                            }
+                        });
+                    }
+                    acc.unwrap_or_default()
+                }
             }
             other => {
                 // TODO: parity — SQLite also handles descendent-of/generalizes/
@@ -3102,6 +3159,105 @@ async fn pg_filter_property_ne(
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// Split a compose-filter list value (`in` / `not-in`): comma-separated,
+/// trimmed, empties dropped.
+fn pg_split_filter_values(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// The listed codes that exist in `system_id` (`property=concept, op=in`).
+async fn pg_filter_codes_in(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    codes: &[&str],
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let owned: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1 AND c.code = ANY($2::text[])",
+            &[&system_id, &owned],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// Concepts in `system_id` that carry (`want_present`) / lack the property —
+/// the FHIR `exists` operator. Honours locally-renamed property aliases like
+/// the equality filters.
+async fn pg_filter_property_exists(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    want_present: bool,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+    let sql = if want_present {
+        "SELECT c.code, c.display
+           FROM concepts c
+          WHERE c.system_id = $1
+            AND EXISTS (
+                SELECT 1 FROM concept_properties cp
+                 WHERE cp.concept_id = c.id AND cp.property = ANY($2::text[])
+            )"
+    } else {
+        "SELECT c.code, c.display
+           FROM concepts c
+          WHERE c.system_id = $1
+            AND NOT EXISTS (
+                SELECT 1 FROM concept_properties cp
+                 WHERE cp.concept_id = c.id AND cp.property = ANY($2::text[])
+            )"
+    };
+    let rows = client
+        .query(sql, &[&system_id, &property_aliases])
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `generalizes`: every ancestor of `value_code` plus the code itself (the
+/// closure stores self-links). Mirrors the SQLite `query_ancestors_full`.
+async fn pg_filter_generalizes(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    value_code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if value_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = generalizes has no value"
+        )));
+    }
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concept_closure cc
+               JOIN concepts c ON c.system_id = $1 AND c.code = cc.ancestor_code
+              WHERE cc.system_id = $1 AND cc.descendant_code = $2",
+            &[&system_id, &value_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
