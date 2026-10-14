@@ -270,6 +270,7 @@ mod collection_navigation;
 mod contains_function;
 mod conversion_functions;
 mod format_functions;
+mod html_checks;
 mod interval_functions;
 mod json_utils;
 pub mod ucum;

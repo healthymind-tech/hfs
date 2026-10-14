@@ -10,6 +10,7 @@
 mod errors;
 mod path;
 mod primitives;
+mod references;
 pub(crate) mod slicing;
 mod walk;
 
@@ -33,8 +34,9 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Policy for profile references (`meta.profile` / caller-supplied) that the
-/// resolver cannot resolve.
+/// Policy for `meta.profile` claims the resolver cannot resolve. A profile
+/// the caller asked for ([`ValidationOptions::profiles`]) that cannot be
+/// resolved is always an error: the requested validation did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnknownProfilePolicy {
     /// Report as a warning-severity issue (default).
@@ -151,6 +153,92 @@ fn bundle_entry_type_mismatches(resource: &Value) -> Vec<ValidationError> {
     errors
 }
 
+/// `urn:uuid:` / `urn:oid:` references inside a Bundle's entries that no
+/// entry's `fullUrl` provides. A URN names nothing outside the Bundle, so
+/// such a reference cannot be resolved by anyone. In a `transaction` or
+/// `batch` the server has to resolve it to process the entry, so it is an
+/// error; in other Bundles a warning, as the HL7 validator reports it.
+/// References inside a nested Bundle belong to that Bundle and are skipped.
+fn bundle_unresolved_urns(resource: &Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
+        return errors;
+    }
+    let Some(entries) = resource.get("entry").and_then(Value::as_array) else {
+        return errors;
+    };
+    let severity = match resource.get("type").and_then(Value::as_str) {
+        Some("transaction" | "batch") => Severity::Error,
+        _ => Severity::Warning,
+    };
+    let full_urls: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("fullUrl").and_then(Value::as_str))
+        .collect();
+
+    fn walk(
+        value: &Value,
+        path: &mut String,
+        full_urls: &std::collections::HashSet<&str>,
+        severity: Severity,
+        out: &mut Vec<ValidationError>,
+    ) {
+        match value {
+            Value::Object(map) => {
+                if let Some(reference) = map.get("reference").and_then(Value::as_str)
+                    && (reference.starts_with("urn:uuid:") || reference.starts_with("urn:oid:"))
+                    && !full_urls.contains(reference)
+                {
+                    out.push(
+                        ValidationError::new(
+                            ErrorKind::ReferenceUnresolved,
+                            path.clone(),
+                            errors::msg_reference_urn_unresolved(reference),
+                        )
+                        .with_severity(severity),
+                    );
+                }
+                for (key, child) in map {
+                    if child
+                        .get("resourceType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|rt| rt == "Bundle")
+                    {
+                        continue;
+                    }
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(key);
+                    walk(child, path, full_urls, severity, out);
+                    path.truncate(len);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(&index.to_string());
+                    walk(item, path, full_urls, severity, out);
+                    path.truncate(len);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(res) = entry.get("resource") else {
+            continue;
+        };
+        if res.get("resourceType").and_then(Value::as_str) == Some("Bundle") {
+            continue;
+        }
+        let mut path = format!("Bundle.entry.{index}.resource");
+        walk(res, &mut path, &full_urls, severity, &mut errors);
+    }
+    errors
+}
+
 /// The validator: a resolver plus the walk.
 pub struct Validator {
     resolver: Arc<dyn SchemaResolver>,
@@ -169,6 +257,7 @@ impl Validator {
         outcome
             .errors
             .extend(bundle_entry_type_mismatches(resource));
+        outcome.errors.extend(bundle_unresolved_urns(resource));
         outcome
     }
 

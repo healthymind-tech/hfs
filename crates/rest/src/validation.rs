@@ -402,7 +402,7 @@ impl ValidationService {
     /// [`Self::rehydrate_stored_profiles`] finishes, validation waits for it
     /// (at most `HFS_VALIDATION_REHYDRATE_WAIT_MS`) instead of answering from
     /// a half-filled registry: a `$validate` right after a restart would
-    /// otherwise report "could not resolve profile", and an enforce-mode
+    /// otherwise report the profile as not found, and an enforce-mode
     /// write claiming a stored profile would be accepted unchecked.
     pub fn begin_rehydration(&self) {
         if self.tenant_profiles.is_some() {
@@ -794,6 +794,10 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::ExtensionContext => IssueType::Invalid,
         // A batch/transaction entry filed under the wrong resource type.
         ErrorKind::BundleEntryMismatch => IssueType::Invalid,
+        // A malformed or wrongly-typed reference.
+        ErrorKind::ReferenceInvalid => IssueType::Invalid,
+        // A Bundle-internal URN reference no entry provides.
+        ErrorKind::ReferenceUnresolved => IssueType::NotFound,
         ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
@@ -809,7 +813,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         | ErrorKind::SliceUnmatched
         | ErrorKind::SliceOrder
         | ErrorKind::Choice
-        | ErrorKind::ChoiceExcluded => IssueType::Structure,
+        | ErrorKind::ChoiceExcluded
+        | ErrorKind::EmptyObject => IssueType::Structure,
     };
     let severity = match error.severity {
         Severity::Error => IssueSeverity::Error,

@@ -73,6 +73,14 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
+      "file": "basic-example.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
       "file": "basic-questionnaire.json",
       "issues": 14,
       "kinds": [
@@ -457,6 +465,14 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
+      "file": "devicemetric-example.json",
+      "issues": 1,
+      "kinds": [
+        "reference-invalid"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: DeviceMetric.parent is Reference(Device) in R4, the example points at DeviceDefinition/dc102."
+    },
+    {
       "file": "devicemetric-questionnaire.json",
       "issues": 26,
       "kinds": [
@@ -479,6 +495,14 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "deviceusestatement-example.json",
+      "issues": 1,
+      "kinds": [
+        "reference-invalid"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: R4 DeviceUseStatement.reasonReference does not allow Procedure."
     },
     {
       "file": "deviceusestatement-questionnaire.json",
@@ -769,6 +793,14 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
+      "file": "json-edge-cases.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
       "file": "ldlcholesterol-questionnaire.json",
       "issues": 55,
       "kinds": [
@@ -879,6 +911,14 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationrequest0301.json",
+      "issues": 1,
+      "kinds": [
+        "reference-invalid"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: R4 MedicationRequest.dispenseRequest.performer is Reference(Organization), the example points at Practitioner/f001."
     },
     {
       "file": "medicationstatement-questionnaire.json",
@@ -1009,100 +1049,12 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
-      "file": "observation-example-bloodpressure-cancel.json",
+      "file": "observation-example-clinical-gender.json",
       "issues": 1,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-bloodpressure-dar.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-bloodpressure.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-bmi.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-height.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-length.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-temperature.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-head-circumference.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-heart-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-respiratory-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-satO2.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-vitals-panel.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: R4 Observation.performer does not allow Encounter."
     },
     {
       "file": "observation-genetics-questionnaire.json",
@@ -1271,6 +1223,14 @@
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter's `id` is 67 characters, exceeding the 64-character limit of FHIR's `id` type. R4 declares `Resource.id` as `System.String`, so the walk checks the `id` pattern on resources itself."
     },
     {
       "file": "questionnaireresponse-questionnaire.json",

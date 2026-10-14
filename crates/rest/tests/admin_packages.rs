@@ -205,8 +205,7 @@ fn has_error(issues: &[Value]) -> bool {
 
 fn unresolved(issues: &[Value]) -> bool {
     issues.iter().any(|i| {
-        i.to_string().contains("could not resolve profile")
-            || i.to_string().contains("acme-ext-patient")
+        i.to_string().contains("could not be found") || i.to_string().contains("acme-ext-patient")
     })
 }
 

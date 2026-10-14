@@ -577,7 +577,7 @@ async fn profile_resolves(server: &TestServer, url: &str) -> bool {
         i["code"] == "not-supported"
             && i["details"]["text"]
                 .as_str()
-                .is_some_and(|t| t.contains("could not resolve profile"))
+                .is_some_and(|t| t.contains("could not be found"))
     });
     let enforced = issues
         .iter()

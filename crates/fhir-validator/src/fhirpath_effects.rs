@@ -4,17 +4,21 @@
 //! `helios_fhir` model (the `crates/sof` pattern) — helios-fhirpath
 //! evaluates against typed resources, not raw JSON. Each constraint is then
 //! evaluated as one combined expression: for a constraint attached below
-//! the root, the validator path is rendered as a relative FHIRPath and the
-//! invariant is wrapped in `.all(...)`:
+//! the root, the validator path is rendered as a relative FHIRPath, and the
+//! invariant runs per node inside `.all(...)`, coerced with `allTrue()`:
 //!
 //! ```text
 //! path Patient.contact.0, expr "name.exists() or telecom.exists()"
-//!   → contact[0].all(name.exists() or telecom.exists())
+//!   → contact[0].all((name.exists() or telecom.exists()).allTrue())
 //! ```
 //!
-//! `all()` gives the correct per-node focus *and* the FHIR invariant
-//! semantics for absent nodes (empty collection → pass). Root-attached
-//! constraints evaluate as-is.
+//! `all()` gives the per-node focus and passes an absent node. `allTrue()`
+//! turns a node's empty result into a pass, as FHIR invariant semantics
+//! require for every node, not only the root: `all()` alone wants each
+//! criterion to be `true`, so ref-1 on a logical, identifier-only reference
+//! (`{} or {}`) was reported as a violation. (`select(...).allTrue()` has the
+//! same semantics but measured twice as slow in helios-fhirpath.)
+//! Root-attached constraints evaluate as-is.
 //!
 //! Result coercion (FHIRPath 5.1.1 / FHIR invariant semantics): empty →
 //! pass; a single boolean → itself; anything else → not evaluable
@@ -34,6 +38,7 @@ use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint}
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath::{EvaluationContext, EvaluationResult};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -76,7 +81,7 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         constraints
             .iter()
             .map(|c| {
-                let combined = combine(c.path, c.expression);
+                let combined = combine(c.path, &effective_expression(c.id, c.expression));
                 self.evaluate_one(&combined, &context)
             })
             .collect()
@@ -108,8 +113,33 @@ impl FhirPathConstraintEvaluator {
     }
 }
 
+/// The expression actually evaluated for a constraint.
+///
+/// - R4 through R5 give the two narrative invariants the same expression,
+///   `htmlChecks()`, though they state different rules: `txt-1` the allowed
+///   elements and attributes, `txt-2` "SHALL have some non-whitespace
+///   content". Evaluating `txt-2` as written would re-check `txt-1` and leave
+///   the content rule unchecked, so it runs `htmlChecks2()`, the content
+///   check (the HL7 validator's name for it). R6 folds both rules into
+///   `txt-1` and has no `txt-2`.
+/// - The `as(type)` *function* filters a collection by type in the HL7
+///   validator, and invariants rely on it: dom-3 applies it to
+///   `%resource.descendants()`. helios-fhirpath follows the FHIRPath
+///   spec's singleton rule and fails, so dom-3 never ran. The function form
+///   is evaluated as `ofType(type)`, which is the same on a single item and
+///   filters a collection; the `as` operator is left alone.
+fn effective_expression<'a>(id: &str, expression: &'a str) -> Cow<'a, str> {
+    if id == "txt-2" && expression.trim() == "htmlChecks()" {
+        return Cow::Borrowed("htmlChecks2()");
+    }
+    if expression.contains(".as(") {
+        return Cow::Owned(expression.replace(".as(", ".ofType("));
+    }
+    Cow::Borrowed(expression)
+}
+
 /// Build the combined focus+invariant expression from a dotted validator
-/// path (`Patient.contact.0` → `contact[0].all(<expr>)`).
+/// path (`Patient.contact.0` → `contact[0].all((<expr>).allTrue())`).
 fn combine(path: &str, expression: &str) -> String {
     let mut relative = String::new();
     for segment in path.split('.').skip(1) {
@@ -127,7 +157,7 @@ fn combine(path: &str, expression: &str) -> String {
     if relative.is_empty() {
         expression.to_string()
     } else {
-        format!("{relative}.all({expression})")
+        format!("{relative}.all(({expression}).allTrue())")
     }
 }
 
@@ -186,18 +216,43 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
 
 #[cfg(test)]
 mod tests {
-    use super::combine;
+    use super::{combine, effective_expression};
+
+    #[test]
+    fn txt_2_checks_content_not_names() {
+        assert_eq!(
+            effective_expression("txt-2", "htmlChecks()"),
+            "htmlChecks2()"
+        );
+        assert_eq!(
+            effective_expression("txt-1", "htmlChecks()"),
+            "htmlChecks()"
+        );
+        assert_eq!(effective_expression("txt-2", "other()"), "other()");
+    }
+
+    #[test]
+    fn as_function_filters_like_of_type() {
+        assert_eq!(
+            effective_expression("dom-3", "%resource.descendants().as(canonical)"),
+            "%resource.descendants().ofType(canonical)"
+        );
+        assert_eq!(
+            effective_expression("x-1", "(value as Quantity).exists()"),
+            "(value as Quantity).exists()"
+        );
+    }
 
     #[test]
     fn combines_paths_into_focused_expressions() {
         assert_eq!(combine("Patient", "name.exists()"), "name.exists()");
         assert_eq!(
             combine("Patient.contact.0", "name.exists() or telecom.exists()"),
-            "contact[0].all(name.exists() or telecom.exists())"
+            "contact[0].all((name.exists() or telecom.exists()).allTrue())"
         );
         assert_eq!(
             combine("Patient.name.2.given", "length() < 10"),
-            "name[2].given.all(length() < 10)"
+            "name[2].given.all((length() < 10).allTrue())"
         );
     }
 }

@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Stable error type strings — the cross-implementation contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
     /// A data key matched no element in any schema of the cooperative set.
@@ -67,11 +67,19 @@ pub enum ErrorKind {
     /// A `batch`/`transaction` entry whose `request.url` names a different
     /// resource type than the entry's `resource` (X10).
     BundleEntryMismatch,
+    /// A `Reference` that is malformed, contradicts its own `type`, or names
+    /// a target type the element does not allow.
+    ReferenceInvalid,
+    /// A `urn:uuid:`/`urn:oid:` reference inside a Bundle that no entry's
+    /// `fullUrl` matches.
+    ReferenceUnresolved,
+    /// A JSON object with no members (FHIR JSON forbids empty elements).
+    EmptyObject,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
 /// conformance error shape stays exactly `{type, path, message, ...extra}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Severity {
     #[default]
     Error,
@@ -292,9 +300,66 @@ pub(crate) fn msg_unknown_schema(reference: &str) -> String {
     format!("could not resolve schema '{reference}'")
 }
 
-/// [helios] a profile reference could not be resolved.
+/// [helios] a `meta.profile` claim could not be resolved (the HL7
+/// validator's wording).
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {
-    format!("could not resolve profile '{reference}'")
+    format!("Profile reference '{reference}' has not been checked because it could not be found")
+}
+
+/// [helios] a profile the caller asked to validate against could not be
+/// resolved.
+pub(crate) fn msg_unknown_requested_profile(reference: &str) -> String {
+    format!(
+        "Profile '{reference}' was requested for validation but could not be found; the resource was not checked against it"
+    )
+}
+
+/// [helios] `Reference.reference` is not a reference (HL7 validator
+/// wording).
+pub(crate) fn msg_reference_malformed(reference: &str) -> String {
+    format!("The reference '{reference}' is not a valid reference")
+}
+
+/// [helios] the literal reference and `Reference.type` disagree.
+pub(crate) fn msg_reference_type_mismatch(
+    reference: &str,
+    literal: &str,
+    declared: &str,
+) -> String {
+    format!(
+        "The reference '{reference}' refers to a {literal}, but Reference.type says '{declared}'"
+    )
+}
+
+/// [helios] the target type is not allowed (HL7 validator wording).
+pub(crate) fn msg_reference_target_type(found: &str, allowed: &[String]) -> String {
+    format!(
+        "Invalid Resource target type. Found {found}, but expected one of ({})",
+        allowed.join(", ")
+    )
+}
+
+/// [helios] a Bundle-internal URN reference no entry provides (HL7
+/// validator wording).
+pub(crate) fn msg_reference_urn_unresolved(reference: &str) -> String {
+    format!("URN reference is not locally contained within the bundle {reference}")
+}
+
+/// [helios] a resource id outside the `id` pattern (HL7 validator
+/// wording).
+pub(crate) fn msg_resource_id(id: &str) -> String {
+    format!("Invalid Resource id: Invalid Characters ('{id}')")
+}
+
+/// [helios] a modifier extension with no known definition (HL7 validator
+/// wording).
+pub(crate) fn msg_unknown_modifier_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
+/// [helios] an empty JSON object (HL7 validator wording).
+pub(crate) fn msg_empty_object() -> String {
+    "Object must have some content".to_string()
 }
 
 /// The reference validator's JSON type vocabulary (`getType`).
