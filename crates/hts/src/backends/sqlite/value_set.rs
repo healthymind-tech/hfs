@@ -4956,25 +4956,29 @@ fn query_descendants_full(
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     if closure_built {
+        // `concepts` is bound to the system and the closure range scan sits in
+        // an IN-subquery: this shape keeps the planner on the two primary-key
+        // indexes (the JOIN form let it scan every concept and probe the
+        // closure per row — seconds on a cold 2 GB database).
         let mut stmt = conn
             .prepare_cached(
                 "SELECT c.code, c.display
-                 FROM   concept_closure cc
-                 JOIN   concepts c ON c.system_id = cc.system_id AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?1 AND cc.ancestor_code = ?2
-                   AND  (cc.descendant_code != ?2 OR ?3)",
+                 FROM   concepts c
+                 WHERE  c.system_id = ?1
+                   AND  c.code IN (SELECT cc.descendant_code FROM concept_closure cc
+                                   WHERE cc.system_id = ?1 AND cc.ancestor_code = ?2)",
             )
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         let rows = stmt
-            .query_map(
-                rusqlite::params![system_id, root_code, i64::from(include_self)],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
+            .query_map(rusqlite::params![system_id, root_code], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
             .map_err(|e| HtsError::StorageError(e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         return Ok(rows
             .into_iter()
+            .filter(|(code, _)| include_self || code != root_code)
             .map(|(code, display)| bare_contains(system_url, code, display))
             .collect());
     }
