@@ -3,6 +3,7 @@
 //! Gated by the `postgres` feature flag. Uses `deadpool-postgres` for async
 //! connection pooling and `tokio-postgres` for query execution.
 
+pub mod admin;
 pub mod schema;
 
 mod code_system;

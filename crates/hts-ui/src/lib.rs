@@ -42,6 +42,7 @@
 //! crate owns templates only, not assets, so the two concerns move on their
 //! own schedules.
 
+mod admin;
 mod capability;
 mod chart;
 mod code_systems;
@@ -164,13 +165,26 @@ pub struct HtsUiState {
 /// Mount this at `/ui` in the HTS binary so the routes below become
 /// `/ui/hts`, `/ui/hts/assets/*`, etc.
 pub fn router(state: Arc<HtsUiState>) -> Router {
-    Router::new()
-        .merge(home::routes())
+    router_with_admin(state, None)
+}
+
+/// [`router`] plus the HTS admin API nested at `/hts/api/admin`, so the
+/// console's browser code (chunked upload, live job progress) reaches it on
+/// the console's own origin and path prefix — `/ui/hts/api/admin/...` — which
+/// any reverse proxy forwarding `/ui/hts` already routes to this binary.
+/// `admin` is `None` when `HTS_ADMIN_UI` is off.
+pub fn router_with_admin(state: Arc<HtsUiState>, admin: Option<Router>) -> Router {
+    let base = match admin {
+        Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
+        None => Router::new(),
+    };
+    base.merge(home::routes())
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
         .merge(concepts::routes())
         .merge(import::routes())
+        .merge(admin::routes())
         .merge(capability::routes())
         .merge(raw_json_fragment::concept_fragment_routes())
         .merge(raw_json_fragment::workbench_fragment_routes())

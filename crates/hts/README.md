@@ -392,6 +392,7 @@ Options:
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 | `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
+| `HTS_ADMIN_UI` | false | Enable terminology management — the `/admin` API (chunked upload, import jobs, delete, current-version pin, compaction, registry install) and the matching console pages. See [`docs/hts-terminology-admin.md`](../../docs/hts-terminology-admin.md) for this and the related `HTS_ADMIN_DATA_DIR`, `HTS_IMPORT_DIR`, `HTS_PACKAGE_REGISTRY`, `HTS_UPLOAD_CHUNK_SIZE`, `HTS_MAX_UPLOAD_SIZE` and `HTS_DISK_HEADROOM`. |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected

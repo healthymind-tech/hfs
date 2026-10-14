@@ -90,9 +90,18 @@ async fn root_redirect() -> Response {
 /// [`CorsLayer`] validates origins lazily at request time.
 pub fn create_app<B>(config: &HtsConfig, state: AppState<B>) -> Router
 where
-    B: TerminologyBackend + BundleImportBackend + Clone,
+    B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
     let cors = build_cors(config);
+
+    // Terminology management (`HTS_ADMIN_UI=true`): the `/admin` API and its
+    // background job worker. Built before the UI so the console can mount the
+    // same router under its own prefix.
+    let admin = if config.admin_ui {
+        build_admin(config, &state)
+    } else {
+        None
+    };
 
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
@@ -151,7 +160,7 @@ where
             // Starts empty; the Home page's own 15 s poll fills it.
             metrics_ring: Default::default(),
         });
-        Some(helios_hts_ui::router(ui_state))
+        Some(helios_hts_ui::router_with_admin(ui_state, admin.clone()))
     } else {
         None
     };
@@ -267,6 +276,10 @@ where
     // trailing-slash canonicalization; the existing `POST /` batch handler
     // is unaffected because axum's `Router::route` merges compatible method
     // routers on the same path.
+    let router = match admin {
+        Some(admin) => router.nest("/admin", admin),
+        None => router,
+    };
     let router = if let Some(ui) = hts_ui {
         router.route("/", get(root_redirect)).nest("/ui", ui)
     } else {
@@ -296,6 +309,59 @@ where
             Duration::from_secs(30),
         ))
         .layer(TraceLayer::new_for_http())
+}
+
+/// Wire the admin core to this app's backend and caches and start its worker.
+///
+/// Returns `None` (admin stays off, with an error logged) when the data
+/// directory cannot be created, rather than failing the whole server.
+fn build_admin<B>(config: &HtsConfig, state: &AppState<B>) -> Option<Router>
+where
+    B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
+{
+    use std::sync::Arc;
+    let admin_config = crate::admin::AdminConfig::from_hts(config);
+    let ops: Arc<dyn crate::admin::TerminologyAdmin> = state.backend.clone();
+    let importer: Arc<dyn BundleImportBackend> = state.backend.clone();
+    let on_change = {
+        let st = state.clone();
+        Arc::new(move || {
+            st.clear_expand_cache();
+            st.backend().invalidate_caches();
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let core = match crate::admin::AdminCore::new(
+        admin_config,
+        ops,
+        importer,
+        state.active_resource_store(),
+        on_change,
+    ) {
+        Ok(core) => core,
+        Err(err) => {
+            tracing::error!(%err, "HTS_ADMIN_UI: cannot create the admin data directory; admin API disabled");
+            return None;
+        }
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        crate::admin::jobs::start_worker(core.clone());
+        let c = core.clone();
+        tokio::spawn(async move {
+            let n = c.uploads.purge_stale(chrono::Duration::days(7)).await;
+            if n > 0 {
+                tracing::info!(removed = n, "purged stale incomplete uploads");
+            }
+        });
+    } else {
+        tracing::error!("HTS_ADMIN_UI: no Tokio runtime at router build; jobs will not run");
+    }
+    tracing::info!(
+        data_dir = %core.config.data_dir.display(),
+        import_dir = ?core.config.import_dir,
+        registry = ?core.config.registry_url,
+        "terminology admin API enabled at /admin"
+    );
+    Some(crate::admin::routes::router(core))
 }
 
 /// Recursively size a directory in bytes. Small utility used at HTS-UI

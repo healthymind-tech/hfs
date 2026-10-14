@@ -1,0 +1,59 @@
+{#- Job detail fragment; polls itself every 2 s while the job is active. -#}
+<div id="hts-job-detail"
+     {% if job.active %}hx-get="/ui/hts/jobs/{{ job.id|urlencode_strict }}?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+     data-status="{{ job.status }}" data-phase="{{ job.phase }}" data-percent="{{ job.percent }}">
+  <section class="card">
+    <div class="card-head">
+      <h3>{{ chrome.i18n.t("hts-job-progress") }}</h3>
+      <div class="card-head__tools">
+        <span class="tag {{ job.tag_class }}" data-job-status>{{ chrome.i18n.t(job.status_key.as_str()) }}</span>
+        {% if job.cancellable %}
+        <form method="post" action="/ui/hts/jobs/{{ job.id|urlencode_strict }}/cancel">
+          <button class="btn btn--danger" type="submit" id="hts-job-cancel">{{ chrome.i18n.t("hts-job-cancel") }}</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="progress {{ job.progress_class }}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.percent }}" aria-labelledby="hts-job-heading">
+        <div class="progress__bar" style="width: {{ job.percent }}%"></div>
+      </div>
+      <p class="job-card__meta" data-progress-text>
+        {% if job.status == "queued" %}{% if let Some(p) = job.queue_position %}{{ chrome.i18n.t_arg("hts-job-queued-position", "n", *p) }}{% endif %}
+        {% else if job.active %}{{ chrome.i18n.t(job.phase_key.as_str()) }}{% if let Some(c) = job.counter %} · {{ c }}{% endif %}{% if let Some(c) = job.concepts %} · {{ chrome.i18n.t_arg("hts-job-concepts", "n", c.to_string()) }}{% endif %} · {{ job.percent }}%
+        {% endif %}
+      </p>
+      <ol class="facets facets--bare" aria-label="{{ chrome.i18n.t("hts-job-phases") }}">
+        {% for ph in job.phases %}
+        <li class="tag {% if ph.state == "done" %}tag--complete{% else if ph.state == "current" %}tag--in-progress{% else %}tag--muted{% endif %}" data-phase-state="{{ ph.state }}"{% if ph.state == "current" %} aria-current="step"{% endif %}>{{ chrome.i18n.t(ph.key.as_str()) }}</li>
+        {% endfor %}
+      </ol>
+      {% if let Some(e) = job.error %}<p class="alert" role="alert">{{ e }}</p>{% endif %}
+      <div class="kv-grid">
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-job-requested-by") }}</span><div>{{ job.who }}</div></div>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-job-created") }}</span><div>{{ job.created }}</div></div>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-job-started") }}</span><div>{% if let Some(s) = job.started %}{{ s }}{% else %}&mdash;{% endif %}</div></div>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-job-finished") }}</span><div>{% if let Some(s) = job.finished %}{{ s }}{% else %}&mdash;{% endif %}{% if let Some(d) = job.duration %} ({{ d }}){% endif %}</div></div>
+        {% for (k, v) in job.result_summary %}
+        <div class="detail__field"><span>{{ chrome.i18n.t(k) }}</span><div>{{ v }}</div></div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h3>{{ chrome.i18n.t("hts-job-log") }}</h3></div>
+    <div class="panel">
+      {% if log.is_empty() %}<p class="query-empty">{{ chrome.i18n.t("hts-job-log-empty") }}</p>
+      {% else %}<pre class="detail__code" id="hts-job-log">{% for l in log %}{{ l }}
+{% endfor %}</pre>{% endif %}
+    </div>
+  </section>
+
+  {% if let Some(r) = job.result_json %}
+  <details class="card disclosure">
+    <summary class="disclosure__summary card-head"><h3>{{ chrome.i18n.t("hts-job-result-raw") }}</h3></summary>
+    <div class="panel"><pre class="detail__code">{{ r }}</pre></div>
+  </details>
+  {% endif %}
+</div>

@@ -1,0 +1,84 @@
+{#-
+  Delete confirmation for one CodeSystem version (plan F.6): what will be
+  removed, which resources depend on it, which version answers version-less
+  requests afterwards. The operator types the canonical URL to confirm; the
+  POST queues a delete job and redirects to it.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-del-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <a class="back-link" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-del-back") }}</a>
+  <h1 id="hts-del-heading" class="page-head__title">{{ chrome.i18n.t("hts-del-title") }}</h1>
+  <p class="page-head__lede"><span class="url">{{ url }}</span> · <code>{{ version_label }}</code></p>
+</section>
+
+{% if let Some(e) = error %}
+<p class="alert" role="alert" data-flash="error">{% if e == "confirm" %}{{ chrome.i18n.t("hts-del-confirm-mismatch") }}{% else %}{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}{% endif %}</p>
+{% endif %}
+
+{% if let Some(u) = unavailable %}
+  {% include "partials/hts-admin-unavailable.html" %}
+{% else %}
+<section class="card">
+  <div class="card-head"><h3>{{ chrome.i18n.t("hts-del-what") }}</h3></div>
+  <div class="panel kv-grid">
+    <div class="detail__field"><span>{{ chrome.i18n.t("hts-term-col-concepts") }}</span><div>{% if let Some(c) = concepts %}{{ c }}{% else %}&mdash;{% endif %}</div></div>
+    <div class="detail__field"><span>{{ chrome.i18n.t("hts-term-col-size") }}</span><div>{% if let Some(s) = size %}≈ {{ s }}{% else %}&mdash;{% endif %}</div></div>
+    <div class="detail__field detail__field--wide"><span>{{ chrome.i18n.t("hts-del-rows") }}</span><div>{{ chrome.i18n.t("hts-del-rows-value") }}</div></div>
+    <div class="detail__field detail__field--wide"><span>{{ chrome.i18n.t("hts-del-after") }}</span>
+      <div data-after-delete>{% if nothing_left %}{{ chrome.i18n.t("hts-del-after-none") }}{% else if let Some(v) = current_after %}{{ chrome.i18n.t_arg("hts-del-after-version", "version", v.to_string()) }}{% endif %}</div>
+    </div>
+    {% if is_pinned %}<div class="detail__field detail__field--wide"><span>{{ chrome.i18n.t("hts-term-pinned") }}</span><div>{{ chrome.i18n.t("hts-del-pinned-note") }}</div></div>{% endif %}
+  </div>
+</section>
+
+<section class="card" aria-labelledby="hts-del-deps-heading">
+  <div class="card-head"><h3 id="hts-del-deps-heading">{{ chrome.i18n.t_arg("hts-del-deps", "n", deps.len()) }}</h3></div>
+  {% if deps.is_empty() %}
+  <div class="panel"><p class="query-empty">{{ chrome.i18n.t("hts-del-deps-none") }}</p></div>
+  {% else %}
+  <div class="panel"><p class="notice notice--warn">{{ chrome.i18n.t("hts-del-deps-warning") }}</p></div>
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack" id="hts-del-deps">
+      <thead><tr>
+        <th scope="col">{{ chrome.i18n.t("hts-del-dep-type") }}</th>
+        <th scope="col" class="col-name">{{ chrome.i18n.t("hts-term-other-url") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-term-col-version") }}</th>
+        <th scope="col">{{ chrome.i18n.t("hts-del-dep-binding") }}</th>
+      </tr></thead>
+      <tbody>
+        {% for d in deps %}
+        <tr>
+          <td data-label="{{ chrome.i18n.t("hts-del-dep-type") }}">{{ d.kind }}</td>
+          <td class="col-name"><span class="url">{{ d.url }}</span></td>
+          <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}">{% if d.version.is_empty() %}&mdash;{% else %}<code>{{ d.version }}</code>{% endif %}</td>
+          <td data-label="{{ chrome.i18n.t("hts-del-dep-binding") }}">{% if d.pins %}<span class="tag tag--danger">{{ chrome.i18n.t("hts-del-dep-pinned") }}</span>{% else %}<span class="tag tag--muted">{{ chrome.i18n.t("hts-del-dep-floating") }}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<form class="card" method="post" action="/ui/hts/terminology/delete" aria-labelledby="hts-del-confirm-heading">
+  <div class="card-head"><h3 id="hts-del-confirm-heading">{{ chrome.i18n.t("hts-del-confirm-heading") }}</h3></div>
+  <div class="panel">
+    <input type="hidden" name="url" value="{{ url }}">
+    <input type="hidden" name="version" value="{{ version }}">
+    <label class="field">
+      <span class="field__label">{{ chrome.i18n.t("hts-del-confirm-label") }}</span>
+      <input class="field__input" name="confirm" autocomplete="off" spellcheck="false" required placeholder="{{ url }}">
+      <span class="field__hint">{{ chrome.i18n.t("hts-del-confirm-hint") }}</span>
+    </label>
+    <div class="form-actions">
+      <a class="btn" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-del-cancel") }}</a>
+      <button class="btn btn--danger" type="submit">{{ chrome.i18n.t("hts-del-submit") }}</button>
+    </div>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

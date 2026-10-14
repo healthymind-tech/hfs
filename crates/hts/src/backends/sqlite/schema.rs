@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS code_systems (
     -- `ORDER BY version_sort DESC` picks the semantically newest version
     -- (10.0.0 above 9.0.0 above 2018-08-12) instead of the textually largest.
     -- Recomputed on every write; backfilled by `migrate_version_sort`.
-    version_sort  TEXT
+    version_sort  TEXT,
+    -- 1 = an operator pinned this row as the current version of `url`
+    -- (admin API `PUT /admin/code-systems/current`). At most one row per url
+    -- carries it; the precedence ORDER BY ranks it above version order. NULL
+    -- (the default) leaves the semantic newest version current.
+    current_pin   INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -443,18 +448,37 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
 /// closure table was introduced) are migrated automatically.
 pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Find every system that has hierarchy edges but no closure rows at all.
+    //
+    // One indexed probe per stored CodeSystem rather than a correlated
+    // `NOT EXISTS` over every hierarchy row: once `ANALYZE` has run on a
+    // database holding a single large closure (a fresh SNOMED CT load),
+    // `sqlite_stat1` says `system_id = ?` matches every closure row, and
+    // SQLite 3.48 then plans the subquery as a full `SCAN` of
+    // `concept_closure` — once per hierarchy row. Importing LOINC next to
+    // SNOMED turned that into 176 k scans of 7.7 M rows (hours of CPU, no
+    // I/O). `INDEXED BY` pins the seek regardless of the statistics.
     let systems_needing_closure: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT h.system_id
-             FROM   concept_hierarchy h
-             WHERE  NOT EXISTS (
-                        SELECT 1 FROM concept_closure c
-                        WHERE  c.system_id = h.system_id
-                        LIMIT  1
-                    )",
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM code_systems")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut has_edges = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM concept_hierarchy INDEXED BY idx_hierarchy_child
+                           WHERE system_id = ?1)",
         )?;
-        stmt.query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
+        let mut has_closure = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM concept_closure INDEXED BY idx_closure_descendant
+                           WHERE system_id = ?1)",
+        )?;
+        let mut out = Vec::new();
+        for id in ids {
+            let edges: bool = has_edges.query_row([&id], |r| r.get(0))?;
+            if edges && !has_closure.query_row([&id], |r| r.get::<_, bool>(0))? {
+                out.push(id);
+            }
+        }
+        out
     };
 
     for sid in &systems_needing_closure {
@@ -585,6 +609,18 @@ pub fn migrate_version_sort(conn: &rusqlite::Connection) -> rusqlite::Result<()>
         backfill_version_sort(conn, table)?;
     }
     Ok(())
+}
+
+/// Add the operator-controlled `current_pin` column to `code_systems`.
+///
+/// Must run after the `drop_url_unique` rebuild (which recreates the table with
+/// a fixed column list). Idempotent; no backfill — `NULL` means "not pinned".
+pub fn migrate_current_pin(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    match conn.execute_batch("ALTER TABLE code_systems ADD COLUMN current_pin INTEGER") {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<()> {
@@ -1184,5 +1220,75 @@ mod tests {
         migrate_icd9cm_reimport(&conn).unwrap();
 
         assert_eq!(ledger_paths(&conn), vec![ICD9CM_MARKER.to_string()]);
+    }
+
+    /// After `ANALYZE` on a database whose closure holds a single large
+    /// system, the statistics claim `system_id = ?` matches every closure
+    /// row. The probe must still seek the index (it used to fall back to a
+    /// full table scan per hierarchy row), and a second system lacking its
+    /// closure must be found and built.
+    #[test]
+    fn closure_probe_stays_indexed_after_analyze_with_one_big_system() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        for id in ["big", "small"] {
+            conn.execute(
+                "INSERT INTO code_systems (id, url, status, content, created_at, updated_at)
+                 VALUES (?1, ?1, 'active', 'complete', ?2, ?2)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..3000 {
+            conn.execute(
+                "INSERT INTO concept_closure VALUES ('big', ?1, ?1)",
+                [format!("c{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT; ANALYZE;").unwrap();
+        for (p, c) in [("a", "b"), ("b", "c")] {
+            conn.execute(
+                "INSERT INTO concepts (system_id, code) VALUES ('small', ?1)",
+                [p],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO concept_hierarchy VALUES ('small', ?1, ?2)",
+                [p, c],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO concepts (system_id, code) VALUES ('small', 'c')",
+            [],
+        )
+        .unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM concept_closure \
+                 INDEXED BY idx_closure_descendant WHERE system_id = ?1)",
+            )
+            .unwrap()
+            .query_map(["small"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("USING COVERING INDEX idx_closure_descendant")),
+            "{plan:?}"
+        );
+        migrate_concept_closure(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_closure WHERE system_id = 'small'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 6, "a, b, c self-links + a>b, b>c, a>c");
     }
 }

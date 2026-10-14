@@ -36,6 +36,7 @@
 //! [`AppState`]: state::AppState
 //! [`create_app`]: server::create_app
 
+pub mod admin;
 pub mod backends;
 pub(crate) mod bcp13;
 pub mod config;

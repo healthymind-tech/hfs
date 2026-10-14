@@ -160,6 +160,20 @@ const ROUTES: &[Route] = &[
         // Fluent en value for `hts-import-heading` is "Import Terminology".
         expect: ">Import Terminology<",
     },
+    // Terminology management (HTS_ADMIN_UI). With the closed upstream the
+    // pages render their shell plus the degraded notice.
+    Route {
+        path: "/ui/hts/terminology",
+        expect: ">Terminology inventory<",
+    },
+    Route {
+        path: "/ui/hts/terminology/delete?url=http%3A%2F%2Fx&version=1",
+        expect: ">Delete a CodeSystem version<",
+    },
+    Route {
+        path: "/ui/hts/jobs",
+        expect: "hts-jobs-list",
+    },
     // Capability & Conformance. One entry — the page mirrors HFS's own
     // capability page (stacked `.card` sections, no tab strip), so there is
     // no fragment endpoint. It was called "Diagnostics" at

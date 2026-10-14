@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
+use helios_hts::import::dispatch::dispatch_import;
 use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
 use helios_persistence::tenant::TenantContext;
 use tracing::info;
@@ -105,12 +106,16 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let signal = helios_observability::shutdown::signal().await;
-            info!(signal, "Shutdown signal received, draining connections");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        // Peer addresses feed the admin audit trail (`admin::audit`).
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
+    })
+    .await?;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())
@@ -173,12 +178,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS (PostgreSQL) listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let signal = helios_observability::shutdown::signal().await;
-            info!(signal, "Shutdown signal received, draining connections");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        // Peer addresses feed the admin audit trail (`admin::audit`).
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
+    })
+    .await?;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())
@@ -923,80 +932,6 @@ async fn import_directory_files(
     }
 
     Ok((stats, imported_count, skipped_count))
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-async fn dispatch_import(
-    format: ImportFormat,
-    backend: &dyn BundleImportBackend,
-    ctx: &TenantContext,
-    path: &std::path::Path,
-    batch_size: usize,
-    dry_run: bool,
-    languages: &LanguageFilter,
-) -> Result<ImportStats, helios_hts::error::HtsError> {
-    use helios_hts::import::{
-        dicom::import_dicom, hl7_v2_tables::import_hl7_v2_tables, icd9_cm::import_icd9_cm,
-        icd10_cm::import_icd10_cm, icd10_pcs::import_icd10_pcs, loinc_csv::import_loinc_csv,
-        mesh::import_mesh, nci_thesaurus::import_nci_thesaurus, ndc::import_ndc, nucc::import_nucc,
-        rxnorm_rrf::import_rxnorm_rrf, snomed_rf2::import_snomed_rf2, tgz::import_tgz,
-        ucum::import_ucum,
-    };
-
-    match format {
-        ImportFormat::Hl7Npm => import_tgz(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::SnomedRf2 => {
-            import_snomed_rf2(backend, ctx, path, batch_size, dry_run, languages).await
-        }
-        ImportFormat::Loinc => {
-            import_loinc_csv(backend, ctx, path, batch_size, dry_run, languages).await
-        }
-        ImportFormat::Icd10Cm => import_icd10_cm(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Icd10Pcs => import_icd10_pcs(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Icd9Cm => import_icd9_cm(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Rxnorm => import_rxnorm_rrf(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Ucum => import_ucum(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::NciThesaurus => {
-            import_nci_thesaurus(backend, ctx, path, batch_size, dry_run).await
-        }
-        ImportFormat::Mesh => import_mesh(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Dicom => import_dicom(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Hl7V2Tables => {
-            import_hl7_v2_tables(backend, ctx, path, batch_size, dry_run).await
-        }
-        ImportFormat::Nucc => import_nucc(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Ndc => import_ndc(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::FhirBundle => import_fhir_bundle_file(backend, ctx, path, dry_run).await,
-    }
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-async fn import_fhir_bundle_file(
-    backend: &dyn BundleImportBackend,
-    ctx: &TenantContext,
-    path: &std::path::Path,
-    dry_run: bool,
-) -> Result<helios_hts::import::ImportStats, helios_hts::error::HtsError> {
-    use helios_hts::error::HtsError;
-
-    let data = tokio::fs::read(path)
-        .await
-        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read '{}': {e}", path.display())))?;
-
-    if dry_run {
-        let parsed = helios_hts::import::bundle_parser::parse_bundle(&data)?;
-        let concepts: usize = parsed.code_systems.iter().map(|cs| cs.concepts.len()).sum();
-        let stats = helios_hts::import::ImportStats {
-            code_systems: parsed.code_systems.len() as u32,
-            value_sets: parsed.value_sets.len() as u32,
-            concept_maps: parsed.concept_maps.len() as u32,
-            concepts: concepts as u32,
-            ..Default::default()
-        };
-        return Ok(stats);
-    }
-
-    backend.import_bundle(ctx, &data).await
 }
 
 #[cfg(not(any(feature = "sqlite", feature = "postgres")))]

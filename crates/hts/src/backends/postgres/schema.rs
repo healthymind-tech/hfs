@@ -299,6 +299,8 @@ END $$;
 -- precedence ORDER BY picks the semantically newest version. Backfilled by
 -- `migrate_version_sort_pg` right after this schema is applied.
 ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS version_sort TEXT;
+-- Operator-pinned current version (admin API); see the SQLite schema.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS current_pin INTEGER;
 ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS version_sort TEXT;
 
 -- ── ICD-9-CM re-import backfill (issue #802) ────────────────────────────────────

@@ -399,6 +399,7 @@ pub async fn import_snomed_rf2(
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 
+        crate::import::progress::report_batch(i + 1, total_batches);
         eprintln!(
             "[{FORMAT}] concept batch {}/{total_batches} — +{} concepts (total: {})",
             i + 1,

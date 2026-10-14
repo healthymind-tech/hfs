@@ -384,6 +384,7 @@ pub async fn import_loinc_csv(
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 
+        crate::import::progress::report_batch(i + 1, num_batches);
         eprintln!(
             "[{FORMAT}] concept batch {}/{num_batches} — +{} concepts (total: {})",
             i + 1,
@@ -431,7 +432,7 @@ struct LoincArchivePaths {
 /// Stored on `CodeSystem.version` at import time so unpinned `$validate-code`
 /// and `version=current` resolution prefer the full release over empty HL7 or
 /// consult-minimal stub rows. See `docs/ig-publisher-compatibility.md`.
-fn loinc_release_version_from_entry(entry_path: &str) -> Option<String> {
+pub(crate) fn loinc_release_version_from_entry(entry_path: &str) -> Option<String> {
     for segment in entry_path.split('/') {
         let lower = segment.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("loinc_") {

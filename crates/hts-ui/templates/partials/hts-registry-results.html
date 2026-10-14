@@ -1,0 +1,20 @@
+{#- Registry search results (htmx fragment for the Import page). -#}
+<div id="hts-registry-results" aria-live="polite">
+  {% if let Some(e) = error %}<p class="alert" role="alert">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>
+  {% else if searched && packages.is_empty() %}<p class="query-empty">{{ chrome.i18n.t("hts-reg-none") }}</p>
+  {% else %}
+  <ul class="query-list">
+    {% for (name, fv, desc) in packages %}
+    <li class="query-row">
+      <div class="query-row__main">
+        <span class="query-row__name"><code>{{ name }}</code>{% if !fv.is_empty() %} <span class="tag tag--muted">{{ fv }}</span>{% endif %}</span>
+        {% if !desc.is_empty() %}<span class="query-row__meta">{{ desc }}</span>{% endif %}
+      </div>
+      <div class="query-row__actions">
+        <button type="button" class="btn" data-pick-package="{{ name }}">{{ chrome.i18n.t("hts-reg-pick") }}</button>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>

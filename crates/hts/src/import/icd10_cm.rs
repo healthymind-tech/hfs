@@ -111,6 +111,7 @@ pub async fn import_icd10_cm(
         let chunk = backend.import_bundle(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
 
+        crate::import::progress::report_batch(batch_idx + 1, total_batches);
         eprintln!(
             "[icd10-cm] batch {}/{total_batches} — +{} concepts (total: {})",
             batch_idx + 1,

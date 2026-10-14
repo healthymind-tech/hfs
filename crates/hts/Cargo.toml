@@ -70,6 +70,10 @@ clap = { version = "4.0", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 sha2 = "0.10"
+sha1 = "0.10"
+libc = "0.2"
+# packages.fhir.org client for terminology package installs (admin API).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 octofhir-ucum = "0.5"
 unicode-normalization = "0.1"
 

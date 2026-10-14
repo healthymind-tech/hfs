@@ -1,0 +1,180 @@
+{#-
+  Archive import (plan F.1–F.5). One form, three sources selected by the
+  `admin_source` radio (not `source`: `assets/import.js` owns that name for
+  the Bundle paste/file toggle below).
+
+    upload      — `assets/hts-admin.js` uploads the picked file in
+                  `chunk_size` pieces straight to the admin API under
+                  `/ui/hts/api/admin` (resumable: re-picking the same file
+                  after a reload continues where it stopped), then adds it to
+                  the "uploaded files" radio list and selects it;
+    import-dir  — files an operator copied into HTS_IMPORT_DIR;
+    registry    — a FHIR package from the configured registry.
+
+  The submit posts the urlencoded form to `/ui/hts/import/job`, which queues
+  the job and redirects to its progress page — no script needed for the
+  import-dir and registry sources.
+-#}
+<form class="card" id="hts-admin-import" method="post" action="/ui/hts/import/job"
+      data-api="{{ a.api }}" data-chunk-size="{{ a.chunk_size }}"
+      data-msg-uploading="{{ chrome.i18n.t("hts-up-uploading") }}"
+      data-msg-paused="{{ chrome.i18n.t("hts-up-paused") }}"
+      data-msg-resumed="{{ chrome.i18n.t("hts-up-resumed") }}"
+      data-msg-verifying="{{ chrome.i18n.t("hts-up-verifying") }}"
+      data-msg-done="{{ chrome.i18n.t("hts-up-done") }}"
+      data-msg-failed="{{ chrome.i18n.t("hts-up-failed") }}"
+      data-msg-detected="{{ chrome.i18n.t("hts-up-detected") }}"
+      data-msg-undetected="{{ chrome.i18n.t("hts-up-undetected") }}"
+      data-msg-space="{{ chrome.i18n.t("hts-up-space") }}"
+      aria-labelledby="hts-import-archive-heading">
+  <div class="card-head">
+    <h2 id="hts-import-archive-heading">{{ chrome.i18n.t("hts-import-archive-heading") }}</h2>
+  </div>
+  <div class="panel">
+    <aside class="notice" data-licence-note>
+      <p><strong>{{ chrome.i18n.t("hts-import-licence-title") }}</strong></p>
+      <p>{{ chrome.i18n.t("hts-import-licence-body") }}</p>
+    </aside>
+
+    <div class="field" role="radiogroup" aria-labelledby="hts-archive-source-label">
+      <span class="field__label" id="hts-archive-source-label">1 · {{ chrome.i18n.t("hts-import-step-source") }}</span>
+      <div class="facets facets--bare">
+        <label class="chip"><input type="radio" name="admin_source" value="upload" checked> {{ chrome.i18n.t("hts-import-src-upload") }}</label>
+        {% if a.import_dir.is_some() %}<label class="chip"><input type="radio" name="admin_source" value="import-dir"> {{ chrome.i18n.t("hts-import-src-dir") }}</label>{% endif %}
+        {% if a.registry.is_some() %}<label class="chip"><input type="radio" name="admin_source" value="registry"> {{ chrome.i18n.t("hts-import-src-registry") }}</label>{% endif %}
+      </div>
+    </div>
+
+    {#- ── Upload ───────────────────────────────────────────────────────── -#}
+    <div role="group" class="field" data-source-panel="upload" id="hts-src-upload">
+      <span class="field__label">{{ chrome.i18n.t("hts-import-src-upload") }}</span>
+      <noscript><p class="field__hint">{{ chrome.i18n.t("hts-up-needs-js") }}</p></noscript>
+      <button type="button" class="batch-drop" id="hts-up-drop">
+        <strong>{{ chrome.i18n.t("hts-up-drop") }}</strong>
+        <span>{{ chrome.i18n.t_arg("hts-up-drop-hint", "max", a.max_upload.to_string()) }}</span>
+      </button>
+      <input id="hts-up-file" type="file" hidden accept=".zip,.tgz,.gz,.json,.xml,.txt,.csv,.rrf">
+      <div id="hts-up-progress" hidden>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="hts-up-status" id="hts-up-bar">
+          <div class="progress-fill" id="hts-up-fill" style="width:0%"></div>
+        </div>
+        <p class="job-card__meta" id="hts-up-status" role="status" aria-live="polite"></p>
+        <div class="form-actions form-actions--start">
+          <button type="button" class="btn" id="hts-up-pause">{{ chrome.i18n.t("hts-up-pause") }}</button>
+          <button type="button" class="btn" id="hts-up-resume" hidden>{{ chrome.i18n.t("hts-up-resume") }}</button>
+        </div>
+      </div>
+      <p class="alert" id="hts-up-error" role="alert" hidden></p>
+      <div id="hts-up-detection" class="kv-grid" hidden>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-up-format") }}</span><div id="hts-up-det-format"></div></div>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-term-col-version") }}</span><div id="hts-up-det-version"></div></div>
+        <div class="detail__field"><span>{{ chrome.i18n.t("hts-up-growth") }}</span><div id="hts-up-det-growth"></div></div>
+        <div class="detail__field detail__field--wide"><span>SHA-256</span><div><code id="hts-up-det-sha"></code></div></div>
+      </div>
+      {% if !a.incomplete.is_empty() %}
+      <div class="notice notice--warn" id="hts-up-incomplete">
+        <p><strong>{{ chrome.i18n.t("hts-up-incomplete") }}</strong></p>
+        <ul>
+          {% for u in a.incomplete %}<li><code>{{ u.filename }}</code> · {{ u.percent }}% · {{ u.size }} · {{ u.updated }}</li>{% endfor %}
+        </ul>
+        <p>{{ chrome.i18n.t("hts-up-incomplete-hint") }}</p>
+      </div>
+      {% endif %}
+      <div class="field">
+        <span class="field__label">{{ chrome.i18n.t("hts-up-uploaded") }}</span>
+        <ul class="query-list" id="hts-up-list">
+          {% for u in a.completed %}
+          <li class="query-row"><label><input type="radio" name="upload_id" value="{{ u.id }}"{% if loop.first %} checked{% endif %}> <code>{{ u.filename }}</code> · {{ u.size }}{% if !u.format.is_empty() %} · {{ u.format }}{% endif %}{% if !u.version.is_empty() %} {{ u.version }}{% endif %}</label></li>
+          {% endfor %}
+        </ul>
+        {% if a.completed.is_empty() %}<p class="query-empty" id="hts-up-none">{{ chrome.i18n.t("hts-up-none") }}</p>{% endif %}
+      </div>
+    </div>
+
+    {#- ── Server import directory ──────────────────────────────────────── -#}
+    {% if let Some(dir) = a.import_dir %}
+    <div role="group" class="field" data-source-panel="import-dir" id="hts-src-dir">
+      <span class="field__label">{{ chrome.i18n.t("hts-import-src-dir") }} <code>{{ dir }}</code></span>
+      {% if let Some(e) = a.dir_error %}<p class="alert">{{ e }}</p>{% endif %}
+      {% if a.dir_entries.is_empty() %}<p class="query-empty">{{ chrome.i18n.t("hts-dir-empty") }}</p>{% else %}
+      <div class="table-wrap" tabindex="0">
+        <table class="data-table data-table--stack" id="hts-dir-table">
+          <thead><tr>
+            <th scope="col" class="col-name">{{ chrome.i18n.t("hts-dir-file") }}</th>
+            <th scope="col" class="col-num">{{ chrome.i18n.t("hts-term-col-size") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-dir-modified") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-up-format") }}</th>
+          </tr></thead>
+          <tbody>
+            {% for e in a.dir_entries %}
+            <tr>
+              <td class="col-name"><label><input type="radio" name="path" value="{{ e.path }}"> <code>{{ e.path }}</code></label></td>
+              <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{{ e.size }}</td>
+              <td data-label="{{ chrome.i18n.t("hts-dir-modified") }}">{{ e.modified }}</td>
+              <td data-label="{{ chrome.i18n.t("hts-up-format") }}">{% if e.hint.is_empty() %}{{ chrome.i18n.t("hts-dir-detect-on-import") }}{% else %}{{ e.hint }}{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {#- ── Registry ─────────────────────────────────────────────────────── -#}
+    {% if let Some(reg) = a.registry %}
+    <div role="group" class="field" data-source-panel="registry" id="hts-src-registry">
+      <span class="field__label">{{ chrome.i18n.t("hts-import-src-registry") }} <code>{{ reg }}</code></span>
+      <div class="field-row">
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-reg-search") }}</span>
+          <input class="field__input" type="search" name="registry_q" placeholder="hl7.terminology"
+                 hx-get="/ui/hts/import/registry" hx-trigger="input changed delay:400ms, search" hx-target="#hts-registry-results" hx-swap="outerHTML"
+                 hx-include="this" hx-params="registry_q" autocomplete="off" spellcheck="false" data-registry-q>
+        </label>
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-reg-package") }}</span>
+          <input class="field__input" name="package" id="hts-reg-package" placeholder="hl7.terminology.r4" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-reg-version") }}</span>
+          <input class="field__input" name="package_version" placeholder="{{ chrome.i18n.t("hts-reg-latest") }}" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+      <div id="hts-registry-results"></div>
+    </div>
+    {% endif %}
+
+    {#- ── Options ──────────────────────────────────────────────────────── -#}
+    <div role="group" class="field" id="hts-import-options">
+      <span class="field__label">2 · {{ chrome.i18n.t("hts-import-options") }}</span>
+      <div class="field-row">
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-up-format") }}</span>
+          <select class="field__input" name="format" id="hts-import-format">
+            <option value="auto" selected>{{ chrome.i18n.t("hts-import-format-auto") }}</option>
+            {% for f in a.formats %}<option value="{{ f.id }}">{{ f.id }}{% if f.user_supplied %} *{% endif %}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-import-version-override") }}</span>
+          <input class="field__input" name="version" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-import-languages") }}</span>
+          <input class="field__input" name="languages" placeholder="zh-TW,en" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field__label">{{ chrome.i18n.t("hts-import-properties") }}</span>
+          <input class="field__input" name="properties" placeholder="COMPONENT,PROPERTY,SYSTEM,SCALE_TYP,CLASS" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+      <span class="field__hint">{{ chrome.i18n.t("hts-import-options-hint") }}</span>
+    </div>
+
+    <div class="form-actions">
+      <span class="field__hint">{{ chrome.i18n.t("hts-import-job-note") }}</span>
+      <button class="btn btn--primary" type="submit" id="hts-archive-submit">{{ chrome.i18n.t("hts-import-start-job") }}</button>
+    </div>
+  </div>
+</form>

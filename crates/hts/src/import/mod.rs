@@ -18,7 +18,8 @@
 //! | [`rxnorm_rrf`] | RxNorm RRF (folder or `.zip`) | Free NLM Terms of Service |
 //! | [`ndc`] | FDA NDC Directory (`product.txt` or `.zip`) | Free (public domain) |
 //!
-//! All importers are invoked from the CLI (`hts import`) via `main.rs` using
+//! All importers are invoked through [`dispatch::dispatch_import`] — by the CLI
+//! (`hts import`) and by the admin import jobs ([`crate::admin`]) — using
 //! the format auto-detection in [`crate::config::detect_format`], or
 //! programmatically via [`BundleImportBackend::import_bundle`] for HTTP-based
 //! Bundle imports.
@@ -26,6 +27,7 @@
 pub mod bundle_builder;
 pub mod bundle_parser;
 pub mod dicom;
+pub mod dispatch;
 pub mod fhir_bundle;
 pub mod hl7_v2_tables;
 pub mod icd10_cm;
@@ -36,6 +38,7 @@ pub mod mesh;
 pub mod nci_thesaurus;
 pub mod ndc;
 pub mod nucc;
+pub mod progress;
 pub mod rxnorm_rrf;
 pub mod snomed_rf2;
 pub mod tgz;

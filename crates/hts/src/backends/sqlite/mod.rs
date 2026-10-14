@@ -11,6 +11,7 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
+pub mod admin;
 pub mod schema;
 
 mod code_system;
@@ -569,6 +570,9 @@ impl SqliteTerminologyBackend {
             schema::migrate_version_sort(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
             })?;
+            schema::migrate_current_pin(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
+            })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
@@ -758,6 +762,9 @@ impl SqliteTerminologyBackend {
             // Also after the rebuilds (same reason as authority_rank).
             schema::migrate_version_sort(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
+            schema::migrate_current_pin(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
             })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
