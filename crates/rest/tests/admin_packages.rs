@@ -563,3 +563,149 @@ async fn id_clash_with_a_different_canonical_gets_its_own_id() {
         &validate(&server, "acme-patient", json!({"resourceType": "Patient"})).await
     ));
 }
+
+/// A terminology server stand-in: `POST /import` keeps CodeSystem /
+/// ValueSet / ConceptMap by (type, url, version), `GET /{type}?url=&version=`
+/// searches, `DELETE /{type}/{id}` removes. Returns its base URL and store.
+async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    use axum::{
+        Json, Router,
+        extract::{Path, Query, State},
+        routing::{delete, get, post},
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    type Store = Arc<Mutex<Vec<Value>>>;
+    async fn import(State(store): State<Store>, Json(bundle): Json<Value>) -> Json<Value> {
+        let mut s = store.lock().unwrap();
+        let mut n = 0;
+        for e in bundle["entry"].as_array().cloned().unwrap_or_default() {
+            let r = e["resource"].clone();
+            s.retain(|x| {
+                !(x["resourceType"] == r["resourceType"]
+                    && x["url"] == r["url"]
+                    && x["version"] == r["version"])
+            });
+            s.push(r);
+            n += 1;
+        }
+        Json(json!({"code_systems": n, "value_sets": 0, "concept_maps": 0, "concepts": 0}))
+    }
+    async fn search(
+        State(store): State<Store>,
+        Path(t): Path<String>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let s = store.lock().unwrap();
+        let entry: Vec<Value> = s
+            .iter()
+            .filter(|r| r["resourceType"] == t.as_str())
+            .filter(|r| q.get("url").is_none_or(|u| r["url"] == u.as_str()))
+            .filter(|r| q.get("version").is_none_or(|v| r["version"] == v.as_str()))
+            .map(|r| json!({"resource": r}))
+            .collect();
+        Json(
+            json!({"resourceType": "Bundle", "type": "searchset", "total": entry.len(), "entry": entry}),
+        )
+    }
+    async fn remove(
+        State(store): State<Store>,
+        Path((t, id)): Path<(String, String)>,
+    ) -> axum::http::StatusCode {
+        store
+            .lock()
+            .unwrap()
+            .retain(|r| !(r["resourceType"] == t.as_str() && r["id"] == id.as_str()));
+        axum::http::StatusCode::NO_CONTENT
+    }
+    let store: Store = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/import", post(import))
+        .route("/{t}", get(search))
+        .route("/{t}/{id}", delete(remove))
+        .with_state(Arc::clone(&store));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), store)
+}
+
+/// With a terminology server configured, CodeSystems go there (not into
+/// HFS), uninstall deletes them there, and terminology that was already
+/// loaded before the install is left alone.
+#[tokio::test]
+async fn terminology_goes_to_the_terminology_server_and_is_removed_from_it() {
+    let (hts, store) = mock_hts().await;
+    // Already on the terminology server before any package.
+    store.lock().unwrap().push(json!({
+        "resourceType": "CodeSystem", "id": "shared", "url": "http://acme.org/CodeSystem/shared",
+        "version": "1.0.0", "status": "active", "content": "complete"
+    }));
+    let backend = SqliteBackend::in_memory().expect("sqlite");
+    backend.init_schema().expect("schema");
+    let cache = tempfile::tempdir().unwrap();
+    let config = ServerConfig {
+        seed_conformance: false,
+        request_timeout: 60,
+        terminology_server: Some(hts),
+        packages: PackageConfig {
+            admin_ui: true,
+            registry: RegistryMode::Off,
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..PackageConfig::default()
+        },
+        ..ServerConfig::for_testing()
+    };
+    let server = TestServer::new(helios_rest::create_app_with_config(backend, config)).unwrap();
+    let cs = |id: &str| {
+        json!({
+            "resourceType": "CodeSystem", "id": id, "url": format!("http://acme.org/CodeSystem/{id}"),
+            "version": "1.0.0", "status": "active", "content": "complete", "concept": [{"code": "a"}]
+        })
+    };
+    let pkg = package(
+        "acme.terms",
+        "1.0.0",
+        json!({}),
+        &[
+            ("CodeSystem-own.json", cs("own")),
+            ("CodeSystem-shared.json", cs("shared")),
+            (
+                "StructureDefinition-acme-patient.json",
+                profile("acme-patient", "1.0.0", "birthDate"),
+            ),
+        ],
+    );
+    upload(&server, pkg, "").await.assert_status(StatusCode::OK);
+    let job = install(&server, "acme.terms#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(
+        store.lock().unwrap().len(),
+        2,
+        "own + shared on the terminology server"
+    );
+    server
+        .get("/CodeSystem/own")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    let detail: Value = server.get("/admin/packages/acme.terms/1.0.0").await.json();
+    let rows = detail["resources"]["CodeSystem"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(rows.iter().all(|r| r["target"] == "hts"), "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|r| r["url"] == "http://acme.org/CodeSystem/shared" && r["preexisting"] == true)
+    );
+
+    let job: Value = server
+        .delete("/admin/packages/acme.terms/1.0.0?wait=30")
+        .await
+        .json();
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let left: Vec<Value> = store.lock().unwrap().clone();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["id"], "shared", "pre-existing terminology stays");
+    assert_eq!(job["result"]["keptPreexisting"], 1);
+}

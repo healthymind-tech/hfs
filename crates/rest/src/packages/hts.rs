@@ -106,7 +106,9 @@ impl HtsClient {
             .get(format!("{}/{resource_type}", self.base))
             .header("Accept", "application/fhir+json")
             .timeout(Duration::from_secs(60))
-            .query(&[("url", url)]);
+            // The summary carries id, url and version without the concept
+            // list: 14 ms instead of 0.7 s (3.4 MB) for THO's v3-ActCode.
+            .query(&[("url", url), ("_summary", "true")]);
         if let Some(v) = version {
             request = request.query(&[("version", v)]);
         }
