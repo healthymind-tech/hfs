@@ -351,6 +351,12 @@ pub(crate) fn msg_resource_id(id: &str) -> String {
     format!("Invalid Resource id: Invalid Characters ('{id}')")
 }
 
+/// [helios] a modifier extension with no known definition (HL7 validator
+/// wording).
+pub(crate) fn msg_unknown_modifier_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
 /// [helios] an empty JSON object (HL7 validator wording).
 pub(crate) fn msg_empty_object() -> String {
     "Object must have some content".to_string()

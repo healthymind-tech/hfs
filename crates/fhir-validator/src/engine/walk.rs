@@ -652,17 +652,58 @@ fn eval_element(
         // matched slice schemas are consumed — the plain per-item pass below
         // skips them so base-set errors are not emitted twice.
         let consumed = super::slicing::validate_slices(ctx, &elset, items);
+        let is_extension_array = key == "extension" || key == "modifierExtension";
 
         for (index, item) in items.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
             }
             ctx.path.push_index(index);
-            validate_node(ctx, &elset, item);
+            if is_extension_array {
+                validate_extension_item(ctx, &elset, item, key == "modifierExtension");
+            } else {
+                validate_node(ctx, &elset, item);
+            }
             ctx.path.pop();
         }
     } else {
         validate_node(ctx, &elset, value);
+    }
+}
+
+/// Validate an extension no profile slice claimed. An extension whose `url`
+/// resolves to a known extension definition is held to that definition
+/// (value type, sub-extensions, cardinalities), as the HL7 validator does;
+/// before, only extensions a profile declared were checked, so
+/// `patient-birthPlace` carrying a `valueString` instead of an Address
+/// passed. An unknown url stays allowed on `extension`, but a modifier
+/// extension changes the meaning of its element, so one nobody can look up
+/// is an error (FHIR: unknown modifier extensions SHALL NOT be ignored).
+fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Value, modifier: bool) {
+    let url = item
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|u| u.contains("://") || u.starts_with("urn:"));
+    let Some(url) = url else {
+        validate_node(ctx, elset, item);
+        return;
+    };
+    match ctx.resolver.resolve(url) {
+        Some(definition) if definition.kind.as_deref() == Some(crate::schema::kind::EXTENSION) => {
+            let mut extended = elset.clone();
+            add_schemas_to_set(ctx, &mut extended, definition, url);
+            validate_node(ctx, &extended, item);
+        }
+        Some(_) => validate_node(ctx, elset, item),
+        None => {
+            if modifier {
+                ctx.error(
+                    ErrorKind::UnknownSchema,
+                    errors::msg_unknown_modifier_extension(url),
+                );
+            }
+            validate_node(ctx, elset, item);
+        }
     }
 }
 
@@ -1405,6 +1446,40 @@ mod tests {
             ),
             vec!["Patient.contained.0.id"]
         );
+    }
+
+    #[test]
+    fn undeclared_extensions_meet_their_definitions() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let errors = |resource: serde_json::Value| {
+            validator
+                .validate_sync(&resource, &crate::ValidationOptions::default())
+                .errors
+        };
+        let birthplace = "http://hl7.org/fhir/StructureDefinition/patient-birthPlace";
+        assert!(
+            errors(json!({"resourceType": "Patient",
+                "extension": [{"url": birthplace, "valueAddress": {"city": "Taipei"}}]}))
+            .is_empty()
+        );
+        let wrong = errors(json!({"resourceType": "Patient",
+            "extension": [{"url": birthplace, "valueString": "Taipei"}]}));
+        assert!(
+            wrong.iter().any(|e| e.kind == ErrorKind::ChoiceExcluded
+                && e.path.starts_with("Patient.extension.0")),
+            "{wrong:?}"
+        );
+        // Unknown extensions stay allowed; unknown modifier extensions do not.
+        assert!(
+            errors(json!({"resourceType": "Patient",
+                "extension": [{"url": "http://example.org/x", "valueString": "v"}]}))
+            .is_empty()
+        );
+        let modifier = errors(json!({"resourceType": "Patient",
+            "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
+        assert_eq!(modifier.len(), 1, "{modifier:?}");
+        assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
     }
 
     #[test]
