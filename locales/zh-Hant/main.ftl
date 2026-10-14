@@ -1973,3 +1973,4 @@ hts-home-chart-hint-series-5xx = 僅5xx回應
 ## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
 auth-bearer-only = 此伺服器已啟用身分驗證，但未設定瀏覽器登入。從瀏覽器呼叫FHIR API的頁面——資源、批次／交易、已儲存的查詢與偏好設定——會被以401拒絕。請設定HFS_UI_LOGIN_CLIENT_ID以啟用登入，或直接以bearer token使用API。
 batch-sign-in-required = 此伺服器未設定瀏覽器登入，因此本頁面無法為請求進行身分驗證。請設定HFS_UI_LOGIN_CLIENT_ID，才能從此處執行bundle。
+batch-too-large = 此bundle超過伺服器可接受的大小。請將其拆成較小的bundle，或提高伺服器的HFS_MAX_BODY_SIZE。

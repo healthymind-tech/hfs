@@ -80,7 +80,8 @@ pub use editor::{
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, TerminologyError, TerminologyProvider,
+    EffectHandlers, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
+    TerminologyProvider,
 };
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
@@ -88,4 +89,4 @@ pub use engine::{
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
-pub use terminology::{CoreTerminology, core_terminology};
+pub use terminology::{CompositeTerminologyProvider, CoreTerminology, core_terminology};

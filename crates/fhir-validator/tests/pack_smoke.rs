@@ -499,3 +499,61 @@ fn non_breaking_space_is_valid_in_string_and_code() {
         );
     }
 }
+
+/// X10: a batch/transaction entry whose `request.url` names another
+/// resource type than its `resource` is an error at `request.url`.
+#[test]
+fn bundle_entry_request_url_must_match_the_resource_type() {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let opts = ValidationOptions::default();
+    let obs = json!({
+        "resourceType": "Observation", "status": "final",
+        "code": { "text": "x" }
+    });
+    let bundle = |bundle_type: &str, entries: Vec<serde_json::Value>| json!({ "resourceType": "Bundle", "type": bundle_type, "entry": entries });
+    let mismatches = |b: &serde_json::Value| -> Vec<String> {
+        validator
+            .validate_sync(b, &opts)
+            .errors
+            .into_iter()
+            .filter(|e| e.kind == helios_fhir_validator::ErrorKind::BundleEntryMismatch)
+            .map(|e| e.path)
+            .collect()
+    };
+
+    for bundle_type in ["transaction", "batch"] {
+        let b = bundle(
+            bundle_type,
+            vec![
+                json!({ "resource": obs, "request": { "method": "POST", "url": "Observation" } }),
+                json!({ "resource": obs, "request": { "method": "POST", "url": "Patient" } }),
+                json!({ "resource": obs, "request": { "method": "PUT", "url": "Patient/p1" } }),
+                json!({ "resource": obs,
+                        "request": { "method": "PUT", "url": "Observation?identifier=x" } }),
+                json!({ "request": { "method": "DELETE", "url": "Patient/p1" } }),
+            ],
+        );
+        assert_eq!(
+            mismatches(&b),
+            vec!["Bundle.entry.1.request.url", "Bundle.entry.2.request.url"],
+            "{bundle_type}"
+        );
+    }
+
+    // Not judged: other bundle types, FHIRPath Patch bodies, absolute URLs.
+    let b = bundle(
+        "collection",
+        vec![json!({ "resource": obs, "request": { "method": "POST", "url": "Patient" } })],
+    );
+    assert!(mismatches(&b).is_empty());
+    let b = bundle(
+        "transaction",
+        vec![
+            json!({ "resource": { "resourceType": "Parameters" },
+                    "request": { "method": "PATCH", "url": "Patient/p1" } }),
+            json!({ "resource": obs,
+                    "request": { "method": "PUT", "url": "http://example.org/fhir/Observation/o1" } }),
+        ],
+    );
+    assert!(mismatches(&b).is_empty());
+}

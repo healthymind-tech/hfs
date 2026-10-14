@@ -20,8 +20,9 @@
 //! - bindings: only `strength: required` is enforced. The coded shape is
 //!   the element's declared type when known, else inferred from the value
 //!   (`code` string / Coding / CodeableConcept, mirroring the reference).
-//!   Provider errors surface as warning issues by default (fail-open) or
-//!   error issues when `terminology_fail_closed` is set.
+//!   Provider errors surface as warning issues by default (fail-open);
+//!   [`TerminologyFailMode`] escalates them — all of them (`Closed`), or
+//!   only "ValueSet not known" (`ClosedRequired`) — to errors.
 //!
 //! Issue order: all constraint issues (deferred order), then all binding
 //! issues (deferred order) — always after the structural errors.
@@ -89,16 +90,89 @@ pub trait TerminologyProvider: Send + Sync {
     ) -> Result<bool, TerminologyError>;
 }
 
+/// Why a terminology check could not produce a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminologyErrorKind {
+    /// The service could not be reached, timed out, or answered
+    /// unintelligibly — the code may well be valid.
+    #[default]
+    Unavailable,
+    /// The service does not know the ValueSet the binding names. For a
+    /// `required` binding this is a defect of the deployment (the IG's
+    /// terminology was never loaded), not a transient outage.
+    UnknownValueSet,
+}
+
 /// A terminology-service failure (network, unknown ValueSet, ...).
 #[derive(Debug, Clone)]
-pub struct TerminologyError(pub String);
+pub struct TerminologyError {
+    message: String,
+    kind: TerminologyErrorKind,
+}
+
+impl TerminologyError {
+    /// A failure of kind [`TerminologyErrorKind::Unavailable`].
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: TerminologyErrorKind::Unavailable,
+        }
+    }
+
+    /// A failure of kind [`TerminologyErrorKind::UnknownValueSet`].
+    pub fn unknown_value_set(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: TerminologyErrorKind::UnknownValueSet,
+        }
+    }
+
+    pub fn kind(&self) -> TerminologyErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 impl std::fmt::Display for TerminologyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for TerminologyError {}
+
+/// What a terminology failure on a `required` binding becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminologyFailMode {
+    /// Every failure is a warning: validation never blocks on terminology
+    /// (the default).
+    #[default]
+    Open,
+    /// Every failure is an error, outages included.
+    Closed,
+    /// An unknown ValueSet ([`TerminologyErrorKind::UnknownValueSet`]) is an
+    /// error — the binding could not have been satisfied by any deployment
+    /// state the client controls — while an outage stays a warning.
+    ClosedRequired,
+}
+
+impl TerminologyFailMode {
+    /// The severity a failure of `kind` is reported with.
+    pub fn severity(self, kind: TerminologyErrorKind) -> Severity {
+        match (self, kind) {
+            (TerminologyFailMode::Open, _) => Severity::Warning,
+            (TerminologyFailMode::Closed, _) => Severity::Error,
+            (TerminologyFailMode::ClosedRequired, TerminologyErrorKind::UnknownValueSet) => {
+                Severity::Error
+            }
+            (TerminologyFailMode::ClosedRequired, TerminologyErrorKind::Unavailable) => {
+                Severity::Warning
+            }
+        }
+    }
+}
 
 /// The outcome of evaluating one constraint.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,8 +213,8 @@ pub struct EffectHandlers<'a> {
     pub constraints: Option<&'a dyn ConstraintEvaluator>,
     /// Constraint ids to skip entirely (e.g. `dom-6`).
     pub suppress_constraints: &'a [String],
-    /// Treat terminology-service failures as errors instead of warnings.
-    pub terminology_fail_closed: bool,
+    /// How terminology-service failures on required bindings are reported.
+    pub terminology_fail: TerminologyFailMode,
 }
 
 /// Execute the deferred obligations, appending issues to `errors`.
@@ -278,16 +352,12 @@ async fn execute_bindings(
                 );
             }
             Err(e) => {
-                let severity = if handlers.terminology_fail_closed {
-                    Severity::Error
-                } else {
-                    Severity::Warning
-                };
+                let severity = handlers.terminology_fail.severity(e.kind());
                 errors.push(
                     ValidationError::new(
                         ErrorKind::TerminologyBinding,
                         path.clone(),
-                        messages::terminology_unavailable(&binding.value_set, &e.0),
+                        messages::terminology_unavailable(&binding.value_set, e.message()),
                     )
                     .with_severity(severity),
                 );

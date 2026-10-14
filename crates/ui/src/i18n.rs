@@ -409,7 +409,14 @@ mod tests {
         // Browsers send `zh-TW` (region, no script), `zh-Hant`/`zh-Hant-TW`
         // (script), or a bare `zh`: every one must reach the one Chinese
         // catalog, and the rendered tag stays the canonical `zh-Hant`.
-        for header in ["zh-TW", "zh-Hant", "zh-Hant-TW", "zh", "zh-HK,en;q=0.5", "ZH-tw"] {
+        for header in [
+            "zh-TW",
+            "zh-Hant",
+            "zh-Hant-TW",
+            "zh",
+            "zh-HK,en;q=0.5",
+            "ZH-tw",
+        ] {
             let map = headers(&[(header::ACCEPT_LANGUAGE, header)]);
             let (locale, _) = negotiate(&Uri::from_static("/ui"), &map);
             assert_eq!(locale, &ZH_HANT, "{header} must negotiate zh-Hant");

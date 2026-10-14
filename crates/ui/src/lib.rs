@@ -1323,6 +1323,11 @@ struct BatchPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`, #1662): batch.js
+    /// refuses a bundle above it before uploading, since the server answers
+    /// such a request before reading it and the browser may only see the
+    /// connection drop.
+    max_body_size: usize,
 }
 
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
@@ -1744,7 +1749,17 @@ pub fn mount_with_conformance_source_and_runtime(
             axum::routing::post(capability_json_expand),
         )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
-        .route("/ui/batch", get(batch_page))
+        .route(
+            "/ui/batch",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -2976,7 +2991,13 @@ async fn ui_not_found(
 ) -> Response {
     let i18n = I18n::new(locale);
     let back_label = i18n.t("nav-home");
-    render_not_found(current_status(&state, rv.0, &rt), i18n, "", "/ui", back_label)
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        back_label,
+    )
 }
 
 /// Terminology setup state (#611). The sidebar links here when the environment
@@ -3345,11 +3366,13 @@ async fn batch_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    max_body_size: usize,
 ) -> Response {
     render(BatchPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
     })
 }
 
@@ -10890,7 +10913,11 @@ mod terminology_navigation_tests {
     #[test]
     fn an_explicit_public_url_wins() {
         assert_eq!(
-            link(Some("http://hts:8090"), Some("https://fhir.example.org/ui/hts")).as_deref(),
+            link(
+                Some("http://hts:8090"),
+                Some("https://fhir.example.org/ui/hts")
+            )
+            .as_deref(),
             Some("https://fhir.example.org/ui/hts")
         );
         // Explicit but unusable: invalid, not silently replaced.
@@ -10911,7 +10938,11 @@ mod terminology_navigation_tests {
             "http://172.16.0.9:8090",
             "http://[::1]:8090",
         ] {
-            assert_eq!(link(Some(internal), None).as_deref(), Some("/ui/hts"), "{internal}");
+            assert_eq!(
+                link(Some(internal), None).as_deref(),
+                Some("/ui/hts"),
+                "{internal}"
+            );
         }
     }
 

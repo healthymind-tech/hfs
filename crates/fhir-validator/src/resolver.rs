@@ -100,6 +100,42 @@ impl SchemaRegistry {
         }
     }
 
+    /// Insert a schema under its canonical `url` **only** — no `name` alias.
+    ///
+    /// Profiles and extensions (`derivation: constraint`) are referenced by
+    /// canonical URL; element `type` references resolve base types by *name*.
+    /// Indexing a constraint under its name lets an extension such as
+    /// `rendering-xhtml` (`name: "xhtml"`) shadow the primitive `xhtml`, so
+    /// every `Narrative.div` fails as "expected object, got string". Stored
+    /// (tenant-uploaded) profiles use this entry point; the embedded packs
+    /// keep their two-pass `insert` because there the core schema is
+    /// guaranteed to win the name alias.
+    ///
+    /// Returns `false` (and stores nothing) if the schema has no `url`.
+    pub fn insert_by_url(&mut self, schema: FhirSchema) -> bool {
+        match schema.url.clone() {
+            Some(url) => {
+                self.map.insert(url, Arc::new(schema));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the schema reachable under `reference`, together with every
+    /// other key (url, name, explicit key) that aliases the same schema.
+    ///
+    /// Returns `true` if something was removed. Removing an alias that
+    /// pointed at a schema also registered under a *different* schema's key
+    /// only drops the aliases of the schema actually found.
+    pub fn remove(&mut self, reference: &str) -> bool {
+        let Some(target) = self.map.get(reference).cloned() else {
+            return false;
+        };
+        self.map.retain(|_, schema| !Arc::ptr_eq(schema, &target));
+        true
+    }
+
     /// Build a registry from `(key, schema)` pairs.
     pub fn from_named(iter: impl IntoIterator<Item = (String, FhirSchema)>) -> Self {
         let mut reg = Self::new();
@@ -162,6 +198,68 @@ mod tests {
         assert!(Arc::ptr_eq(&by_key, &by_url));
         assert!(Arc::ptr_eq(&by_key, &by_name));
         assert!(reg.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn insert_by_url_does_not_claim_the_name_alias() {
+        let mut reg = SchemaRegistry::new();
+        // A base type registered the usual way (url + name).
+        reg.insert(FhirSchema {
+            name: Some("xhtml".into()),
+            url: Some("http://hl7.org/fhir/StructureDefinition/xhtml".into()),
+            kind: Some("primitive-type".into()),
+            ..Default::default()
+        });
+        // An extension whose *name* collides with the base type (the real
+        // `rendering-xhtml` extension in hl7.fhir.r4.core).
+        assert!(reg.insert_by_url(FhirSchema {
+            name: Some("xhtml".into()),
+            url: Some("http://hl7.org/fhir/StructureDefinition/rendering-xhtml".into()),
+            kind: Some("extension".into()),
+            derivation: Some("constraint".into()),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            reg.resolve("xhtml").unwrap().kind.as_deref(),
+            Some("primitive-type"),
+            "the name alias must still resolve the base type"
+        );
+        assert_eq!(
+            reg.resolve("http://hl7.org/fhir/StructureDefinition/rendering-xhtml")
+                .unwrap()
+                .kind
+                .as_deref(),
+            Some("extension")
+        );
+        assert!(
+            !reg.insert_by_url(FhirSchema {
+                name: Some("no-url".into()),
+                ..Default::default()
+            }),
+            "a schema without a url cannot be registered by url"
+        );
+    }
+
+    #[test]
+    fn remove_drops_every_alias_of_the_schema() {
+        let mut reg = SchemaRegistry::new();
+        reg.insert_named("PatKey", named("Patient"));
+        reg.insert(named("Observation"));
+        assert_eq!(reg.len(), 5);
+
+        assert!(reg.remove("http://example.org/Patient"));
+        assert!(reg.resolve("PatKey").is_none());
+        assert!(reg.resolve("Patient").is_none());
+        assert!(reg.resolve("http://example.org/Patient").is_none());
+        assert!(
+            reg.resolve("http://example.org/Observation").is_some(),
+            "unrelated schemas are untouched"
+        );
+        assert_eq!(reg.len(), 2);
+
+        assert!(!reg.remove("http://example.org/Patient"), "already gone");
+        assert!(!reg.remove("never-there"));
     }
 
     #[test]

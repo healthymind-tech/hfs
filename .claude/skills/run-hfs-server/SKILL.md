@@ -45,7 +45,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, applied after decompression |
+| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size in bytes (128 MiB), applied after decompression; sized for the largest per-patient Synthea Bundle (#1662) |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
@@ -275,13 +275,18 @@ StructureDefinitions (per tenant) become validatable profiles on write.
 | `HFS_VALIDATION_UNKNOWN_PROFILE` | `warn` | Unresolvable profiles: `warn`, `error`, or `ignore` |
 | `HFS_VALIDATION_CONSTRAINTS` | `true` | Evaluate FHIRPath invariants |
 | `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | `dom-6` | Comma-separated constraint ids to skip |
-| `HFS_VALIDATION_TERMINOLOGY` | `off` | Required-binding checks: `off` or `remote` (`ValueSet/$validate-code` against `HFS_TERMINOLOGY_SERVER`) |
+| `HFS_VALIDATION_TERMINOLOGY` | `embedded` | Required-binding checks: `off`; `embedded` (offline, the FHIR core value sets shipped with the validator); `remote` (embedded core value sets first, then `ValueSet/$validate-code` against `HFS_TERMINOLOGY_SERVER` for every value set the pack cannot judge, with `url\|version` canonicals split into `url` + `valueSetVersion`); `remote-only` (every binding goes to the server) |
 | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | `3000` | Per-check terminology timeout |
-| `HFS_VALIDATION_TERMINOLOGY_FAIL` | `open` | Terminology outage posture: `open` (warn) or `closed` (error) |
-| `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions |
+| `HFS_VALIDATION_TERMINOLOGY_FAIL` | `open` | Terminology failure posture on required bindings: `open` (warn), `closed` (error, outages included), or `closed-required` (a ValueSet the server does not know is an error, an outage is a warning) |
+| `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions (registered on create/update, removed on delete) |
+| `HFS_VALIDATION_REHYDRATE` | `true` | Replay stored StructureDefinitions into the profile registries at startup (count and duration are logged) |
+| `HFS_VALIDATION_REHYDRATE_BATCH_SIZE` | `100` | StructureDefinitions per storage round-trip during startup rehydration |
+| `HFS_VALIDATION_REHYDRATE_WAIT_MS` | `60000` | While startup rehydration runs, validation (`$validate` and write-path checks) waits up to this long for it instead of answering from a partly filled registry |
+| `HFS_VALIDATION_SHADOW_CORE` | `false` | Let a stored StructureDefinition with a core canonical (`http://hl7.org/fhir/StructureDefinition/…`) override the embedded definition. Off, so importing `hl7.fhir.r4.core` cannot replace the base types |
 
-Note: tenant profile registries are in-memory and populated by
-StructureDefinition writes since process start (no startup warm-load yet).
+Note: stored profiles (`derivation: constraint`, extensions) are registered
+by canonical URL only — never by `name` — so an extension such as
+`rendering-xhtml` (`name: xhtml`) cannot shadow the `xhtml` type.
 
 ## API Endpoints
 

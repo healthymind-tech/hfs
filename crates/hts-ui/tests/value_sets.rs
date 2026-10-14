@@ -100,10 +100,12 @@ async fn body_text(response: axum::response::Response) -> String {
 async fn rows_fragment_pushes_the_filtered_page_url() {
     let response = app()
         .oneshot(
-            axum::http::Request::get("/ui/hts/value-sets/rows?name=obs&title=&status=active&_count=25")
-                .header("HX-Request", "true")
-                .body(Body::empty())
-                .unwrap(),
+            axum::http::Request::get(
+                "/ui/hts/value-sets/rows?name=obs&title=&status=active&_count=25",
+            )
+            .header("HX-Request", "true")
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();

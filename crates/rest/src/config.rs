@@ -10,7 +10,7 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
+//! | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed origins |
@@ -492,16 +492,39 @@ pub struct ValidationConfig {
     pub suppress_constraints: Vec<String>,
     /// Terminology binding checking: `embedded` (default — offline checks
     /// against the FHIR core value sets embedded in helios-fhir-validator),
-    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
+    /// `remote` (embedded core value sets first, then
+    /// `HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code` for everything
+    /// the pack cannot judge), `remote-only` (every binding goes to the
+    /// server), or `off`.
     pub terminology: String,
     /// Per-check terminology timeout, in milliseconds.
     pub terminology_timeout_ms: u64,
-    /// Terminology outages: `open` (warn and proceed) or `closed`
-    /// (treat as validation errors).
+    /// Terminology failures on required bindings: `open` (warn and proceed),
+    /// `closed` (every failure is an error, outages included), or
+    /// `closed-required` (a ValueSet the server does not know is an error,
+    /// an outage is a warning).
     pub terminology_fail: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
+    /// Let a stored StructureDefinition whose canonical URL is already
+    /// defined by the embedded core pack (`http://hl7.org/fhir/StructureDefinition/…`)
+    /// override the embedded definition. Off by default: importing the
+    /// `hl7.fhir.r4.core` package must not replace the base types the
+    /// validator was built with.
+    pub shadow_core: bool,
+    /// Replay stored StructureDefinitions into the profile registries at
+    /// startup (`HFS_VALIDATION_REHYDRATE`, default `true`). Without it the
+    /// registries are empty after every restart until each profile is
+    /// re-written.
+    pub rehydrate: bool,
+    /// StructureDefinitions fetched per storage round-trip during startup
+    /// rehydration (`HFS_VALIDATION_REHYDRATE_BATCH_SIZE`, default 100).
+    pub rehydrate_batch_size: u32,
+    /// How long validation waits for an unfinished startup rehydration
+    /// before validating against the profiles registered so far
+    /// (`HFS_VALIDATION_REHYDRATE_WAIT_MS`, default 60000).
+    pub rehydrate_wait_ms: u64,
 }
 
 impl Default for ValidationConfig {
@@ -516,6 +539,10 @@ impl Default for ValidationConfig {
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
             stored_profiles: true,
+            shadow_core: false,
+            rehydrate: true,
+            rehydrate_batch_size: 100,
+            rehydrate_wait_ms: 60_000,
         }
     }
 }
@@ -561,6 +588,14 @@ impl ValidationConfig {
             terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+            shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
+            rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
+            rehydrate_batch_size: env_u64(
+                "HFS_VALIDATION_REHYDRATE_BATCH_SIZE",
+                u64::from(d.rehydrate_batch_size),
+            )
+            .clamp(1, u64::from(u32::MAX)) as u32,
+            rehydrate_wait_ms: env_u64("HFS_VALIDATION_REHYDRATE_WAIT_MS", d.rehydrate_wait_ms),
         }
     }
 
@@ -579,15 +614,21 @@ impl ValidationConfig {
                 self.unknown_profile
             ));
         }
-        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
+        if !matches!(
+            self.terminology.as_str(),
+            "off" | "embedded" | "remote" | "remote-only"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote|remote-only)",
                 self.terminology
             ));
         }
-        if !matches!(self.terminology_fail.as_str(), "open" | "closed") {
+        if !matches!(
+            self.terminology_fail.as_str(),
+            "open" | "closed" | "closed-required"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed)",
+                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed|closed-required)",
                 self.terminology_fail
             ));
         }
@@ -1104,7 +1145,13 @@ pub struct ServerConfig {
     /// For requests sent with `Content-Encoding`, the limit applies to the
     /// *decompressed* body, so a small highly-compressed payload cannot
     /// bypass it.
-    #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "10485760")]
+    ///
+    /// The 128 MiB default sits well above the largest per-patient Synthea
+    /// Bundle measured in #1662 (69.4 MiB as Synthea writes it, p99 38.2 MiB);
+    /// the old 10 MiB rejected about one patient in eleven. A batch or
+    /// transaction body is held in memory and parsed whole, so a request near
+    /// the limit can take a few GiB of RAM: lower it on small hosts.
+    #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "134217728")]
     pub max_body_size: usize,
 
     /// Request timeout in seconds.
@@ -1603,7 +1650,7 @@ impl Default for ServerConfig {
             port: 8080,
             host: "127.0.0.1".to_string(),
             log_level: "info".to_string(),
-            max_body_size: 10 * 1024 * 1024, // 10MB
+            max_body_size: 128 * 1024 * 1024, // 128 MiB (#1662)
             request_timeout: 30,
             batch_max_concurrency: 16,
             enable_cors: true,
@@ -1857,10 +1904,15 @@ impl ServerConfig {
         }
 
         // Remote terminology checking needs a terminology server to call.
-        if self.validation.terminology == "remote" && self.terminology_server.is_none() {
-            errors.push(
-                "HFS_VALIDATION_TERMINOLOGY=remote requires HFS_TERMINOLOGY_SERVER".to_string(),
-            );
+        if matches!(
+            self.validation.terminology.as_str(),
+            "remote" | "remote-only"
+        ) && self.terminology_server.is_none()
+        {
+            errors.push(format!(
+                "HFS_VALIDATION_TERMINOLOGY={} requires HFS_TERMINOLOGY_SERVER",
+                self.validation.terminology
+            ));
         }
 
         if errors.is_empty() {
@@ -1879,7 +1931,7 @@ impl ServerConfig {
             port: 0, // Let OS assign port
             host: "127.0.0.1".to_string(),
             log_level: "debug".to_string(),
-            max_body_size: 10 * 1024 * 1024,
+            max_body_size: 128 * 1024 * 1024,
             request_timeout: 5, // Shorter timeout for tests
             batch_max_concurrency: 16,
             enable_cors: false,
@@ -2519,6 +2571,16 @@ mod tests {
         let errors = result.unwrap_err();
         // At least the three errors above should be present
         assert!(errors.len() >= 3);
+    }
+
+    /// The body limit default is 128 MiB (#1662) on every construction path,
+    /// so the CLI, `Default` and `for_testing()` cannot drift apart.
+    #[test]
+    fn test_max_body_size_default_is_128_mib() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.max_body_size, 128 * 1024 * 1024);
+        }
     }
 
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────

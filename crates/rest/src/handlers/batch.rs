@@ -37,6 +37,60 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
 
+/// Reads the request body, capped at `max_body_size` (`HFS_MAX_BODY_SIZE`,
+/// measured after decompression).
+///
+/// An over-limit body is a 413 like on every other write endpoint (#1662):
+/// rejected up front when the declared `Content-Length` already exceeds the
+/// limit, or when the stream crosses it while being read. Any other read
+/// failure (a corrupt compressed stream, an I/O error) stays a 400.
+async fn read_body_within_limit(
+    request: Request,
+    max_body_size: usize,
+) -> RestResult<axum::body::Bytes> {
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > max_body_size as u64) {
+        return Err(body_too_large(max_body_size));
+    }
+
+    axum::body::to_bytes(request.into_body(), max_body_size)
+        .await
+        .map_err(|e| {
+            if exceeds_length_limit(&e) {
+                body_too_large(max_body_size)
+            } else {
+                RestError::BadRequest {
+                    message: "Failed to read request body".to_string(),
+                }
+            }
+        })
+}
+
+/// Whether a body-read error is the length limit of `to_bytes`, wherever it
+/// sits in the source chain.
+fn exceeds_length_limit(error: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+fn body_too_large(max_body_size: usize) -> RestError {
+    RestError::PayloadTooLarge {
+        message: format!(
+            "Request body exceeds the maximum allowed size of {max_body_size} bytes (HFS_MAX_BODY_SIZE)"
+        ),
+    }
+}
+
 struct RestPatchValidator<'a> {
     validation: &'a crate::validation::ValidationService,
 }
@@ -113,13 +167,8 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Parse the body as JSON
-    let bundle: Value = serde_json::from_slice(
-        &axum::body::to_bytes(request.into_body(), state.config().max_body_size)
-            .await
-            .map_err(|_| RestError::BadRequest {
-                message: "Failed to read request body".to_string(),
-            })?,
-    )?;
+    let body = read_body_within_limit(request, state.config().max_body_size).await?;
+    let bundle: Value = serde_json::from_slice(&body)?;
     // Validate it's a Bundle
     let resource_type = bundle
         .get("resourceType")
@@ -696,6 +745,12 @@ where
         })
         .collect();
 
+    // StructureDefinitions a DELETE entry addresses, resolved now: once the
+    // transaction has committed the row is a tombstone, and the profile
+    // registry is keyed by the canonical url the content carried.
+    let profiles_to_unregister =
+        transaction_profiles_to_unregister(state, &tenant, &json_entries, &indexed_entries).await;
+
     // Call the persistence layer
     let patch_validator = RestPatchValidator {
         validation: state.validation(),
@@ -712,6 +767,24 @@ where
 
     match result {
         Ok(bundle_result) => {
+            // Deleted StructureDefinitions leave the tenant's profile registry.
+            for (position, deleted) in &profiles_to_unregister {
+                if bundle_result
+                    .entries
+                    .get(*position)
+                    .is_some_and(|r| r.effect == BundleEntryEffect::Deleted)
+                {
+                    for stored in deleted {
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            "StructureDefinition",
+                            stored,
+                        );
+                    }
+                }
+            }
+
             // Stored StructureDefinitions feed the tenant's profile registry.
             for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
             {
@@ -735,11 +808,13 @@ where
                         .read(tenant.context(), &resource_type, &id)
                         .await
                     {
-                        Ok(Some(stored)) => state.validation().upsert_stored_profile(
-                            tenant.tenant_id(),
-                            stored.fhir_version(),
-                            stored.content(),
-                        ),
+                        Ok(Some(stored)) => {
+                            state.validation().upsert_stored_profile(
+                                tenant.tenant_id(),
+                                stored.fhir_version(),
+                                stored.content(),
+                            );
+                        }
                         Ok(None) => {
                             warn!(resource_id = %id, "committed PATCH target missing during profile refresh")
                         }
@@ -1560,6 +1635,12 @@ where
                             -1,
                             None,
                         );
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            &resource_type,
+                            &deleted,
+                        );
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
                     }
@@ -1594,6 +1675,22 @@ where
                 return failure;
             }
 
+            // A StructureDefinition leaves the profile registry with its
+            // delete; the registry is keyed by canonical url, so read the
+            // current content first.
+            let profile_to_unregister = if resource_type == "StructureDefinition" {
+                match state
+                    .storage()
+                    .read(tenant.context(), &resource_type, &id)
+                    .await
+                {
+                    Ok(Some(current)) => Some(current),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             // Delete operation
             match state
                 .storage()
@@ -1609,6 +1706,14 @@ where
                         -1,
                         Some(super::write_event::delete_notice(&id, None)),
                     );
+                    if let Some(current) = &profile_to_unregister {
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            &resource_type,
+                            current,
+                        );
+                    }
                     BundleEntryResult::deleted()
                 }
                 Err(e) => entry_storage_failure(e),
@@ -1770,6 +1875,63 @@ where
 /// Applies the type and immutability gates shared by batch and transaction
 /// mutations. The caller decides whether the error belongs to one batch entry
 /// or rejects the whole transaction.
+/// The StructureDefinitions each DELETE entry of a transaction currently
+/// addresses, as `(position in the sorted entry list, resources)`: an
+/// instance delete reads the one row, a conditional delete resolves its
+/// criteria. Entries that address nothing (or whose criteria the backend
+/// cannot resolve) are left out — the registry then keeps a definition the
+/// store no longer has, which the next restart's rehydration corrects.
+async fn transaction_profiles_to_unregister<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    json_entries: &[Value],
+    indexed_entries: &[(usize, BundleEntry, Option<String>)],
+) -> Vec<(usize, Vec<helios_persistence::types::StoredResource>)>
+where
+    S: ResourceStorage + ConditionalStorage + Send + Sync,
+{
+    let mut out = Vec::new();
+    for (position, (index, entry, _)) in indexed_entries.iter().enumerate() {
+        if entry.method != BundleMethod::Delete {
+            continue;
+        }
+        let Ok((resource_type, id)) = parse_request_url(&entry.url) else {
+            continue;
+        };
+        if resource_type != "StructureDefinition" {
+            continue;
+        }
+        let found = if entry.criteria.is_some() {
+            let raw_query = json_entries
+                .get(*index)
+                .and_then(|e| e["request"]["url"].as_str())
+                .and_then(|url| url.split_once('?'))
+                .map(|(_, query)| query)
+                .unwrap_or_default();
+            state
+                .storage()
+                .resolve_conditional_matches(tenant.context(), &resource_type, raw_query)
+                .await
+                .unwrap_or_default()
+        } else if id.is_empty() {
+            Vec::new()
+        } else {
+            match state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await
+            {
+                Ok(Some(stored)) => vec![stored],
+                _ => Vec::new(),
+            }
+        };
+        if !found.is_empty() {
+            out.push((position, found));
+        }
+    }
+    out
+}
+
 /// Folds a written StructureDefinition into the tenant profile registry so
 /// later entries' `check_write` resolve against it. Every write arm calls this;
 /// `batch_concurrency` serializes the bundle when one of them will.

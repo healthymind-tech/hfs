@@ -509,7 +509,9 @@ pub async fn create(
     };
 
     match storage.get_tenant(&id).await {
-        Ok(Some(_)) => return load(Some(i18n.t_arg("tenants-error-exists", "id", id.clone()))).await,
+        Ok(Some(_)) => {
+            return load(Some(i18n.t_arg("tenants-error-exists", "id", id.clone()))).await;
+        }
         Ok(None) => {}
         Err(e) => return load(Some(e.to_string())).await,
     }
@@ -754,7 +756,9 @@ mod provisioning_row_tests {
             },
         );
 
-        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs).await.expect("rows");
+        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs)
+            .await
+            .expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1, "one row per tenant, not one per source");
         assert!(acme[0].provisioning, "the provisioning row wins");
@@ -767,7 +771,9 @@ mod provisioning_row_tests {
                 message: "boom".to_string(),
             },
         );
-        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs).await.expect("rows");
+        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs)
+            .await
+            .expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1);
         assert!(!acme[0].provisioning);

@@ -64,6 +64,9 @@ pub enum ErrorKind {
     /// warning severity: context matching is conservative and ad-hoc
     /// extensions must stay permissive.
     ExtensionContext,
+    /// A `batch`/`transaction` entry whose `request.url` names a different
+    /// resource type than the entry's `resource` (X10).
+    BundleEntryMismatch,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the

@@ -212,6 +212,18 @@ where
         "Resource deleted"
     );
 
+    // A deleted StructureDefinition leaves the tenant's profile registry.
+    if resource_type == "StructureDefinition"
+        && let Some(url) = existing_resource
+            .as_ref()
+            .and_then(|stored| stored.content().get("url"))
+            .and_then(serde_json::Value::as_str)
+    {
+        state
+            .validation()
+            .remove_stored_profile(tenant.tenant_id(), fhir_version, url);
+    }
+
     // Compartment reference for the audit record, taken from the pre-delete
     // content while it is still in hand. `update_handler` and `patch_handler`
     // both attach this; delete never did, so delete AuditEvents carried no
@@ -365,6 +377,7 @@ where
                 id = %deleted.id(),
                 "Resource conditionally deleted"
             );
+            unregister_deleted_profile(&state, tenant.tenant_id(), &resource_type, &deleted);
             // Name the entity in the audit trail, as the instance delete does.
             // Before the result carried the snapshot, a delete-by-criteria
             // produced an AuditEvent with no entity at all.
@@ -399,6 +412,28 @@ where
             operation: "delete".to_string(),
             count,
         }),
+    }
+}
+
+/// Drops a deleted StructureDefinition from the tenant's profile registry.
+/// Shared by the conditional delete here and the bundle DELETE entries.
+pub(crate) fn unregister_deleted_profile<S>(
+    state: &AppState<S>,
+    tenant_id: &str,
+    resource_type: &str,
+    deleted: &helios_persistence::types::StoredResource,
+) where
+    S: ResourceStorage + Send + Sync,
+{
+    if resource_type == "StructureDefinition"
+        && let Some(url) = deleted
+            .content()
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+    {
+        state
+            .validation()
+            .remove_stored_profile(tenant_id, deleted.fhir_version(), url);
     }
 }
 
