@@ -867,10 +867,42 @@ impl SearchProvider for PostgresBackend {
                     }
                 }
 
-                let sql = format!(
-                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
-                    fragment.sql
-                );
+                // A lone membership test is counted from `search_index` alone.
+                // The general form below joins `resources` once per match to
+                // check `is_deleted` — ~11 µs a probe, ~200 ms of the 243 ms
+                // `Observation?code=<17,837 matches>&_summary=count` took — and
+                // the check cannot fail here: every delete path removes the
+                // resource's `search_index` rows in the same transaction (the
+                // soft delete in `storage.rs` and in `transaction.rs`; a purge
+                // removes the resource outright), and a reindex writes rows
+                // only for resources it finds live. So the distinct
+                // `resource_id`s of the matching rows are exactly the live
+                // matches.
+                //
+                // It counts the resources the single-parameter page returns:
+                // top-level rows (`last_updated IS NOT NULL`, see the fast path
+                // in `search_with_client`), grouped by `(last_updated,
+                // resource_id)`, which is one group per resource because a
+                // resource's top-level rows all carry its `last_updated`. That
+                // pair is the tail of the token, date and quantity `*_recent`
+                // indexes, so for an equality on their leading columns the
+                // groups arrive in index order and are counted as they stream
+                // past: 15 ms for 17,837 matches, against 21 ms hashing the
+                // distinct ids and 55 ms for `COUNT(DISTINCT resource_id)`,
+                // which sorts. Any other predicate is grouped as before.
+                let sql = match PostgresQueryBuilder::single_index_predicate(&fragment.sql) {
+                    Some(pred) => format!(
+                        "SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                           AND last_updated IS NOT NULL \
+                         GROUP BY last_updated, resource_id \
+                         ORDER BY last_updated DESC, resource_id) matches"
+                    ),
+                    None => format!(
+                        "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
+                        fragment.sql
+                    ),
+                };
                 (sql, params)
             } else {
                 let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();

@@ -5,8 +5,8 @@
 //! most 1,000 index rows) instead of walking the type in sort order. Every
 //! shape, and the choice between them, must give exactly the answer the plain
 //! plan gave: same members, same order, same pages, same count. The seed
-//! crosses the 1,000-row threshold on purpose. Included by the SQLite test
-//! binary via `#[path]`; generic over the backend.
+//! crosses the 1,000-row threshold on purpose. Shared by the SQLite and
+//! PostgreSQL test binaries via `#[path]`.
 
 use std::collections::HashSet;
 
@@ -238,5 +238,22 @@ where
     assert_eq!(
         backend.search_count(t, &amended).await.unwrap(),
         (AMENDED - 1) as u64
+    );
+    // A lone membership is counted from the index alone on PostgreSQL; the
+    // deleted resource's rows must be gone with it.
+    let status_only = query(
+        vec![param("status", SearchParamType::Token, "amended")],
+        100,
+    );
+    assert_eq!(
+        backend.search_count(t, &status_only).await.unwrap(),
+        (AMENDED - 1) as u64
+    );
+    assert_eq!(
+        backend
+            .search_count(t, &query(vec![code()], 100))
+            .await
+            .unwrap(),
+        (TOTAL - 1) as u64
     );
 }

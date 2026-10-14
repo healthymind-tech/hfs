@@ -174,6 +174,10 @@ mod patient_everything_postgres_tests {
                 vec!["ExplanationOfBenefit/eob1"],
                 "{path}"
             );
+            // Counted once as well, from the same top-level rows the page reads.
+            let resp = server.get(&format!("{path}&_summary=count")).await;
+            let count: serde_json::Value = resp.json();
+            assert_eq!(count["total"], 1, "{path}: {count}");
         }
     }
 

@@ -328,4 +328,9 @@ async fn a_container_is_returned_once() {
     assert_eq!(resp.status_code(), StatusCode::OK);
     let body: Value = resp.json();
     assert_eq!(entries(&body, "match"), vec!["ExplanationOfBenefit/eob1"]);
+    let resp = server
+        .get("/ExplanationOfBenefit?patient=p1&_summary=count")
+        .await;
+    let count: Value = resp.json();
+    assert_eq!(count["total"], 1, "{count}");
 }
