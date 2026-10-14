@@ -108,6 +108,22 @@ pub mod number;
 /// name as a fallback so an existing choice is not lost.)
 pub const LANG_COOKIE: &str = "hfs_lang";
 
+/// Name of the cookie the theme switcher persists its choice in: `system`
+/// (follow `prefers-color-scheme`, the default), `light` or `dark`.
+///
+/// Like [`LANG_COOKIE`], one cookie for both products, `Path=/`, so the HFS
+/// console (`/ui`) and the HTS console (`/ui/hts`) read the same choice. It
+/// is written client-side by `crates/ui/assets/theme.js` (the one theme
+/// script both consoles serve) and read before first paint by the inline
+/// [`theme_boot`] script. Neither server reads it: the system mode can only
+/// be resolved in the browser, so the server never renders a theme.
+pub const THEME_COOKIE: &str = "hfs_theme";
+
+/// The localStorage key both consoles cached the theme under before
+/// [`THEME_COOKIE`] existed (`light` | `dark`). Read once as a fallback and
+/// migrated into the cookie by `theme.js`, then removed.
+pub const LEGACY_THEME_KEY: &str = "hfs-theme";
+
 /// The localisation surface the shared chrome needs from its host.
 ///
 /// Both products already own a fluent-backed i18n type; this trait is the
@@ -205,6 +221,50 @@ pub struct UserIdentity<'a> {
 /// no fallible construct, so this is a formality the signature keeps honest.
 pub fn user_menu(i18n: &dyn ChromeLabels, user: UserIdentity<'_>) -> Result<String, askama::Error> {
     UserMenuTemplate { i18n, user }.render()
+}
+
+/// The topbar theme switcher: ONE button that cycles the preference
+/// system -> light -> dark -> system (`theme.js`), showing the icon and the
+/// accessible label of the mode currently in effect.
+///
+/// Needs the keys `theme-toggle-system`, `theme-toggle-light` and
+/// `theme-toggle-dark` from the host's catalog. Like [`user_menu`], the
+/// fragment starts at column 8 and carries no trailing newline.
+///
+/// # Errors
+///
+/// Propagates [`askama::Error`] from rendering.
+pub fn theme_toggle(i18n: &dyn ChromeLabels) -> Result<String, askama::Error> {
+    ThemeToggleTemplate { i18n }.render()
+}
+
+/// The inline `<script>` both layouts put in `<head>`, ahead of any
+/// stylesheet-dependent paint: it reads [`THEME_COOKIE`] (falling back to
+/// [`LEGACY_THEME_KEY`]) and stamps `data-theme-pref` and the effective
+/// `data-theme` on `<html>`, so a stored dark choice never flashes light.
+///
+/// # Errors
+///
+/// Propagates [`askama::Error`] from rendering.
+pub fn theme_boot() -> Result<String, askama::Error> {
+    ThemeBootTemplate {
+        cookie: THEME_COOKIE,
+        legacy_key: LEGACY_THEME_KEY,
+    }
+    .render()
+}
+
+#[derive(Template)]
+#[template(path = "partials/theme-toggle.html")]
+struct ThemeToggleTemplate<'a> {
+    i18n: &'a dyn ChromeLabels,
+}
+
+#[derive(Template)]
+#[template(path = "partials/theme-boot.html")]
+struct ThemeBootTemplate {
+    cookie: &'static str,
+    legacy_key: &'static str,
 }
 
 /// Re-exported so consumers can name [`askama::Error`] — the error type of

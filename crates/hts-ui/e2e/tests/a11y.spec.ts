@@ -44,12 +44,10 @@ for (const theme of THEMES) {
   for (const route of ROUTES) {
     test(`${route} is free of WCAG 2.2 AA violations — ${theme}`, async ({ page }) => {
       // `assets/theme.js` (shared with crates/ui) stamps `data-theme` on <html>
-      // from localStorage["hfs-theme"] before first paint, so the seed has to
+      // from the shared hfs_theme cookie before first paint, so the seed has to
       // land as an init script rather than after navigation.
       await page.addInitScript((t) => {
-        try {
-          localStorage.setItem("hfs-theme", t as string);
-        } catch {}
+        document.cookie = `hfs_theme=${t}; Path=/; SameSite=Lax`;
       }, theme);
 
       const response = await page.goto(route, { waitUntil: "networkidle" });

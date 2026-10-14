@@ -6,9 +6,10 @@
   <title>{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}</title>
   <link rel="icon" type="image/png" href="/ui/hts/assets/logo.png">
   <link rel="stylesheet" href="/ui/hts/assets/app.css">
-  <!-- No `defer`: the theme attribute must land on <html> before first paint,
-       or the stored theme flashes its default first. -->
-  <script src="/ui/hts/assets/theme.js"></script>
+  <!-- Inline first-paint theme stamp, shared with HFS (see its layout):
+       crates/ui-chrome/templates/partials/theme-boot.html. -->
+  {{ chrome.theme_boot()?|safe }}
+  <script src="/ui/hts/assets/theme.js" defer></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/hts/assets/htmx.min.js" defer></script>
   <!-- The responsive navigation drawer (phones and tablets), shared with HFS. -->
@@ -142,14 +143,7 @@
           Real `displayLanguage` support is unaffected: it lives as per-operation
           form fields in the workbenches (`code_systems.rs`, `concepts.rs`).
         -#}
-        <div class="theme-toggle" role="group" aria-label="{{ chrome.i18n.t("theme-label") }}">
-          <button type="button" data-set-theme="light" aria-label="{{ chrome.i18n.t("theme-light") }}">
-            {% include "icons/sun.svg" %}
-          </button>
-          <button type="button" data-set-theme="dark" aria-label="{{ chrome.i18n.t("theme-dark") }}">
-            {% include "icons/moon.svg" %}
-          </button>
-        </div>
+{{ chrome.theme_toggle()?|safe }}{# markup: crates/ui-chrome/templates/partials/theme-toggle.html #}
 {{ chrome.user_menu()?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
       </div>
     </header>

@@ -8363,3 +8363,139 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
         "editor-add.js must load before resources.js"
     );
 }
+
+/// The Validate page (`/ui/validate`): a full page in the shell, current in
+/// the nav (which every page — and so the phone drawer, the same `<aside>` —
+/// carries), with the editor, the profile datalist, its scripts and the
+/// rendered message templates.
+#[tokio::test]
+async fn validate_page_serves_the_shell_and_is_in_the_nav() {
+    let response = app_with_body_limit(4096)
+        .oneshot(Request::get("/ui/validate").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"href="/ui/validate" aria-current="page""#));
+    assert!(html.contains(r#"id="validate-text""#));
+    assert!(html.contains(r#"list="validate-profiles""#));
+    assert!(html.contains(r#"<datalist id="validate-profiles">"#));
+    assert!(html.contains(r#"id="validate-per-entry""#));
+    assert!(html.contains(r#"data-max-body-size="4096""#));
+    for script in [
+        "vendor/codemirror.bundle.js",
+        "code-editor.js",
+        "bundle-check.js",
+        "fhir-validate.js",
+        "validate-page.js",
+    ] {
+        assert!(
+            html.contains(&format!(r#"src="/ui/assets/{script}""#)),
+            "{script}"
+        );
+    }
+    // Rendered copy, not just the attribute: a missing Fluent key would
+    // still carry the attribute with the key as its value.
+    assert!(html.contains(r#"data-msg-entry-label="entry %n% (%name%)""#));
+    assert!(html.contains(r#"data-msg-json-syntax="JSON syntax error: %detail%.""#));
+
+    // Every other page links it, in the one sidebar the drawer also is.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let home = body_text(response).await;
+    assert!(home.contains(r#"<a class="nav-item" href="/ui/validate""#));
+    assert!(!home.contains(r#"href="/ui/validate" aria-current"#));
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/validate?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zh = body_text(response).await;
+    assert!(zh.contains("驗證"), "{zh}");
+}
+
+/// The Batch page's paste mode, live checks and "Validate" action ride on
+/// the shell: the mode tabs, the editor, the check report, the validate
+/// controls, and the shared check / validate scripts and their messages.
+#[tokio::test]
+async fn batch_page_offers_paste_mode_checks_and_validation() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="batch-mode-file" role="tab" aria-selected="true""#));
+    assert!(html.contains(r#"id="batch-mode-paste" role="tab" aria-selected="false""#));
+    assert!(html.contains(r#"<textarea class="json-editor batch-paste__source" id="batch-paste""#));
+    assert!(html.contains(r#"id="batch-format""#));
+    assert!(html.contains(r#"id="batch-continue" disabled"#));
+    assert!(html.contains(r#"id="batch-check" aria-live="polite" hidden"#));
+    assert!(html.contains(r#"id="batch-validate""#));
+    assert!(html.contains(r#"id="batch-validate-per-entry""#));
+    assert!(html.contains(r#"data-msg-bad-method="Entry %entry%: request.method"#));
+    assert!(html.contains(r#"data-msg-check-at="line %line%, col %col%""#));
+    let check = html
+        .find(r#"src="/ui/assets/bundle-check.js""#)
+        .expect("check");
+    let validate = html
+        .find(r#"src="/ui/assets/fhir-validate.js""#)
+        .expect("validate");
+    let page = html.find(r#"src="/ui/assets/batch.js""#).expect("batch");
+    assert!(
+        check < page && validate < page,
+        "helpers load before the page script"
+    );
+
+    for (asset, needle) in [
+        ("bundle-check.js", "window.HfsBundleCheck"),
+        ("fhir-validate.js", "/$validate"),
+        (
+            "validate-page.js",
+            "StructureDefinition?derivation=constraint",
+        ),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/assets/{asset}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{asset}");
+        assert!(body_text(response).await.contains(needle), "{asset}");
+    }
+}
+
+/// The theme switcher is one shared button with a translated, mode-specific
+/// label in every locale.
+#[tokio::test]
+async fn theme_switcher_is_one_button_labelled_per_locale() {
+    for (lang, label) in [
+        ("en", "Theme: follow system"),
+        ("zh-Hant", "主題：跟隨系統"),
+        ("de", "Design: System folgen"),
+        ("es", "Tema: seguir al sistema"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(html.matches("data-theme-cycle").count(), 1, "{lang}");
+        assert!(html.contains(&format!(r#"aria-label="{label}""#)), "{lang}");
+        assert!(html.contains("data-label-dark="), "{lang}");
+    }
+}

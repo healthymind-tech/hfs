@@ -244,6 +244,16 @@ impl Chrome<'_> {
     pub(crate) fn user_menu(&self) -> Result<String, askama::Error> {
         helios_ui_chrome::user_menu(&self.i18n, helios_ui_chrome::UserIdentity::default())
     }
+
+    /// The topbar theme switcher, shared with HFS (`helios-ui-chrome`).
+    pub(crate) fn theme_toggle(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_toggle(&self.i18n)
+    }
+
+    /// The inline first-paint theme stamp for `<head>` (shared with HFS).
+    pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_boot()
+    }
 }
 
 /// Askama render helper for full-page and fragment responses that already

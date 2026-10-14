@@ -16,9 +16,13 @@
        second tag, and a layout without it (HTS) means "no such endpoint". -->
   <meta name="hfs-fhir-base" content="{{ status.fhir_base() }}">
   <meta name="hfs-user-settings" content="{{ status.fhir_base() }}/_user/settings">
-  <!-- No `defer`: the theme attribute must land on <html> before first paint,
-       or the stored theme flashes its default first. -->
-  <script src="/ui/assets/theme.js"></script>
+  <!-- Inline, ahead of everything else that can paint: stamps the stored
+       theme (shared hfs_theme cookie; default "system") on <html> before
+       first paint, so a dark choice never flashes light. Markup:
+       crates/ui-chrome/templates/partials/theme-boot.html. The behaviour
+       (cycling, sync, animation) is theme.js, deferred like the rest. -->
+  {{ status.theme_boot()?|safe }}
+  <script src="/ui/assets/theme.js" defer></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
   <!-- The shared busy states (#679); ahead of every page script by defer's
@@ -103,6 +107,10 @@
       <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/validate"{% if active_page == "validate" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-validate") }}">
+        <span class="icon">{% include "icons/check-circle.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-validate") }}</span>
       </a>
       <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
@@ -232,14 +240,7 @@
         <!-- The theme toggle stays in the topbar (#725): it is a one-click,
              instant-feedback control, and a click deeper behind the menu
              would slow the most common visit-time adjustment. -->
-        <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
-          <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
-            {% include "icons/sun.svg" %}
-          </button>
-          <button type="button" data-set-theme="dark" aria-label="{{ i18n.t("theme-dark") }}">
-            {% include "icons/moon.svg" %}
-          </button>
-        </div>
+{{ status.theme_toggle(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/theme-toggle.html #}
 
         <!--
           The user menu (#725): identity, language, and session actions behind

@@ -3,6 +3,14 @@
  * review the execution plan (one row per entry, method chip, collapsible
  * body), execute against the FHIR root, and read the per-action outcomes plus
  * the aggregate result. The bundle's own `type` decides the semantics copy.
+ *
+ * Two ways in: upload a file, or paste JSON into the editor (CodeMirror via
+ * code-editor.js when available, else the plain monospace textarea). Both
+ * feed the same client-side checks (bundle-check.js): live with a debounce
+ * while typing, again on submit, and on a file once it is read. Errors —
+ * each with its line:column — keep the plan out of reach; warnings show but
+ * never block. "Validate" sends the Bundle to `$validate` (fhir-validate.js)
+ * and renders the OperationOutcome without importing anything.
  */
 (function () {
   "use strict";
@@ -62,6 +70,36 @@
   var createdBadge = document.getElementById("batch-created");
   var doneBtn = document.getElementById("batch-done");
   var busyRegion = document.getElementById("batch-busy");
+  var modeFile = document.getElementById("batch-mode-file");
+  var modePaste = document.getElementById("batch-mode-paste");
+  var paneFile = document.getElementById("batch-pane-file");
+  var panePaste = document.getElementById("batch-pane-paste");
+  var pasteArea = document.getElementById("batch-paste");
+  var formatBtn = document.getElementById("batch-format");
+  var pasteActions = document.getElementById("batch-paste-actions");
+  var continueBtn = document.getElementById("batch-continue");
+  var continueBlocked = document.getElementById("batch-continue-blocked");
+  var checkPanel = document.getElementById("batch-check");
+  var checkOk = document.getElementById("batch-check-ok");
+  var checkErrors = document.getElementById("batch-check-errors");
+  var checkWarnings = document.getElementById("batch-check-warnings");
+  var checkSummary = document.getElementById("batch-check-summary");
+  var checkMethods = document.getElementById("batch-check-methods");
+  var checkTypes = document.getElementById("batch-check-types");
+  var preflightWarnings = document.getElementById("batch-preflight-warnings");
+  var validateBtn = document.getElementById("batch-validate");
+  var validatePerEntry = document.getElementById("batch-validate-per-entry");
+  var validationCard = document.getElementById("batch-validation");
+  var validationProgress = document.getElementById("batch-validation-progress");
+  var validationResults = document.getElementById("batch-validation-results");
+
+  var Check = window.HfsBundleCheck;
+  var checkMessages = Check ? Check.messagesFrom(document.getElementById("bundle-check-messages")) : {};
+  var validateMessages = Check ? Check.messagesFrom(document.getElementById("validate-messages")) : {};
+  /* The last check report: Execute and Continue refuse while it has errors. */
+  var lastReport = null;
+  var editorView = null;
+  var mode = "file";
 
   var bundle = null;
   var bundleJsonRenderer = null;
@@ -189,15 +227,9 @@
            deferred window owns the stage now. */
         if (generation !== renderGeneration) return;
         try {
-          var parsed;
-          try {
-            parsed = JSON.parse(reader.result);
-          } catch (e) {
-            return fail(messages.msgInvalidJson + " (" + e.message + ")");
-          }
-          if (!parsed || parsed.resourceType !== "Bundle") return fail(messages.msgNotABundle);
-          if (parsed.type !== "batch" && parsed.type !== "transaction") return fail(messages.msgBadType);
-          bundle = parsed;
+          var report = runCheck(String(reader.result));
+          if (report.errors.length) return;
+          bundle = report.value;
           renderPreflight(generation);
           show("preflight");
           /* The drop zone was hidden with its stage, stranding focus.
@@ -218,6 +250,246 @@
     };
     reader.readAsText(file);
   }
+
+  /* ---- client-side checks (bundle-check.js) ---------------------------- */
+
+  function positionText(problem) {
+    if (problem.line == null) return "";
+    return messages.msgCheckAt.replace("%line%", problem.line).replace("%col%", problem.col);
+  }
+
+  function fillList(group, problems, clickable) {
+    var list = group.querySelector("ul");
+    list.textContent = "";
+    group.querySelector(".batch-check__count").textContent = problems.length ? "· " + window.HfsNumber.format(problems.length) : "";
+    problems.forEach(function (problem) {
+      var li = document.createElement("li");
+      var where = positionText(problem);
+      if (where && clickable && mode === "paste") {
+        var jump = document.createElement("button");
+        jump.type = "button";
+        jump.className = "batch-check__at";
+        jump.textContent = where;
+        jump.addEventListener("click", function () {
+          jumpTo(problem.line, problem.col);
+        });
+        li.appendChild(jump);
+      } else if (where) {
+        var at = document.createElement("span");
+        at.className = "batch-check__at";
+        at.textContent = where;
+        li.appendChild(at);
+      }
+      li.appendChild(document.createTextNode(problem.message));
+      list.appendChild(li);
+    });
+    group.hidden = !problems.length;
+  }
+
+  function chips(target, counts) {
+    target.textContent = "";
+    Object.keys(counts)
+      .sort(function (a, b) {
+        return counts[b] - counts[a] || (a < b ? -1 : 1);
+      })
+      .forEach(function (key) {
+        var li = document.createElement("li");
+        var chip = document.createElement("span");
+        var isMethod = target === checkMethods;
+        chip.className = isMethod ? "batch-chip batch-chip--" + key.toLowerCase() : "tag";
+        chip.textContent = key;
+        li.appendChild(chip);
+        li.appendChild(document.createTextNode(" " + window.HfsNumber.format(counts[key])));
+        target.appendChild(li);
+      });
+  }
+
+  function renderCheck(report) {
+    var empty = report.errors.length === 1 && report.errors[0].code === "empty";
+    checkPanel.hidden = empty && mode === "paste";
+    if (empty && mode !== "paste") checkPanel.hidden = false;
+    fillList(checkErrors, report.errors, true);
+    fillList(checkWarnings, report.warnings, true);
+    checkOk.hidden = !!(report.errors.length || report.warnings.length);
+    if (report.summary && !report.errors.some(function (e) { return e.code === "jsonSyntax" || e.code === "notBundle" || e.code === "notObject"; })) {
+      chips(checkMethods, report.summary.byMethod);
+      chips(checkTypes, report.summary.byType);
+      checkSummary.hidden = !report.summary.entries;
+      var total = checkSummary.querySelector(".batch-check__total");
+      if (!total) {
+        total = document.createElement("p");
+        total.className = "batch-check__total";
+        checkSummary.insertBefore(total, checkSummary.firstChild);
+      }
+      total.textContent = messages.msgCheckEntries.replace("%count%", window.HfsNumber.format(report.summary.entries));
+    } else {
+      checkSummary.hidden = true;
+    }
+    continueBtn.disabled = !!report.errors.length;
+    continueBlocked.hidden = !report.errors.length || empty;
+    pushDiagnostics(report);
+  }
+
+  function runCheck(text) {
+    var report = Check
+      ? Check.check(text, { maxBytes: MAX_BODY_SIZE, messages: checkMessages })
+      : legacyCheck(text);
+    lastReport = report;
+    renderCheck(report);
+    return report;
+  }
+
+  /* bundle-check.js failed to load: the old three checks, unlocated. */
+  function legacyCheck(text) {
+    var report = { errors: [], warnings: [], summary: null, value: undefined };
+    function err(message) {
+      report.errors.push({ code: "legacy", message: message, line: null, col: null });
+      return report;
+    }
+    try {
+      report.value = JSON.parse(text);
+    } catch (e) {
+      return err(messages.msgInvalidJson + " (" + e.message + ")");
+    }
+    if (!report.value || report.value.resourceType !== "Bundle") return err(messages.msgNotABundle);
+    if (report.value.type !== "batch" && report.value.type !== "transaction") return err(messages.msgBadType);
+    return report;
+  }
+
+  function offsetOf(line, col) {
+    if (!editorView) return null;
+    var doc = editorView.state.doc;
+    if (line < 1 || line > doc.lines) return doc.length;
+    var l = doc.line(line);
+    return Math.min(l.from + Math.max(col - 1, 0), l.to);
+  }
+
+  function pushDiagnostics(report) {
+    var CM = window.HfsCodeMirror;
+    if (!editorView || !CM || !CM.setDiagnostics || mode !== "paste") return;
+    var diagnostics = [];
+    function add(list, severity) {
+      list.forEach(function (problem) {
+        if (problem.line == null) return;
+        var from = offsetOf(problem.line, problem.col);
+        if (from == null) return;
+        var to = Math.min(from + 1, editorView.state.doc.length);
+        diagnostics.push({ from: from, to: Math.max(to, from), severity: severity, message: problem.message });
+      });
+    }
+    add(report.errors, "error");
+    add(report.warnings, "warning");
+    try {
+      editorView.dispatch(CM.setDiagnostics(editorView.state, diagnostics));
+    } catch (e) {
+      /* diagnostics are a nicety; the list above is authoritative */
+    }
+  }
+
+  function jumpTo(line, col) {
+    if (editorView) {
+      var at = offsetOf(line, col);
+      editorView.dispatch({ selection: { anchor: at }, scrollIntoView: true });
+      editorView.focus();
+      return;
+    }
+    var text = pasteArea.value;
+    var offset = 0;
+    for (var l = 1; l < line && offset >= 0; l++) offset = text.indexOf("\n", offset) + 1;
+    offset += col - 1;
+    pasteArea.focus();
+    pasteArea.setSelectionRange(offset, offset + 1);
+  }
+
+  /* ---- paste mode --------------------------------------------------------- */
+
+  function mountEditor() {
+    if (editorView || !window.HfsCodeEditor || !window.HfsCodeMirror) return;
+    var CM = window.HfsCodeMirror;
+    var highlight = window.HfsCodeEditor.jsonHighlight();
+    editorView = window.HfsCodeEditor.mount(pasteArea, {
+      language: CM.json(),
+      highlight: highlight ? [CM.syntaxHighlighting(highlight)] : [],
+      extensions: CM.lintGutter ? [CM.lintGutter()] : [],
+      fold: true,
+      wrapperClass: "batch-paste__editor",
+      id: "batch-paste-editor",
+    });
+  }
+
+  function setPasteText(text) {
+    if (editorView) {
+      editorView.dispatch({ changes: { from: 0, to: editorView.state.doc.length, insert: text } });
+    } else {
+      pasteArea.value = text;
+    }
+  }
+
+  function selectMode(which, focus) {
+    mode = which;
+    var paste = which === "paste";
+    modeFile.setAttribute("aria-selected", paste ? "false" : "true");
+    modePaste.setAttribute("aria-selected", paste ? "true" : "false");
+    modeFile.tabIndex = paste ? -1 : 0;
+    modePaste.tabIndex = paste ? 0 : -1;
+    paneFile.hidden = paste;
+    panePaste.hidden = !paste;
+    pasteActions.hidden = !paste;
+    uploadError.hidden = true;
+    if (paste) {
+      mountEditor();
+      if (pasteArea.value.trim()) runCheck(pasteArea.value);
+      else checkPanel.hidden = true;
+    } else {
+      checkPanel.hidden = true;
+    }
+    if (focus) (paste ? modePaste : modeFile).focus();
+  }
+  modeFile.addEventListener("click", function () { selectMode("file"); });
+  modePaste.addEventListener("click", function () { selectMode("paste"); });
+  [modeFile, modePaste].forEach(function (tab) {
+    tab.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft" || e.key === "Home" || e.key === "End") {
+        e.preventDefault();
+        var next = e.key === "Home" ? "file" : e.key === "End" ? "paste" : mode === "file" ? "paste" : "file";
+        selectMode(next, true);
+      }
+    });
+  });
+
+  var debounce = null;
+  pasteArea.addEventListener("input", function () {
+    clearTimeout(debounce);
+    debounce = setTimeout(function () {
+      runCheck(pasteArea.value);
+    }, 350);
+  });
+
+  formatBtn.addEventListener("click", function () {
+    var text = pasteArea.value;
+    var formatted;
+    try {
+      formatted = Check ? Check.format(text) : JSON.stringify(JSON.parse(text), null, 2) + "\n";
+    } catch (e) {
+      runCheck(text);
+      return;
+    }
+    setPasteText(formatted);
+    clearTimeout(debounce);
+    runCheck(formatted);
+  });
+
+  continueBtn.addEventListener("click", function () {
+    clearTimeout(debounce);
+    var report = runCheck(pasteArea.value);
+    if (report.errors.length) return;
+    var generation = resetJsonRendering();
+    bundle = report.value;
+    clearPreflight();
+    renderPreflight(generation);
+    show("preflight");
+    stages.preflight.focus({ preventScroll: true });
+  });
 
   /* ---- stage 2: the execution plan ------------------------------------ */
 
@@ -298,6 +570,19 @@
     rawJson.textContent = "";
     bundleJsonRenderer = lazyJson(rawJson, bundle, generation);
     selectTab("actions");
+
+    var warnings = (lastReport && lastReport.warnings) || [];
+    var list = preflightWarnings.querySelector("ul");
+    list.textContent = "";
+    warnings.forEach(function (w) {
+      var li = document.createElement("li");
+      var where = positionText(w);
+      li.textContent = (where ? where + " — " : "") + w.message;
+      list.appendChild(li);
+    });
+    preflightWarnings.hidden = !warnings.length;
+    resetValidation();
+    executeTopBtn.disabled = !!(lastReport && lastReport.errors.length);
   }
 
   function selectTab(which) {
@@ -321,7 +606,10 @@
        one (#731). */
     uploadError.hidden = true;
     executeError.hidden = true;
+    resetValidation();
     show("upload");
+    if (mode === "paste" && pasteArea.value.trim()) runCheck(pasteArea.value);
+    else checkPanel.hidden = true;
     /* Done/Cancel hid the stage that held focus; land on the one action
        the upload stage offers (#679). Containment, not body: the focus
        fixup for the hidden trigger runs at the next render update. */
@@ -336,6 +624,60 @@
   }
   cancelTopBtn.addEventListener("click", reset);
 
+  /* ---- validate without importing (fhir-validate.js) ------------------ */
+
+  var validationAbort = null;
+
+  function resetValidation() {
+    if (validationAbort) validationAbort.abort();
+    validationAbort = null;
+    validationCard.hidden = true;
+    validationResults.textContent = "";
+    validationProgress.hidden = true;
+  }
+
+  function validate() {
+    if (!bundle || !window.HfsValidate) return;
+    resetValidation();
+    validationCard.hidden = false;
+    var controller = window.AbortController ? new AbortController() : null;
+    validationAbort = controller;
+    var label = validationProgress.querySelector("[data-busy-label]");
+    validationProgress.hidden = false;
+    label.textContent = validateMessages.running;
+    hfsBusy.during(
+      [validateBtn],
+      function () {
+        return window.HfsValidate.run(bundle, {
+          perEntry: validatePerEntry.checked,
+          signal: controller ? controller.signal : undefined,
+          onProgress: function (done, total) {
+            label.textContent = validateMessages.progress
+              .replace("%done%", window.HfsNumber.format(done))
+              .replace("%total%", window.HfsNumber.format(total));
+          },
+        })
+          .then(function (result) {
+            if (validationAbort !== controller) return;
+            validationProgress.hidden = true;
+            window.HfsValidate.render(validationResults, result, { resource: bundle, messages: validateMessages });
+            validationCard.focus({ preventScroll: false });
+          })
+          .catch(function (e) {
+            if (e && e.name === "AbortError") return;
+            validationProgress.hidden = true;
+            validationResults.textContent = "";
+            var p = document.createElement("p");
+            p.className = "alert";
+            p.textContent = validateMessages.requestFailed.replace("%detail%", (e && e.message) || "");
+            validationResults.appendChild(p);
+          });
+      },
+      { alsoDisable: [executeTopBtn, cancelTopBtn] }
+    );
+  }
+  validateBtn.addEventListener("click", validate);
+
   /* ---- stage 3: execute and report ------------------------------------ */
 
   function executeFailed(detail) {
@@ -348,8 +690,8 @@
 
   function execute() {
     executeError.hidden = true;
-    if (!bundle) {
-      fail(messages.msgInvalidJson);
+    if (!bundle || (lastReport && lastReport.errors.length)) {
+      if (!bundle) fail(messages.msgInvalidJson);
       show("upload");
       return;
     }
@@ -399,7 +741,12 @@
   executeTopBtn.addEventListener("click", execute);
   /* The run already happened: Done lands back on a clean upload stage
      rather than offering to re-run a mutation that succeeded (#675). */
-  doneBtn.addEventListener("click", reset);
+  doneBtn.addEventListener("click", function () {
+    /* The pasted bundle ran: start the next one from an empty editor. */
+    if (mode === "paste") setPasteText("");
+    lastReport = null;
+    reset();
+  });
 
   function renderResponse(response, body) {
     overall.textContent = String(response.status);

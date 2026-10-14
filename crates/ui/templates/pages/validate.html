@@ -1,0 +1,84 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("validate-page-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title" id="validate-title">{{ i18n.t("validate-page-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("validate-page-lede") }}</p>
+</section>
+
+<!--
+  Validate without importing: the resource (or Bundle) in the editor goes to
+  this server's own `POST [base]/[type]/$validate` (crates/rest
+  handlers/validate.rs), optionally with a `profile` canonical, and the
+  returned OperationOutcome is rendered by fhir-validate.js. Nothing is
+  stored. The profile list is the StructureDefinitions this server holds,
+  read through the ordinary FHIR search API when the field is first used.
+-->
+<div id="validate" data-max-body-size="{{ max_body_size }}"
+     data-msg-check-at="{{ i18n.t("batch-check-at") }}"
+     data-msg-format-failed="{{ i18n.t("batch-format-failed") }}"
+     data-msg-read-failed="{{ i18n.t("batch-read-failed") }}"
+     data-msg-profiles-loaded="{{ i18n.t("validate-profiles-loaded") }}"
+     data-msg-sign-in-required="{{ i18n.t("batch-sign-in-required") }}">
+  <section class="card">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("validate-input") }}</h3>
+    </div>
+    <form class="validate-form" id="validate-form" novalidate>
+      <div class="validate-form__row">
+        <button type="button" class="btn" id="validate-upload"><span class="icon">{% include "icons/import.svg" %}</span> {{ i18n.t("batch-mode-file") }}</button>
+        <input type="file" id="validate-file" accept=".json,application/json,application/fhir+json" hidden>
+        <button type="button" class="btn" id="validate-format"><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("batch-format") }}</button>
+        <span class="muted batch-paste__hint" id="validate-file-name"></span>
+      </div>
+      <div class="editor__doc batch-paste__doc">
+        <textarea class="json-editor batch-paste__source" id="validate-text" spellcheck="false" autocomplete="off" autocapitalize="off"
+                  aria-label="{{ i18n.t("validate-input-label") }}" placeholder="{{ i18n.t("validate-input-placeholder") }}"></textarea>
+      </div>
+
+      <div class="batch-check" id="validate-check" aria-live="polite" hidden>
+        <div class="batch-check__group batch-check__group--error" id="validate-check-errors" hidden>
+          <h4>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h4>
+          <ul></ul>
+        </div>
+      </div>
+
+      <label class="field">
+        <span class="field__label">{{ i18n.t("validate-profile") }}</span>
+        <input class="field__input" type="text" id="validate-profile" name="profile" list="validate-profiles"
+               inputmode="url" autocomplete="off" spellcheck="false"
+               placeholder="{{ i18n.t("validate-profile-placeholder") }}" aria-describedby="validate-profile-hint">
+        <span class="field__hint" id="validate-profile-hint">{{ i18n.t("validate-profile-hint") }}</span>
+      </label>
+      <datalist id="validate-profiles"></datalist>
+
+      <div class="validate-form__row">
+        <label class="batch-validate__option" id="validate-per-entry-option" hidden><input type="checkbox" id="validate-per-entry"> {{ i18n.t("validate-per-entry") }}</label>
+        <span class="muted batch-validate__hint" id="validate-per-entry-hint" hidden>{{ i18n.t("validate-per-entry-hint") }}</span>
+      </div>
+      <div class="batch-footer batch-footer--end">
+        <button type="submit" class="btn btn--primary btn--busy-slot" id="validate-run" disabled><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-run") }}</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card validate-card" id="validate-result" tabindex="-1" hidden>
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h3>
+    </div>
+    <p class="busy-status" id="validate-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+    <div class="validate-results" id="validate-results"></div>
+  </section>
+
+{% include "partials/bundle-check-messages.html" %}
+{% include "partials/validate-messages.html" %}
+</div>
+
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/bundle-check.js" defer></script>
+<script src="/ui/assets/fhir-validate.js" defer></script>
+<script src="/ui/assets/validate-page.js" defer></script>
+{% endblock %}

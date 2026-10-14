@@ -32,19 +32,66 @@
      data-max-body-size="{{ max_body_size }}"
      data-msg-reading="{{ i18n.t("batch-reading") }}"
      data-msg-executing="{{ i18n.t("batch-executing") }}"
-     data-msg-read-failed="{{ i18n.t("batch-read-failed") }}">
+     data-msg-read-failed="{{ i18n.t("batch-read-failed") }}"
+     data-msg-format-failed="{{ i18n.t("batch-format-failed") }}"
+     data-msg-check-at="{{ i18n.t("batch-check-at") }}"
+     data-msg-check-entries="{{ i18n.t("batch-check-entries") }}">
 
-  <!-- ============ Stage 1: upload ============ -->
+  <!-- ============ Stage 1: upload or paste ============ -->
+  <!-- Two ways in, one pipeline: a picked file is read client-side and its
+       text goes through exactly the same checks (bundle-check.js) as text
+       pasted into the editor. Errors block the way to the plan; warnings
+       only inform. -->
   <section class="card" id="batch-upload">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("batch-upload") }}</h3>
     </div>
-    <button type="button" class="batch-drop" id="batch-drop">
-      <strong>{{ i18n.t("batch-drop-hint") }}</strong>
-      <span>{{ i18n.t("batch-drop-browse") }}</span>
-    </button>
-    <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
+    <div class="batch-tabs batch-modes" role="tablist" aria-label="{{ i18n.t("batch-mode-label") }}">
+      <button type="button" class="batch-tab" id="batch-mode-file" role="tab" aria-selected="true" aria-controls="batch-pane-file"><span class="icon">{% include "icons/import.svg" %}</span> {{ i18n.t("batch-mode-file") }}</button>
+      <button type="button" class="batch-tab" id="batch-mode-paste" role="tab" aria-selected="false" aria-controls="batch-pane-paste" tabindex="-1"><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("batch-mode-paste") }}</button>
+    </div>
+    <div class="batch-pane" id="batch-pane-file" role="tabpanel" aria-labelledby="batch-mode-file">
+      <button type="button" class="batch-drop" id="batch-drop">
+        <strong>{{ i18n.t("batch-drop-hint") }}</strong>
+        <span>{{ i18n.t("batch-drop-browse") }}</span>
+      </button>
+      <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
+    </div>
+    <div class="batch-pane" id="batch-pane-paste" role="tabpanel" aria-labelledby="batch-mode-paste" hidden>
+      <div class="batch-paste__toolbar">
+        <button type="button" class="btn" id="batch-format"><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("batch-format") }}</button>
+        <span class="muted batch-paste__hint">{{ i18n.t("batch-paste-hint") }}</span>
+      </div>
+      <div class="editor__doc batch-paste__doc">
+        <textarea class="json-editor batch-paste__source" id="batch-paste" spellcheck="false" autocomplete="off" autocapitalize="off"
+                  aria-label="{{ i18n.t("batch-paste-label") }}" placeholder="{{ i18n.t("batch-paste-placeholder") }}"></textarea>
+      </div>
+    </div>
+
+    <!-- The live check report (bundle-check.js): errors with line:column,
+         warnings, and the entry tally. Polite: it updates as the user types. -->
+    <div class="batch-check" id="batch-check" aria-live="polite" hidden>
+      <p class="batch-check__ok" id="batch-check-ok" hidden><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-check-ok") }}</p>
+      <div class="batch-check__group batch-check__group--error" id="batch-check-errors" hidden>
+        <h4>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h4>
+        <ul></ul>
+      </div>
+      <div class="batch-check__group batch-check__group--warning" id="batch-check-warnings" hidden>
+        <h4>{{ i18n.t("batch-check-warnings") }} <span class="batch-check__count"></span></h4>
+        <ul></ul>
+      </div>
+      <div class="batch-check__summary" id="batch-check-summary" hidden>
+        <div><h4>{{ i18n.t("batch-check-by-method") }}</h4><ul class="batch-check__chips" id="batch-check-methods"></ul></div>
+        <div><h4>{{ i18n.t("batch-check-by-type") }}</h4><ul class="batch-check__chips" id="batch-check-types"></ul></div>
+      </div>
+    </div>
+
     <p class="alert" id="batch-upload-error" role="alert" hidden></p>
+
+    <div class="batch-footer batch-footer--end" id="batch-paste-actions" hidden>
+      <span class="muted batch-check__blocked" id="batch-continue-blocked" hidden>{{ i18n.t("batch-check-blocked") }}</span>
+      <button type="button" class="btn btn--primary" id="batch-continue" disabled>{{ i18n.t("batch-continue") }}</button>
+    </div>
   </section>
 
   <!-- ============ Stage 2: preflight ============ -->
@@ -60,6 +107,15 @@
       <button type="button" class="btn btn--primary btn--busy-slot" id="batch-execute-top">{{ i18n.t("batch-execute") }}</button>
     </div>
 
+    <!-- Server-side validation without importing (#p1): $validate on the
+         whole Bundle, optionally on every entry against its own
+         meta.profile. Nothing is stored. -->
+    <div class="batch-validate">
+      <button type="button" class="btn btn--busy-slot" id="batch-validate"><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-run") }}</button>
+      <label class="batch-validate__option"><input type="checkbox" id="batch-validate-per-entry"> {{ i18n.t("validate-per-entry") }}</label>
+      <span class="muted batch-validate__hint">{{ i18n.t("validate-run-hint") }}</span>
+    </div>
+
     <div class="request-strip">
       <span class="request-strip__label">{{ i18n.t("batch-request") }}</span>
       <code id="batch-request-line"></code>
@@ -72,6 +128,21 @@
     <!-- A failed execute reports here, above the plan (#730) — on a long
          plan the page may be scrolled anywhere when the attempt fails. -->
     <p class="alert" id="batch-execute-error" role="alert" hidden></p>
+
+    <!-- Warnings from the client-side check stay visible next to the plan;
+         they do not block Execute. -->
+    <div class="notice notice--warn batch-preflight-warnings" id="batch-preflight-warnings" hidden>
+      <strong>{{ i18n.t("batch-check-warnings") }}</strong>
+      <ul></ul>
+    </div>
+
+    <section class="card validate-card" id="batch-validation" tabindex="-1" hidden>
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h3>
+      </div>
+      <p class="busy-status" id="batch-validation-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+      <div class="validate-results" id="batch-validation-results"></div>
+    </section>
 
     <div class="card">
       <div class="card-head">
@@ -116,7 +187,13 @@
 
   <!-- Cloned by batch.js into each row's disclosure control (#674). -->
   <template id="batch-chevron"><span class="icon">{% include "icons/chevron-down.svg" %}</span></template>
+{% include "partials/bundle-check-messages.html" %}
+{% include "partials/validate-messages.html" %}
 </div>
 
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/bundle-check.js" defer></script>
+<script src="/ui/assets/fhir-validate.js" defer></script>
 <script src="/ui/assets/batch.js" defer></script>
 {% endblock %}

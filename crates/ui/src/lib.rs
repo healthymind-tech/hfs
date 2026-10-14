@@ -636,6 +636,17 @@ impl Status {
         )
     }
 
+    /// The topbar theme switcher, shared with HTS through `helios-ui-chrome`:
+    /// one button cycling system -> light -> dark (`assets/theme.js`).
+    pub(crate) fn theme_toggle(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_toggle(i18n)
+    }
+
+    /// The inline first-paint theme stamp for `<head>` (shared with HTS).
+    pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_boot()
+    }
+
     /// A browser-safe terminology destination, when the configured value is a
     /// valid absolute HTTP(S) URL (#611).
     pub(crate) fn terminology_url(&self) -> Option<&str> {
@@ -1330,6 +1341,20 @@ struct BatchPage {
     max_body_size: usize,
 }
 
+/// Validate without importing (/ui/validate): a static shell like Batch;
+/// validate-page.js sends the pasted/uploaded resource to the FHIR API's own
+/// `POST [base]/[type]/$validate` and renders the OperationOutcome.
+#[derive(Template)]
+#[template(path = "pages/validate.html")]
+struct ValidatePage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`), checked
+    /// client-side before the resource is sent, as on the Batch page.
+    max_body_size: usize,
+}
+
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
 #[derive(Template)]
 #[template(path = "partials/json-view.html")]
@@ -1757,6 +1782,19 @@ pub fn mount_with_conformance_source_and_runtime(
                       rv: RequestVersion,
                       rt: RequestTenant| {
                     batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
+        // Validate a resource or Bundle against FHIR rules and profiles
+        // without storing it ($validate).
+        .route(
+            "/ui/validate",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    validate_page(state, locale, rv, rt, max_body_size)
                 },
             ),
         )
@@ -3372,6 +3410,24 @@ async fn batch_page(
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
+    })
+}
+
+/// The Validate page: the shell only. validate-page.js and the shared
+/// fhir-validate.js call `$validate` against the ordinary FHIR API, so this
+/// crate never touches storage or the validator.
+async fn validate_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    max_body_size: usize,
+) -> Response {
+    render(ValidatePage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "validate",
         max_body_size,
     })
 }
@@ -9780,7 +9836,20 @@ mod tests {
         let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("PATCH"));
-        assert!(source.contains("hfs-theme"), "localStorage cache stays");
+        assert!(
+            source.contains("hfs-theme"),
+            "legacy localStorage key is migrated"
+        );
+        assert!(
+            source.contains(&format!(r#"COOKIE = "{}""#, helios_ui_chrome::THEME_COOKIE)),
+            "theme.js writes the shared cookie the boot script reads"
+        );
+        assert!(source.contains("BroadcastChannel"), "live cross-tab sync");
+        assert!(source.contains("startViewTransition"), "animated switch");
+        assert!(
+            source.contains("prefers-reduced-motion"),
+            "motion is optional"
+        );
     }
 
     #[test]
@@ -10071,8 +10140,20 @@ mod tests {
             .render()
             .expect("index renders");
 
-        assert!(html.contains(r#"data-set-theme="light""#));
-        assert!(html.contains(r#"data-set-theme="dark""#));
+        // One cycling button (system -> light -> dark), not one per mode.
+        assert_eq!(html.matches("data-theme-cycle").count(), 1);
+        assert!(!html.contains("data-set-theme"));
+        assert!(html.contains(r#"aria-label="Theme: follow system""#));
+        // The first-paint stamp is inline in <head>, ahead of the deferred
+        // behaviour script.
+        let head = &html[..html.find("</head>").expect("head")];
+        let boot = head
+            .find("hfs_theme=(system|light|dark)")
+            .expect("inline boot");
+        let script = head
+            .find(r#"<script src="/ui/assets/theme.js" defer></script>"#)
+            .expect("deferred theme.js");
+        assert!(boot < script);
         assert!(html.contains("<svg"));
         assert!(html.contains(r#"fill="currentColor""#));
     }
