@@ -10861,6 +10861,20 @@ mod tests {
         }"#
     }
 
+    /// Wait for the implicit-cache population a cold paged `$expand` starts
+    /// in the background. The in-memory test database is shared-cache, where
+    /// a concurrent writer fails readers with "table is locked" instead of
+    /// making them wait as WAL does.
+    fn wait_for_background_cache(b: &SqliteTerminologyBackend) {
+        for _ in 0..500 {
+            if b.bg_index_pending.lock().unwrap().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("background implicit cache population did not finish");
+    }
+
     async fn expand_codes(
         b: &SqliteTerminologyBackend,
         url: &str,
@@ -10877,6 +10891,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("expand {url}: {e:?}"));
+        wait_for_background_cache(b);
         let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
         codes.sort();
         codes
@@ -10987,7 +11002,9 @@ mod tests {
     }
 
     async fn expand_req(b: &SqliteTerminologyBackend, req: ExpandRequest) -> ExpandResponse {
-        b.expand(&ctx(), req).await.expect("expand")
+        let resp = b.expand(&ctx(), req).await.expect("expand");
+        wait_for_background_cache(b);
+        resp
     }
 
     /// Filtered and CodeSystem-wide implicit expansions report
@@ -11019,7 +11036,8 @@ mod tests {
             assert_eq!(r.total, Some(31));
             let r = expand_req(&b, page(isa, Some("number 2"))).await;
             assert_eq!(r.total, Some(11));
-            // Let the background cache population finish.
+            // The background population has finished (`expand_req`); make
+            // sure both caches exist for the warm round.
             ensure_implicit_cache(&b.pool().get().unwrap(), all, None).unwrap();
             ensure_implicit_cache(&b.pool().get().unwrap(), isa, None).unwrap();
         }
