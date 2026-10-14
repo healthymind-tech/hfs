@@ -51,6 +51,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 |-------------|-----------|--------|--------------------------|
 | [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free - redistribution with attribution |
 | [ICD-10-CM](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html) | [U.S. CDC / NCHS](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
+| [ICD-10-PCS](https://www.cms.gov/medicare/coding-billing/icd-10-codes) | [U.S. CMS](https://www.cms.gov) | 🔑 Download required | Public domain (US federal government work) - download the yearly `icd10pcs_tables_and_index` or `icd10pcs_order` ZIP from CMS; `hts import --format icd10-pcs` |
 | [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain - retired 2015, legacy data only |
 | [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive - also in the THO package |
 | [NCI Thesaurus (NCIt)](https://evs.nci.nih.gov) | [U.S. National Cancer Institute](https://www.cancer.gov) | ✅ Bundled | Public domain |
@@ -214,7 +215,7 @@ Bulk-import terminology data into the HTS database. `<PATH>` can be either a sin
 
 If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required. The same is true for PostgreSQL: pass `--storage-backend postgres` (or set `HTS_STORAGE_BACKEND=postgres`) along with a `postgresql://` connection string and the schema is created on first import.
 
-All 13 import formats (`hl7-npm`, `snomed-rf2`, `loinc`, `icd10-cm`, `icd9-cm`, `rxnorm`, `ucum`, `nci-thesaurus`, `mesh`, `dicom`, `hl7-v2-tables`, `nucc`, `ndc`) work against both the SQLite and PostgreSQL backends.
+All 14 import formats (`hl7-npm`, `snomed-rf2`, `loinc`, `icd10-cm`, `icd10-pcs`, `icd9-cm`, `rxnorm`, `ucum`, `nci-thesaurus`, `mesh`, `dicom`, `hl7-v2-tables`, `nucc`, `ndc`) work against both the SQLite and PostgreSQL backends.
 
 ```bash
 # HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
@@ -233,6 +234,10 @@ hts import ./Loinc_*.zip --format loinc
 
 # ICD-10-CM tabular XML (free, from cms.gov)
 hts import ./icd10cm_tabular_2025.xml
+
+# ICD-10-PCS order file (free, from cms.gov) — or the CMS ZIP containing it; version = file-name year
+hts import ./icd10pcs_codes_2025.txt
+hts import ./icd10pcs_tables_2025.zip --format icd10-pcs
 
 # ICD-9-CM pipe-delimited text (free, from cms.gov)
 hts import ./CMS32_DESC_LONG_DX.txt --format icd9-cm

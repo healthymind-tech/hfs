@@ -671,8 +671,8 @@ async fn run_import_for_path(
             HtsError::InvalidRequest(format!(
                 "Cannot auto-detect format from '{}'. \
                  Use --format to specify one of: hl7-npm, snomed-rf2, loinc, \
-                 icd10-cm, icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, dicom, \
-                 hl7-v2-tables, nucc, ndc, fhir-bundle. Note: .zip files may \
+                 icd10-cm, icd10-pcs, icd9-cm, rxnorm, ucum, nci-thesaurus, mesh, \
+                 dicom, hl7-v2-tables, nucc, ndc, fhir-bundle. Note: .zip files may \
                  require --format if auto-detection is ambiguous.",
                 args.path.display()
             ))
@@ -937,8 +937,8 @@ async fn dispatch_import(
 ) -> Result<ImportStats, helios_hts::error::HtsError> {
     use helios_hts::import::{
         dicom::import_dicom, hl7_v2_tables::import_hl7_v2_tables, icd9_cm::import_icd9_cm,
-        icd10_cm::import_icd10_cm, loinc_csv::import_loinc_csv, mesh::import_mesh,
-        nci_thesaurus::import_nci_thesaurus, ndc::import_ndc, nucc::import_nucc,
+        icd10_cm::import_icd10_cm, icd10_pcs::import_icd10_pcs, loinc_csv::import_loinc_csv,
+        mesh::import_mesh, nci_thesaurus::import_nci_thesaurus, ndc::import_ndc, nucc::import_nucc,
         rxnorm_rrf::import_rxnorm_rrf, snomed_rf2::import_snomed_rf2, tgz::import_tgz,
         ucum::import_ucum,
     };
@@ -952,6 +952,7 @@ async fn dispatch_import(
             import_loinc_csv(backend, ctx, path, batch_size, dry_run, languages).await
         }
         ImportFormat::Icd10Cm => import_icd10_cm(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::Icd10Pcs => import_icd10_pcs(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Icd9Cm => import_icd9_cm(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Rxnorm => import_rxnorm_rrf(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Ucum => import_ucum(backend, ctx, path, batch_size, dry_run).await,
