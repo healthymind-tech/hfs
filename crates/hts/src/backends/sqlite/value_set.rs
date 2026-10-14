@@ -5343,10 +5343,10 @@ fn batch_direct_children_in_set(
 
 /// Return concepts in `system_id` matching `filter_lower`, ranked for typeahead.
 ///
-/// Prefers
-/// `concepts_search_fts` (preferred display + synonym designations) with FTS5
-/// `bm25`, then applies clinical heuristics via [`sort_typeahead_candidates`].
-/// Falls back to `concepts_fts` (display only) when the search index is empty.
+/// Searches `concepts_search_fts` (preferred display + synonym designations)
+/// with FTS5 `bm25`, then applies clinical heuristics via
+/// [`sort_typeahead_candidates`]. The caller must have run
+/// [`ensure_concepts_fts`] for `system_id`.
 fn fts_candidates_ranked_for_system(
     conn: &Connection,
     system_id: &str,
@@ -5359,59 +5359,43 @@ fn fts_candidates_ranked_for_system(
         .map(|h| (h * 10).clamp(100, 5000))
         .unwrap_or(5000) as i64;
 
-    let search_populated: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM concepts_search_fts WHERE system_id = ?1 LIMIT 1)",
-            [system_id],
-            |r| r.get(0),
+    // A concept contributes one row per term (preferred display + each
+    // designation), so scores are collapsed per code with MIN — bm25 is
+    // negative and lower is better, i.e. the concept's best-matching term
+    // wins. The CTE must be MATERIALIZED: bm25() is an FTS5 auxiliary
+    // function and SQLite rejects it in an aggregate context, so without
+    // the fence it gets flattened into the GROUP BY and the query fails
+    // with "unable to use function bm25 in the requested context".
+    //
+    // No "is the search index populated for this system?" probe first:
+    // `system_id` is UNINDEXED, so `EXISTS(… WHERE system_id = ?)` walked the
+    // index in rowid order until it met the system — 0.6 s for SNOMED CT
+    // (its synonym rows sort after every negative designation rowid), 2 s for
+    // a system with no rows, on every filtered request. Every writer builds
+    // `concepts_search_fts` together with `concepts_fts` (callers run
+    // `ensure_concepts_fts` first), so the old display-only fallback could
+    // only ever find what this query finds.
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH hits AS MATERIALIZED (
+                 SELECT code, bm25(concepts_search_fts) AS rank
+                 FROM concepts_search_fts
+                 WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+             )
+             SELECT code, MIN(rank) AS rank
+             FROM hits
+             GROUP BY code
+             ORDER BY rank ASC
+             LIMIT ?3",
         )
-        .unwrap_or(false);
-
-    let ranked_codes: Vec<(String, f64)> = if search_populated {
-        // A concept contributes one row per term (preferred display + each
-        // designation), so scores are collapsed per code with MIN — bm25 is
-        // negative and lower is better, i.e. the concept's best-matching term
-        // wins. The CTE must be MATERIALIZED: bm25() is an FTS5 auxiliary
-        // function and SQLite rejects it in an aggregate context, so without
-        // the fence it gets flattened into the GROUP BY and the query fails
-        // with "unable to use function bm25 in the requested context".
-        let mut stmt = conn
-            .prepare_cached(
-                "WITH hits AS MATERIALIZED (
-                     SELECT code, bm25(concepts_search_fts) AS rank
-                     FROM concepts_search_fts
-                     WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
-                 )
-                 SELECT code, MIN(rank) AS rank
-                 FROM hits
-                 GROUP BY code
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let ranked_codes: Vec<(String, f64)> = stmt
+        .query_map(rusqlite::params![match_expr, system_id, limit], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })
         .map_err(|e| HtsError::StorageError(e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT code, display, bm25(concepts_fts) AS rank
-                 FROM concepts_fts
-                 WHERE concepts_fts MATCH ?1 AND system_id = ?2
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(2)?))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     if ranked_codes.is_empty() {
         return Ok(vec![]);
@@ -8112,6 +8096,11 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
         return Ok(());
     }
 
+    // Stale FTS rows (built from earlier cache rows of this url) go too.
+    if let Err(e) = drop_implicit_fts(conn, url) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
     if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(HtsError::StorageError(e.to_string()));
@@ -8504,95 +8493,108 @@ fn fts5_word_prefix(term: &str) -> String {
     format!("{}*", term.replace('"', "\"\""))
 }
 
-/// Count cached entries matching an optional filter for an implicit VS URL.
-///
-/// Ensure the FTS5 mirror of the implicit expansion cache is populated for `url`.
+/// Rowid range `[block << 32, (block + 1) << 32)` of one implicit-expansion
+/// url's rows in `implicit_expansion_fts` / `implicit_expansion_word_fts`.
+fn implicit_fts_rowids(block: i64) -> (i64, i64) {
+    (block << 32, ((block + 1) << 32) - 1)
+}
+
+/// The rowid block of `url`'s implicit-expansion FTS rows, if they are built.
+fn implicit_fts_block(conn: &Connection, url: &str) -> Result<Option<i64>, HtsError> {
+    conn.query_row(
+        "SELECT block FROM implicit_expansion_fts_built WHERE url = ?1",
+        [url],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Remove `url`'s rows from both implicit-expansion FTS tables, and its
+/// tracker row. Deletes the url's rowid block — the `url` column is
+/// `UNINDEXED`, so `DELETE … WHERE url = ?` would scan every url's rows. Run
+/// it (inside the caller's transaction) whenever `url`'s
+/// `implicit_expansion_cache` rows are replaced or removed.
+pub(crate) fn drop_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let Some(block) = implicit_fts_block(conn, url)? else {
+        return Ok(());
+    };
+    let (lo, hi) = implicit_fts_rowids(block);
+    conn.execute(
+        "DELETE FROM implicit_expansion_fts WHERE rowid BETWEEN ?1 AND ?2",
+        [lo, hi],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_word_fts WHERE rowid BETWEEN ?1 AND ?2",
+        [lo, hi],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_fts_built WHERE block = ?1",
+        [block],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Ensure the FTS5 mirrors of the implicit expansion cache are populated for
+/// `url`, and return the url's rowid block (see [`implicit_fts_rowids`]).
 ///
 /// Populated lazily — only called when a text filter is actually needed so that
 /// unfiltered requests (e.g. EX01 hierarchy expansions) pay no FTS5 overhead.
-/// Reads rows from `implicit_expansion_cache` and bulk-inserts them into
-/// `implicit_expansion_fts` via a single `INSERT … SELECT` statement.
-fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
-    // Check both FTS tables in one query; either missing triggers a (re)build.
-    let (trigram_ok, word_ok): (bool, bool) = conn
-        .query_row(
-            "SELECT
-               EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
-               EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
-            [url],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    if trigram_ok && word_ok {
-        return Ok(());
+/// Copies the url's `implicit_expansion_cache` rows into
+/// `implicit_expansion_fts` and `implicit_expansion_word_fts`, numbered inside
+/// a rowid block that `implicit_expansion_fts_built` assigns, so lookups and
+/// deletes seek the block instead of filtering on the `UNINDEXED` url column.
+fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<i64, HtsError> {
+    if let Some(block) = implicit_fts_block(conn, url)? {
+        return Ok(block);
     }
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent VUs don't
     // each rebuild the same 350K-row index independently (mirrors ensure_concepts_fts).
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    // Re-check inside the lock: another VU may have built the index while we waited.
-    let (still_no_trigram, still_no_word): (bool, bool) = match conn.query_row(
-        "SELECT
-           NOT EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
-           NOT EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
-        [url],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ) {
-        Ok(v) => v,
+    let built = (|| -> Result<i64, HtsError> {
+        // Re-check inside the lock: another VU may have built the index while we waited.
+        if let Some(block) = implicit_fts_block(conn, url)? {
+            return Ok(block);
+        }
+        let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+        conn.execute(
+            "INSERT INTO implicit_expansion_fts_built (url) VALUES (?1)",
+            [url],
+        )
+        .map_err(err)?;
+        let block = conn.last_insert_rowid();
+        let (base, _) = implicit_fts_rowids(block);
+        for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (rowid, url, system_url, code, display)
+                     SELECT ?2 + ROW_NUMBER() OVER (), url, system_url, code, display
+                     FROM implicit_expansion_cache
+                     WHERE url = ?1"
+                ),
+                rusqlite::params![url, base],
+            )
+            .map_err(err)?;
+        }
+        Ok(block)
+    })();
+    match built {
+        Ok(block) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(block)
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-    };
-
-    if !still_no_trigram && !still_no_word {
-        conn.execute_batch("COMMIT")
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        return Ok(());
-    }
-
-    if still_no_trigram {
-        if let Err(e) = conn.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url]) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-        if let Err(e) = conn.execute(
-            "INSERT INTO implicit_expansion_fts (url, system_url, code, display)
-             SELECT url, system_url, code, display
-             FROM implicit_expansion_cache
-             WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
+            Err(e)
         }
     }
-
-    if still_no_word {
-        if let Err(e) = conn.execute(
-            "DELETE FROM implicit_expansion_word_fts WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-        if let Err(e) = conn.execute(
-            "INSERT INTO implicit_expansion_word_fts (url, system_url, code, display)
-             SELECT url, system_url, code, display
-             FROM implicit_expansion_cache
-             WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-    }
-
-    conn.execute_batch("COMMIT")
-        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Ensure the FTS5 trigram index on `concepts_fts` is populated for `system_id`.
@@ -8721,23 +8723,23 @@ fn implicit_cache_count(
 ) -> Result<u32, HtsError> {
     let n: i64 = match filter_lower {
         Some(f) if f.len() >= 3 => {
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let match_expr = fts5_quote(f);
             conn.query_row(
                 "SELECT COUNT(*) FROM implicit_expansion_fts
-                 WHERE implicit_expansion_fts MATCH ?1 AND url = ?2",
-                rusqlite::params![match_expr, url],
+                 WHERE implicit_expansion_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+                rusqlite::params![match_expr, lo, hi],
                 |r| r.get(0),
             )
         }
         Some(f) => {
             // Short filter (1–2 chars): word-prefix FTS count avoids O(N) LIKE scan.
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let prefix_expr = fts5_word_prefix(f);
             conn.query_row(
                 "SELECT COUNT(*) FROM implicit_expansion_word_fts
-                 WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2",
-                rusqlite::params![prefix_expr, url],
+                 WHERE implicit_expansion_word_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+                rusqlite::params![prefix_expr, lo, hi],
                 |r| r.get(0),
             )
         }
@@ -8764,7 +8766,7 @@ fn implicit_cache_page(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     match filter_lower {
         Some(f) if f.len() >= 3 => {
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let match_expr = fts5_quote(f);
             let mut stmt = conn
                 .prepare_cached(
@@ -8774,12 +8776,12 @@ fn implicit_cache_page(
                     // set is sorted in Rust below — O(N log N) on 20–100 rows.
                     "SELECT system_url, code, display
                      FROM implicit_expansion_fts
-                     WHERE implicit_expansion_fts MATCH ?1 AND url = ?2
-                     LIMIT ?3 OFFSET ?4",
+                     WHERE implicit_expansion_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3
+                     LIMIT ?4 OFFSET ?5",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let mut rows = stmt
-                .query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
+                .query_map(rusqlite::params![match_expr, lo, hi, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
                         version: None,
@@ -8805,18 +8807,18 @@ fn implicit_cache_page(
         Some(f) => {
             // Short filter (1–2 chars): word-prefix FTS so `di*` matches any
             // token starting with "di" — O(log N) vs O(N) LIKE scan on 350K rows.
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let prefix_expr = fts5_word_prefix(f);
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT system_url, code, display
                      FROM implicit_expansion_word_fts
-                     WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2
-                     LIMIT ?3 OFFSET ?4",
+                     WHERE implicit_expansion_word_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3
+                     LIMIT ?4 OFFSET ?5",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let mut rows = stmt
-                .query_map(rusqlite::params![prefix_expr, url, limit, offset], |r| {
+                .query_map(rusqlite::params![prefix_expr, lo, hi, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
                         version: None,
@@ -8912,6 +8914,11 @@ fn populate_implicit_cache(
         return Ok(());
     }
 
+    // Stale FTS rows (built from earlier cache rows of this url) go too.
+    if let Err(e) = drop_implicit_fts(conn, url) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
     if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(HtsError::StorageError(e.to_string()));
@@ -12598,6 +12605,91 @@ mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Implicit-expansion FTS rows live in a per-url rowid block, so a url's
+    /// rows are counted, paged and deleted by seeking its block instead of
+    /// filtering on the UNINDEXED `url` column (a scan of every url's rows).
+    #[test]
+    fn implicit_fts_rows_live_in_per_url_rowid_blocks() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        conn.execute_batch(
+            "INSERT INTO implicit_expansion_cache (url, system_url, code, display) VALUES
+                 ('u1', 'http://s', 'a1', 'Alpha one'),
+                 ('u1', 'http://s', 'a2', 'Beta'),
+                 ('u2', 'http://s', 'b1', 'Alpha two'),
+                 ('u2', 'http://s', 'b2', 'Alpine');",
+        )
+        .unwrap();
+
+        assert_eq!(implicit_cache_count(&conn, "u1", Some("alpha")).unwrap(), 1);
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("alp")).unwrap(), 2);
+        // 1–2 character filters use the word-prefix table, same blocks.
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("al")).unwrap(), 2);
+        let page = implicit_cache_page(&conn, "u2", Some("alp"), 10, 0).unwrap();
+        assert_eq!(
+            page.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            ["b1", "b2"]
+        );
+
+        let block = |url: &str| implicit_fts_block(&conn, url).unwrap().expect("built");
+        let (lo, hi) = implicit_fts_rowids(block("u1"));
+        assert_eq!(
+            count(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM implicit_expansion_fts WHERE rowid BETWEEN {lo} AND {hi}"
+                )
+            ),
+            2
+        );
+        assert_ne!(block("u1"), block("u2"));
+
+        drop_implicit_fts(&conn, "u1").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_fts"),
+            2
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_word_fts"),
+            2
+        );
+        assert!(implicit_fts_block(&conn, "u1").unwrap().is_none());
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("alp")).unwrap(), 2);
+        // Rebuilt on the next filtered request.
+        assert_eq!(implicit_cache_count(&conn, "u1", Some("alpha")).unwrap(), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_fts"),
+            4
+        );
+    }
+
+    /// Replacing a url's cached expansion drops its FTS rows with it, so the
+    /// next filtered request indexes the new rows instead of the old ones.
+    #[test]
+    fn repopulating_an_implicit_cache_url_drops_its_fts_rows() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        let entry = |code: &str, display: &str| ExpansionContains {
+            system: "http://s".into(),
+            version: None,
+            code: code.into(),
+            display: Some(display.into()),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        };
+        populate_implicit_cache(&conn, "u", &[entry("a", "Old term")]).unwrap();
+        assert_eq!(implicit_cache_count(&conn, "u", Some("old")).unwrap(), 1);
+        conn.execute("DELETE FROM implicit_expansion_cache WHERE url = 'u'", [])
+            .unwrap();
+        populate_implicit_cache(&conn, "u", &[entry("a", "New term")]).unwrap();
+        assert_eq!(implicit_cache_count(&conn, "u", Some("old")).unwrap(), 0);
+        assert_eq!(implicit_cache_count(&conn, "u", Some("new")).unwrap(), 1);
     }
 
     /// #295: the startup FTS build must be incremental and idempotent — it

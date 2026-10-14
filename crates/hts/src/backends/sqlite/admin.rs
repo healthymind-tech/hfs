@@ -283,14 +283,14 @@ fn delete_code_system_blocking(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(storage)?;
-    for sql in [
-        "DELETE FROM value_set_expansions WHERE system_url = ?1",
-        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
-        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
-        "DELETE FROM implicit_expansion_word_fts WHERE system_url = ?1",
-    ] {
-        report.expansion_cache += tx.execute(sql, [&row.url]).map_err(storage)? as u64;
-    }
+    report.expansion_cache += tx
+        .execute(
+            "DELETE FROM value_set_expansions WHERE system_url = ?1",
+            [&row.url],
+        )
+        .map_err(storage)? as u64;
+    report.expansion_cache +=
+        crate::import::fhir_bundle::invalidate_implicit_expansions(&tx, &row.url)?;
     tx.execute("DELETE FROM concepts_fts_built WHERE system_id = ?1", [sid])
         .map_err(storage)?;
     tx.execute("DELETE FROM code_systems WHERE id = ?1", [sid])
