@@ -239,7 +239,6 @@ impl ResourceStorage for SqliteBackend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
-        let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Extract or generate ID
@@ -248,22 +247,6 @@ impl ResourceStorage for SqliteBackend {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
-
-        // Check if resource already exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-                params![tenant_id, resource_type, id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if exists {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.clone(),
-            }));
-        }
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -279,13 +262,46 @@ impl ResourceStorage for SqliteBackend {
         let data = serde_json::to_vec(&resource)
             .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
 
+        // Extract the search values before queueing for the write lock: it is
+        // pure CPU, so concurrent creates can do it side by side.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, &id, &resource));
+
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
         let version_id = "1";
         let fhir_version_str = fhir_version.as_mime_param();
 
+        let mut conn = self.get_connection()?;
+
+        // The existence check, resource row, history row and index rows in ONE
+        // IMMEDIATE transaction. They used to be separate autocommits, each
+        // taking and releasing the write lock: a concurrent create of the same
+        // id could pass the check in between, and a failure partway left a
+        // resource without its history or index rows. IMMEDIATE takes the lock
+        // up front, where the busy handler applies (see `purge_tenant_data`).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin create: {}", e)))?;
+
+        // Check if resource already exists
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                params![tenant_id, resource_type, id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if exists {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.clone(),
+            }));
+        }
+
         // Insert the resource
-        conn.execute(
+        tx.execute(
             "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, version_id, data, last_updated, fhir_version_str],
@@ -293,7 +309,7 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
         // Insert into history
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, version_id, data, last_updated, fhir_version_str],
@@ -301,7 +317,11 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.write_prepared_index(&tx, tenant_id, resource_type, &id, &resource, prepared)?;
+        }
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit create: {}", e)))?;
 
         // An overlay-affecting SearchParameter write changes this tenant's
         // registry — drop the cached copy so the next access rebuilds from
