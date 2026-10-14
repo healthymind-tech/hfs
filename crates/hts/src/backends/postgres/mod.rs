@@ -550,6 +550,41 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
             })
         })
     }
+
+    fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
+        let pool = self.pool.clone();
+        let (table, order_by) = match resource_type {
+            "CodeSystem" => (
+                "code_systems",
+                crate::backends::cs_precedence_order_by("code_systems"),
+            ),
+            "ValueSet" => (
+                "value_sets",
+                crate::backends::vs_precedence_order_by("value_sets"),
+            ),
+            "ConceptMap" => (
+                "concept_maps",
+                std::borrow::Cow::Borrowed("created_at DESC"),
+            ),
+            _ => return None,
+        };
+        // Same matching rules as the SQLite twin: exact storage id, synthetic
+        // `<id>|<version>` storage ids, then the FHIR id inside the JSON.
+        let sql = format!(
+            "SELECT resource_json::text FROM {table} \
+             WHERE id = $1 OR id LIKE $1 || '|%' OR (resource_json->>'id') = $1 \
+             ORDER BY (id = $1) DESC, {order_by} LIMIT 1"
+        );
+        let id = id.to_owned();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = pool.get().await.ok()?;
+                let rows = client.query(&sql, &[&id]).await.ok()?;
+                let raw: Option<String> = rows.into_iter().next().and_then(|r| r.get(0));
+                raw.and_then(|s| serde_json::from_str(&s).ok())
+            })
+        })
+    }
 }
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────

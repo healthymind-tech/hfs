@@ -164,6 +164,29 @@ pub(crate) fn import_parsed_sync(
 #[cfg(feature = "sqlite")]
 const CLOSURE_REBUILD_INLINE_MAX_EDGES: i64 = 250_000;
 
+/// Rebuild `concept_closure` for the CodeSystem row that `cs_json` was just
+/// written to (resolved by `(url, version)`, the same key `write_code_system`
+/// upserts on). Used by the REST create/update path, which writes one resource
+/// at a time outside `import_parsed_sync`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn rebuild_closure_for_code_system(conn: &Connection, cs_json: &serde_json::Value) {
+    let Some(url) = cs_json.get("url").and_then(|u| u.as_str()) else {
+        return;
+    };
+    let version = cs_json.get("version").and_then(|v| v.as_str());
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![url, version],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(sid) = system_id {
+        build_closure_if_hierarchical(conn, &sid);
+    }
+}
+
 /// Build `concept_closure` for `system_id` when it has hierarchy edges; a
 /// failure is logged rather than propagated because the concepts themselves
 /// are already committed and `migrate_concept_closure` repairs the closure on

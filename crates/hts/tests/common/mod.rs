@@ -150,6 +150,66 @@ impl TestApp {
         TestApp { router }
     }
 
+    /// Like [`Self::new`] but wired the way `hts run` wires production: with a
+    /// persistence resource store and the HTS pool, so the REST CRUD
+    /// endpoints (`POST`/`PUT`/`DELETE /CodeSystem/{id}` …) are live.
+    #[cfg(feature = "sqlite")]
+    pub fn with_resource_store() -> Self {
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        let backend =
+            SqliteTerminologyBackend::in_memory().expect("failed to create in-memory HTS backend");
+        let hts_pool = backend.pool().clone();
+        let resource_store = SqliteBackend::in_memory().expect("persistence in-memory backend");
+        resource_store
+            .init_schema()
+            .expect("persistence schema init");
+        let state = AppState::new(backend)
+            .with_resource_store(resource_store)
+            .with_hts_pool(hts_pool);
+        let config = HtsConfig::default();
+        let router = helios_hts::server::create_app(&config, state);
+        TestApp { router }
+    }
+
+    /// PUT a FHIR JSON body to `path`, returning `(status, response_body)`.
+    pub async fn put_fhir(&self, path: &str, body: impl Into<String>) -> (StatusCode, Value) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(path)
+                    .header("content-type", "application/fhir+json")
+                    .body(Body::from(body.into()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// DELETE `path`, returning the status code.
+    pub async fn delete_fhir(&self, path: &str) -> StatusCode {
+        self.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     /// POST a FHIR JSON body to `path`, returning `(status, response_body)`.
     pub async fn post_fhir(&self, path: &str, body: impl Into<String>) -> (StatusCode, Value) {
         let response = self
