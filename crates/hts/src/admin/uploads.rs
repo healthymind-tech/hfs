@@ -423,7 +423,8 @@ pub struct ImportDirEntry {
     pub format_hint: Option<String>,
 }
 
-/// List regular files (and RxNorm-style directories) up to two levels deep.
+/// List regular files (and RxNorm-style directories) up to three levels deep
+/// (`loinc/2.80/Loinc_2.80.zip` is a typical layout).
 pub fn list_import_dir(root: &Path) -> Result<Vec<ImportDirEntry>, AdminError> {
     let mut out = Vec::new();
     walk(root, root, 0, &mut out)?;
@@ -475,7 +476,7 @@ fn walk(
                     is_dir: true,
                     format_hint: Some("rxnorm".into()),
                 });
-            } else if depth < 1 {
+            } else if depth < 2 {
                 walk(root, &path, depth + 1, out)?;
             }
         } else if meta.is_file() {

@@ -114,7 +114,7 @@ Request and response bodies are JSON; errors are
 | `POST /uploads/{id}/complete` | Verify, hash, detect → session with `sha256` and `detection`. |
 | `GET /uploads/{id}/detect?format=` | Detection and disk check (optionally for an overridden format). |
 | `DELETE /uploads/{id}` | Remove the staged file. |
-| `GET /import-dir` | Files under `HTS_IMPORT_DIR` (two levels, plus RxNorm RRF directories). |
+| `GET /import-dir` | Files under `HTS_IMPORT_DIR` (three levels deep, plus RxNorm RRF directories). |
 | `GET /import-dir/detect?path=&format=` | Detection and disk check for one file. |
 | `POST /imports` `{source, format?, version?, languages?, properties?, batch_size?}` | Queue an import → `202` + job. `source` is `{"type":"upload","upload_id":…}`, `{"type":"import-dir","path":…}` or `{"type":"registry","package":…,"version"?:…}`. |
 | `GET /registry/search?q=&fhirVersion=R4` | Search the package registry catalog. |

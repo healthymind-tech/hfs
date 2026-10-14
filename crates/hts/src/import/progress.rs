@@ -176,10 +176,15 @@ impl ProgressBackend {
     fn record(&self, parsed: &ParsedBundle) {
         let concepts: usize = parsed.code_systems.iter().map(|c| c.concepts.len()).sum();
         self.progress.writing.store(true, Ordering::SeqCst);
-        self.progress.batches_done.fetch_add(1, Ordering::Relaxed);
-        self.progress
-            .concepts
-            .fetch_add(concepts as u64, Ordering::Relaxed);
+        // Only concept batches count toward "batch x / y": importers report
+        // `y` as their concept-batch total, and the seed write (an empty
+        // CodeSystem) or trailing ConceptMap bundles would overshoot it.
+        if concepts > 0 {
+            self.progress.batches_done.fetch_add(1, Ordering::Relaxed);
+            self.progress
+                .concepts
+                .fetch_add(concepts as u64, Ordering::Relaxed);
+        }
     }
 }
 
