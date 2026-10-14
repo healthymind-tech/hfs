@@ -167,6 +167,11 @@ pub struct AppState<S> {
 
     /// Post-commit write observer and the dashboard counters it feeds.
     write_observability: WriteObservability,
+
+    /// Search-time terminology service (`:in` / `:not-in` / token `:above` /
+    /// `:below` expansion through `HFS_TERMINOLOGY_SERVER`, with its cache).
+    /// `None` when no terminology server is configured.
+    search_terminology: Option<Arc<crate::terminology::SearchTerminology>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -198,6 +203,7 @@ impl<S> Clone for AppState<S> {
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
             validation: Arc::clone(&self.validation),
             write_observability: self.write_observability.clone(),
+            search_terminology: self.search_terminology.clone(),
         }
     }
 }
@@ -220,6 +226,7 @@ impl<S: ResourceStorage> AppState<S> {
             config.terminology_server.as_deref(),
             config.default_fhir_version,
         ));
+        let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -246,6 +253,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_config,
             validation,
             write_observability: WriteObservability::new(),
+            search_terminology,
         }
     }
 
@@ -278,6 +286,7 @@ impl<S: ResourceStorage> AppState<S> {
             config.terminology_server.as_deref(),
             config.default_fhir_version,
         ));
+        let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -304,6 +313,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_config,
             validation,
             write_observability: WriteObservability::new(),
+            search_terminology,
         }
     }
 
@@ -586,6 +596,31 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns a reference to the auth configuration.
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
+    }
+
+    /// Builds the search-time terminology service from the configuration:
+    /// `Some` when a terminology server is configured.
+    fn search_terminology_from(
+        config: &ServerConfig,
+    ) -> Option<Arc<crate::terminology::SearchTerminology>> {
+        config.terminology_server.as_deref().map(|url| {
+            Arc::new(crate::terminology::SearchTerminology::from_config(
+                url,
+                &config.search_terminology,
+            ))
+        })
+    }
+
+    /// The search-time terminology service, when a terminology server is
+    /// configured (`HFS_TERMINOLOGY_SERVER`).
+    pub fn search_terminology(&self) -> Option<&crate::terminology::SearchTerminology> {
+        self.search_terminology.as_deref()
+    }
+
+    /// What a search does when a terminology expansion behind one of its
+    /// modifiers fails (`HFS_SEARCH_TERMINOLOGY_FAIL`).
+    pub fn expansion_failure_policy(&self) -> crate::terminology::ExpansionFailurePolicy {
+        crate::terminology::ExpansionFailurePolicy::parse(&self.config.search_terminology.fail)
     }
 
     /// Returns the configured terminology server URL, if any.

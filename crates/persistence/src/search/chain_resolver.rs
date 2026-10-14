@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use crate::core::SearchProvider;
-use crate::error::{SearchError, StorageError, StorageResult};
+use crate::error::{SearchError, StorageError, StorageResult, TerminologyFailureKind};
 use crate::tenant::TenantContext;
 use crate::types::{
     ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
@@ -32,6 +32,10 @@ pub enum TerminologyExpansion {
     /// search for instead — a comma-separated OR list of `system|code` tokens,
     /// as a client would write it — with the modifier removed.
     Tokens(String),
+    /// The modifier was `:not-in` and resolved into a negated token search:
+    /// the same OR list, to be searched with `:not` — "no value of the
+    /// parameter is in the set" (#473 semantics, at the resource level).
+    NegatedTokens(String),
     /// Nothing to expand (a hierarchy modifier whose value is not a
     /// `system|code`): the terminal search runs with the value and the
     /// modifier as written.
@@ -39,6 +43,15 @@ pub enum TerminologyExpansion {
     /// The expansion failed and the caller's policy is to go on without the
     /// filter: the whole chained / `_has` parameter is dropped from the search.
     Dropped,
+    /// The expansion failed and the caller's policy is to fail the search:
+    /// the resolver raises [`SearchError::TerminologyFailure`] naming the
+    /// chained / `_has` parameter as the client wrote it.
+    Failed {
+        /// What went wrong, for the HTTP status.
+        kind: TerminologyFailureKind,
+        /// Human-readable detail, safe to return to the client.
+        message: String,
+    },
 }
 
 /// Expands a terminology-backed modifier (`:in`, token `:above` / `:below`) on
@@ -53,7 +66,8 @@ pub enum TerminologyExpansion {
 #[async_trait::async_trait]
 pub trait TerminologyExpander: Send + Sync {
     /// Expands `value` — the parameter's raw value as the client wrote it,
-    /// commas included — for `modifier`, which is `:in`, `:above` or `:below`.
+    /// commas included — for `modifier`, which is `:in`, `:not-in`, `:above`
+    /// or `:below`.
     async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion;
 }
 
@@ -550,9 +564,10 @@ where
             &terminal_types[0],
             terminal_param,
             &raw,
+            &forward_chain_display(param),
             &mut terminal,
         )
-        .await;
+        .await?;
         if !expanded {
             return Ok(None);
         }
@@ -720,9 +735,10 @@ where
                 &reverse_chain.source_type,
                 search_param,
                 raw_value,
+                &format!("{level}{search_param}"),
                 &mut terminal,
             )
-            .await;
+            .await?;
             if !expanded {
                 return Ok(None);
             }
@@ -864,8 +880,8 @@ fn parse_terminal_values(
 ///   is a terminology server to ask (#1339);
 /// * one that is valid but needs a terminology server the caller does not have
 ///   ([`param_requires_terminology`]), which the REST layer maps to a `501`.
-///   `:not-in` is always that: negated value-set membership cannot be turned
-///   into a token list, so a terminology server does not help.
+///   `:not-in` is expanded like `:in` and searched negated (`:not`), so with a
+///   terminology server it is answerable too.
 ///
 /// Returns the caller's terminology expander when the modifier is valid, needs
 /// one and there is one: the terminal's value is then to be expanded with
@@ -893,8 +909,8 @@ fn check_terminal_modifier<'a>(
         return Ok(None);
     }
     match options.terminology {
-        Some(expander) if *m != SearchModifier::NotIn => Ok(Some(expander)),
-        _ => Err(StorageError::Search(SearchError::TerminologyRequired {
+        Some(expander) => Ok(Some(expander)),
+        None => Err(StorageError::Search(SearchError::TerminologyRequired {
             modifier: m.to_string(),
             param: display(),
         })),
@@ -910,9 +926,13 @@ struct TerminalSearch {
 }
 
 /// Expands the terminology-backed modifier of `terminal` through `expander`,
-/// turning it into the plain token search a direct `code:in` becomes: the
-/// expansion is parsed like any terminal value. `raw` is the value as the
-/// client wrote it. Returns false when the expander dropped the parameter.
+/// turning it into the plain token search a direct `code:in` becomes (or the
+/// `:not` token search a direct `code:not-in` becomes): the expansion is
+/// parsed like any terminal value. `raw` is the value as the client wrote it;
+/// `display` is the whole chained / `_has` key, for the error. Returns
+/// `Ok(false)` when the expander dropped the parameter, and the expander's
+/// failure as [`SearchError::TerminologyFailure`].
+#[allow(clippy::too_many_arguments)]
 async fn expand_terminal<S>(
     storage: &S,
     tenant: &TenantContext,
@@ -920,36 +940,45 @@ async fn expand_terminal<S>(
     resource_type: &str,
     param_name: &str,
     raw: &str,
+    display: &str,
     terminal: &mut TerminalSearch,
-) -> bool
+) -> StorageResult<bool>
 where
     S: SearchProvider + ?Sized,
 {
     let Some(modifier) = terminal.modifier.clone() else {
-        return true;
+        return Ok(true);
     };
-    match expander.expand(&modifier, raw).await {
-        TerminologyExpansion::Tokens(tokens) => {
-            let reg = storage.search_param_registry(tenant);
-            let registry = reg.read();
-            let (param_type, values) = parse_terminal_values(
-                &registry,
-                resource_type,
-                param_name,
-                &[SearchValue::eq(tokens)],
-                None,
-                true,
-            );
-            *terminal = TerminalSearch {
-                param_type,
-                modifier: None,
-                values,
-            };
-            true
+    let (tokens, negated) = match expander.expand(&modifier, raw).await {
+        TerminologyExpansion::Tokens(tokens) => (tokens, false),
+        TerminologyExpansion::NegatedTokens(tokens) => (tokens, true),
+        TerminologyExpansion::Unchanged => return Ok(true),
+        TerminologyExpansion::Dropped => return Ok(false),
+        TerminologyExpansion::Failed { kind, message } => {
+            return Err(StorageError::Search(SearchError::TerminologyFailure {
+                modifier: modifier.to_string(),
+                param: display.to_string(),
+                kind,
+                message,
+            }));
         }
-        TerminologyExpansion::Unchanged => true,
-        TerminologyExpansion::Dropped => false,
-    }
+    };
+    let reg = storage.search_param_registry(tenant);
+    let registry = reg.read();
+    let (param_type, values) = parse_terminal_values(
+        &registry,
+        resource_type,
+        param_name,
+        &[SearchValue::eq(tokens)],
+        None,
+        true,
+    );
+    *terminal = TerminalSearch {
+        param_type,
+        modifier: negated.then_some(SearchModifier::Not),
+        values,
+    };
+    Ok(true)
 }
 
 /// A forward chain as the client wrote it, less the terminal modifier:
@@ -2234,44 +2263,71 @@ mod tests {
         assert!(run_with(&b, &t, &q, &expander).await.unwrap().is_empty());
         assert_eq!(expander.calls(), vec![]);
 
-        // `:not-in` cannot be expanded: unanswerable with a server too, but
-        // only once it is known to be valid for the terminal's type.
-        for (q, valid) in [
-            (
-                has(
-                    "Patient",
-                    "Procedure",
-                    "subject",
-                    "status:not-in",
-                    "http://vs",
-                ),
-                true,
-            ),
-            (
-                has(
-                    "Patient",
-                    "Procedure",
-                    "subject",
-                    "date:not-in",
-                    "http://vs",
-                ),
-                false,
-            ),
-        ] {
-            match (run_with(&b, &t, &q, &expander).await, valid) {
-                (
-                    Err(StorageError::Search(SearchError::TerminologyRequired {
-                        modifier, ..
-                    })),
-                    true,
-                ) => {
-                    assert_eq!(modifier, "not-in")
-                }
-                (Err(StorageError::Search(SearchError::QueryParseError { .. })), false) => {}
-                (other, _) => panic!("unexpected {other:?}"),
+        // `:not-in` is expanded like `:in` and searched negated: the patients
+        // with a Procedure whose status is *not* in the set — only once the
+        // modifier is known to be valid for the terminal's type.
+        b.create(
+            &t,
+            "Procedure",
+            json!({ "resourceType": "Procedure", "id": "prx", "status": "in-progress",
+                    "subject": { "reference": "Patient/pf" } }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        let expander = FakeExpander::new(TerminologyExpansion::NegatedTokens("completed".into()));
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:not-in",
+            "http://vs",
+        );
+        assert_eq!(run_with(&b, &t, &q, &expander).await.unwrap(), ["pf"]);
+        assert_eq!(
+            expander.calls(),
+            [("not-in".to_string(), "http://vs".to_string())]
+        );
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "date:not-in",
+            "http://vs",
+        );
+        assert!(matches!(
+            run_with(&b, &t, &q, &expander).await,
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+        assert_eq!(expander.calls().len(), 1);
+
+        // Failed (the caller fails closed): the error names the whole key and
+        // carries the expander's diagnosis.
+        let expander = FakeExpander::new(TerminologyExpansion::Failed {
+            kind: TerminologyFailureKind::Unavailable,
+            message: "connection refused".into(),
+        });
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "status:not-in",
+            "http://vs",
+        );
+        match run_with(&b, &t, &q, &expander).await {
+            Err(StorageError::Search(SearchError::TerminologyFailure {
+                modifier,
+                param,
+                kind,
+                message,
+            })) => {
+                assert_eq!(modifier, "not-in");
+                assert_eq!(param, "_has:Procedure:subject:status");
+                assert_eq!(kind, TerminologyFailureKind::Unavailable);
+                assert_eq!(message, "connection refused");
             }
+            other => panic!("unexpected {other:?}"),
         }
-        assert_eq!(expander.calls(), vec![]);
     }
 
     /// #1339: an error on the terminal parameter of a nested `_has` names the

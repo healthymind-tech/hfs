@@ -942,14 +942,18 @@ impl SqliteBackend {
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
-            // `not-in` is intentionally omitted: the SQLite backend returns 501
-            // for it (negated value-set filtering is unimplemented), so it must
-            // not be advertised. `text-advanced` is implemented by the token
-            // handler and was previously under-advertised.
+            // The terminology-backed modifiers (`in`, `not-in`, and `below` /
+            // `above` on a token) are expanded by the REST layer into the
+            // plain (or `:not`) token OR-lists this backend answers natively.
+            // `text-advanced` is implemented by the token handler and was
+            // previously under-advertised.
             SearchParamType::Token => vec![
                 "not",
                 "text",
                 "in",
+                "not-in",
+                "below",
+                "above",
                 "of-type",
                 "code-text",
                 "text-advanced",
@@ -1126,8 +1130,12 @@ mod tests {
         // `:code` is a non-spec modifier and must not be advertised.
         assert!(!token_mods.contains(&"code"));
         assert!(token_mods.contains(&"text-advanced"));
-        // `not-in` returns 501, so it must not be advertised as supported.
-        assert!(!token_mods.contains(&"not-in"));
+        // The terminology-backed modifiers are resolved by the REST layer into
+        // plain / `:not` token searches, which this backend answers.
+        assert!(token_mods.contains(&"in"));
+        assert!(token_mods.contains(&"not-in"));
+        assert!(token_mods.contains(&"below"));
+        assert!(token_mods.contains(&"above"));
 
         // Reference modifiers
         let ref_mods = SqliteBackend::modifiers_for_type(SearchParamType::Reference);

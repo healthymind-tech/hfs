@@ -232,6 +232,51 @@ The server is configured via environment variables:
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+| `HFS_TERMINOLOGY_SERVER` | - | Terminology server for the `:in` / `:not-in` / token `:above` / `:below` search modifiers (see below) |
+| `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet / hierarchy expansion fails: `closed` (the search fails with an OperationOutcome), `empty` (the parameter matches nothing), `open` (the parameter is dropped; returns a superset) |
+| `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) for search modifiers; keep it below the terminology server's expansion limit (`HTS_MAX_EXPANSION_SIZE`) |
+| `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into; larger ones fail as `422 too-costly` |
+| `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long a successful expansion is reused by identical searches; `0` disables the cache |
+
+### Terminology-backed search modifiers
+
+With `HFS_TERMINOLOGY_SERVER` set, the token modifiers that need a
+terminology server are answered by expanding through its `ValueSet/$expand`
+and searching the codes:
+
+| Search | Expansion | Runs as |
+|--------|-----------|---------|
+| `code:in=<ValueSet url>` or `<url>\|<version>` | `url` (+ `valueSetVersion`) | `code=sys\|a,sys\|b,…` |
+| `code:not-in=<ValueSet url>` | the same | `code:not=sys\|a,sys\|b,…` — resources with **no** code in the set; an empty ValueSet excludes nothing |
+| `code:below=<system>\|<code>` | inline ValueSet, `is-a` filter | the code and its descendants |
+| `code:above=<system>\|<code>` | inline ValueSet, `generalizes` filter | the code and its ancestors |
+
+Every expansion is requested **flat** (`excludeNested=true`) and **paged**
+(`count` = `HFS_SEARCH_EXPANSION_PAGE_SIZE`, `offset` until `total`), so a
+ValueSet defined by an `is-a` filter yields the whole subtree rather than a
+tree whose top level is the root concept alone, and a large ValueSet stays
+below the terminology server's own expansion limit. Nested `contains` are
+flattened anyway. A comma-separated value (`code:in=vs1,vs2`) is the union of
+its alternatives. Successful expansions are cached for
+`HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`. The same applies to the terminal
+parameter of a chained or `_has` search (`subject:Patient.gender:in=…`,
+`_has:Observation:subject:code:not-in=…`).
+
+A search whose expansion **fails** does not quietly return a superset. With
+the default `HFS_SEARCH_TERMINOLOGY_FAIL=closed` it fails with an
+`OperationOutcome` naming the parameter and the cause:
+
+| Cause | Status |
+|-------|--------|
+| ValueSet / code system / code unknown to the terminology server (its `404`, or a `400`) | `400 invalid` |
+| Expansion over `HFS_SEARCH_EXPANSION_MAX_CODES`, or the terminology server's `422 too-costly` | `422` |
+| Terminology server unreachable, timed out, `5xx` or unparseable | `503 transient` |
+
+`empty` makes the parameter match nothing instead; `open` restores the
+pre-fork behaviour (the parameter is dropped with a warning in the log).
+Without `HFS_TERMINOLOGY_SERVER` these modifiers are `501`. An empty
+expansion matches nothing (`:in`, `:below`, `:above`) or excludes nothing
+(`:not-in`).
 
 ### Batch entry concurrency
 

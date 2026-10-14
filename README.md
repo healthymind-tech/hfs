@@ -290,7 +290,11 @@ compressed when the client sends `Accept-Encoding`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_TERMINOLOGY_SERVER` | *(none)* | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions (`memberOf`, `subsumes`) |
+| `HFS_TERMINOLOGY_SERVER` | *(none)* | HTS base URL for the `:in`/`:not-in`/token `:above`/`:below` search modifiers and FHIRPath terminology functions (`memberOf`, `subsumes`) |
+| `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: `closed` (OperationOutcome error), `empty` (match nothing) or `open` (drop the parameter, pre-fork behaviour) |
+| `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used by search modifiers |
+| `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else `422 too-costly`) |
+| `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; `0` disables |
 | `HFS_TERMINOLOGY_PUBLIC_URL` | *(none)* | Browser-reachable URL for the web UI's Terminology link (the server-side URL above is often an internal address); defaults to `/ui/hts` on the UI's own origin when `HFS_TERMINOLOGY_SERVER` names an internal host |
 
 **Elasticsearch**
