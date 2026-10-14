@@ -7,7 +7,8 @@
 //! RESTful URL (`Patient/1`, `Patient?identifier=…`,
 //! `https://x/fhir/Patient/1/_history/2`), a contained `#id`, or
 //! `Reference.type`. `urn:uuid:` and logical (identifier-only) references
-//! name no type here.
+//! name no type here; Bundle-level `urn:uuid:` resolution is checked by
+//! the Bundle pass in `engine/mod.rs`.
 //!
 //! A `refers` entry that does not resolve to a known type (an uninstalled
 //! profile) makes that layer unjudgeable rather than restrictive, so

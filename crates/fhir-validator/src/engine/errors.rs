@@ -70,6 +70,9 @@ pub enum ErrorKind {
     /// A `Reference` that is malformed, contradicts its own `type`, or names
     /// a target type the element does not allow.
     ReferenceInvalid,
+    /// A `urn:uuid:`/`urn:oid:` reference inside a Bundle that no entry's
+    /// `fullUrl` matches.
+    ReferenceUnresolved,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -332,6 +335,12 @@ pub(crate) fn msg_reference_target_type(found: &str, allowed: &[String]) -> Stri
         "Invalid Resource target type. Found {found}, but expected one of ({})",
         allowed.join(", ")
     )
+}
+
+/// [helios] a Bundle-internal URN reference no entry provides (HL7
+/// validator wording).
+pub(crate) fn msg_reference_urn_unresolved(reference: &str) -> String {
+    format!("URN reference is not locally contained within the bundle {reference}")
 }
 
 /// The reference validator's JSON type vocabulary (`getType`).

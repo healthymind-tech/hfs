@@ -1177,7 +1177,12 @@ mod tests {
             .validate_sync(resource, &opts)
             .errors
             .into_iter()
-            .filter(|e| e.kind == ErrorKind::ReferenceInvalid)
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    ErrorKind::ReferenceInvalid | ErrorKind::ReferenceUnresolved
+                )
+            })
             .collect()
     }
 
@@ -1242,6 +1247,36 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         contained["contained"] = json!([{"resourceType": "Patient", "id": "m"}]);
         assert!(reference_errors(&contained, &[]).is_empty());
+    }
+
+    #[test]
+    fn bundle_urn_references_must_resolve() {
+        let bundle = |kind: &str, target: &str| {
+            json!({
+                "resourceType": "Bundle", "type": kind,
+                "entry": [
+                    {"fullUrl": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                     "resource": {"resourceType": "Patient"},
+                     "request": {"method": "POST", "url": "Patient"}},
+                    {"fullUrl": "urn:uuid:22222222-2222-2222-2222-222222222222",
+                     "resource": observation(json!({"reference": target})),
+                     "request": {"method": "POST", "url": "Observation"}}
+                ]
+            })
+        };
+        let resolved = "urn:uuid:11111111-1111-1111-1111-111111111111";
+        let dangling = "urn:uuid:99999999-9999-9999-9999-999999999999";
+        assert!(reference_errors(&bundle("transaction", resolved), &[]).is_empty());
+
+        let errors = reference_errors(&bundle("transaction", dangling), &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].kind, ErrorKind::ReferenceUnresolved);
+        assert_eq!(errors[0].severity, Severity::Error);
+        assert_eq!(errors[0].path, "Bundle.entry.1.resource.subject");
+
+        let errors = reference_errors(&bundle("collection", dangling), &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].severity, Severity::Warning);
     }
 
     /// A profile that constrains a primitive's extensions gives the
