@@ -102,7 +102,7 @@
             </td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
             <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>
-            <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
+            <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-current") }}">
@@ -116,9 +116,9 @@
                 <input type="hidden" name="version" value="{{ r.version_param }}">
                 <input type="hidden" name="back" value="{{ back }}">
                 {% if r.pinned %}
-                <button class="btn" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
-                {% else if r.version_count > 1 %}
-                <button class="btn" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
+                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
+                {% else if r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
+                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
                 {% endif %}
               </form>
               {% endif %}
@@ -129,6 +129,9 @@
         </tbody>
       </table>
     </div>
+    {% if let Some((label, href)) = more %}
+    <div class="table-foot"><span>{{ label }}</span> <a class="btn" href="{{ href }}" data-show-all>{{ chrome.i18n.t("hts-term-show-all-rows") }}</a></div>
+    {% endif %}
   </section>
 </div>
 

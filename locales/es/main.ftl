@@ -2306,3 +2306,5 @@ hts-dir-empty = El directorio está vacío.
 hts-dir-file = Archivo
 hts-dir-modified = Modificado
 hts-dir-detect-on-import = se detecta al importar
+hts-term-showing = Se muestran { $shown } de { $total } sistemas de códigos
+hts-term-show-all-rows = Mostrar todos

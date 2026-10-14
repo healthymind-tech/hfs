@@ -294,6 +294,8 @@ pub(crate) struct InvRow {
 #[derive(Debug, Deserialize, Default)]
 struct InvQuery {
     q: Option<String>,
+    /// Number of code systems to show (default 50).
+    limit: Option<usize>,
     sort: Option<String>,
     all: Option<String>,
     notice: Option<String>,
@@ -321,6 +323,8 @@ struct InventoryPage<'a> {
     error: Option<String>,
     refresh_url: String,
     back: String,
+    /// "Showing x of y" when the list was truncated, with the link to all.
+    more: Option<(String, String)>,
 }
 
 async fn inventory_page(
@@ -337,7 +341,8 @@ async fn inventory_page(
     let query = q.q.clone().unwrap_or_default();
     let sort_size = q.sort.as_deref() == Some("size");
     let show_all = q.all.is_some();
-    let mut path = format!("/terminology?limit=300&q={}", enc(&query));
+    let limit = q.limit.unwrap_or(50).clamp(1, 5000);
+    let mut path = format!("/terminology?limit={limit}&q={}", enc(&query));
     if sort_size {
         path.push_str("&sort=size");
     }
@@ -372,6 +377,7 @@ async fn inventory_page(
         notice: q.notice,
         error: q.error,
         refresh_url: back.clone(),
+        more: None,
         back,
     };
     match result {
@@ -387,6 +393,19 @@ async fn inventory_page(
             page.concepts = inv.total_concepts.map(|n| i18n.num(n));
             page.value_sets = i18n.num(inv.value_sets);
             page.concept_maps = i18n.num(inv.concept_maps);
+            let shown = inv.systems.len() as u64;
+            if shown < inv.code_system_count {
+                page.more = Some((
+                    i18n.t_arg2(
+                        "hts-term-showing",
+                        "shown",
+                        i18n.num(shown),
+                        "total",
+                        i18n.num(inv.code_system_count),
+                    ),
+                    format!("{}&limit=5000", page.back),
+                ));
+            }
             page.rows = flatten(&i18n, inv.systems);
         }
     }

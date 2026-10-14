@@ -2421,3 +2421,5 @@ hts-dir-empty = 目錄是空的。
 hts-dir-file = 檔案
 hts-dir-modified = 修改時間
 hts-dir-detect-on-import = 匯入時偵測
+hts-term-showing = 顯示 { $shown } / { $total } 個代碼系統
+hts-term-show-all-rows = 顯示全部

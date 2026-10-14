@@ -2424,3 +2424,5 @@ hts-dir-empty = The directory is empty.
 hts-dir-file = File
 hts-dir-modified = Modified
 hts-dir-detect-on-import = detected on import
+hts-term-showing = Showing { $shown } of { $total } code systems
+hts-term-show-all-rows = Show all
