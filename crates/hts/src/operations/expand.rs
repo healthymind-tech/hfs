@@ -1464,7 +1464,7 @@ fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Byte
 /// nonetheless map to the same canonical URL+params bucket (e.g. when the
 /// caller adds `valueSet` / `tx-resource` inline payloads that force this
 /// outer cache to skip but otherwise produce the same expansion).
-async fn process_expand<B: TerminologyBackend>(
+pub(crate) async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
@@ -1481,6 +1481,11 @@ async fn process_expand<B: TerminologyBackend>(
     // Either path is short-circuited on a hit.  Falling through both means
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
+    //
+    // Canonical `url|version` is folded into `url` + `valueSetVersion` first so
+    // the cache key, the negative cache and every resolver below see one shape.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
@@ -1761,9 +1766,18 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // URLs that previously returned NotFound are remembered here so we can skip
     // all backend queries on repeated requests (saves 5+ SQLite round-trips per
     // hit).
-    if let Some(ref url_str) = url {
+    // Keyed on `url` or `url|valueSetVersion`: a miss for one pinned version
+    // must not shadow a different version (or the unpinned latest) of the same
+    // canonical URL.
+    let neg_cache_key: Option<String> =
+        url.as_ref()
+            .map(|u| match find_str_param(&params, "valueSetVersion") {
+                Some(v) => format!("{u}|{v}"),
+                None => u.clone(),
+            });
+    if let (Some(url_str), Some(key)) = (&url, &neg_cache_key) {
         if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(url_str.as_str()) {
+            if neg.contains(key.as_str()) {
                 return Err(HtsError::NotFound(url_str.clone()));
             }
         }
@@ -1975,7 +1989,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 if msg_names_top {
                     if let Ok(mut neg) = state.not_found_urls.write() {
                         if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(url_str.clone());
+                            neg.insert(neg_cache_key.clone().unwrap_or_else(|| url_str.clone()));
                         }
                     }
                 }

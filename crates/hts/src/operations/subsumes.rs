@@ -28,8 +28,8 @@ use crate::types::{SubsumesRequest, SubsumptionOutcome};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_coding, extract_parameter_array, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    extract_coding, extract_parameter_array, find_str_param, normalize_canonical_params,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Core subsumption logic shared by the POST and GET handlers.
@@ -55,10 +55,13 @@ use super::params::{
 /// | Cross-system codings | [`HtsError::InvalidRequest`] |
 /// | Neither form detected | [`HtsError::InvalidRequest`] |
 /// | Unknown code system | [`HtsError::NotFound`] |
-async fn process_subsumes<B: TerminologyBackend>(
+pub(crate) async fn process_subsumes<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` → `system=X` + `version=V` (see `normalize_canonical_params`).
+    let mut params = params;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
     // ── Resolve (system, codeA, codeB) from one of two input forms ───────────
     //
     // Form 1: bare `codeA` + `codeB` + shared `system` parameter.

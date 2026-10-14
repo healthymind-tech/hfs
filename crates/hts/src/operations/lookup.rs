@@ -41,8 +41,8 @@ use crate::types::{DesignationValue, LookupRequest, PropertyValue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
-    property_value_part, query_params_to_fhir_params,
+    collect_str_params, extract_parameter_array, find_str_param, normalize_canonical_params,
+    parse_query_string, property_value_part, query_params_to_fhir_params,
 };
 
 /// Build a canonical cache key for a `$lookup` request from its normalised
@@ -137,10 +137,14 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// A `serde_json::Value` representing a FHIR `Parameters` resource, or an
 /// [`HtsError`] (400 when `system`/`code` are missing, 404 when the code is
 /// not found, 501 when `expression` is supplied).
-async fn process_lookup<B: TerminologyBackend>(
+pub(crate) async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` is folded into `system=X` + `version=V` so the cache key and
+    // the backend lookup agree on which CodeSystem version is meant.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the

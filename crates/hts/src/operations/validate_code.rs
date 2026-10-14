@@ -36,8 +36,8 @@ use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     coding_entries_from_codeable_concept, collect_canonical_params, collect_resource_params,
     extract_codeable_concept, extract_coding_full, extract_parameter_array,
-    find_codeable_concept_param, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    find_codeable_concept_param, find_resource_param, find_str_param, normalize_canonical_params,
+    parse_query_string, query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -2203,6 +2203,12 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     // CodeSystemOperations::validate_code) when the same canonical params have
     // produced a response earlier in this AppState's lifetime.  Cleared on
     // every bundle import / CRUD write via `clear_expand_cache`.
+    //
+    // `url=X|V` / `system=X|V` are folded into the bare URL + `version` first
+    // (see `normalize_canonical_params`) so every path below sees one shape.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("version"))?;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
@@ -4102,6 +4108,12 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     //   * `resolve_supplements` / `supplement_url_in_coding_error`
     // A warm hit here returns the previously-built JSON response directly,
     // skipping all of those.  Cleared on every bundle import / CRUD write.
+    //
+    // `url=X|V` → `url=X` + `valueSetVersion=V`, `system=X|V` → `system=X` +
+    // `systemVersion=V` (see `normalize_canonical_params`).
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    normalize_canonical_params(&mut params, "system", Some("systemVersion"))?;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
