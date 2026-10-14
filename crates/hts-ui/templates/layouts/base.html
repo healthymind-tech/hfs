@@ -56,6 +56,14 @@
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-import") }}</span>
       </a>
+      <a class="nav-item" href="/ui/hts/terminology"{% if chrome.active_page == "terminology" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-terminology") }}">
+        <span class="icon">{% include "icons/sliders.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-terminology") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/hts/jobs"{% if chrome.active_page == "jobs" %} aria-current="page"{% endif %} title="{{ chrome.i18n.t("hts-nav-jobs") }}">
+        <span class="icon">{% include "icons/sync.svg" %}</span>
+        <span class="nav-item__label">{{ chrome.i18n.t("hts-nav-jobs") }}</span>
+      </a>
 
       <div class="nav__section">{{ chrome.i18n.t("hts-nav-section-server") }}</div>
       {#-

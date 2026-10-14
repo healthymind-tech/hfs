@@ -62,6 +62,12 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
 struct ImportPageTemplate<'a> {
     chrome: Chrome<'a>,
     status: Option<StatusView>,
+    /// Archive sources (upload / server directory / registry) from the admin
+    /// API; `None` with `admin_off` set when the admin API is off or down.
+    admin: Option<crate::admin::ImportAdmin>,
+    admin_off: Option<crate::admin::Unavailable>,
+    /// `?error=` flash from a failed `POST /hts/import/job`.
+    flash_error: Option<String>,
     /// True when the upstream `/health` probe failed on the initial GET —
     /// the shell then renders the shared `hts-degraded.html` banner and
     /// disables the submit button (design doc §7 preamble degraded state).
@@ -227,10 +233,30 @@ impl StatusView {
 
 // ── GET /hts/import ─────────────────────────────────────────────────────
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct ImportQuery {
+    error: Option<String>,
+}
+
+/// Admin data for the archive sources, split into the two template slots.
+async fn load_admin(
+    state: &HtsUiState,
+    i18n: &I18n,
+) -> (
+    Option<crate::admin::ImportAdmin>,
+    Option<crate::admin::Unavailable>,
+) {
+    match crate::admin::import_admin(state, i18n).await {
+        Ok(a) => (Some(a), None),
+        Err(u) => (None, Some(u)),
+    }
+}
+
 async fn import_page(
     State(state): State<Arc<HtsUiState>>,
     HxRequest(is_htmx): HxRequest,
     locale: RequestLocale,
+    axum::extract::Query(query): axum::extract::Query<ImportQuery>,
 ) -> Response {
     let chrome = Chrome {
         i18n: I18n::new(locale),
@@ -253,10 +279,14 @@ async fn import_page(
             .render(),
         );
     }
+    let (admin, admin_off) = load_admin(&state, &chrome.i18n).await;
     render(
         ImportPageTemplate {
             chrome,
             status: None,
+            admin,
+            admin_off,
+            flash_error: query.error,
             degraded_reason,
             target_url,
         }
@@ -308,7 +338,7 @@ async fn import_run(
         let view = StatusView::from_outcome(OutcomeView::invalid_input(
             chrome.i18n.t("hts-import-empty-bundle-error"),
         ));
-        return respond(&chrome, view, is_htmx, target_url);
+        return respond(&state, &chrome, view, is_htmx, target_url).await;
     }
 
     // Pre-flight gate #2 — invalid JSON. Same shape as gate #1 but a
@@ -318,7 +348,7 @@ async fn import_run(
         let view = StatusView::from_outcome(OutcomeView::invalid_input(
             chrome.i18n.t("hts-import-invalid-json-error"),
         ));
-        return respond(&chrome, view, is_htmx, target_url);
+        return respond(&state, &chrome, view, is_htmx, target_url).await;
     }
 
     match state.upstream.import_bundle(bundle_trim).await {
@@ -326,17 +356,18 @@ async fn import_run(
             let mut view = StatusView::from_result(result);
             // Highlight raw JSON payload for the "Raw response" disclosure (#897).
             view.highlight(&chrome.i18n);
-            respond(&chrome, view, is_htmx, target_url)
+            respond(&state, &chrome, view, is_htmx, target_url).await
         }
         Err(err) => {
             let mut view = StatusView::from_error(target_url.clone(), &err);
             view.highlight(&chrome.i18n);
-            respond(&chrome, view, is_htmx, target_url)
+            respond(&state, &chrome, view, is_htmx, target_url).await
         }
     }
 }
 
-fn respond<'a>(
+async fn respond<'a>(
+    state: &HtsUiState,
     chrome: &Chrome<'a>,
     view: StatusView,
     is_htmx: bool,
@@ -351,10 +382,14 @@ fn respond<'a>(
             .render(),
         );
     }
+    let (admin, admin_off) = load_admin(state, &chrome.i18n).await;
     render(
         ImportPageTemplate {
             chrome: *chrome,
             status: Some(view),
+            admin,
+            admin_off,
+            flash_error: None,
             // Post-submit the shell does not re-probe /health; if we
             // just reached HTS to import we would have surfaced the
             // failure via `from_error` and its `degraded_reason`

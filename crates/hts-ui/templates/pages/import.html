@@ -32,6 +32,29 @@
 {% block content %}
 <section class="page-head">
   <h1 id="hts-import-heading" class="page-head__title">{{ chrome.i18n.t("hts-import-heading") }}</h1>
+  <p class="page-head__lede">{{ chrome.i18n.t("hts-import-help-admin") }}</p>
+</section>
+
+{% if let Some(e) = flash_error %}
+<p class="alert" role="alert" data-flash="error">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>
+{% endif %}
+
+{#-
+  Archive sources (plan F): chunked upload, server import directory and
+  package registry, all queued as background import jobs through
+  `POST /ui/hts/import/job`. Present only when the admin API is enabled.
+-#}
+{% if let Some(a) = admin %}
+  {% include "partials/hts-import-archive.html" %}
+{% else if let Some(u) = admin_off %}
+<section class="card" aria-labelledby="hts-import-archive-heading">
+  <div class="card-head"><h2 id="hts-import-archive-heading">{{ chrome.i18n.t("hts-import-archive-heading") }}</h2></div>
+  <div class="panel">{% include "partials/hts-admin-unavailable.html" %}</div>
+</section>
+{% endif %}
+
+<section class="page-head" aria-labelledby="hts-import-bundle-section">
+  <h2 id="hts-import-bundle-section" class="page-head__title">{{ chrome.i18n.t("hts-import-bundle-section") }}</h2>
   <p class="page-head__lede">{{ chrome.i18n.t("hts-import-help") }}</p>
 </section>
 
@@ -66,4 +89,5 @@
   safe even if included at end of body.
 -#}
 <script src="/ui/hts/assets/import.js" defer></script>
+<script src="/ui/hts/assets/hts-admin.js" defer></script>
 {% endblock %}

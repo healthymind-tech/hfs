@@ -1,0 +1,22 @@
+{#-
+  Shared "cannot show admin data" states for the terminology management
+  pages. Expects `u: Unavailable` in scope.
+    • disabled  — the server runs with HTS_ADMIN_UI off: say how to enable it;
+    • degraded  — transport failure: the shared degraded banner wording;
+    • error     — the admin API answered with an error message.
+-#}
+{% if u.is_disabled() %}
+<aside class="notice notice--warn" role="status" data-admin-state="disabled">
+  <p><strong>{{ chrome.i18n.t("hts-admin-disabled-title") }}</strong></p>
+  <p>{{ chrome.i18n.t("hts-admin-disabled-body") }}</p>
+  <p><code>HTS_ADMIN_UI=true</code></p>
+</aside>
+{% else if let Some(reason) = u.degraded_reason() %}
+<aside class="notice notice--warn" role="alert" data-admin-state="degraded">
+  <p><strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong></p>
+  <p>{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+  <p>{{ chrome.i18n.t("hts-degraded-body") }}</p>
+</aside>
+{% else if let Some(msg) = u.error_message() %}
+<p class="alert" role="alert" data-admin-state="error">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ msg }}</p>
+{% endif %}

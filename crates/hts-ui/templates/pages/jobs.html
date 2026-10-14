@@ -1,0 +1,22 @@
+{#-
+  Jobs (plan F "工作"): active and past imports, deletes and maintenance.
+  The list fragment polls itself every 2 s while any job is queued or running.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-nav-jobs") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 id="hts-jobs-heading" class="page-head__title">{{ chrome.i18n.t("hts-nav-jobs") }}</h1>
+    <p class="page-head__lede">{{ chrome.i18n.t("hts-jobs-lede") }}</p>
+  </div>
+  <div class="page-head__actions">
+    <a class="btn btn--primary" href="/ui/hts/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
+    <a class="btn" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-nav-terminology") }}</a>
+  </div>
+</section>
+{% if let Some(e) = flash.error %}<p class="alert" role="alert">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>{% endif %}
+{% include "partials/hts-jobs-list.html" %}
+{% endblock %}

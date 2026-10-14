@@ -1,0 +1,32 @@
+{#- Jobs list fragment; polls itself while anything is active. -#}
+<div id="hts-jobs-list"
+     {% if any_active %}hx-get="/ui/hts/jobs?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+     aria-live="polite" data-active="{{ any_active }}">
+  {% if let Some(u) = unavailable %}
+    {% include "partials/hts-admin-unavailable.html" %}
+  {% else if jobs.is_empty() %}
+  <section class="card"><div class="panel"><p class="query-empty">{{ chrome.i18n.t("hts-jobs-empty") }}</p></div></section>
+  {% else %}
+    {% for job in jobs %}
+    <article class="card job-card" id="job-{{ job.id }}" data-status="{{ job.status }}">
+      <div class="job-card__head">
+        <h2 class="job-card__name"><a href="/ui/hts/jobs/{{ job.id|urlencode_strict }}">{{ job.label }}</a></h2>
+        <div class="job-card__actions">
+          <span class="tag {{ job.tag_class }}">{{ chrome.i18n.t(job.status_key.as_str()) }}</span>
+        </div>
+      </div>
+      {% if job.active || job.status == "succeeded" %}
+      <div class="progress {{ job.progress_class }}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.percent }}" aria-label="{{ job.label }}">
+        <div class="progress__bar" style="width: {{ job.percent }}%"></div>
+      </div>
+      {% endif %}
+      <p class="job-card__meta">
+        {% if job.status == "queued" %}{% if let Some(p) = job.queue_position %}{{ chrome.i18n.t_arg("hts-job-queued-position", "n", *p) }} · {% endif %}{% endif %}
+        {% if job.active && !job.phase.is_empty() %}{{ chrome.i18n.t(job.phase_key.as_str()) }}{% if let Some(c) = job.counter %} · {{ c }}{% endif %}{% if let Some(c) = job.concepts %} · {{ chrome.i18n.t_arg("hts-job-concepts", "n", c.to_string()) }}{% endif %} · {{ job.percent }}% · {% endif %}
+        {{ chrome.i18n.t_arg("hts-job-created-by", "who", job.who.to_string()) }} · {{ job.created }}{% if let Some(d) = job.duration %} · {{ d }}{% endif %}
+      </p>
+      {% if let Some(e) = job.error %}<p class="alert">{{ e }}</p>{% endif %}
+    </article>
+    {% endfor %}
+  {% endif %}
+</div>

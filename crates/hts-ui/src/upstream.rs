@@ -4502,6 +4502,44 @@ fn parse_terminology_capabilities_view(body: &Value) -> TerminologyCapabilitiesV
     }
 }
 
+// ── Admin API (terminology management) ─────────────────────────────────
+
+impl UpstreamClient {
+    /// One call to the HTS admin API (`/admin/...`, see
+    /// `docs/hts-terminology-admin.md`). Returns the HTTP status and the JSON
+    /// body (`Null` when the body is empty or not JSON) — the admin pages
+    /// branch on the status themselves (404 = admin switched off, 202 = job
+    /// queued, 507 = not enough disk), so non-2xx is not an error here; only
+    /// transport failures are.
+    ///
+    /// `timeout` overrides the 5 s dashboard default: inventory scans and
+    /// delete-dependents lookups legitimately take longer on a large database.
+    pub(crate) async fn admin_call(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<(u16, Value), UpstreamError> {
+        let url = format!("{}/admin{}", self.base_url, path_and_query);
+        let mut req = self.client.request(method, &url).timeout(timeout);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Ok((status, value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,7 @@
 //! crate owns templates only, not assets, so the two concerns move on their
 //! own schedules.
 
+mod admin;
 mod capability;
 mod chart;
 mod code_systems;
@@ -183,6 +184,7 @@ pub fn router_with_admin(state: Arc<HtsUiState>, admin: Option<Router>) -> Route
         .merge(concept_maps::routes())
         .merge(concepts::routes())
         .merge(import::routes())
+        .merge(admin::routes())
         .merge(capability::routes())
         .merge(raw_json_fragment::concept_fragment_routes())
         .merge(raw_json_fragment::workbench_fragment_routes())
