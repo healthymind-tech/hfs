@@ -9,6 +9,14 @@
   ],
   "knownFailures": [
     {
+      "file": "basic-example.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
       "file": "codesystem-adjudication-reason.json",
       "issues": 1,
       "kinds": [
@@ -122,7 +130,7 @@
     },
     {
       "file": "codesystem-catalogType.json",
-      "issues": 4,
+      "issues": 3,
       "kinds": [
         "required"
       ],
@@ -1305,100 +1313,36 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
-      "file": "observation-example-bloodpressure-cancel.json",
+      "file": "devicemetric-example.json",
       "issues": 1,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: DeviceMetric.parent is Reference(Device), the example points at DeviceDefinition/dc102."
     },
     {
-      "file": "observation-example-bloodpressure-dar.json",
-      "issues": 1,
+      "file": "evidencevariable-example-Wardlaw2014Analysis1.16.3EvidenceSet.json",
+      "issues": 6,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: characteristic.definitionReference is Reference(Group|EvidenceVariable), the example declares type Evidence."
     },
     {
-      "file": "observation-example-bloodpressure.json",
-      "issues": 1,
+      "file": "json-edge-cases.json",
+      "issues": 2,
       "kinds": [
-        "slice-cardinality"
+        "unknown-schema"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
     },
     {
-      "file": "observation-example-bmi.json",
+      "file": "observation-example-clinical-gender.json",
       "issues": 1,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-height.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-length.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-temperature.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-head-circumference.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-heart-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-respiratory-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-satO2.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-vitals-panel.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: Observation.performer does not allow Encounter."
     },
     {
       "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
@@ -1410,7 +1354,7 @@
     },
     {
       "file": "valueset-catalogType.json",
-      "issues": 3,
+      "issues": 2,
       "kinds": [
         "required"
       ],
@@ -1498,11 +1442,11 @@
     },
     {
       "file": "valuesets.json",
-      "issues": 2,
+      "issues": 186,
       "kinds": [
         "required"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
+      "reason": "Genuine defect in the published example, not an engine bug: its entries declare `meta.profile` `shareablecodesystem`/`shareablevalueset` and omit elements that profile requires (`publisher`, `description`; a few also omit base-required `status`). Most of these were silent until nested Bundle entries were held to their own meta.profile claims. The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone."
     }
   ]
 }

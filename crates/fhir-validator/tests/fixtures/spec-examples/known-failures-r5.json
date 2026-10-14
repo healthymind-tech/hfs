@@ -9,6 +9,30 @@
   ],
   "knownFailures": [
     {
+      "file": "basic-example.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
+      "file": "biologicallyderivedproduct-example-allogeneicHCT.json",
+      "issues": 1,
+      "kinds": [
+        "reference-invalid"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: BiologicallyDerivedProduct.request is Reference(ServiceRequest), the example points at a BiologicallyDerivedProduct."
+    },
+    {
+      "file": "biologicallyderivedproduct-example-autologousHCT.json",
+      "issues": 1,
+      "kinds": [
+        "reference-invalid"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: BiologicallyDerivedProduct.request is Reference(ServiceRequest), the example points at a BiologicallyDerivedProduct."
+    },
+    {
       "file": "codesystem-account-aggregate.json",
       "issues": 1,
       "kinds": [
@@ -3145,108 +3169,44 @@
       "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
     },
     {
-      "file": "observation-example-bloodpressure-cancel.json",
+      "file": "documentreference-example-xray.json",
       "issues": 1,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: DocumentReference.context is Reference(Appointment|Encounter|EpisodeOfCare), the example also points at a DocumentReference."
     },
     {
-      "file": "observation-example-bloodpressure-dar.json",
+      "file": "encounter-example.json",
       "issues": 1,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: Encounter.careTeam is Reference(CareTeam), the example points at Encounter/example."
     },
     {
-      "file": "observation-example-bloodpressure.json",
-      "issues": 1,
+      "file": "json-edge-cases.json",
+      "issues": 2,
       "kinds": [
-        "slice-cardinality"
+        "unknown-schema"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
     },
     {
-      "file": "observation-example-bmi.json",
-      "issues": 1,
+      "file": "researchsubject-example-crossover-placebo-to-drug.json",
+      "issues": 2,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+      "reason": "Genuine defect in the published example, not an engine bug: study and subject carry bare ids (no resource type), which are not valid references."
     },
     {
-      "file": "observation-example-body-height.json",
-      "issues": 1,
+      "file": "transport-example.json",
+      "issues": 2,
       "kinds": [
-        "slice-cardinality"
+        "reference-invalid"
       ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-length.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-body-temperature.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-head-circumference.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-heart-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-respiratory-rate.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-satO2.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "observation-example-vitals-panel.json",
-      "issues": 1,
-      "kinds": [
-        "slice-cardinality"
-      ],
-      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
-    },
-    {
-      "file": "questionnaireresponse-example-f201-lifelines.json",
-      "issues": 1,
-      "kinds": [
-        "required"
-      ],
-      "reason": "Genuine defect in the published example, not an engine bug: R5 makes `QuestionnaireResponse.questionnaire` 1..1 and the example omits it."
+      "reason": "Genuine defect in the published example, not an engine bug: requestedLocation/currentLocation are Reference(Location), the example points at Transport/location-*."
     },
     {
       "file": "valueset-FHIR-version.json",
@@ -9415,6 +9375,14 @@
         "unknown-schema"
       ],
       "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
+    },
+    {
+      "file": "valuesets.json",
+      "issues": 1947,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Documented engine limitation: entries claim core profiles whose `extensions` sugar references core extension URLs (cqf-knowledgeRepresentationLevel, valueset-authoritativeSource) that are not in the vendored spec bundles, so they report unknown-schema. Surfaced once nested resources were held to their meta.profile claims."
     }
   ]
 }
