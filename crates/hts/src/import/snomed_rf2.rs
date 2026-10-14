@@ -140,6 +140,8 @@ struct SnomedParseResult {
     role_relationships: RoleProps,
     /// refset_id → Vec<(source_concept_id, target_concept_id)> from association refset files.
     association_refsets: RoleProps,
+    /// Active Simple refset members as `(refset_id, referenced_component_id)`.
+    refset_members: Vec<(String, String)>,
     release_version: Option<String>,
     parse_errors: Vec<String>,
 }
@@ -164,8 +166,14 @@ pub async fn import_snomed_rf2(
     let path_owned = path.to_path_buf();
     let languages = languages.clone();
     let parsed = tokio::task::spawn_blocking(move || -> Result<SnomedParseResult, HtsError> {
-        let (concept_path, desc_paths, rel_path, assoc_refset_paths, lang_refset_paths) =
-            find_rf2_paths(&path_owned, &languages)?;
+        let Rf2Paths {
+            concept: concept_path,
+            descriptions: desc_paths,
+            relationship: rel_path,
+            association_refsets: assoc_refset_paths,
+            language_refsets: lang_refset_paths,
+            simple_refsets: simple_refset_paths,
+        } = find_rf2_paths(&path_owned, &languages)?;
 
         tracing::info!(
             concept_file = %concept_path,
@@ -173,6 +181,7 @@ pub async fn import_snomed_rf2(
             relationship_file = %rel_path,
             assoc_refset_files = assoc_refset_paths.len(),
             lang_refset_files = lang_refset_paths.len(),
+            simple_refset_files = simple_refset_paths.len(),
             "Located RF2 files in archive"
         );
 
@@ -239,6 +248,18 @@ pub async fn import_snomed_rf2(
             merged
         };
 
+        let refset_members = {
+            let mut latest: HashMap<String, RefsetMemberRow> = HashMap::new();
+            for refset_path in &simple_refset_paths {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(refset_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open simple refset file: {e}"))
+                })?;
+                parse_simple_refsets(BufReader::new(entry), &mut latest, &mut parse_errors);
+            }
+            active_members(latest)
+        };
+
         let release_version = extract_release_date(&concept_path);
 
         Ok(SnomedParseResult {
@@ -246,6 +267,7 @@ pub async fn import_snomed_rf2(
             is_a_edges,
             role_relationships,
             association_refsets,
+            refset_members,
             release_version,
             parse_errors,
         })
@@ -258,6 +280,7 @@ pub async fn import_snomed_rf2(
         is_a_edges,
         role_relationships,
         association_refsets,
+        refset_members,
         release_version,
         parse_errors,
     } = parsed;
@@ -277,7 +300,9 @@ pub async fn import_snomed_rf2(
         stats.concepts = concept_count;
         eprintln!(
             "[{FORMAT}] dry-run — would import {concept_count} concepts, {edge_count} Is-a edges, \
-             {role_count} role relationships, {assoc_count} association refset mappings"
+             {role_count} role relationships, {assoc_count} association refset mappings, \
+             {} simple refset members",
+            refset_members.len()
         );
         return Ok(stats);
     }
@@ -408,6 +433,16 @@ pub async fn import_snomed_rf2(
         );
     }
 
+    // Simple reference set membership (ECL `^`, `?fhir_vs=refset/<id>`).
+    // Written even when empty so a re-import that drops a refset clears it.
+    let member_count = refset_members.len();
+    let written = backend
+        .import_refset_members(ctx, SNOMED_URL, Some(&meta_version), refset_members)
+        .await?;
+    if written > 0 || member_count > 0 {
+        eprintln!("[{FORMAT}] imported {written} simple refset members");
+    }
+
     // Import association refsets as ConceptMap resources.
     if !association_refsets.is_empty() {
         eprintln!(
@@ -525,11 +560,18 @@ fn retain_languages(paths: Vec<String>, filter: &LanguageFilter) -> Vec<String> 
         .collect()
 }
 
-#[allow(clippy::type_complexity)]
-fn find_rf2_paths(
-    path: &Path,
-    languages: &LanguageFilter,
-) -> Result<(String, Vec<String>, String, Vec<String>, Vec<String>), HtsError> {
+/// The RF2 files an import reads from a distribution ZIP.
+struct Rf2Paths {
+    concept: String,
+    descriptions: Vec<String>,
+    relationship: String,
+    association_refsets: Vec<String>,
+    language_refsets: Vec<String>,
+    /// `der2_Refset_Simple*` files: Simple reference set membership.
+    simple_refsets: Vec<String>,
+}
+
+fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, HtsError> {
     let mut zip = open_zip(path)?;
 
     let mut concept_paths: Vec<String> = Vec::new();
@@ -537,6 +579,7 @@ fn find_rf2_paths(
     let mut rel_paths: Vec<String> = Vec::new();
     let mut assoc_refset_paths: Vec<String> = Vec::new();
     let mut lang_refset_paths: Vec<String> = Vec::new();
+    let mut simple_refset_paths: Vec<String> = Vec::new();
 
     for i in 0..zip.len() {
         let entry = zip
@@ -553,6 +596,10 @@ fn find_rf2_paths(
                 assoc_refset_paths.push(name);
             } else if lower.contains("language") {
                 lang_refset_paths.push(name);
+            } else if file_name_of(&lower).starts_with("der2_refset_simple") {
+                // `der2_Refset_SimpleSnapshot_…`; not `…SimpleMap…`, whose
+                // file name carries an `sRefset` pattern prefix.
+                simple_refset_paths.push(name);
             }
             continue;
         }
@@ -575,6 +622,8 @@ fn find_rf2_paths(
     lang_refset_paths.sort();
     let mut assoc_refset_paths = prefer_snapshot(assoc_refset_paths);
     assoc_refset_paths.sort();
+    let mut simple_refset_paths = prefer_snapshot(simple_refset_paths);
+    simple_refset_paths.sort();
 
     if desc_paths.is_empty() {
         return Err(HtsError::InvalidRequest(
@@ -583,23 +632,29 @@ fn find_rf2_paths(
         ));
     }
 
-    Ok((
-        pick_single(concept_paths).ok_or_else(|| {
+    Ok(Rf2Paths {
+        concept: pick_single(concept_paths).ok_or_else(|| {
             HtsError::InvalidRequest(
                 "No Concept RF2 file found. Expected a file containing 'Concept_' in its path."
                     .into(),
             )
         })?,
-        desc_paths,
-        pick_single(rel_paths).ok_or_else(|| {
+        descriptions: desc_paths,
+        relationship: pick_single(rel_paths).ok_or_else(|| {
             HtsError::InvalidRequest(
                 "No Relationship RF2 file found. Expected a file containing 'Relationship_' in its path."
                     .into(),
             )
         })?,
-        assoc_refset_paths,
-        lang_refset_paths,
-    ))
+        association_refsets: assoc_refset_paths,
+        language_refsets: lang_refset_paths,
+        simple_refsets: simple_refset_paths,
+    })
+}
+
+/// The last path segment.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 // ── RF2 parsers ───────────────────────────────────────────────────────────────
@@ -981,6 +1036,71 @@ fn parse_association_refsets(reader: impl BufRead, errors: &mut Vec<String>) -> 
     }
 
     result
+}
+
+/// Latest state of one RF2 refset member row (`id` keyed).
+#[derive(Debug)]
+struct RefsetMemberRow {
+    effective_time: String,
+    active: bool,
+    refset_id: String,
+    referenced_component_id: String,
+}
+
+/// Parse a Simple refset file (`der2_Refset_Simple…`), keeping the latest
+/// row per member `id`: a Snapshot has one row per member, a Full file one
+/// per change.
+///
+/// Columns: `id effectiveTime active moduleId refsetId referencedComponentId`.
+fn parse_simple_refsets(
+    reader: impl BufRead,
+    latest: &mut HashMap<String, RefsetMemberRow>,
+    errors: &mut Vec<String>,
+) {
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let Ok(line) = line_result else { continue };
+        if line_num == 0 || line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.trim_end_matches('\r').split('\t').collect();
+        if parts.len() < 6 {
+            errors.push(format!(
+                "Simple refset line {}: expected ≥6 fields, got {} — skipped",
+                line_num + 1,
+                parts.len()
+            ));
+            continue;
+        }
+        let (id, effective_time) = (parts[0].trim(), parts[1].trim());
+        let (refset_id, referenced) = (parts[4].trim(), parts[5].trim());
+        if id.is_empty() || refset_id.is_empty() || referenced.is_empty() {
+            continue;
+        }
+        let row = RefsetMemberRow {
+            effective_time: effective_time.to_string(),
+            active: parts[2].trim() == "1",
+            refset_id: refset_id.to_string(),
+            referenced_component_id: referenced.to_string(),
+        };
+        match latest.get(id) {
+            Some(prev) if prev.effective_time > row.effective_time => {}
+            _ => {
+                latest.insert(id.to_string(), row);
+            }
+        }
+    }
+}
+
+/// The active members, as sorted, de-duplicated `(refset_id, code)` pairs.
+fn active_members(latest: HashMap<String, RefsetMemberRow>) -> Vec<(String, String)> {
+    let mut members: Vec<(String, String)> = latest
+        .into_values()
+        .filter(|r| r.active)
+        .map(|r| (r.refset_id, r.referenced_component_id))
+        .collect();
+    members.sort();
+    members.dedup();
+    members
 }
 
 /// Build a FHIR Bundle containing a ConceptMap for a SNOMED association refset.
@@ -1786,6 +1906,81 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
             .await
             .unwrap();
         assert!(resp.display.is_some());
+    }
+
+    /// Simple refset rows: 123456001 is an active member of R1; 789012001 was
+    /// a member but its latest row (20240101) retires it.
+    const SIMPLE_REFSET_FULL_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\r\n\
+m1\t20230101\t1\t900000000000207008\t723264001\t123456001\r\n\
+m2\t20230101\t1\t900000000000207008\t723264001\t789012001\r\n\
+m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
+
+    fn make_rf2_zip_with_simple_refset(extra: &[(&str, &str)]) -> NamedTempFile {
+        let tmp = make_test_rf2_zip();
+        {
+            let mut zip = zip::ZipWriter::new_append(tmp.reopen().unwrap()).unwrap();
+            let opts = zip::write::FileOptions::default();
+            for (name, body) in extra {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn parse_simple_refsets_keeps_latest_row_per_member() {
+        let mut latest = HashMap::new();
+        let mut errors = Vec::new();
+        parse_simple_refsets(SIMPLE_REFSET_FULL_TSV.as_bytes(), &mut latest, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            active_members(latest),
+            vec![("723264001".to_string(), "123456001".to_string())]
+        );
+    }
+
+    /// The Simple refset file is imported into `refset_members` (the
+    /// SimpleMap file next to it is not), a re-import replaces the rows, and
+    /// ECL `^` reads them.
+    #[tokio::test]
+    async fn import_snomed_rf2_writes_simple_refset_members() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_rf2_zip_with_simple_refset(&[
+            (
+                "Full/Refset/Content/der2_Refset_SimpleFull_INT_20240101.txt",
+                SIMPLE_REFSET_FULL_TSV,
+            ),
+            (
+                "Snapshot/Refset/Map/der2_sRefset_SimpleMapSnapshot_INT_20240101.txt",
+                "id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\tmapTarget\r\n\
+                 x1\t20240101\t1\t900000000000207008\t446608001\t789012001\tC00\r\n",
+            ),
+        ]);
+        for _ in 0..2 {
+            import_snomed_rf2(
+                &backend,
+                &ctx,
+                zip_file.path(),
+                500,
+                false,
+                &LanguageFilter::default(),
+            )
+            .await
+            .expect("import should succeed");
+        }
+        assert_eq!(count_rows(&backend, "refset_members"), 1);
+
+        let conn = backend.pool().get().unwrap();
+        let members = crate::ecl::parse_and_evaluate(&conn, "snomed-ct|20240101", "^ 723264001")
+            .expect("ECL ^ evaluates");
+        assert_eq!(
+            members.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            ["123456001"]
+        );
     }
 
     #[tokio::test]

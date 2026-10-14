@@ -85,9 +85,10 @@ pub fn parse_and_evaluate(
 
 /// Return the subset of `candidates` that are members of the ECL constraint.
 ///
-/// Evaluates `ecl` against `system_id` and intersects the resulting concept
-/// codes with `candidates`, so only the codes that satisfy the constraint are
-/// returned. An empty `candidates` slice short-circuits to an empty set without
+/// Tests the candidates against the expression (see
+/// [`evaluator::filter_codes`]) rather than evaluating it in full, so a text
+/// filter's few hundred hits are checked against `<< 404684003` without
+/// materialising its 120 000 members. An empty `candidates` slice short-circuits to an empty set without
 /// evaluating the expression.
 ///
 /// # Errors
@@ -104,11 +105,7 @@ pub fn filter_candidates(
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
-    let members = parse_and_evaluate(conn, system_id, ecl)?;
-    let member_codes: HashSet<&str> = members.iter().map(|c| c.code.as_str()).collect();
-    Ok(candidates
-        .iter()
-        .filter(|c| member_codes.contains(c.as_str()))
-        .cloned()
-        .collect())
+    let expr = parser::parse(ecl)
+        .map_err(|e| HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))?;
+    evaluator::filter_codes(conn, system_id, &expr, candidates)
 }

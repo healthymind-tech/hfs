@@ -239,6 +239,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_word_fts
 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
            tokenize='unicode61 remove_diacritics 1');
 
+-- ── Implicit-expansion FTS tracker ─────────────────────────────────────────────
+-- One row per implicit-expansion url whose rows are in implicit_expansion_fts
+-- and implicit_expansion_word_fts. `url` is UNINDEXED there, so finding or
+-- deleting a url's rows by it scans every url's rows; instead each url owns
+-- the rowid block [block << 32, (block + 1) << 32), which FTS5 seeks directly.
+-- A url has FTS rows iff it has a row here (see `ensure_implicit_fts`).
+CREATE TABLE IF NOT EXISTS implicit_expansion_fts_built (
+    block INTEGER PRIMARY KEY,
+    url   TEXT NOT NULL UNIQUE
+);
+
 -- ── FTS5 trigram index for direct concept text search ─────────────────────────
 -- Enables fast substring matching on concepts.code and concepts.display.
 -- Used by expand_inline_filtered for full-system includes with a text filter.
@@ -294,6 +305,17 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
 
+-- ── Reference set membership ──────────────────────────────────────────────────
+-- Active members of SNOMED CT Simple reference sets (RF2
+-- der2_Refset_Simple*): ECL `^ refset` and `?fhir_vs=refset/<id>` read it.
+-- Replaced per system on re-import; goes with the CodeSystem row.
+CREATE TABLE IF NOT EXISTS refset_members (
+    system_id       TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    refset_id       TEXT NOT NULL,
+    referenced_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, refset_id, referenced_code)
+) WITHOUT ROWID;
+
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the
@@ -318,7 +340,49 @@ CREATE TABLE IF NOT EXISTS bootstrap_imports (
 ///
 /// Safe to call on every startup — all statements are idempotent.
 pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // Must look at the database before SCHEMA creates the tracker table.
+    migrate_implicit_fts_blocks(conn)?;
     conn.execute_batch(SCHEMA)
+}
+
+/// Drop implicit-expansion FTS rows written before the rowid-block tracker
+/// (`implicit_expansion_fts_built`) existed.
+///
+/// Those rows have arbitrary rowids, so they can neither be found by block nor
+/// told apart from new rows. The tables are a lazily rebuilt cache of
+/// `implicit_expansion_cache`, normally empty (filtered implicit expansions
+/// are served from the in-memory index), so they are dropped and SCHEMA
+/// recreates them. The checks are a `sqlite_master` lookup and a one-row
+/// probe; nothing is scanned.
+pub fn migrate_implicit_fts_blocks(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |r| r.get(0),
+        )
+    };
+    if table_exists("implicit_expansion_fts_built")? || !table_exists("implicit_expansion_fts")? {
+        return Ok(());
+    }
+    let mut legacy = false;
+    for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+        if table_exists(table)? {
+            legacy |= conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                [],
+                |r| r.get::<_, bool>(0),
+            )?;
+        }
+    }
+    if legacy {
+        tracing::info!("dropping implicit-expansion FTS rows written without a rowid block");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS implicit_expansion_fts;
+             DROP TABLE IF EXISTS implicit_expansion_word_fts;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Build (or rebuild) the transitive ancestor closure for one code system.
@@ -950,6 +1014,8 @@ mod tests {
             "concepts_word_fts",
             "concepts_search_fts",
             "concepts_fts_built",
+            "implicit_expansion_fts_built",
+            "refset_members",
         ];
 
         for table in &expected_tables {
@@ -962,6 +1028,41 @@ mod tests {
                 .unwrap_or(0);
             assert_eq!(count, 1, "table '{table}' should exist after migration");
         }
+    }
+
+    /// Implicit-expansion FTS rows written before the rowid-block tracker
+    /// existed cannot be found by block, so the first start with the tracker
+    /// drops them (the tables are a lazily rebuilt cache); later starts keep
+    /// what was built.
+    #[test]
+    fn legacy_implicit_fts_rows_are_dropped_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE implicit_expansion_fts
+                 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+                            tokenize='trigram case_sensitive 0');
+             CREATE VIRTUAL TABLE implicit_expansion_word_fts
+                 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+                            tokenize='unicode61 remove_diacritics 1');
+             INSERT INTO implicit_expansion_fts (url, system_url, code, display)
+                 VALUES ('u', 's', 'a', 'Alpha');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let rows = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows("implicit_expansion_fts"), 0, "legacy rows dropped");
+
+        conn.execute_batch(
+            "INSERT INTO implicit_expansion_fts_built (block, url) VALUES (1, 'u');
+             INSERT INTO implicit_expansion_fts (rowid, url, system_url, code, display)
+                 VALUES (4294967297, 'u', 's', 'a', 'Alpha');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(rows("implicit_expansion_fts"), 1, "block rows kept");
     }
 
     #[test]

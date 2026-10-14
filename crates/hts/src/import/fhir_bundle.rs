@@ -994,44 +994,41 @@ pub(crate) fn delete_concept_fts_rows(conn: &Connection, system_id: &str) -> Res
     Ok(())
 }
 
-/// Drop persisted implicit-ValueSet expansions derived from `system_url`.
+/// Drop persisted implicit-ValueSet expansions derived from `system_url`, and
+/// return how many cache rows went.
 ///
-/// `implicit_expansion_fts` keys `system_url` as an `UNINDEXED` column, so
-/// its delete is a full scan; skip it unless the (indexed) cache table holds
-/// rows for this system — which a fresh import never does.
+/// A cached expansion (`?fhir_vs` url or `inline-compose:` key) that holds
+/// any code of the system is dropped whole — keeping its rows from other
+/// systems would leave a partial expansion behind. Its rows in the implicit
+/// FTS tables are deleted by rowid block ([`drop_implicit_fts`]); their `url`
+/// and `system_url` columns are `UNINDEXED`, so deleting by either scans
+/// every expansion's rows. A fresh import finds nothing in the indexed probe.
+///
+/// [`drop_implicit_fts`]: crate::backends::sqlite::drop_implicit_fts
 #[cfg(feature = "sqlite")]
 pub(crate) fn invalidate_implicit_expansions(
     conn: &Connection,
     system_url: &str,
-) -> Result<(), HtsError> {
+) -> Result<u64, HtsError> {
     let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
-    let cached: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache \
-             INDEXED BY idx_implicit_expansion_cache_system WHERE system_url = ?1)",
-            [system_url],
-            |r| r.get(0),
+    let urls: Vec<String> = conn
+        .prepare_cached(
+            "SELECT DISTINCT url FROM implicit_expansion_cache \
+             INDEXED BY idx_implicit_expansion_cache_system WHERE system_url = ?1",
         )
+        .map_err(err)?
+        .query_map([system_url], |r| r.get(0))
+        .map_err(err)?
+        .collect::<rusqlite::Result<_>>()
         .map_err(err)?;
-    if !cached {
-        return Ok(());
+    let mut removed = 0u64;
+    for url in &urls {
+        crate::backends::sqlite::drop_implicit_fts(conn, url)?;
+        removed += conn
+            .execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url])
+            .map_err(err)? as u64;
     }
-    conn.execute(
-        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
-        [system_url],
-    )
-    .map_err(err)?;
-    conn.execute(
-        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
-        [system_url],
-    )
-    .map_err(err)?;
-    conn.execute(
-        "DELETE FROM implicit_expansion_word_fts WHERE system_url = ?1",
-        [system_url],
-    )
-    .map_err(err)?;
-    Ok(())
+    Ok(removed)
 }
 
 /// Build a multi-version-safe storage id for a CodeSystem.
@@ -1450,6 +1447,44 @@ mod tests {
             count_rows(&b, "concept_properties"),
             0,
             "stale property must be removed on re-import"
+        );
+    }
+
+    /// Re-importing a CodeSystem drops every cached implicit expansion that
+    /// holds one of its codes — whole, including that expansion's rows from
+    /// other systems and its FTS rowid block — and leaves the others alone.
+    #[test]
+    fn invalidating_a_system_drops_whole_cached_expansions_that_use_it() {
+        let b = backend();
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO implicit_expansion_cache (url, system_url, code, display) VALUES
+                 ('mixed', 'http://x', 'x1', 'Alpha x'),
+                 ('mixed', 'http://y', 'y1', 'Alpha y'),
+                 ('only-y', 'http://y', 'y1', 'Alpha y');
+             INSERT INTO implicit_expansion_fts_built (block, url) VALUES (1, 'mixed'), (2, 'only-y');
+             INSERT INTO implicit_expansion_fts (rowid, url, system_url, code, display) VALUES
+                 (4294967297, 'mixed', 'http://x', 'x1', 'Alpha x'),
+                 (4294967298, 'mixed', 'http://y', 'y1', 'Alpha y'),
+                 (8589934593, 'only-y', 'http://y', 'y1', 'Alpha y');",
+        )
+        .unwrap();
+        let removed = super::invalidate_implicit_expansions(&conn, "http://x").unwrap();
+        assert_eq!(removed, 2, "both rows of the mixed expansion");
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM implicit_expansion_cache WHERE url = 'only-y'"),
+            1
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM implicit_expansion_cache"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM implicit_expansion_fts"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM implicit_expansion_fts_built WHERE url = 'only-y'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM implicit_expansion_fts_built"),
+            1
         );
     }
 

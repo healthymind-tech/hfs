@@ -42,6 +42,7 @@ pub(crate) mod bcp13;
 pub mod config;
 pub mod ecl;
 pub mod error;
+pub(crate) mod implicit_vs;
 pub mod import;
 pub(crate) mod language;
 pub mod operations;

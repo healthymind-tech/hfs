@@ -273,6 +273,23 @@ pub trait BundleImportBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Replace the reference set membership of the CodeSystem `url` (at
+    /// `version`) with `members`, given as `(refset_id, referenced_code)`
+    /// pairs, and return how many were stored. The CodeSystem must already be
+    /// imported. Read by ECL `^` and `?fhir_vs=refset/<id>`.
+    ///
+    /// The default stores nothing: a backend without an ECL evaluator (the
+    /// PostgreSQL one) has no reader for the rows.
+    async fn import_refset_members(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        Ok(0)
+    }
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
     /// Called by the CRUD DELETE handler after the persistence soft-delete so

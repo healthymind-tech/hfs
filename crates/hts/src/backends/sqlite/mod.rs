@@ -19,6 +19,7 @@ mod concept_map;
 mod value_set;
 
 pub(crate) use code_system::invalidate_cs_language_cache;
+pub(crate) use value_set::drop_implicit_fts;
 pub(crate) use value_set::invalidate_cs_id_cache;
 
 use std::collections::{HashMap, HashSet};
@@ -1155,6 +1156,75 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
+    async fn import_refset_members(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        let written = tokio::task::spawn_blocking(move || -> Result<u64, HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            write_refset_members(&mut conn, &url, version.as_deref(), &members)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        // Cached expansions may hold ECL `^` results.
+        self.invalidate_caches();
+        Ok(written)
+    }
+}
+
+/// Replace the `refset_members` rows of the CodeSystem `url|version` in one
+/// transaction (a delete by primary-key prefix, then the inserts).
+fn write_refset_members(
+    conn: &mut rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+    members: &[(String, String)],
+) -> Result<u64, HtsError> {
+    use rusqlite::OptionalExtension;
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(err)?;
+    let system_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![url, version],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(system_id) = system_id else {
+        return Err(HtsError::NotFound(format!(
+            "CodeSystem {url}|{} is not imported; cannot store its reference set members",
+            version.unwrap_or("")
+        )));
+    };
+    tx.execute(
+        "DELETE FROM refset_members WHERE system_id = ?1",
+        [&system_id],
+    )
+    .map_err(err)?;
+    let mut written = 0u64;
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO refset_members (system_id, refset_id, referenced_code)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(err)?;
+        for (refset, code) in members {
+            written += stmt.execute([&system_id, refset, code]).map_err(err)? as u64;
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(written)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

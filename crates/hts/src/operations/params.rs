@@ -110,6 +110,25 @@ pub fn collect_canonical_params(params: &[Value], name: &str) -> Vec<(String, St
         .collect()
 }
 
+/// Collect every `useSupplement` value, as given (`url` or `url|version`).
+///
+/// Accepts `valueCanonical`, `valueUri`, `valueUrl` and `valueString`: the GET
+/// forms of the operations turn every query parameter into a `valueString`
+/// (see [`query_params_to_fhir_params`]), so a reader that only knows the
+/// canonical types silently ignores `?useSupplement=` on GET.
+pub fn collect_use_supplements(params: &[Value]) -> Vec<String> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueUrl", "valueString"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Extract a string-typed value from a FHIR parameter object, checking the
 /// most common `valueXxx` fields.
 fn extract_any_string_value(param: &Value) -> Option<String> {
