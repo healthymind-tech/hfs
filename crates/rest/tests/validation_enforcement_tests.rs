@@ -770,3 +770,58 @@ async fn stored_profiles_are_rehydrated_from_storage_on_restart() {
         "deleted profiles are not resurrected"
     );
 }
+
+/// While a startup rehydration pass is announced, validation waits for it
+/// instead of reporting a stored profile as unresolvable.
+#[tokio::test]
+async fn validation_waits_for_an_announced_rehydration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("fhir.db");
+    let backend = || {
+        let backend = SqliteBackend::with_config(&db_path, SqliteBackendConfig::default())
+            .expect("sqlite backend");
+        backend.init_schema().expect("schema");
+        Arc::new(backend)
+    };
+    let config = || ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "test-tenant".to_string(),
+        ..ServerConfig::for_testing()
+    };
+    let url = "http://example.org/StructureDefinition/gated";
+    {
+        let state = helios_rest::AppState::new(backend(), config());
+        let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("server");
+        let response = server
+            .put("/StructureDefinition/gated")
+            .json(&birthdate_profile("gated"))
+            .await;
+        assert!(response.status_code().is_success(), "{}", response.text());
+    }
+
+    let storage = backend();
+    let state = helios_rest::AppState::new(Arc::clone(&storage), config());
+    let validation = state.validation_shared();
+    validation.begin_rehydration();
+    assert!(validation.is_rehydrating());
+    let server =
+        TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).expect("server");
+
+    // The replay starts only after the request is already waiting.
+    let replay = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        validation
+            .rehydrate_stored_profiles(storage.as_ref(), "test-tenant", 100)
+            .await
+    });
+    assert!(
+        profile_resolves(&server, url).await,
+        "a request during rehydration must see the replayed profile"
+    );
+    assert_eq!(replay.await.expect("replay").registered, 1);
+}

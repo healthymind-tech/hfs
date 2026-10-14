@@ -1202,6 +1202,9 @@ fn spawn_profile_rehydration<S>(
     }
     let default_tenant = config.default_tenant.clone();
     let batch_size = config.validation.rehydrate_batch_size;
+    // Announced before the spawn, so no request can observe the empty
+    // registry between the port opening and the task starting.
+    validation.begin_rehydration();
     tokio::spawn(async move {
         validation
             .rehydrate_stored_profiles(storage.as_ref(), &default_tenant, batch_size)

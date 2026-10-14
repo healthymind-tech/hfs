@@ -92,6 +92,11 @@ pub struct ValidationService {
     /// Allow stored StructureDefinitions to override embedded core
     /// definitions with the same canonical URL (`HFS_VALIDATION_SHADOW_CORE`).
     shadow_core: bool,
+    /// `true` while a startup rehydration pass is announced but not finished;
+    /// validation waits for it (see [`Self::begin_rehydration`]).
+    rehydrating: tokio::sync::watch::Sender<bool>,
+    /// Upper bound on that wait (`HFS_VALIDATION_REHYDRATE_WAIT_MS`).
+    rehydrate_wait: Duration,
 }
 
 impl Default for ValidationService {
@@ -106,6 +111,8 @@ impl Default for ValidationService {
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
             shadow_core: false,
+            rehydrating: tokio::sync::watch::Sender::new(false),
+            rehydrate_wait: Duration::from_millis(60_000),
         }
     }
 }
@@ -175,6 +182,8 @@ impl ValidationService {
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
             shadow_core: config.shadow_core,
+            rehydrating: tokio::sync::watch::Sender::new(false),
+            rehydrate_wait: Duration::from_millis(config.rehydrate_wait_ms),
         }
     }
 
@@ -199,6 +208,7 @@ impl ValidationService {
         profiles: Vec<String>,
         tenant: Option<&str>,
     ) -> Vec<ValidationError> {
+        self.await_rehydration().await;
         let core = helios_fhir_validator::packs::core_registry(version);
         let resolver: Arc<dyn SchemaResolver> = match self.tenant_overlay(tenant, version) {
             Some(overlay) => Arc::new(CompositeResolver::new(vec![overlay, core])),
@@ -388,6 +398,39 @@ impl ValidationService {
         removed
     }
 
+    /// Announce that a startup rehydration pass is about to run. Until
+    /// [`Self::rehydrate_stored_profiles`] finishes, validation waits for it
+    /// (at most `HFS_VALIDATION_REHYDRATE_WAIT_MS`) instead of answering from
+    /// a half-filled registry: a `$validate` right after a restart would
+    /// otherwise report "could not resolve profile", and an enforce-mode
+    /// write claiming a stored profile would be accepted unchecked.
+    pub fn begin_rehydration(&self) {
+        if self.tenant_profiles.is_some() {
+            self.rehydrating.send_replace(true);
+        }
+    }
+
+    /// Whether a startup rehydration pass is announced and not yet finished.
+    pub fn is_rehydrating(&self) -> bool {
+        *self.rehydrating.borrow()
+    }
+
+    async fn await_rehydration(&self) {
+        if !self.is_rehydrating() {
+            return;
+        }
+        let mut rx = self.rehydrating.subscribe();
+        if tokio::time::timeout(self.rehydrate_wait, rx.wait_for(|busy| !*busy))
+            .await
+            .is_err()
+        {
+            warn!(
+                wait_ms = self.rehydrate_wait.as_millis() as u64,
+                "profile rehydration still running; validating against the profiles registered so far"
+            );
+        }
+    }
+
     /// Whether stored StructureDefinitions feed profile registries at all
     /// (`HFS_VALIDATION_STORED_PROFILES`).
     pub fn stored_profiles_enabled(&self) -> bool {
@@ -422,8 +465,18 @@ impl ValidationService {
         let mut report = ProfileRehydrationReport::default();
         if self.tenant_profiles.is_none() {
             debug!("stored profiles disabled; skipping profile rehydration");
+            self.rehydrating.send_replace(false);
             return report;
         }
+        // Released however the pass ends, so a waiting request never hangs
+        // on a pass that panicked or returned early.
+        struct Done<'a>(&'a tokio::sync::watch::Sender<bool>);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.send_replace(false);
+            }
+        }
+        let _done = Done(&self.rehydrating);
         let batch_size = batch_size.max(1);
 
         let mut tenants: BTreeSet<String> = BTreeSet::new();

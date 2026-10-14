@@ -521,6 +521,10 @@ pub struct ValidationConfig {
     /// StructureDefinitions fetched per storage round-trip during startup
     /// rehydration (`HFS_VALIDATION_REHYDRATE_BATCH_SIZE`, default 100).
     pub rehydrate_batch_size: u32,
+    /// How long validation waits for an unfinished startup rehydration
+    /// before validating against the profiles registered so far
+    /// (`HFS_VALIDATION_REHYDRATE_WAIT_MS`, default 60000).
+    pub rehydrate_wait_ms: u64,
 }
 
 impl Default for ValidationConfig {
@@ -538,6 +542,7 @@ impl Default for ValidationConfig {
             shadow_core: false,
             rehydrate: true,
             rehydrate_batch_size: 100,
+            rehydrate_wait_ms: 60_000,
         }
     }
 }
@@ -590,6 +595,7 @@ impl ValidationConfig {
                 u64::from(d.rehydrate_batch_size),
             )
             .clamp(1, u64::from(u32::MAX)) as u32,
+            rehydrate_wait_ms: env_u64("HFS_VALIDATION_REHYDRATE_WAIT_MS", d.rehydrate_wait_ms),
         }
     }
 

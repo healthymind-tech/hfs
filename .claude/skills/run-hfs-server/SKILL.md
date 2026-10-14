@@ -281,6 +281,7 @@ StructureDefinitions (per tenant) become validatable profiles on write.
 | `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions (registered on create/update, removed on delete) |
 | `HFS_VALIDATION_REHYDRATE` | `true` | Replay stored StructureDefinitions into the profile registries at startup (count and duration are logged) |
 | `HFS_VALIDATION_REHYDRATE_BATCH_SIZE` | `100` | StructureDefinitions per storage round-trip during startup rehydration |
+| `HFS_VALIDATION_REHYDRATE_WAIT_MS` | `60000` | While startup rehydration runs, validation (`$validate` and write-path checks) waits up to this long for it instead of answering from a partly filled registry |
 | `HFS_VALIDATION_SHADOW_CORE` | `false` | Let a stored StructureDefinition with a core canonical (`http://hl7.org/fhir/StructureDefinition/…`) override the embedded definition. Off, so importing `hl7.fhir.r4.core` cannot replace the base types |
 
 Note: stored profiles (`derivation: constraint`, extensions) are registered
