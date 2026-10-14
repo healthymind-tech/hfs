@@ -136,7 +136,15 @@ pub struct SqliteBackend {
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
+    /// This process's queue for SQLite's single write lock. See
+    /// [`SqliteBackend::write_permit`].
+    write_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// How long a write may wait in this process's write queue before it is
+/// answered 503. Long on purpose: the queue is first-come first-served, so a
+/// write only waits this long behind this many seconds of other writes.
+const WRITE_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Debug for SqliteBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -505,6 +513,7 @@ impl SqliteBackend {
             config,
             is_memory,
             registries,
+            write_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // Configure the connection
@@ -651,6 +660,50 @@ impl SqliteBackend {
                 source: None,
             })
         })?
+    }
+
+    /// Waits for this process's turn at SQLite's single write lock.
+    ///
+    /// SQLite admits one writer at a time, and a connection that finds the
+    /// lock taken sleeps in the busy handler and polls again — 1, 2, 5, 10 …
+    /// 100 ms apart, in no order — until `busy_timeout` (30 s) expires. Under
+    /// concurrent writes that is the worst of both worlds: creates that take
+    /// 2 ms each queue for hundreds of milliseconds (8 VUs dropped from 375 to
+    /// 108 creates/s), and an unlucky transaction bundle keeps losing the race
+    /// until it fails 500 "rolled back" after 30-50 s while the lock was
+    /// changing hands all along.
+    ///
+    /// Writers in this process therefore queue here first, in arrival order,
+    /// and only the head of the queue asks SQLite for the lock — which it then
+    /// almost always gets at once. `busy_timeout` still covers writers in
+    /// other processes and the few write paths that do not queue.
+    ///
+    /// Taken before a pooled connection, so queued writers hold no
+    /// connection and readers are never starved of one. Never take it while
+    /// already holding it (it is not re-entrant): only the outermost write
+    /// entry points — CRUD and `begin_transaction` — call this.
+    pub(crate) async fn write_permit(&self) -> StorageResult<tokio::sync::OwnedSemaphorePermit> {
+        match tokio::time::timeout(WRITE_QUEUE_TIMEOUT, self.write_gate.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_closed)) => Err(crate::error::StorageError::Backend(
+                BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: "write queue closed".to_string(),
+                    source: None,
+                },
+            )),
+            Err(_elapsed) => Err(crate::error::StorageError::Backend(
+                BackendError::Unavailable {
+                    backend_name: "sqlite".to_string(),
+                    message: format!(
+                        "waited {} s for the write lock",
+                        WRITE_QUEUE_TIMEOUT.as_secs()
+                    ),
+                },
+            )),
+        }
     }
 
     /// The per-tenant registry container (shared with a co-located ES backend).

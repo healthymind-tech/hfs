@@ -57,6 +57,10 @@ pub struct SqliteTransaction {
     /// Bulk fast-load (#903): skip search-index and FTS writes; stale rows of
     /// updated resources are still deleted so a deferred index never lies.
     defer_search_indexing: bool,
+    /// This process's turn at the write lock (see
+    /// [`SqliteBackend::write_permit`]), released when the transaction is
+    /// dropped — after `Drop` has rolled back whatever was left open.
+    _write: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl std::fmt::Debug for SqliteTransaction {
@@ -71,6 +75,7 @@ impl std::fmt::Debug for SqliteTransaction {
 impl SqliteTransaction {
     /// Create a new transaction.
     fn new(
+        write: tokio::sync::OwnedSemaphorePermit,
         conn: PooledConnection<SqliteConnectionManager>,
         tenant: TenantContext,
         backend: SqliteBackend,
@@ -92,6 +97,7 @@ impl SqliteTransaction {
             invalidate_registry: false,
             fhir_version,
             defer_search_indexing,
+            _write: write,
         })
     }
 
@@ -690,6 +696,7 @@ impl TransactionProvider for SqliteBackend {
         tenant: &TenantContext,
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
+        let write = self.write_permit().await?;
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let fhir_version = options.fhir_version.unwrap_or(self.config().fhir_version);
@@ -718,6 +725,7 @@ impl TransactionProvider for SqliteBackend {
         }
 
         SqliteTransaction::new(
+            write,
             conn,
             tenant.clone(),
             self.clone(),

@@ -272,6 +272,7 @@ impl ResourceStorage for SqliteBackend {
         let version_id = "1";
         let fhir_version_str = fhir_version.as_mime_param();
 
+        let _write = self.write_permit().await?;
         let mut conn = self.get_connection()?;
 
         // The existence check, resource row, history row and index rows in ONE
@@ -378,6 +379,7 @@ impl ResourceStorage for SqliteBackend {
             // (FHIR http.html#delete), continuing the existing version chain
             // rather than being rejected with `Gone`.
             Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let _write = self.write_permit().await?;
                 let restored = self.restore_deleted(tenant, resource_type, id, resource)?;
                 Ok((restored, true))
             }
@@ -471,6 +473,7 @@ impl ResourceStorage for SqliteBackend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
+        let _write = self.write_permit().await?;
         let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
@@ -614,6 +617,7 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        let _write = self.write_permit().await?;
         self.soft_delete(tenant, resource_type, id, None)
     }
 
@@ -624,6 +628,7 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
+        let _write = self.write_permit().await?;
         self.soft_delete(tenant, resource_type, id, Some(expected_version))
     }
 
@@ -1145,6 +1150,7 @@ impl ResourceStorage for SqliteBackend {
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
+        let _write = self.write_permit().await?;
         let mut conn = self.get_connection()?;
         // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
         // below) before it writes. Under WAL a deferred transaction takes a read
@@ -2937,6 +2943,7 @@ impl PurgableStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        let _write = self.write_permit().await?;
         let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -3021,6 +3028,7 @@ impl PurgableStorage for SqliteBackend {
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let _write = self.write_permit().await?;
         let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
