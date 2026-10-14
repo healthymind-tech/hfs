@@ -27,7 +27,7 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
-use super::search::{KeysetKey, QueryBuilder, SortValueKind, SqlParam};
+use super::search::{FilterPart, KeysetKey, Membership, QueryBuilder, SortValueKind, SqlParam};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -184,6 +184,200 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
     }
 }
 
+/// A membership listing at most this many `search_index` rows drives the
+/// search: the outer query looks each candidate up by rowid and sorts them,
+/// instead of walking every resource of the type in sort order until a page
+/// of matches turns up.
+///
+/// Measured on the 527k-resource benchmark database (Observation, `_count=50`,
+/// warm): looking up and sorting N candidates costs ~10 µs each; the ordered
+/// walk costs ~15 ms for a set of any size up to a few thousand, more for a
+/// rare one (61 ms for 5 matches, which it has to look past every row of the
+/// type to find). They cross at about a thousand rows.
+const DRIVE_MAX_ROWS: usize = 1_000;
+
+/// When no membership is selective enough to drive, each is counted up to
+/// this many rows to choose the smallest one to materialise (the rest are
+/// probed per candidate). Counting reads only index entries.
+const PICK_MAX_ROWS: usize = 50_000;
+
+/// How a search's filter joins the outer `resources` query; see
+/// [`plan_filter`].
+pub(crate) struct FilterPlan {
+    /// Conditions to append to the outer `WHERE`, each starting with ` AND `.
+    pub clause: String,
+    /// The values the clause binds, in placeholder order, after the outer
+    /// query's own leading parameters.
+    pub params: Vec<SqlParam>,
+    /// The driving membership is selective: the outer query must reach rows
+    /// through it (by rowid) rather than through a `resources` index.
+    pub drive: bool,
+}
+
+fn sql_param_value(param: &SqlParam) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match param {
+        SqlParam::String(s) => Value::Text(s.clone()),
+        SqlParam::Integer(i) => Value::Integer(*i),
+        SqlParam::Float(f) => Value::Real(*f),
+        SqlParam::Null => Value::Null,
+    }
+}
+
+/// Counts the rows `m` matches, stopping at `cap + 1`.
+///
+/// `values` holds every value of the outer statement in placeholder order;
+/// the probe binds the prefix its own highest placeholder needs (the outer
+/// query's other leading values, e.g. a cursor's, are bound but unused).
+fn probe_membership(
+    conn: &rusqlite::Connection,
+    m: &Membership,
+    values: &[rusqlite::types::Value],
+    cap: usize,
+) -> StorageResult<usize> {
+    // Count index entries only: `SELECT 1` keeps a token or reference probe
+    // inside its covering index instead of reading each row's `resource_key`.
+    let select = m.select.replace(
+        "SELECT resource_key FROM search_index WHERE ",
+        "SELECT 1 FROM search_index WHERE ",
+    );
+    let sql = format!("SELECT COUNT(*) FROM ({select} LIMIT {})", cap + 1);
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare search filter probe")?;
+    let n = stmt.parameter_count().min(values.len());
+    let rows: i64 = stmt
+        .query_row(rusqlite::params_from_iter(&values[..n]), |row| row.get(0))
+        .or_query_error("Failed to probe search filter")?;
+    Ok(rows as usize)
+}
+
+/// Chooses how the search filter `parts` joins an outer query over
+/// `resources` (`FROM resources`, unaliased, with `?1` = tenant and `?2` =
+/// type).
+///
+/// The filter used to be one `rowid IN (SELECT DISTINCT resource_key FROM
+/// search_index WHERE … AND resource_key IN (…) AND resource_key IN (…))`.
+/// SQLite materialises every `IN` list in full, and with no statistics it
+/// always ordered the outer query by walking `idx_resources_reindex`. So
+/// `Observation?patient=X&code=Y` built the list of all 17,837 `code=Y`
+/// Observations to intersect with the patient's 57 (~190 ms), and a query
+/// that matches a handful of rows walked every row of the type to find them.
+///
+/// Now the positive memberships are counted (bounded, from the index), the
+/// smallest becomes the one `rowid IN (…)` list, and every other membership is
+/// a correlated `EXISTS` probe of that candidate's own rows through
+/// `idx_search_composite` (`tenant_id, resource_type, resource_key,
+/// param_name`). The hint is required: left to itself SQLite answers the
+/// `EXISTS` from the value index, re-reading the whole value set per
+/// candidate. When the smallest membership is selective ([`DRIVE_MAX_ROWS`])
+/// the plan says so, and the caller makes the outer query reach rows through
+/// it. Every other condition keeps the original wrapper.
+///
+/// The result set is the same: the wrapper only required that a resource
+/// have some `search_index` row of its type, which any membership implies.
+pub(crate) fn plan_filter(
+    conn: &rusqlite::Connection,
+    parts: Vec<FilterPart>,
+    leading: &[rusqlite::types::Value],
+) -> StorageResult<Option<FilterPlan>> {
+    let mut params: Vec<SqlParam> = Vec::new();
+    let mut memberships: Vec<Membership> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
+    for part in parts {
+        match part {
+            FilterPart::Membership(m) => {
+                params.extend(m.params.iter().cloned());
+                memberships.push(m);
+            }
+            FilterPart::Other(f) => {
+                params.extend(f.params);
+                if !f.sql.is_empty() {
+                    others.push(format!("({})", f.sql));
+                }
+            }
+        }
+    }
+
+    let mut clause = String::new();
+    let mut drive = false;
+    if !memberships.is_empty() {
+        let values: Vec<rusqlite::types::Value> = leading
+            .iter()
+            .cloned()
+            .chain(params.iter().map(sql_param_value))
+            .collect();
+        let mut counts = Vec::with_capacity(memberships.len());
+        for m in &memberships {
+            counts.push(probe_membership(conn, m, &values, DRIVE_MAX_ROWS)?);
+        }
+        let mut smallest = argmin(&counts);
+        drive = counts[smallest] <= DRIVE_MAX_ROWS;
+        if !drive && memberships.len() > 1 {
+            counts.clear();
+            for m in &memberships {
+                counts.push(probe_membership(conn, m, &values, PICK_MAX_ROWS)?);
+            }
+            smallest = argmin(&counts);
+        }
+        clause.push_str(&format!(" AND rowid IN ({})", memberships[smallest].select));
+        for (i, m) in memberships.iter().enumerate() {
+            if i != smallest {
+                clause.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+                     WHERE resource_key = resources.rowid AND {})",
+                    m.row_where
+                ));
+            }
+        }
+    }
+    if !others.is_empty() {
+        clause.push_str(&format!(
+            " AND rowid IN (SELECT DISTINCT resource_key FROM search_index \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
+            others.join(" AND ")
+        ));
+    } else if memberships.is_empty() {
+        // Parameters that built no condition still restricted the search to
+        // resources with a `search_index` row of the type; keep that.
+        clause.push_str(
+            " AND rowid IN (SELECT DISTINCT resource_key FROM search_index \
+             WHERE tenant_id = ?1 AND resource_type = ?2)",
+        );
+    }
+    Ok(Some(FilterPlan {
+        clause,
+        params,
+        drive,
+    }))
+}
+
+/// The outer statement's leading values for [`plan_filter`]'s probes: tenant,
+/// type, then `NULL` for any further leading placeholder (a cursor's), which
+/// no probe reads.
+fn leading_values(
+    tenant_id: &str,
+    resource_type: &str,
+    param_offset: usize,
+) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+    let mut values = vec![
+        Value::Text(tenant_id.to_string()),
+        Value::Text(resource_type.to_string()),
+    ];
+    values.resize(param_offset.max(2), Value::Null);
+    values
+}
+
+fn argmin(counts: &[usize]) -> usize {
+    counts
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, n)| **n)
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 impl SqliteBackend {
     /// The body of [`SearchProvider::search`], run on a caller-supplied
     /// connection.
@@ -229,23 +423,25 @@ impl SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
+        let plan = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder =
                 QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
-            let fragment = builder.build(query);
-            if !fragment.sql.is_empty() {
-                Some(fragment)
-            } else {
-                None
-            }
+            plan_filter(
+                conn,
+                builder.build_parts(query),
+                &leading_values(tenant_id, resource_type, param_offset),
+            )?
         } else {
             None
         };
-        let filter_clause = search_filter
-            .as_ref()
-            .map(|f| format!(" AND rowid IN ({})", f.sql))
-            .unwrap_or_default();
-        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
+        // A selective filter drives: `+` keeps the planner off the `resources`
+        // indexes so it reaches the rows by rowid through the filter.
+        let scope = if plan.as_ref().is_some_and(|p| p.drive) {
+            "+tenant_id = ?1 AND +resource_type = ?2"
+        } else {
+            "tenant_id = ?1 AND resource_type = ?2"
+        };
+        let (filter_clause, search_params) = plan.map(|p| (p.clause, p.params)).unwrap_or_default();
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -269,7 +465,7 @@ impl SqliteBackend {
             let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 WHERE {scope} AND is_deleted = 0{filter} \
                  AND {condition} \
                  ORDER BY {order} LIMIT {lim}",
                 cols = select_cols,
@@ -281,7 +477,7 @@ impl SqliteBackend {
         } else if let Some(offset) = query.offset {
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 WHERE {scope} AND is_deleted = 0{filter} \
                  {order} LIMIT {lim} OFFSET {off}",
                 cols = select_cols,
                 filter = filter_clause,
@@ -293,7 +489,7 @@ impl SqliteBackend {
         } else {
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 WHERE {scope} AND is_deleted = 0{filter} \
                  {order} LIMIT {lim}",
                 cols = select_cols,
                 filter = filter_clause,
@@ -511,25 +707,26 @@ impl SearchProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
-        let search_filter = if !query.parameters.is_empty() {
-            let fragment = QueryBuilder::new(tenant_id, resource_type)
+        let conn = self.get_connection()?;
+        let plan = if !query.parameters.is_empty() {
+            let parts = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
-                .build(query);
-            if fragment.sql.is_empty() {
-                None
-            } else {
-                Some(fragment)
-            }
+                .build_parts(query);
+            plan_filter(
+                &conn,
+                parts,
+                &leading_values(tenant_id, resource_type, param_offset),
+            )?
         } else {
             None
         };
-        let filter_clause = search_filter
-            .as_ref()
-            .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
-            .unwrap_or_default();
-        let search_params = search_filter
-            .map(|fragment| fragment.params)
-            .unwrap_or_default();
+        // See `search_with_connection`.
+        let scope = if plan.as_ref().is_some_and(|p| p.drive) {
+            "+tenant_id = ?1 AND +resource_type = ?2"
+        } else {
+            "tenant_id = ?1 AND resource_type = ?2"
+        };
+        let (filter_clause, search_params) = plan.map(|p| (p.clause, p.params)).unwrap_or_default();
         let cursor_clause = if cursor.is_some() {
             " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
         } else {
@@ -538,7 +735,7 @@ impl SearchProvider for SqliteBackend {
         let count = query.count.unwrap_or(100) as usize;
         let sql = format!(
             "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
+             WHERE {scope} AND is_deleted = 0{filter_clause}{cursor_clause} \
              ORDER BY last_updated DESC, id ASC LIMIT {}",
             count + 1
         );
@@ -560,7 +757,6 @@ impl SearchProvider for SqliteBackend {
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             params.iter().map(|param| param.as_ref()).collect();
-        let conn = self.get_connection()?;
         let mut stmt = conn
             .prepare(&sql)
             .or_query_error("Failed to prepare id-only search query")?;
@@ -626,7 +822,17 @@ impl SearchProvider for SqliteBackend {
             || query.compartment.is_some()
         {
             let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
-            let fragment = builder.build(query);
+            // Planned like a search, but the outer query is left free to
+            // answer `is_deleted` from `idx_resources_live_type` (covering,
+            // one seek per candidate rowid) even when the filter is
+            // selective, so no `+` here.
+            let (clause, filter_params) = plan_filter(
+                &conn,
+                builder.build_parts(query),
+                &leading_values(tenant_id, resource_type, 2),
+            )?
+            .map(|p| (p.clause, p.params))
+            .unwrap_or_default();
 
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new(tenant_id.to_string()),
@@ -634,7 +840,7 @@ impl SearchProvider for SqliteBackend {
             ];
 
             // Add search params
-            for param in &fragment.params {
+            for param in &filter_params {
                 match param {
                     SqlParam::String(s) => params.push(Box::new(s.clone())),
                     SqlParam::Integer(i) => params.push(Box::new(*i)),
@@ -644,8 +850,7 @@ impl SearchProvider for SqliteBackend {
             }
 
             let sql = format!(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
-                fragment.sql
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{clause}"
             );
 
             (sql, params)

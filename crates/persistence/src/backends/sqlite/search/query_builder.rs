@@ -181,6 +181,57 @@ impl SqlFragment {
     }
 }
 
+/// A plain positive membership test: the resource has a `search_index` row
+/// of its type satisfying `row_where`.
+///
+/// The same test is kept in two shapes so the outer query can pick the one
+/// that suits its plan: `select` lists the matching `resource_key`s (to drive
+/// the query from, or to materialise as an `IN` list), `row_where` judges one
+/// candidate `search_index` row (to probe per resource with a correlated
+/// `EXISTS`). Both use the same numbered placeholders and bind `params`.
+#[derive(Debug, Clone)]
+pub struct Membership {
+    /// `SELECT resource_key FROM search_index WHERE …`.
+    pub select: String,
+    /// The `WHERE` clause of one matching `search_index` row (it names the
+    /// row's own columns unqualified).
+    pub row_where: String,
+    /// The bound values, in placeholder order.
+    pub params: Vec<SqlParam>,
+}
+
+/// One top-level (AND-ed) condition of a search, over `search_index`'s
+/// `resource_key`.
+#[derive(Debug, Clone)]
+pub enum FilterPart {
+    /// A positive membership test; see [`Membership`].
+    Membership(Membership),
+    /// Any other condition, as SQL over the enclosing `search_index` row's
+    /// `resource_key` (negations, `:missing`, composites, `_id`, …).
+    Other(SqlFragment),
+}
+
+impl FilterPart {
+    /// The number of values this part binds.
+    pub fn param_count(&self) -> usize {
+        match self {
+            FilterPart::Membership(m) => m.params.len(),
+            FilterPart::Other(f) => f.params.len(),
+        }
+    }
+
+    /// The part as a condition over the enclosing row's `resource_key`, the
+    /// shape [`QueryBuilder::build`] conjoins.
+    pub fn into_condition(self) -> SqlFragment {
+        match self {
+            FilterPart::Membership(m) => {
+                SqlFragment::with_params(format!("resource_key IN ({})", m.select), m.params)
+            }
+            FilterPart::Other(f) => f,
+        }
+    }
+}
+
 /// Builds SQL queries from FHIR search parameters.
 pub struct QueryBuilder {
     /// The tenant ID for the query.
@@ -287,6 +338,32 @@ impl QueryBuilder {
         }
 
         base
+    }
+
+    /// Builds each top-level condition of the search as a [`FilterPart`], in
+    /// the order and with the placeholder numbering [`Self::build`] uses: the
+    /// conjunction of the parts, over `search_index` rows of the type, is
+    /// exactly `build`'s filter. Parameters building no condition are skipped,
+    /// as there.
+    pub fn build_parts(&self, query: &SearchQuery) -> Vec<FilterPart> {
+        let mut parts = Vec::new();
+        let mut current_offset = if self.skip_base_params {
+            self.param_offset
+        } else {
+            2
+        };
+        for param in &query.parameters {
+            if let Some(part) = self.parameter_condition_part(param, current_offset) {
+                current_offset += part.param_count();
+                parts.push(part);
+            }
+        }
+        if let Some(comp) = &query.compartment
+            && let Some(m) = self.compartment_membership(comp, current_offset)
+        {
+            parts.push(FilterPart::Membership(m));
+        }
+        parts
     }
 
     /// Builds the `_contained` match subquery.
@@ -651,6 +728,16 @@ impl QueryBuilder {
         comp: &CompartmentMembership,
         param_offset: usize,
     ) -> Option<SqlFragment> {
+        self.compartment_membership(comp, param_offset)
+            .map(|m| FilterPart::Membership(m).into_condition())
+    }
+
+    /// [`Self::build_compartment_condition`] as a [`Membership`].
+    fn compartment_membership(
+        &self,
+        comp: &CompartmentMembership,
+        param_offset: usize,
+    ) -> Option<Membership> {
         if comp.params.is_empty() || comp.reference.is_empty() {
             return None;
         }
@@ -675,14 +762,14 @@ impl QueryBuilder {
         let base = strip_reference_version(&comp.reference);
         let range = ReferenceHandler::versioned_reference_predicate(param_offset + 1);
 
-        Some(SqlFragment::with_params(
-            format!(
-                "resource_key IN (SELECT resource_key FROM search_index \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
-                 AND {range})"
-            ),
-            vec![SqlParam::string(base)],
-        ))
+        let row_where = format!(
+            "tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) AND {range}"
+        );
+        Some(Membership {
+            select: format!("SELECT resource_key FROM search_index WHERE {row_where}"),
+            row_where,
+            params: vec![SqlParam::string(base)],
+        })
     }
 
     /// Builds a condition for a single search parameter.
@@ -691,6 +778,18 @@ impl QueryBuilder {
         param: &SearchParameter,
         param_offset: usize,
     ) -> Option<SqlFragment> {
+        self.parameter_condition_part(param, param_offset)
+            .map(FilterPart::into_condition)
+    }
+
+    /// Builds one search parameter's condition, keeping a plain positive
+    /// membership test apart from everything else so the caller can choose how
+    /// to join it (see [`FilterPart`]).
+    fn parameter_condition_part(
+        &self,
+        param: &SearchParameter,
+        param_offset: usize,
+    ) -> Option<FilterPart> {
         if param.values.is_empty() {
             return None;
         }
@@ -700,7 +799,9 @@ impl QueryBuilder {
         // that simultaneously requires an index row for the same parameter.
         if is_missing_modifier(&param.modifier) {
             let is_missing = get_missing_value(&param.values[0].value);
-            return Some(build_missing_condition(param, is_missing));
+            return Some(FilterPart::Other(build_missing_condition(
+                param, is_missing,
+            )));
         }
 
         // Defence in depth behind `validate_value_presence` (#1380): an empty
@@ -708,7 +809,7 @@ impl QueryBuilder {
         // than whatever the handler below would make of it — the whole
         // parameter, since under `:not` "nothing" negates into "everything".
         if crate::search::has_empty_value(param) {
-            return Some(SqlFragment::new("1 = 0"));
+            return Some(FilterPart::Other(SqlFragment::new("1 = 0")));
         }
 
         // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
@@ -731,12 +832,16 @@ impl QueryBuilder {
                 "_tag" | "_profile" | "_security" | "_source" | "_language"
             )
         {
-            return self.build_special_parameter_condition(param, param_offset);
+            return self
+                .build_special_parameter_condition(param, param_offset)
+                .map(FilterPart::Other);
         }
 
         // Composite parameters need a group-aware subquery (see below).
         if matches!(param.param_type, SearchParamType::Composite) {
-            return self.build_composite_parameter_condition(param, param_offset);
+            return self
+                .build_composite_parameter_condition(param, param_offset)
+                .map(FilterPart::Other);
         }
 
         // A plain multi-value reference search (all `Type/id`, no modifier)
@@ -804,20 +909,24 @@ impl QueryBuilder {
         // multi-valued resource must not slip through via its other rows, and
         // resources with no rows for the parameter count as matches — both of
         // which NOT IN gives and a row-level NOT cannot.
-        let membership = if matches!(param.modifier, Some(SearchModifier::Not)) {
-            "NOT IN"
-        } else {
-            "IN"
-        };
-        Some(SqlFragment::with_params(
-            format!(
-                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({}))",
-                membership,
-                sql_string_literal(&param.name),
-                combined.sql
-            ),
-            combined.params,
-        ))
+        let row_where = format!(
+            "tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({})",
+            sql_string_literal(&param.name),
+            combined.sql
+        );
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            return Some(FilterPart::Other(SqlFragment::with_params(
+                format!(
+                    "resource_key NOT IN (SELECT resource_key FROM search_index WHERE {row_where})"
+                ),
+                combined.params,
+            )));
+        }
+        Some(FilterPart::Membership(Membership {
+            select: format!("SELECT resource_key FROM search_index WHERE {row_where}"),
+            row_where,
+            params: combined.params,
+        }))
     }
 
     /// Builds a condition for a composite parameter.
