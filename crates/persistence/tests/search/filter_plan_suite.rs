@@ -2,11 +2,13 @@
 //!
 //! SQLite materialises only a search's smallest membership and probes the rest
 //! per candidate, reaching rows by rowid when that membership is selective (at
-//! most 1,000 index rows) instead of walking the type in sort order. Every
-//! shape, and the choice between them, must give exactly the answer the plain
-//! plan gave: same members, same order, same pages, same count. The seed
-//! crosses the 1,000-row threshold on purpose. Shared by the SQLite and
-//! PostgreSQL test binaries via `#[path]`.
+//! most 1,000 index rows) instead of walking the type in sort order.
+//! PostgreSQL resolves the first page of a conjunction of broad memberships
+//! (all over 1,000 rows) by walking the smallest one's index rows. Every shape,
+//! and the choice between them, must give exactly the answer the plain plan
+//! gave: same members, same order, same pages, same count. The seed crosses
+//! the 1,000-row threshold on purpose. Shared by the SQLite and PostgreSQL
+//! test binaries via `#[path]`.
 
 use std::collections::HashSet;
 

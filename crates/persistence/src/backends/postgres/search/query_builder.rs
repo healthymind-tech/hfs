@@ -1631,6 +1631,42 @@ impl PostgresQueryBuilder {
         Some(inner)
     }
 
+    /// Each parameter's row predicate over `search_index`, when the search is
+    /// nothing but plain membership tests — one per parameter, in order, with
+    /// their placeholders numbered from `param_offset` and their bound values.
+    ///
+    /// A predicate names the row's own columns unqualified and starts with the
+    /// tenant/type scope, so it can stand as the `WHERE` of a `search_index`
+    /// scan or of a correlated probe. `None` when anything else is in play:
+    /// a compartment, `_has`, `_contained`, or a parameter that builds
+    /// something other than a lone membership (`:missing`, `:not`, `_id`, a
+    /// legacy composite, …).
+    pub(crate) fn membership_predicates(
+        query: &SearchQuery,
+        param_offset: usize,
+        layout: IndexLayout,
+    ) -> Option<Vec<SqlFragment>> {
+        if query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+            || query.contained != ContainedMode::Off
+        {
+            return None;
+        }
+        let mut predicates = Vec::with_capacity(query.parameters.len());
+        let mut offset = param_offset;
+        for param in &query.parameters {
+            let fragment = Self::build_parameter_condition(param, offset, layout)?;
+            let select = Self::simple_membership_arm(&fragment.sql, &param.name)?;
+            let predicate = select.strip_prefix("SELECT resource_id FROM search_index WHERE ")?;
+            offset += fragment.params.len();
+            predicates.push(SqlFragment::with_params(
+                predicate.to_string(),
+                fragment.params,
+            ));
+        }
+        Some(predicates)
+    }
+
     /// Returns the `SELECT` a membership test closes over, when `sql` is exactly
     /// one such test **on `name`**.
     ///
