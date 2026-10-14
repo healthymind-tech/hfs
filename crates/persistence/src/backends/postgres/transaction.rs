@@ -178,7 +178,7 @@ impl PostgresTransaction {
         }
         let extracts = !backend.is_search_offloaded() && !options.defer_search_indexing;
         let extractor = match backend
-            .write_extractor(&*guarded, tenant_id, extracts)
+            .write_extractor(&*guarded, tenant_id, extracts, true)
             .await
         {
             Ok(extractor) => extractor,
@@ -563,7 +563,15 @@ impl PostgresTransaction {
             let extracts = !self.search_offloaded && !self.defer_search_indexing;
             let extractor = match self
                 .backend
-                .write_extractor(self.client()?, self.tenant.tenant_id().as_str(), extracts)
+                // Dirty means this transaction wrote a SearchParameter or
+                // rolled back to a savepoint: what it reads now may be
+                // uncommitted, so it must not reach the shared cache.
+                .write_extractor(
+                    self.client()?,
+                    self.tenant.tenant_id().as_str(),
+                    extracts,
+                    false,
+                )
                 .await
             {
                 Ok(extractor) => extractor,

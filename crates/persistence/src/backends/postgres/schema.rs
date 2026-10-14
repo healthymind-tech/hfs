@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 46;
+pub const SCHEMA_VERSION: i32 = 47;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -443,6 +443,7 @@ async fn migrate_schema(
                 continue;
             }
             45 => migrate_v45_to_v46(client).await?,
+            46 => migrate_v46_to_v47(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4130,6 +4131,65 @@ async fn migrate_v45_to_v46(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v45->v46 failed: {e}")))?;
+    Ok(())
+}
+
+/// v46 -> v47: a per-tenant SearchParameter epoch, bumped by trigger.
+///
+/// Every indexed write needs the tenant's SearchParameter overlay, and it must
+/// be the persisted one: another HFS process may have changed it. Until now
+/// each write re-read it — `SELECT data FROM resources WHERE resource_type =
+/// 'SearchParameter'`, 1,372 seeded rows and ~1.5 MB of JSONB — which was most
+/// of a 74 ms single create and pinned 11 cores at 138 creates/s.
+///
+/// The epoch makes that question one primary-key probe: a writer reads it
+/// after taking the tenant gate and reuses its cached overlay while the value
+/// is unchanged. The triggers fire for every write path that touches a
+/// SearchParameter row — CRUD, bundles, bulk submit, purge, raw maintenance
+/// SQL — so no caller can forget to bump it. `WHEN` keeps them free for every
+/// other resource type: the condition is evaluated without calling the
+/// function. TRUNCATE has no rows to test, so it bumps the row of the empty
+/// tenant id, which every reader adds to its own.
+async fn migrate_v46_to_v47(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS search_parameter_epochs (
+                 tenant_id TEXT PRIMARY KEY,
+                 epoch BIGINT NOT NULL
+             );
+             CREATE OR REPLACE FUNCTION hfs_bump_search_parameter_epoch() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF TG_OP = 'TRUNCATE' THEN
+                     INSERT INTO search_parameter_epochs (tenant_id, epoch) VALUES ('', 1)
+                     ON CONFLICT (tenant_id)
+                     DO UPDATE SET epoch = search_parameter_epochs.epoch + 1;
+                     RETURN NULL;
+                 END IF;
+                 INSERT INTO search_parameter_epochs (tenant_id, epoch)
+                 VALUES (CASE WHEN TG_OP = 'DELETE' THEN OLD.tenant_id ELSE NEW.tenant_id END, 1)
+                 ON CONFLICT (tenant_id)
+                 DO UPDATE SET epoch = search_parameter_epochs.epoch + 1;
+                 RETURN NULL;
+             END
+             $$;
+             DROP TRIGGER IF EXISTS trg_search_parameter_epoch_write ON resources;
+             CREATE TRIGGER trg_search_parameter_epoch_write
+                 AFTER INSERT OR UPDATE ON resources FOR EACH ROW
+                 WHEN (NEW.resource_type = 'SearchParameter')
+                 EXECUTE FUNCTION hfs_bump_search_parameter_epoch();
+             DROP TRIGGER IF EXISTS trg_search_parameter_epoch_delete ON resources;
+             CREATE TRIGGER trg_search_parameter_epoch_delete
+                 AFTER DELETE ON resources FOR EACH ROW
+                 WHEN (OLD.resource_type = 'SearchParameter')
+                 EXECUTE FUNCTION hfs_bump_search_parameter_epoch();
+             DROP TRIGGER IF EXISTS trg_search_parameter_epoch_truncate ON resources;
+             CREATE TRIGGER trg_search_parameter_epoch_truncate
+                 AFTER TRUNCATE ON resources FOR EACH STATEMENT
+                 EXECUTE FUNCTION hfs_bump_search_parameter_epoch();",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v46->v47 failed: {e}")))?;
     Ok(())
 }
 
