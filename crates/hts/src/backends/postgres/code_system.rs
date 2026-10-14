@@ -1218,6 +1218,51 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         }))
     }
 
+    async fn supplements_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        // Mirrors the SQLite twin: bare or `|version`-qualified target match,
+        // one row per supplement URL in precedence order.
+        let sql = format!(
+            "SELECT url, version FROM code_systems \
+             WHERE content = 'supplement' \
+               AND ((resource_json->>'supplements') = $1 \
+                    OR (resource_json->>'supplements') LIKE $1 || '|%') \
+             ORDER BY url, {}",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        let rows = client
+            .query(&sql, &[&system_url])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let mut out: Vec<SupplementInfo> = Vec::new();
+        for r in rows {
+            let url: String = r.get(0);
+            let version: Option<String> = r.get(1);
+            if out
+                .iter()
+                .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
+            {
+                continue;
+            }
+            out.push(SupplementInfo {
+                target_url: system_url.to_owned(),
+                supplement_canonical: match version {
+                    Some(v) => format!("{url}|{v}"),
+                    None => url,
+                },
+            });
+        }
+        Ok(out)
+    }
+
     async fn supplement_designations(
         &self,
         _ctx: &TenantContext,

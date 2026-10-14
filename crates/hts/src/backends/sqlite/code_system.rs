@@ -1363,6 +1363,60 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
 
+    async fn supplements_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // `supplements` may carry the target's `|version`; match the bare
+            // URL either way. One row per supplement URL — the precedence
+            // order puts the preferred version first and we dedupe on url.
+            let sql = format!(
+                "SELECT url, version FROM code_systems \
+                 WHERE content = 'supplement' \
+                   AND (json_extract(resource_json, '$.supplements') = ?1 \
+                        OR json_extract(resource_json, '$.supplements') LIKE ?1 || '|%') \
+                 ORDER BY url, {}",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
+            let mut stmt = conn
+                .prepare_cached(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![system_url], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut out: Vec<SupplementInfo> = Vec::new();
+            for (url, version) in rows {
+                if out
+                    .iter()
+                    .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
+                {
+                    continue;
+                }
+                out.push(SupplementInfo {
+                    target_url: system_url.clone(),
+                    supplement_canonical: match version {
+                        Some(v) => format!("{url}|{v}"),
+                        None => url,
+                    },
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     async fn supplement_designations(
         &self,
         _ctx: &TenantContext,

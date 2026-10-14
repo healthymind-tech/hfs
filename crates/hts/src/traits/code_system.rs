@@ -200,6 +200,21 @@ pub trait CodeSystemOperations: Send + Sync {
         Ok(None)
     }
 
+    /// Every stored supplement (`content=supplement`) whose `supplements`
+    /// field names `system_url` (bare or `|version`-qualified), one entry per
+    /// supplement canonical URL (the preferred version when several are
+    /// stored). Drives the automatic supplement application in `$lookup` /
+    /// `$expand` (`HTS_AUTO_SUPPLEMENTS`).
+    ///
+    /// Default implementation returns an empty list.
+    async fn supplements_for_system(
+        &self,
+        _ctx: &TenantContext,
+        _system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        Ok(Vec::new())
+    }
+
     /// Batch-fetch designations contributed by named CodeSystem supplements.
     ///
     /// Mirrors [`Self::concept_designations`] but reads from CSes whose URLs
