@@ -174,11 +174,11 @@ pub use preconditions::{
     precondition_failed_entry,
 };
 pub use search::{
-    ChainedSearchProvider, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider,
-    MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider, SearchProvider,
-    SearchResult, TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
-    is_include_truncation_marker, resolve_includes_iterate_continuation,
-    resolve_includes_iterative,
+    ChainedSearchProvider, DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID,
+    IncludeProvider, MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider,
+    SearchProvider, SearchResult, TerminologySearchProvider, TextSearchProvider,
+    include_truncation_outcome, is_include_truncation_marker,
+    resolve_includes_iterate_continuation, resolve_includes_iterative,
 };
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{

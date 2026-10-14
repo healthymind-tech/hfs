@@ -88,6 +88,8 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | reindex (type) | POST | `/[type]/$reindex` |
 | reindex status | GET | `/$reindex-status/[job_id]` |
 | reindex cancel | DELETE | `/$reindex-status/[job_id]` |
+| meta (system / type / instance) | GET/POST | `/$meta`, `/[type]/$meta`, `/[type]/[id]/$meta` |
+| meta-add / meta-delete | POST | `/[type]/[id]/$meta-add`, `/[type]/[id]/$meta-delete` |
 
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
@@ -190,6 +192,23 @@ the background and is polled via `/$reindex-status/[job_id]`.
 Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
 `0` / `4` / `8`) — each attributed to the requesting principal.
+
+### `$meta`, `$meta-add`, `$meta-delete`
+
+`GET|POST /$meta`, `/[type]/$meta` and `/[type]/[id]/$meta` answer a
+`Parameters` whose `return` parameter is a `Meta`: the resource's own `meta`
+at instance level, and at type / system level every profile, tag and
+security label in use on live resources (read from the search index, so it is
+what `_profile=` / `_tag=` / `_security=` would match; backends without a
+queryable index answer `501`).
+
+`POST /[type]/[id]/$meta-add` and `$meta-delete` take a `Parameters` with one
+`meta` parameter (`valueMeta`) and add or remove its `profile`, `security` and
+`tag` entries — Codings match on `system` + `code`, profiles on the canonical
+string. Like HAPI, the change is stored as a **new version** of the resource
+(`meta.versionId` advances, the change appears in `_history`, tag searches see
+it at once) even though nothing but `meta` changed; an input that changes
+nothing stores nothing. Both answer the resulting `Meta`.
 
 ### `Patient/$everything`
 

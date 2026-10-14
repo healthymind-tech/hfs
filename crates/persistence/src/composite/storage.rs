@@ -52,7 +52,9 @@ use crate::core::{
     SearchResult, SofRunner, StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider,
     TextSearchProvider, TypeHistoryProvider, VersionedStorage,
 };
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
+use crate::error::{
+    BackendError, ResourceError, SearchError, StorageError, StorageResult, TransactionError,
+};
 use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
 use crate::types::{
@@ -1568,6 +1570,39 @@ impl SearchProvider for CompositeStorage {
             .get(self.config.primary_id().unwrap_or("primary"))
             .map(|p| p.modifiers_for_param_type(param_type))
             .unwrap_or_default()
+    }
+
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<crate::core::DistinctMetaValue>> {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            && let Some(provider) = self.search_providers.get(&search_backend.id)
+        {
+            return provider
+                .distinct_meta_values(tenant, resource_type, param)
+                .await;
+        }
+        match self
+            .search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+        {
+            Some(provider) => {
+                provider
+                    .distinct_meta_values(tenant, resource_type, param)
+                    .await
+            }
+            None => Err(StorageError::Search(SearchError::IncludeNotSupported {
+                operation: "type- and system-level $meta".to_string(),
+            })),
+        }
     }
 
     /// A composite's search lags its primary on two axes, and this closes

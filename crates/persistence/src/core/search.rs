@@ -416,6 +416,22 @@ fn replace_cursor_param(url: &str, cursor: &str) -> String {
     format!("{base}{sep}_cursor={cursor}")
 }
 
+/// One distinct value of a resource-level metadata search parameter, as
+/// [`SearchProvider::distinct_meta_values`] reads it from the search index:
+/// a token (`_tag`, `_security`) has a system and code, a uri (`_profile`)
+/// has the uri alone.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DistinctMetaValue {
+    /// The token's system, when it has one.
+    pub system: Option<String>,
+    /// The token's code.
+    pub code: Option<String>,
+    /// The token's display, when it was indexed.
+    pub display: Option<String>,
+    /// The uri value (profile canonical).
+    pub uri: Option<String>,
+}
+
 /// Basic search provider for single resource type queries.
 ///
 /// This trait provides search functionality for a single resource type,
@@ -544,6 +560,30 @@ pub trait SearchProvider: ResourceStorage {
     fn modifiers_for_param_type(&self, param_type: SearchParamType) -> Vec<&'static str> {
         let _ = param_type;
         Vec::new()
+    }
+
+    /// The distinct values of a resource-level token or uri search parameter
+    /// — `_tag`, `_security`, `_profile` — across the live (not deleted)
+    /// resources of `resource_type`, or of every type when `None`.
+    ///
+    /// Backs the type- and system-level `$meta` operation, which reports
+    /// every profile, tag and security label in use. Read from the search
+    /// index, so it reflects what a `_tag=` / `_profile=` search would match.
+    ///
+    /// Defaults to "not supported" (a `501` at the REST layer); backends with
+    /// a queryable index override it.
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<DistinctMetaValue>> {
+        let _ = (tenant, resource_type, param);
+        Err(crate::error::StorageError::Search(
+            crate::error::SearchError::IncludeNotSupported {
+                operation: "type- and system-level $meta".to_string(),
+            },
+        ))
     }
 
     /// Makes every write this storage acknowledged before the call visible
