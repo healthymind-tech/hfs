@@ -371,7 +371,7 @@ where
 
     // Pre-process :in / :not-in / :above / :below modifiers via the
     // terminology server.
-    let pairs = if let Some(terminology) = state.search_terminology() {
+    let expanded = if let Some(terminology) = state.search_terminology() {
         expand_terminology_params(pairs, terminology, state.expansion_failure_policy()).await?
     } else {
         // No terminology server configured: token `:in` / `:above` / `:below`
@@ -410,8 +410,9 @@ where
                 }
             }
         }
-        pairs
+        pairs.into_iter().map(ExpandedPair::unchanged).collect()
     };
+    let pairs: Vec<(String, String)> = expanded.iter().filter_map(|e| e.applied.clone()).collect();
 
     let mut search_params = SearchParams::from_pairs(pairs);
 
@@ -468,6 +469,7 @@ where
     // `_total=bogus` both used to answer `200`, the sort silently replaced by
     // an id sort and the `_total` by none.
     let mut sort_warnings = sort_warnings;
+    let mut total_ignored = false;
     if let Some(value) =
         crate::extractors::search_query_builder::invalid_total_value(&search_params)
     {
@@ -480,6 +482,7 @@ where
             });
         }
         sort_warnings.push(format!("{message}; it was ignored"));
+        total_ignored = true;
         let retained: Vec<(String, String)> = search_params
             .iter()
             .filter(|(k, _)| k.as_str() != "_total")
@@ -720,9 +723,23 @@ where
     // warnings already are.
     let truncation_messages = drain_truncation_markers(&mut result.included);
 
-    // Build the self link URL
+    // Build the self link URL from the parameters as the client sent them,
+    // less those the search ignored (see `ExpandedPair`).
     let public_base = state.public_base_url_for_request(tenant);
-    let self_link = build_search_url(&public_base, resource_type, &search_params);
+    let shown: Vec<(String, String)> = expanded
+        .into_iter()
+        .filter(|e| {
+            e.applied.as_ref().is_some_and(|(key, _)| {
+                !ignored_params.contains(key) && !(total_ignored && key == "_total")
+            })
+        })
+        .map(|e| e.original)
+        .collect();
+    let self_link = build_search_url(
+        &public_base,
+        resource_type,
+        &SearchParams::from_pairs(shown),
+    );
 
     // Counts for the debug line below, taken before `into_bundle` consumes the
     // result.
@@ -1222,12 +1239,13 @@ async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
     terminology: &SearchTerminology,
     policy: ExpansionFailurePolicy,
-) -> Result<Vec<(String, String)>, RestError> {
-    let mut result: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+) -> Result<Vec<ExpandedPair>, RestError> {
+    let mut result: Vec<ExpandedPair> = Vec::with_capacity(pairs.len());
 
     for (key, value) in pairs {
+        let original = (key.clone(), value.clone());
         if is_chained_key(&key) {
-            result.push((key, value));
+            result.push(ExpandedPair::unchanged(original));
             continue;
         }
         let Some((param_name, modifier)) = key
@@ -1243,28 +1261,55 @@ async fn expand_terminology_params(
                 )
             })
         else {
-            result.push((key, value));
+            result.push(ExpandedPair::unchanged(original));
             continue;
         };
 
-        match rewrite_terminology_modifier(terminology, policy, &modifier, &value).await {
-            Rewrite::Tokens(tokens) => result.push((param_name.to_string(), tokens)),
-            Rewrite::NegatedTokens(tokens) => result.push((format!("{param_name}:not"), tokens)),
-            Rewrite::Unchanged => result.push((key, value)),
-            Rewrite::Dropped => {}
-            Rewrite::Failed { kind, message } => {
-                return Err(SearchError::TerminologyFailure {
-                    modifier: modifier.to_string(),
-                    param: param_name.to_string(),
-                    kind,
-                    message,
+        let applied =
+            match rewrite_terminology_modifier(terminology, policy, &modifier, &value).await {
+                Rewrite::Tokens(tokens) => Some((param_name.to_string(), tokens)),
+                Rewrite::NegatedTokens(tokens) => Some((format!("{param_name}:not"), tokens)),
+                Rewrite::Unchanged => Some((key, value)),
+                Rewrite::Dropped => None,
+                Rewrite::Failed { kind, message } => {
+                    return Err(SearchError::TerminologyFailure {
+                        modifier: modifier.to_string(),
+                        param: param_name.to_string(),
+                        kind,
+                        message,
+                    }
+                    .into());
                 }
-                .into());
-            }
-        }
+            };
+        result.push(ExpandedPair { original, applied });
     }
 
     Ok(result)
+}
+
+/// One search parameter as the client sent it and as the search applies it.
+///
+/// Terminology expansion rewrites `code:in=<ValueSet>` into the expanded
+/// `code=<system|code,…>` (or a sentinel that matches nothing), which is what
+/// the query needs and not what the client asked for. The self link — and the
+/// paging links built from it — must carry the client's own parameter: they
+/// used to show the rewrite, `code=__hts_empty_expansion__` or a thousand
+/// codes long, and a next page re-sent that instead of re-expanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedPair {
+    /// The pair as the client sent it.
+    original: (String, String),
+    /// The pair the search applies; `None` when the parameter is dropped.
+    applied: Option<(String, String)>,
+}
+
+impl ExpandedPair {
+    fn unchanged(pair: (String, String)) -> Self {
+        Self {
+            applied: Some(pair.clone()),
+            original: pair,
+        }
+    }
 }
 
 /// Sentinel token that cannot match any indexed code, used to force an empty
@@ -1607,7 +1652,9 @@ mod tests {
         url: &str,
         policy: ExpansionFailurePolicy,
     ) -> Result<Vec<(String, String)>, RestError> {
-        expand_terminology_params(params, &terminology(url), policy).await
+        expand_terminology_params(params, &terminology(url), policy)
+            .await
+            .map(|pairs| pairs.into_iter().filter_map(|e| e.applied).collect())
     }
 
     /// A mock terminology server answering every `$expand` with `expansion`;
@@ -1846,6 +1893,44 @@ mod tests {
         assert_eq!(
             result,
             vec![("code".to_string(), HTS_EMPTY_EXPANSION.to_string())]
+        );
+    }
+
+    /// The client's own pair travels with every rewrite, so the self link can
+    /// show what was asked rather than the expansion or its no-match sentinel.
+    #[tokio::test]
+    async fn test_expand_terminology_params_keeps_the_client_pair() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [] }
+        }))
+        .await;
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let expanded = expand_terminology_params(
+            vec![
+                pair("code:in", "http://example.org/vs"),
+                pair("code:not-in", "http://example.org/vs"),
+                pair("status", "final"),
+            ],
+            &terminology(&url),
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            expanded,
+            vec![
+                ExpandedPair {
+                    original: pair("code:in", "http://example.org/vs"),
+                    applied: Some(pair("code", HTS_EMPTY_EXPANSION)),
+                },
+                ExpandedPair {
+                    original: pair("code:not-in", "http://example.org/vs"),
+                    applied: None,
+                },
+                ExpandedPair::unchanged(pair("status", "final")),
+            ]
         );
     }
 
