@@ -50,7 +50,12 @@ CREATE TABLE IF NOT EXISTS code_systems (
     -- database behaves exactly as it did before. Had this defaulted to 0 the
     -- upsert below could not distinguish 'asserted authoritative' from 'never
     -- asserted', and a re-imported copy could not demote itself.
-    authority_rank INTEGER
+    authority_rank INTEGER,
+    -- Byte-sortable key derived from `version` (see `version_order.rs`), so
+    -- `ORDER BY version_sort DESC` picks the semantically newest version
+    -- (10.0.0 above 9.0.0 above 2018-08-12) instead of the textually largest.
+    -- Recomputed on every write; backfilled by `migrate_version_sort`.
+    version_sort  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -134,7 +139,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
     updated_at    TEXT NOT NULL,
     resource_json TEXT,
     -- See code_systems.authority_rank.
-    authority_rank INTEGER
+    authority_rank INTEGER,
+    -- See code_systems.version_sort.
+    version_sort  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
@@ -556,6 +563,54 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
         }
     }
 
+    Ok(())
+}
+
+/// Add `version_sort` to `code_systems` / `value_sets` and backfill it for
+/// every versioned row that does not have one yet.
+///
+/// The key is computed in Rust ([`crate::version_order::version_sort_key`])
+/// because SQL has no portable way to express the numeric-then-date-then-text
+/// ordering. Idempotent: the `ALTER TABLE` is skipped when the column exists
+/// and the backfill only touches rows whose key is `NULL`, so a database
+/// written by an older binary (which leaves the column `NULL`) converges on
+/// the next start.
+pub fn migrate_version_sort(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for table in ["code_systems", "value_sets"] {
+        match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN version_sort TEXT")) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+        backfill_version_sort(conn, table)?;
+    }
+    Ok(())
+}
+
+fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<()> {
+    let pending: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, version FROM {table} \
+             WHERE version IS NOT NULL AND version_sort IS NULL"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut update = conn.prepare(&format!(
+        "UPDATE {table} SET version_sort = ?1 WHERE id = ?2"
+    ))?;
+    for (id, version) in &pending {
+        let key = crate::version_order::version_sort_key(Some(version));
+        update.execute(rusqlite::params![key, id])?;
+    }
+    tracing::info!(
+        table,
+        rows = pending.len(),
+        "Backfilled version_sort keys for semantic version ordering"
+    );
     Ok(())
 }
 

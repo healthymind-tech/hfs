@@ -294,6 +294,13 @@ BEGIN
     END IF;
 END $$;
 
+-- ── version_sort (semantic version ordering) ───────────────────────────────────
+-- Byte-sortable key derived from `version` (see `version_order.rs`) so the
+-- precedence ORDER BY picks the semantically newest version. Backfilled by
+-- `migrate_version_sort_pg` right after this schema is applied.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS version_sort TEXT;
+ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS version_sort TEXT;
+
 -- ── ICD-9-CM re-import backfill (issue #802) ────────────────────────────────────
 -- The importer previously required a pipe delimiter that the real bundled CMS
 -- file never has, so every code silently failed to parse while the file was
@@ -337,6 +344,47 @@ pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres
         .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
         .await;
     result
+}
+
+/// Backfill `version_sort` for every versioned `code_systems` / `value_sets`
+/// row that does not have one yet. Mirrors the SQLite
+/// `schema::migrate_version_sort`; idempotent and cheap (one SELECT per table,
+/// one UPDATE per missing row — only on first start after the upgrade or after
+/// an older binary wrote rows without the key).
+pub async fn migrate_version_sort_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
+    for table in ["code_systems", "value_sets"] {
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT id, version FROM {table} \
+                     WHERE version IS NOT NULL AND version_sort IS NULL"
+                ),
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let update = client
+            .prepare(&format!(
+                "UPDATE {table} SET version_sort = $1 WHERE id = $2"
+            ))
+            .await?;
+        for row in &rows {
+            let id: String = row.get(0);
+            let version: String = row.get(1);
+            let key = crate::version_order::version_sort_key(Some(&version));
+            client.execute(&update, &[&key, &id]).await?;
+        }
+        tracing::info!(
+            table,
+            rows = rows.len(),
+            "Backfilled version_sort keys for semantic version ordering"
+        );
+    }
+    Ok(())
 }
 
 /// Build (or rebuild) the transitive ancestor closure for one code system.

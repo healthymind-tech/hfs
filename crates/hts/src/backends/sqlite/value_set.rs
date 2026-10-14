@@ -1816,10 +1816,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 } else {
                     let mut sorted = candidates.clone();
                     sorted.sort_by(|a, b| {
-                        b.version
-                            .as_deref()
-                            .unwrap_or("")
-                            .cmp(a.version.as_deref().unwrap_or(""))
+                        crate::version_order::compare_versions(
+                            b.version.as_deref(),
+                            a.version.as_deref(),
+                        )
                     });
                     sorted.into_iter().next().cloned()
                 }

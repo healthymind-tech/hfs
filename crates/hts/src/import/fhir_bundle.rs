@@ -302,8 +302,8 @@ fn write_code_system(
     conn.execute(
         "INSERT OR IGNORE INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
-          authority_rank)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+          authority_rank, version_sort)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
         rusqlite::params![
             storage_id,
             cs.url,
@@ -315,6 +315,7 @@ fn write_code_system(
             resource_json,
             now,
             cs.authority_rank,
+            version_sort_key(cs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -346,7 +347,8 @@ fn write_code_system(
            content        = ?4,
            resource_json  = ?5,
            updated_at     = ?6,
-           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9),
+           version_sort   = ?10
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
@@ -362,6 +364,7 @@ fn write_code_system(
             cs.url,
             cs.version,
             cs.authority_rank,
+            version_sort_key(cs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -640,8 +643,8 @@ fn write_value_set(
     conn.execute(
         "INSERT OR IGNORE INTO value_sets
          (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
-          authority_rank)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+          authority_rank, version_sort)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
         rusqlite::params![
             storage_id,
             vs.url,
@@ -653,6 +656,7 @@ fn write_value_set(
             resource_json,
             now,
             vs.authority_rank,
+            version_sort_key(vs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -670,7 +674,8 @@ fn write_value_set(
            compose_json   = ?4,
            resource_json  = ?5,
            updated_at     = ?6,
-           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9),
+           version_sort   = ?10
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
@@ -686,6 +691,7 @@ fn write_value_set(
             vs.url,
             vs.version,
             vs.authority_rank,
+            version_sort_key(vs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;

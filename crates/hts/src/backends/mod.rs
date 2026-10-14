@@ -91,7 +91,7 @@ fn build_cs_precedence_order_by(alias: &str) -> String {
              (SELECT 1 FROM concepts hc WHERE hc.system_id = {alias}.id) \
              THEN 0 ELSE 1 END), \
          COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
@@ -121,7 +121,7 @@ pub(crate) fn vs_precedence_order_by(alias: &str) -> Cow<'static, str> {
 fn build_vs_precedence_order_by(alias: &str) -> String {
     format!(
         "COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
@@ -161,7 +161,7 @@ mod precedence_tests {
              (SELECT 1 FROM concepts hc WHERE hc.system_id = code_systems.id) \
              THEN 0 ELSE 1 END), \
          COALESCE(code_systems.authority_rank, 0), \
-         COALESCE(code_systems.version, '') DESC, \
+         COALESCE(code_systems.version_sort, code_systems.version, '') DESC, \
          code_systems.id";
 
     #[test]
@@ -195,7 +195,7 @@ mod precedence_tests {
     #[test]
     fn vs_precedence_cached_and_fallback_match_shipped_sql() {
         const VS_EXPECTED: &str = "COALESCE(value_sets.authority_rank, 0), \
-         COALESCE(value_sets.version, '') DESC, \
+         COALESCE(value_sets.version_sort, value_sets.version, '') DESC, \
          value_sets.id";
         assert_eq!(&*vs_precedence_order_by("value_sets"), VS_EXPECTED);
         assert_eq!(

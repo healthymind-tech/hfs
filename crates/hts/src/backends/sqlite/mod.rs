@@ -565,6 +565,10 @@ impl SqliteTerminologyBackend {
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
@@ -741,6 +745,10 @@ impl SqliteTerminologyBackend {
             // See the on-disk path: must follow the drop_url_unique rebuilds.
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
+            })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
             })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
