@@ -965,11 +965,22 @@ impl PackageManager {
         });
         // Keep an explicit flag once set (a dependency later installed on
         // purpose stays explicit; a re-install as a dependency keeps it).
-        if let Ok(Some(prior)) = self.deps.store.get_package(tenant, name, version).await
-            && prior.document.get("explicit").and_then(Value::as_bool) == Some(true)
+        let prior = self
+            .deps
+            .store
+            .get_package(tenant, name, version)
+            .await
+            .ok()
+            .flatten();
+        if prior
+            .as_ref()
+            .is_some_and(|p| p.document.get("explicit").and_then(Value::as_bool) == Some(true))
         {
             document["explicit"] = json!(true);
         }
+        // A reinstall that is stopped leaves the earlier, complete install
+        // in place, so the package stays installed.
+        let was_installed = prior.as_ref().is_some_and(|p| p.status == "installed");
         let mut record = PackageRecord {
             name: name.to_string(),
             version: version.to_string(),
@@ -1149,7 +1160,7 @@ impl PackageManager {
                 self.resolve_dependency(dep, range, &installed_now, options.dependency_policy),
             );
         }
-        record.status = if job.cancelled() {
+        record.status = if job.cancelled() && !was_installed {
             "cancelled".into()
         } else {
             "installed".into()
