@@ -46,6 +46,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::ecl;
 use crate::error::HtsError;
+use crate::implicit_vs::{ImplicitVsPattern, parse_implicit_vs_url};
 use crate::traits::ValueSetOperations;
 use crate::types::{
     ExpandRequest, ExpandResponse, ExpansionContains, ResourceSearchQuery, ValidateCodeRequest,
@@ -796,7 +797,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // `resolve_value_set_versioned` win would expand its empty/skeleton
                 // compose and silently return zero codes for SNOMED — masking the
                 // working `bfs_isa_page`/implicit-cache traversal below.
-                let implicit_short_circuit = parse_fhir_vs_url(url).is_some();
+                let implicit_short_circuit = parse_implicit_vs_url(url).is_some();
                 let resolution = if implicit_short_circuit {
                     Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
                 } else {
@@ -999,13 +1000,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
                         if !cache_populated {
                             if let Some(count) = req.count.filter(|&c| c > 0) {
-                                let cs_pat = if let Ok(cs_url) =
-                                    find_cs_for_implicit_vs(&conn, url, req.date.as_deref())
-                                {
-                                    Some((cs_url, FhirVsPattern::AllConcepts))
-                                } else {
-                                    parse_fhir_vs_url(url)
-                                };
+                                // The URL forms first: `find_cs_for_implicit_vs`
+                                // parses every stored CodeSystem's JSON.
+                                let cs_pat = match parse_implicit_vs_url(url) {
+                                    Some(p) => Some(p),
+                                    None => find_cs_for_implicit_vs(&conn, url, req.date.as_deref())
+                                        .ok()
+                                        .map(|cs_url| (cs_url, ImplicitVsPattern::AllConcepts)),
+                                }
+                                // ECL has no paged shortcut: it goes to the cached
+                                // expansion below.
+                                .filter(|(_, p)| implicit_ecl(p).is_none());
 
                                 if let Some((cs_url, pattern)) = cs_pat {
                                     let system_id = resolve_system_id_cached(&conn, &cs_url)?;
@@ -1379,7 +1384,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // `resolve_value_set_versioned` win would expand its empty/skeleton
             // compose to zero codes and force `result=false` for every input —
             // masking the targeted `validate_fhir_vs` lookup below.
-            let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+            let implicit_short_circuit = parse_implicit_vs_url(&url).is_some();
             let resolution = if implicit_short_circuit {
                 Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
             } else {
@@ -1456,7 +1461,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
                         // instead of materializing all concepts (which times out for large
                         // code systems like SNOMED CT with ~350k concepts).
-                        if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
+                        if let Some((cs_url, pattern)) = parse_implicit_vs_url(&url) {
                             let found = validate_fhir_vs(
                                 &conn,
                                 &cs_url,
@@ -5815,38 +5820,13 @@ fn fnv64(data: &[u8]) -> u64 {
     h
 }
 
-/// Pattern extracted from a `?fhir_vs` implicit ValueSet URL.
-///
-/// FHIR defines query-parameter patterns on a CodeSystem URL that implicitly
-/// describe a ValueSet (FHIR R4 §4.8.7):
-///
-/// | URL form | Pattern | Meaning |
-/// |---|---|---|
-/// | `<cs>?fhir_vs` | `AllConcepts` | Every code in the CodeSystem |
-/// | `<cs>?fhir_vs=isa/<code>` | `IsA(code)` | Descendants (subsumees) of `code` |
-#[derive(Debug)]
-enum FhirVsPattern {
-    AllConcepts,
-    IsA(String),
-}
-
-/// Parse a `?fhir_vs` implicit ValueSet URL.
-///
-/// Returns `Some((cs_url, pattern))` on a recognised pattern, `None` otherwise.
-fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
-    let (base, query) = url.split_once('?')?;
-    if !query.starts_with("fhir_vs") {
-        return None;
+/// The ECL an `ecl/` or `refset/` implicit ValueSet pattern stands for.
+fn implicit_ecl(pattern: &ImplicitVsPattern) -> Option<String> {
+    match pattern {
+        ImplicitVsPattern::Ecl(expr) => Some(expr.clone()),
+        ImplicitVsPattern::Refset(id) => Some(format!("^ {id}")),
+        _ => None,
     }
-    let rest = &query["fhir_vs".len()..];
-    if rest.is_empty() {
-        return Some((base.to_owned(), FhirVsPattern::AllConcepts));
-    }
-    let value = rest.strip_prefix('=')?;
-    if let Some(code) = value.strip_prefix("isa/") {
-        return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
-    }
-    None
 }
 
 /// Check whether a compose is a "simple hierarchy" and extract its parameters.
@@ -6078,13 +6058,13 @@ fn bfs_expand_page(
     conn: &Connection,
     cs_url: &str,
     system_id: &str,
-    pattern: &FhirVsPattern,
+    pattern: &ImplicitVsPattern,
     offset: usize,
     limit: usize,
     filter_lower: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     match pattern {
-        FhirVsPattern::AllConcepts => {
+        ImplicitVsPattern::AllConcepts => {
             let sql_limit = limit as i64;
             let sql_offset = offset as i64;
             if let Some(f) = filter_lower {
@@ -6187,7 +6167,7 @@ fn bfs_expand_page(
                 .map_err(|e| HtsError::StorageError(e.to_string()))
             }
         }
-        FhirVsPattern::IsA(root_code) => bfs_isa_page(
+        ImplicitVsPattern::IsA(root_code) => bfs_isa_page(
             conn,
             cs_url,
             system_id,
@@ -6197,6 +6177,21 @@ fn bfs_expand_page(
             limit,
             filter_lower,
         ),
+        // http://loinc.org/vs/<LP…>: the part's descendants (`<`).
+        ImplicitVsPattern::DescendantOf(root_code) => bfs_isa_page(
+            conn,
+            cs_url,
+            system_id,
+            root_code,
+            false,
+            offset,
+            limit,
+            filter_lower,
+        ),
+        // No paged shortcut: callers send these to the cached expansion.
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => Err(HtsError::Internal(
+            "bfs_expand_page called for an ECL implicit ValueSet".into(),
+        )),
     }
 }
 
@@ -7939,7 +7934,7 @@ fn finish_validate_code_response(
 fn validate_fhir_vs(
     conn: &Connection,
     cs_url: &str,
-    pattern: &FhirVsPattern,
+    pattern: &ImplicitVsPattern,
     code: &str,
     system: Option<&str>,
 ) -> Result<Option<ExpansionContains>, HtsError> {
@@ -7962,8 +7957,17 @@ fn validate_fhir_vs(
         }
     };
 
+    if let Some(expr) = implicit_ecl(pattern) {
+        // One membership test, not a full evaluation.
+        let hit = ecl::filter_candidates(conn, &system_id, &expr, &[code.to_owned()])?;
+        if hit.is_empty() {
+            return Ok(None);
+        }
+        return validate_fhir_vs(conn, cs_url, &ImplicitVsPattern::AllConcepts, code, system);
+    }
+
     match pattern {
-        FhirVsPattern::AllConcepts => {
+        ImplicitVsPattern::AllConcepts => {
             let row = conn
                 .query_row(
                     "SELECT code, display FROM concepts \
@@ -7990,7 +7994,10 @@ fn validate_fhir_vs(
                 contains: vec![],
             }))
         }
-        FhirVsPattern::IsA(root_code) => {
+        ImplicitVsPattern::IsA(root_code) | ImplicitVsPattern::DescendantOf(root_code) => {
+            if matches!(pattern, ImplicitVsPattern::DescendantOf(_)) && code == root_code {
+                return Ok(None);
+            }
             // O(1) closure lookup: is root_code an ancestor-or-self of code?
             let is_member: bool = conn
                 .query_row(
@@ -8033,6 +8040,7 @@ fn validate_fhir_vs(
                 contains: vec![],
             }))
         }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => unreachable!("handled above"),
     }
 }
 
@@ -8058,10 +8066,12 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     // Determine the code system and the set of concepts to cache.
     // AllConcepts is also used for the CodeSystem.valueSet link path.
-    let (cs_url, pattern) = if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
-        (cs_url, FhirVsPattern::AllConcepts)
-    } else if let Some((cs_url, pat)) = parse_fhir_vs_url(url) {
+    // The URL forms first: `find_cs_for_implicit_vs` parses every stored
+    // CodeSystem's JSON.
+    let (cs_url, pattern) = if let Some((cs_url, pat)) = parse_implicit_vs_url(url) {
         (cs_url, pat)
+    } else if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
+        (cs_url, ImplicitVsPattern::AllConcepts)
     } else {
         return Err(HtsError::NotFound(format!(
             "A definition for the value Set \'{url}\' could not be found"
@@ -8070,6 +8080,12 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     let system_id = resolve_system_id_cached(conn, &cs_url)?
         .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+
+    // Evaluate ECL before taking the write lock.
+    let ecl_members = match implicit_ecl(&pattern) {
+        Some(expr) => Some(ecl::parse_and_evaluate(conn, &system_id, &expr)?),
+        None => None,
+    };
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
     // cannot both see an empty cache and then duplicate-write the expansion.
@@ -8107,23 +8123,37 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
     }
 
     let insert_result = match &pattern {
-        FhirVsPattern::AllConcepts => conn.execute(
+        ImplicitVsPattern::AllConcepts => conn.execute(
             "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
              SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
             rusqlite::params![url, cs_url, system_id],
         ),
-        FhirVsPattern::IsA(root_code) => {
+        ImplicitVsPattern::IsA(root_code) | ImplicitVsPattern::DescendantOf(root_code) => {
             // O(1) closure JOIN replaces the recursive CTE.
-            // << semantics: all descendants plus the root itself (self-link in closure).
+            // << semantics: all descendants plus the root itself (self-link in
+            // closure); `DescendantOf` drops the self-link.
+            let include_root = matches!(pattern, ImplicitVsPattern::IsA(_));
             conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
                  SELECT ?1, ?2, c.code, c.display
                  FROM   concept_closure cc
                  JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
-                rusqlite::params![url, cs_url, system_id, root_code],
+                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4
+                   AND  (?5 OR cc.descendant_code != ?4)",
+                rusqlite::params![url, cs_url, system_id, root_code, include_root],
             )
         }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => (|| {
+            let mut stmt = conn.prepare_cached(
+                "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut n = 0;
+            for c in ecl_members.iter().flatten() {
+                n += stmt.execute(rusqlite::params![url, cs_url, c.code, c.display])?;
+            }
+            Ok(n)
+        })(),
     };
 
     if let Err(e) = insert_result {
@@ -10532,6 +10562,147 @@ mod tests {
             }
           }]
         }"#
+    }
+
+    /// A LOINC-shaped CodeSystem: part LP1-1 > part LP2-2 > term 2345-7, and
+    /// an unrelated term.
+    fn bundle_loinc_like() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "loinc",
+              "url": "http://loinc.org",
+              "version": "2.80",
+              "status": "active",
+              "content": "complete",
+              "concept": [
+                {
+                  "code": "LP1-1",
+                  "display": "Chemistry",
+                  "concept": [{
+                    "code": "LP2-2",
+                    "display": "Glucose",
+                    "concept": [{ "code": "2345-7", "display": "Glucose [Mass/volume] in Serum or Plasma" }]
+                  }]
+                },
+                { "code": "999-9", "display": "Unrelated term" }
+              ]
+            }
+          }]
+        }"#
+    }
+
+    async fn expand_codes(
+        b: &SqliteTerminologyBackend,
+        url: &str,
+        count: Option<u32>,
+    ) -> Vec<String> {
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some(url.into()),
+                    count,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("expand {url}: {e:?}"));
+        let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
+        codes.sort();
+        codes
+    }
+
+    async fn validates(b: &SqliteTerminologyBackend, url: &str, code: &str) -> bool {
+        b.validate_code(
+            &ctx(),
+            ValidateCodeRequest {
+                url: Some(url.into()),
+                code: code.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("validate {url} {code}: {e:?}"))
+        .result
+    }
+
+    /// `http://loinc.org/vs` is all of LOINC; `http://loinc.org/vs/<LP…>` the
+    /// codes under that part (not the part itself). Both the paged cold path
+    /// (`count`) and the cached full expansion.
+    #[tokio::test]
+    async fn loinc_implicit_value_sets_expand_and_validate() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_loinc_like().as_bytes())
+            .await
+            .unwrap();
+        let all = ["2345-7", "999-9", "LP1-1", "LP2-2"];
+        assert_eq!(expand_codes(&b, "http://loinc.org/vs", Some(10)).await, all);
+        assert_eq!(expand_codes(&b, "http://loinc.org/vs", None).await, all);
+        let part = ["2345-7", "LP2-2"];
+        assert_eq!(
+            expand_codes(&b, "http://loinc.org/vs/LP1-1", Some(10)).await,
+            part
+        );
+        assert_eq!(
+            expand_codes(&b, "http://loinc.org/vs/LP1-1", None).await,
+            part
+        );
+
+        assert!(validates(&b, "http://loinc.org/vs", "999-9").await);
+        assert!(!validates(&b, "http://loinc.org/vs", "0000-0").await);
+        assert!(validates(&b, "http://loinc.org/vs/LP1-1", "2345-7").await);
+        assert!(!validates(&b, "http://loinc.org/vs/LP1-1", "LP1-1").await);
+        assert!(!validates(&b, "http://loinc.org/vs/LP1-1", "999-9").await);
+    }
+
+    /// `?fhir_vs=ecl/<expr>` (percent-encoded or not) and
+    /// `?fhir_vs=refset/<id>` evaluate the ECL, for `$expand` and
+    /// `$validate-code`.
+    #[tokio::test]
+    async fn ecl_and_refset_implicit_value_sets() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+        let ecl = "http://example.org/cs-fvs?fhir_vs=ecl/%3C%3C%20root";
+        assert_eq!(
+            expand_codes(&b, ecl, Some(10)).await,
+            ["child1", "child2", "root"]
+        );
+        assert_eq!(
+            expand_codes(&b, "http://example.org/cs-fvs?fhir_vs=ecl/< root", None).await,
+            ["child1", "child2"]
+        );
+        assert!(validates(&b, ecl, "child2").await);
+        assert!(!validates(&b, ecl, "unrelated").await);
+
+        let refset = "http://example.org/cs-fvs?fhir_vs=refset/R1";
+        {
+            let conn = b.pool().get().unwrap();
+            let sid: String = conn
+                .query_row(
+                    "SELECT id FROM code_systems WHERE url = 'http://example.org/cs-fvs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO refset_members (system_id, refset_id, referenced_code)
+                 VALUES (?1, 'R1', 'child1'), (?1, 'R1', 'unrelated')",
+                [&sid],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            expand_codes(&b, refset, Some(10)).await,
+            ["child1", "unrelated"]
+        );
+        assert!(validates(&b, refset, "unrelated").await);
+        assert!(!validates(&b, refset, "child2").await);
     }
 
     #[tokio::test]

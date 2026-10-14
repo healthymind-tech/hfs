@@ -2042,8 +2042,9 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     ))
 }
 
-/// True when `url` is a synthesized `?fhir_vs` implicit ValueSet URL (e.g.
-/// `http://snomed.info/sct?fhir_vs` or `http://snomed.info/sct?fhir_vs=isa/X`).
+/// True when `url` is an implicit ValueSet URL (e.g.
+/// `http://snomed.info/sct?fhir_vs=isa/X` or `http://loinc.org/vs`; see
+/// [`crate::implicit_vs`]).
 ///
 /// These URLs are computed dynamically from the underlying CodeSystem and
 /// never appear as rows in the `value_sets` table, so the per-request
@@ -2057,10 +2058,7 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
 /// warming fast enough within the 30 s bench window because the cold
 /// path's overhead dominated.
 fn is_implicit_fhir_vs_url(url: &str) -> bool {
-    match url.split_once('?') {
-        Some((_, query)) => query == "fhir_vs" || query.starts_with("fhir_vs="),
-        None => false,
-    }
+    crate::implicit_vs::is_implicit_vs_url(url)
 }
 
 /// Build a canonical cache key for the `$validate-code` handler-response cache.

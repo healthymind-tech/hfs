@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::HtsError;
+use crate::implicit_vs::{ImplicitVsPattern, parse_implicit_vs_url};
 use crate::traits::ValueSetOperations;
 use crate::types::{
     ExpandRequest, ExpandResponse, ExpansionContains, ResourceSearchQuery, ValidateCodeRequest,
@@ -293,7 +294,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // synthetic compose so `compute_expansion` handles it via the
             // normal SNOMED hierarchy filter (mirrors sqlite's
             // `implicit_short_circuit` at backends/sqlite/value_set.rs).
-            if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
+            if let Some((cs_url, pattern)) = parse_implicit_vs_url(url) {
+                reject_ecl_pattern(&pattern)?;
                 // Resolve once and keep the id around: the iter 7k fast path
                 // below needs it for the closure-table query, and the
                 // existing slow path needs the existence check to reject
@@ -351,7 +353,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 //     fast path skips the cap; matches the pattern's
                 //     bounded-page semantics — caller already requested
                 //     a page).
-                if matches!(pattern, FhirVsPattern::IsA(_))
+                if matches!(pattern, ImplicitVsPattern::IsA(_))
                     && req.count.filter(|&c| c > 0).is_some()
                     && req.filter.is_none()
                     && req.hierarchical != Some(true)
@@ -361,7 +363,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     && req.tx_resources.is_empty()
                 {
                     let root_code = match &pattern {
-                        FhirVsPattern::IsA(c) => c.clone(),
+                        ImplicitVsPattern::IsA(c) => c.clone(),
                         _ => unreachable!(),
                     };
 
@@ -1069,7 +1071,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // ?fhir_vs URLs: a persisted stub VS with one of those canonical URLs
         // would expand to zero codes and force result=false for every input —
         // short-circuit straight to the implicit-VS validator.
-        let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+        let implicit_short_circuit = parse_implicit_vs_url(&url).is_some();
 
         let resolution = if implicit_short_circuit {
             Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
@@ -1160,7 +1162,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 }
                 Err(HtsError::NotFound(_)) => {
                     // ?fhir_vs implicit ValueSet: targeted O(1)/O(depth) lookup.
-                    if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
+                    if let Some((cs_url, pattern)) = parse_implicit_vs_url(&url) {
+                        reject_ecl_pattern(&pattern)?;
                         let found = validate_fhir_vs(
                             &client,
                             &cs_url,
@@ -1232,7 +1235,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // table for repeated lookups instead of recomputing.
                     match find_cs_for_implicit_vs(&client, &url, req.date.as_deref()).await {
                         Ok(cs_url) => {
-                            let pattern = FhirVsPattern::AllConcepts;
+                            let pattern = ImplicitVsPattern::AllConcepts;
                             let found = validate_fhir_vs(
                                 &client,
                                 &cs_url,
@@ -3744,36 +3747,17 @@ async fn populate_cache(
 
 // ── Implicit-ValueSet (?fhir_vs) helpers ──────────────────────────────────────
 
-/// FHIR defines query-parameter patterns on a CodeSystem URL that implicitly
-/// describe a ValueSet (FHIR R4 §4.8.7):
-///
-/// | URL form | Pattern | Meaning |
-/// |---|---|---|
-/// | `<cs>?fhir_vs` | `AllConcepts` | Every code in the CodeSystem |
-/// | `<cs>?fhir_vs=isa/<code>` | `IsA(code)` | Descendants (subsumees) of `code` |
-#[derive(Debug)]
-enum FhirVsPattern {
-    AllConcepts,
-    IsA(String),
-}
-
-/// Parse a `?fhir_vs` implicit ValueSet URL.
-///
-/// Returns `Some((cs_url, pattern))` on a recognised pattern, `None` otherwise.
-fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
-    let (base, query) = url.split_once('?')?;
-    if !query.starts_with("fhir_vs") {
-        return None;
+/// ECL-backed implicit ValueSets (`?fhir_vs=ecl/…`, `?fhir_vs=refset/…`)
+/// need the ECL evaluator, which only the SQLite backend has.
+fn reject_ecl_pattern(pattern: &ImplicitVsPattern) -> Result<(), HtsError> {
+    match pattern {
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => Err(HtsError::NotSupported(
+            "ECL implicit ValueSets (?fhir_vs=ecl/ and ?fhir_vs=refset/) are not supported by \
+             the PostgreSQL backend"
+                .into(),
+        )),
+        _ => Ok(()),
     }
-    let rest = &query["fhir_vs".len()..];
-    if rest.is_empty() {
-        return Some((base.to_owned(), FhirVsPattern::AllConcepts));
-    }
-    let value = rest.strip_prefix('=')?;
-    if let Some(code) = value.strip_prefix("isa/") {
-        return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
-    }
-    None
 }
 
 /// Recognise the narrow inline-compose shape that iter 7k's paginated
@@ -3887,7 +3871,7 @@ async fn resolve_system_id_pg(
 async fn validate_fhir_vs(
     client: &tokio_postgres::Client,
     cs_url: &str,
-    pattern: &FhirVsPattern,
+    pattern: &ImplicitVsPattern,
     code: &str,
     system: Option<&str>,
 ) -> Result<Option<ExpansionContains>, HtsError> {
@@ -3907,7 +3891,7 @@ async fn validate_fhir_vs(
     };
 
     match pattern {
-        FhirVsPattern::AllConcepts => {
+        ImplicitVsPattern::AllConcepts => {
             let row = client
                 .query_opt(
                     "SELECT code, display FROM concepts \
@@ -3930,7 +3914,10 @@ async fn validate_fhir_vs(
                 contains: vec![],
             }))
         }
-        FhirVsPattern::IsA(root_code) => {
+        ImplicitVsPattern::IsA(root_code) | ImplicitVsPattern::DescendantOf(root_code) => {
+            if matches!(pattern, ImplicitVsPattern::DescendantOf(_)) && code == root_code {
+                return Ok(None);
+            }
             // Closure-table fast path: a single PK lookup decides membership.
             // Same assumption as `pg_filter_is_a` — closure is built by the
             // time we serve requests.
@@ -3973,6 +3960,10 @@ async fn validate_fhir_vs(
                 extensions: vec![],
                 contains: vec![],
             }))
+        }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => {
+            reject_ecl_pattern(pattern)?;
+            Ok(None)
         }
     }
 }
@@ -5165,25 +5156,11 @@ fn build_url_cache_key(
     fnv64(canonical.as_bytes())
 }
 
-/// Build the synthetic compose value for a `?fhir_vs` implicit ValueSet
-/// pattern. Factored out so the `OnceCell` cold-miss closure can build it
-/// lazily (only the winning VU does the work).
-fn build_implicit_compose_value(cs_url: &str, pattern: &FhirVsPattern) -> serde_json::Value {
-    match pattern {
-        FhirVsPattern::AllConcepts => serde_json::json!({
-            "include": [{ "system": cs_url }]
-        }),
-        FhirVsPattern::IsA(code) => serde_json::json!({
-            "include": [{
-                "system": cs_url,
-                "filter": [{
-                    "property": "concept",
-                    "op": "is-a",
-                    "value": code,
-                }],
-            }]
-        }),
-    }
+/// Build the synthetic compose value for an implicit ValueSet pattern.
+/// Factored out so the `OnceCell` cold-miss closure can build it lazily
+/// (only the winning VU does the work).
+fn build_implicit_compose_value(cs_url: &str, pattern: &ImplicitVsPattern) -> serde_json::Value {
+    pattern.compose(cs_url)
 }
 
 /// Apply the `max_expansion_size` guardrail to a freshly-computed code list.
