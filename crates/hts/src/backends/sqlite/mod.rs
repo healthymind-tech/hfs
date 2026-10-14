@@ -701,12 +701,18 @@ impl SqliteTerminologyBackend {
         // Only refresh planner statistics when we actually built something:
         // ANALYZE stats persist on disk across restarts, so a no-op boot needs
         // none.
+        // The statistics are sampled (`analysis_limit`): a boot usually
+        // indexes only a few new systems, and a full ANALYZE of a database
+        // holding SNOMED CT and LOINC reads every page, which on a cold
+        // spinning disk kept the server from binding for over 20 minutes.
         let built = value_set::prebuild_concepts_fts(&conn);
         if built > 0 {
             let _ = conn.execute_batch(
-                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                "PRAGMA analysis_limit=1000; \
+                 ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
                  ANALYZE concept_properties; ANALYZE concept_designations; \
-                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps; \
+                 PRAGMA analysis_limit=0;",
             );
         }
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
