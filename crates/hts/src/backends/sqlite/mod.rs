@@ -11,6 +11,7 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
+pub mod admin;
 pub mod schema;
 
 mod code_system;

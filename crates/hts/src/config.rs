@@ -133,6 +133,49 @@ pub struct HtsConfig {
     /// convenience, not part of the FHIR contract.
     #[arg(long, env = "HTS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
+
+    /// Enable terminology management: the `/admin` API (upload, import,
+    /// delete, set current version, compact) and the console pages that use
+    /// it. **Off by default.** Until SMART/OIDC admin scopes exist this flag
+    /// is the access control, so only enable it where `/admin` and `/ui/hts`
+    /// are reachable by administrators alone.
+    #[arg(long, env = "HTS_ADMIN_UI", default_value = "false", action = clap::ArgAction::Set)]
+    pub admin_ui: bool,
+
+    /// Working directory for uploads, job records and logs, downloaded
+    /// packages and the audit log. Empty = `<database dir>/hts-admin`.
+    #[arg(long, env = "HTS_ADMIN_DATA_DIR", default_value = "")]
+    pub admin_data_dir: String,
+
+    /// Server-side directory operators copy terminology files into; the
+    /// console lists it and imports from it without an upload. Empty = off.
+    #[arg(long, env = "HTS_IMPORT_DIR", default_value = "")]
+    pub import_dir: String,
+
+    /// FHIR package registry for terminology packages (`hl7.terminology.r4`…):
+    /// packages.fhir.org, an internal mirror URL, or `off` for hospitals
+    /// without outbound internet.
+    #[arg(
+        long,
+        env = "HTS_PACKAGE_REGISTRY",
+        default_value = "https://packages.fhir.org"
+    )]
+    pub package_registry: String,
+
+    /// Upload chunk size in bytes (default 8 MiB). Each chunk is one request,
+    /// so this must stay well below any proxy body limit and the 30 s request
+    /// timeout at the slowest expected link speed.
+    #[arg(long, env = "HTS_UPLOAD_CHUNK_SIZE", default_value = "8388608")]
+    pub upload_chunk_size: u64,
+
+    /// Largest accepted upload in bytes (default 16 GiB).
+    #[arg(long, env = "HTS_MAX_UPLOAD_SIZE", default_value = "17179869184")]
+    pub max_upload_size: u64,
+
+    /// Free space required on top of every import's growth estimate (default
+    /// 1 GiB) — covers WAL growth and temporary files during the import.
+    #[arg(long, env = "HTS_DISK_HEADROOM", default_value = "1073741824")]
+    pub disk_headroom: u64,
 }
 
 impl HtsConfig {
@@ -159,6 +202,13 @@ impl Default for HtsConfig {
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
             ui_enabled: true,
+            admin_ui: false,
+            admin_data_dir: String::new(),
+            import_dir: String::new(),
+            package_registry: "https://packages.fhir.org".into(),
+            upload_chunk_size: 8 * 1024 * 1024,
+            max_upload_size: 16 * 1024 * 1024 * 1024,
+            disk_headroom: 1024 * 1024 * 1024,
         }
     }
 }
