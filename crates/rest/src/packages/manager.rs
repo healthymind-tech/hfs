@@ -985,6 +985,15 @@ impl PackageManager {
 
         let owners = self.owner_map(tenant).await?;
         let ctx = Self::ctx(tenant);
+        // Side by side when asked, or when a newer version of this package
+        // stays installed (the plan never downgrades it).
+        let side_by_side = options.mode == InstallMode::SideBySide
+            || self
+                .installed_pairs(tenant)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|(n, v)| n == name && super::version::compare(v, version).is_gt());
         let mut rows: Vec<PackageResourceRecord> = Vec::new();
         let mut written: BTreeMap<String, u64> = BTreeMap::new();
         let mut failures = 0u64;
@@ -1016,7 +1025,7 @@ impl PackageManager {
                 continue;
             }
             let mut id = e.id.clone().unwrap_or_else(|| id_from_path(&e.path));
-            if options.mode == InstallMode::SideBySide
+            if side_by_side
                 && owners
                     .get(&(TARGET_HFS.to_string(), e.resource_type.clone(), id.clone()))
                     .is_some_and(|by| {

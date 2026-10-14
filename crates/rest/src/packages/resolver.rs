@@ -327,10 +327,42 @@ async fn traverse(
         .await
         .map_err(|e| format!("{}#{root_version}: {e}", request.name))?;
     let others = installed_versions(installed, &request.name);
+    // Upgrade replaces only older versions: asking for an older version
+    // than one installed (which other packages may need) installs it side
+    // by side instead of silently downgrading them.
+    let lower: Vec<String> = others
+        .iter()
+        .filter(|v| compare(v, root_version).is_lt())
+        .cloned()
+        .collect();
+    let higher: Vec<&String> = others
+        .iter()
+        .filter(|v| compare(v, root_version).is_gt())
+        .collect();
+    if !higher.is_empty() {
+        t.warnings.push(format!(
+            "{}#{} is installed and stays; {}#{root_version} is installed side by side",
+            request.name,
+            higher
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            request.name
+        ));
+    }
+    if !fhir_compatible(&root_manifest.fhir_versions, &request.fhir_release) {
+        t.warnings.push(format!(
+            "{}#{root_version} is for FHIR {}; this server is {}",
+            request.name,
+            root_manifest.fhir_versions.join(", "),
+            request.fhir_release.to_ascii_uppercase()
+        ));
+    }
     let root_action = if others.iter().any(|v| v == root_version) {
         NodeAction::Reinstall
-    } else if !others.is_empty() && request.mode == InstallMode::Upgrade {
-        NodeAction::Upgrade { from: others }
+    } else if !lower.is_empty() && request.mode == InstallMode::Upgrade {
+        NodeAction::Upgrade { from: lower }
     } else {
         NodeAction::Install
     };
@@ -465,6 +497,24 @@ async fn traverse(
                     continue;
                 }
             };
+            if !fhir_compatible(&manifest.fhir_versions, &request.fhir_release) {
+                let reason = format!(
+                    "for FHIR {}, not this server's {}",
+                    manifest.fhir_versions.join(", "),
+                    request.fhir_release.to_ascii_uppercase()
+                );
+                attach(&mut t, &parent_key, &key, requirement, || PlanNode {
+                    name: dep.clone(),
+                    version: Some(version.clone()),
+                    required: Vec::new(),
+                    action: NodeAction::Skipped { reason },
+                    depth,
+                    dependencies: Vec::new(),
+                    title: manifest.title.clone(),
+                    fhir_versions: manifest.fhir_versions.clone(),
+                });
+                continue;
+            }
             let lower: Vec<String> = have
                 .iter()
                 .filter(|v| compare(v, &version).is_lt())
@@ -495,6 +545,24 @@ async fn traverse(
         }
     }
     Ok(t)
+}
+
+/// Whether a package's `fhirVersions` include the server's release
+/// (`r4` ↔ 4.0.x, `r4b` ↔ 4.3.x, `r5` ↔ 5.0.x, `r6` ↔ 6.x). A package that
+/// declares none is assumed compatible.
+pub fn fhir_compatible(fhir_versions: &[String], release: &str) -> bool {
+    let prefix = match release {
+        "r4" => "4.0",
+        "r4b" => "4.3",
+        "r5" => "5.0",
+        "r6" => "6.",
+        "r3" => "3.0",
+        _ => return true,
+    };
+    fhir_versions.is_empty()
+        || fhir_versions
+            .iter()
+            .any(|v| v.starts_with(prefix) || v.eq_ignore_ascii_case(release))
 }
 
 fn installed_versions(installed: &[(String, String)], name: &str) -> Vec<String> {
@@ -557,11 +625,14 @@ mod tests {
     /// `name -> [(version, [(dependency, range)])]`.
     type Registry = HashMap<String, Vec<(String, Vec<(String, String)>)>>;
 
+    /// One test package: name, version, `(dependency, range)` pairs.
+    type Entry<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
     /// A registry in a map.
     struct MapSource(Registry);
 
     impl MapSource {
-        fn new(entries: &[(&str, &str, &[(&str, &str)])]) -> Self {
+        fn new(entries: &[Entry<'_>]) -> Self {
             let mut map: Registry = HashMap::new();
             for (name, version, deps) in entries {
                 map.entry(name.to_string()).or_default().push((
@@ -595,7 +666,11 @@ mod tests {
             Ok(Manifest {
                 name: name.into(),
                 version: version.into(),
-                fhir_versions: vec!["4.0.1".into()],
+                fhir_versions: vec![if name.ends_with(".r5ig") {
+                    "5.0.0".into()
+                } else {
+                    "4.0.1".into()
+                }],
                 dependencies: deps.iter().cloned().collect(),
                 title: Some(format!("{name} title")),
                 description: None,
@@ -685,6 +760,8 @@ mod tests {
                 ],
             ),
             ("cycle.a", "1.0.0", &[("cycle.b", "1.0.0")]),
+            ("needs.r5", "1.0.0", &[("hl7.terminology.r5ig", "5.3.0")]),
+            ("hl7.terminology.r5ig", "5.3.0", &[]),
             ("cycle.b", "1.0.0", &[("cycle.a", "1.0.0")]),
         ])
     }
@@ -826,6 +903,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn older_root_goes_side_by_side_and_other_release_dependencies_are_skipped() {
+        let source = twcore_world();
+        let installed = vec![("hl7.terminology.r4".to_string(), "7.4.0".to_string())];
+        let mut req = request("hl7.terminology.r4", "7.0.0");
+        req.include_dependencies = false;
+        let plan = resolve(&req, &installed, &source).await.unwrap();
+        assert_eq!(plan.nodes[0].action, NodeAction::Install, "no downgrade");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("stays")),
+            "{:?}",
+            plan.warnings
+        );
+
+        let installed = vec![
+            ("hl7.terminology.r4".to_string(), "5.0.0".to_string()),
+            ("hl7.terminology.r4".to_string(), "7.4.0".to_string()),
+        ];
+        let plan = resolve(&req, &installed, &source).await.unwrap();
+        assert_eq!(
+            plan.nodes[0].action,
+            NodeAction::Upgrade {
+                from: vec!["5.0.0".into()]
+            }
+        );
+
+        let plan = resolve(&request("needs.r5", "1.0.0"), &[], &source)
+            .await
+            .unwrap();
+        assert!(matches!(
+            plan.node("hl7.terminology.r5ig#5.3.0").unwrap().action,
+            NodeAction::Skipped { .. }
+        ));
+        assert_eq!(plan.install_order, ["needs.r5#1.0.0"]);
+        assert!(fhir_compatible(&["4.0.1".into()], "r4"));
+        assert!(fhir_compatible(&[], "r4"));
+        assert!(!fhir_compatible(&["5.0.0".into()], "r4"));
+        assert!(fhir_compatible(&["4.0.1".into(), "5.0.0".into()], "r5"));
     }
 
     #[tokio::test]
