@@ -186,6 +186,10 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
     ON implicit_expansion_cache(url);
 CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
     ON implicit_expansion_cache(url, code);
+-- Per-system invalidation on CodeSystem (re)import probes this before
+-- touching implicit_expansion_fts, whose system_url column is UNINDEXED.
+CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_system
+    ON implicit_expansion_cache(system_url);
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (

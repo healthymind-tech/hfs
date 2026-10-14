@@ -8639,9 +8639,12 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
         return Ok(());
     }
 
-    if let Err(e) = conn.execute("DELETE FROM concepts_fts WHERE system_id = ?1", [system_id]) {
+    // Clear leftovers by rowid: `system_id` is UNINDEXED in the FTS tables,
+    // so deleting by it scans every system's rows (millions with SNOMED CT and
+    // LOINC loaded) while this transaction holds the write lock.
+    if let Err(e) = crate::import::fhir_bundle::delete_concept_fts_rows(conn, system_id) {
         let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
+        return Err(e);
     }
 
     if let Err(e) = conn.execute(
@@ -8654,13 +8657,6 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
     }
 
     // Also populate the word-prefix FTS used for short (< 3 char) filter terms.
-    if let Err(e) = conn.execute(
-        "DELETE FROM concepts_word_fts WHERE system_id = ?1",
-        [system_id],
-    ) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_word_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
@@ -8692,12 +8688,8 @@ fn populate_concepts_search_fts_for_system(
     conn: &Connection,
     system_id: &str,
 ) -> Result<(), HtsError> {
-    conn.execute(
-        "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-        [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
+    // Callers clear the system's previous rows by rowid first
+    // (`fhir_bundle::delete_concept_fts_rows`).
     conn.execute(
         "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
          SELECT id, system_id, code, display FROM concepts

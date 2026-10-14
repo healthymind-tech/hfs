@@ -405,6 +405,11 @@ fn write_code_system(
         )
         .map_err(|e| HtsError::StorageError(format!("Failed to resolve CodeSystem id: {e}")))?;
 
+    // Invalidate this system's concept FTS *before* the upserts below: the
+    // per-concept delete-before-reinsert of designations changes their ids,
+    // and the FTS rows are removed by rowid (see `invalidate_concept_fts`).
+    invalidate_concept_fts(conn, &system_id)?;
+
     // Upsert each concept with `RETURNING id` to avoid a second round-trip per
     // row.  ON CONFLICT preserves child rows (no cascade-delete) so reimports
     // refresh display/definition without losing properties or designations.
@@ -511,52 +516,18 @@ fn write_code_system(
     // startup knows to (re)build the full closure once all batches are loaded.
     // Without this, a previous partial closure (from a re-import or an earlier
     // batch in the same session) would be mistakenly treated as complete.
+    // INDEXED BY: once ANALYZE has seen one huge closure (SNOMED CT) the
+    // statistics say `system_id = ?` matches every row and SQLite would scan
+    // the whole table for every CodeSystem in an import batch.
     let _ = conn.execute(
-        "DELETE FROM concept_closure WHERE system_id = ?1",
-        rusqlite::params![system_id],
-    );
-
-    // Invalidate this system's concept FTS so a later filtered $expand rebuilds
-    // it from the freshly-imported concepts/designations instead of serving
-    // stale display/synonym rows. The `concepts_fts_built` tracker row MUST be
-    // cleared alongside the content: it is the authoritative "FTS current for
-    // this system" flag (both the lazy ensure_concepts_fts path and the
-    // startup incremental prebuild_concepts_fts short-circuit on it), so leaving
-    // it set would freeze stale FTS results until the next full rebuild.
-    // Runs in the same transaction as the concept upserts above, so the content
-    // and the tracker flip atomically — no window where a concurrent reader
-    // sees "built" with stale rows (issue #295). The three content tables carry
-    // an explicit system_id column, so the delete is exact: designation rows
-    // (negative `-cd.id` rowids in concepts_search_fts) are removed too, and no
-    // other system's rows are touched.
-    let _ = conn.execute(
-        "DELETE FROM concepts_fts WHERE system_id = ?1",
-        rusqlite::params![system_id],
-    );
-    let _ = conn.execute(
-        "DELETE FROM concepts_word_fts WHERE system_id = ?1",
-        rusqlite::params![system_id],
-    );
-    let _ = conn.execute(
-        "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-        rusqlite::params![system_id],
-    );
-    let _ = conn.execute(
-        "DELETE FROM concepts_fts_built WHERE system_id = ?1",
+        "DELETE FROM concept_closure INDEXED BY idx_closure_descendant WHERE system_id = ?1",
         rusqlite::params![system_id],
     );
 
     // Invalidate any cached implicit-ValueSet expansions for this code system.
     // The implicit_expansion_cache is otherwise persistent across restarts; stale
     // entries from a previous version of this system must be evicted on re-import.
-    let _ = conn.execute(
-        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
-        rusqlite::params![cs.url],
-    );
-    let _ = conn.execute(
-        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
-        rusqlite::params![cs.url],
-    );
+    invalidate_implicit_expansions(conn, &cs.url)?;
 
     // The process-wide URL→system_id cache may have memoised a now-stale row
     // (e.g. an empty stub that this import is about to replace, or a
@@ -871,31 +842,18 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
         })
         .unwrap_or_default();
 
+    // FTS rows first, while the concepts (whose ids are the rowids) still
+    // exist — see `invalidate_concept_fts`.
+    for sid in &system_ids {
+        invalidate_concept_fts(conn, sid)?;
+    }
+
     conn.execute(
         "DELETE FROM code_systems \
          WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    for sid in &system_ids {
-        let _ = conn.execute(
-            "DELETE FROM concepts_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_word_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_fts_built WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-    }
 
     crate::backends::sqlite::invalidate_cs_id_cache();
     crate::backends::sqlite::invalidate_cs_language_cache();
@@ -953,6 +911,127 @@ pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsE
 
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Remove one CodeSystem's rows from the three concept FTS indexes and clear
+/// its `concepts_fts_built` marker.
+///
+/// The FTS tables carry `system_id` as an `UNINDEXED` column, so the obvious
+/// `DELETE FROM concepts_fts WHERE system_id = ?` is a full scan of the whole
+/// index — on a database holding SNOMED CT and LOINC that is millions of rows,
+/// three tables, *per CodeSystem written*. A 200-CodeSystem `/import` batch
+/// (an HFS package install of hl7.terminology) spent over 15 minutes of CPU in
+/// those scans while holding the write lock. Instead:
+///
+/// * a system whose FTS was never built (no marker) has no FTS rows — every
+///   writer inserts rows and the marker together — so there is nothing to do;
+/// * otherwise delete by rowid, which every FTS writer sets to the concept id
+///   (and to `-designation id` for synonym rows in `concepts_search_fts`).
+///   Must run before designations are deleted and re-inserted.
+#[cfg(feature = "sqlite")]
+pub(crate) fn invalidate_concept_fts(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let built: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concepts_fts_built WHERE system_id = ?1)",
+            [system_id],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if !built {
+        return Ok(());
+    }
+    delete_concept_fts_rows(conn, system_id)?;
+    conn.execute(
+        "DELETE FROM concepts_fts_built WHERE system_id = ?1",
+        [system_id],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Delete every FTS row of `system_id`'s current concepts and designations
+/// from `concepts_fts`, `concepts_word_fts` and `concepts_search_fts`, by
+/// rowid (indexed) rather than by the `UNINDEXED` `system_id` column (a full
+/// scan). Rowids are the concept id, or `-designation id` for synonym rows.
+#[cfg(feature = "sqlite")]
+pub(crate) fn delete_concept_fts_rows(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let ids: Vec<i64> = conn
+        .prepare_cached("SELECT id FROM concepts WHERE system_id = ?1")
+        .map_err(err)?
+        .query_map([system_id], |r| r.get(0))
+        .map_err(err)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(err)?;
+    let designation_ids: Vec<i64> = conn
+        .prepare_cached(
+            "SELECT cd.id FROM concept_designations cd \
+             JOIN concepts c ON c.id = cd.concept_id WHERE c.system_id = ?1",
+        )
+        .map_err(err)?
+        .query_map([system_id], |r| r.get(0))
+        .map_err(err)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(err)?;
+    let mut fts = conn
+        .prepare_cached("DELETE FROM concepts_fts WHERE rowid = ?1")
+        .map_err(err)?;
+    let mut word = conn
+        .prepare_cached("DELETE FROM concepts_word_fts WHERE rowid = ?1")
+        .map_err(err)?;
+    let mut search = conn
+        .prepare_cached("DELETE FROM concepts_search_fts WHERE rowid = ?1")
+        .map_err(err)?;
+    for id in &ids {
+        fts.execute([id]).map_err(err)?;
+        word.execute([id]).map_err(err)?;
+        search.execute([id]).map_err(err)?;
+    }
+    for id in &designation_ids {
+        search.execute([-id]).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Drop persisted implicit-ValueSet expansions derived from `system_url`.
+///
+/// `implicit_expansion_fts` keys `system_url` as an `UNINDEXED` column, so
+/// its delete is a full scan; skip it unless the (indexed) cache table holds
+/// rows for this system — which a fresh import never does.
+#[cfg(feature = "sqlite")]
+pub(crate) fn invalidate_implicit_expansions(
+    conn: &Connection,
+    system_url: &str,
+) -> Result<(), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let cached: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache \
+             INDEXED BY idx_implicit_expansion_cache_system WHERE system_url = ?1)",
+            [system_url],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if !cached {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
+        [system_url],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
+        [system_url],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_word_fts WHERE system_url = ?1",
+        [system_url],
+    )
+    .map_err(err)?;
+    Ok(())
 }
 
 /// Build a multi-version-safe storage id for a CodeSystem.
@@ -1371,6 +1450,114 @@ mod tests {
             count_rows(&b, "concept_properties"),
             0,
             "stale property must be removed on re-import"
+        );
+    }
+
+    fn cs_with_synonym(url: &str, display: &str, synonym: &str) -> String {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[
+                {{"resource":{{"resourceType":"CodeSystem","id":"cs","url":"{url}",
+                    "version":"1","status":"active","content":"complete",
+                    "concept":[{{"code":"A","display":"{display}",
+                        "designation":[{{"language":"de","value":"{synonym}"}}]}}]}}}}]}}"#
+        )
+    }
+
+    /// The FTS invalidation on re-import deletes by rowid: the concept rows
+    /// *and* the synonym rows (`-designation id`, whose ids change on the
+    /// delete-before-reinsert) of that system must go, and no other system's
+    /// rows may be touched.
+    #[tokio::test]
+    async fn reimport_removes_synonym_fts_rows_by_rowid_and_spares_other_systems() {
+        let b = backend();
+        let ctx = ctx();
+        b.import_bundle(
+            &ctx,
+            cs_with_synonym("http://ex.org/one", "Alpha one", "Erste Synonym").as_bytes(),
+        )
+        .await
+        .unwrap();
+        b.import_bundle(
+            &ctx,
+            cs_with_synonym("http://ex.org/two", "Alpha two", "Zweite Synonym").as_bytes(),
+        )
+        .await
+        .unwrap();
+        b.finalize_after_bootstrap().unwrap();
+        let count = |term: &str| -> i64 {
+            b.pool()
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM concepts_search_fts WHERE term = ?1",
+                    [term],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!((count("Erste Synonym"), count("Zweite Synonym")), (1, 1));
+
+        b.import_bundle(
+            &ctx,
+            cs_with_synonym("http://ex.org/one", "Alpha one", "Neues Synonym").as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count("Erste Synonym"), 0, "stale synonym row removed");
+        assert_eq!(count("Alpha one"), 0, "stale preferred-term row removed");
+        assert_eq!(count("Zweite Synonym"), 1, "other system untouched");
+        assert_eq!(count("Alpha two"), 1, "other system untouched");
+    }
+
+    /// Writing a new CodeSystem must not cost time proportional to the FTS
+    /// index of *other* systems. With a 30 000-concept system indexed, the old
+    /// `DELETE … WHERE system_id = ?` on the UNINDEXED FTS column scanned all
+    /// of it three times per CodeSystem; a 20-CodeSystem batch now costs about
+    /// the same as against an empty index.
+    #[tokio::test]
+    async fn import_batch_cost_does_not_scale_with_other_systems_fts() {
+        let batch = || {
+            let entries: Vec<String> = (0..20)
+                .map(|i| {
+                    format!(
+                        r#"{{"resource":{{"resourceType":"CodeSystem","id":"s{i}",
+                        "url":"http://ex.org/s{i}","status":"active","content":"complete",
+                        "concept":[{{"code":"a","display":"x"}}]}}}}"#
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"resourceType":"Bundle","type":"collection","entry":[{}]}}"#,
+                entries.join(",")
+            )
+        };
+        let timed = |b: &SqliteTerminologyBackend| {
+            let pool = b.pool().clone();
+            let data = batch();
+            let t = std::time::Instant::now();
+            super::import_bundle_sync(&pool, data.as_bytes()).unwrap();
+            t.elapsed()
+        };
+        let small = backend();
+        let base = timed(&small);
+
+        let big = backend();
+        {
+            let conn = big.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems (id, url, status, content, created_at, updated_at)
+                     VALUES ('big', 'http://ex.org/big', 'active', 'complete', 'x', 'x');
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30000)
+                 INSERT INTO concepts (system_id, code, display)
+                     SELECT 'big', 'c' || i, 'display number ' || i FROM n;",
+            )
+            .unwrap();
+        }
+        big.finalize_after_bootstrap().unwrap();
+        let with_big = timed(&big);
+        assert!(
+            with_big < base * 10 + std::time::Duration::from_millis(500),
+            "20 CodeSystems took {with_big:?} next to a 30k-concept FTS index vs {base:?} alone"
         );
     }
 }
