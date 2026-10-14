@@ -106,7 +106,8 @@ pub struct FunctionInfo {
 /// Includes every function from the [FHIRPath 3.0.0 specification](https://hl7.org/fhirpath/2025Jan/#functions)
 /// this crate's evaluator implements, plus the FHIR- and SQL-on-FHIR-specific
 /// extensions it also supports (`extension`, `getResourceKey`,
-/// `getReferenceKey`, `memberOf`, `hasValue`, `comparable`, `resolve`).
+/// `getReferenceKey`, `memberOf`, `hasValue`, `htmlChecks`, `htmlChecks2`,
+/// `comparable`, `resolve`).
 ///
 /// Deliberately excludes:
 /// - Infix operators (`is`, `as`, `in`, `contains`, `and`, `or`, `xor`,
@@ -342,6 +343,16 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
         FunctionInfo {
             name: "highBoundary",
             signature: "highBoundary([precision])",
+            category: Utility,
+        },
+        FunctionInfo {
+            name: "htmlChecks",
+            signature: "htmlChecks()",
+            category: Utility,
+        },
+        FunctionInfo {
+            name: "htmlChecks2",
+            signature: "htmlChecks2()",
             category: Utility,
         },
         FunctionInfo {

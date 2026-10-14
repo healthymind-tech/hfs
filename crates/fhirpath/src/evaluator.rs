@@ -6481,6 +6481,8 @@ fn call_function(
             }
             crate::resolve_function::resolve_function(invocation_base, context)
         }
+        "htmlChecks" => crate::html_checks::html_checks_function(invocation_base, args, context),
+        "htmlChecks2" => crate::html_checks::html_checks2_function(invocation_base, args),
         "hasValue" => {
             // hasValue() returns true if the element is a primitive with an actual value
             // Returns false if element is empty or is a primitive with extensions but no value

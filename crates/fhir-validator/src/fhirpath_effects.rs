@@ -76,7 +76,7 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         constraints
             .iter()
             .map(|c| {
-                let combined = combine(c.path, c.expression);
+                let combined = combine(c.path, effective_expression(c.id, c.expression));
                 self.evaluate_one(&combined, &context)
             })
             .collect()
@@ -105,6 +105,21 @@ impl FhirPathConstraintEvaluator {
             Ok(result) => coerce(result),
             Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
         }
+    }
+}
+
+/// The expression actually evaluated for a constraint. R4 through R5 give
+/// the two narrative invariants the same expression, `htmlChecks()`, though
+/// they state different rules: `txt-1` the allowed elements and attributes,
+/// `txt-2` "SHALL have some non-whitespace content". Evaluating `txt-2` as
+/// written would re-check `txt-1` and leave the content rule unchecked, so
+/// it runs `htmlChecks2()`, the content check (the HL7 validator's name for
+/// it). R6 folds both rules into `txt-1` and has no `txt-2`.
+fn effective_expression<'a>(id: &str, expression: &'a str) -> &'a str {
+    if id == "txt-2" && expression.trim() == "htmlChecks()" {
+        "htmlChecks2()"
+    } else {
+        expression
     }
 }
 
@@ -186,7 +201,14 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
 
 #[cfg(test)]
 mod tests {
-    use super::combine;
+    use super::{combine, effective_expression};
+
+    #[test]
+    fn txt_2_checks_content_not_names() {
+        assert_eq!(effective_expression("txt-2", "htmlChecks()"), "htmlChecks2()");
+        assert_eq!(effective_expression("txt-1", "htmlChecks()"), "htmlChecks()");
+        assert_eq!(effective_expression("txt-2", "other()"), "other()");
+    }
 
     #[test]
     fn combines_paths_into_focused_expressions() {
