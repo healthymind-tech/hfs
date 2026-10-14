@@ -665,10 +665,23 @@ pub fn unsortable_sort_warnings(
     params: &SearchParams,
     registry: &SearchParameterRegistry,
 ) -> Vec<String> {
+    unsortable_sort_fields(resource_type, params, registry)
+        .into_iter()
+        .map(|(_, warning)| warning)
+        .collect()
+}
+
+/// The `_sort` fields behind [`unsortable_sort_warnings`], each with its
+/// warning, in directive order.
+pub fn unsortable_sort_fields(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Vec<(String, String)> {
     let Some(sort) = params.get("_sort") else {
         return Vec::new();
     };
-    let mut warnings = Vec::new();
+    let mut fields = Vec::new();
     for directive in sort.split(',') {
         let code = directive.trim().trim_start_matches('-');
         if code.is_empty() || code == "_id" || code == "_lastUpdated" {
@@ -678,22 +691,39 @@ pub fn unsortable_sort_warnings(
             .get_param(resource_type, code)
             .or_else(|| registry.get_param("Resource", code));
         match def {
-            None => warnings.push(format!(
-                "_sort parameter '{code}' is not a search parameter of {resource_type}; \
-                 results are ordered by id instead"
+            None => fields.push((
+                code.to_string(),
+                format!(
+                    "_sort parameter '{code}' is not a search parameter of {resource_type}; \
+                     results are ordered by id instead"
+                ),
             )),
             Some(def) => {
                 let kind = def.param_type.to_string();
                 if kind == "composite" || kind == "special" {
-                    warnings.push(format!(
-                        "_sort parameter '{code}' has type {kind}, which cannot be \
-                         sorted; results are ordered by id instead"
+                    fields.push((
+                        code.to_string(),
+                        format!(
+                            "_sort parameter '{code}' has type {kind}, which cannot be \
+                             sorted; results are ordered by id instead"
+                        ),
                     ));
                 }
             }
         }
     }
-    warnings
+    fields
+}
+
+/// The `_total` value, when it is not one of the codes FHIR defines for it
+/// (`none`, `estimate`, `accurate`). An unrecognised one used to be dropped
+/// without a word, which reads to the client as "the server ignores
+/// `_total`".
+pub fn invalid_total_value(params: &SearchParams) -> Option<String> {
+    params
+        .total()
+        .filter(|value| parse_total_mode(value).is_none())
+        .map(str::to_string)
 }
 
 /// [`build_search_query_for_version`] from ordered key/value pairs, which

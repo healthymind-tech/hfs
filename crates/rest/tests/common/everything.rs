@@ -155,3 +155,39 @@ pub async fn walk(server: &TestServer, first: &str) -> (Vec<String>, Vec<Value>)
     }
     (matches, pages)
 }
+
+/// Seeds an ExplanationOfBenefit for `p1` shaped like Synthea's: it contains a
+/// Coverage and a ServiceRequest that reference `p1` too, so the index holds
+/// `patient` rows for the contained resources under the EOB's own id.
+pub async fn seed_eob_with_contained(server: &TestServer) {
+    put(
+        server,
+        json!({"resourceType": "ExplanationOfBenefit", "id": "eob1", "status": "active",
+            "type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/claim-type", "code": "professional"}]},
+            "use": "claim", "patient": {"reference": "Patient/p1"}, "created": "2020-05-01T00:00:00Z",
+            "insurer": {"display": "Payer"}, "provider": {"reference": "Practitioner/dr1"},
+            "outcome": "complete",
+            "contained": [
+                {"resourceType": "ServiceRequest", "id": "referral", "status": "completed",
+                 "intent": "order", "subject": {"reference": "Patient/p1"}},
+                {"resourceType": "Coverage", "id": "coverage", "status": "active",
+                 "beneficiary": {"reference": "Patient/p1"}, "payor": [{"display": "Payer"}]}
+            ],
+            "insurance": [{"focal": true, "coverage": {"reference": "#coverage"}}]}),
+    )
+    .await;
+}
+
+/// Asserts that no entry of `bundle` repeats another (same type, id, mode).
+pub fn assert_no_duplicate_entries(bundle: &Value) {
+    let mut seen = std::collections::HashSet::new();
+    for e in bundle["entry"].as_array().into_iter().flatten() {
+        let key = format!(
+            "{}/{} {}",
+            e["resource"]["resourceType"].as_str().unwrap_or_default(),
+            e["resource"]["id"].as_str().unwrap_or_default(),
+            e["search"]["mode"].as_str().unwrap_or_default()
+        );
+        assert!(seen.insert(key.clone()), "duplicate entry {key}");
+    }
+}

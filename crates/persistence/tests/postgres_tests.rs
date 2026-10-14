@@ -67,6 +67,12 @@ mod fts_purge_suite;
 #[path = "search/meta_params_suite.rs"]
 mod meta_params_suite;
 
+/// The backend-agnostic filter-plan scenarios (members, order, pages and
+/// counts on both sides of the 1,000-row threshold, and after a delete).
+/// Same `#[path]` arrangement.
+#[path = "search/filter_plan_suite.rs"]
+mod filter_plan_suite;
+
 /// The backend-agnostic day-precision date-boundary suite (issue #519):
 /// the #456 boundary table, which #463 fixed and pinned for SQLite only.
 /// Declared at the top level for the same `#[path]` resolution reason as
@@ -939,6 +945,16 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    #[tokio::test]
+    async fn postgres_filter_plans_keep_the_answer() {
+        let backend = create_backend().await;
+        super::filter_plan_suite::filter_plans_keep_the_answer(
+            &backend,
+            &format!("filter-plan-pg-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {
@@ -9429,10 +9445,11 @@ mod postgres_integration {
         client
             .execute(
                 "INSERT INTO search_index \
-                 (tenant_id, resource_type, resource_id, param_name, value_reference) \
+                 (tenant_id, resource_type, resource_id, param_name, value_reference, last_updated) \
                  SELECT $1, 'Observation', 'bare-plan-' || series, 'subject', \
                         CASE WHEN series = 1 THEN 'Patient/rare-plan-target' \
-                             ELSE 'Patient/decoy-' || series END \
+                             ELSE 'Patient/decoy-' || series END, \
+                        statement_timestamp() \
                  FROM generate_series(1, 20000) AS series",
                 &[&tenant_id],
             )
@@ -9455,7 +9472,7 @@ mod postgres_integration {
         let prepared_counts = client
             .query(
                 "SELECT name, statement FROM pg_prepared_statements \
-                 WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' \
+                 WHERE statement LIKE 'SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index%' \
                    AND statement LIKE '%split_part(value_reference%' \
                  ORDER BY name",
                 &[],
@@ -9473,10 +9490,12 @@ mod postgres_integration {
         );
         let statement_name: String = prepared_counts[0].get(0);
         let count_sql: String = prepared_counts[0].get(1);
+        // A lone membership is counted from `search_index` alone (no
+        // per-match probe of `resources`).
         assert!(
             count_sql.starts_with(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 \
-                 AND is_deleted = FALSE"
+                "SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND"
             ),
             "unexpected prepared count statement: {count_sql}"
         );

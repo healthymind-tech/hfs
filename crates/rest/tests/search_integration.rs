@@ -2187,6 +2187,126 @@ mod subsetting {
 mod unsupported_params {
     use super::*;
 
+    const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+    fn outcome_diagnostics(body: &Value) -> Vec<String> {
+        get_bundle_entries(body)
+            .iter()
+            .filter(|e| e["search"]["mode"] == "outcome")
+            .flat_map(|e| {
+                e["resource"]["issue"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|i| {
+                i["details"]["text"]
+                    .as_str()
+                    .or_else(|| i["diagnostics"].as_str())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn self_link(body: &Value) -> String {
+        body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A `_sort` field or `_total` value the server cannot honour is a `400`
+    /// without a `Prefer` header and under `handling=strict`; under
+    /// `handling=lenient` it is ignored and reported. Both used to answer
+    /// `200` with nothing to say the request was not honoured.
+    #[tokio::test]
+    async fn test_unhonourable_sort_and_total_are_rejected_unless_lenient() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for url in [
+            "/Patient?_sort=nope",
+            "/Patient?_sort=family,-nope",
+            "/Patient?_total=bogus",
+            "/Patient?_summary=count&_total=bogus",
+        ] {
+            for prefer in [None, Some("handling=strict")] {
+                let mut request = server
+                    .get(url)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"));
+                if let Some(prefer) = prefer {
+                    request = request.add_header(PREFER, HeaderValue::from_static(prefer));
+                }
+                let response = request.await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::BAD_REQUEST,
+                    "{url} with Prefer {prefer:?}"
+                );
+                let body: Value = response.json();
+                assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+            }
+        }
+
+        let lenient = |url: &'static str| {
+            server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(PREFER, HeaderValue::from_static("handling=lenient"))
+        };
+
+        let response = lenient("/Patient?_sort=nope").await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(!get_bundle_entries(&body).is_empty());
+        assert!(
+            outcome_diagnostics(&body)
+                .iter()
+                .any(|d| d.contains("_sort parameter 'nope'")),
+            "{body}"
+        );
+
+        let response = lenient("/Patient?_total=bogus").await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            outcome_diagnostics(&body)
+                .iter()
+                .any(|d| d.contains("_total value 'bogus'")),
+            "{body}"
+        );
+        assert!(
+            !self_link(&body).contains("_total"),
+            "the ignored _total is not claimed by the self link: {}",
+            self_link(&body)
+        );
+    }
+
+    /// The values the server honours keep answering `200`.
+    #[tokio::test]
+    async fn test_honourable_sort_and_total_are_accepted() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for url in [
+            "/Patient?_sort=family",
+            "/Patient?_sort=-birthdate,_id",
+            "/Patient?_sort=_lastUpdated",
+            "/Patient?_total=accurate",
+            "/Patient?_total=estimate",
+            "/Patient?_total=none",
+            "/Patient?_summary=count",
+        ] {
+            let response = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::OK, "{url}");
+        }
+    }
+
     #[tokio::test]
     async fn test_unsupported_control_param_rejected() {
         // `_query`/`_contained`/`_containedType` are not implemented; the server
@@ -5295,6 +5415,35 @@ mod summary_count {
             body.get("entry").is_none(),
             "count mode returns no entries: {body}"
         );
+    }
+
+    /// `_summary=count` is answered from the backend's count alone, with the
+    /// same total a search reports under `_total=accurate`, filtered or not,
+    /// and with nothing else in the Bundle (no entries, no paging links).
+    #[tokio::test]
+    async fn test_summary_count_matches_the_accurate_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for filter in ["", "family=Smith&", "gender=female&", "name=nobody&"] {
+            let get = |url: String| {
+                server
+                    .get(&url)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            };
+            let count: Value = get(format!("/Patient?{filter}_summary=count")).await.json();
+            let full: Value = get(format!("/Patient?{filter}_total=accurate&_count=1"))
+                .await
+                .json();
+            assert_eq!(count["total"], full["total"], "{filter}: {count} vs {full}");
+            assert!(count.get("entry").is_none(), "{filter}: {count}");
+            assert!(
+                count["link"]
+                    .as_array()
+                    .is_none_or(|links| links.iter().all(|l| l["relation"] != "next")),
+                "{filter}: {count}"
+            );
+        }
     }
 
     /// `_total=none` means no total on a plain search either, whatever the

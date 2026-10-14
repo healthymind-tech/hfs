@@ -27,6 +27,17 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 #[path = "search/large_id_set_suite.rs"]
 mod large_id_set_suite;
 
+#[path = "search/filter_plan_suite.rs"]
+mod filter_plan_suite;
+
+/// Searches drive from their smallest filter without changing the answer
+/// (members, order, pages, count, deletes).
+#[tokio::test]
+async fn sqlite_filter_plans_keep_the_answer() {
+    let backend = create_backend();
+    filter_plan_suite::filter_plans_keep_the_answer(&backend, "filter-plan-sqlite").await;
+}
+
 #[tokio::test]
 async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
     let backend = create_backend();

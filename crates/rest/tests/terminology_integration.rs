@@ -1316,3 +1316,41 @@ async fn test_chained_in_modifier_fails_closed_on_hts_unavailable() {
         );
     }
 }
+
+/// The searchset's self link names the parameters as the client sent them:
+/// `code:in=<ValueSet>`, not the token list it expanded to nor the sentinel an
+/// empty expansion becomes (`code=__hts_empty_expansion__`), which is what it
+/// used to show.
+#[tokio::test]
+async fn test_self_link_shows_the_client_parameters_not_the_expansion() {
+    for codes in [&["8867-4", "8480-6"][..], &[][..]] {
+        let (ts_url, _) = start_mock_hts(make_expansion("http://loinc.org", codes)).await;
+        let server = create_hfs_with_spec_params(ServerConfig {
+            terminology_server: Some(ts_url),
+            ..ServerConfig::for_testing()
+        });
+
+        let response = server
+            .get("/Observation")
+            .add_query_param("code:in", "http://example.org/vs")
+            .add_query_param("status", "final")
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let self_link = body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            self_link.contains("code:in=http%3A%2F%2Fexample.org%2Fvs"),
+            "{codes:?}: {self_link}"
+        );
+        assert!(self_link.contains("status=final"), "{codes:?}: {self_link}");
+        assert!(
+            !self_link.contains("__hts_empty_expansion__") && !self_link.contains("8867-4"),
+            "{codes:?}: {self_link}"
+        );
+    }
+}

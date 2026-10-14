@@ -311,9 +311,179 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     })
 }
 
+/// A membership the planner expects to match at most this many index rows is
+/// selective: the general plan, which PostgreSQL drives from it, is already
+/// cheap.
+const BROAD_MEMBERSHIP_ROWS: i64 = 1_000;
+
+fn bind_sql_params(
+    leading: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    params: &[SqlParam],
+) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+    let mut out = leading;
+    for param in params {
+        match param {
+            SqlParam::Text(s) => out.push(Box::new(s.clone())),
+            SqlParam::TextArray(ids) => out.push(Box::new(ids.clone())),
+            SqlParam::Float(f) => out.push(Box::new(*f)),
+            SqlParam::Integer(i) => out.push(Box::new(*i)),
+            SqlParam::Bool(b) => out.push(Box::new(*b)),
+            SqlParam::Timestamp(dt) => out.push(Box::new(*dt)),
+            SqlParam::Null => out.push(Box::new(Option::<String>::None)),
+        }
+    }
+    out
+}
+
+/// The first page of a conjunction of broad memberships, resolved from
+/// `search_index` before `resources` is touched.
+///
+/// `Observation?code=X&date=ge2019` took ~320 ms on the 527k-resource
+/// benchmark database. Both memberships match ~15k rows (896 together), the
+/// planner estimated ~2k and ~6k, and it chose to join all 13,457 date matches
+/// to `resources` and then probe each one's index rows for the code: ~25k
+/// probes for a 51-row page. Here the page walks one membership's index rows
+/// newest first, keeps a row when every other membership has a row for the
+/// same resource (a correlated probe), and joins only the page to
+/// `resources`, as the single-parameter fast path does: ~35 ms.
+///
+/// The walk is bounded by the size of the membership it walks, so that is the
+/// one the planner expects to be smallest: walking a 260k-row `status=final`
+/// against a 17k-row code took 132 ms, against 8 ms the other way round. A
+/// conjunction with a membership expected to be selective
+/// ([`BROAD_MEMBERSHIP_ROWS`]) keeps the general plan, which PostgreSQL
+/// already drives from that membership.
+///
+/// Like the fast path, the page is of top-level rows (`last_updated IS NOT
+/// NULL`; see there) and it is the first page only: no cursor, offset or
+/// explicit sort.
+fn broad_conjunction_sql(predicates: &[SqlFragment], driver: usize, limit: usize) -> String {
+    let mut probes = String::new();
+    for (i, other) in predicates.iter().enumerate() {
+        if i != driver {
+            probes.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM search_index o \
+                   WHERE o.resource_id = search_index.resource_id AND {})",
+                other.sql
+            ));
+        }
+    }
+    format!(
+        "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                r.last_updated AS sort_key \
+         FROM ( \
+           SELECT DISTINCT resource_id, last_updated FROM search_index \
+           WHERE {driver} AND last_updated IS NOT NULL{probes} \
+           ORDER BY last_updated DESC, resource_id ASC LIMIT {limit} \
+         ) c \
+         JOIN resources r \
+           ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+         WHERE r.is_deleted = FALSE \
+         ORDER BY c.last_updated DESC, c.resource_id ASC",
+        driver = predicates[driver].sql,
+    )
+}
+
 impl PostgresBackend {
     /// Page and count build precisely the same search predicate. Only cursor
     /// bindings change the initial offset.
+    /// The memberships of a first-page search whose filter is a conjunction
+    /// of broad memberships, and the one to walk; see
+    /// [`broad_conjunction_sql`]. `None` for any other search.
+    async fn broad_conjunction(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        has_cursor: bool,
+        general_filter: Option<&str>,
+    ) -> StorageResult<Option<(Vec<SqlFragment>, usize)>> {
+        // Shapes the builder already plans with a measured special form —
+        // repeated names and the code/value-quantity pair folded into an
+        // `INTERSECT` (#1416, #1580), the patient-scoped composite and
+        // quantity probes (#1579) — keep that form.
+        if general_filter
+            .is_some_and(|sql| sql.contains(" INTERSECT ") || sql.contains("EXISTS (WITH scoped_"))
+        {
+            return Ok(None);
+        }
+        if query.parameters.len() < 2
+            || has_cursor
+            || query.offset.is_some()
+            || !query.sort.is_empty()
+            || self.index_layout() != super::schema::IndexLayout::Denormalized
+            || self.supports_native_reverse_chains(tenant, query)
+        {
+            return Ok(None);
+        }
+        // A plain reference match names one resource's dependents (a
+        // patient's Observations): selective in practice, and the general
+        // plan is driven from it. Deciding that costs no estimates, which the
+        // commonest conjunction, `patient=X&code=Y`, would otherwise pay.
+        if query.parameters.iter().any(|p| {
+            p.param_type == crate::types::SearchParamType::Reference
+                && matches!(
+                    p.modifier,
+                    None | Some(crate::types::SearchModifier::Type(_))
+                )
+        }) {
+            return Ok(None);
+        }
+        let Some(predicates) =
+            PostgresQueryBuilder::membership_predicates(query, 2, self.index_layout())
+        else {
+            return Ok(None);
+        };
+        // The planner's row estimate for each membership on its own, each
+        // built alone so its placeholders start at `$3`. Counting the rows
+        // instead was dearer than the page itself: a date range is a bitmap
+        // scan that cannot stop at a `LIMIT`, and the two probes of
+        // `code&date` took 45 ms. An underestimate only keeps the general
+        // plan; the estimates are what order the walk.
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut estimates = Vec::with_capacity(query.parameters.len());
+        for param in &query.parameters {
+            let mut single = SearchQuery::new(query.resource_type.clone());
+            single.parameters = vec![param.clone()];
+            let Some(alone) =
+                PostgresQueryBuilder::membership_predicates(&single, 2, self.index_layout())
+            else {
+                return Ok(None);
+            };
+            let leading: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(tenant_id.to_string()),
+                Box::new(query.resource_type.clone()),
+            ];
+            let bound = bind_sql_params(leading, &alone[0].params);
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let row = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (FORMAT JSON) SELECT 1 FROM search_index WHERE {}",
+                        alone[0].sql
+                    ),
+                    &refs,
+                )
+                .await
+                .or_query_error("Failed to estimate a search membership")?;
+            let plan: serde_json::Value = row.get(0);
+            estimates.push(plan[0]["Plan"]["Plan Rows"].as_f64().unwrap_or(0.0));
+        }
+        if estimates
+            .iter()
+            .any(|rows| *rows <= BROAD_MEMBERSHIP_ROWS as f64)
+        {
+            return Ok(None);
+        }
+        let driver = (0..estimates.len())
+            .min_by(|&a, &b| estimates[a].total_cmp(&estimates[b]))
+            .unwrap_or(0);
+        Ok(Some((predicates, driver)))
+    }
+
     fn search_filter(
         &self,
         tenant: &TenantContext,
@@ -409,11 +579,28 @@ impl PostgresBackend {
             cursor.is_some(),
         );
 
+        let broad = if fast_index_pred.is_none() {
+            self.broad_conjunction(
+                client,
+                tenant,
+                query,
+                cursor.is_some(),
+                search_filter.as_ref().map(|f| f.sql.as_str()),
+            )
+            .await?
+        } else {
+            None
+        };
+
         let filter_clause = search_filter
             .as_ref()
             .map(|f| format!(" AND ({})", f.sql))
             .unwrap_or_default();
-        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
+        let search_params = match &broad {
+            // The broad page binds its own per-parameter predicates.
+            Some((predicates, _)) => predicates.iter().flat_map(|p| p.params.clone()).collect(),
+            None => search_filter.map(|f| f.params).unwrap_or_default(),
+        };
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -432,7 +619,9 @@ impl PostgresBackend {
         };
 
         // Build query based on pagination mode.
-        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
+        let (sql, has_previous) = if let Some((predicates, driver)) = &broad {
+            (broad_conjunction_sql(predicates, *driver, count + 1), false)
+        } else if let Some(pred) = &fast_index_pred {
             // `keyset` is always `Some` here: the fast path requires the default
             // sort, which yields the `last_updated` keyset.
             // Gate the ordered scan on the predicate matching anything at all;
@@ -447,12 +636,28 @@ impl PostgresBackend {
             } else {
                 String::new()
             };
+            // `last_updated IS NOT NULL` keeps the page to top-level rows.
+            // Rows extracted from a contained resource are filed under the
+            // container's id with a NULL `last_updated`, so without it the
+            // `DISTINCT` saw `(id, <ts>)` and `(id, NULL)` as two candidates
+            // and the join returned the container twice — every Synthea
+            // ExplanationOfBenefit, whose contained Coverage and
+            // ServiceRequest both carry `patient`, came back twice from
+            // `ExplanationOfBenefit?patient=` and from `Patient/$everything`
+            // (307 entries for 273 resources), and the NULL keys sorted first
+            // under `DESC`, ahead of every real one. A contained resource's
+            // values are not its container's (`_contained` searches them on
+            // their own path). The scan reads `last_updated` for its order
+            // anyway — from the key or INCLUDE list of the token, date and
+            // quantity indexes, from the heap for references — so the
+            // predicate costs nothing extra.
             let sql = format!(
                 "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
                         r.last_updated AS sort_key \
                  FROM ( \
                    SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                     AND last_updated IS NOT NULL{guard} \
                    ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
                  ) c \
                  JOIN resources r \
@@ -851,10 +1056,42 @@ impl SearchProvider for PostgresBackend {
                     }
                 }
 
-                let sql = format!(
-                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
-                    fragment.sql
-                );
+                // A lone membership test is counted from `search_index` alone.
+                // The general form below joins `resources` once per match to
+                // check `is_deleted` — ~11 µs a probe, ~200 ms of the 243 ms
+                // `Observation?code=<17,837 matches>&_summary=count` took — and
+                // the check cannot fail here: every delete path removes the
+                // resource's `search_index` rows in the same transaction (the
+                // soft delete in `storage.rs` and in `transaction.rs`; a purge
+                // removes the resource outright), and a reindex writes rows
+                // only for resources it finds live. So the distinct
+                // `resource_id`s of the matching rows are exactly the live
+                // matches.
+                //
+                // It counts the resources the single-parameter page returns:
+                // top-level rows (`last_updated IS NOT NULL`, see the fast path
+                // in `search_with_client`), grouped by `(last_updated,
+                // resource_id)`, which is one group per resource because a
+                // resource's top-level rows all carry its `last_updated`. That
+                // pair is the tail of the token, date and quantity `*_recent`
+                // indexes, so for an equality on their leading columns the
+                // groups arrive in index order and are counted as they stream
+                // past: 15 ms for 17,837 matches, against 21 ms hashing the
+                // distinct ids and 55 ms for `COUNT(DISTINCT resource_id)`,
+                // which sorts. Any other predicate is grouped as before.
+                let sql = match PostgresQueryBuilder::single_index_predicate(&fragment.sql) {
+                    Some(pred) => format!(
+                        "SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                           AND last_updated IS NOT NULL \
+                         GROUP BY last_updated, resource_id \
+                         ORDER BY last_updated DESC, resource_id) matches"
+                    ),
+                    None => format!(
+                        "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
+                        fragment.sql
+                    ),
+                };
                 (sql, params)
             } else {
                 let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
