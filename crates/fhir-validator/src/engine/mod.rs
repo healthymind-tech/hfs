@@ -33,8 +33,9 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Policy for profile references (`meta.profile` / caller-supplied) that the
-/// resolver cannot resolve.
+/// Policy for `meta.profile` claims the resolver cannot resolve. A profile
+/// the caller asked for ([`ValidationOptions::profiles`]) that cannot be
+/// resolved is always an error: the requested validation did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnknownProfilePolicy {
     /// Report as a warning-severity issue (default).

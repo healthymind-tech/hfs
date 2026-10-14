@@ -402,7 +402,7 @@ impl ValidationService {
     /// [`Self::rehydrate_stored_profiles`] finishes, validation waits for it
     /// (at most `HFS_VALIDATION_REHYDRATE_WAIT_MS`) instead of answering from
     /// a half-filled registry: a `$validate` right after a restart would
-    /// otherwise report "could not resolve profile", and an enforce-mode
+    /// otherwise report the profile as not found, and an enforce-mode
     /// write claiming a stored profile would be accepted unchecked.
     pub fn begin_rehydration(&self) {
         if self.tenant_profiles.is_some() {

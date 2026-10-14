@@ -292,9 +292,18 @@ pub(crate) fn msg_unknown_schema(reference: &str) -> String {
     format!("could not resolve schema '{reference}'")
 }
 
-/// [helios] a profile reference could not be resolved.
+/// [helios] a `meta.profile` claim could not be resolved (the HL7
+/// validator's wording).
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {
-    format!("could not resolve profile '{reference}'")
+    format!("Profile reference '{reference}' has not been checked because it could not be found")
+}
+
+/// [helios] a profile the caller asked to validate against could not be
+/// resolved.
+pub(crate) fn msg_unknown_requested_profile(reference: &str) -> String {
+    format!(
+        "Profile '{reference}' was requested for validation but could not be found; the resource was not checked against it"
+    )
 }
 
 /// The reference validator's JSON type vocabulary (`getType`).

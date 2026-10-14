@@ -151,12 +151,20 @@ pub(super) fn validate(
         }
     }
     if opts.use_meta_profiles {
-        for profile in meta_profiles(resource) {
-            add_profile(&mut ctx, &mut set, &profile, opts.unknown_profile);
+        // An unresolvable claim is located at the claim itself
+        // (`meta.profile[i]`), as the HL7 validator reports it.
+        for (index, profile) in meta_profiles(resource).iter().enumerate() {
+            ctx.path.push_key("meta");
+            ctx.path.push_key("profile");
+            ctx.path.push_index(index);
+            add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, false);
+            ctx.path.pop();
+            ctx.path.pop();
+            ctx.path.pop();
         }
     }
     for profile in &opts.profiles {
-        add_profile(&mut ctx, &mut set, profile, opts.unknown_profile);
+        add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, true);
     }
 
     validate_node(&mut ctx, &set, resource);
@@ -187,21 +195,33 @@ fn add_profile(
     set: &mut SchemaSet,
     profile: &str,
     policy: UnknownProfilePolicy,
+    requested: bool,
 ) {
-    match ctx.resolver.resolve(profile) {
-        Some(schema) => add_schemas_to_set(ctx, set, schema, profile),
-        None => match policy {
-            UnknownProfilePolicy::Warn => ctx.error_with_severity(
-                ErrorKind::UnknownProfile,
-                errors::msg_unknown_profile(profile),
-                Severity::Warning,
-            ),
-            UnknownProfilePolicy::Error => ctx.error(
-                ErrorKind::UnknownProfile,
-                errors::msg_unknown_profile(profile),
-            ),
-            UnknownProfilePolicy::Ignore => {}
-        },
+    if let Some(schema) = ctx.resolver.resolve(profile) {
+        add_schemas_to_set(ctx, set, schema, profile);
+        return;
+    }
+    // A profile the caller asked to validate against (`$validate?profile=`)
+    // that cannot be found means the requested validation did not happen:
+    // always an error, whatever the policy for `meta.profile` claims.
+    if requested {
+        ctx.error(
+            ErrorKind::UnknownProfile,
+            errors::msg_unknown_requested_profile(profile),
+        );
+        return;
+    }
+    match policy {
+        UnknownProfilePolicy::Warn => ctx.error_with_severity(
+            ErrorKind::UnknownProfile,
+            errors::msg_unknown_profile(profile),
+            Severity::Warning,
+        ),
+        UnknownProfilePolicy::Error => ctx.error(
+            ErrorKind::UnknownProfile,
+            errors::msg_unknown_profile(profile),
+        ),
+        UnknownProfilePolicy::Ignore => {}
     }
 }
 
@@ -1000,6 +1020,36 @@ mod tests {
         let missing = slice_errors(&obs(json!([{"coding": [other]}])));
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(missing[0].path, "Observation.category");
+    }
+
+    /// An unknown `meta.profile` claim follows the policy (warning by
+    /// default); an unknown profile the caller requested is an error.
+    #[test]
+    fn unknown_profiles() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let nope = "http://example.org/StructureDefinition/nope";
+        let claimed = json!({"resourceType": "Patient", "meta": {"profile": [nope]}});
+        let errors = validator
+            .validate_sync(&claimed, &crate::ValidationOptions::default())
+            .errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].kind, ErrorKind::UnknownProfile);
+        assert_eq!(errors[0].severity, Severity::Warning);
+        assert_eq!(errors[0].path, "Patient.meta.profile.0");
+
+        let requested = crate::ValidationOptions {
+            profiles: vec![nope.to_string()],
+            unknown_profile: UnknownProfilePolicy::Ignore,
+            ..Default::default()
+        };
+        let errors = validator
+            .validate_sync(&json!({"resourceType": "Patient"}), &requested)
+            .errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].kind, ErrorKind::UnknownProfile);
+        assert_eq!(errors[0].severity, Severity::Error);
+        assert_eq!(errors[0].path, "Patient");
     }
 
     /// A profile that constrains a primitive's extensions gives the
