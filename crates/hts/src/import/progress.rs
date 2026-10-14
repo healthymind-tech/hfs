@@ -232,6 +232,19 @@ impl BundleImportBackend for ProgressBackend {
         self.inner.code_system_has_concepts(ctx, url).await
     }
 
+    async fn import_refset_members(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        self.check_cancel()?;
+        self.inner
+            .import_refset_members(ctx, url, version, members)
+            .await
+    }
+
     async fn delete_normalized(
         &self,
         resource_type: &str,

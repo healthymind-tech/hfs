@@ -305,6 +305,17 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
 
+-- ── Reference set membership ──────────────────────────────────────────────────
+-- Active members of SNOMED CT Simple reference sets (RF2
+-- der2_Refset_Simple*): ECL `^ refset` and `?fhir_vs=refset/<id>` read it.
+-- Replaced per system on re-import; goes with the CodeSystem row.
+CREATE TABLE IF NOT EXISTS refset_members (
+    system_id       TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    refset_id       TEXT NOT NULL,
+    referenced_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, refset_id, referenced_code)
+) WITHOUT ROWID;
+
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the
@@ -1004,6 +1015,7 @@ mod tests {
             "concepts_search_fts",
             "concepts_fts_built",
             "implicit_expansion_fts_built",
+            "refset_members",
         ];
 
         for table in &expected_tables {

@@ -22,6 +22,7 @@
 //! | `>> id` | Same but seed with `id` itself |
 //! | `id` (exact) | Single row lookup in `concepts` |
 //! | `*` | All rows in `concepts` for this system |
+//! | `^ id` | `refset_members` rows of reference set `id` |
 //!
 //! The hierarchy operators read the precomputed `concept_closure` when it
 //! holds the focus concept (its self-link), one indexed range scan; the
@@ -67,7 +68,7 @@ pub fn evaluate(
 ///
 /// Answers each operator for the candidates only, with one indexed query per
 /// focus concept: `concept_closure` for the hierarchy operators (when it is
-/// built for the focus concept). Sub-expressions
+/// built for the focus concept), `refset_members` for `^`. Sub-expressions
 /// without such a shortcut are evaluated in full and intersected.
 pub fn filter_codes(
     conn: &Connection,
@@ -124,6 +125,22 @@ pub fn filter_codes(
                 rusqlite::params![system_id, id, codes_json(candidates)?, include_self],
             )
         }
+        EclExpr::MemberOf(refsets) => match refsets.as_ref() {
+            EclExpr::Focus {
+                op: None,
+                concept: FocusConcept::Id(id),
+            } => {
+                require_members(conn, system_id)?;
+                query_codes(
+                    conn,
+                    "SELECT referenced_code FROM refset_members
+                     WHERE system_id = ?1 AND refset_id = ?2
+                       AND referenced_code IN (SELECT value FROM json_each(?3))",
+                    rusqlite::params![system_id, id, codes_json(candidates)?],
+                )
+            }
+            _ => intersect_full(conn, system_id, expr, candidates),
+        },
         _ => intersect_full(conn, system_id, expr, candidates),
     }
 }
@@ -205,7 +222,97 @@ fn eval_to_map(
                 .collect();
             Ok(result)
         }
+
+        EclExpr::MemberOf(refsets) => match refsets.as_ref() {
+            EclExpr::Focus {
+                op: None,
+                concept: FocusConcept::Wildcard,
+            } => fetch_members(conn, system_id, &[], true),
+            // `^ id` names the refset directly; whether `id` is itself a
+            // concept of the system does not matter.
+            EclExpr::Focus {
+                op: None,
+                concept: FocusConcept::Id(id),
+            } => fetch_members(conn, system_id, std::slice::from_ref(id), false),
+            inner => {
+                let ids: Vec<String> = eval_to_map(conn, system_id, inner)?.into_keys().collect();
+                fetch_members(conn, system_id, &ids, false)
+            }
+        },
     }
+}
+
+/// Members (referenced components) of the given reference sets, or of every
+/// reference set when `any` is set.
+///
+/// Membership comes from `refset_members`, which the SNOMED CT RF2 importer
+/// fills from the Simple reference set files ([`require_members`]).
+fn fetch_members(
+    conn: &Connection,
+    system_id: &str,
+    refsets: &[String],
+    any: bool,
+) -> Result<HashMap<String, ResolvedConcept>, HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    require_members(conn, system_id)?;
+    let mut out = HashMap::new();
+    let mut push = |row: &rusqlite::Row<'_>| -> rusqlite::Result<()> {
+        let code: String = row.get(0)?;
+        let display: Option<String> = row.get(1)?;
+        out.entry(code.clone())
+            .or_insert(ResolvedConcept { code, display });
+        Ok(())
+    };
+    if any {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT c.code, c.display FROM refset_members m
+                 JOIN concepts c ON c.system_id = m.system_id AND c.code = m.referenced_code
+                 WHERE m.system_id = ?1",
+            )
+            .map_err(err)?;
+        let mut rows = stmt.query([system_id]).map_err(err)?;
+        while let Some(row) = rows.next().map_err(err)? {
+            push(row).map_err(err)?;
+        }
+    } else {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display FROM refset_members m
+                 JOIN concepts c ON c.system_id = m.system_id AND c.code = m.referenced_code
+                 WHERE m.system_id = ?1 AND m.refset_id = ?2",
+            )
+            .map_err(err)?;
+        for refset in refsets {
+            let mut rows = stmt.query([system_id, refset.as_str()]).map_err(err)?;
+            while let Some(row) = rows.next().map_err(err)? {
+                push(row).map_err(err)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Fail unless the system has reference set members: a system with none was
+/// imported without them (or before HTS read them), and an empty `^` answer
+/// would look like a real one.
+fn require_members(conn: &Connection, system_id: &str) -> Result<(), HtsError> {
+    let imported: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM refset_members WHERE system_id = ?1)",
+            [system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if imported {
+        return Ok(());
+    }
+    Err(HtsError::NotSupported(
+        "Reference set membership (ECL `^`) is not available for this code system: no \
+         reference set members were imported. Re-import the SNOMED CT RF2 release to load \
+         the Simple reference sets."
+            .into(),
+    ))
 }
 
 /// `true` when `concept_closure` is built for `code` — every built closure
@@ -773,11 +880,68 @@ mod tests {
         }
     }
 
+    // ── Member-of (^) ─────────────────────────────────────────────────────────
+
+    fn add_members(backend: &SqliteTerminologyBackend, sys_id: &str, rows: &[(&str, &str)]) {
+        let conn = backend.pool().get().unwrap();
+        for (refset, code) in rows {
+            conn.execute(
+                "INSERT INTO refset_members (system_id, refset_id, referenced_code)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![sys_id, refset, code],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn member_of_returns_refset_members() {
+        let (backend, sys_id) = setup_db();
+        add_members(
+            &backend,
+            &sys_id,
+            &[("R1", "102"), ("R1", "105"), ("R2", "103"), ("R1", "999")],
+        );
+        // 999 is a member but not a concept of the system: dropped.
+        assert_eq!(eval(&backend, &sys_id, "^ R1"), vec!["102", "105"]);
+        assert_eq!(eval(&backend, &sys_id, "^ *"), vec!["102", "103", "105"]);
+        // `^ (expr)`: the refsets are the concepts `expr` selects.
+        assert!(eval(&backend, &sys_id, "^ (R1 OR R2)").is_empty());
+        backend
+            .pool()
+            .get()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO concepts (system_id, code, display) VALUES
+                     ('test-system-id', 'R1', 'Refset one'), ('test-system-id', 'R2', 'Refset two')",
+            )
+            .unwrap();
+        assert_eq!(
+            eval(&backend, &sys_id, "^ (R1 OR R2)"),
+            vec!["102", "103", "105"]
+        );
+        assert_eq!(eval(&backend, &sys_id, "^ R1 AND << 101"), vec!["102"]);
+        assert_eq!(eval(&backend, &sys_id, "<< 100 MINUS ^ R1").len(), 4);
+        assert!(eval(&backend, &sys_id, "^ R9").is_empty());
+    }
+
+    #[test]
+    fn member_of_without_imported_members_is_an_error() {
+        let (backend, sys_id) = setup_db();
+        let conn = backend.pool().get().unwrap();
+        let expr = parser::parse("^ R1").unwrap();
+        assert!(matches!(
+            evaluate(&conn, &sys_id, &expr),
+            Err(HtsError::NotSupported(_))
+        ));
+    }
+
     /// `filter_codes` (candidate-restricted) agrees with full evaluation,
     /// with and without the closure, for every operator.
     #[test]
     fn filter_codes_agrees_with_full_evaluation() {
         let (backend, sys_id) = setup_db();
+        add_members(&backend, &sys_id, &[("R1", "102"), ("R1", "105")]);
         let candidates: Vec<String> = ["000", "100", "101", "102", "103", "104", "105", "999"]
             .iter()
             .map(|c| c.to_string())
@@ -787,9 +951,10 @@ mod tests {
             "<< 101",
             "> 105",
             ">> 103",
-            "<< 101 OR < 104",
+            "^ R1",
+            "^ R1 OR < 104",
             "<< 100 MINUS << 101",
-            "<< 100 AND < 101",
+            "<< 100 AND ^ R1",
             "*",
             "101",
         ];
