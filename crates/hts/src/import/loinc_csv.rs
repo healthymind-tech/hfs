@@ -19,6 +19,23 @@
 //! optionally be restricted via [`LanguageFilter`] (`HTS_IMPORT_LANGUAGES` /
 //! `--languages`); excluded variant files are skipped without being parsed.
 //!
+//! ## Parts and answer lists
+//!
+//! The main table and the hierarchy give the LOINC terms and the parts that
+//! appear in the multiaxial hierarchy. Official releases also ship
+//! `AccessoryFiles/PartFile/Part.csv` (every part, about 42 000 of them in
+//! no hierarchy) and `AccessoryFiles/AnswerFile/AnswerList.csv` (answer
+//! lists `LL…` and their answers `LA…`). When present they are imported
+//! too, unless `HTS_LOINC_PARTS_AND_ANSWERS=false`:
+//!
+//! * every part, answer list and answer becomes a concept of
+//!   `http://loinc.org` (for 2.80: 243 550 concepts in all, the same count
+//!   HAPI's loader reports, instead of 176 668);
+//! * each answer list with answers becomes a ValueSet
+//!   `http://loinc.org/vs/<LL…>` enumerating its answers in sequence order;
+//! * `LoincAnswerListLink.csv` gives each linked term an `answer-list`
+//!   property.
+//!
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real LOINC data requires a free license from the Regenstrief Institute.
@@ -36,7 +53,7 @@ use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderDesignation, CodeSystemMeta, build_parsed_code_system,
+    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_parsed_code_system,
 };
 
 // ── LOINC constants ───────────────────────────────────────────────────────────
@@ -66,6 +83,17 @@ struct MergedConcept {
     /// Translated display names from LOINC linguistic-variant files. Owned so
     /// the borrowed [`BuilderDesignation`] slice can be assembled per batch.
     designations: Vec<OwnedDesignation>,
+    /// `answer-list` codes from `LoincAnswerListLink.csv`.
+    answer_lists: Vec<String>,
+}
+
+/// One answer list from `AnswerList.csv`.
+#[derive(Debug, Default)]
+struct AnswerList {
+    name: String,
+    oid: Option<String>,
+    /// `(sequence, LA code, display)`, sorted by sequence.
+    answers: Vec<(u32, String, String)>,
 }
 
 /// One translated display name, owned by its [`MergedConcept`].
@@ -88,6 +116,11 @@ struct LoincParseResult {
     parse_errors: Vec<String>,
     /// Release version parsed from a `Loinc_<ver>/` ZIP path segment, if present.
     release_version: Option<String>,
+    /// Parts from `Part.csv` that the hierarchy did not already provide.
+    extra_part_count: usize,
+    /// Answer lists keyed by `LL…` code, in code order.
+    answer_lists: std::collections::BTreeMap<String, AnswerList>,
+    answer_count: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -252,6 +285,13 @@ pub async fn import_loinc_csv(
             );
         }
 
+        // Parts, answer lists and answers (see the module docs).
+        let (extra_part_count, answer_lists, answer_count) = if parts_and_answers_enabled() {
+            load_parts_and_answers(&path_owned, &paths, &mut all_concepts, &mut parse_errors)?
+        } else {
+            Default::default()
+        };
+
         // Attach translated display names as designations on the concepts that
         // exist in this CodeSystem. Translations for unknown codes are recorded
         // as parse errors rather than creating orphan concepts.
@@ -288,6 +328,9 @@ pub async fn import_loinc_csv(
             designations_by_language,
             parse_errors,
             release_version: paths.release_version,
+            extra_part_count,
+            answer_lists,
+            answer_count,
         })
     })
     .await
@@ -307,10 +350,17 @@ pub async fn import_loinc_csv(
         stats.concepts = total_concepts;
         eprintln!(
             "[{FORMAT}] dry-run — would import {total_concepts} concepts \
-             ({} LOINC codes, {} LP category nodes), {} hierarchy edges, \
-             {} translated designations{lang_summary}",
-            parsed.loinc_count, parsed.lp_count, parsed.edge_count, parsed.designation_count,
+             ({} LOINC codes, {} LP category nodes, {} further parts, {} answer lists, \
+             {} answers), {} hierarchy edges, {} translated designations{lang_summary}",
+            parsed.loinc_count,
+            parsed.lp_count,
+            parsed.extra_part_count,
+            parsed.answer_lists.len(),
+            parsed.answer_count,
+            parsed.edge_count,
+            parsed.designation_count,
         );
+        stats.value_sets = answer_list_value_sets(&parsed.answer_lists) as u32;
         return Ok(stats);
     }
 
@@ -365,16 +415,31 @@ pub async fn import_loinc_csv(
             })
             .collect();
 
+        let prop_sets: Vec<Vec<BuilderProperty<'_>>> = chunk
+            .iter()
+            .map(|(_, entry)| {
+                entry
+                    .answer_lists
+                    .iter()
+                    .map(|ll| BuilderProperty {
+                        code: "answer-list",
+                        value_key: "valueCode",
+                        value: ll.as_str(),
+                    })
+                    .collect()
+            })
+            .collect();
+
         let builder: Vec<BuilderConcept<'_>> = chunk
             .iter()
-            .zip(&desig_sets)
-            .map(|((code, entry), desigs)| BuilderConcept {
+            .zip(desig_sets.iter().zip(&prop_sets))
+            .map(|((code, entry), (desigs, props))| BuilderConcept {
                 code: code.as_str(),
                 display: Some(entry.display.as_str()).filter(|s| !s.is_empty()),
                 definition: entry.definition.as_deref(),
                 parent_code: entry.parent.as_deref(),
                 designations: desigs.as_slice(),
-                ..Default::default()
+                extra_properties: props.as_slice(),
             })
             .collect();
 
@@ -400,7 +465,161 @@ pub async fn import_loinc_csv(
         );
     }
 
+    // One ValueSet per answer list, `http://loinc.org/vs/<LL…>`.
+    let lists: Vec<(&String, &AnswerList)> = parsed
+        .answer_lists
+        .iter()
+        .filter(|(_, l)| !l.answers.is_empty())
+        .collect();
+    for chunk in lists.chunks(500) {
+        let bundle = answer_list_bundle(chunk, release_version.as_deref());
+        let vs_stats = backend.import_bundle(ctx, &bundle).await?;
+        stats.value_sets += vs_stats.value_sets;
+        stats.errors.extend(vs_stats.errors);
+    }
+    if !lists.is_empty() {
+        eprintln!(
+            "[{FORMAT}] imported {} answer lists as ValueSets ({} further parts, {} answers as concepts)",
+            lists.len(),
+            parsed.extra_part_count,
+            parsed.answer_count,
+        );
+    }
+
     Ok(stats)
+}
+
+/// `HTS_LOINC_PARTS_AND_ANSWERS` (default on): import `Part.csv` and the
+/// answer files.
+fn parts_and_answers_enabled() -> bool {
+    std::env::var("HTS_LOINC_PARTS_AND_ANSWERS").map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Read `Part.csv`, `AnswerList.csv` and `LoincAnswerListLink.csv` (each when
+/// present) into `concepts`: parts the hierarchy did not provide, answer
+/// lists and answers become concepts, and linked terms get their
+/// `answer-list` codes. Returns `(parts added, answer lists, answers added)`.
+#[allow(clippy::type_complexity)]
+fn load_parts_and_answers(
+    zip_path: &Path,
+    paths: &LoincArchivePaths,
+    concepts: &mut ConceptEntries,
+    errors: &mut Vec<String>,
+) -> Result<(usize, std::collections::BTreeMap<String, AnswerList>, usize), HtsError> {
+    let open = |name: &str| -> Result<Vec<u8>, HtsError> {
+        use std::io::Read;
+        let mut zip = open_zip(zip_path)?;
+        let mut entry = zip
+            .by_name(name)
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot open {name}: {e}")))?;
+        let mut buf = Vec::new();
+        entry
+            .read_to_end(&mut buf)
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read {name}: {e}")))?;
+        Ok(buf)
+    };
+    let status_definition = |status: &str| {
+        (!status.is_empty() && status != "ACTIVE").then(|| format!("STATUS:{status}"))
+    };
+
+    let mut extra_parts = 0;
+    if let Some(name) = &paths.parts {
+        for (code, display, status) in parse_parts(open(name)?.as_slice(), errors)? {
+            if let std::collections::hash_map::Entry::Vacant(slot) = concepts.entry(code) {
+                slot.insert(MergedConcept {
+                    display,
+                    definition: status_definition(&status),
+                    ..Default::default()
+                });
+                extra_parts += 1;
+            }
+        }
+    }
+
+    let mut lists = std::collections::BTreeMap::new();
+    let mut answers = 0;
+    if let Some(name) = &paths.answer_lists {
+        lists = parse_answer_lists(open(name)?.as_slice(), errors)?;
+        for (ll, list) in &lists {
+            concepts.entry(ll.clone()).or_insert_with(|| MergedConcept {
+                display: list.name.clone(),
+                ..Default::default()
+            });
+            for (_, la, display) in &list.answers {
+                if let std::collections::hash_map::Entry::Vacant(slot) = concepts.entry(la.clone())
+                {
+                    slot.insert(MergedConcept {
+                        display: display.clone(),
+                        ..Default::default()
+                    });
+                    answers += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(name) = &paths.answer_list_links {
+        for (loinc, ll) in parse_answer_list_links(open(name)?.as_slice(), errors)? {
+            match concepts.get_mut(&loinc) {
+                Some(c) if !c.answer_lists.contains(&ll) => c.answer_lists.push(ll),
+                Some(_) => {}
+                None => errors.push(format!(
+                    "Answer list link for unknown LOINC code '{loinc}' — skipped"
+                )),
+            }
+        }
+    }
+    Ok((extra_parts, lists, answers))
+}
+
+/// How many answer lists become ValueSets (those with answers; externally
+/// defined lists have none in the file).
+fn answer_list_value_sets(lists: &std::collections::BTreeMap<String, AnswerList>) -> usize {
+    lists.values().filter(|l| !l.answers.is_empty()).count()
+}
+
+/// A Bundle of ValueSets, one per answer list, each enumerating its answers
+/// in sequence order.
+fn answer_list_bundle(lists: &[(&String, &AnswerList)], version: Option<&str>) -> Vec<u8> {
+    use serde_json::json;
+    let entries: Vec<serde_json::Value> = lists
+        .iter()
+        .map(|(ll, list)| {
+            let mut vs = json!({
+                "resourceType": "ValueSet",
+                "id": ll,
+                "url": format!("{}/{ll}", crate::implicit_vs::LOINC_VS_URL),
+                "name": format!("LOINC_Answer_List_{}", ll.replace('-', "_")),
+                "title": list.name,
+                "status": "active",
+                "compose": {"include": [{
+                    "system": LOINC_URL,
+                    "concept": list.answers.iter()
+                        .map(|(_, la, display)| json!({"code": la, "display": display}))
+                        .collect::<Vec<_>>(),
+                }]},
+            });
+            if let Some(v) = version {
+                vs["version"] = json!(v);
+            }
+            if let Some(oid) = &list.oid {
+                vs["identifier"] =
+                    json!([{"system": "urn:ietf:rfc:3986", "value": format!("urn:oid:{oid}")}]);
+            }
+            json!({"resource": vs})
+        })
+        .collect();
+    serde_json::to_vec(&json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": entries,
+    }))
+    .unwrap_or_default()
 }
 
 // ── ZIP helpers ───────────────────────────────────────────────────────────────
@@ -424,6 +643,12 @@ struct LoincArchivePaths {
     lv_variants: Vec<String>,
     /// Parsed from a top-level `Loinc_<ver>/` directory in the ZIP, e.g. `2.82`.
     release_version: Option<String>,
+    /// `AccessoryFiles/PartFile/Part.csv`, if present.
+    parts: Option<String>,
+    /// `AnswerList.csv` (the `AnswerFile/` copy preferred), if present.
+    answer_lists: Option<String>,
+    /// `LoincAnswerListLink.csv` (the `AnswerFile/` copy preferred), if present.
+    answer_list_links: Option<String>,
 }
 
 /// Extract LOINC release version from a ZIP entry path such as
@@ -454,6 +679,15 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
     let mut lv_index: Option<String> = None;
     let mut lv_variants: Vec<String> = Vec::new();
     let mut release_version: Option<String> = None;
+    let mut parts: Option<String> = None;
+    let mut answer_lists: Option<String> = None;
+    let mut answer_list_links: Option<String> = None;
+    // `PanelsAndForms/` carries copies of the answer files; `AnswerFile/` wins.
+    let prefer_answer_file = |slot: &mut Option<String>, name: &str| {
+        if slot.is_none() || name.to_lowercase().contains("answerfile/") {
+            *slot = Some(name.to_string());
+        }
+    };
 
     for i in 0..zip.len() {
         let entry = zip
@@ -487,6 +721,12 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
                 }
             } else if filename.contains("multiaxial") || filename.contains("componenthierarchy") {
                 hierarchy_path = Some(name);
+            } else if filename == "part.csv" {
+                parts = Some(name);
+            } else if filename == "answerlist.csv" {
+                prefer_answer_file(&mut answer_lists, &name);
+            } else if filename == "loincanswerlistlink.csv" {
+                prefer_answer_file(&mut answer_list_links, &name);
             } else if filename == "linguisticvariants.csv" {
                 // The translation index (note trailing 's').
                 lv_index = Some(name);
@@ -523,6 +763,9 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
         lv_index,
         lv_variants,
         release_version,
+        parts,
+        answer_lists,
+        answer_list_links,
     })
 }
 
@@ -862,6 +1105,136 @@ fn parse_hierarchy(
     Ok((concepts, edges))
 }
 
+/// `Part.csv`: `(PartNumber, display, Status)`; display is
+/// `PartDisplayName`, else `PartName`.
+fn parse_parts(
+    reader: impl std::io::Read,
+    errors: &mut Vec<String>,
+) -> Result<Vec<(String, String, String)>, HtsError> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
+    let headers = rdr
+        .headers()
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read Part.csv headers: {e}")))?
+        .clone();
+    let code_idx = find_col(&headers, "PartNumber")?;
+    let name_idx = find_col(&headers, "PartName").ok();
+    let display_idx = find_col(&headers, "PartDisplayName").ok();
+    let status_idx = find_col(&headers, "Status").ok();
+    let field = |r: &csv::StringRecord, i: Option<usize>| {
+        i.and_then(|i| r.get(i))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = Vec::new();
+    for (n, result) in rdr.records().enumerate() {
+        let record =
+            result.map_err(|e| HtsError::InvalidRequest(format!("Part.csv record error: {e}")))?;
+        let code = field(&record, Some(code_idx));
+        if code.is_empty() {
+            errors.push(format!(
+                "Part.csv record {}: PartNumber is empty — skipped",
+                n + 1
+            ));
+            continue;
+        }
+        let mut display = field(&record, display_idx);
+        if display.is_empty() {
+            display = field(&record, name_idx);
+        }
+        out.push((code, display, field(&record, status_idx)));
+    }
+    Ok(out)
+}
+
+/// `AnswerList.csv`: one row per (list, answer); a list without answers
+/// (externally defined) has one row with an empty `AnswerStringId`.
+fn parse_answer_lists(
+    reader: impl std::io::Read,
+    errors: &mut Vec<String>,
+) -> Result<std::collections::BTreeMap<String, AnswerList>, HtsError> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
+    let headers = rdr
+        .headers()
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read AnswerList.csv headers: {e}")))?
+        .clone();
+    let ll_idx = find_col(&headers, "AnswerListId")?;
+    let name_idx = find_col(&headers, "AnswerListName").ok();
+    let oid_idx = find_col(&headers, "AnswerListOID").ok();
+    let la_idx = find_col(&headers, "AnswerStringId").ok();
+    let seq_idx = find_col(&headers, "SequenceNumber").ok();
+    let display_idx = find_col(&headers, "DisplayText").ok();
+    let field = |r: &csv::StringRecord, i: Option<usize>| {
+        i.and_then(|i| r.get(i))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut lists: std::collections::BTreeMap<String, AnswerList> = Default::default();
+    for (n, result) in rdr.records().enumerate() {
+        let record = result
+            .map_err(|e| HtsError::InvalidRequest(format!("AnswerList.csv record error: {e}")))?;
+        let ll = field(&record, Some(ll_idx));
+        if ll.is_empty() {
+            errors.push(format!(
+                "AnswerList.csv record {}: AnswerListId is empty — skipped",
+                n + 1
+            ));
+            continue;
+        }
+        let list = lists.entry(ll).or_default();
+        if list.name.is_empty() {
+            list.name = field(&record, name_idx);
+        }
+        if list.oid.is_none() {
+            list.oid = Some(field(&record, oid_idx)).filter(|s| !s.is_empty());
+        }
+        let la = field(&record, la_idx);
+        if !la.is_empty() {
+            let seq = field(&record, seq_idx).parse().unwrap_or(u32::MAX);
+            list.answers.push((seq, la, field(&record, display_idx)));
+        }
+    }
+    for list in lists.values_mut() {
+        list.answers.sort();
+        list.answers.dedup_by(|a, b| a.1 == b.1);
+    }
+    Ok(lists)
+}
+
+/// `LoincAnswerListLink.csv`: `(LoincNumber, AnswerListId)` pairs.
+fn parse_answer_list_links(
+    reader: impl std::io::Read,
+    errors: &mut Vec<String>,
+) -> Result<Vec<(String, String)>, HtsError> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
+    let headers = rdr
+        .headers()
+        .map_err(|e| {
+            HtsError::InvalidRequest(format!("Cannot read LoincAnswerListLink.csv headers: {e}"))
+        })?
+        .clone();
+    let loinc_idx = find_col(&headers, "LoincNumber")?;
+    let ll_idx = find_col(&headers, "AnswerListId")?;
+    let mut out = Vec::new();
+    for (n, result) in rdr.records().enumerate() {
+        let record = result.map_err(|e| {
+            HtsError::InvalidRequest(format!("LoincAnswerListLink.csv record error: {e}"))
+        })?;
+        let loinc = record.get(loinc_idx).unwrap_or("").trim();
+        let ll = record.get(ll_idx).unwrap_or("").trim();
+        if loinc.is_empty() || ll.is_empty() {
+            errors.push(format!(
+                "LoincAnswerListLink.csv record {}: empty LoincNumber or AnswerListId — skipped",
+                n + 1
+            ));
+            continue;
+        }
+        out.push((loinc.to_string(), ll.to_string()));
+    }
+    Ok(out)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -1147,6 +1520,145 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 6);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 4);
+    }
+
+    // Accessory files: one part already in the hierarchy (LP29693-6), one
+    // that is not (LP999-1, deprecated); answer list LL1-1 with two answers
+    // linked to 2160-0; LL2-2 is externally defined (no answers).
+    const PART_CSV: &str = "\
+\"PartNumber\",\"PartTypeName\",\"PartName\",\"PartDisplayName\",\"Status\"\r\n\
+\"LP29693-6\",\"CLASS\",\"Chem\",\"Chemistry (part file)\",\"ACTIVE\"\r\n\
+\"LP999-1\",\"COMPONENT\",\"Oldthing\",\"\",\"DEPRECATED\"\r\n";
+    const ANSWER_LIST_CSV: &str = "\
+\"AnswerListId\",\"AnswerListName\",\"AnswerListOID\",\"ExtDefinedYN\",\"ExtDefinedAnswerListCodeSystem\",\"ExtDefinedAnswerListLink\",\"AnswerStringId\",\"LocalAnswerCode\",\"LocalAnswerCodeSystem\",\"SequenceNumber\",\"DisplayText\"\r\n\
+\"LL1-1\",\"Yes/No\",\"1.2.3\",\"N\",\"\",\"\",\"LA33-6\",\"\",\"\",\"1\",\"Yes\"\r\n\
+\"LL1-1\",\"Yes/No\",\"1.2.3\",\"N\",\"\",\"\",\"LA32-8\",\"\",\"\",\"2\",\"No\"\r\n\
+\"LL2-2\",\"External list\",\"\",\"Y\",\"http://example.org\",\"\",\"\",\"\",\"\",\"\",\"\"\r\n";
+    const ANSWER_LINK_CSV: &str = "\
+\"LoincNumber\",\"LongCommonName\",\"AnswerListId\",\"AnswerListName\",\"AnswerListLinkType\",\"ApplicableContext\"\r\n\
+\"2160-0\",\"Creatinine\",\"LL1-1\",\"Yes/No\",\"NORMATIVE\",\"\"\r\n";
+
+    fn make_loinc_zip_with_accessory_files() -> NamedTempFile {
+        let tmp = make_test_loinc_zip();
+        {
+            let mut zip = zip::ZipWriter::new_append(tmp.reopen().unwrap()).unwrap();
+            let opts = zip::write::FileOptions::default();
+            for (name, body) in [
+                ("AccessoryFiles/PartFile/Part.csv", PART_CSV),
+                // The PanelsAndForms copy must lose to AnswerFile/.
+                (
+                    "AccessoryFiles/PanelsAndForms/AnswerList.csv",
+                    "AnswerListId\r\n",
+                ),
+                ("AccessoryFiles/AnswerFile/AnswerList.csv", ANSWER_LIST_CSV),
+                (
+                    "AccessoryFiles/AnswerFile/LoincAnswerListLink.csv",
+                    ANSWER_LINK_CSV,
+                ),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        tmp
+    }
+
+    /// Parts outside the hierarchy, answer lists and answers become concepts;
+    /// an answer list with answers becomes `http://loinc.org/vs/<LL…>`; a
+    /// linked term carries `answer-list`.
+    #[tokio::test]
+    async fn import_loinc_csv_imports_parts_and_answer_lists() {
+        use crate::traits::{CodeSystemOperations, ValueSetOperations};
+        use crate::types::{ExpandRequest, LookupRequest, ValidateCodeRequest};
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_loinc_zip_with_accessory_files();
+
+        let dry = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        // 6 + LP999-1 + LL1-1 + LL2-2 + LA33-6 + LA32-8.
+        assert_eq!((dry.concepts, dry.value_sets), (11, 1));
+
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("import");
+        assert_eq!((stats.concepts, stats.value_sets), (11, 1));
+        assert_eq!(count_rows(&backend, "concepts"), 11);
+
+        let lookup = |code: &str| LookupRequest {
+            system: "http://loinc.org".into(),
+            code: code.into(),
+            ..Default::default()
+        };
+        let part = backend.lookup(&ctx, lookup("LP999-1")).await.unwrap();
+        assert_eq!(part.display.as_deref(), Some("Oldthing"));
+        // The hierarchy's display stays for a part it already has.
+        let chem = backend.lookup(&ctx, lookup("LP29693-6")).await.unwrap();
+        assert_eq!(chem.display.as_deref(), Some("Chemistry"));
+        let term = backend.lookup(&ctx, lookup("2160-0")).await.unwrap();
+        assert!(
+            term.properties
+                .iter()
+                .any(|p| p.code == "answer-list" && p.value == "LL1-1"),
+            "{:?}",
+            term.properties
+        );
+
+        let vs = backend
+            .expand(
+                &ctx,
+                ExpandRequest {
+                    url: Some("http://loinc.org/vs/LL1-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("answer list ValueSet");
+        let mut answers: Vec<&str> = vs.contains.iter().map(|c| c.code.as_str()).collect();
+        answers.sort_unstable();
+        assert_eq!(answers, ["LA32-8", "LA33-6"]);
+        let valid = ValueSetOperations::validate_code(
+            &backend,
+            &ctx,
+            ValidateCodeRequest {
+                url: Some("http://loinc.org/vs/LL1-1".into()),
+                system: Some("http://loinc.org".into()),
+                code: "LA32-8".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(valid.result);
+        assert!(
+            backend
+                .expand(
+                    &ctx,
+                    ExpandRequest {
+                        url: Some("http://loinc.org/vs/LL2-2".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_err(),
+            "an externally defined list has no ValueSet"
+        );
     }
 
     #[tokio::test]
