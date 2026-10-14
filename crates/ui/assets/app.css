@@ -7188,6 +7188,180 @@ button.batch-check__at {
   overflow-wrap: anywhere;
 }
 
+/* ---- $validate results (fhir-validate.js), Batch and Validate pages ---- */
+
+.batch-validate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin: 0 0 12px;
+}
+
+.batch-validate__option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+}
+
+.batch-validate__hint {
+  font-size: 12px;
+}
+
+.validate-card {
+  margin-bottom: 14px;
+}
+
+.validate-card > .busy-status,
+.validate-card > .validate-results {
+  margin: 0 14px 12px;
+}
+
+.validate-results:empty {
+  display: none;
+}
+
+.validate-run__title {
+  margin: 12px 0 6px;
+  font-size: 14px;
+}
+
+.validate-verdict {
+  margin: 0 0 10px;
+}
+
+.validate-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.validate-badge--ok { background: var(--ok-soft); color: var(--ok); }
+.validate-badge--warning { background: var(--warn-soft); color: var(--warn); }
+.validate-badge--error { background: var(--danger-soft); color: var(--danger); }
+
+.validate-group {
+  margin-bottom: 12px;
+}
+
+.validate-group__title {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.validate-group--error .validate-group__title { color: var(--danger); }
+.validate-group--warning .validate-group__title { color: var(--warn); }
+
+.validate-sev {
+  display: inline-block;
+  justify-self: start;
+  width: fit-content;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.validate-sev--error { background: var(--danger-soft); color: var(--danger); }
+.validate-sev--warning { background: var(--warn-soft); color: var(--warn); }
+.validate-sev--information { background: var(--accent-soft); color: var(--accent-text); }
+
+.validate-table td {
+  vertical-align: top;
+}
+
+.validate-table__loc {
+  min-width: 14ch;
+}
+
+.validate-table__msg {
+  overflow-wrap: anywhere;
+}
+
+.validate-entry {
+  display: block;
+  font-weight: 600;
+}
+
+.validate-path {
+  display: block;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.validate-entries {
+  display: grid;
+  gap: 6px;
+}
+
+.validate-entry-result {
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+}
+
+.validate-entry-result__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  min-height: 44px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.validate-entry-result__head .validate-entry {
+  display: inline;
+}
+
+.validate-entry-result__head .validate-badge {
+  margin-left: auto;
+}
+
+.validate-entry-result__profiles {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.validate-entry-result__body {
+  padding: 0 12px 10px;
+}
+
+/* ---- The Validate page (/ui/validate) ---- */
+
+.validate-form {
+  display: grid;
+  gap: 12px;
+}
+
+.validate-form__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.validate-form .field {
+  margin-bottom: 0;
+}
+
+@media (max-width: 640px) {
+  .batch-validate .btn,
+  .validate-form__row .btn {
+    flex: 1 1 100%;
+    justify-content: center;
+  }
+
+  .validate-entry-result__head .validate-badge {
+    margin-left: 0;
+  }
+}
+
 /* The card head's right-hand cluster (#729): created count beside the
    status badge. */
 .card-head__meta {

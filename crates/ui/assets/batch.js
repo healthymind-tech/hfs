@@ -9,7 +9,8 @@
  * feed the same client-side checks (bundle-check.js): live with a debounce
  * while typing, again on submit, and on a file once it is read. Errors —
  * each with its line:column — keep the plan out of reach; warnings show but
- * never block.
+ * never block. "Validate" sends the Bundle to `$validate` (fhir-validate.js)
+ * and renders the OperationOutcome without importing anything.
  */
 (function () {
   "use strict";
@@ -86,9 +87,15 @@
   var checkMethods = document.getElementById("batch-check-methods");
   var checkTypes = document.getElementById("batch-check-types");
   var preflightWarnings = document.getElementById("batch-preflight-warnings");
+  var validateBtn = document.getElementById("batch-validate");
+  var validatePerEntry = document.getElementById("batch-validate-per-entry");
+  var validationCard = document.getElementById("batch-validation");
+  var validationProgress = document.getElementById("batch-validation-progress");
+  var validationResults = document.getElementById("batch-validation-results");
 
   var Check = window.HfsBundleCheck;
   var checkMessages = Check ? Check.messagesFrom(document.getElementById("bundle-check-messages")) : {};
+  var validateMessages = Check ? Check.messagesFrom(document.getElementById("validate-messages")) : {};
   /* The last check report: Execute and Continue refuse while it has errors. */
   var lastReport = null;
   var editorView = null;
@@ -574,6 +581,7 @@
       list.appendChild(li);
     });
     preflightWarnings.hidden = !warnings.length;
+    resetValidation();
     executeTopBtn.disabled = !!(lastReport && lastReport.errors.length);
   }
 
@@ -598,6 +606,7 @@
        one (#731). */
     uploadError.hidden = true;
     executeError.hidden = true;
+    resetValidation();
     show("upload");
     if (mode === "paste" && pasteArea.value.trim()) runCheck(pasteArea.value);
     else checkPanel.hidden = true;
@@ -614,6 +623,60 @@
     }
   }
   cancelTopBtn.addEventListener("click", reset);
+
+  /* ---- validate without importing (fhir-validate.js) ------------------ */
+
+  var validationAbort = null;
+
+  function resetValidation() {
+    if (validationAbort) validationAbort.abort();
+    validationAbort = null;
+    validationCard.hidden = true;
+    validationResults.textContent = "";
+    validationProgress.hidden = true;
+  }
+
+  function validate() {
+    if (!bundle || !window.HfsValidate) return;
+    resetValidation();
+    validationCard.hidden = false;
+    var controller = window.AbortController ? new AbortController() : null;
+    validationAbort = controller;
+    var label = validationProgress.querySelector("[data-busy-label]");
+    validationProgress.hidden = false;
+    label.textContent = validateMessages.running;
+    hfsBusy.during(
+      [validateBtn],
+      function () {
+        return window.HfsValidate.run(bundle, {
+          perEntry: validatePerEntry.checked,
+          signal: controller ? controller.signal : undefined,
+          onProgress: function (done, total) {
+            label.textContent = validateMessages.progress
+              .replace("%done%", window.HfsNumber.format(done))
+              .replace("%total%", window.HfsNumber.format(total));
+          },
+        })
+          .then(function (result) {
+            if (validationAbort !== controller) return;
+            validationProgress.hidden = true;
+            window.HfsValidate.render(validationResults, result, { resource: bundle, messages: validateMessages });
+            validationCard.focus({ preventScroll: false });
+          })
+          .catch(function (e) {
+            if (e && e.name === "AbortError") return;
+            validationProgress.hidden = true;
+            validationResults.textContent = "";
+            var p = document.createElement("p");
+            p.className = "alert";
+            p.textContent = validateMessages.requestFailed.replace("%detail%", (e && e.message) || "");
+            validationResults.appendChild(p);
+          });
+      },
+      { alsoDisable: [executeTopBtn, cancelTopBtn] }
+    );
+  }
+  validateBtn.addEventListener("click", validate);
 
   /* ---- stage 3: execute and report ------------------------------------ */
 

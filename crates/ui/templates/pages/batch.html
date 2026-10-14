@@ -107,6 +107,15 @@
       <button type="button" class="btn btn--primary btn--busy-slot" id="batch-execute-top">{{ i18n.t("batch-execute") }}</button>
     </div>
 
+    <!-- Server-side validation without importing (#p1): $validate on the
+         whole Bundle, optionally on every entry against its own
+         meta.profile. Nothing is stored. -->
+    <div class="batch-validate">
+      <button type="button" class="btn btn--busy-slot" id="batch-validate"><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-run") }}</button>
+      <label class="batch-validate__option"><input type="checkbox" id="batch-validate-per-entry"> {{ i18n.t("validate-per-entry") }}</label>
+      <span class="muted batch-validate__hint">{{ i18n.t("validate-run-hint") }}</span>
+    </div>
+
     <div class="request-strip">
       <span class="request-strip__label">{{ i18n.t("batch-request") }}</span>
       <code id="batch-request-line"></code>
@@ -126,6 +135,14 @@
       <strong>{{ i18n.t("batch-check-warnings") }}</strong>
       <ul></ul>
     </div>
+
+    <section class="card validate-card" id="batch-validation" tabindex="-1" hidden>
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h3>
+      </div>
+      <p class="busy-status" id="batch-validation-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+      <div class="validate-results" id="batch-validation-results"></div>
+    </section>
 
     <div class="card">
       <div class="card-head">
@@ -171,10 +188,12 @@
   <!-- Cloned by batch.js into each row's disclosure control (#674). -->
   <template id="batch-chevron"><span class="icon">{% include "icons/chevron-down.svg" %}</span></template>
 {% include "partials/bundle-check-messages.html" %}
+{% include "partials/validate-messages.html" %}
 </div>
 
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
 <script src="/ui/assets/bundle-check.js" defer></script>
+<script src="/ui/assets/fhir-validate.js" defer></script>
 <script src="/ui/assets/batch.js" defer></script>
 {% endblock %}

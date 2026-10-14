@@ -1341,6 +1341,20 @@ struct BatchPage {
     max_body_size: usize,
 }
 
+/// Validate without importing (/ui/validate): a static shell like Batch;
+/// validate-page.js sends the pasted/uploaded resource to the FHIR API's own
+/// `POST [base]/[type]/$validate` and renders the OperationOutcome.
+#[derive(Template)]
+#[template(path = "pages/validate.html")]
+struct ValidatePage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`), checked
+    /// client-side before the resource is sent, as on the Batch page.
+    max_body_size: usize,
+}
+
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
 #[derive(Template)]
 #[template(path = "partials/json-view.html")]
@@ -1768,6 +1782,19 @@ pub fn mount_with_conformance_source_and_runtime(
                       rv: RequestVersion,
                       rt: RequestTenant| {
                     batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
+        // Validate a resource or Bundle against FHIR rules and profiles
+        // without storing it ($validate).
+        .route(
+            "/ui/validate",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    validate_page(state, locale, rv, rt, max_body_size)
                 },
             ),
         )
@@ -3383,6 +3410,24 @@ async fn batch_page(
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
+    })
+}
+
+/// The Validate page: the shell only. validate-page.js and the shared
+/// fhir-validate.js call `$validate` against the ordinary FHIR API, so this
+/// crate never touches storage or the validator.
+async fn validate_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    max_body_size: usize,
+) -> Response {
+    render(ValidatePage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "validate",
         max_body_size,
     })
 }

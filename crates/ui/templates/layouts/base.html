@@ -108,6 +108,10 @@
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
       </a>
+      <a class="nav-item" href="/ui/validate"{% if active_page == "validate" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-validate") }}">
+        <span class="icon">{% include "icons/check-circle.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-validate") }}</span>
+      </a>
       <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
