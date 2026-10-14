@@ -554,7 +554,7 @@ fn validate_required(ctx: &mut WalkCtx<'_>, set: &SchemaSet, required: &[String]
     };
     for key in required {
         ctx.path.push_key(key);
-        if !obj.contains_key(key) && !choice_branch_satisfies(set, key, obj) {
+        if !has_key(obj, key) && !choice_branch_satisfies(set, key, obj) {
             ctx.error(ErrorKind::Required, errors::msg_required(key));
         }
         ctx.path.pop();
@@ -577,8 +577,15 @@ fn choice_branch_satisfies(
             .as_ref()
             .and_then(|els| els.get(key))
             .and_then(|el| el.choices.as_ref())
-            .is_some_and(|branches| branches.iter().any(|b| obj.contains_key(b)))
+            .is_some_and(|branches| branches.iter().any(|b| has_key(obj, b)))
     })
+}
+
+/// A primitive is present when its value or only its `_key` sidecar is:
+/// `{"_valueString": {"extension": [...]}}` is a value[x] carried entirely
+/// by extensions (data-absent-reason, translations), which FHIR allows.
+fn has_key(obj: &serde_json::Map<String, Value>, key: &str) -> bool {
+    obj.contains_key(key) || obj.contains_key(&format!("_{key}"))
 }
 
 fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
@@ -1480,6 +1487,43 @@ mod tests {
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
+    }
+
+    /// A required primitive (or value[x] branch) carried only by its `_`
+    /// sidecar is present.
+    #[test]
+    fn sidecar_only_primitives_satisfy_required() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let ext = json!({
+            "url": "http://hl7.org/fhir/StructureDefinition/codesystem-concept-comments",
+            "_valueString": {"extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+                "valueCode": "unknown"
+            }]}
+        });
+        let errors = validator
+            .validate_sync(
+                &json!({"resourceType": "Patient", "extension": [ext]}),
+                &crate::ValidationOptions::default(),
+            )
+            .errors;
+        assert!(
+            !errors.iter().any(|e| e.kind == ErrorKind::Required),
+            "{errors:?}"
+        );
+        let observation = json!({"resourceType": "Observation", "code": {"text": "t"},
+        "_status": {"extension": [{
+            "url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+            "valueCode": "unknown"
+        }]}});
+        let errors = validator
+            .validate_sync(&observation, &crate::ValidationOptions::default())
+            .errors;
+        assert!(
+            !errors.iter().any(|e| e.kind == ErrorKind::Required),
+            "{errors:?}"
+        );
     }
 
     #[test]
