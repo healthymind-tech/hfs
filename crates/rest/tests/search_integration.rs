@@ -5417,6 +5417,35 @@ mod summary_count {
         );
     }
 
+    /// `_summary=count` is answered from the backend's count alone, with the
+    /// same total a search reports under `_total=accurate`, filtered or not,
+    /// and with nothing else in the Bundle (no entries, no paging links).
+    #[tokio::test]
+    async fn test_summary_count_matches_the_accurate_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for filter in ["", "family=Smith&", "gender=female&", "name=nobody&"] {
+            let get = |url: String| {
+                server
+                    .get(&url)
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            };
+            let count: Value = get(format!("/Patient?{filter}_summary=count")).await.json();
+            let full: Value = get(format!("/Patient?{filter}_total=accurate&_count=1"))
+                .await
+                .json();
+            assert_eq!(count["total"], full["total"], "{filter}: {count} vs {full}");
+            assert!(count.get("entry").is_none(), "{filter}: {count}");
+            assert!(
+                count["link"]
+                    .as_array()
+                    .is_none_or(|links| links.iter().all(|l| l["relation"] != "next")),
+                "{filter}: {count}"
+            );
+        }
+    }
+
     /// `_total=none` means no total on a plain search either, whatever the
     /// backend can produce for free (Elasticsearch always has one, and the
     /// MongoDB backend used to count for it), so the header a client derives

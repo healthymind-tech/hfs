@@ -656,15 +656,44 @@ where
         query
     };
 
-    // Execute the search
-    let mut result = state
-        .storage()
-        .search(tenant.context(), &query)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Search failed");
-            RestError::from(e)
-        })?;
+    // Execute the search. `_summary=count` answers with `Bundle.total` alone
+    // (see `bundle_to_json_with_subsetting`), so it asks the backend for the
+    // count and nothing else: `search` would also fetch, decode and then drop
+    // a page of resources — on PostgreSQL a second statement to plan, ~5 ms
+    // of the 40 ms `Observation?code=...&_summary=count` took.
+    let count_only =
+        query.summary == Some(helios_persistence::types::SummaryMode::Count) && query.wants_total();
+    let mut result = if count_only {
+        let total = state
+            .storage()
+            .search_count(tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Search count failed");
+                RestError::from(e)
+            })?;
+        helios_persistence::core::SearchResult {
+            resources: helios_persistence::types::Page::new(
+                Vec::new(),
+                helios_persistence::types::PageInfo {
+                    total: Some(total),
+                    ..helios_persistence::types::PageInfo::end()
+                },
+            ),
+            included: Vec::new(),
+            total: Some(total),
+            scores: Default::default(),
+        }
+    } else {
+        state
+            .storage()
+            .search(tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Search failed");
+                RestError::from(e)
+            })?
+    };
 
     // Resolve _include/_revinclude for backends whose search() does not
     // populate includes inline (SQLite, Postgres, Elasticsearch): the Full
