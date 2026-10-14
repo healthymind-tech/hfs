@@ -62,6 +62,40 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
+/// Who is behind this console request, forwarded to the admin API so its
+/// audit trail names the operator rather than the console's loopback client.
+pub(crate) struct Fwd(Vec<(&'static str, String)>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Fwd {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let mut out = Vec::new();
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-user",
+            "x-remote-user",
+            "user-agent",
+        ] {
+            if let Some(v) = parts.headers.get(name).and_then(|v| v.to_str().ok()) {
+                out.push((name, v.to_string()));
+            }
+        }
+        if !out.iter().any(|(n, _)| *n == "x-forwarded-for")
+            && let Some(axum::extract::ConnectInfo(peer)) =
+                parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        {
+            out.push(("x-forwarded-for", peer.ip().to_string()));
+        }
+        Ok(Fwd(out))
+    }
+}
+
 /// Why an admin page cannot show data.
 #[derive(Clone, Debug)]
 pub(crate) enum Unavailable {
@@ -109,7 +143,7 @@ pub(crate) async fn admin_get(
 ) -> Result<Value, Unavailable> {
     match state
         .upstream
-        .admin_call(reqwest::Method::GET, path, None, timeout)
+        .admin_call(reqwest::Method::GET, path, None, timeout, &[])
         .await
     {
         Ok((200, v)) => Ok(v),
@@ -156,6 +190,7 @@ fn with_param(base: &str, key: &str, value: &str) -> String {
 /// with the error.
 async fn submit_job(
     state: &HtsUiState,
+    fwd: &Fwd,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
@@ -163,7 +198,7 @@ async fn submit_job(
 ) -> Response {
     match state
         .upstream
-        .admin_call(method, path, body.as_ref(), FAST)
+        .admin_call(method, path, body.as_ref(), FAST, &fwd.0)
         .await
     {
         Ok((202, job)) => match job.get("id").and_then(|i| i.as_str()) {
@@ -447,7 +482,7 @@ pub(crate) fn flatten(i18n: &I18n, systems: Vec<InvSystem>) -> Vec<InvRow> {
     rows
 }
 
-async fn set_current(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Response {
+async fn set_current(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
     let back = field(&f, "back")
         .filter(|b| b.starts_with("/ui/hts/"))
@@ -473,6 +508,7 @@ async fn set_current(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Respo
             "/code-systems/current",
             Some(&body),
             FAST,
+            &fwd.0,
         )
         .await
     {
@@ -593,7 +629,7 @@ async fn delete_confirm_page(
     render_page(page.render())
 }
 
-async fn delete_submit(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Response {
+async fn delete_submit(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
     let url = field(&f, "url").unwrap_or("").to_string();
     let version = field(&f, "version").unwrap_or("").to_string();
@@ -607,6 +643,7 @@ async fn delete_submit(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Res
     }
     submit_job(
         &state,
+        &fwd,
         reqwest::Method::POST,
         "/code-systems/delete",
         Some(json!({ "url": url, "version": version })),
@@ -615,7 +652,7 @@ async fn delete_submit(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Res
     .await
 }
 
-async fn delete_resource(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Response {
+async fn delete_resource(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
     let back = "/ui/hts/terminology";
     let Some(url) = field(&f, "url") else {
@@ -629,12 +666,13 @@ async fn delete_resource(State(state): State<Arc<HtsUiState>>, body: Bytes) -> R
             enc(field(&f, "version").unwrap_or(""))
         ),
     };
-    submit_job(&state, reqwest::Method::DELETE, &path, None, back).await
+    submit_job(&state, &fwd, reqwest::Method::DELETE, &path, None, back).await
 }
 
-async fn compact(State(state): State<Arc<HtsUiState>>) -> Response {
+async fn compact(State(state): State<Arc<HtsUiState>>, fwd: Fwd) -> Response {
     submit_job(
         &state,
+        &fwd,
         reqwest::Method::POST,
         "/maintenance/compact",
         None,
@@ -784,7 +822,7 @@ pub(crate) async fn import_admin(
     })
 }
 
-async fn start_import(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Response {
+async fn start_import(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
     let back = "/ui/hts/import";
     let source = match field(&f, "admin_source") {
@@ -814,7 +852,15 @@ async fn start_import(State(state): State<Arc<HtsUiState>>, body: Bytes) -> Resp
         "languages": field(&f, "languages"),
         "properties": field(&f, "properties"),
     });
-    submit_job(&state, reqwest::Method::POST, "/imports", Some(req), back).await
+    submit_job(
+        &state,
+        &fwd,
+        reqwest::Method::POST,
+        "/imports",
+        Some(req),
+        back,
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1234,7 +1280,11 @@ async fn job_page(
     resp
 }
 
-async fn cancel_job(State(state): State<Arc<HtsUiState>>, Path(id): Path<String>) -> Response {
+async fn cancel_job(
+    State(state): State<Arc<HtsUiState>>,
+    fwd: Fwd,
+    Path(id): Path<String>,
+) -> Response {
     let back = format!("/ui/hts/jobs/{}", enc(&id));
     match state
         .upstream
@@ -1243,6 +1293,7 @@ async fn cancel_job(State(state): State<Arc<HtsUiState>>, Path(id): Path<String>
             &format!("/jobs/{}/cancel", enc(&id)),
             None,
             FAST,
+            &fwd.0,
         )
         .await
     {

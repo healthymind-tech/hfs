@@ -106,12 +106,16 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let signal = helios_observability::shutdown::signal().await;
-            info!(signal, "Shutdown signal received, draining connections");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        // Peer addresses feed the admin audit trail (`admin::audit`).
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
+    })
+    .await?;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())
@@ -174,12 +178,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS (PostgreSQL) listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let signal = helios_observability::shutdown::signal().await;
-            info!(signal, "Shutdown signal received, draining connections");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        // Peer addresses feed the admin audit trail (`admin::audit`).
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
+    })
+    .await?;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())

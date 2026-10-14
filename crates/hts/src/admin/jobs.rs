@@ -392,6 +392,12 @@ impl JobManager {
 
     /// Enqueue `spec`; returns the stored job (with its queue position).
     pub fn submit(&self, spec: JobSpec, actor: Actor) -> Job {
+        self.submit_labeled(spec, actor, None)
+    }
+
+    /// [`Self::submit`] with a human label replacing [`JobSpec::label`]
+    /// (e.g. naming the uploaded file instead of its session id).
+    pub fn submit_labeled(&self, spec: JobSpec, actor: Actor, label: Option<String>) -> Job {
         let id = format!(
             "{}-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S"),
@@ -399,7 +405,7 @@ impl JobManager {
         );
         let job = Job {
             id: id.clone(),
-            label: spec.label(),
+            label: label.unwrap_or_else(|| spec.label()),
             phases: spec.phases().into_iter().map(String::from).collect(),
             spec,
             status: JobStatus::Queued,

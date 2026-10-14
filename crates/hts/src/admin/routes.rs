@@ -63,7 +63,26 @@ pub fn router(core: Arc<AdminCore>) -> Router {
         .route("/jobs/{id}/log", get(job_log))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/audit", get(audit))
+        .layer(axum::middleware::from_fn(peer_as_forwarded_for))
         .with_state(core)
+}
+
+/// Record the TCP peer as `X-Forwarded-For` when no proxy set one, so the
+/// audit trail names a client address even without a reverse proxy.
+async fn peer_as_forwarded_for(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !req.headers().contains_key("x-forwarded-for")
+        && let Some(axum::extract::ConnectInfo(peer)) = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .cloned()
+        && let Ok(v) = peer.ip().to_string().parse()
+    {
+        req.headers_mut().insert("x-forwarded-for", v);
+    }
+    next.run(req).await
 }
 
 fn accepted(job: super::jobs::Job) -> Response {
@@ -643,9 +662,11 @@ async fn start_import(
         ),
         None => None,
     };
+    let mut label_src: Option<String> = None;
     match &body.source {
         ImportSource::Upload { upload_id } => {
-            core.uploads.file_path(upload_id).await?;
+            let (_, meta) = core.uploads.file_path(upload_id).await?;
+            label_src = Some(format!("upload {}", meta.filename));
         }
         ImportSource::ImportDir { path } => {
             uploads::resolve_in(import_root(&core)?, path)?;
@@ -670,7 +691,11 @@ async fn start_import(
             "a version override is only possible for single-system formats, not {f}"
         )));
     }
-    let job = core.jobs.submit(
+    let label = label_src.map(|src| match fmt {
+        Some(f) => format!("import {f} from {src}"),
+        None => format!("import from {src}"),
+    });
+    let job = core.jobs.submit_labeled(
         JobSpec::Import {
             source: body.source,
             format: fmt.map(|f| f.to_string()),
@@ -680,6 +705,7 @@ async fn start_import(
             batch_size: body.batch_size,
         },
         Actor::from_headers(&headers),
+        label,
     );
     Ok(accepted(job))
 }

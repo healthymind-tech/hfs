@@ -4520,9 +4520,15 @@ impl UpstreamClient {
         path_and_query: &str,
         body: Option<&Value>,
         timeout: Duration,
+        forward: &[(&'static str, String)],
     ) -> Result<(u16, Value), UpstreamError> {
         let url = format!("{}/admin{}", self.base_url, path_and_query);
         let mut req = self.client.request(method, &url).timeout(timeout);
+        // Identity of the browser behind the console, for the admin audit
+        // trail (the upstream otherwise sees only this loopback client).
+        for (name, value) in forward {
+            req = req.header(*name, value.as_str());
+        }
         if let Some(b) = body {
             req = req.json(b);
         }

@@ -46,7 +46,7 @@
     </div>
 
     {#- ── Upload ───────────────────────────────────────────────────────── -#}
-    <fieldset class="field" data-source-panel="upload" id="hts-src-upload">
+    <div role="group" class="field" data-source-panel="upload" id="hts-src-upload">
       <span class="field__label">{{ chrome.i18n.t("hts-import-src-upload") }}</span>
       <noscript><p class="field__hint">{{ chrome.i18n.t("hts-up-needs-js") }}</p></noscript>
       <button type="button" class="batch-drop" id="hts-up-drop">
@@ -89,11 +89,11 @@
         </ul>
         {% if a.completed.is_empty() %}<p class="query-empty" id="hts-up-none">{{ chrome.i18n.t("hts-up-none") }}</p>{% endif %}
       </div>
-    </fieldset>
+    </div>
 
     {#- ── Server import directory ──────────────────────────────────────── -#}
     {% if let Some(dir) = a.import_dir %}
-    <fieldset class="field" data-source-panel="import-dir" id="hts-src-dir">
+    <div role="group" class="field" data-source-panel="import-dir" id="hts-src-dir">
       <span class="field__label">{{ chrome.i18n.t("hts-import-src-dir") }} <code>{{ dir }}</code></span>
       {% if let Some(e) = a.dir_error %}<p class="alert">{{ e }}</p>{% endif %}
       {% if a.dir_entries.is_empty() %}<p class="query-empty">{{ chrome.i18n.t("hts-dir-empty") }}</p>{% else %}
@@ -118,12 +118,12 @@
         </table>
       </div>
       {% endif %}
-    </fieldset>
+    </div>
     {% endif %}
 
     {#- ── Registry ─────────────────────────────────────────────────────── -#}
     {% if let Some(reg) = a.registry %}
-    <fieldset class="field" data-source-panel="registry" id="hts-src-registry">
+    <div role="group" class="field" data-source-panel="registry" id="hts-src-registry">
       <span class="field__label">{{ chrome.i18n.t("hts-import-src-registry") }} <code>{{ reg }}</code></span>
       <div class="field-row">
         <label class="field">
@@ -142,11 +142,11 @@
         </label>
       </div>
       <div id="hts-registry-results"></div>
-    </fieldset>
+    </div>
     {% endif %}
 
     {#- ── Options ──────────────────────────────────────────────────────── -#}
-    <fieldset class="field" id="hts-import-options">
+    <div role="group" class="field" id="hts-import-options">
       <span class="field__label">2 · {{ chrome.i18n.t("hts-import-options") }}</span>
       <div class="field-row">
         <label class="field">
@@ -170,7 +170,7 @@
         </label>
       </div>
       <span class="field__hint">{{ chrome.i18n.t("hts-import-options-hint") }}</span>
-    </fieldset>
+    </div>
 
     <div class="form-actions">
       <span class="field__hint">{{ chrome.i18n.t("hts-import-job-note") }}</span>
