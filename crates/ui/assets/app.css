@@ -8649,3 +8649,627 @@ body.app-shell .pane {
   .toolbar { flex-wrap: wrap; }
   #tenant-rows { overflow-x: auto; }
 }
+
+/* ======================================================================
+   IG Packages (/ui/packages, /ui/packages/{name}/{version}) — packages.js.
+   Built from the shared pieces (cards, .batch-tabs, .batch-drop,
+   .table-wrap/.data-table--stack, .progress-track, tags); everything here
+   is layout. Colours come from the theme tokens, so dark mode follows.
+   ====================================================================== */
+.pkg > .card,
+.pkg-pane > .card,
+.pkg-wizard {
+  margin-bottom: 16px;
+}
+
+.pkg-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.pkg-status > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pkg-status dt,
+.pkg-meta dt {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.pkg-status dd,
+.pkg-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.pkg-status code,
+.pkg-meta code,
+.pkg-card__name,
+.pkg-node__name,
+.pkg-registry__item code,
+.pkg-job code,
+.pkg-deps code,
+.pkg-type code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pkg-tabs {
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.pkg-subtitle {
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.pkg-table td.num,
+.pkg-table th.num,
+.pkg-counts td.num,
+.pkg-counts th.num {
+  text-align: right;
+}
+
+.pkg-jobs .pkg-job-list,
+.pkg-deps {
+  list-style: none;
+  margin: 0;
+  padding: 8px 14px 12px;
+}
+
+.pkg-job,
+.pkg-deps li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--surface-border);
+  font-size: 13px;
+}
+
+.pkg-job:last-child,
+.pkg-deps li:last-child {
+  border-bottom: 0;
+}
+
+.btn--small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* Marketplace */
+.pkg-filters {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) repeat(4, minmax(120px, 1fr));
+  gap: 12px;
+  align-items: end;
+  padding: 14px 14px 0;
+}
+
+.pkg-filters .field {
+  margin-bottom: 0;
+}
+
+.pkg-filters__search {
+  align-self: end;
+}
+
+.pkg-market__count {
+  margin: 10px 14px 0;
+  font-size: 12px;
+}
+
+.pkg-pane .notice {
+  margin: 10px 14px;
+}
+
+.pkg-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+  list-style: none;
+  margin: 0;
+  padding: 12px 14px 14px;
+}
+
+.pkg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  background: var(--bg-content);
+}
+
+.pkg-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pkg-card__title {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-strong);
+}
+
+.pkg-card__meta,
+.pkg-card__canonical,
+.pkg-card__versions {
+  margin: 0;
+  font-size: 12px;
+}
+
+.pkg-card__versions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.pkg-card__desc {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  font-size: 13px;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.pkg-card__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 6px;
+}
+
+.pkg-card__version {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pkg-more {
+  display: flex;
+  justify-content: center;
+  padding: 0 14px 14px;
+}
+
+.pkg-more:has(> [hidden]) {
+  display: none;
+}
+
+.pkg-registry {
+  padding: 0 14px 14px;
+}
+
+.pkg-subhead {
+  margin: 4px 0 8px;
+  font-size: 13px;
+}
+
+.pkg-registry__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pkg-registry__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--surface-border);
+  font-size: 13px;
+}
+
+.pkg-byname {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 14px;
+}
+
+.pkg-byname .field {
+  margin-bottom: 0;
+}
+
+.pkg-byname__actions {
+  padding-top: 22px;
+}
+
+.pkg-upload {
+  padding: 14px;
+}
+
+.pkg-upload__hint {
+  margin: 10px 2px 0;
+  font-size: 12px;
+}
+
+.pkg-upload .notice,
+.pkg-upload .busy-status {
+  margin: 10px 0 0;
+}
+
+/* Wizard */
+.pkg-wizard > .pkg-step,
+.pkg-wizard > .pkg-steps {
+  margin: 0 14px;
+}
+
+.pkg-wizard > .pkg-step {
+  padding-bottom: 14px;
+}
+
+.pkg-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding: 12px 0 10px;
+  list-style: none;
+  counter-reset: pkg-step;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.pkg-steps li {
+  counter-increment: pkg-step;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pkg-steps li::before {
+  content: counter(pkg-step);
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.pkg-steps li.is-current {
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.pkg-steps li.is-current::before {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.pkg-steps li.is-done::before {
+  content: "✓";
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.pkg-plan__totals {
+  font-weight: 600;
+}
+
+.pkg-wizard .notice {
+  white-space: pre-line;
+}
+
+.pkg-tree,
+.pkg-tree__children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pkg-tree__children {
+  margin-left: 10px;
+  padding-left: 14px;
+  border-left: 1px dashed var(--divider);
+}
+
+.pkg-node {
+  padding: 6px 0;
+}
+
+.pkg-node__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.pkg-node__title {
+  font-size: 12px;
+}
+
+.pkg-node__skip {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.pkg-node__counts {
+  margin: 3px 0 0;
+  font-size: 12px;
+}
+
+.pkg-node--repeat > .pkg-node__head {
+  opacity: 0.7;
+}
+
+.pkg-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.pkg-options__group {
+  margin: 0;
+  padding: 10px 14px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+}
+
+.pkg-options__group legend {
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pkg-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.pkg-check input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.pkg-progress {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
+.pkg-progress__phase {
+  margin: 4px 0 10px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.pkg-log {
+  margin-top: 12px;
+}
+
+.pkg-log pre {
+  max-height: 280px;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--input-bg);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pkg-verdict {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+}
+
+.pkg-verdict p {
+  margin: 6px 0 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pkg-verdict--ok {
+  background: var(--ok-soft);
+  border-color: var(--ok);
+}
+
+.pkg-verdict--warn {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.pkg-verdict--error {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+.pkg-errors h4 {
+  margin: 12px 0 6px;
+}
+
+.pkg-step__actions {
+  flex-wrap: wrap;
+}
+
+/* Detail */
+.page-head__back {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.pkg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.pkg-meta {
+  padding: 14px;
+}
+
+.pkg-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.pkg-types {
+  padding: 8px 14px 14px;
+}
+
+.pkg-type {
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.pkg-type summary {
+  padding: 9px 0;
+  cursor: pointer;
+}
+
+.pkg-type > p {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.pkg-type .table-wrap {
+  margin-bottom: 10px;
+}
+
+.pkg-dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 16px;
+  background: var(--bg-content);
+  color: var(--text);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 25%);
+}
+
+.pkg-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.pkg-dialog__form {
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px 20px;
+  font-size: 13px;
+}
+
+.pkg-dialog__form p,
+.pkg-dialog__form .notice {
+  margin: 0;
+}
+
+.pkg-dialog__title {
+  margin: 0;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.pkg-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 900px) {
+  .pkg-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .pkg-filters__search {
+    grid-column: 1 / -1;
+  }
+
+  .pkg-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .pkg-filters,
+  .pkg-byname {
+    grid-template-columns: 1fr;
+  }
+
+  .pkg-byname__actions {
+    padding-top: 0;
+  }
+
+  .pkg-byname__actions .btn,
+  .pkg-card__actions .btn,
+  .pkg-step__actions .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+
+  .pkg-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .pkg-registry__item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pkg-node__skip {
+    margin-left: 0;
+  }
+
+  .pkg-tree__children {
+    margin-left: 4px;
+    padding-left: 10px;
+  }
+
+  .pkg-status {
+    flex-direction: column;
+  }
+
+  /* Stacked rows read label/value left to right: no right-aligned figures. */
+  .pkg-table td.num,
+  .pkg-counts td.num {
+    text-align: left;
+  }
+
+  .pkg-pane .toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .pkg-pane .toolbar__search {
+    flex: 1 1 100%;
+  }
+
+  .pkg-pane .table-card {
+    padding: 12px;
+  }
+}

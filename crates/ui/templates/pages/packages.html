@@ -1,0 +1,261 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("packages-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title" id="packages-title">{{ i18n.t("packages-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("packages-lede") }}</p>
+</section>
+
+{% if !enabled %}
+<div class="card notice" id="pkg-disabled">{{ i18n.t("packages-disabled") }}</div>
+{% else %}
+<!--
+  FHIR package (IG) management. Everything below is driven by packages.js
+  against the admin API (`[base]/admin/packages`, crates/rest
+  handlers/admin_packages.rs): the Installed list, the marketplace index
+  (FHIR/ig-registry, Taiwan first), registry search, `.tgz` upload, and the
+  install wizard (dependency tree -> options -> live progress -> result).
+-->
+<div id="pkg-app" class="pkg">
+  <dl class="pkg-status" id="pkg-status" aria-live="polite">
+    <div><dt>{{ i18n.t("packages-status-registry") }}</dt><dd id="pkg-status-registry">…</dd></div>
+    <div><dt>{{ i18n.t("packages-status-terminology") }}</dt><dd id="pkg-status-terminology">…</dd></div>
+    <div><dt>{{ i18n.t("packages-status-cache") }}</dt><dd id="pkg-status-cache"><code>…</code></dd></div>
+  </dl>
+
+  <div id="pkg-views">
+    <div class="batch-tabs pkg-tabs" role="tablist" aria-label="{{ i18n.t("packages-tabs-label") }}">
+      <button type="button" class="batch-tab" id="pkg-tab-installed" role="tab" aria-selected="true" aria-controls="pkg-pane-installed" data-pkg-tab="installed"><span class="icon">{% include "icons/package.svg" %}</span> {{ i18n.t("packages-tab-installed") }}</button>
+      <button type="button" class="batch-tab" id="pkg-tab-market" role="tab" aria-selected="false" aria-controls="pkg-pane-market" tabindex="-1" data-pkg-tab="market"><span class="icon">{% include "icons/search.svg" %}</span> {{ i18n.t("packages-tab-market") }}</button>
+      <button type="button" class="batch-tab" id="pkg-tab-upload" role="tab" aria-selected="false" aria-controls="pkg-pane-upload" tabindex="-1" data-pkg-tab="upload"><span class="icon">{% include "icons/import.svg" %}</span> {{ i18n.t("packages-tab-upload") }}</button>
+    </div>
+
+    <!-- ============ Installed ============ -->
+    <div class="pkg-pane" id="pkg-pane-installed" role="tabpanel" aria-labelledby="pkg-tab-installed" tabindex="0">
+      <section class="card table-card">
+        <div class="toolbar">
+          <label class="toolbar__search">
+            {% include "icons/search.svg" %}
+            <input type="search" id="pkg-installed-filter" placeholder="{{ i18n.t("packages-installed-search") }}" autocomplete="off" aria-label="{{ i18n.t("packages-installed-search") }}">
+          </label>
+          <span class="toolbar__count muted" id="pkg-installed-count"></span>
+        </div>
+        <div class="table-wrap" tabindex="0">
+          <table class="data-table data-table--stack pkg-table">
+            <thead>
+              <tr>
+                <th scope="col">{{ i18n.t("packages-col-name") }}</th>
+                <th scope="col">{{ i18n.t("packages-col-version") }}</th>
+                <th scope="col">{{ i18n.t("packages-col-fhir") }}</th>
+                <th scope="col">{{ i18n.t("packages-col-installed") }}</th>
+                <th scope="col" class="num">{{ i18n.t("packages-col-resources") }}</th>
+                <th scope="col">{{ i18n.t("packages-col-dependencies") }}</th>
+                <th scope="col">{{ i18n.t("packages-col-status") }}</th>
+              </tr>
+            </thead>
+            <tbody id="pkg-installed-rows">
+              <tr><td colspan="7" class="data-table__empty"><span class="spinner" aria-hidden="true"></span> {{ i18n.t("packages-detail-loading") }}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card pkg-jobs">
+        <div class="card-head"><h3><span class="icon">{% include "icons/history.svg" %}</span> {{ i18n.t("packages-jobs-heading") }}</h3></div>
+        <ul class="pkg-job-list" id="pkg-jobs"></ul>
+      </section>
+    </div>
+
+    <!-- ============ Marketplace ============ -->
+    <div class="pkg-pane" id="pkg-pane-market" role="tabpanel" aria-labelledby="pkg-tab-market" tabindex="0" hidden>
+      <section class="card">
+        <form class="pkg-filters" id="pkg-market-form" role="search">
+          <label class="toolbar__search pkg-filters__search">
+            {% include "icons/search.svg" %}
+            <input type="search" id="pkg-market-q" name="q" placeholder="{{ i18n.t("packages-market-search") }}" autocomplete="off" aria-label="{{ i18n.t("packages-market-search") }}">
+          </label>
+          <label class="field pkg-filters__field">
+            <span class="field__label">{{ i18n.t("packages-filter-country") }}</span>
+            <select class="field__input" id="pkg-market-country" name="country"><option value="">{{ i18n.t("packages-filter-any") }}</option></select>
+          </label>
+          <label class="field pkg-filters__field">
+            <span class="field__label">{{ i18n.t("packages-filter-category") }}</span>
+            <select class="field__input" id="pkg-market-category" name="category"><option value="">{{ i18n.t("packages-filter-any") }}</option></select>
+          </label>
+          <label class="field pkg-filters__field">
+            <span class="field__label">{{ i18n.t("packages-filter-authority") }}</span>
+            <select class="field__input" id="pkg-market-authority" name="authority"><option value="">{{ i18n.t("packages-filter-any") }}</option></select>
+          </label>
+          <label class="field pkg-filters__field">
+            <span class="field__label">{{ i18n.t("packages-filter-fhir") }}</span>
+            <select class="field__input" id="pkg-market-fhir" name="fhirversion">
+              <option value="">{{ i18n.t("packages-filter-any") }}</option>
+              <option value="R4" selected>R4</option>
+              <option value="R4B">R4B</option>
+              <option value="R5">R5</option>
+            </select>
+          </label>
+        </form>
+        <p class="muted pkg-market__count" id="pkg-market-count" aria-live="polite"></p>
+        <div class="notice notice--warn" id="pkg-market-error" hidden></div>
+        <ul class="pkg-cards" id="pkg-market-results"></ul>
+        <div class="pkg-more"><button type="button" class="btn" id="pkg-market-more" hidden>{{ i18n.t("packages-market-more") }}</button></div>
+        <div class="pkg-registry" id="pkg-registry" hidden>
+          <h3 class="pkg-subhead">{{ i18n.t("packages-registry-results") }}</h3>
+          <ul class="pkg-registry__list" id="pkg-registry-results"></ul>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h3><span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("packages-install-by-name") }}</h3></div>
+        <form class="pkg-byname" id="pkg-byname" novalidate>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("packages-install-name") }}</span>
+            <input class="field__input" type="text" id="pkg-byname-name" required autocomplete="off" spellcheck="false" autocapitalize="off"
+                   placeholder="{{ i18n.t("packages-install-name-placeholder") }}" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*">
+          </label>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("packages-install-version") }}</span>
+            <input class="field__input" type="text" id="pkg-byname-version" list="pkg-byname-versions" autocomplete="off" spellcheck="false"
+                   placeholder="{{ i18n.t("packages-install-version-latest") }}" aria-describedby="pkg-byname-hint">
+            <span class="field__hint" id="pkg-byname-hint">{{ i18n.t("packages-install-version-hint") }}</span>
+          </label>
+          <datalist id="pkg-byname-versions"></datalist>
+          <div class="pkg-byname__actions">
+            <button type="submit" class="btn btn--primary">{{ i18n.t("packages-install") }}</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <!-- ============ Upload ============ -->
+    <div class="pkg-pane" id="pkg-pane-upload" role="tabpanel" aria-labelledby="pkg-tab-upload" tabindex="0" hidden>
+      <section class="card pkg-upload">
+        <button type="button" class="batch-drop" id="pkg-drop">
+          <strong>{{ i18n.t("packages-upload-drop") }}</strong>
+          <span>{{ i18n.t("packages-upload-browse") }}</span>
+        </button>
+        <input type="file" id="pkg-file" accept=".tgz,.tar.gz,application/gzip,application/x-gzip" hidden>
+        <p class="muted pkg-upload__hint">{{ i18n.t("packages-upload-hint") }}</p>
+        <p class="busy-status" id="pkg-upload-status" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+        <div class="notice notice--warn" id="pkg-upload-error" hidden></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ============ Install wizard ============ -->
+  <section class="card pkg-wizard" id="pkg-wizard" tabindex="-1" hidden aria-labelledby="pkg-wizard-title">
+    <div class="card-head">
+      <h3 id="pkg-wizard-title"></h3>
+      <button type="button" class="btn" id="pkg-wizard-close">{{ i18n.t("packages-close") }}</button>
+    </div>
+    <ol class="pkg-steps" aria-label="{{ i18n.t("packages-wizard-steps") }}">
+      <li data-step="tree">{{ i18n.t("packages-step-tree") }}</li>
+      <li data-step="options">{{ i18n.t("packages-step-options") }}</li>
+      <li data-step="progress">{{ i18n.t("packages-step-progress") }}</li>
+      <li data-step="result">{{ i18n.t("packages-step-result") }}</li>
+    </ol>
+
+    <div class="pkg-step" id="pkg-step-tree">
+      <p class="busy-status" id="pkg-plan-busy" role="status"><span class="spinner" aria-hidden="true"></span><span>{{ i18n.t("packages-wizard-planning") }}</span></p>
+      <p class="muted">{{ i18n.t("packages-tree-lede") }}</p>
+      <p class="pkg-plan__totals" id="pkg-plan-totals" aria-live="polite"></p>
+      <div class="notice notice--warn" id="pkg-plan-error" hidden></div>
+      <ul class="pkg-tree" id="pkg-tree"></ul>
+      <div class="batch-footer pkg-step__actions">
+        <button type="button" class="btn" data-pkg-close>{{ i18n.t("packages-cancel") }}</button>
+        <button type="button" class="btn btn--primary" id="pkg-to-options" disabled>{{ i18n.t("packages-next") }}</button>
+      </div>
+    </div>
+
+    <div class="pkg-step" id="pkg-step-options" hidden>
+      <form class="pkg-options" id="pkg-options">
+        <fieldset class="pkg-options__group">
+          <legend>{{ i18n.t("packages-step-options") }}</legend>
+          <label class="pkg-check"><input type="checkbox" name="includeDependencies" checked> {{ i18n.t("packages-opt-dependencies") }}</label>
+          <label class="pkg-check"><input type="checkbox" name="includeExamples"> {{ i18n.t("packages-opt-examples") }}</label>
+          <span class="field__hint">{{ i18n.t("packages-opt-examples-hint") }}</span>
+        </fieldset>
+        <fieldset class="pkg-options__group">
+          <legend>{{ i18n.t("packages-opt-mode") }}</legend>
+          <label class="pkg-check"><input type="radio" name="mode" value="upgrade" checked> {{ i18n.t("packages-opt-mode-upgrade") }}</label>
+          <label class="pkg-check"><input type="radio" name="mode" value="side-by-side"> {{ i18n.t("packages-opt-mode-side") }}</label>
+        </fieldset>
+        <fieldset class="pkg-options__group">
+          <legend>{{ i18n.t("packages-opt-policy") }}</legend>
+          <label class="pkg-check"><input type="radio" name="dependencyPolicy" value="newer" checked> {{ i18n.t("packages-opt-policy-newer") }}</label>
+          <label class="pkg-check"><input type="radio" name="dependencyPolicy" value="exact"> {{ i18n.t("packages-opt-policy-exact") }}</label>
+        </fieldset>
+        <fieldset class="pkg-options__group">
+          <legend>{{ i18n.t("packages-opt-terminology") }}</legend>
+          <label class="pkg-check"><input type="radio" name="terminology" value="auto" checked> {{ i18n.t("packages-opt-terminology-auto") }}</label>
+          <label class="pkg-check"><input type="radio" name="terminology" value="hfs"> {{ i18n.t("packages-opt-terminology-hfs") }}</label>
+          <label class="pkg-check"><input type="radio" name="terminology" value="both"> {{ i18n.t("packages-opt-terminology-both") }}</label>
+        </fieldset>
+      </form>
+      <div class="batch-footer pkg-step__actions">
+        <button type="button" class="btn" id="pkg-back-tree">{{ i18n.t("packages-back-step") }}</button>
+        <button type="button" class="btn" id="pkg-replan">{{ i18n.t("packages-replan") }}</button>
+        <button type="button" class="btn btn--primary" id="pkg-start">{{ i18n.t("packages-start-install") }}</button>
+      </div>
+    </div>
+
+    <div class="pkg-step" id="pkg-step-progress" hidden>
+      <p class="pkg-progress__phase" id="pkg-phase" role="status" aria-live="polite"></p>
+      <div class="pkg-progress">
+        <span class="muted" id="pkg-progress-packages-label"></span>
+        <div class="progress-track" role="progressbar" aria-labelledby="pkg-progress-packages-label" id="pkg-progress-packages"><div class="progress-fill" style="width:0%"></div></div>
+        <span class="muted" id="pkg-progress-resources-label"></span>
+        <div class="progress-track" role="progressbar" aria-labelledby="pkg-progress-resources-label" id="pkg-progress-resources"><div class="progress-fill" style="width:0%"></div></div>
+      </div>
+      <div class="table-wrap" tabindex="0">
+        <table class="data-table data-table--stack pkg-counts">
+          <thead><tr>
+            <th scope="col">{{ i18n.t("packages-col-package") }}</th>
+            <th scope="col">{{ i18n.t("packages-col-type") }}</th>
+            <th scope="col" class="num">{{ i18n.t("packages-col-written") }}</th>
+            <th scope="col" class="num">{{ i18n.t("packages-col-failed") }}</th>
+            <th scope="col" class="num">{{ i18n.t("packages-col-skipped") }}</th>
+          </tr></thead>
+          <tbody id="pkg-counts"></tbody>
+        </table>
+      </div>
+      <details class="pkg-log">
+        <summary>{{ i18n.t("packages-log") }}</summary>
+        <pre id="pkg-log"></pre>
+      </details>
+      <div class="batch-footer pkg-step__actions">
+        <button type="button" class="btn btn--danger" id="pkg-stop"><span class="icon">{% include "icons/stop-circle.svg" %}</span> {{ i18n.t("packages-stop") }}</button>
+      </div>
+    </div>
+
+    <div class="pkg-step" id="pkg-step-result" hidden>
+      <div class="pkg-verdict" id="pkg-verdict" role="status"></div>
+      <div class="notice" id="pkg-notes" hidden></div>
+      <div class="pkg-errors" id="pkg-errors" hidden>
+        <h4>{{ i18n.t("packages-errors-heading") }}</h4>
+        <div class="table-wrap" tabindex="0">
+          <table class="data-table data-table--stack">
+            <thead><tr>
+              <th scope="col">{{ i18n.t("packages-col-package") }}</th>
+              <th scope="col">{{ i18n.t("packages-col-resource") }}</th>
+              <th scope="col">{{ i18n.t("packages-col-message") }}</th>
+            </tr></thead>
+            <tbody id="pkg-error-rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="batch-footer pkg-step__actions">
+        <button type="button" class="btn" id="pkg-download">{{ i18n.t("packages-download-report") }}</button>
+        <button type="button" class="btn btn--primary" id="pkg-done">{{ i18n.t("packages-view-installed") }}</button>
+      </div>
+    </div>
+  </section>
+
+{% include "partials/packages-messages.html" %}
+</div>
+<script src="/ui/assets/packages.js" defer></script>
+{% endif %}
+{% endblock %}
