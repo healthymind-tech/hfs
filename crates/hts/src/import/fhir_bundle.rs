@@ -14,12 +14,14 @@ use crate::import::ImportStats;
 use crate::import::bundle_parser::{
     self, ParsedBundle, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet,
 };
+use crate::version_order::version_sort_key;
 #[cfg(feature = "sqlite")]
 use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -101,31 +103,106 @@ pub(crate) fn import_parsed_sync(
 
     // Rebuild concept closure for newly imported (previously empty) code systems.
     // Skipped for batch imports of existing systems (see comment above).
-    for url in &systems_needing_closure {
-        let system_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
-                rusqlite::params![url],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(sid) = system_id {
-            let has_hierarchy: bool = conn
+    //
+    // A URL may map to several `code_systems` rows when a bundle carries more
+    // than one version of the same CodeSystem; every row that has hierarchy
+    // edges needs its own closure (mirrors the PostgreSQL importer).
+    //
+    // Re-imports of a system that already had concepts (not in
+    // `systems_needing_closure`) have had their closure wiped by
+    // `write_code_system`; rebuild it right away too unless the system is a
+    // bulk load in progress (hierarchy above `CLOSURE_REBUILD_INLINE_MAX_EDGES`
+    // edges), where the one-shot rebuild at the end of the CLI import /
+    // next start is the cheaper option.
+    let mut rebuilt: HashSet<String> = HashSet::new();
+    for cs in &parsed.code_systems {
+        let system_ids: Vec<String> = conn
+            .prepare("SELECT id FROM code_systems WHERE url = ?1")
+            .and_then(|mut s| {
+                s.query_map(rusqlite::params![cs.url], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        for sid in system_ids {
+            if !rebuilt.insert(sid.clone()) {
+                continue;
+            }
+            if systems_needing_closure.contains(&cs.url) {
+                build_closure_if_hierarchical(&conn, &sid);
+                continue;
+            }
+            let closure_missing: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
+                    "SELECT NOT EXISTS(SELECT 1 FROM concept_closure WHERE system_id = ?1)",
                     rusqlite::params![sid],
                     |r| r.get(0),
                 )
                 .unwrap_or(false);
-            if has_hierarchy {
-                if let Err(e) = schema::build_concept_closure(&conn, &sid) {
-                    tracing::warn!(system_id = %sid, error = %e, "Failed to build concept closure after import");
-                }
+            if !closure_missing {
+                continue;
+            }
+            let edges: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM concept_hierarchy WHERE system_id = ?1",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if edges > 0 && edges <= CLOSURE_REBUILD_INLINE_MAX_EDGES {
+                build_closure_if_hierarchical(&conn, &sid);
             }
         }
     }
 
     Ok(stats)
+}
+
+/// Largest hierarchy (in parent→child edges) whose closure is rebuilt inline
+/// after a bundle import of an already-populated system. Above this the
+/// system is assumed to be a chunked bulk load (SNOMED CT, LOINC) and the
+/// closure is built once at the end instead.
+#[cfg(feature = "sqlite")]
+const CLOSURE_REBUILD_INLINE_MAX_EDGES: i64 = 250_000;
+
+/// Rebuild `concept_closure` for the CodeSystem row that `cs_json` was just
+/// written to (resolved by `(url, version)`, the same key `write_code_system`
+/// upserts on). Used by the REST create/update path, which writes one resource
+/// at a time outside `import_parsed_sync`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn rebuild_closure_for_code_system(conn: &Connection, cs_json: &serde_json::Value) {
+    let Some(url) = cs_json.get("url").and_then(|u| u.as_str()) else {
+        return;
+    };
+    let version = cs_json.get("version").and_then(|v| v.as_str());
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![url, version],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(sid) = system_id {
+        build_closure_if_hierarchical(conn, &sid);
+    }
+}
+
+/// Build `concept_closure` for `system_id` when it has hierarchy edges; a
+/// failure is logged rather than propagated because the concepts themselves
+/// are already committed and `migrate_concept_closure` repairs the closure on
+/// the next start.
+#[cfg(feature = "sqlite")]
+pub(crate) fn build_closure_if_hierarchical(conn: &Connection, system_id: &str) {
+    let has_hierarchy: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
+            rusqlite::params![system_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_hierarchy && let Err(e) = schema::build_concept_closure(conn, system_id) {
+        tracing::warn!(system_id = %system_id, error = %e, "Failed to build concept closure after import");
+    }
 }
 
 /// Write a [`ParsedBundle`] into the SQLite normalized tables.
@@ -246,8 +323,8 @@ fn write_code_system(
     conn.execute(
         "INSERT OR IGNORE INTO code_systems
          (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
-          authority_rank)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+          authority_rank, version_sort)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
         rusqlite::params![
             storage_id,
             cs.url,
@@ -259,6 +336,7 @@ fn write_code_system(
             resource_json,
             now,
             cs.authority_rank,
+            version_sort_key(cs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -290,7 +368,8 @@ fn write_code_system(
            content        = ?4,
            resource_json  = ?5,
            updated_at     = ?6,
-           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9),
+           version_sort   = ?10
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
@@ -306,6 +385,7 @@ fn write_code_system(
             cs.url,
             cs.version,
             cs.authority_rank,
+            version_sort_key(cs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -584,8 +664,8 @@ fn write_value_set(
     conn.execute(
         "INSERT OR IGNORE INTO value_sets
          (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
-          authority_rank)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+          authority_rank, version_sort)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
         rusqlite::params![
             storage_id,
             vs.url,
@@ -597,6 +677,7 @@ fn write_value_set(
             resource_json,
             now,
             vs.authority_rank,
+            version_sort_key(vs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -614,7 +695,8 @@ fn write_value_set(
            compose_json   = ?4,
            resource_json  = ?5,
            updated_at     = ?6,
-           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9),
+           version_sort   = ?10
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
@@ -630,6 +712,7 @@ fn write_value_set(
             vs.url,
             vs.version,
             vs.authority_rank,
+            version_sort_key(vs.version.as_deref()),
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;

@@ -29,6 +29,8 @@ use crate::traits::{
 };
 use crate::types::ResourceSearchQuery;
 
+use super::params::split_canonical;
+
 fn ctx() -> TenantContext {
     TenantContext::system()
 }
@@ -93,6 +95,26 @@ fn parse_search_query(raw: Option<&str>) -> Result<ResourceSearchQuery, HtsError
             // behavior. Only modifiers on the five announced parameters above
             // are rejected.
             _ => {}
+        }
+    }
+
+    // `url=X|V` is the canonical spelling of `url=X&version=V`; fold it so the
+    // search hits the same rows as the operations do (see
+    // `params::normalize_canonical_params`). Disagreeing versions are a 400.
+    if let Some(raw) = query.url.take() {
+        let (bare, piped) = split_canonical(&raw);
+        query.url = Some(bare.to_string());
+        if let Some(piped) = piped {
+            match query.version.as_deref() {
+                Some(explicit) if explicit != piped => {
+                    return Err(HtsError::InvalidRequest(format!(
+                        "Search parameter `url` carries version `{piped}` but `version` is \
+                         `{explicit}`; supply one or make them agree"
+                    )));
+                }
+                Some(_) => {}
+                None => query.version = Some(piped.to_string()),
+            }
         }
     }
 

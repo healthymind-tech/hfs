@@ -565,11 +565,24 @@ impl SqliteTerminologyBackend {
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
+            // Must run before `migrate_concept_closure` would be useful again:
+            // it drops the closure of the systems it repairs, so run the
+            // closure migration once more afterwards.
+            schema::migrate_property_hierarchy(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
+            })?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
 
             // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
@@ -742,11 +755,24 @@ impl SqliteTerminologyBackend {
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
+            // Must run before `migrate_concept_closure` would be useful again:
+            // it drops the closure of the systems it repairs, so run the
+            // closure migration once more afterwards.
+            schema::migrate_property_hierarchy(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
+            })?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
         }
 
@@ -865,6 +891,43 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
                 .ok(),
             _ => None,
         }
+    }
+
+    fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
+        let conn = self.pool.get().ok()?;
+        let (table, order_by) = match resource_type {
+            "CodeSystem" => (
+                "code_systems",
+                crate::backends::cs_precedence_order_by("code_systems"),
+            ),
+            "ValueSet" => (
+                "value_sets",
+                crate::backends::vs_precedence_order_by("value_sets"),
+            ),
+            "ConceptMap" => (
+                "concept_maps",
+                std::borrow::Cow::Borrowed("created_at DESC"),
+            ),
+            _ => return None,
+        };
+        // Exact storage id first, then the synthetic `<id>|<version>` storage
+        // ids. Both are served by the primary key (the `|` prefix is expressed
+        // as a range so SQLite can use the index; `}` is the next ASCII
+        // character after `|`). Deliberately no `json_extract(resource_json,
+        // '$.id')` fallback: that is a full scan of every stored resource
+        // (~2.3 s over 21k ValueSets) on every miss, i.e. on every 404.
+        let sql = format!(
+            "SELECT resource_json FROM {table} \
+             WHERE id = ?1 OR (id >= ?1 || '|' AND id < ?1 || '}}') \
+             ORDER BY (id = ?1) DESC, {order_by} LIMIT 1"
+        );
+        let raw: Option<String> = conn
+            .query_row(&sql, rusqlite::params![id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten();
+        raw.and_then(|s| serde_json::from_str(&s).ok())
     }
 }
 

@@ -55,8 +55,8 @@ use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
-    collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    collect_resource_params, extract_parameter_array, find_bool_param, find_resource_param,
+    find_str_param, normalize_canonical_params, parse_query_string, query_params_to_fhir_params,
 };
 
 /// Standards-status codes that warrant a `warning-<status>` expansion
@@ -330,6 +330,19 @@ fn populate_concept_flags<'a, B: TerminologyBackend>(
 /// Populate `designations` on each expansion entry in-place via a per-system
 /// batched lookup. Mirrors `populate_concept_flags` and is only invoked when
 /// the caller passes `includeDesignations=true`.
+/// Distinct `system` URLs appearing anywhere in `contains` (nested included),
+/// in first-seen order.
+fn collect_contains_systems(contains: &[ExpansionContains], out: &mut Vec<String>) {
+    for c in contains {
+        if !out.contains(&c.system) {
+            out.push(c.system.clone());
+        }
+        if !c.contains.is_empty() {
+            collect_contains_systems(&c.contains, out);
+        }
+    }
+}
+
 fn populate_designations<'a, B: TerminologyBackend>(
     backend: &'a B,
     ctx: &'a TenantContext,
@@ -1141,6 +1154,7 @@ fn apply_display_language<'a, B: TerminologyBackend>(
     contains: &'a mut [ExpansionContains],
     spec: &'a DisplayLangSpec,
     cs_lang_by_url: &'a std::collections::HashMap<String, Option<String>>,
+    supplement_urls: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
         use crate::types::ExpansionContainsDesignation;
@@ -1160,9 +1174,33 @@ fn apply_display_language<'a, B: TerminologyBackend>(
         // a designation whose tag extends the requested tag with a `-`
         // subtag (so `de` matches `de-CH` but not `den`), then the same two
         // rules against truncations of the requested tag (`de-DE` → `de`).
+        // Designations contributed by applied supplements (translation
+        // supplements in particular) take part in the language match too.
+        // They are keyed by code only, so they are offered to every system
+        // that carries that code.
+        let mut supplement_lists: HashMap<String, Vec<crate::traits::ConceptDesignation>> =
+            HashMap::new();
+        if !supplement_urls.is_empty() {
+            let mut all_codes: Vec<String> = by_system.values().flatten().cloned().collect();
+            all_codes.sort();
+            all_codes.dedup();
+            if let Ok(ds) = backend
+                .supplement_designations(ctx, supplement_urls, &all_codes)
+                .await
+            {
+                supplement_lists = ds;
+            }
+        }
         let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
         for (system, codes) in &by_system {
-            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+            if let Ok(mut ds) = backend.concept_designations(ctx, system, codes).await {
+                for code in codes {
+                    if let Some(extra) = supplement_lists.get(code) {
+                        ds.entry(code.clone())
+                            .or_default()
+                            .extend(extra.iter().cloned());
+                    }
+                }
                 for (code, list) in ds {
                     let chosen = crate::language::best_lang_match_index(
                         language,
@@ -1190,8 +1228,15 @@ fn apply_display_language<'a, B: TerminologyBackend>(
             if cs_lang_already_matches {
                 // Skip the swap entirely; designations are preserved as-is.
                 if !c.contains.is_empty() {
-                    apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url)
-                        .await;
+                    apply_display_language(
+                        backend,
+                        ctx,
+                        &mut c.contains,
+                        spec,
+                        cs_lang_by_url,
+                        supplement_urls,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -1272,7 +1317,15 @@ fn apply_display_language<'a, B: TerminologyBackend>(
             }
 
             if !c.contains.is_empty() {
-                apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url).await;
+                apply_display_language(
+                    backend,
+                    ctx,
+                    &mut c.contains,
+                    spec,
+                    cs_lang_by_url,
+                    supplement_urls,
+                )
+                .await;
             }
         }
     })
@@ -1464,7 +1517,7 @@ fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Byte
 /// nonetheless map to the same canonical URL+params bucket (e.g. when the
 /// caller adds `valueSet` / `tx-resource` inline payloads that force this
 /// outer cache to skip but otherwise produce the same expansion).
-async fn process_expand<B: TerminologyBackend>(
+pub(crate) async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
@@ -1481,6 +1534,11 @@ async fn process_expand<B: TerminologyBackend>(
     // Either path is short-circuited on a hit.  Falling through both means
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
+    //
+    // Canonical `url|version` is folded into `url` + `valueSetVersion` first so
+    // the cache key, the negative cache and every resolver below see one shape.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
@@ -1761,12 +1819,20 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // URLs that previously returned NotFound are remembered here so we can skip
     // all backend queries on repeated requests (saves 5+ SQLite round-trips per
     // hit).
-    if let Some(ref url_str) = url {
-        if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(url_str.as_str()) {
-                return Err(HtsError::NotFound(url_str.clone()));
-            }
-        }
+    // Keyed on `url` or `url|valueSetVersion`: a miss for one pinned version
+    // must not shadow a different version (or the unpinned latest) of the same
+    // canonical URL.
+    let neg_cache_key: Option<String> =
+        url.as_ref()
+            .map(|u| match find_str_param(&params, "valueSetVersion") {
+                Some(v) => format!("{u}|{v}"),
+                None => u.clone(),
+            });
+    if let (Some(url_str), Some(key)) = (&url, &neg_cache_key)
+        && let Ok(neg) = state.not_found_urls.read()
+        && neg.contains(key.as_str())
+    {
+        return Err(HtsError::NotFound(url_str.clone()));
     }
 
     // `tx-resource` parameters provide ad-hoc terminology that the caller does
@@ -1972,12 +2038,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
             if let Some(ref url_str) = url_for_neg_cache {
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
-                if msg_names_top {
-                    if let Ok(mut neg) = state.not_found_urls.write() {
-                        if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(url_str.clone());
-                        }
-                    }
+                if msg_names_top
+                    && let Ok(mut neg) = state.not_found_urls.write()
+                    && neg.len() < NOT_FOUND_CACHE_MAX
+                {
+                    neg.insert(neg_cache_key.clone().unwrap_or_else(|| url_str.clone()));
                 }
             }
             // The IG fixtures format VS-not-found errors as
@@ -2156,6 +2221,37 @@ async fn process_expand_inner<B: TerminologyBackend>(
             }
         }
     }
+    // Auto-apply stored supplements of every CodeSystem that contributed to
+    // the expansion (`HTS_AUTO_SUPPLEMENTS`, default on), so e.g. zh-Hant
+    // designations from a translation supplement reach `includeDesignations`
+    // and `displayLanguage` without an explicit `useSupplement`.
+    if state.auto_supplements {
+        let mut systems: Vec<String> = Vec::new();
+        collect_contains_systems(&resp.contains, &mut systems);
+        for system in systems {
+            for info in state
+                .backend()
+                .supplements_for_system(&ctx, &system)
+                .await
+                .unwrap_or_default()
+            {
+                let bare = info
+                    .supplement_canonical
+                    .split('|')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if supplement_inputs
+                    .iter()
+                    .any(|s| s.split('|').next() == Some(bare.as_str()))
+                {
+                    continue;
+                }
+                supplement_inputs.push(info.supplement_canonical.clone());
+                applied_supplements.push(info);
+            }
+        }
+    }
     // Rebuild bare_supplement_urls including any VS-extension additions.
     let bare_supplement_urls: Vec<String> = supplement_inputs
         .iter()
@@ -2163,11 +2259,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
         .collect();
 
     // ── Populate designations (only if explicitly requested) ─────────────────
-    let include_designations = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("includeDesignations"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    // Accept the GET spelling (`includeDesignations=true`) as well as the
+    // POST `valueBoolean`.
+    let include_designations = find_bool_param(&params, "includeDesignations").unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
         // After base designations are loaded, append any supplement-derived
@@ -2574,6 +2668,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 &mut resp.contains,
                 &spec,
                 &cs_lang_by_url,
+                &bare_supplement_urls,
             )
             .await;
         }
@@ -2585,11 +2680,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     //   - the source VS has `compose.inactive: false` (FHIR R5)
     // Post-filter using the freshly-populated inactive flag and adjust
     // `total` to match.
-    let active_only_request = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let active_only_request = find_bool_param(&params, "activeOnly").unwrap_or(false);
     let compose_inactive_false = source_vs
         .as_ref()
         .and_then(|vs| vs.get("compose"))

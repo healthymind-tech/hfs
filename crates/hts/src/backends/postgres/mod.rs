@@ -24,6 +24,7 @@ use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{
     ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
 };
+use crate::version_order::version_sort_key;
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -319,6 +320,14 @@ impl PostgresTerminologyBackend {
             schema::apply(&client).await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
             })?;
+            schema::migrate_version_sort_pg(&client)
+                .await
+                .map_err(|e| {
+                    HtsError::StorageError(format!(
+                        "Failed to backfill version_sort: {}",
+                        error_chain(&e)
+                    ))
+                })?;
 
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
@@ -538,6 +547,41 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
                     }
                     _ => None,
                 }
+            })
+        })
+    }
+
+    fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
+        let pool = self.pool.clone();
+        let (table, order_by) = match resource_type {
+            "CodeSystem" => (
+                "code_systems",
+                crate::backends::cs_precedence_order_by("code_systems"),
+            ),
+            "ValueSet" => (
+                "value_sets",
+                crate::backends::vs_precedence_order_by("value_sets"),
+            ),
+            "ConceptMap" => (
+                "concept_maps",
+                std::borrow::Cow::Borrowed("created_at DESC"),
+            ),
+            _ => return None,
+        };
+        // Same matching rules as the SQLite twin: exact storage id, then the
+        // synthetic `<id>|<version>` storage ids (index-friendly range).
+        let sql = format!(
+            "SELECT resource_json::text FROM {table} \
+             WHERE id = $1 OR (id >= $1 || '|' AND id < $1 || '}}') \
+             ORDER BY (id = $1) DESC, {order_by} LIMIT 1"
+        );
+        let id = id.to_owned();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = pool.get().await.ok()?;
+                let rows = client.query(&sql, &[&id]).await.ok()?;
+                let raw: Option<String> = rows.into_iter().next().and_then(|r| r.get(0));
+                raw.and_then(|s| serde_json::from_str(&s).ok())
             })
         })
     }
@@ -831,8 +875,8 @@ async fn write_code_system(
         .execute(
             "INSERT INTO code_systems
              (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
-              authority_rank)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10)
+              authority_rank, version_sort)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11)
              ON CONFLICT DO NOTHING",
             &[
                 &storage_id,
@@ -845,6 +889,7 @@ async fn write_code_system(
                 &resource_json,
                 &now,
                 &cs.authority_rank,
+                &version_sort_key(cs.version.as_deref()),
             ],
         )
         .await
@@ -862,7 +907,8 @@ async fn write_code_system(
            content        = $4,
            resource_json  = $5,
            updated_at     = $6,
-           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9)
+           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9),
+           version_sort   = $10
          WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')
          RETURNING id",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
@@ -880,6 +926,7 @@ async fn write_code_system(
                 &cs.url,
                 &cs.version,
                 &cs.authority_rank,
+                &version_sort_key(cs.version.as_deref()),
             ],
         )
         .await
@@ -1094,8 +1141,8 @@ async fn write_value_set(
         .execute(
             "INSERT INTO value_sets
              (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
-              authority_rank)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10)
+              authority_rank, version_sort)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11)
              ON CONFLICT DO NOTHING",
             &[
                 &storage_id,
@@ -1108,6 +1155,7 @@ async fn write_value_set(
                 &resource_json,
                 &now,
                 &vs.authority_rank,
+                &version_sort_key(vs.version.as_deref()),
             ],
         )
         .await
@@ -1122,7 +1170,8 @@ async fn write_value_set(
            compose_json   = $4,
            resource_json  = $5,
            updated_at     = $6,
-           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9)
+           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9),
+           version_sort   = $10
          WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')",
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
@@ -1139,6 +1188,7 @@ async fn write_value_set(
                 &vs.url,
                 &vs.version,
                 &vs.authority_rank,
+                &version_sort_key(vs.version.as_deref()),
             ],
         )
         .await

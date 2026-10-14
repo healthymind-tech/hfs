@@ -181,6 +181,10 @@ pub struct AppState<B: TerminologyBackend> {
     /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
 
+    /// Apply stored CodeSystem supplements to `$lookup` / `$expand` without an
+    /// explicit `useSupplement` (`HTS_AUTO_SUPPLEMENTS`, default `true`).
+    pub auto_supplements: bool,
+
     /// In-process LRU-style cache for `$expand` responses.
     ///
     /// Eliminates redundant backend work when the same expansion is requested
@@ -260,6 +264,7 @@ impl<B: TerminologyBackend> AppState<B> {
             resource_store_pg: None,
             terminology_importer: None,
             max_expansion_size: 10_000,
+            auto_supplements: true,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -314,6 +319,13 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Override the maximum expansion size (default: 10 000).
     pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
         self.max_expansion_size = limit;
+        self
+    }
+
+    /// Enable / disable automatic application of stored CodeSystem supplements
+    /// (default: enabled).
+    pub fn with_auto_supplements(mut self, enabled: bool) -> Self {
+        self.auto_supplements = enabled;
         self
     }
 

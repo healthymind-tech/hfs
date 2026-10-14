@@ -196,7 +196,7 @@ fn fetch_all(
 ///
 /// When `include_self` is `true` (`<< operator`), the root concept is also
 /// included in the result.
-fn fetch_descendants(
+pub(crate) fn fetch_descendants(
     conn: &Connection,
     system_id: &str,
     root_code: &str,

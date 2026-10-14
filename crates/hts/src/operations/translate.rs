@@ -26,7 +26,7 @@ use crate::types::TranslateRequest;
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     extract_codeable_concept, extract_coding, extract_parameter_array, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    normalize_canonical_params, parse_query_string, query_params_to_fhir_params,
 };
 
 /// Resolve a `(system, code)` pair from the Coding/CodeableConcept spellings of a
@@ -76,6 +76,17 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // Canonical `X|V` spellings: the ConceptMap `url` promotes its version to
+    // `conceptMapVersion`, the source `system` to `version`. The ValueSet /
+    // target-system canonicals have no companion version parameter in the
+    // operation definition, so their version suffix is dropped.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("conceptMapVersion"))?;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
+    normalize_canonical_params(&mut params, "sourceSystem", Some("version"))?;
+    for name in ["source", "target", "targetSystem", "targetsystem"] {
+        normalize_canonical_params(&mut params, name, None)?;
+    }
     // R4 names: `code`, `system`. R5 names: `sourceCode`, `sourceSystem`,
     // `targetCode`, `targetSystem`. Accept either form.
     let mut source_code =
@@ -140,6 +151,32 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
+
+    // `conceptMapVersion` (explicit or promoted from `url=X|V`): the store keeps
+    // one row per ConceptMap URL, so a version that does not match the stored
+    // row is a 404 rather than a silent answer from a different version.
+    if let (Some(url), Some(want)) = (
+        req.url.as_deref(),
+        find_str_param(&params, "conceptMapVersion"),
+    ) {
+        let hits = ConceptMapOperations::search(
+            state.backend(),
+            &ctx,
+            crate::types::ResourceSearchQuery {
+                url: Some(url.to_string()),
+                version: Some(want.clone()),
+                count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if hits.is_empty() {
+            return Err(HtsError::NotFound(format!(
+                "ConceptMap not found: {url}|{want}"
+            )));
+        }
+    }
+
     let resp = ConceptMapOperations::translate(state.backend(), &ctx, req).await?;
 
     // ── Build FHIR Parameters response ─────────────────────────────────────────

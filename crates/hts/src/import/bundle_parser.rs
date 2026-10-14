@@ -339,9 +339,11 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
 
     let mut concepts: Vec<ParsedConcept> = Vec::new();
 
+    let edges = HierarchyProperties::from_code_system(cs);
     if let Some(top_level) = cs["concept"].as_array() {
-        flatten_concepts(top_level, None, &mut concepts);
+        flatten_concepts(top_level, None, &edges, &mut concepts);
     }
+    edges.apply_child_edges(&mut concepts);
 
     Some(ParsedCodeSystem {
         id,
@@ -357,14 +359,98 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
     })
 }
 
+/// Which concept properties of a CodeSystem encode hierarchy edges.
+///
+/// FHIR defines the standard properties `parent` and `child`
+/// (`http://hl7.org/fhir/concept-properties#parent` / `#child`); a CodeSystem
+/// may declare them under any local code via `CodeSystem.property[].uri`. The
+/// HL7 v3 code systems on terminology.hl7.org (v3-ActCode, v3-RoleCode, …)
+/// use a flat `concept[]` list with a `subsumedBy` property for the parent
+/// link, and nothing else — without recognising it, `is-a` filters and
+/// `$subsumes` see no hierarchy at all (fork issue T3, `_ActEncounterCode`).
+#[derive(Debug, Default)]
+pub(crate) struct HierarchyProperties {
+    /// Property codes whose `valueCode` names the concept's parent.
+    parent_codes: Vec<String>,
+    /// Property codes whose `valueCode` names a child of the concept.
+    child_codes: Vec<String>,
+}
+
+impl HierarchyProperties {
+    pub(crate) fn from_code_system(cs: &Value) -> Self {
+        let mut me = Self {
+            parent_codes: vec!["parent".into(), "subsumedBy".into()],
+            child_codes: vec!["child".into()],
+        };
+        if let Some(defs) = cs["property"].as_array() {
+            for def in defs {
+                let (Some(code), Some(uri)) = (def["code"].as_str(), def["uri"].as_str()) else {
+                    continue;
+                };
+                match uri {
+                    "http://hl7.org/fhir/concept-properties#parent"
+                        if !me.parent_codes.iter().any(|c| c == code) =>
+                    {
+                        me.parent_codes.push(code.to_owned());
+                    }
+                    "http://hl7.org/fhir/concept-properties#child"
+                        if !me.child_codes.iter().any(|c| c == code) =>
+                    {
+                        me.child_codes.push(code.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        me
+    }
+
+    fn is_parent(&self, code: &str) -> bool {
+        self.parent_codes.iter().any(|c| c == code)
+    }
+
+    fn is_child(&self, code: &str) -> bool {
+        self.child_codes.iter().any(|c| c == code)
+    }
+
+    /// `child` properties point the other way: `X child Y` means Y's parent
+    /// is X. Fill in `parent_code` for children that have no parent yet.
+    fn apply_child_edges(&self, concepts: &mut [ParsedConcept]) {
+        if self.child_codes.is_empty() {
+            return;
+        }
+        let mut parent_of: Vec<(String, String)> = Vec::new();
+        for c in concepts.iter() {
+            for p in &c.properties {
+                if p.value_type == "code" && self.is_child(&p.code) {
+                    parent_of.push((p.value.clone(), c.code.clone()));
+                }
+            }
+        }
+        if parent_of.is_empty() {
+            return;
+        }
+        for (child, parent) in parent_of {
+            if let Some(c) = concepts.iter_mut().find(|c| c.code == child)
+                && c.parent_code.is_none()
+            {
+                c.parent_code = Some(parent);
+            }
+        }
+    }
+}
+
 /// Recursively flatten a nested concept tree into a flat `Vec<ParsedConcept>`.
 ///
 /// `parent_code` is propagated to each child via the nesting relationship.
-/// A `"parent"` property on a concept also generates a hierarchy edge to the
-/// property's `valueCode` (in addition to or instead of the nesting edge).
+/// A parent-edge property on a concept (`parent`, `subsumedBy`, or any
+/// property declared with the `concept-properties#parent` URI — see
+/// [`HierarchyProperties`]) also generates a hierarchy edge to the property's
+/// `valueCode` (in addition to or instead of the nesting edge).
 fn flatten_concepts(
     concepts: &[Value],
     nesting_parent: Option<&str>,
+    edges: &HierarchyProperties,
     out: &mut Vec<ParsedConcept>,
 ) {
     for concept_val in concepts {
@@ -382,7 +468,7 @@ fn flatten_concepts(
 
         if let Some(props) = concept_val["property"].as_array() {
             for prop in props {
-                if let Some(p) = parse_property(prop) {
+                if let Some(p) = parse_property(prop, edges) {
                     if p.is_parent_edge {
                         if let Some(ref pv) = p.parent_code_value {
                             property_parent = Some(pv.clone());
@@ -418,19 +504,19 @@ fn flatten_concepts(
 
         // Recurse into nested children.
         if let Some(children) = concept_val["concept"].as_array() {
-            flatten_concepts(children, Some(&code), out);
+            flatten_concepts(children, Some(&code), edges, out);
         }
     }
 }
 
-fn parse_property(prop: &Value) -> Option<ParsedProperty> {
+fn parse_property(prop: &Value, edges: &HierarchyProperties) -> Option<ParsedProperty> {
     let code = prop["code"].as_str()?.to_owned();
     let (value_type, value) = extract_property_value(prop);
     if value.is_empty() {
         return None;
     }
 
-    let is_parent_edge = code == "parent" && value_type == "code";
+    let is_parent_edge = edges.is_parent(&code) && value_type == "code";
     let parent_code_value = if is_parent_edge {
         Some(value.clone())
     } else {

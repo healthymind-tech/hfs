@@ -91,7 +91,7 @@ fn build_cs_precedence_order_by(alias: &str) -> String {
              (SELECT 1 FROM concepts hc WHERE hc.system_id = {alias}.id) \
              THEN 0 ELSE 1 END), \
          COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
@@ -121,13 +121,76 @@ pub(crate) fn vs_precedence_order_by(alias: &str) -> Cow<'static, str> {
 fn build_vs_precedence_order_by(alias: &str) -> String {
     format!(
         "COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
 
 static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
     LazyLock::new(|| build_vs_precedence_order_by("value_sets"));
+
+/// `expansion.contains` entries built straight from `compose.include.concept[]`
+/// (code + embedded display), skipping codes already in `skip`.
+pub(crate) fn enumerated_from_compose(
+    system_url: &str,
+    version: Option<&str>,
+    explicit_codes: &[serde_json::Value],
+    skip: &std::collections::HashSet<String>,
+) -> Vec<crate::types::ExpansionContains> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in explicit_codes {
+        let Some(code) = entry["code"].as_str() else {
+            continue;
+        };
+        if skip.contains(code) || !seen.insert(code) {
+            continue;
+        }
+        out.push(crate::types::ExpansionContains {
+            system: system_url.to_owned(),
+            version: version.map(str::to_owned),
+            code: code.to_owned(),
+            display: entry["display"].as_str().map(str::to_owned),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        });
+    }
+    out
+}
+
+/// Warning issue for a code accepted through ValueSet enumeration while the
+/// CodeSystem has no loaded content to verify it against. Shared by both
+/// storage backends.
+pub(crate) fn push_unverified_code_system_warning(
+    response: &mut crate::types::ValidateCodeResponse,
+    system_url: &str,
+    value_set_url: &str,
+) {
+    if response
+        .issues
+        .iter()
+        .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM"))
+    {
+        return;
+    }
+    response.issues.push(crate::types::ValidationIssue {
+        severity: "warning".into(),
+        fhir_code: "not-found".into(),
+        tx_code: "not-found".into(),
+        text: format!(
+            "A definition for CodeSystem '{system_url}' could not be found, so the code could not \
+             be checked against it; it was accepted because the ValueSet '{value_set_url}' \
+             enumerates it"
+        ),
+        expression: None,
+        location: None,
+        message_id: Some("UNKNOWN_CODESYSTEM".into()),
+    });
+}
 
 /// True when `ver` is the sentinel `current` (case-insensitive).
 ///
@@ -161,7 +224,7 @@ mod precedence_tests {
              (SELECT 1 FROM concepts hc WHERE hc.system_id = code_systems.id) \
              THEN 0 ELSE 1 END), \
          COALESCE(code_systems.authority_rank, 0), \
-         COALESCE(code_systems.version, '') DESC, \
+         COALESCE(code_systems.version_sort, code_systems.version, '') DESC, \
          code_systems.id";
 
     #[test]
@@ -195,7 +258,7 @@ mod precedence_tests {
     #[test]
     fn vs_precedence_cached_and_fallback_match_shipped_sql() {
         const VS_EXPECTED: &str = "COALESCE(value_sets.authority_rank, 0), \
-         COALESCE(value_sets.version, '') DESC, \
+         COALESCE(value_sets.version_sort, value_sets.version, '') DESC, \
          value_sets.id";
         assert_eq!(&*vs_precedence_order_by("value_sets"), VS_EXPECTED);
         assert_eq!(

@@ -125,6 +125,11 @@ pub enum EclExpr {
 ///
 /// Returns `Err(message)` when an unrecognised character (e.g. `@`, `%`)
 /// is encountered outside a pipe label.
+/// Characters allowed inside a concept identifier token (after the first).
+fn is_concept_id_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
 pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0;
@@ -182,22 +187,20 @@ pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     pos += 1;
                 }
             }
-            c if c.is_ascii_digit() => {
+            c if c.is_ascii_digit() || c == '_' => {
                 // Allow digit-prefixed alphanumeric codes (e.g. SNOMED SCTIDs
-                // as well as codes like "404684003").
+                // as well as codes like "404684003") and underscore-prefixed
+                // abstract codes (THO v3 `_ActEncounterCode`). `.` is accepted
+                // inside a code so ICD-10-CM `E11.9` tokenizes as one id.
                 let start = pos;
-                while pos < chars.len()
-                    && (chars[pos].is_alphanumeric() || chars[pos] == '_' || chars[pos] == '-')
-                {
+                while pos < chars.len() && is_concept_id_char(chars[pos]) {
                     pos += 1;
                 }
                 tokens.push(Token::ConceptId(chars[start..pos].iter().collect()));
             }
             c if c.is_alphabetic() => {
                 let start = pos;
-                while pos < chars.len()
-                    && (chars[pos].is_alphanumeric() || chars[pos] == '_' || chars[pos] == '-')
-                {
+                while pos < chars.len() && is_concept_id_char(chars[pos]) {
                     pos += 1;
                 }
                 let word: String = chars[start..pos].iter().collect();
@@ -471,6 +474,22 @@ mod tests {
     fn tokenize_alphanumeric_code_is_concept_id() {
         let toks = tokenize("A11Y-code").unwrap();
         assert_eq!(toks, vec![Token::ConceptId("A11Y-code".into())]);
+    }
+
+    #[test]
+    fn tokenize_underscore_prefixed_code_is_concept_id() {
+        // THO v3 abstract codes (`_ActEncounterCode`) are valid ECL focus concepts.
+        let tokens = tokenize("<< _ActEncounterCode").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::LtLt, Token::ConceptId("_ActEncounterCode".into())]
+        );
+    }
+
+    #[test]
+    fn tokenize_dotted_code_is_one_concept_id() {
+        let tokens = tokenize("<< E11.9").unwrap();
+        assert_eq!(tokens, vec![Token::LtLt, Token::ConceptId("E11.9".into())]);
     }
 
     #[test]

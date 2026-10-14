@@ -41,8 +41,8 @@ use crate::types::{DesignationValue, LookupRequest, PropertyValue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
-    property_value_part, query_params_to_fhir_params,
+    collect_str_params, extract_parameter_array, find_str_param, normalize_canonical_params,
+    parse_query_string, property_value_part, query_params_to_fhir_params,
 };
 
 /// Build a canonical cache key for a `$lookup` request from its normalised
@@ -137,10 +137,14 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// A `serde_json::Value` representing a FHIR `Parameters` resource, or an
 /// [`HtsError`] (400 when `system`/`code` are missing, 404 when the code is
 /// not found, 501 when `expression` is supplied).
-async fn process_lookup<B: TerminologyBackend>(
+pub(crate) async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` is folded into `system=X` + `version=V` so the cache key and
+    // the backend lookup agree on which CodeSystem version is meant.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
@@ -213,7 +217,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     // `supplements` URL matches the lookup `system`. Mismatches and unknown
     // supplements both reject with NotFound (issue.code=not-found) per the
     // IG fixtures.
-    let supplement_inputs: Vec<String> = collect_supplement_inputs(&params);
+    let mut supplement_inputs: Vec<String> = collect_supplement_inputs(&params);
     let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
     for raw in &supplement_inputs {
         let bare = raw.split('|').next().unwrap_or(raw).to_string();
@@ -227,7 +231,46 @@ async fn process_lookup_inner<B: TerminologyBackend>(
         }
     }
 
+    // Auto-apply every stored supplement of this CodeSystem (e.g. a zh-Hant
+    // translation supplement) unless the operator turned that off
+    // (`HTS_AUTO_SUPPLEMENTS=false`). Explicitly named supplements keep
+    // precedence; discovered ones are appended once.
+    if state.auto_supplements {
+        for info in state
+            .backend()
+            .supplements_for_system(&ctx, &system)
+            .await
+            .unwrap_or_default()
+        {
+            let bare = info
+                .supplement_canonical
+                .split('|')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if supplement_inputs
+                .iter()
+                .any(|s| s.split('|').next() == Some(bare.as_str()))
+            {
+                continue;
+            }
+            supplement_inputs.push(info.supplement_canonical.clone());
+            applied_supplements.push(info);
+        }
+    }
+
+    let display_language = find_str_param(&params, "displayLanguage");
     let mut resp = state.backend().lookup(&ctx, req).await?;
+    // Did the base CodeSystem already satisfy `displayLanguage`? (The backend
+    // keeps only matching designations when the parameter is set.) Decides
+    // whether a supplement designation may take over `display` below.
+    let base_lang_matched = display_language.as_deref().is_some_and(|lang| {
+        resp.designations.iter().any(|d| {
+            d.language
+                .as_deref()
+                .is_some_and(|l| crate::language::lang_matches(lang, l))
+        })
+    });
 
     // Surface the default display as a synthesised "preferredForLanguage"
     // designation tagged with the CodeSystem's primary language. The IG
@@ -281,6 +324,16 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             .unwrap_or_default();
         if let Some(list) = supp_desigs.get(&code) {
             for d in list {
+                // `displayLanguage` filters supplement designations the same
+                // way the backend filters the base ones.
+                if let Some(lang) = display_language.as_deref()
+                    && !d
+                        .language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                {
+                    continue;
+                }
                 resp.designations.push(DesignationValue {
                     language: d.language.clone(),
                     use_system: d.use_system.clone(),
@@ -288,6 +341,18 @@ async fn process_lookup_inner<B: TerminologyBackend>(
                     value: d.value.clone(),
                     source: d.source.clone(),
                 });
+            }
+            // When the base CodeSystem has no designation in the requested
+            // language but a supplement does, that translation becomes the
+            // display — the whole point of a translation supplement.
+            if let Some(lang) = display_language.as_deref()
+                && !base_lang_matched
+                && let Some(idx) = crate::language::best_lang_match_index(
+                    lang,
+                    list.iter().map(|d| d.language.as_deref()),
+                )
+            {
+                resp.display = Some(list[idx].value.clone());
             }
         }
 
@@ -860,6 +925,16 @@ mod tests {
     // `source = supplement_url|version` plus a `used-supplement` parameter
     // echoing the applied supplement.
     fn make_supplement_app() -> Router {
+        make_supplement_app_with(supplement_backend(), true)
+    }
+
+    fn make_supplement_app_strict() -> Router {
+        make_supplement_app_with(supplement_backend(), false)
+    }
+
+    /// Base CodeSystem `extensions` + supplement `supplement` contributing a
+    /// Dutch designation for `code1`.
+    fn supplement_backend() -> SqliteTerminologyBackend {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         {
             let conn = backend.pool().get().unwrap();
@@ -887,7 +962,16 @@ mod tests {
             )
             .unwrap();
         }
-        let state = AppState::new(backend);
+        backend
+    }
+
+    /// `auto_supplements=false` restores the strict FHIR behaviour where a
+    /// supplement applies only when named (`useSupplement`).
+    fn make_supplement_app_with(
+        backend: SqliteTerminologyBackend,
+        auto_supplements: bool,
+    ) -> Router {
+        let state = AppState::new(backend).with_auto_supplements(auto_supplements);
         Router::new()
             .route(
                 "/CodeSystem/$lookup",
@@ -980,8 +1064,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_without_use_supplement_omits_supplement_designation() {
+    async fn lookup_auto_applies_stored_supplement_by_default() {
         let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://hl7.org/fhir/test/CodeSystem/extensions"},
+                {"name": "code", "valueCode": "code1"}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$lookup", body).await;
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let has_ectenoot = params.iter().any(|p| {
+            p["name"] == "designation"
+                && p["part"]
+                    .as_array()
+                    .map(|parts| parts.iter().any(|q| q["valueString"] == "ectenoot"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            has_ectenoot,
+            "stored supplement must be auto-applied: {json}"
+        );
+        assert!(
+            params.iter().any(|p| p["name"] == "used-supplement"
+                && p["valueCanonical"] == "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_without_use_supplement_omits_supplement_designation() {
+        // Strict mode (`HTS_AUTO_SUPPLEMENTS=false`): supplements apply only
+        // when named explicitly.
+        let app = make_supplement_app_strict();
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [

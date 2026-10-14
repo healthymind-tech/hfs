@@ -85,6 +85,17 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "3500")]
     pub max_expansion_size: u32,
 
+    /// Automatically apply stored CodeSystem supplements (`content=supplement`
+    /// resources whose `supplements` names the CodeSystem) to `$lookup` and
+    /// `$expand`, so translated designations (e.g. zh-Hant display names for
+    /// ICD-10-CM or LOINC) are returned — and honoured by `displayLanguage` —
+    /// without the client having to pass `useSupplement`. Set to `false` to
+    /// restore the strict FHIR behaviour where supplements apply only when
+    /// named explicitly (`useSupplement`) or pinned by the ValueSet
+    /// (`valueset-supplement` extension).
+    #[arg(long, env = "HTS_AUTO_SUPPLEMENTS", default_value = "true", action = clap::ArgAction::Set)]
+    pub auto_supplements: bool,
+
     /// Directory of terminology distribution files to auto-import on first
     /// run. When set and pointing at an existing directory, the server
     /// checks whether the target database already contains any code
@@ -143,6 +154,7 @@ impl Default for HtsConfig {
             cors_origins: "*".into(),
             max_body_size: 10 * 1024 * 1024, // 10MB
             max_expansion_size: 10_000,
+            auto_supplements: true,
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
