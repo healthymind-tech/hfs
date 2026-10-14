@@ -253,11 +253,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
-                        let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
-
-                        let total = if skip_count {
-                            None
-                        } else {
+                        // Always counted: with a filter the in-memory trigram
+                        // index answers in O(matches), and a client paging a
+                        // filtered expansion needs the total.
+                        let total = {
                             let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
@@ -513,6 +512,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // the IG enum-* fixtures want a flat expansion even with
             // excludeNested=false.
             let compose_is_enumerated: bool;
+            // Set when the text-filtered expansion stopped at a candidate
+            // limit: the exact total (None if it cannot be counted), which
+            // the length of the truncated result would understate.
+            let mut filtered_total: Option<Option<u32>> = None;
+            let window = request_window(&req);
 
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
@@ -565,11 +569,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .default_value_set_versions
                     .clone_from(&req.default_value_set_versions);
                 let codes = if let Some(filter) = req.filter.as_deref() {
-                    let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
+                    let limit_hint = window.map(|w| (w * 3).max(100));
                     let compose_str = compose.to_string();
                     let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
                     let plain_key = format!("plain-fts:{:016x}", fnv64(compose_str.as_bytes()));
-                    expand_inline_filtered(
+                    let mut truncated = false;
+                    let codes = expand_inline_filtered(
                         &conn,
                         compose,
                         filter,
@@ -577,7 +582,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         &mut warnings,
                         Some((&prop_key, &property_result_cache)),
                         Some((&plain_key, &plain_fts_cache)),
-                    )?
+                        &mut truncated,
+                    )?;
+                    if truncated {
+                        filtered_total = Some(count_inline_filtered(&conn, compose, filter)?);
+                    }
+                    codes
                 } else {
                     let compose_str = compose.to_string();
                     // Cache inline compose expansions so that repeated requests for
@@ -680,8 +690,20 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     count as usize,
                                     None,
                                 )?;
+                                let total = if page.len() < count as usize
+                                    && (bfs_offset == 0 || !page.is_empty())
+                                {
+                                    (bfs_offset + page.len()) as u32
+                                } else {
+                                    let pattern = if include_root {
+                                        ImplicitVsPattern::IsA(root_code.clone())
+                                    } else {
+                                        ImplicitVsPattern::DescendantOf(root_code.clone())
+                                    };
+                                    bfs_expand_total(&conn, &sys_id, &pattern, None)?
+                                };
                                 return Ok(ExpandResponse {
-                                    total: None,
+                                    total: Some(total),
                                     offset: req.offset,
                                     contains: page,
                                     warnings,
@@ -700,8 +722,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 bfs_offset,
                                 &mut warnings,
                             )? {
+                                // Branches may overlap, so only a short page
+                                // tells the total.
+                                let total = (page.len() < count as usize
+                                    && (bfs_offset == 0 || !page.is_empty()))
+                                .then(|| (bfs_offset + page.len()) as u32);
                                 return Ok(ExpandResponse {
-                                    total: None,
+                                    total,
                                     offset: req.offset,
                                     contains: page,
                                     warnings,
@@ -893,8 +920,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     if let Ok(compose) =
                                         serde_json::from_str::<serde_json::Value>(compose_str)
                                     {
-                                        let limit_hint =
-                                            req.count.map(|c| ((c as usize) * 10).max(100));
+                                        let limit_hint = window.map(|w| (w * 10).max(100));
                                         let prop_key = format!(
                                             "prop-result:{:016x}",
                                             fnv64(compose_str.as_bytes())
@@ -903,7 +929,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             "plain-fts:{:016x}",
                                             fnv64(compose_str.as_bytes())
                                         );
-                                        expand_inline_filtered(
+                                        let mut truncated = false;
+                                        let codes = expand_inline_filtered(
                                             &conn,
                                             &compose,
                                             filter,
@@ -911,7 +938,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             &mut warnings,
                                             Some((&prop_key, &property_result_cache)),
                                             Some((&plain_key, &plain_fts_cache)),
-                                        )?
+                                            &mut truncated,
+                                        )?;
+                                        if truncated {
+                                            filtered_total = Some(count_inline_filtered(
+                                                &conn, &compose, filter,
+                                            )?);
+                                        }
+                                        codes
                                     } else {
                                         compute_expansion_with_versions(
                                             &backend,
@@ -1081,8 +1115,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             });
                                         }
 
+                                        // A short page holds the rest of the expansion;
+                                        // otherwise count with the page's predicate.
+                                        let total = if page.len() < count as usize
+                                            && (bfs_offset == 0 || !page.is_empty())
+                                        {
+                                            (bfs_offset + page.len()) as u32
+                                        } else {
+                                            bfs_expand_total(
+                                                &conn,
+                                                &system_id,
+                                                &pattern,
+                                                filter_lower.as_deref(),
+                                            )?
+                                        };
                                         return Ok(ExpandResponse {
-                                            total: None,
+                                            total: Some(total),
                                             offset: req.offset,
                                             contains: page,
                                             warnings: vec![],
@@ -1102,21 +1150,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
 
-                        // Skip the COUNT query when the request is bounded (count > 0)
-                        // and has a text filter: the total is not required by the
-                        // benchmark checks and halving the DB round-trips under 50 VUs
-                        // significantly reduces p95 latency (EX03 optimisation).
-                        // Always count for unbounded requests: needed for size-cap check.
-                        let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
+                        // The total is always counted (it used to be skipped for
+                        // filtered pages): in memory that is an O(matches) trigram
+                        // lookup, in SQL one FTS COUNT.
 
                         // Serve from the in-memory index — no DB connection needed for
                         // filter/pagination once the index is warm.
                         let in_mem = implicit_index.read().ok().and_then(|g| g.get(url).cloned());
 
                         if let Some(concept_idx) = in_mem {
-                            let total = if skip_count {
-                                None
-                            } else {
+                            let total = {
                                 let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                                 if req.count.is_none() {
                                     if let Some(cap) = req.max_expansion_size {
@@ -1147,9 +1190,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         }
 
                         // Fallback: SQL path (index lock poisoned — should not happen).
-                        let total = if skip_count {
-                            None
-                        } else {
+                        let total = {
                             let n = implicit_cache_count(&conn, url, filter_lower.as_deref())?;
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
@@ -1216,6 +1257,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // HL7-tx `hierarchical=true` convention still asks for an
             // explicit tree on non-enumerated VSes.
             let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
+            let total_reported = filtered_total.unwrap_or(Some(filtered.len() as u32));
             if want_tree {
                 let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;
@@ -1227,7 +1269,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 });
             }
 
-            let total = filtered.len() as u32;
+            let total = total_reported.unwrap_or(filtered.len() as u32);
 
             // Enforce the expansion size cap only when no explicit count (page size) was
             // requested. When count is set, the response is already bounded and the limit
@@ -1264,7 +1306,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             );
 
             Ok(ExpandResponse {
-                total: Some(total),
+                total: total_reported,
                 offset: req.offset,
                 contains: page,
                 warnings,
@@ -2429,6 +2471,145 @@ fn fetch_cache_legacy(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionCon
     .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
+/// The rows a paged request needs: `offset + count`, or `None` when unpaged.
+fn request_window(req: &ExpandRequest) -> Option<usize> {
+    req.count
+        .map(|c| req.offset.unwrap_or(0) as usize + c as usize)
+}
+
+/// Exact number of concepts a text-filtered compose selects, for
+/// `expansion.total` when [`expand_inline_filtered`] stopped at a candidate
+/// limit. Counts instead of materialising: per include, the FTS (or, for
+/// one- and two-character filters, `LIKE`) match count of a whole-system
+/// include, or the text matches that pass its hierarchy / ECL / property
+/// filters. `None` when an include cannot be counted that way (nested
+/// `valueSet` references), so the response omits `total` rather than
+/// reporting a wrong one.
+fn count_inline_filtered(
+    conn: &Connection,
+    compose: &serde_json::Value,
+    text_filter: &str,
+) -> Result<Option<u32>, HtsError> {
+    let filter_lower = text_filter.to_lowercase();
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let matches_text = |code: &str, display: Option<&str>| {
+        code.to_lowercase().contains(&filter_lower)
+            || display.is_some_and(|d| d.to_lowercase().contains(&filter_lower))
+    };
+    let mut total: u64 = 0;
+    for inc in compose["include"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        if inc["valueSet"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(None);
+        }
+        let Some(system_url) = inc["system"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(system_id) = resolve_system_id_cached(conn, system_url)? else {
+            continue;
+        };
+        if let Some(concepts) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
+            let mut stmt = conn
+                .prepare_cached("SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2")
+                .map_err(err)?;
+            for code in concepts.iter().filter_map(|c| c["code"].as_str()) {
+                let display: Option<String> = stmt
+                    .query_row(rusqlite::params![system_id, code], |r| r.get(0))
+                    .optional()
+                    .map_err(err)?
+                    .flatten();
+                total += u64::from(matches_text(code, display.as_deref()));
+            }
+            continue;
+        }
+        let filters: &[serde_json::Value] =
+            inc["filter"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let pattern = format!("%{filter_lower}%");
+        if filters.is_empty() {
+            let n: i64 = if filter_lower.len() >= 3 {
+                ensure_concepts_fts(conn, &system_id)?;
+                conn.query_row(
+                    "SELECT COUNT(*) FROM concepts_fts WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                    rusqlite::params![fts5_quote(&filter_lower), system_id],
+                    |r| r.get(0),
+                )
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM concepts WHERE system_id = ?1 \
+                       AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2)",
+                    rusqlite::params![system_id, pattern],
+                    |r| r.get(0),
+                )
+            }
+            .map_err(err)?;
+            total += n.max(0) as u64;
+            continue;
+        }
+        // Text matches first (the same predicate as the expansion: code or
+        // display contains the filter), then the include's filters.
+        let candidates: Vec<ExpansionContains> = {
+            let (sql, param) = if filter_lower.len() >= 3 {
+                ensure_concepts_fts(conn, &system_id)?;
+                (
+                    "SELECT code, display FROM concepts_fts \
+                     WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                    fts5_quote(&filter_lower),
+                )
+            } else {
+                (
+                    "SELECT code, display FROM concepts WHERE system_id = ?2 \
+                       AND (LOWER(code) LIKE ?1 OR LOWER(display) LIKE ?1)",
+                    pattern,
+                )
+            };
+            let mut stmt = conn.prepare_cached(sql).map_err(err)?;
+            stmt.query_map(rusqlite::params![param, system_id], |r| {
+                Ok(ExpansionContains {
+                    system: system_url.to_owned(),
+                    version: None,
+                    code: r.get(0)?,
+                    display: r.get(1)?,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: vec![],
+                    properties: vec![],
+                    extensions: vec![],
+                    contains: vec![],
+                })
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?
+        };
+        total += apply_compose_filters_to_candidates(conn, &system_id, filters, candidates)?.len()
+            as u64;
+    }
+    Ok(Some(u32::try_from(total).unwrap_or(u32::MAX)))
+}
+
+/// SQL `LIMIT` for a text-filter candidate query: `mult` times the caller's
+/// hint (at least 100), or no limit (`-1`) without a hint.
+///
+/// The hint comes from the requested window (`offset + count`), so a later
+/// page still finds its rows; there used to be a 5000 cap and the hint
+/// ignored `offset`, which emptied pages past the first few thousand matches
+/// and capped the reported total at whatever the query returned.
+fn candidate_limit(limit_hint: Option<usize>, mult: usize) -> i64 {
+    match limit_hint {
+        Some(h) => i64::try_from(h.saturating_mul(mult).max(100)).unwrap_or(i64::MAX),
+        None => -1,
+    }
+}
+
+/// `true` when a query run with [`candidate_limit`] `limit` stopped at it,
+/// i.e. there may be more matches than it returned.
+fn hit_limit(rows: usize, limit: i64) -> bool {
+    limit >= 0 && rows as i64 >= limit
+}
+
 /// Fast path for text-filtered expansions where every include is a plain
 /// full-system include (no compose filters, no explicit concept list).
 ///
@@ -2444,6 +2625,7 @@ fn expand_inline_plain_fts(
     filter_lower: &str,
     limit_hint: Option<usize>,
     warnings: &mut Vec<String>,
+    truncated: &mut bool,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     // Resolve (system_url, system_id) for each include.
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
@@ -2481,7 +2663,7 @@ fn expand_inline_plain_fts(
         .collect();
 
     let match_expr = fts5_quote(filter_lower);
-    let total_limit = limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+    let total_limit = candidate_limit(limit_hint, 3);
 
     // Single FTS query across all systems — FTS5 evaluates MATCH first (fast),
     // then applies the system_id IN post-filter to the small matching set.
@@ -2509,6 +2691,7 @@ fn expand_inline_plain_fts(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    *truncated |= hit_limit(rows.len(), total_limit);
     let mut results = Vec::with_capacity(rows.len());
     for (system_id, code, display) in rows {
         if let Some(&system_url) = id_to_url.get(system_id.as_str()) {
@@ -2552,6 +2735,7 @@ fn expand_inline_filtered(
     warnings: &mut Vec<String>,
     prop_cache: Option<(&str, &super::PropertyResultCache)>,
     plain_fts_cache: Option<(&str, &super::PlainFtsCache)>,
+    truncated: &mut bool,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
@@ -2582,7 +2766,14 @@ fn expand_inline_filtered(
                     return Ok(page_in_memory(&concept_idx, Some(&filter_lower), 0, -1));
                 }
             }
-            return expand_inline_plain_fts(conn, includes, &filter_lower, limit_hint, warnings);
+            return expand_inline_plain_fts(
+                conn,
+                includes,
+                &filter_lower,
+                limit_hint,
+                warnings,
+                truncated,
+            );
         }
     }
 
@@ -2701,13 +2892,14 @@ fn expand_inline_filtered(
             // FTS-first: text index narrows candidates, compose filters (including ECL)
             // intersect in Rust, then rank for typeahead UX.
             ensure_concepts_fts(conn, &system_id)?;
-            let mut candidates = fts_candidates_ranked_for_system(
+            let (mut candidates, capped) = fts_candidates_ranked_for_system(
                 conn,
                 &system_id,
                 system_url,
                 &filter_lower,
                 limit_hint,
             )?;
+            *truncated |= capped;
             if !candidates.is_empty() {
                 candidates = apply_compose_filters_to_candidates(
                     conn,
@@ -2789,10 +2981,9 @@ fn expand_inline_filtered(
             if filter_lower.len() >= 3 {
                 ensure_concepts_fts(conn, &system_id)?;
                 let match_expr = fts5_quote(&filter_lower);
-                // Per-system FTS limit: use hint×3 headroom (multi-system requests need surplus),
-                // but cap at 5000 for safety. Minimum 100 so tiny counts still get results.
-                let per_sys_limit =
-                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+                // Per-system FTS limit: use hint×3 headroom (multi-system
+                // requests need surplus). Minimum 100 so tiny counts still get results.
+                let per_sys_limit = candidate_limit(limit_hint, 3);
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts_fts \
@@ -2824,10 +3015,10 @@ fn expand_inline_filtered(
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                *truncated |= hit_limit(rows.len(), per_sys_limit);
                 results.extend(rows);
             } else {
-                let per_sys_limit =
-                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+                let per_sys_limit = candidate_limit(limit_hint, 3);
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts \
@@ -2860,6 +3051,7 @@ fn expand_inline_filtered(
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                *truncated |= hit_limit(rows.len(), per_sys_limit);
                 results.extend(rows);
             }
         }
@@ -5358,11 +5550,9 @@ fn fts_candidates_ranked_for_system(
     system_url: &str,
     filter_lower: &str,
     limit_hint: Option<usize>,
-) -> Result<Vec<ExpansionContains>, HtsError> {
+) -> Result<(Vec<ExpansionContains>, bool), HtsError> {
     let match_expr = fts5_quote(filter_lower);
-    let limit = limit_hint
-        .map(|h| (h * 10).clamp(100, 5000))
-        .unwrap_or(5000) as i64;
+    let limit = candidate_limit(limit_hint, 10);
 
     // A concept contributes one row per term (preferred display + each
     // designation), so scores are collapsed per code with MIN — bm25 is
@@ -5402,8 +5592,9 @@ fn fts_candidates_ranked_for_system(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let capped = hit_limit(ranked_codes.len(), limit);
     if ranked_codes.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], false));
     }
 
     let codes: Vec<String> = ranked_codes.iter().map(|(c, _)| c.clone()).collect();
@@ -5423,7 +5614,7 @@ fn fts_candidates_ranked_for_system(
         .collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    Ok(ranked_codes
+    let found = ranked_codes
         .into_iter()
         .filter_map(|(code, _rank)| {
             displays.get(&code).map(|display| ExpansionContains {
@@ -5439,7 +5630,8 @@ fn fts_candidates_ranked_for_system(
                 contains: vec![],
             })
         })
-        .collect())
+        .collect();
+    Ok((found, capped))
 }
 
 /// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
@@ -6045,6 +6237,80 @@ fn extract_simple_hierarchy_compose(
         root_code.to_owned(),
         include_root,
     )))
+}
+
+/// Number of codes [`bfs_expand_page`] pages through for `pattern` and
+/// `filter_lower`: the same predicates as a `COUNT(*)`, nothing materialised
+/// (an index range count over `concepts` or `concept_closure`, or an FTS
+/// match count).
+fn bfs_expand_total(
+    conn: &Connection,
+    system_id: &str,
+    pattern: &ImplicitVsPattern,
+    filter_lower: Option<&str>,
+) -> Result<u32, HtsError> {
+    let n: i64 = match pattern {
+        ImplicitVsPattern::AllConcepts => match filter_lower {
+            Some(f) if f.len() >= 3 => conn.query_row(
+                "SELECT COUNT(*) FROM concepts_fts WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                rusqlite::params![fts5_quote(f), system_id],
+                |r| r.get(0),
+            ),
+            Some(f) => conn.query_row(
+                "SELECT COUNT(*) FROM concepts_word_fts \
+                 WHERE concepts_word_fts MATCH ?1 AND system_id = ?2",
+                rusqlite::params![fts5_word_prefix(f), system_id],
+                |r| r.get(0),
+            ),
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+                [system_id],
+                |r| r.get(0),
+            ),
+        },
+        ImplicitVsPattern::IsA(root) | ImplicitVsPattern::DescendantOf(root) => {
+            let include_root = i64::from(matches!(pattern, ImplicitVsPattern::IsA(_)));
+            match filter_lower {
+                Some(f) if f.len() >= 3 => conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM   concepts_fts cf
+                     JOIN   concept_closure cc
+                            ON cc.system_id = ?2 AND cc.ancestor_code = ?3
+                            AND cc.descendant_code = cf.code
+                     WHERE  cf.system_id = ?2
+                       AND  concepts_fts MATCH ?1
+                       AND  (cf.code != ?3 OR ?4)",
+                    rusqlite::params![fts5_quote(f), system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+                Some(f) => conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM   concept_closure cc
+                     JOIN   concepts c ON c.system_id = ?2 AND c.code = cc.descendant_code
+                     WHERE  cc.system_id = ?2
+                       AND  cc.ancestor_code = ?3
+                       AND  (cc.descendant_code != ?3 OR ?4)
+                       AND  (LOWER(c.code) LIKE ?1 OR LOWER(COALESCE(c.display,'')) LIKE ?1)",
+                    rusqlite::params![format!("%{f}%"), system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+                None => conn.query_row(
+                    "SELECT COUNT(*) FROM concept_closure
+                     WHERE system_id = ?1 AND ancestor_code = ?2
+                       AND (descendant_code != ?2 OR ?3)",
+                    rusqlite::params![system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+            }
+        }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => {
+            return Err(HtsError::Internal(
+                "bfs_expand_total called for an ECL implicit ValueSet".into(),
+            ));
+        }
+    }
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(u32::try_from(n.max(0)).unwrap_or(u32::MAX))
 }
 
 /// Serve a page of an implicit ValueSet without waiting for the full cache.
@@ -10705,6 +10971,92 @@ mod tests {
         assert!(!validates(&b, refset, "child2").await);
     }
 
+    /// A CodeSystem `http://example.org/cs-many` with `root` and `n` children
+    /// `item-<i>` ("Item number <i>").
+    fn bundle_many(n: usize) -> String {
+        let children: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"code":"item-{i}","display":"Item number {i}"}}"#))
+            .collect();
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                "resourceType":"CodeSystem","id":"cs-many","url":"http://example.org/cs-many",
+                "status":"active","content":"complete",
+                "concept":[{{"code":"root","display":"Root","concept":[{}]}}]}}}}]}}"#,
+            children.join(",")
+        )
+    }
+
+    async fn expand_req(b: &SqliteTerminologyBackend, req: ExpandRequest) -> ExpandResponse {
+        b.expand(&ctx(), req).await.expect("expand")
+    }
+
+    /// Filtered and CodeSystem-wide implicit expansions report
+    /// `expansion.total`: on the cold paged path (before the implicit cache
+    /// is built) and on the warm in-memory path, with and without a filter.
+    #[tokio::test]
+    async fn implicit_expansions_report_total_with_and_without_filter() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_many(30).as_bytes())
+            .await
+            .unwrap();
+        let page = |url: &str, filter: Option<&str>| ExpandRequest {
+            url: Some(url.into()),
+            filter: filter.map(Into::into),
+            count: Some(5),
+            offset: Some(5),
+            ..Default::default()
+        };
+        let all = "http://example.org/cs-many?fhir_vs";
+        let isa = "http://example.org/cs-many?fhir_vs=isa/root";
+        for _ in 0..2 {
+            // First round: cold paged path. Second: the cache is warm.
+            let r = expand_req(&b, page(all, None)).await;
+            assert_eq!((r.total, r.contains.len()), (Some(31), 5));
+            let r = expand_req(&b, page(all, Some("number 1"))).await;
+            // "Item number 1", "…10" … "…19".
+            assert_eq!(r.total, Some(11));
+            let r = expand_req(&b, page(isa, None)).await;
+            assert_eq!(r.total, Some(31));
+            let r = expand_req(&b, page(isa, Some("number 2"))).await;
+            assert_eq!(r.total, Some(11));
+            // Let the background cache population finish.
+            ensure_implicit_cache(&b.pool().get().unwrap(), all, None).unwrap();
+            ensure_implicit_cache(&b.pool().get().unwrap(), isa, None).unwrap();
+        }
+    }
+
+    /// A text filter combined with a hierarchy filter stops collecting
+    /// candidates at a limit derived from the requested window. The total
+    /// must still be exact, and later pages must still have rows: the total
+    /// used to be the truncated length (at most 1000 here) and the window
+    /// ignored `offset`.
+    #[tokio::test]
+    async fn filtered_inline_expansion_total_is_exact_past_the_candidate_limit() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_many(1200).as_bytes())
+            .await
+            .unwrap();
+        let req = |offset: u32| ExpandRequest {
+            value_set: Some(serde_json::json!({
+                "resourceType": "ValueSet",
+                "compose": {"include": [{
+                    "system": "http://example.org/cs-many",
+                    "filter": [{"property": "concept", "op": "is-a", "value": "root"}]
+                }]}
+            })),
+            filter: Some("item".into()),
+            count: Some(10),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let first = expand_req(&b, req(0)).await;
+        assert_eq!(first.contains.len(), 10);
+        assert_eq!(first.total, Some(1200));
+        let last = expand_req(&b, req(1195)).await;
+        assert_eq!(last.contains.len(), 5, "page past the old candidate cap");
+        assert_eq!(last.total, Some(1200));
+    }
+
     #[tokio::test]
     async fn expand_fhir_vs_all_concepts() {
         let b = backend();
@@ -12336,9 +12688,6 @@ mod tests {
             vec!["code2", "code2a", "code2aI", "code2aII", "code2b"],
             "is-a returns the full subtree including self"
         );
-        // `total` is intentionally not asserted — the BFS fast path used by
-        // single-include is-a expansions returns `total: None` to avoid the
-        // separate count round-trip when the caller only asked for a page.
     }
     // ── inline `#contained` ValueSet ref + canonical URL intersection ──────────
 
@@ -12765,7 +13114,8 @@ mod tests {
 
         let hits =
             fts_candidates_ranked_for_system(&conn, "sys1", "http://example.org/cs", "data", None)
-                .expect("ranked search must not error");
+                .expect("ranked search must not error")
+                .0;
 
         let mut codes: Vec<&str> = hits.iter().map(|c| c.code.as_str()).collect();
         codes.sort_unstable();
