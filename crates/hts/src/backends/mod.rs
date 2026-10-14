@@ -40,7 +40,12 @@ pub use postgres::PostgresTerminologyBackend;
 ///    tier is the only thing keeping `version=current` resolving to the real
 ///    import. See `docs/ig-publisher-compatibility.md`.
 /// 2. **has concepts** — a populated row beats an empty one, for the same reason.
-/// 3. **`authority_rank`** — the original beats a re-published copy. This is the
+/// 3. **`current_pin`** — a version an operator explicitly marked "current"
+///    through the admin API beats every other populated row. It sits below
+///    tiers 1–2 so pinning an empty stub cannot hide the real edition, and
+///    above provenance and version order because it is an explicit decision.
+///    Unpinned (the default), the semantic newest version wins as before.
+/// 4. **`authority_rank`** — the original beats a re-published copy. This is the
 ///    tier that fixes the `terminology.hl7.org` collisions: `hl7.fhir.r4.core`
 ///    re-ships 746 THO CodeSystems stamped with the *FHIR release* version
 ///    (`4.0.1`), which outsorts the code system's own version (`1.0.0`) under any
@@ -48,10 +53,10 @@ pub use postgres::PostgresTerminologyBackend;
 ///    Provenance is the only thing that separates those rows; nothing intrinsic
 ///    to them does. `NULL` (a row imported before the column existed) coalesces
 ///    to 0, so an un-re-imported database keeps its previous behaviour.
-/// 4. **`version`** — highest version string wins, as before.
-/// 5. **`id`** — a stable, deterministic final tiebreak.
+/// 5. **`version`** — highest version string wins, as before.
+/// 6. **`id`** — a stable, deterministic final tiebreak.
 ///
-/// Tier 3 sits *below* 1 and 2 deliberately: if a package that owns a canonical
+/// Tier 4 sits *below* 1 and 2 deliberately: if a package that owns a canonical
 /// ships only an empty stub of it while some other package ships a populated
 /// copy, the populated row should still win — being authoritative is worthless
 /// if the row has no concepts to validate against.
@@ -90,6 +95,7 @@ fn build_cs_precedence_order_by(alias: &str) -> String {
          (CASE WHEN EXISTS \
              (SELECT 1 FROM concepts hc WHERE hc.system_id = {alias}.id) \
              THEN 0 ELSE 1 END), \
+         (CASE WHEN {alias}.current_pin = 1 THEN 0 ELSE 1 END), \
          COALESCE({alias}.authority_rank, 0), \
          COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
@@ -223,6 +229,7 @@ mod precedence_tests {
          (CASE WHEN EXISTS \
              (SELECT 1 FROM concepts hc WHERE hc.system_id = code_systems.id) \
              THEN 0 ELSE 1 END), \
+         (CASE WHEN code_systems.current_pin = 1 THEN 0 ELSE 1 END), \
          COALESCE(code_systems.authority_rank, 0), \
          COALESCE(code_systems.version_sort, code_systems.version, '') DESC, \
          code_systems.id";

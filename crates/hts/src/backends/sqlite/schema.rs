@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS code_systems (
     -- `ORDER BY version_sort DESC` picks the semantically newest version
     -- (10.0.0 above 9.0.0 above 2018-08-12) instead of the textually largest.
     -- Recomputed on every write; backfilled by `migrate_version_sort`.
-    version_sort  TEXT
+    version_sort  TEXT,
+    -- 1 = an operator pinned this row as the current version of `url`
+    -- (admin API `PUT /admin/code-systems/current`). At most one row per url
+    -- carries it; the precedence ORDER BY ranks it above version order. NULL
+    -- (the default) leaves the semantic newest version current.
+    current_pin   INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -585,6 +590,18 @@ pub fn migrate_version_sort(conn: &rusqlite::Connection) -> rusqlite::Result<()>
         backfill_version_sort(conn, table)?;
     }
     Ok(())
+}
+
+/// Add the operator-controlled `current_pin` column to `code_systems`.
+///
+/// Must run after the `drop_url_unique` rebuild (which recreates the table with
+/// a fixed column list). Idempotent; no backfill — `NULL` means "not pinned".
+pub fn migrate_current_pin(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    match conn.execute_batch("ALTER TABLE code_systems ADD COLUMN current_pin INTEGER") {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<()> {
