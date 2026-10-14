@@ -1781,16 +1781,8 @@ async fn resolve_supplements<B: TerminologyBackend>(
     expected_target: Option<&str>,
 ) -> Result<Vec<SupplementInfo>, HtsError> {
     let mut out = Vec::new();
-    for s in params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-        })
-    {
-        let bare = s.split('|').next().unwrap_or(s);
+    for s in crate::operations::params::collect_use_supplements(params) {
+        let bare = s.split('|').next().unwrap_or(&s);
         let info = backend.supplement_target(ctx, bare).await?;
         let info = match info {
             Some(i) => i,

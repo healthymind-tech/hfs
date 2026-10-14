@@ -1728,16 +1728,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // bad-supplement IG fixtures reject with 4xx. The resolved info list is
     // applied later, after expansion completes.
     let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
-    let mut supplement_inputs: Vec<String> = params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect();
+    let mut supplement_inputs: Vec<String> =
+        crate::operations::params::collect_use_supplements(&params);
     if !supplement_inputs.is_empty() {
         let ctx = TenantContext::system();
         for raw in &supplement_inputs {
@@ -5074,7 +5066,8 @@ mod tests {
         Router::new()
             .route(
                 "/ValueSet/$expand",
-                post(expand_handler::<SqliteTerminologyBackend>),
+                post(expand_handler::<SqliteTerminologyBackend>)
+                    .get(get_expand_handler::<SqliteTerminologyBackend>),
             )
             .with_state(state)
     }
@@ -5170,6 +5163,44 @@ mod tests {
         });
         let resp = post_json(app, "/ValueSet/$expand", body).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    /// GET passes `useSupplement` as a `valueString`; it must still be
+    /// resolved (and an unknown one rejected), as on POST.
+    #[tokio::test]
+    async fn get_expand_honours_use_supplement() {
+        let base = "/ValueSet/$expand?url=http://hl7.org/fhir/test/ValueSet/extensions-all-ns";
+        let resp = make_supplement_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&useSupplement=http://does-not-exist/cs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = make_supplement_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{base}&useSupplement=http://hl7.org/fhir/test/CodeSystem/supplement"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        assert!(
+            json["expansion"]["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "used-supplement"),
+            "{json}"
+        );
     }
 
     /// `excludeNested=false` should produce a tree (root contains child contains grandchild,

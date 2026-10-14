@@ -212,12 +212,13 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let ctx = TenantContext::system();
 
     // ── Resolve supplements ──────────────────────────────────────────────────
-    // Accept either valueCanonical or valueUri on `useSupplement`. For each,
+    // Accept any canonical-ish value type on `useSupplement`. For each,
     // verify it points at a stored CodeSystem with `content=supplement` whose
     // `supplements` URL matches the lookup `system`. Mismatches and unknown
     // supplements both reject with NotFound (issue.code=not-found) per the
     // IG fixtures.
-    let mut supplement_inputs: Vec<String> = collect_supplement_inputs(&params);
+    let mut supplement_inputs: Vec<String> =
+        crate::operations::params::collect_use_supplements(&params);
     let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
     for raw in &supplement_inputs {
         let bare = raw.split('|').next().unwrap_or(raw).to_string();
@@ -502,22 +503,6 @@ pub async fn get_lookup_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
-}
-
-/// Collect every `useSupplement` input from a Parameters body, accepting
-/// either `valueCanonical` or `valueUri`. Returns the raw values so callers
-/// can later strip an optional `|version` suffix when looking up the CS.
-fn collect_supplement_inputs(params: &[Value]) -> Vec<String> {
-    params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect()
 }
 
 /// Inject (or replace) the `system` parameter in a FHIR params list.
@@ -975,9 +960,65 @@ mod tests {
         Router::new()
             .route(
                 "/CodeSystem/$lookup",
-                post(lookup_handler::<SqliteTerminologyBackend>),
+                post(lookup_handler::<SqliteTerminologyBackend>)
+                    .get(get_lookup_handler::<SqliteTerminologyBackend>),
             )
             .with_state(state)
+    }
+
+    async fn get(app: Router, uri: &str) -> axum::response::Response {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn has_designation(json: &Value, value: &str) -> bool {
+        json["parameter"].as_array().unwrap().iter().any(|p| {
+            p["name"] == "designation"
+                && p["part"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|q| q["valueString"] == value))
+        })
+    }
+
+    /// GET turns every query parameter into a `valueString`; `useSupplement`
+    /// must still be honoured (it was read from valueCanonical/valueUri only,
+    /// so GET silently dropped it).
+    #[tokio::test]
+    async fn get_lookup_honours_use_supplement() {
+        let app = make_supplement_app_strict();
+        let base =
+            "/CodeSystem/$lookup?system=http://hl7.org/fhir/test/CodeSystem/extensions&code=code1";
+        let without = body_json(get(app.clone(), base).await).await;
+        assert!(!has_designation(&without, "ectenoot"), "{without}");
+
+        let resp = get(
+            app.clone(),
+            &format!("{base}&useSupplement=http://hl7.org/fhir/test/CodeSystem/supplement"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        assert!(has_designation(&json, "ectenoot"), "{json}");
+        assert!(
+            json["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "used-supplement"),
+            "{json}"
+        );
+
+        let resp = get(
+            app,
+            &format!("{base}&useSupplement=http://does-not-exist/cs"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            404,
+            "unknown supplement must be rejected on GET too"
+        );
     }
 
     /// Build an app with a small hierarchy so we can exercise the synthesised
