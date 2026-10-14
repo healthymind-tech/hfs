@@ -2064,10 +2064,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // not verified against the CodeSystem (fork issue T8).
             if let (true, Some(sys), Some(code)) =
                 (response.result, system_for_msg.as_deref(), matched_code.as_deref())
+                && !is_code_in_cs(&conn, sys, code)
             {
-                if !is_code_in_cs(&conn, sys, code) {
-                    crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
-                }
+                crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
             }
             Ok(response)
             };

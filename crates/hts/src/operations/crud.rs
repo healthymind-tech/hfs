@@ -416,12 +416,12 @@ mod inner {
             .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
         let ctx = ctx();
 
-        if let Some(body_id) = body.get("id").and_then(|v| v.as_str()) {
-            if body_id != id {
-                return Err(HtsError::InvalidRequest(format!(
-                    "Resource id '{body_id}' does not match the URL id '{id}'"
-                )));
-            }
+        if let Some(body_id) = body.get("id").and_then(|v| v.as_str())
+            && body_id != id
+        {
+            return Err(HtsError::InvalidRequest(format!(
+                "Resource id '{body_id}' does not match the URL id '{id}'"
+            )));
         }
         if let Some(obj) = body.as_object_mut() {
             obj.insert("id".into(), Value::String(id.clone()));

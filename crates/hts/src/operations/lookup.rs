@@ -326,14 +326,13 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             for d in list {
                 // `displayLanguage` filters supplement designations the same
                 // way the backend filters the base ones.
-                if let Some(lang) = display_language.as_deref() {
-                    if !d
+                if let Some(lang) = display_language.as_deref()
+                    && !d
                         .language
                         .as_deref()
                         .is_some_and(|l| crate::language::lang_matches(lang, l))
-                    {
-                        continue;
-                    }
+                {
+                    continue;
                 }
                 resp.designations.push(DesignationValue {
                     language: d.language.clone(),
@@ -346,15 +345,14 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             // When the base CodeSystem has no designation in the requested
             // language but a supplement does, that translation becomes the
             // display — the whole point of a translation supplement.
-            if let Some(lang) = display_language.as_deref() {
-                if !base_lang_matched {
-                    if let Some(idx) = crate::language::best_lang_match_index(
-                        lang,
-                        list.iter().map(|d| d.language.as_deref()),
-                    ) {
-                        resp.display = Some(list[idx].value.clone());
-                    }
-                }
+            if let Some(lang) = display_language.as_deref()
+                && !base_lang_matched
+                && let Some(idx) = crate::language::best_lang_match_index(
+                    lang,
+                    list.iter().map(|d| d.language.as_deref()),
+                )
+            {
+                resp.display = Some(list[idx].value.clone());
             }
         }
 

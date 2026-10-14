@@ -423,13 +423,13 @@ pub fn normalize_canonical_params(
         let ver = ver.map(str::to_string);
         obj.insert(key, Value::String(bare));
         if let Some(v) = ver {
-            if let Some(prev) = promoted.as_deref() {
-                if prev != v {
-                    return Err(HtsError::InvalidRequest(format!(
-                        "Parameter `{url_name}` was supplied with conflicting versions \
-                         ({prev} vs {v})"
-                    )));
-                }
+            if let Some(prev) = promoted.as_deref()
+                && prev != v
+            {
+                return Err(HtsError::InvalidRequest(format!(
+                    "Parameter `{url_name}` was supplied with conflicting versions \
+                     ({prev} vs {v})"
+                )));
             }
             promoted = Some(v);
         }

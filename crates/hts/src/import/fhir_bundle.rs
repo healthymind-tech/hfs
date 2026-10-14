@@ -200,10 +200,8 @@ pub(crate) fn build_closure_if_hierarchical(conn: &Connection, system_id: &str) 
             |r| r.get(0),
         )
         .unwrap_or(false);
-    if has_hierarchy {
-        if let Err(e) = schema::build_concept_closure(conn, system_id) {
-            tracing::warn!(system_id = %system_id, error = %e, "Failed to build concept closure after import");
-        }
+    if has_hierarchy && let Err(e) = schema::build_concept_closure(conn, system_id) {
+        tracing::warn!(system_id = %system_id, error = %e, "Failed to build concept closure after import");
     }
 }
 

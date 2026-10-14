@@ -388,15 +388,15 @@ impl HierarchyProperties {
                     continue;
                 };
                 match uri {
-                    "http://hl7.org/fhir/concept-properties#parent" => {
-                        if !me.parent_codes.iter().any(|c| c == code) {
-                            me.parent_codes.push(code.to_owned());
-                        }
+                    "http://hl7.org/fhir/concept-properties#parent"
+                        if !me.parent_codes.iter().any(|c| c == code) =>
+                    {
+                        me.parent_codes.push(code.to_owned());
                     }
-                    "http://hl7.org/fhir/concept-properties#child" => {
-                        if !me.child_codes.iter().any(|c| c == code) {
-                            me.child_codes.push(code.to_owned());
-                        }
+                    "http://hl7.org/fhir/concept-properties#child"
+                        if !me.child_codes.iter().any(|c| c == code) =>
+                    {
+                        me.child_codes.push(code.to_owned());
                     }
                     _ => {}
                 }
@@ -431,10 +431,10 @@ impl HierarchyProperties {
             return;
         }
         for (child, parent) in parent_of {
-            if let Some(c) = concepts.iter_mut().find(|c| c.code == child) {
-                if c.parent_code.is_none() {
-                    c.parent_code = Some(parent);
-                }
+            if let Some(c) = concepts.iter_mut().find(|c| c.code == child)
+                && c.parent_code.is_none()
+            {
+                c.parent_code = Some(parent);
             }
         }
     }

@@ -1828,12 +1828,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 Some(v) => format!("{u}|{v}"),
                 None => u.clone(),
             });
-    if let (Some(url_str), Some(key)) = (&url, &neg_cache_key) {
-        if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(key.as_str()) {
-                return Err(HtsError::NotFound(url_str.clone()));
-            }
-        }
+    if let (Some(url_str), Some(key)) = (&url, &neg_cache_key)
+        && let Ok(neg) = state.not_found_urls.read()
+        && neg.contains(key.as_str())
+    {
+        return Err(HtsError::NotFound(url_str.clone()));
     }
 
     // `tx-resource` parameters provide ad-hoc terminology that the caller does
@@ -2039,12 +2038,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
             if let Some(ref url_str) = url_for_neg_cache {
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
-                if msg_names_top {
-                    if let Ok(mut neg) = state.not_found_urls.write() {
-                        if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(neg_cache_key.clone().unwrap_or_else(|| url_str.clone()));
-                        }
-                    }
+                if msg_names_top
+                    && let Ok(mut neg) = state.not_found_urls.write()
+                    && neg.len() < NOT_FOUND_CACHE_MAX
+                {
+                    neg.insert(neg_cache_key.clone().unwrap_or_else(|| url_str.clone()));
                 }
             }
             // The IG fixtures format VS-not-found errors as

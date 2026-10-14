@@ -1753,10 +1753,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             response.result,
             system_for_msg.as_deref(),
             matched_code.as_deref(),
-        ) {
-            if !is_code_in_cs(&client, sys, code).await {
-                crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
-            }
+        ) && !is_code_in_cs(&client, sys, code).await
+        {
+            crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
         }
         Ok(response)
     }
