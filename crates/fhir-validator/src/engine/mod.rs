@@ -85,6 +85,72 @@ pub struct SyncOutcome {
     pub deferred: Vec<Deferred>,
 }
 
+/// `batch`/`transaction` entries whose `request.url` addresses a different
+/// resource type than the entry's `resource`: `POST Patient` carrying an
+/// Observation would be stored as an Observation the client asked to file
+/// as a Patient. Only relative URLs are judged (`Type`, `Type/id`,
+/// `Type?criteria`); an absolute URL's base cannot be told apart from its
+/// type without knowing the server base. Methods without a resource body
+/// (GET, DELETE, HEAD) are skipped.
+fn bundle_entry_type_mismatches(resource: &Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Bundle")
+        || !matches!(
+            resource.get("type").and_then(Value::as_str),
+            Some("batch" | "transaction")
+        )
+    {
+        return errors;
+    }
+    let Some(entries) = resource.get("entry").and_then(Value::as_array) else {
+        return errors;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(request) = entry.get("request") else {
+            continue;
+        };
+        if !matches!(
+            request.get("method").and_then(Value::as_str),
+            Some("POST" | "PUT" | "PATCH")
+        ) {
+            continue;
+        }
+        let (Some(url), Some(actual)) = (
+            request.get("url").and_then(Value::as_str),
+            entry
+                .get("resource")
+                .and_then(|r| r.get("resourceType"))
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if url.contains("://") {
+            continue;
+        }
+        let path = url.split(['?', '#']).next().unwrap_or_default();
+        let Some(addressed) = path.trim_start_matches('/').split('/').next() else {
+            continue;
+        };
+        // `Parameters` is a PATCH body (FHIRPath Patch), not the target.
+        if addressed.is_empty()
+            || addressed.starts_with('$')
+            || addressed == actual
+            || actual == "Parameters"
+            || actual == "Binary"
+        {
+            continue;
+        }
+        errors.push(ValidationError::new(
+            ErrorKind::BundleEntryMismatch,
+            format!("Bundle.entry.{index}.request.url"),
+            format!(
+                "request.url '{url}' addresses resource type {addressed}, but the entry's resource is of type {actual}"
+            ),
+        ));
+    }
+    errors
+}
+
 /// The validator: a resolver plus the walk.
 pub struct Validator {
     resolver: Arc<dyn SchemaResolver>,
@@ -99,7 +165,11 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        walk::validate(self.resolver.as_ref(), resource, opts)
+        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts);
+        outcome
+            .errors
+            .extend(bundle_entry_type_mismatches(resource));
+        outcome
     }
 
     /// Full validation: the structural walk plus execution of the deferred

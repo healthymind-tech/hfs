@@ -792,6 +792,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         // A known extension outside its declared context (#615): invalid
         // content by placement, not a structural malformation.
         ErrorKind::ExtensionContext => IssueType::Invalid,
+        // A batch/transaction entry filed under the wrong resource type.
+        ErrorKind::BundleEntryMismatch => IssueType::Invalid,
         ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
