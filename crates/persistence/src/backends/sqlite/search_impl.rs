@@ -224,19 +224,52 @@ fn sql_param_value(param: &SqlParam) -> rusqlite::types::Value {
     }
 }
 
-/// Counts the rows `m` matches, stopping at `cap + 1`.
+/// What a key probe read: the matching rows' `resource_key`s and how many
+/// rows it read.
+struct ProbedKeys {
+    /// The keys, in index order. A row without a `resource_key` names no
+    /// resource (`rowid IN` never matched it either) and is left out.
+    keys: Vec<i64>,
+    /// Rows read, keyed or not; at most the probe's cap plus one.
+    rows: usize,
+}
+
+/// The `resource_key`s `m` matches, stopping after `cap + 1` rows.
 ///
 /// `values` holds every value of the outer statement in placeholder order;
 /// the probe binds the prefix its own highest placeholder needs (the outer
 /// query's other leading values, e.g. a cursor's, are bound but unused).
-fn probe_membership(
+fn probe_membership_keys(
+    conn: &rusqlite::Connection,
+    m: &Membership,
+    values: &[rusqlite::types::Value],
+    cap: usize,
+) -> StorageResult<ProbedKeys> {
+    let sql = format!("SELECT resource_key FROM ({}) LIMIT {}", m.select, cap + 1);
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare search filter probe")?;
+    let n = stmt.parameter_count().min(values.len());
+    let read: Vec<Option<i64>> = stmt
+        .query_map(rusqlite::params_from_iter(&values[..n]), |row| row.get(0))
+        .or_query_error("Failed to probe search filter")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read search filter probe")?;
+    Ok(ProbedKeys {
+        rows: read.len(),
+        keys: read.into_iter().flatten().collect(),
+    })
+}
+
+/// Counts the rows `m` matches, stopping at `cap + 1`. Reads index entries
+/// only: `SELECT 1` keeps a token or reference probe inside its covering
+/// index instead of reading each row's `resource_key`.
+fn probe_membership_count(
     conn: &rusqlite::Connection,
     m: &Membership,
     values: &[rusqlite::types::Value],
     cap: usize,
 ) -> StorageResult<usize> {
-    // Count index entries only: `SELECT 1` keeps a token or reference probe
-    // inside its covering index instead of reading each row's `resource_key`.
     let select = m.select.replace(
         "SELECT resource_key FROM search_index WHERE ",
         "SELECT 1 FROM search_index WHERE ",
@@ -264,7 +297,7 @@ fn probe_membership(
 /// Observations to intersect with the patient's 57 (~190 ms), and a query
 /// that matches a handful of rows walked every row of the type to find them.
 ///
-/// Now the positive memberships are counted (bounded, from the index), the
+/// Now the positive memberships are probed (bounded, from the index), the
 /// smallest becomes the one `rowid IN (…)` list, and every other membership is
 /// a correlated `EXISTS` probe of that candidate's own rows through
 /// `idx_search_composite` (`tenant_id, resource_type, resource_key,
@@ -301,26 +334,52 @@ pub(crate) fn plan_filter(
 
     let mut clause = String::new();
     let mut drive = false;
+    let mut json_keys = None;
     if !memberships.is_empty() {
         let values: Vec<rusqlite::types::Value> = leading
             .iter()
             .cloned()
             .chain(params.iter().map(sql_param_value))
             .collect();
-        let mut counts = Vec::with_capacity(memberships.len());
+        let mut keys = Vec::with_capacity(memberships.len());
         for m in &memberships {
-            counts.push(probe_membership(conn, m, &values, DRIVE_MAX_ROWS)?);
+            keys.push(probe_membership_keys(conn, m, &values, DRIVE_MAX_ROWS)?);
         }
+        let mut counts: Vec<usize> = keys.iter().map(|k| k.rows).collect();
         let mut smallest = argmin(&counts);
         drive = counts[smallest] <= DRIVE_MAX_ROWS;
-        if !drive && memberships.len() > 1 {
-            counts.clear();
-            for m in &memberships {
-                counts.push(probe_membership(conn, m, &values, PICK_MAX_ROWS)?);
+        if drive {
+            // The probe already read the whole membership, so the outer query
+            // takes its keys rather than running it a second time: a
+            // membership that cannot seek (a `name` prefix, a `:contains`)
+            // costs one pass over its rows, not two. The probe ran a statement
+            // earlier on this connection; a write committed in between is
+            // seen by the rest of the query but not by this list, exactly as
+            // if the search had started a moment earlier.
+            let json = format!(
+                "[{}]",
+                keys[smallest]
+                    .keys
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            clause.push_str(&format!(
+                " AND rowid IN (SELECT value FROM json_each(?{}))",
+                leading.len() + params.len() + 1
+            ));
+            json_keys = Some(json);
+        } else {
+            if memberships.len() > 1 {
+                counts.clear();
+                for m in &memberships {
+                    counts.push(probe_membership_count(conn, m, &values, PICK_MAX_ROWS)?);
+                }
+                smallest = argmin(&counts);
             }
-            smallest = argmin(&counts);
+            clause.push_str(&format!(" AND rowid IN ({})", memberships[smallest].select));
         }
-        clause.push_str(&format!(" AND rowid IN ({})", memberships[smallest].select));
         for (i, m) in memberships.iter().enumerate() {
             if i != smallest {
                 clause.push_str(&format!(
@@ -345,6 +404,8 @@ pub(crate) fn plan_filter(
              WHERE tenant_id = ?1 AND resource_type = ?2)",
         );
     }
+    // Bound last: its placeholder was numbered after every part's.
+    params.extend(json_keys.map(SqlParam::String));
     Ok(Some(FilterPlan {
         clause,
         params,
