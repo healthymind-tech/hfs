@@ -76,7 +76,7 @@ where
 
     let format_param = last_value(&pairs, "_format");
     let negotiated = negotiate_format(&req_headers, format_param.as_deref());
-    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let handling = Handling::from_headers(&req_headers);
 
     execute_search(
         &state,
@@ -84,7 +84,7 @@ where
         &resource_type,
         pairs,
         negotiated.format,
-        strict,
+        handling,
     )
     .await
 }
@@ -118,7 +118,7 @@ where
     );
 
     let negotiated = negotiate_format(&req_headers, None);
-    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let handling = Handling::from_headers(&req_headers);
 
     execute_search(
         &state,
@@ -126,7 +126,7 @@ where
         &resource_type,
         pairs,
         negotiated.format,
-        strict,
+        handling,
     )
     .await
 }
@@ -202,20 +202,45 @@ async fn execute_search<S>(
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
-    strict: bool,
+    handling: Handling,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    let bundle_json =
+        execute_search_bundle_with(state, &tenant, resource_type, pairs, handling).await?;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format)
 }
 
-/// Executes a type-level search and returns the searchset Bundle as JSON.
+/// The search's `Prefer: handling` (FHIR search error handling).
 ///
-/// The HTTP search handlers wrap this in content negotiation; bundle
-/// processing (`GET [type]?params` entries in batch/transaction Bundles,
-/// #478) embeds the returned Bundle as an entry resource.
+/// Without the header the server still ignores, and reports, a search
+/// parameter it does not know; it refuses a result parameter whose value it
+/// cannot honour (`_sort`, `_total`). `lenient` ignores and reports both,
+/// `strict` refuses both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handling {
+    /// No `handling` preference.
+    Default,
+    /// `Prefer: handling=strict`.
+    Strict,
+    /// `Prefer: handling=lenient`.
+    Lenient,
+}
+
+impl Handling {
+    /// The preference a request's headers state.
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        match PreferHeader::from_headers(headers).handling() {
+            Some("strict") => Handling::Strict,
+            Some("lenient") => Handling::Lenient,
+            _ => Handling::Default,
+        }
+    }
+}
+
+/// [`execute_search_bundle_with`] for a caller that only distinguishes
+/// strict handling (bundle entries carry no `Prefer` of their own).
 pub(crate) async fn execute_search_bundle<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -226,6 +251,31 @@ pub(crate) async fn execute_search_bundle<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let handling = if strict {
+        Handling::Strict
+    } else {
+        Handling::Default
+    };
+    execute_search_bundle_with(state, tenant, resource_type, pairs, handling).await
+}
+
+/// Executes a type-level search and returns the searchset Bundle as JSON.
+///
+/// The HTTP search handlers wrap this in content negotiation; bundle
+/// processing (`GET [type]?params` entries in batch/transaction Bundles,
+/// #478) embeds the returned Bundle as an entry resource.
+pub(crate) async fn execute_search_bundle_with<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    pairs: Vec<(String, String)>,
+    handling: Handling,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+{
+    let strict = handling == Handling::Strict;
+    let lenient = handling == Handling::Lenient;
     // Direct requests were already judged by the router's resource-type gate
     // (`middleware::resource_type`); a `GET [type]?[params]` entry inside a
     // batch or transaction Bundle arrives here without passing through it, and
@@ -410,6 +460,51 @@ where
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         search_params = SearchParams::from_pairs(retained);
+    }
+
+    // A result parameter whose value the server cannot honour is a `400`, as
+    // FHIR search error handling has it, unless the client asked for lenient
+    // handling: then it is ignored and reported. `_sort=nope` and
+    // `_total=bogus` both used to answer `200`, the sort silently replaced by
+    // an id sort and the `_total` by none.
+    let mut sort_warnings = sort_warnings;
+    if let Some(value) =
+        crate::extractors::search_query_builder::invalid_total_value(&search_params)
+    {
+        let message =
+            format!("_total value '{value}' is not one of 'none', 'estimate' or 'accurate'");
+        if !lenient {
+            return Err(RestError::InvalidParameter {
+                param: "_total".to_string(),
+                message,
+            });
+        }
+        sort_warnings.push(format!("{message}; it was ignored"));
+        let retained: Vec<(String, String)> = search_params
+            .iter()
+            .filter(|(k, _)| k.as_str() != "_total")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        search_params = SearchParams::from_pairs(retained);
+    }
+    if !lenient {
+        let unsortable = {
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
+            crate::extractors::search_query_builder::unsortable_sort_fields(
+                resource_type,
+                &search_params,
+                &registry,
+            )
+        };
+        // `_score` ranks by relevance on full-text backends and is accepted
+        // everywhere (other backends fall back to the default order).
+        if let Some((field, warning)) = unsortable.into_iter().find(|(f, _)| f != "_score") {
+            return Err(RestError::InvalidParameter {
+                param: format!("_sort={field}"),
+                message: warning.split(';').next().unwrap_or(&warning).to_string(),
+            });
+        }
     }
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
