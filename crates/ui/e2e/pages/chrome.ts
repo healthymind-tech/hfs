@@ -1,9 +1,11 @@
 // The persistent app chrome (layouts/base.html): the sidebar rail (expands on
-// hover, #438), theme buttons, and the account menu. On every full page.
+// hover, #438), the theme switcher, and the account menu. On every full page.
 import type { Page, Locator } from "@playwright/test";
 import { langLink, userMenu } from "./user-menu";
 
 export type Theme = "light" | "dark";
+/** The stored preference: "system" follows prefers-color-scheme. */
+export type ThemePref = "system" | Theme;
 
 export class AppChrome {
   readonly sidebar: Locator;
@@ -17,8 +19,19 @@ export class AppChrome {
     return this.page.locator(`a.nav-item[href='${href}']`);
   }
 
-  themeButton(theme: Theme): Locator {
-    return this.page.locator(`[data-set-theme='${theme}']`);
+  /** The one topbar theme button (helios-ui-chrome theme-toggle.html): each
+   * click cycles system -> light -> dark -> system. */
+  themeToggle(): Locator {
+    return this.page.locator("[data-theme-cycle]");
+  }
+
+  /** Click the switcher until the stored preference is `pref`. */
+  async chooseTheme(pref: ThemePref): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      if ((await this.page.locator("html").getAttribute("data-theme-pref")) === pref) return;
+      await this.themeToggle().click();
+    }
+    throw new Error(`theme switcher never reached ${pref}`);
   }
 
   /** The current theme as stamped on <html data-theme>. */
@@ -26,8 +39,19 @@ export class AppChrome {
     return this.page.locator("html").getAttribute("data-theme");
   }
 
-  /** Seed the cached theme before first paint, the way a returning user has it. */
-  async seedTheme(theme: Theme): Promise<void> {
+  /** Seed the stored theme before first paint, the way a returning user has
+   * it: the shared `hfs_theme` cookie both consoles read. */
+  async seedTheme(theme: ThemePref): Promise<void> {
+    // An init script runs before every page script — the inline boot
+    // stamp included — so the cookie is there for the very first paint.
+    await this.page.addInitScript((t) => {
+      document.cookie = `hfs_theme=${t}; Path=/; SameSite=Lax`;
+    }, theme);
+  }
+
+  /** Seed the pre-cookie localStorage cache (light | dark) instead, to
+   * exercise its one-time migration into the cookie. */
+  async seedLegacyTheme(theme: Theme): Promise<void> {
     await this.page.addInitScript((t) => {
       try {
         localStorage.setItem("hfs-theme", t as string);

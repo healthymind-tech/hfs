@@ -636,6 +636,17 @@ impl Status {
         )
     }
 
+    /// The topbar theme switcher, shared with HTS through `helios-ui-chrome`:
+    /// one button cycling system -> light -> dark (`assets/theme.js`).
+    pub(crate) fn theme_toggle(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_toggle(i18n)
+    }
+
+    /// The inline first-paint theme stamp for `<head>` (shared with HTS).
+    pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_boot()
+    }
+
     /// A browser-safe terminology destination, when the configured value is a
     /// valid absolute HTTP(S) URL (#611).
     pub(crate) fn terminology_url(&self) -> Option<&str> {
@@ -9780,7 +9791,20 @@ mod tests {
         let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("PATCH"));
-        assert!(source.contains("hfs-theme"), "localStorage cache stays");
+        assert!(
+            source.contains("hfs-theme"),
+            "legacy localStorage key is migrated"
+        );
+        assert!(
+            source.contains(&format!(r#"COOKIE = "{}""#, helios_ui_chrome::THEME_COOKIE)),
+            "theme.js writes the shared cookie the boot script reads"
+        );
+        assert!(source.contains("BroadcastChannel"), "live cross-tab sync");
+        assert!(source.contains("startViewTransition"), "animated switch");
+        assert!(
+            source.contains("prefers-reduced-motion"),
+            "motion is optional"
+        );
     }
 
     #[test]
@@ -10071,8 +10095,20 @@ mod tests {
             .render()
             .expect("index renders");
 
-        assert!(html.contains(r#"data-set-theme="light""#));
-        assert!(html.contains(r#"data-set-theme="dark""#));
+        // One cycling button (system -> light -> dark), not one per mode.
+        assert_eq!(html.matches("data-theme-cycle").count(), 1);
+        assert!(!html.contains("data-set-theme"));
+        assert!(html.contains(r#"aria-label="Theme: follow system""#));
+        // The first-paint stamp is inline in <head>, ahead of the deferred
+        // behaviour script.
+        let head = &html[..html.find("</head>").expect("head")];
+        let boot = head
+            .find("hfs_theme=(system|light|dark)")
+            .expect("inline boot");
+        let script = head
+            .find(r#"<script src="/ui/assets/theme.js" defer></script>"#)
+            .expect("deferred theme.js");
+        assert!(boot < script);
         assert!(html.contains("<svg"));
         assert!(html.contains(r#"fill="currentColor""#));
     }

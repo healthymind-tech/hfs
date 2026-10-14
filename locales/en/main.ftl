@@ -169,9 +169,9 @@ tenant-heading = Tenants
 tenant-all = All tenants
 tenant-search-placeholder = Search tenants
 
-theme-label = Theme
-theme-light = Light theme
-theme-dark = Dark theme
+theme-toggle-system = Theme: follow system
+theme-toggle-light = Theme: light
+theme-toggle-dark = Theme: dark
 
 fhir-version = FHIR { $version }
 fhir-version-heading = FHIR Version

@@ -8363,3 +8363,28 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
         "editor-add.js must load before resources.js"
     );
 }
+
+/// The theme switcher is one shared button with a translated, mode-specific
+/// label in every locale.
+#[tokio::test]
+async fn theme_switcher_is_one_button_labelled_per_locale() {
+    for (lang, label) in [
+        ("en", "Theme: follow system"),
+        ("zh-Hant", "主題：跟隨系統"),
+        ("de", "Design: System folgen"),
+        ("es", "Tema: seguir al sistema"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(html.matches("data-theme-cycle").count(), 1, "{lang}");
+        assert!(html.contains(&format!(r#"aria-label="{label}""#)), "{lang}");
+        assert!(html.contains("data-label-dark="), "{lang}");
+    }
+}

@@ -791,39 +791,78 @@ button.menu__option {
   gap: 16px;
 }
 
+/* The theme switcher (shared markup: helios-ui-chrome theme-toggle.html):
+   ONE round button that cycles system -> light -> dark (theme.js). It shows
+   the icon of the preference in effect, read off <html data-theme-pref>,
+   which the inline boot script stamps before first paint. */
 .theme-toggle {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 0;
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  border-radius: 16px;
-  box-shadow: var(--surface-shadow);
-}
-
-.theme-toggle button {
   display: grid;
   place-items: center;
-  /* 44x44 targets (WCAG 2.5.5 / the 44px touch guidance both platforms
-     publish; 2.5.8's 24px floor was too small to hit on a phone). The icon
-     inside stays small; only the hit area grows. */
+  /* 44x44 target (WCAG 2.5.5 / the 44px touch guidance both platforms
+     publish). The icon inside stays small; only the hit area grows. */
   width: 44px;
   height: 44px;
   padding: 0;
-  border: 1px solid transparent;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
   border-radius: 50%;
-  background: none;
-  color: var(--muted);
+  box-shadow: var(--surface-shadow);
+  color: var(--text-strong);
   cursor: pointer;
 }
 
-/* The active side of the toggle is raised, like the design's inner circle. */
-:root:not([data-theme="dark"]) .theme-toggle button[data-set-theme="light"],
-[data-theme="dark"] .theme-toggle button[data-set-theme="dark"] {
-  border-color: var(--surface-border);
-  box-shadow: var(--surface-shadow);
-  color: var(--text-strong);
+/* Without JavaScript the button could not do anything: hide it (the page
+   then stays on the light design default). */
+html:not(.js) .theme-toggle {
+  display: none;
+}
+
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--accent, #0a84ff);
+  outline-offset: 2px;
+}
+
+.theme-toggle__icon {
+  display: none;
+  place-items: center;
+}
+
+.theme-toggle__icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+:root:not([data-theme-pref="light"]):not([data-theme-pref="dark"]) .theme-toggle__icon--system,
+[data-theme-pref="light"] .theme-toggle__icon--light,
+[data-theme-pref="dark"] .theme-toggle__icon--dark {
+  display: grid;
+}
+
+/* Animated light <-> dark switch (theme.js). With the View Transitions API
+   the new theme is revealed by a growing circle from the button, so the
+   default cross-fade of the root snapshot is switched off for theme
+   transitions only; elsewhere a short colour cross-fade stands in. Neither
+   class is ever set under prefers-reduced-motion. */
+html.theme-vt::view-transition-old(root),
+html.theme-vt::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+html.theme-vt::view-transition-old(root) {
+  z-index: 1;
+}
+
+html.theme-vt::view-transition-new(root) {
+  z-index: 2;
+}
+
+html.theme-fade,
+html.theme-fade *,
+html.theme-fade *::before,
+html.theme-fade *::after {
+  transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease,
+    fill 0.25s ease, box-shadow 0.25s ease !important;
 }
 
 .topbar__avatar {

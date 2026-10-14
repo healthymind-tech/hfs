@@ -167,9 +167,9 @@ tenant-heading = 租戶
 tenant-all = 所有租戶
 tenant-search-placeholder = 搜尋租戶
 
-theme-label = 主題
-theme-light = 淺色主題
-theme-dark = 深色主題
+theme-toggle-system = 主題：跟隨系統
+theme-toggle-light = 主題：淺色
+theme-toggle-dark = 主題：深色
 
 fhir-version = FHIR { $version }
 fhir-version-heading = FHIR版本
