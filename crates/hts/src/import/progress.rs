@@ -199,10 +199,14 @@ impl BundleImportBackend for ProgressBackend {
         if self.transforms.is_identity() {
             self.progress.writing.store(true, Ordering::SeqCst);
             let stats = self.inner.import_bundle(ctx, data).await?;
-            self.progress.batches_done.fetch_add(1, Ordering::Relaxed);
-            self.progress
-                .concepts
-                .fetch_add(u64::from(stats.concepts), Ordering::Relaxed);
+            // Same rule as `record`: ConceptMap/ValueSet-only bundles (the
+            // SNOMED association refsets) are not concept batches.
+            if stats.concepts > 0 {
+                self.progress.batches_done.fetch_add(1, Ordering::Relaxed);
+                self.progress
+                    .concepts
+                    .fetch_add(u64::from(stats.concepts), Ordering::Relaxed);
+            }
             return Ok(stats);
         }
         let parsed = crate::import::bundle_parser::parse_bundle(data)?;
@@ -305,6 +309,32 @@ mod tests {
             .map(|p| p.code.as_str())
             .collect();
         assert_eq!(codes, vec!["COMPONENT", "STATUS"]);
+    }
+
+    #[tokio::test]
+    async fn only_concept_bundles_count_as_batches() {
+        let backend = Arc::new(crate::backends::SqliteTerminologyBackend::in_memory().unwrap());
+        let progress = Arc::new(ImportProgress::default());
+        let pb = ProgressBackend::new(backend, progress.clone(), ImportTransforms::default());
+        let ctx = TenantContext::system();
+        let cs = br#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":
+            {"resourceType":"CodeSystem","url":"http://x","status":"active","content":"complete",
+             "concept":[{"code":"a"},{"code":"b"}]}}]}"#;
+        let cm = br#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":
+            {"resourceType":"ConceptMap","url":"http://x/cm","status":"active",
+             "group":[{"source":"http://x","target":"http://y","element":[{"code":"a","target":[{"code":"z","equivalence":"equal"}]}]}]}}]}"#;
+        pb.import_bundle(&ctx, cs).await.unwrap();
+        pb.import_bundle(&ctx, cm).await.unwrap();
+        pb.import_parsed(&ctx, ParsedBundle::default())
+            .await
+            .unwrap();
+        assert_eq!(progress.batches_done.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.concepts.load(Ordering::Relaxed), 2);
+        progress.request_cancel();
+        assert!(
+            pb.import_bundle(&ctx, cs).await.is_err(),
+            "cancel stops the next batch"
+        );
     }
 
     #[tokio::test]
