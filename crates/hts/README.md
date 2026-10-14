@@ -392,6 +392,7 @@ Options:
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 | `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
+| `HTS_LOINC_PARTS_AND_ANSWERS` | true | Import LOINC's `Part.csv`, `AnswerList.csv` and `LoincAnswerListLink.csv` along with the main table: all parts, answer lists and answers as concepts, one ValueSet `http://loinc.org/vs/<LL…>` per answer list, and an `answer-list` property on linked terms. `false` imports only the terms and the parts in the component hierarchy. |
 | `HTS_ADMIN_UI` | false | Enable terminology management — the `/admin` API (chunked upload, import jobs, delete, current-version pin, compaction, registry install) and the matching console pages. See [`docs/hts-terminology-admin.md`](../../docs/hts-terminology-admin.md) for this and the related `HTS_ADMIN_DATA_DIR`, `HTS_IMPORT_DIR`, `HTS_PACKAGE_REGISTRY`, `HTS_UPLOAD_CHUNK_SIZE`, `HTS_MAX_UPLOAD_SIZE` and `HTS_DISK_HEADROOM`. |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
@@ -864,6 +865,24 @@ curl -X POST http://localhost:8090/CodeSystem/\$lookup \
   -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
 ```
 
+Simple reference sets (`der2_Refset_Simple*`, e.g. *723264001
+Lateralizable body structure reference set*) are imported as membership,
+so ECL `^ <refset>` works in a compose `constraint` filter, in
+`?fhir_vs=ecl/…` and as `?fhir_vs=refset/<id>`. Map reference sets are not
+read. A database whose SNOMED CT was imported before this answers `^` with
+`501`; re-import the release to load the members.
+
+SNOMED CT's implicit ValueSet URLs are recognised by `$expand` and
+`$validate-code` (SQLite backend; the PostgreSQL backend answers the ECL
+forms with `501`):
+
+| URL | Members |
+|---|---|
+| `http://snomed.info/sct?fhir_vs` | all concepts |
+| `http://snomed.info/sct?fhir_vs=isa/<id>` | `<id>` and its descendants |
+| `http://snomed.info/sct?fhir_vs=ecl/<expr>` | the URL-encoded ECL expression, e.g. `ecl/%3C%3C%2073211009` |
+| `http://snomed.info/sct?fhir_vs=refset/<id>` | the members of reference set `<id>` |
+
 Multiple editions of the same code system (e.g. the SNOMED International
 release plus a national edition) coexist as separate versions keyed on
 `(url, version)`; unversioned requests resolve to the highest version.
@@ -883,6 +902,22 @@ Produced by the [Regenstrief Institute](https://www.regenstrief.org) under the [
 ```bash
 hts import ./Loinc_2.80.zip   # format auto-detected from LoincTable.csv inside the ZIP
 ```
+
+Besides the main table and the component hierarchy, the importer reads the
+accessory files of the release: every part in `Part.csv`, the answer lists
+(`LL…`) and answers (`LA…`) in `AnswerList.csv`, and the term-to-answer-list
+links in `LoincAnswerListLink.csv` (as an `answer-list` property). LOINC 2.80
+yields 243 550 concepts (104 672 terms, 114 224 parts, 4 621 answer lists,
+20 033 answers). Set `HTS_LOINC_PARTS_AND_ANSWERS=false` to import only the
+terms and the parts in the hierarchy (176 668 concepts for 2.80).
+
+LOINC's ValueSet URLs:
+
+| URL | Members |
+|---|---|
+| `http://loinc.org/vs` | all of LOINC (implicit, like `http://loinc.org?fhir_vs`) |
+| `http://loinc.org/vs/<LP…>` | the codes under the part in the hierarchy, not the part itself (implicit) |
+| `http://loinc.org/vs/<LL…>` | the answers of the answer list, in sequence order (a stored ValueSet the importer creates; externally defined lists have none) |
 
 **Required attribution when redistributing:**
 ```
