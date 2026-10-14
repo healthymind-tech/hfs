@@ -568,11 +568,11 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
             ),
             _ => return None,
         };
-        // Same matching rules as the SQLite twin: exact storage id, synthetic
-        // `<id>|<version>` storage ids, then the FHIR id inside the JSON.
+        // Same matching rules as the SQLite twin: exact storage id, then the
+        // synthetic `<id>|<version>` storage ids (index-friendly range).
         let sql = format!(
             "SELECT resource_json::text FROM {table} \
-             WHERE id = $1 OR id LIKE $1 || '|%' OR (resource_json->>'id') = $1 \
+             WHERE id = $1 OR (id >= $1 || '|' AND id < $1 || '}}') \
              ORDER BY (id = $1) DESC, {order_by} LIMIT 1"
         );
         let id = id.to_owned();

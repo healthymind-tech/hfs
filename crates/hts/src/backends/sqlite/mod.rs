@@ -910,11 +910,15 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
             ),
             _ => return None,
         };
-        // Exact storage id first (cheap PK probe), then the multi-version
-        // forms: `<id>|<version>` storage ids and the FHIR id inside the JSON.
+        // Exact storage id first, then the synthetic `<id>|<version>` storage
+        // ids. Both are served by the primary key (the `|` prefix is expressed
+        // as a range so SQLite can use the index; `}` is the next ASCII
+        // character after `|`). Deliberately no `json_extract(resource_json,
+        // '$.id')` fallback: that is a full scan of every stored resource
+        // (~2.3 s over 21k ValueSets) on every miss, i.e. on every 404.
         let sql = format!(
             "SELECT resource_json FROM {table} \
-             WHERE id = ?1 OR id LIKE ?1 || '|%' OR json_extract(resource_json, '$.id') = ?1 \
+             WHERE id = ?1 OR (id >= ?1 || '|' AND id < ?1 || '}}') \
              ORDER BY (id = ?1) DESC, {order_by} LIMIT 1"
         );
         let raw: Option<String> = conn
