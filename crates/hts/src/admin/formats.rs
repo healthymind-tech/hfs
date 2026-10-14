@@ -199,7 +199,16 @@ pub fn detect(path: &Path) -> Detection {
         d.evidence = Some(evidence_for(f, &name, &entries));
         match f {
             ImportFormat::SnomedRf2 => d.version = snomed_release(&entries),
-            ImportFormat::Loinc => d.version = loinc_release(&entries),
+            // Same rule as the importer: the ZIP name (`Loinc_2.80.zip`),
+            // else a `Loinc_<ver>/` folder.
+            ImportFormat::Loinc => {
+                d.version = crate::import::loinc_csv::loinc_release_version_from_entry(&name)
+                    .or_else(|| {
+                        entries.iter().find_map(|e| {
+                            crate::import::loinc_csv::loinc_release_version_from_entry(e)
+                        })
+                    })
+            }
             ImportFormat::Hl7Npm => {
                 if let Some((n, v)) = npm_name_version(path) {
                     d.package_name = Some(n);
@@ -213,16 +222,17 @@ pub fn detect(path: &Path) -> Detection {
 }
 
 fn evidence_for(format: ImportFormat, name: &str, entries: &[String]) -> String {
+    // Most specific first: LOINC archives also carry accessory `Loinc.csv`
+    // copies (PanelsAndForms) that are not the main table.
     let needle: &[&str] = match format {
         ImportFormat::SnomedRf2 => &["concept_full", "concept_snapshot", "description_full"],
-        ImportFormat::Loinc => &["loinc.csv", "loinctable.csv"],
+        ImportFormat::Loinc => &["loinctable/loinc.csv", "loinctable.csv", "loinc.csv"],
         ImportFormat::Rxnorm => &["rxnconso.rrf"],
         ImportFormat::Icd10Cm => &["tabular"],
         _ => &[],
     };
-    for e in entries {
-        let l = e.to_ascii_lowercase();
-        if needle.iter().any(|n| l.contains(n)) {
+    for n in needle {
+        if let Some(e) = entries.iter().find(|e| e.to_ascii_lowercase().contains(n)) {
             return format!("archive entry {e}");
         }
     }
@@ -255,17 +265,6 @@ fn snomed_release(entries: &[String]) -> Option<String> {
             (tail.len() >= 8 && tail[..8].bytes().all(|b| b.is_ascii_digit()))
                 .then(|| tail[..8].to_string())
         })
-}
-
-/// `Loinc_2.80/LoincTable/Loinc.csv` → `2.80`.
-fn loinc_release(entries: &[String]) -> Option<String> {
-    entries.iter().find_map(|e| {
-        e.split('/').find_map(|seg| {
-            let l = seg.to_ascii_lowercase();
-            let v = l.strip_prefix("loinc_")?;
-            (v.chars().next()?.is_ascii_digit()).then(|| v.to_string())
-        })
-    })
 }
 
 /// First four-digit year 19xx/20xx in a file name (`icd10cm_tabular_2025.xml`).
@@ -352,6 +351,22 @@ mod tests {
         let d = detect(&p);
         assert_eq!(d.format.as_deref(), Some("loinc"));
         assert_eq!(d.version.as_deref(), Some("2.80"));
+        // The 2.80 distribution: flat layout, version only in the ZIP name,
+        // and a decoy `Loinc_2.80_DifferenceReport.pdf` plus accessory copy.
+        let (_d, p) = zip_with(
+            "Loinc_2.80.zip",
+            &[
+                "Loinc_2.80_DifferenceReport.pdf",
+                "AccessoryFiles/PanelsAndForms/Loinc.csv",
+                "LoincTable/Loinc.csv",
+            ],
+        );
+        let d = detect(&p);
+        assert_eq!(d.version.as_deref(), Some("2.80"));
+        assert_eq!(
+            d.evidence.as_deref(),
+            Some("archive entry LoincTable/Loinc.csv")
+        );
     }
 
     #[test]
