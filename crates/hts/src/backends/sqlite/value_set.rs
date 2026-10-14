@@ -2038,7 +2038,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             } else {
                 None
             };
-            finish_validate_code_response(
+            let matched_code: Option<String> = found.as_ref().map(|c| c.code.clone());
+            let mut response = finish_validate_code_response(
                 found,
                 &req.code,
                 &url,
@@ -2056,7 +2057,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 cs_is_fragment,
                 echo_display_lookup.as_deref(),
                 normalized_code.as_deref(),
-            )
+            )?;
+            // The code is in the ValueSet but not backed by stored CodeSystem
+            // content (unknown system or `not-present` stub): the membership
+            // answer stands, with a warning so callers know the code itself was
+            // not verified against the CodeSystem (fork issue T8).
+            if let (true, Some(sys), Some(code)) =
+                (response.result, system_for_msg.as_deref(), matched_code.as_deref())
+            {
+                if !is_code_in_cs(&conn, sys, code) {
+                    crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
+                }
+            }
+            Ok(response)
             };
             let response = compute(req)?;
             // Populate the response cache (bounded). We clone the assembled
@@ -3553,6 +3566,28 @@ fn expand_single_include_local(
                         )));
                     }
                 }
+                // An enumerated include (`concept[]`) does not need the
+                // CodeSystem to be loaded: the ValueSet author listed the
+                // codes explicitly, so they are returned as listed (with the
+                // compose-embedded display). `$validate-code` then answers
+                // `true` for them, with a warning that the system is unknown
+                // (fork issue T8 — enumerated LOINC/SNOMED ValueSets without a
+                // licensed load of the CodeSystem).
+                if let Some(explicit) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
+                    let msg = format!(
+                        "CodeSystem {system_url} was not found; its {} enumerated codes are \
+                         included as listed in the ValueSet",
+                        explicit.len()
+                    );
+                    tracing::warn!(%system_url, ?inc_version, "{msg}");
+                    warnings.push(msg);
+                    return Ok(crate::backends::enumerated_from_compose(
+                        system_url,
+                        inc_version,
+                        explicit,
+                        &HashSet::new(),
+                    ));
+                }
                 let msg = format!(
                     "CodeSystem {system_url} was not found and has been excluded from the expansion"
                 );
@@ -3618,6 +3653,32 @@ fn expand_single_include_local(
                 extensions: vec![],
                 contains: vec![],
             });
+        }
+        // The CodeSystem row exists but carries no concepts (a `not-present`
+        // stub such as the THO LOINC/SNOMED placeholders, or an empty
+        // fragment): nothing to refute the enumerated codes against, so keep
+        // the ones the JOIN dropped, as listed. A CS WITH content still drops
+        // unknown codes (IG `simple-expand-enum-bad`).
+        if seen_codes.len() < explicit_codes.len() && !system_has_concepts(conn, &system_id) {
+            let extra = crate::backends::enumerated_from_compose(
+                system_url,
+                cs_version.as_deref(),
+                explicit_codes,
+                &seen_codes,
+            );
+            if !extra.is_empty() {
+                let msg = format!(
+                    "CodeSystem {system_url} has no concept content loaded; {} enumerated codes \
+                     are included as listed in the ValueSet",
+                    extra.len()
+                );
+                tracing::debug!(%system_url, "{msg}");
+                warnings.push(msg);
+                for c in extra {
+                    seen_codes.insert(c.code.clone());
+                    out.push(c);
+                }
+            }
         }
         // IG `parameters/parameters-expand-enum-*` semantics: when an
         // explicitly-enumerated concept is abstract (notSelectable=true), the
@@ -4773,6 +4834,16 @@ fn query_all_concepts_in_system(
             contains: vec![],
         })
         .collect())
+}
+
+/// `true` when at least one concept row is stored for `system_id`.
+fn system_has_concepts(conn: &Connection, system_id: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM concepts WHERE system_id = ?1)",
+        [system_id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 /// Split a FHIR compose-filter `value` for the list operators (`in`,

@@ -1727,7 +1727,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             None
         };
 
-        finish_validate_code_response(
+        let matched_code: Option<String> = found.as_ref().map(|c| c.code.clone());
+        let mut response = finish_validate_code_response(
             found,
             &req.code,
             &url,
@@ -1745,7 +1746,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             cs_is_fragment,
             cs_display_lookup.as_deref(),
             normalized_code.as_deref(),
-        )
+        )?;
+        // Membership via enumeration without stored CS content → warning
+        // (SQLite twin, fork issue T8).
+        if let (true, Some(sys), Some(code)) = (
+            response.result,
+            system_for_msg.as_deref(),
+            matched_code.as_deref(),
+        ) {
+            if !is_code_in_cs(&client, sys, code).await {
+                crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
+            }
+        }
+        Ok(response)
     }
 
     async fn count(
@@ -2297,6 +2310,22 @@ async fn compute_expansion_inner_body(
                         )));
                     }
                 }
+                // Enumerated include for an unknown system: return the listed
+                // codes as-is (see the SQLite twin, fork issue T8).
+                if let Some(explicit) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
+                    tracing::warn!(
+                        system_url,
+                        inc_version,
+                        "CodeSystem not found; enumerated codes included as listed"
+                    );
+                    included.extend(crate::backends::enumerated_from_compose(
+                        system_url,
+                        inc_version,
+                        explicit,
+                        &HashSet::new(),
+                    ));
+                    continue;
+                }
                 tracing::warn!(
                     system_url,
                     inc_version,
@@ -2396,6 +2425,29 @@ async fn compute_expansion_inner_body(
                 // explicitly-enumerated concept is abstract (notSelectable=true),
                 // its immediate children appear alongside it in the expansion
                 // — the IG fixture lists the children flat at the top level.
+                // CS row without concept content (`not-present` stub): keep the
+                // enumerated codes the lookup dropped (SQLite twin, T8).
+                if seen_codes.len() < explicit_codes.len() {
+                    let has_concepts: bool = client
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM concepts WHERE system_id = $1)",
+                            &[&system_id],
+                        )
+                        .await
+                        .map(|r| r.get::<_, bool>(0))
+                        .unwrap_or(false);
+                    if !has_concepts {
+                        for c in crate::backends::enumerated_from_compose(
+                            system_url,
+                            cs_version.as_deref(),
+                            explicit_codes,
+                            &seen_codes,
+                        ) {
+                            seen_codes.insert(c.code.clone());
+                            out.push(c);
+                        }
+                    }
+                }
                 // Skip when depth > 0: a contained-VS / nested ref (Cluster C)
                 // expansion is supposed to return EXACTLY the enumerated codes
                 // so that intersections with sibling refs are well-defined.
