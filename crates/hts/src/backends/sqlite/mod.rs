@@ -228,6 +228,10 @@ fn count_resources(
     Ok(count)
 }
 
+/// Newly full-text-indexed rows at startup below which planner statistics
+/// are left as they are (see `finalize_after_bootstrap`).
+const STARTUP_ANALYZE_MIN_ROWS: usize = 200_000;
+
 impl SqliteTerminologyBackend {
     /// Async wrapper around [`count_resources`] for the per-type search traits.
     pub(super) async fn count_search_matches(
@@ -701,18 +705,23 @@ impl SqliteTerminologyBackend {
         // Only refresh planner statistics when we actually built something:
         // ANALYZE stats persist on disk across restarts, so a no-op boot needs
         // none.
-        // The statistics are sampled (`analysis_limit`): a boot usually
-        // indexes only a few new systems, and a full ANALYZE of a database
-        // holding SNOMED CT and LOINC reads every page, which on a cold
-        // spinning disk kept the server from binding for over 20 minutes.
+        // Statistics are refreshed only when the boot indexed a lot. A few
+        // new systems (an IG's CodeSystems) barely move them, and a full
+        // ANALYZE of a database holding SNOMED CT and LOINC reads every page:
+        // on a spinning disk with a cold page cache that kept the server from
+        // binding for over 20 minutes, `analysis_limit` or not. Imports still
+        // run their own ANALYZE.
         let built = value_set::prebuild_concepts_fts(&conn);
-        if built > 0 {
+        if built >= STARTUP_ANALYZE_MIN_ROWS {
             let _ = conn.execute_batch(
-                "PRAGMA analysis_limit=1000; \
-                 ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
                  ANALYZE concept_properties; ANALYZE concept_designations; \
-                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps; \
-                 PRAGMA analysis_limit=0;",
+                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+            );
+        } else if built > 0 {
+            tracing::info!(
+                rows = built,
+                "skipping startup ANALYZE: too few newly indexed rows to matter"
             );
         }
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
