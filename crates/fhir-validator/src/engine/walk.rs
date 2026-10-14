@@ -829,28 +829,36 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
     out
 }
 
-/// Lodash-style `_.isMatch`: partial deep match. Every key present in
+/// Partial deep match, with FHIR pattern semantics. Every key present in
 /// `pattern` must exist in `data` and match recursively; extra data keys are
-/// permitted. Arrays match index-wise as a prefix; scalars by equality.
+/// permitted; scalars match by equality.
+///
+/// - An array pattern matches when each of its items matches *some* data
+///   item, in any order (FHIR `pattern[x]`: "each element in the pattern
+///   array must be present in the instance array"; also lodash `_.isMatch`
+///   for arrays). A prefix match missed a VSCat category coding that was
+///   not the first one.
+/// - An object pattern against an array matches when one item matches. A
+///   value discriminator path runs through repeating elements: VSCat's
+///   `coding.code` + `coding.system` compile to `{coding: {code, system}}`
+///   and select every coding, so a category whose codings include
+///   vital-signs belongs to the slice.
 pub(crate) fn is_partial_match(data: &Value, pattern: &Value) -> bool {
     match pattern {
-        Value::Object(pattern_map) => {
-            let Some(data_map) = data.as_object() else {
-                return false;
-            };
-            pattern_map
+        Value::Object(pattern_map) => match data {
+            Value::Object(data_map) => pattern_map
                 .iter()
-                .all(|(k, pv)| data_map.get(k).is_some_and(|dv| is_partial_match(dv, pv)))
-        }
+                .all(|(k, pv)| data_map.get(k).is_some_and(|dv| is_partial_match(dv, pv))),
+            Value::Array(data_items) => data_items.iter().any(|dv| is_partial_match(dv, pattern)),
+            _ => false,
+        },
         Value::Array(pattern_items) => {
             let Some(data_items) = data.as_array() else {
                 return false;
             };
-            pattern_items.len() <= data_items.len()
-                && pattern_items
-                    .iter()
-                    .zip(data_items.iter())
-                    .all(|(pv, dv)| is_partial_match(dv, pv))
+            pattern_items
+                .iter()
+                .all(|pv| data_items.iter().any(|dv| is_partial_match(dv, pv)))
         }
         scalar => data == scalar,
     }
@@ -952,6 +960,43 @@ mod tests {
         assert_eq!(status_bindings, 1, "{:?}", outcome.deferred);
     }
 
+    /// The core vitalsigns VSCat slice (value discriminators `coding.code`,
+    /// `coding.system`) matches a vital-signs category, wherever the coding
+    /// sits in the array; a category without it still misses the slice.
+    #[test]
+    fn vscat_slice_matches_through_the_coding_array() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions {
+            profiles: vec!["http://hl7.org/fhir/StructureDefinition/vitalsigns".to_string()],
+            ..Default::default()
+        };
+        let obs = |category: serde_json::Value| {
+            json!({
+                "resourceType": "Observation", "status": "final", "category": category,
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                "subject": {"reference": "Patient/p"}, "effectiveDateTime": "2024-01-01T10:00:00Z",
+                "valueQuantity": {"value": 72, "unit": "/min", "system": "http://unitsofmeasure.org", "code": "/min"}
+            })
+        };
+        let slice_errors = |resource: &serde_json::Value| {
+            validator
+                .validate_sync(resource, &opts)
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::SliceCardinality)
+                .collect::<Vec<_>>()
+        };
+        let vs = json!({"system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs"});
+        let other = json!({"system": "http://example.org/cat", "code": "x"});
+
+        assert!(slice_errors(&obs(json!([{"coding": [vs.clone()]}]))).is_empty());
+        assert!(slice_errors(&obs(json!([{"coding": [other.clone(), vs.clone()]}]))).is_empty());
+        let missing = slice_errors(&obs(json!([{"coding": [other]}])));
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(missing[0].path, "Observation.category");
+    }
+
     #[test]
     fn partial_match_semantics() {
         assert!(is_partial_match(
@@ -968,7 +1013,25 @@ mod tests {
             &json!({"a": {"b": 1}})
         ));
         assert!(is_partial_match(&json!([1, 2, 3]), &json!([1, 2])));
-        assert!(!is_partial_match(&json!([2, 1]), &json!([1])));
+        // Array patterns are unordered: each pattern item matches some item.
+        assert!(is_partial_match(&json!([2, 1]), &json!([1])));
+        assert!(is_partial_match(&json!([3, 2, 1]), &json!([1, 2])));
+        assert!(!is_partial_match(&json!([2, 3]), &json!([1])));
         assert!(is_partial_match(&json!(5), &json!(5)));
+        // An object pattern against an array: one item must match.
+        let category = json!({ "coding": [
+            { "system": "http://example.org/other", "code": "x" },
+            { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs" }
+        ]});
+        let vscat = json!({ "coding": {
+            "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs"
+        }});
+        assert!(is_partial_match(&category, &vscat));
+        // ...the same item: code and system from different codings do not.
+        let split = json!({ "coding": [
+            { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "x" },
+            { "system": "http://example.org/other", "code": "vital-signs" }
+        ]});
+        assert!(!is_partial_match(&split, &vscat));
     }
 }
