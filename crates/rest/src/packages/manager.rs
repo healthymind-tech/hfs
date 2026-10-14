@@ -1462,36 +1462,62 @@ impl PackageManager {
         let ctx = Self::ctx(tenant);
         let mut deleted: BTreeMap<String, u64> = BTreeMap::new();
         let (mut kept_shared, mut kept_preexisting, mut failed) = (0u64, 0u64, 0u64);
+        let mut terminology: Vec<PackageResourceRecord> = Vec::new();
+        let mut record = |r: &PackageResourceRecord, result: Result<(), String>| match result {
+            Ok(()) => {
+                *deleted.entry(r.resource_type.clone()).or_default() += 1;
+                job.count(&key, &r.resource_type, |c| c.written += 1);
+            }
+            Err(e) => {
+                failed += 1;
+                job.count(&key, &r.resource_type, |c| c.failed += 1);
+                job.error(&key, format!("{}/{}", r.resource_type, r.resource_id), e);
+            }
+        };
         for owned in &mine {
             let r = &owned.resource;
+            if r.preexisting || other_keys.contains(&r.key()) {
+                if r.preexisting {
+                    kept_preexisting += 1;
+                } else {
+                    kept_shared += 1;
+                }
+                job.update(|s| s.resources_done += 1);
+                job.count(&key, &r.resource_type, |c| c.skipped += 1);
+                continue;
+            }
+            if r.target == TARGET_HTS {
+                terminology.push(r.clone());
+                continue;
+            }
+            let result = self.delete_hfs(&ctx, tenant, r, &other_profiles).await;
             job.update(|s| s.resources_done += 1);
-            if r.preexisting {
-                kept_preexisting += 1;
-                job.count(&key, &r.resource_type, |c| c.skipped += 1);
-                continue;
-            }
-            if other_keys.contains(&r.key()) {
-                kept_shared += 1;
-                job.count(&key, &r.resource_type, |c| c.skipped += 1);
-                continue;
-            }
-            let result = if r.target == TARGET_HTS {
-                self.delete_terminology(r).await
-            } else {
-                self.delete_hfs(&ctx, tenant, r, &other_profiles).await
-            };
-            match result {
-                Ok(()) => {
-                    *deleted.entry(r.resource_type.clone()).or_default() += 1;
-                    job.count(&key, &r.resource_type, |c| c.written += 1);
-                }
-                Err(e) => {
-                    failed += 1;
-                    job.count(&key, &r.resource_type, |c| c.failed += 1);
-                    job.error(&key, format!("{}/{}", r.resource_type, r.resource_id), e);
-                }
-            }
+            record(r, result);
         }
+        // Terminology deletes are bound by the terminology server's own
+        // per-request work (cache eviction, closure cleanup), so a few run
+        // at once; ValueSets and maps go before the systems they draw on.
+        terminology.sort_by_key(|r| match r.resource_type.as_str() {
+            "ConceptMap" => 0,
+            "ValueSet" => 1,
+            _ => 2,
+        });
+        let deletes: Vec<_> = terminology
+            .into_iter()
+            .map(|r| {
+                let client = self.hts.clone();
+                async move {
+                    let result = delete_terminology_on(client, &r).await;
+                    (r, result)
+                }
+            })
+            .collect();
+        let mut stream = futures::stream::iter(deletes).buffer_unordered(4);
+        while let Some((r, result)) = stream.next().await {
+            job.update(|s| s.resources_done += 1);
+            record(&r, result);
+        }
+        drop(stream);
         Ok(json!({
             "deleted": deleted,
             "keptShared": kept_shared,
@@ -1553,22 +1579,6 @@ impl PackageManager {
                     other.content(),
                 );
             }
-        }
-        Ok(())
-    }
-
-    async fn delete_terminology(&self, r: &PackageResourceRecord) -> Result<(), String> {
-        let Some(client) = &self.hts else {
-            return Err("no terminology server is configured (HFS_TERMINOLOGY_SERVER)".into());
-        };
-        let Some(url) = r.url.as_deref() else {
-            return Ok(());
-        };
-        let ids = client
-            .find(&r.resource_type, url, r.version.as_deref())
-            .await?;
-        for id in ids {
-            client.delete(&r.resource_type, &id).await?;
         }
         Ok(())
     }
@@ -1673,6 +1683,27 @@ impl PackageManager {
             }
         });
     }
+}
+
+/// Deletes one package terminology resource from the terminology server,
+/// addressed by canonical (HTS may store it under another id).
+async fn delete_terminology_on(
+    client: Option<HtsClient>,
+    r: &PackageResourceRecord,
+) -> Result<(), String> {
+    let Some(client) = client else {
+        return Err("no terminology server is configured (HFS_TERMINOLOGY_SERVER)".into());
+    };
+    let Some(url) = r.url.as_deref() else {
+        return Ok(());
+    };
+    for id in client
+        .find(&r.resource_type, url, r.version.as_deref())
+        .await?
+    {
+        client.delete(&r.resource_type, &id).await?;
+    }
+    Ok(())
 }
 
 fn type_counts(entries: &[&PackageEntry]) -> BTreeMap<String, u64> {
