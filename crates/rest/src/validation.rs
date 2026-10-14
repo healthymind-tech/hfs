@@ -813,7 +813,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         | ErrorKind::SliceUnmatched
         | ErrorKind::SliceOrder
         | ErrorKind::Choice
-        | ErrorKind::ChoiceExcluded => IssueType::Structure,
+        | ErrorKind::ChoiceExcluded
+        | ErrorKind::EmptyObject => IssueType::Structure,
     };
     let severity = match error.severity {
         Severity::Error => IssueSeverity::Error,

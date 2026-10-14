@@ -73,6 +73,8 @@ pub enum ErrorKind {
     /// A `urn:uuid:`/`urn:oid:` reference inside a Bundle that no entry's
     /// `fullUrl` matches.
     ReferenceUnresolved,
+    /// A JSON object with no members (FHIR JSON forbids empty elements).
+    EmptyObject,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -341,6 +343,11 @@ pub(crate) fn msg_reference_target_type(found: &str, allowed: &[String]) -> Stri
 /// validator wording).
 pub(crate) fn msg_reference_urn_unresolved(reference: &str) -> String {
     format!("URN reference is not locally contained within the bundle {reference}")
+}
+
+/// [helios] an empty JSON object (HL7 validator wording).
+pub(crate) fn msg_empty_object() -> String {
+    "Object must have some content".to_string()
 }
 
 /// The reference validator's JSON type vocabulary (`getType`).

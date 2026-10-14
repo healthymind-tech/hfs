@@ -369,6 +369,14 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
         return;
     };
 
+    // FHIR JSON has no empty objects: an element is present only with a
+    // value or children (ele-1). The typed FHIRPath model drops `{}` before
+    // ele-1 can see it, so the walk reports it.
+    if obj.is_empty() {
+        ctx.error(ErrorKind::EmptyObject, errors::msg_empty_object());
+        return;
+    }
+
     let is_resource = obj.get("resourceType").is_some_and(Value::is_string);
     if is_resource {
         ctx.contained.push(contained_types(obj));
@@ -1277,6 +1285,35 @@ mod tests {
         let errors = reference_errors(&bundle("collection", dangling), &[]);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn empty_objects_are_reported() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let errors = validator
+            .validate_sync(
+                &json!({"resourceType": "Patient", "name": [{}], "maritalStatus": {}}),
+                &crate::ValidationOptions::default(),
+            )
+            .errors;
+        let empty: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == ErrorKind::EmptyObject)
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(
+            empty,
+            vec!["Patient.name.0", "Patient.maritalStatus"],
+            "{errors:?}"
+        );
+        let fine = validator
+            .validate_sync(
+                &json!({"resourceType": "Patient", "name": [{"family": "x"}]}),
+                &crate::ValidationOptions::default(),
+            )
+            .errors;
+        assert!(fine.is_empty(), "{fine:?}");
     }
 
     /// A profile that constrains a primitive's extensions gives the
