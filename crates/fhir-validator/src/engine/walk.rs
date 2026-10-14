@@ -87,6 +87,10 @@ pub(super) struct WalkCtx<'a> {
     pub(super) path: PathTracker,
     /// Opt-in extension-context warnings (#615).
     check_extension_context: bool,
+    /// Layer `meta.profile` claims, at the root and on nested resources.
+    use_meta_profiles: bool,
+    /// What an unresolvable `meta.profile` claim reports.
+    unknown_profile: UnknownProfilePolicy,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -134,6 +138,8 @@ pub(super) fn validate(
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
         check_extension_context: opts.check_extension_context,
+        use_meta_profiles: opts.use_meta_profiles,
+        unknown_profile: opts.unknown_profile,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
     };
@@ -150,19 +156,7 @@ pub(super) fn validate(
             ),
         }
     }
-    if opts.use_meta_profiles {
-        // An unresolvable claim is located at the claim itself
-        // (`meta.profile[i]`), as the HL7 validator reports it.
-        for (index, profile) in meta_profiles(resource).iter().enumerate() {
-            ctx.path.push_key("meta");
-            ctx.path.push_key("profile");
-            ctx.path.push_index(index);
-            add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, false);
-            ctx.path.pop();
-            ctx.path.pop();
-            ctx.path.pop();
-        }
-    }
+    add_meta_profiles(&mut ctx, &mut set, resource);
     for profile in &opts.profiles {
         add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, true);
     }
@@ -172,6 +166,25 @@ pub(super) fn validate(
     SyncOutcome {
         errors: ctx.errors,
         deferred: ctx.deferred,
+    }
+}
+
+/// Layer the profiles `resource` claims in `meta.profile` onto `set` (when
+/// enabled). An unresolvable claim is located at the claim itself
+/// (`meta.profile[i]`), as the HL7 validator reports it.
+fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Value) {
+    if !ctx.use_meta_profiles {
+        return;
+    }
+    let policy = ctx.unknown_profile;
+    for (index, profile) in meta_profiles(resource).iter().enumerate() {
+        ctx.path.push_key("meta");
+        ctx.path.push_key("profile");
+        ctx.path.push_index(index);
+        add_profile(ctx, set, profile, policy, false);
+        ctx.path.pop();
+        ctx.path.pop();
+        ctx.path.pop();
     }
 }
 
@@ -320,6 +333,10 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
                 Some(schema) => add_schemas_to_set(ctx, &mut extended, schema, rt),
                 None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(rt)),
             }
+            // A nested resource (Bundle entry, contained, Parameters part)
+            // is held to the profiles it claims, as the root resource is: a
+            // TW Core Patient POSTed inside a transaction must meet TW Core.
+            add_meta_profiles(ctx, &mut extended, data);
         }
         // No resourceType on a Resource-typed node: nothing to resolve; the
         // static layers (e.g. the base `Resource` schema) still apply.
@@ -1020,6 +1037,56 @@ mod tests {
         let missing = slice_errors(&obs(json!([{"coding": [other]}])));
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(missing[0].path, "Observation.category");
+    }
+
+    /// A resource nested in a Bundle entry is held to its own `meta.profile`
+    /// claims; an unknown nested claim warns at that claim.
+    #[test]
+    fn nested_resources_meet_their_meta_profiles() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions::default();
+        let bundle = |profile: &str| {
+            json!({
+                "resourceType": "Bundle", "type": "collection",
+                "entry": [{
+                    "fullUrl": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                    "resource": {
+                        "resourceType": "Observation", "status": "final",
+                        "meta": {"profile": [profile]},
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]}
+                    }
+                }]
+            })
+        };
+
+        let errors = validator
+            .validate_sync(
+                &bundle("http://hl7.org/fhir/StructureDefinition/vitalsigns"),
+                &opts,
+            )
+            .errors;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::Required
+                    && e.path == "Bundle.entry.0.resource.subject"),
+            "vitalsigns requires subject on the entry: {errors:?}"
+        );
+
+        let errors = validator
+            .validate_sync(
+                &bundle("http://example.org/StructureDefinition/nope"),
+                &opts,
+            )
+            .errors;
+        let unknown: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == ErrorKind::UnknownProfile)
+            .collect();
+        assert_eq!(unknown.len(), 1, "{errors:?}");
+        assert_eq!(unknown[0].path, "Bundle.entry.0.resource.meta.profile.0");
+        assert_eq!(unknown[0].severity, Severity::Warning);
     }
 
     /// An unknown `meta.profile` claim follows the policy (warning by
