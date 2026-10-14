@@ -21,7 +21,7 @@ use helios_persistence::core::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-use helios_persistence::error::{SearchError, StorageError};
+use helios_persistence::error::{SearchError, TerminologyFailureKind};
 use helios_persistence::search::{
     TerminologyExpander, TerminologyExpansion, param_requires_terminology, validate_modifier,
 };
@@ -36,13 +36,14 @@ use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
 use crate::extractors::{
     SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+    validate_chained_params,
 };
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
-use crate::terminology::TerminologyServiceClient;
+use crate::terminology::{ExpandedCode, ExpansionFailurePolicy, SearchTerminology};
 
 /// Handler for GET search.
 ///
@@ -318,25 +319,10 @@ where
         }
     }
 
-    // `:not-in` requires negated value-set filtering, which no backend
-    // implements. Reject it explicitly (501) regardless of whether a terminology
-    // server is configured, rather than silently ignoring it (which would return
-    // a superset of the intended results).
-    if let Some((key, _)) = pairs
-        .iter()
-        .find(|(k, _)| k.ends_with(":not-in") && !is_chained_key(k))
-    {
-        return Err(RestError::NotImplemented {
-            feature: format!(
-                "search modifier ':not-in' is not supported ({key}); \
-                 use ':in' or remove this modifier"
-            ),
-        });
-    }
-
-    // Pre-process :in / :above / :below modifiers via the terminology server.
-    let pairs = if let Some(ts_url) = state.terminology_server_url() {
-        expand_terminology_params(pairs, ts_url).await?
+    // Pre-process :in / :not-in / :above / :below modifiers via the
+    // terminology server.
+    let pairs = if let Some(terminology) = state.search_terminology() {
+        expand_terminology_params(pairs, terminology, state.expansion_failure_policy()).await?
     } else {
         // No terminology server configured: token `:in` / `:above` / `:below`
         // cannot be satisfied. Reject them with `501` rather than silently
@@ -436,6 +422,9 @@ where
         // `:[type]` qualifier cannot name a type only another version has.
         let built =
             build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
+        // A chain through a parameter the registry does not know (`subject.nosuch.name`)
+        // is a `400` here, not a silent empty searchset from the resolver.
+        validate_chained_params(resource_type, &built, &registry)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort
@@ -546,8 +535,11 @@ where
         // the same code as a direct parameter's — or, without a terminology
         // server, rejects it as the guard above does a direct one (`501`).
         let expander = state
-            .terminology_server_url()
-            .map(|ts_url| ChainTerminologyExpander { ts_url });
+            .search_terminology()
+            .map(|terminology| ChainTerminologyExpander {
+                terminology,
+                policy: state.expansion_failure_policy(),
+            });
         let options = helios_persistence::search::ChainResolveOptions {
             terminology: expander.as_ref().map(|e| e as &dyn TerminologyExpander),
         };
@@ -560,21 +552,7 @@ where
         .await
         .map_err(|e| {
             warn!(error = %e, "Chained search resolution failed");
-            match e {
-                // A valid `:not-in` is unanswerable with a terminology server
-                // too: report it as the direct form is, above.
-                StorageError::Search(SearchError::TerminologyRequired { modifier, param })
-                    if modifier == "not-in" =>
-                {
-                    RestError::NotImplemented {
-                        feature: format!(
-                            "search modifier ':not-in' is not supported ({param}:not-in); \
-                             use ':in' or remove this modifier"
-                        ),
-                    }
-                }
-                e => RestError::from(e),
-            }
+            RestError::from(e)
         })?
     } else {
         query
@@ -1076,35 +1054,31 @@ fn is_chained_key(key: &str) -> bool {
     key.contains('.') || key.starts_with("_has:")
 }
 
-/// The REST layer's terminology server, lent to the chain resolver: expands a
+/// The REST layer's terminology service, lent to the chain resolver: expands a
 /// terminology-backed modifier on the terminal parameter of a chained / `_has`
 /// search exactly as [`expand_terminology_params`] does a direct parameter's —
-/// same requests, same empty-expansion sentinel, same fail-open policy.
+/// same requests, same empty-expansion sentinel, same failure policy.
 struct ChainTerminologyExpander<'a> {
-    ts_url: &'a str,
+    terminology: &'a SearchTerminology,
+    policy: ExpansionFailurePolicy,
 }
 
 #[async_trait::async_trait]
 impl TerminologyExpander for ChainTerminologyExpander<'_> {
     async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion {
-        // The direct form of the terminal parameter; its name does not matter.
-        let key = format!("terminal:{modifier}");
-        let pairs = vec![(key.clone(), value.to_string())];
-        match expand_terminology_params(pairs, self.ts_url).await {
-            Ok(pairs) => match pairs.into_iter().next() {
-                Some((k, _)) if k == key => TerminologyExpansion::Unchanged,
-                Some((_, tokens)) => TerminologyExpansion::Tokens(tokens),
-                None => TerminologyExpansion::Dropped,
-            },
-            // `:not-in` only, which the resolver rejects itself.
-            Err(_) => TerminologyExpansion::Unchanged,
+        match rewrite_terminology_modifier(self.terminology, self.policy, modifier, value).await {
+            Rewrite::Tokens(tokens) => TerminologyExpansion::Tokens(tokens),
+            Rewrite::NegatedTokens(tokens) => TerminologyExpansion::NegatedTokens(tokens),
+            Rewrite::Unchanged => TerminologyExpansion::Unchanged,
+            Rewrite::Dropped => TerminologyExpansion::Dropped,
+            Rewrite::Failed { kind, message } => TerminologyExpansion::Failed { kind, message },
         }
     }
 }
 
-/// Rewrites the terminology-backed modifiers — `:in`, and `:above` / `:below`
-/// on a token — of direct parameters into plain token parameters, using the
-/// terminology server at `ts_url`.
+/// Rewrites the terminology-backed modifiers — `:in`, `:not-in`, and
+/// `:above` / `:below` on a token — of direct parameters into plain token
+/// parameters, using the server's terminology service.
 ///
 /// Only called when a terminology server is configured. Without one the caller
 /// (`execute_search_bundle`) rejects these modifiers with a `501` instead —
@@ -1121,10 +1095,17 @@ impl TerminologyExpander for ChainTerminologyExpander<'_> {
 /// `subject.name:in` is a `400` instead of a search for `subject.name=<codes>`
 /// (#1365).
 ///
-/// **`:in`** — The ValueSet at the given URL is expanded, and the parameter is
-/// replaced with a plain token parameter whose value is the expanded codes
-/// joined by commas (FHIR OR semantics).
-/// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
+/// **`:in`** — The ValueSet at the given canonical (`url` or `url|version`) is
+/// expanded, and the parameter is replaced with a plain token parameter whose
+/// value is the expanded codes joined by commas (FHIR OR semantics).
+/// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`.
+/// An empty expansion is replaced by a sentinel value that matches nothing.
+///
+/// **`:not-in`** — Expanded the same way, and replaced with a `:not` token
+/// parameter over the codes: `code:not=http://cs|A,http://cs|B`, which the
+/// backends answer at the resource level ("no value of `code` is in the
+/// set", #473). An empty expansion excludes nothing, so the parameter is
+/// dropped.
 ///
 /// **`:below` / `:above`** — For a `system|code` value, the code is expanded to
 /// itself plus its descendants (`is-a`) / ancestors (`generalizes`), and the
@@ -1132,103 +1113,59 @@ impl TerminologyExpander for ChainTerminologyExpander<'_> {
 /// reference form, which is structural: it is passed through with its modifier
 /// for the backend to resolve natively.
 ///
-/// **`:not-in`** — Returns `Err(RestError::NotImplemented)`, a `501`. Silently
-/// dropping a negation filter would return all resources instead of the
-/// expected subset, which is worse than an honest error. (The caller rejects
-/// `:not-in` itself before getting here; this arm keeps the function safe to
-/// call on its own.)
+/// A comma-separated value (`code:in=vs1,vs2`) is the union of its
+/// alternatives' expansions.
 ///
-/// All other parameters pass through unchanged. An empty expansion is replaced
-/// by a sentinel value that matches nothing. If an expansion *fails*, the
-/// parameter is dropped with a warning and the search continues without that
-/// filter (fail-open), so an unreachable terminology server or a single bad
-/// ValueSet URL does not abort the entire search.
+/// All other parameters pass through unchanged. If an expansion *fails* —
+/// unknown ValueSet, terminology server unreachable, expansion over the code
+/// cap — the configured [`ExpansionFailurePolicy`] decides: `Closed` (the
+/// default) fails the search with an error whose status reflects the cause,
+/// `Empty` makes the parameter match nothing, and `Open` drops the parameter
+/// and lets the search continue without the filter, which returns a superset
+/// of what was asked for.
 async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
-    ts_url: &str,
+    terminology: &SearchTerminology,
+    policy: ExpansionFailurePolicy,
 ) -> Result<Vec<(String, String)>, RestError> {
-    let client = TerminologyServiceClient::new(ts_url.to_string());
     let mut result: Vec<(String, String)> = Vec::with_capacity(pairs.len());
 
     for (key, value) in pairs {
         if is_chained_key(&key) {
             result.push((key, value));
-        } else if let Some(param_name) = key.strip_suffix(":in") {
-            // Expand the ValueSet and join codes with commas for OR token search.
-            match client.expand_value_set(&value).await {
-                Ok(codes) if !codes.is_empty() => {
-                    let token_list = codes
-                        .iter()
-                        .map(|c| c.as_token())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    debug!(
-                        param = %param_name,
-                        vs_url = %value,
-                        codes = %codes.len(),
-                        "Expanded ValueSet for :in modifier"
-                    );
-                    result.push((param_name.to_string(), token_list));
-                }
-                Ok(_) => {
-                    // Empty expansion — no code can match; use a sentinel value
-                    // that will match nothing in the token index.
-                    warn!(
-                        param = %key,
-                        vs_url = %value,
-                        "ValueSet $expand returned empty expansion for :in modifier; \
-                         injecting sentinel value so no resources match"
-                    );
-                    result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
-                }
-                Err(e) => {
-                    warn!(
-                        param = %key,
-                        vs_url = %value,
-                        error = %e,
-                        "ValueSet $expand failed for :in modifier; skipping parameter (fail-open)"
-                    );
-                    // Omit the param — searches continue without this filter.
-                }
-            }
-        } else if let Some(param_name) = key.strip_suffix(":not-in") {
-            // :not-in requires negated value-set filtering which the current
-            // SQLite search backend does not support.  Return an explicit error
-            // rather than silently dropping the parameter — a silent drop would
-            // return all resources when the client expects a filtered subset.
-            return Err(RestError::NotImplemented {
-                feature: format!(
-                    "search modifier ':not-in' is not supported (param: {param_name}, \
-                     ValueSet: {value}); use ':in' or remove this modifier"
-                ),
-            });
-        } else if let Some((param_name, op)) = key
-            .strip_suffix(":below")
-            .map(|p| (p, "is-a"))
-            .or_else(|| key.strip_suffix(":above").map(|p| (p, "generalizes")))
-        {
-            // Token hierarchy: `code:below=system|code` expands to the code and
-            // its descendants (is-a) / ancestors (generalizes) via the
-            // terminology server. A bare value with no `system|code` is left
-            // untouched — that is the URI form, resolved natively by the backend.
-            if let Some((system, code)) = value.split_once('|') {
-                let modifier = if op == "is-a" { ":below" } else { ":above" };
-                expand_subsumption_into(
-                    &mut result,
-                    &client,
-                    param_name,
-                    &key,
-                    system,
-                    code,
-                    op,
-                    modifier,
+            continue;
+        }
+        let Some((param_name, modifier)) = key
+            .split_once(':')
+            .and_then(|(name, m)| SearchModifier::parse(m).map(|m| (name, m)))
+            .filter(|(_, m)| {
+                matches!(
+                    m,
+                    SearchModifier::In
+                        | SearchModifier::NotIn
+                        | SearchModifier::Above
+                        | SearchModifier::Below
                 )
-                .await;
-            } else {
-                result.push((key, value));
-            }
-        } else {
+            })
+        else {
             result.push((key, value));
+            continue;
+        };
+
+        match rewrite_terminology_modifier(terminology, policy, &modifier, &value).await {
+            Rewrite::Tokens(tokens) => result.push((param_name.to_string(), tokens)),
+            Rewrite::NegatedTokens(tokens) => result.push((format!("{param_name}:not"), tokens)),
+            Rewrite::Unchanged => result.push((key, value)),
+            Rewrite::Dropped => {}
+            Rewrite::Failed { kind, message } => {
+                return Err(SearchError::TerminologyFailure {
+                    modifier: modifier.to_string(),
+                    param: param_name.to_string(),
+                    kind,
+                    message,
+                }
+                .into());
+            }
         }
     }
 
@@ -1239,54 +1176,111 @@ async fn expand_terminology_params(
 /// result when a terminology expansion legitimately yields no codes.
 const HTS_EMPTY_EXPANSION: &str = "__hts_empty_expansion__";
 
-/// Expands a token hierarchy modifier (`:below`/`:above`) and inserts the
-/// resulting comma-joined token list under `param_name`. Mirrors the `:in`
-/// policy: empty expansion → sentinel (match nothing); request error →
-/// fail-open (drop the filter).
-#[allow(clippy::too_many_arguments)]
-async fn expand_subsumption_into(
-    result: &mut Vec<(String, String)>,
-    client: &TerminologyServiceClient,
-    param_name: &str,
-    key: &str,
-    system: &str,
-    code: &str,
-    op: &str,
-    modifier: &str,
-) {
-    match client.expand_subsumption(system, code, op).await {
-        Ok(codes) if !codes.is_empty() => {
-            let token_list = codes
-                .iter()
-                .map(|c| c.as_token())
-                .collect::<Vec<_>>()
-                .join(",");
+/// What a terminology-backed modifier's value was rewritten into.
+enum Rewrite {
+    /// A plain token OR list, with the modifier removed.
+    Tokens(String),
+    /// A token OR list to be searched with `:not` (from `:not-in`).
+    NegatedTokens(String),
+    /// Not the terminology server's (a structural `:below` / `:above`).
+    Unchanged,
+    /// The parameter is to be dropped.
+    Dropped,
+    /// The expansion failed and the search is to fail with it.
+    Failed {
+        kind: TerminologyFailureKind,
+        message: String,
+    },
+}
+
+/// Expands `value` for `modifier` (`:in`, `:not-in`, token `:above` /
+/// `:below`) through `terminology`, applying `policy` to a failure. See
+/// [`expand_terminology_params`] for the rewrite rules.
+async fn rewrite_terminology_modifier(
+    terminology: &SearchTerminology,
+    policy: ExpansionFailurePolicy,
+    modifier: &SearchModifier,
+    value: &str,
+) -> Rewrite {
+    let subsumption_op = match modifier {
+        SearchModifier::In | SearchModifier::NotIn => None,
+        SearchModifier::Below => Some("is-a"),
+        SearchModifier::Above => Some("generalizes"),
+        _ => return Rewrite::Unchanged,
+    };
+    let alternatives = helios_persistence::search::split_unescaped_commas(value);
+    // A hierarchy modifier whose value is not a `system|code` is the uri /
+    // reference form, resolved natively by the backend.
+    if subsumption_op.is_some() && alternatives.iter().any(|a| !a.contains('|')) {
+        return Rewrite::Unchanged;
+    }
+
+    let mut tokens: Vec<String> = Vec::new();
+    for alternative in &alternatives {
+        let expansion = match subsumption_op {
+            None => terminology.expand_value_set(alternative).await,
+            Some(op) => {
+                let (system, code) = alternative
+                    .rsplit_once('|')
+                    .expect("checked above: every alternative contains a '|'");
+                terminology.expand_subsumption(system, code, op).await
+            }
+        };
+        match expansion {
+            Ok(codes) => {
+                debug!(
+                    modifier = %modifier,
+                    value = %alternative,
+                    codes = codes.len(),
+                    "Expanded terminology-backed search modifier"
+                );
+                tokens.extend(codes.iter().map(ExpandedCode::as_token));
+            }
+            Err(e) => {
+                warn!(
+                    modifier = %modifier,
+                    value = %alternative,
+                    error = %e,
+                    policy = ?policy,
+                    "Terminology expansion for search modifier failed"
+                );
+                return match policy {
+                    ExpansionFailurePolicy::Closed => Rewrite::Failed {
+                        kind: e.kind(),
+                        message: e.client_message(alternative),
+                    },
+                    ExpansionFailurePolicy::Empty => {
+                        Rewrite::Tokens(HTS_EMPTY_EXPANSION.to_string())
+                    }
+                    ExpansionFailurePolicy::Open => Rewrite::Dropped,
+                };
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        return if *modifier == SearchModifier::NotIn {
+            // Nothing to exclude: the parameter does not constrain the search.
+            debug!(value = %value, "Empty expansion for :not-in; parameter excludes nothing");
+            Rewrite::Dropped
+        } else {
+            // No code can match; use a sentinel value that matches nothing in
+            // the token index.
             debug!(
-                param = %param_name,
-                system = %system,
-                code = %code,
                 modifier = %modifier,
-                codes = codes.len(),
-                "Expanded token hierarchy modifier"
+                value = %value,
+                "Empty expansion; injecting sentinel value so no resources match"
             );
-            result.push((param_name.to_string(), token_list));
-        }
-        Ok(_) => {
-            warn!(
-                param = %key,
-                modifier = %modifier,
-                "Token hierarchy expansion returned no codes; injecting sentinel so no resources match"
-            );
-            result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
-        }
-        Err(e) => {
-            warn!(
-                param = %key,
-                modifier = %modifier,
-                error = %e,
-                "Token hierarchy expansion failed; skipping parameter (fail-open)"
-            );
-        }
+            Rewrite::Tokens(HTS_EMPTY_EXPANSION.to_string())
+        };
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    let joined = tokens.join(",");
+    if *modifier == SearchModifier::NotIn {
+        Rewrite::NegatedTokens(joined)
+    } else {
+        Rewrite::Tokens(joined)
     }
 }
 
@@ -1505,6 +1499,39 @@ mod tests {
 
     // ─── expand_terminology_params ───────────────────────────────────────────
 
+    /// A terminology service for the server at `url`, uncached.
+    fn terminology(url: &str) -> SearchTerminology {
+        SearchTerminology::new(
+            crate::terminology::TerminologyServiceClient::new(url.to_string()),
+            std::time::Duration::ZERO,
+        )
+    }
+
+    async fn expand(
+        params: Vec<(String, String)>,
+        url: &str,
+        policy: ExpansionFailurePolicy,
+    ) -> Result<Vec<(String, String)>, RestError> {
+        expand_terminology_params(params, &terminology(url), policy).await
+    }
+
+    /// A mock terminology server answering every `$expand` with `expansion`;
+    /// returns its base URL.
+    async fn mock_expand_server(expansion: serde_json::Value) -> String {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/ValueSet/$expand",
+            post(move || {
+                let expansion = expansion.clone();
+                async move { Json(expansion) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
     /// Verifies that non-terminology params pass through unchanged, including
     /// repeated keys.
     #[tokio::test]
@@ -1515,10 +1542,15 @@ mod tests {
             ("_count".to_string(), "10".to_string()),
         ];
 
-        // Use a URL that won't be reachable — but only :in/:above/:below keys trigger calls.
-        let result = expand_terminology_params(params, "http://localhost:9999")
-            .await
-            .unwrap();
+        // Use a URL that won't be reachable — but only :in/:not-in/:above/:below
+        // keys trigger calls.
+        let result = expand(
+            params,
+            "http://localhost:9999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
 
         // Both repeated `name` values survive (FHIR AND semantics).
         let names: Vec<&str> = result
@@ -1532,8 +1564,7 @@ mod tests {
 
     /// #1365: a chained or `_has` key keeps its terminology modifier — the chain
     /// resolver types the terminal parameter first, then expands. (The
-    /// unreachable server would otherwise drop the `:in` keys, and `:not-in`
-    /// would be an error.)
+    /// unreachable server would otherwise make every one of these an error.)
     #[tokio::test]
     async fn test_expand_terminology_params_leaves_chained_keys_to_the_resolver() {
         let params: Vec<(String, String)> = [
@@ -1546,92 +1577,115 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let result = expand_terminology_params(params.clone(), "http://127.0.0.1:19999")
-            .await
-            .unwrap();
+        let result = expand(
+            params.clone(),
+            "http://127.0.0.1:19999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
         assert_eq!(result, params);
     }
 
-    /// Verifies that a `:not-in` parameter returns `NotImplemented` rather than
-    /// silently dropping the filter (which would return incorrect results).
+    /// An unreachable terminology server fails every terminology-backed
+    /// modifier closed by default: a `TerminologyFailure` of kind
+    /// `Unavailable` (a `503`) naming the parameter and modifier — never a
+    /// silently widened search.
     #[tokio::test]
-    async fn test_expand_terminology_params_not_in_returns_not_implemented() {
-        use crate::error::RestError;
-        let params = vec![
-            (
-                "code:not-in".to_string(),
-                "http://example.org/vs".to_string(),
-            ),
-            ("name".to_string(), "Smith".to_string()),
-        ];
-
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
-
-        // :not-in must return an explicit error, not silently drop the filter.
-        assert!(matches!(result, Err(RestError::NotImplemented { .. })));
+    async fn test_expand_terminology_params_fails_closed_on_network_error() {
+        for (key, value) in [
+            ("code:in", "http://example.org/vs"),
+            ("code:not-in", "http://example.org/vs"),
+            ("code:below", "http://snomed.info/sct|73211009"),
+            ("code:above", "http://snomed.info/sct|73211009"),
+        ] {
+            let params = vec![
+                (key.to_string(), value.to_string()),
+                ("name".to_string(), "Smith".to_string()),
+            ];
+            let result = expand(
+                params,
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Closed,
+            )
+            .await;
+            match result {
+                Err(RestError::ServiceUnavailable { message }) => {
+                    assert!(message.contains("'code'"), "{key}: {message}");
+                    assert!(
+                        message.contains(&format!("':{}'", key.split_once(':').unwrap().1)),
+                        "{key}: {message}"
+                    );
+                    assert!(message.contains("could not be reached"), "{key}: {message}");
+                }
+                other => panic!("{key}: expected 503, got {other:?}"),
+            }
+        }
     }
 
-    /// Verifies that a :in param is dropped on network error (fail-open).
+    /// `HFS_SEARCH_TERMINOLOGY_FAIL=open`: the parameter is dropped and the
+    /// rest of the search survives; `empty`: it matches nothing.
     #[tokio::test]
-    async fn test_expand_terminology_params_in_dropped_on_network_error() {
-        let params = vec![("code:in".to_string(), "http://example.org/vs".to_string())];
+    async fn test_expand_terminology_params_open_and_empty_policies_on_network_error() {
+        for key in ["code:in", "code:not-in", "code:below"] {
+            let value = if key.ends_with("in") {
+                "http://example.org/vs"
+            } else {
+                "http://snomed.info/sct|73211009"
+            };
+            let params = vec![
+                (key.to_string(), value.to_string()),
+                ("name".to_string(), "Smith".to_string()),
+            ];
 
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
+            let result = expand(
+                params.clone(),
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Open,
+            )
             .await
             .unwrap();
+            let map = as_map(&result);
+            assert_eq!(map.len(), 1, "{key}: {map:?}");
+            assert_eq!(map.get("name"), Some(&"Smith".to_string()));
 
-        // The :in key is gone; no code key was injected either (fail-open)
-        let map = as_map(&result);
-        assert!(!map.contains_key("code:in"));
-        assert!(!map.contains_key("code"));
-    }
-
-    /// A token `:below` (`system|code`) is fail-open dropped on network error.
-    #[tokio::test]
-    async fn test_expand_terminology_params_below_token_dropped_on_network_error() {
-        let params = vec![(
-            "code:below".to_string(),
-            "http://snomed.info/sct|73211009".to_string(),
-        )];
-
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
+            let result = expand(
+                params,
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Empty,
+            )
             .await
             .unwrap();
-
-        let map = as_map(&result);
-        assert!(!map.contains_key("code:below"));
-        assert!(!map.contains_key("code"));
+            let map = as_map(&result);
+            assert_eq!(
+                map.get("code"),
+                Some(&HTS_EMPTY_EXPANSION.to_string()),
+                "{key}: {map:?}"
+            );
+            assert_eq!(map.get("name"), Some(&"Smith".to_string()));
+        }
     }
 
     /// Happy path: a token `:below` expands to the code and its descendants via
     /// a mock terminology server, rewriting to a comma-joined token list.
     #[tokio::test]
     async fn test_expand_terminology_params_below_success() {
-        use axum::{Json, Router, routing::post};
         use serde_json::json;
-
-        let app = Router::new().route(
-            "/ValueSet/$expand",
-            post(|| async {
-                Json(json!({
-                    "resourceType": "ValueSet",
-                    "expansion": { "contains": [
-                        { "system": "http://snomed.info/sct", "code": "73211009" },
-                        { "system": "http://snomed.info/sct", "code": "44054006" },
-                        { "system": "http://snomed.info/sct", "code": "46635009" }
-                    ]}
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [
+                { "system": "http://snomed.info/sct", "code": "73211009" },
+                { "system": "http://snomed.info/sct", "code": "44054006" },
+                { "system": "http://snomed.info/sct", "code": "46635009" }
+            ]}
+        }))
+        .await;
 
         let params = vec![(
             "code:below".to_string(),
             "http://snomed.info/sct|73211009".to_string(),
         )];
-        let result = expand_terminology_params(params, &format!("http://{addr}"))
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
             .await
             .unwrap();
 
@@ -1644,6 +1698,85 @@ mod tests {
         assert!(codes.contains("http://snomed.info/sct|46635009"));
     }
 
+    /// `:not-in` is rewritten into a `:not` token search over the expansion;
+    /// an empty expansion excludes nothing and drops the parameter.
+    #[tokio::test]
+    async fn test_expand_terminology_params_not_in_rewrites_to_not() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [
+                { "system": "http://cs", "code": "a" },
+                { "system": "http://cs", "code": "b" }
+            ]}
+        }))
+        .await;
+        let params = vec![
+            (
+                "code:not-in".to_string(),
+                "http://example.org/vs".to_string(),
+            ),
+            ("name".to_string(), "Smith".to_string()),
+        ];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                (
+                    "code:not".to_string(),
+                    "http://cs|a,http://cs|b".to_string()
+                ),
+                ("name".to_string(), "Smith".to_string()),
+            ]
+        );
+
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [] }
+        }))
+        .await;
+        let params = vec![
+            (
+                "code:not-in".to_string(),
+                "http://example.org/vs".to_string(),
+            ),
+            ("code:in".to_string(), "http://example.org/vs".to_string()),
+        ];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        // `:not-in` of nothing is dropped; `:in` of nothing matches nothing.
+        assert_eq!(
+            result,
+            vec![("code".to_string(), HTS_EMPTY_EXPANSION.to_string())]
+        );
+    }
+
+    /// A comma-separated value is the union of its alternatives' expansions,
+    /// de-duplicated.
+    #[tokio::test]
+    async fn test_expand_terminology_params_unions_alternatives() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [{ "system": "http://cs", "code": "a" }] }
+        }))
+        .await;
+        let params = vec![(
+            "code:in".to_string(),
+            "http://example.org/vs1,http://example.org/vs2".to_string(),
+        )];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            vec![("code".to_string(), "http://cs|a".to_string())]
+        );
+    }
+
     /// A `:below` value without a `system|code` (the URI form) is left untouched
     /// so the backend can resolve URI hierarchy natively — no terminology call.
     #[tokio::test]
@@ -1653,9 +1786,13 @@ mod tests {
             "http://example.org/fhir/ValueSet/x".to_string(),
         )];
 
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
-            .await
-            .unwrap();
+        let result = expand(
+            params,
+            "http://127.0.0.1:19999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
 
         // Unchanged — no `|`, so not treated as a token subsumption.
         assert_eq!(

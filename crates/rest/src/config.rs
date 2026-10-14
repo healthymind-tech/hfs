@@ -31,7 +31,11 @@
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
-//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
+//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in`/`:above`/`:below` search and FHIRPath terminology functions |
+//! | `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: closed (error), empty (match nothing) or open (drop the parameter) |
+//! | `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used for search modifiers |
+//! | `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else 422 `too-costly`) |
+//! | `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; 0 disables |
 //! | `HFS_TERMINOLOGY_PUBLIC_URL` | (none) | Browser-reachable URL for the web UI's Terminology link; defaults to `/ui/hts` when `HFS_TERMINOLOGY_SERVER` is an internal host |
 //! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
 //! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
@@ -792,6 +796,98 @@ impl ValidationConfig {
         }
         if self.terminology_timeout_ms == 0 {
             errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Search-time terminology configuration (`HFS_SEARCH_TERMINOLOGY_*`,
+/// `HFS_SEARCH_EXPANSION_*`): how the `:in` / `:not-in` / token `:above` /
+/// `:below` search modifiers are resolved through `HFS_TERMINOLOGY_SERVER`.
+///
+/// A modifier's ValueSet (or code hierarchy) is expanded with
+/// `ValueSet/$expand` — flat (`excludeNested=true`), paged with
+/// `count`/`offset` up to a code cap — and the search runs on the codes.
+#[derive(Debug, Clone)]
+pub struct SearchTerminologyConfig {
+    /// What a search does when the expansion fails (unknown ValueSet,
+    /// terminology server down, expansion over the cap): `closed` (default —
+    /// the search fails with an OperationOutcome), `empty` (the parameter
+    /// matches nothing), or `open` (the parameter is dropped and the search
+    /// runs without it — the pre-fork behaviour, which returns a superset).
+    pub fail: String,
+    /// `$expand` page size (`count`); must not exceed the terminology
+    /// server's own expansion limit (`HTS_MAX_EXPANSION_SIZE`, 3500 by
+    /// default on HTS).
+    pub expansion_page_size: u32,
+    /// Maximum number of codes a single expansion may turn into a search
+    /// filter. Larger expansions fail the search as `too-costly` (`422`) —
+    /// SQLite binds at most 32,766 parameters per statement.
+    pub expansion_max_codes: usize,
+    /// How long a successful expansion is reused for identical searches,
+    /// in seconds; `0` disables the cache.
+    pub expansion_cache_ttl_secs: u64,
+}
+
+impl Default for SearchTerminologyConfig {
+    fn default() -> Self {
+        Self {
+            fail: "closed".to_string(),
+            expansion_page_size: 1000,
+            expansion_max_codes: 10_000,
+            expansion_cache_ttl_secs: 60,
+        }
+    }
+}
+
+impl SearchTerminologyConfig {
+    /// Loads the configuration from `HFS_SEARCH_TERMINOLOGY_FAIL`,
+    /// `HFS_SEARCH_EXPANSION_PAGE_SIZE`, `HFS_SEARCH_EXPANSION_MAX_CODES` and
+    /// `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`, defaulting each unset variable.
+    pub fn from_env() -> Self {
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            fail: std::env::var("HFS_SEARCH_TERMINOLOGY_FAIL").unwrap_or(d.fail),
+            expansion_page_size: env_u64(
+                "HFS_SEARCH_EXPANSION_PAGE_SIZE",
+                u64::from(d.expansion_page_size),
+            )
+            .min(u64::from(u32::MAX)) as u32,
+            expansion_max_codes: env_u64(
+                "HFS_SEARCH_EXPANSION_MAX_CODES",
+                d.expansion_max_codes as u64,
+            ) as usize,
+            expansion_cache_ttl_secs: env_u64(
+                "HFS_SEARCH_EXPANSION_CACHE_TTL_SECS",
+                d.expansion_cache_ttl_secs,
+            ),
+        }
+    }
+
+    /// Validates the configuration, returning every problem found.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !matches!(self.fail.as_str(), "closed" | "empty" | "open") {
+            errors.push(format!(
+                "HFS_SEARCH_TERMINOLOGY_FAIL '{}' invalid (expected closed|empty|open)",
+                self.fail
+            ));
+        }
+        if self.expansion_page_size == 0 {
+            errors.push("HFS_SEARCH_EXPANSION_PAGE_SIZE must be > 0".to_string());
+        }
+        if self.expansion_max_codes == 0 {
+            errors.push("HFS_SEARCH_EXPANSION_MAX_CODES must be > 0".to_string());
         }
         if errors.is_empty() {
             Ok(())
@@ -1774,6 +1870,9 @@ pub struct ServerConfig {
     /// `HFS_PACKAGES`, `HFS_ADMIN_UI`; loaded from environment variables).
     #[arg(skip)]
     pub packages: PackageConfig,
+    /// Search-time terminology configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub search_terminology: SearchTerminologyConfig,
 }
 
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
@@ -1793,6 +1892,7 @@ impl ServerConfig {
         config.bulk_submit = BulkSubmitConfig::from_env();
         config.validation = ValidationConfig::from_env();
         config.packages = PackageConfig::from_env();
+        config.search_terminology = SearchTerminologyConfig::from_env();
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
@@ -1884,6 +1984,7 @@ impl Default for ServerConfig {
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
             packages: PackageConfig::default(),
+            search_terminology: SearchTerminologyConfig::default(),
         }
     }
 }
@@ -1905,6 +2006,7 @@ impl ServerConfig {
         // Load validation config from environment
         config.validation = ValidationConfig::from_env();
         config.packages = PackageConfig::from_env();
+        config.search_terminology = SearchTerminologyConfig::from_env();
         config
     }
 
@@ -2069,6 +2171,10 @@ impl ServerConfig {
             errors.append(&mut validation_errors);
         }
 
+        if let Err(mut search_errors) = self.search_terminology.validate() {
+            errors.append(&mut search_errors);
+        }
+
         // Remote terminology checking needs a terminology server to call.
         if matches!(
             self.validation.terminology.as_str(),
@@ -2167,6 +2273,11 @@ impl ServerConfig {
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
             packages: PackageConfig::default(),
+            // Tests count `$expand` calls per search; caching would hide them.
+            search_terminology: SearchTerminologyConfig {
+                expansion_cache_ttl_secs: 0,
+                ..SearchTerminologyConfig::default()
+            },
         }
     }
 

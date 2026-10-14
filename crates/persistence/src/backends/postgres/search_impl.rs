@@ -16,8 +16,8 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
+    ChainedSearchProvider, DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider,
+    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -903,6 +903,49 @@ impl SearchProvider for PostgresBackend {
         param_type: crate::types::SearchParamType,
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
+    }
+
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<DistinctMetaValue>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // Joined to `resources` so a deleted resource's rows (and any rows a
+        // reindex has not yet rewritten) do not count.
+        let mut sql = String::from(
+            "SELECT DISTINCT si.value_token_system, si.value_token_code, si.value_token_display, si.value_uri \
+             FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             WHERE si.tenant_id = $1 AND si.param_name = $2 AND r.is_deleted = FALSE",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(tenant_id.to_string()), Box::new(param.to_string())];
+        if let Some(resource_type) = resource_type {
+            sql.push_str(" AND si.resource_type = $3");
+            params.push(Box::new(resource_type.to_string()));
+        }
+        sql.push_str(" ORDER BY 1, 2, 4");
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = client
+            .query(sql.as_str(), &param_refs)
+            .await
+            .or_query_error("Failed to execute $meta query")?;
+        Ok(rows
+            .iter()
+            .map(|row| DistinctMetaValue {
+                system: row.get(0),
+                code: row.get(1),
+                display: row.get(2),
+                uri: row.get(3),
+            })
+            .filter(|value| value.code.is_some() || value.uri.is_some())
+            .collect())
     }
 }
 

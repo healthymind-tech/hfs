@@ -1049,6 +1049,33 @@ impl From<SearchError> for RestError {
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
                 message: format!("Search returned {} results, maximum is {}", count, max),
             },
+            // A terminology expansion behind a search modifier failed: the
+            // status follows the cause. An unknown ValueSet / code is the
+            // client's `400`; an expansion over the cap is `422` like the
+            // terminology server's own `too-costly`; an outage is a `503`.
+            SearchError::TerminologyFailure { .. } => {
+                use helios_persistence::error::TerminologyFailureKind;
+                let message = err.to_string();
+                let SearchError::TerminologyFailure {
+                    param,
+                    modifier,
+                    kind,
+                    ..
+                } = err
+                else {
+                    unreachable!("matched above")
+                };
+                match kind {
+                    TerminologyFailureKind::NotFound => RestError::InvalidParameter {
+                        param: format!("{param}:{modifier}"),
+                        message,
+                    },
+                    TerminologyFailureKind::TooCostly => RestError::UnprocessableEntity { message },
+                    TerminologyFailureKind::Unavailable => {
+                        RestError::ServiceUnavailable { message }
+                    }
+                }
+            }
         }
     }
 }

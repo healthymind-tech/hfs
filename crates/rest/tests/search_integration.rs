@@ -847,9 +847,8 @@ mod string_search {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // :not-in needs negated value-set filtering, which is unimplemented; it
-        // must return 501 rather than silently returning a superset, even when
-        // no terminology server is configured.
+        // :not-in is expanded through the terminology server like :in; without
+        // one it must return 501 rather than silently returning a superset.
         let response = server
             .get("/Observation?code:not-in=http://example.org/vs")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -3478,7 +3477,7 @@ mod chaining {
             "{text}"
         );
 
-        // `:not-in` stays the `501` it already was.
+        // `:not-in` needs the terminology server too.
         for url in [
             "/Encounter?subject.gender:not-in=http://example.org/vs",
             "/Patient?_has:Observation:subject:code:not-in=http://example.org/vs",
@@ -3651,8 +3650,8 @@ mod chaining {
 
     /// #1365: `:not-in` on the terminal parameter of a chained / `_has` search
     /// follows the direct form's order — the `400` for a type that does not
-    /// define it comes before the `501` for one that does. It used to be a
-    /// blanket `501` on any key ending in `:not-in`.
+    /// define it comes before the `501` (no terminology server) for one that
+    /// does. It used to be a blanket `501` on any key ending in `:not-in`.
     #[tokio::test]
     async fn test_chained_not_in_is_400_on_a_non_token_terminal_and_501_on_a_token() {
         let (server, backend) = create_test_server().await;
@@ -3673,7 +3672,7 @@ mod chaining {
             outcome(&server, "/Patient?gender:not-in=http://vs").await;
         assert_eq!(direct_status, StatusCode::NOT_IMPLEMENTED);
         assert!(
-            direct_text.contains("search modifier ':not-in' is not supported"),
+            direct_text.contains("':not-in' on token parameter 'gender' requires a"),
             "{direct_text}"
         );
 
@@ -3699,10 +3698,10 @@ mod chaining {
         ] {
             let (status, text) = outcome(&server, url).await;
             assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {text}");
-            // The direct form's wording, not "requires a terminology server":
-            // one would not help.
+            // The direct form's wording, naming the whole key.
             assert!(
-                text.contains("search modifier ':not-in' is not supported"),
+                text.contains("':not-in' on token parameter '")
+                    && text.contains("requires a configured terminology server"),
                 "{url}: {text}"
             );
         }

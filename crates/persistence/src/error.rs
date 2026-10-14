@@ -422,6 +422,47 @@ pub enum SearchError {
         /// `_has:Observation:subject:code`).
         param: String,
     },
+
+    /// A terminology-backed modifier (`:in`, `:not-in`, token `:above` /
+    /// `:below`) could not be expanded by the configured terminology server.
+    ///
+    /// Raised instead of silently dropping the filter (which would return a
+    /// superset of what was asked for) or matching nothing (which would hide
+    /// the outage). `kind` tells the REST layer which status to answer with:
+    /// a ValueSet or code the terminology server does not know is the
+    /// client's error, an expansion over the configured size cap is
+    /// `too-costly`, and an unreachable or failing server is a transient
+    /// `503`. The parameter is named as the client wrote it, chain or `_has`
+    /// key included.
+    #[error(
+        "search modifier ':{modifier}' on parameter '{param}' could not be resolved: {message}"
+    )]
+    TerminologyFailure {
+        /// Modifier name (e.g., `in`, `not-in`, `below`).
+        modifier: String,
+        /// The parameter as the client wrote it.
+        param: String,
+        /// What went wrong, for the HTTP status.
+        kind: TerminologyFailureKind,
+        /// Human-readable detail, safe to return to the client.
+        message: String,
+    },
+}
+
+/// Why a terminology expansion behind a search modifier failed — see
+/// [`SearchError::TerminologyFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminologyFailureKind {
+    /// The ValueSet, code system or code is unknown to the terminology server
+    /// (its `404`), or it rejected the request (`400`): a client error.
+    NotFound,
+    /// The expansion is larger than this server is willing to turn into a
+    /// search filter (the terminology server's `too-costly`, or the
+    /// configured code cap).
+    TooCostly,
+    /// The terminology server could not be reached, timed out, or answered
+    /// with a server error or an unparseable body.
+    Unavailable,
 }
 
 /// Errors related to transactions.

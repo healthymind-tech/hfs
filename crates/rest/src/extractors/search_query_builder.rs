@@ -217,7 +217,13 @@ fn build_query(
         }
 
         // Parse the parameter
-        let param = parse_search_parameter_in(resource_type, name, value, registry, types)?;
+        let mut param = parse_search_parameter_in(resource_type, name, value, registry, types)?;
+        // `url=X|V` on a canonical resource: url=X AND version=V.
+        if let Some(version) = split_versioned_url(&mut param, resource_type, registry)? {
+            query.parameters.push(param);
+            query.parameters.push(version);
+            continue;
+        }
         query.parameters.push(param);
     }
 
@@ -244,6 +250,69 @@ fn build_query(
     helios_persistence::search::validate_value_presence(&query)?;
 
     Ok(query)
+}
+
+/// Rewrites a versioned canonical on the `url` parameter — `url=X|V`, as a
+/// canonical reference is written — into `url=X` plus `version=V`, for a
+/// resource type that has a `version` token parameter (StructureDefinition,
+/// ValueSet, CodeSystem, ConceptMap, Questionnaire, SearchParameter, …).
+///
+/// The `url` element itself never carries a version, so the uri index holds
+/// `X` alone and a literal search for `X|V` matched nothing (H8e). `url=X`
+/// still matches every version; `url=X|` is `url=X`. Returns the `version`
+/// parameter to add, with `param` narrowed to the url.
+///
+/// Only the `url` parameter is rewritten: on another uri parameter a `|V`
+/// names the version of the *referenced* artifact (`StructureDefinition?base=`,
+/// `ValueSet?reference=`), not of the resource searched for. A versioned
+/// canonical cannot be one of several comma-separated alternatives — the
+/// version would have to pair with its own url, which one `version` parameter
+/// cannot express — so that is a `400`.
+fn split_versioned_url(
+    param: &mut SearchParameter,
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> Result<Option<SearchParameter>, RestError> {
+    if param.name != "url"
+        || param.param_type != SearchParamType::Uri
+        || param.modifier.is_some()
+        || !param.chain.is_empty()
+        || !param.values.iter().any(|v| v.value.contains('|'))
+    {
+        return Ok(None);
+    }
+    let has_version_param = registry
+        .get_param(resource_type, "version")
+        .is_some_and(|def| def.param_type == SearchParamType::Token);
+    if !has_version_param {
+        return Ok(None);
+    }
+    if param.values.len() > 1 {
+        return Err(RestError::InvalidParameter {
+            param: "url".to_string(),
+            message: "a versioned canonical (url|version) cannot be one of several \
+                      comma-separated alternatives; search for one versioned canonical at a \
+                      time, or use url=X&version=V"
+                .to_string(),
+        });
+    }
+    let (url, version) = param.values[0]
+        .value
+        .split_once('|')
+        .expect("checked above: the value contains a '|'");
+    let (url, version) = (url.to_string(), version.to_string());
+    param.values = vec![SearchValue::eq(url)];
+    if version.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SearchParameter {
+        name: "version".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq(version)],
+        chain: vec![],
+        components: vec![],
+    }))
 }
 
 /// Drops every parameter that has no value: `family=`, a bare `family`, a
@@ -357,6 +426,231 @@ pub fn unknown_search_params(
         }
     }
     unknown
+}
+
+/// Rejects a chained parameter whose hops or terminal the registry does not
+/// know, so `Observation?subject.nosuch.name=x` is a `400` naming the bad
+/// part instead of a silent empty `200` (the resolver used to search the
+/// unknown hop permissively and find nothing).
+///
+/// Walks every forward chain of `query` hop by hop against `registry`: each
+/// hop must be a **reference** search parameter of (one of) the current
+/// candidate types, a `:[type]` qualifier must name one of its declared
+/// targets, and the terminal must be a search parameter of (one of) the
+/// terminal types — one of the [`GLOBAL_SEARCH_PARAMS`] included. A `_has`
+/// level is checked the same way: its reference parameter must be a
+/// reference parameter of the source type that can point at the searched
+/// type, and its terminal a parameter of the source type.
+///
+/// A type the registry has no parameters for at all (the embedded fallback
+/// set, used without a data directory, knows few) is not judged: the chain
+/// is left to the resolver's permissive handling, as before. A reference
+/// parameter without declared targets is followed to the type the resolver
+/// infers from its name (`subject` → Patient), as the resolver does. The first hop's
+/// existence on the searched type is the business of
+/// [`unknown_search_params`], which the lenient / strict handling of unknown
+/// parameters governs; this check begins at the second hop.
+pub fn validate_chained_params(
+    resource_type: &str,
+    query: &SearchQuery,
+    registry: &SearchParameterRegistry,
+) -> Result<(), RestError> {
+    let known_type = |t: &str| !registry.get_all_params(t).is_empty();
+    let lookup = |t: &str, name: &str| {
+        registry
+            .get_param(t, name)
+            .or_else(|| registry.get_param("Resource", name))
+    };
+    let invalid = |param: String, message: String| RestError::InvalidParameter { param, message };
+
+    for param in query.parameters.iter().filter(|p| !p.chain.is_empty()) {
+        let display = {
+            let mut d = param.name.clone();
+            for hop in &param.chain {
+                if let Some(t) = &hop.target_type {
+                    d.push_str(&format!(":{t}"));
+                }
+                d.push('.');
+                d.push_str(&hop.target_param);
+            }
+            // `chain[i].target_param` is the *next* hop's name, so the display
+            // rebuilt above reads `name.hop2.hop3…terminal`.
+            d
+        };
+        let mut current: Vec<String> = vec![resource_type.to_string()];
+        let hops = &param.chain;
+        for (i, hop) in hops.iter().enumerate() {
+            let reference_param = &hop.reference_param;
+            let judged: Vec<&String> = current.iter().filter(|t| known_type(t)).collect();
+            if judged.is_empty() {
+                return Ok(());
+            }
+            let defs: Vec<_> = judged
+                .iter()
+                .filter_map(|t| lookup(t, reference_param))
+                .collect();
+            if defs.is_empty() {
+                // The first hop is `unknown_search_params`' call (lenient
+                // handling may drop it); a later one is a malformed chain.
+                if i == 0 {
+                    return Ok(());
+                }
+                return Err(invalid(
+                    display.clone(),
+                    format!(
+                        "invalid chain '{display}': '{reference_param}' is not a search parameter \
+                         of {}",
+                        join_types(&judged)
+                    ),
+                ));
+            }
+            if !defs
+                .iter()
+                .any(|d| d.param_type == SearchParamType::Reference)
+            {
+                return Err(invalid(
+                    display.clone(),
+                    format!(
+                        "invalid chain '{display}': '{reference_param}' is not a reference search \
+                         parameter of {}, so it cannot be chained through",
+                        join_types(&judged)
+                    ),
+                ));
+            }
+            let mut targets: Vec<String> = Vec::new();
+            for d in &defs {
+                for t in d.target.as_deref().unwrap_or_default() {
+                    if !targets.contains(t) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            current = match &hop.target_type {
+                Some(t) => {
+                    if !targets.is_empty() && !targets.contains(t) {
+                        return Err(invalid(
+                            display.clone(),
+                            format!(
+                                "invalid chain '{display}': '{reference_param}' cannot reference \
+                                 {t} (its targets are {})",
+                                targets.join(", ")
+                            ),
+                        ));
+                    }
+                    vec![t.clone()]
+                }
+                // A definition without declared targets (an IG's SearchParameter
+                // that omits `target`, say): the resolver searches the type it
+                // infers from the parameter's name, so that is what the rest
+                // of the chain is judged against.
+                None if targets.is_empty() => {
+                    vec![helios_persistence::search::infer_target_type(
+                        reference_param,
+                    )]
+                }
+                None => targets,
+            };
+        }
+        let terminal = &hops[hops.len() - 1].target_param;
+        let judged: Vec<&String> = current.iter().filter(|t| known_type(t)).collect();
+        if judged.is_empty() || GLOBAL_SEARCH_PARAMS.contains(&terminal.as_str()) {
+            continue;
+        }
+        if !judged.iter().any(|t| lookup(t, terminal).is_some()) {
+            return Err(invalid(
+                display.clone(),
+                format!(
+                    "invalid chain '{display}': '{terminal}' is not a search parameter of {}",
+                    join_types(&judged)
+                ),
+            ));
+        }
+    }
+
+    for reverse in &query.reverse_chains {
+        validate_reverse_chain(resource_type, reverse, registry, "")?;
+    }
+    Ok(())
+}
+
+/// One level of a `_has` for [`validate_chained_params`]; `outer` is the key
+/// written before this level.
+fn validate_reverse_chain(
+    base_type: &str,
+    reverse: &ReverseChainedParameter,
+    registry: &SearchParameterRegistry,
+    outer: &str,
+) -> Result<(), RestError> {
+    let source = &reverse.source_type;
+    if registry.get_all_params(source).is_empty() {
+        return Ok(());
+    }
+    let level = format!("{outer}_has:{source}:{}:", reverse.reference_param);
+    let lookup = |name: &str| {
+        registry
+            .get_param(source, name)
+            .or_else(|| registry.get_param("Resource", name))
+    };
+    let display = || {
+        let (terminal, _) = reverse.terminal_param();
+        format!("{level}{terminal}")
+    };
+    let Some(def) = lookup(&reverse.reference_param) else {
+        return Err(RestError::InvalidParameter {
+            param: display(),
+            message: format!(
+                "invalid _has '{}': '{}' is not a search parameter of {source}",
+                display(),
+                reverse.reference_param
+            ),
+        });
+    };
+    if def.param_type != SearchParamType::Reference {
+        return Err(RestError::InvalidParameter {
+            param: display(),
+            message: format!(
+                "invalid _has '{}': '{}' is not a reference search parameter of {source}",
+                display(),
+                reverse.reference_param
+            ),
+        });
+    }
+    if let Some(targets) = def.target.as_deref()
+        && !targets.is_empty()
+        && !targets.iter().any(|t| t == base_type)
+    {
+        return Err(RestError::InvalidParameter {
+            param: display(),
+            message: format!(
+                "invalid _has '{}': {source}.{} cannot reference {base_type} (its targets are {})",
+                display(),
+                reverse.reference_param,
+                targets.join(", ")
+            ),
+        });
+    }
+    if let Some(nested) = &reverse.nested {
+        return validate_reverse_chain(source, nested, registry, &level);
+    }
+    let (terminal, _) = reverse.terminal_param();
+    if !GLOBAL_SEARCH_PARAMS.contains(&terminal) && lookup(terminal).is_none() {
+        return Err(RestError::InvalidParameter {
+            param: display(),
+            message: format!(
+                "invalid _has '{}': '{terminal}' is not a search parameter of {source}",
+                display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn join_types(types: &[&String]) -> String {
+    types
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// Returns warnings for `_sort` directives the backends cannot honor (#958).
@@ -962,6 +1256,25 @@ mod tests {
                 SearchParamType::Number,
                 "RiskAssessment",
             ),
+            (
+                "StructureDefinition-url",
+                "url",
+                SearchParamType::Uri,
+                "StructureDefinition",
+            ),
+            (
+                "StructureDefinition-version",
+                "version",
+                SearchParamType::Token,
+                "StructureDefinition",
+            ),
+            (
+                "StructureDefinition-base",
+                "base",
+                SearchParamType::Uri,
+                "StructureDefinition",
+            ),
+            ("Device-url", "url", SearchParamType::Uri, "Device"),
         ];
         for (id, code, ty, base) in entries {
             r.register(
@@ -976,6 +1289,280 @@ mod tests {
             .unwrap();
         }
         r
+    }
+
+    /// H8e: `url=X|V` is url=X AND version=V on a canonical resource; `url=X`
+    /// alone, a trailing `|`, another uri parameter, a modifier, and a type
+    /// without a `version` parameter are left as written; several
+    /// alternatives with a version are a `400`.
+    #[test]
+    fn test_versioned_canonical_url_is_split_into_url_and_version() {
+        let registry = test_registry();
+        let sp = |pairs: &[(&str, &str)]| {
+            SearchParams::from_pairs(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let build = |pairs: &[(&str, &str)]| {
+            build_search_query("StructureDefinition", &sp(pairs), &registry)
+        };
+        fn values(p: &SearchParameter) -> Vec<&str> {
+            p.values.iter().map(|v| v.value.as_str()).collect()
+        }
+
+        let q = build(&[("url", "http://x/sd|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 2);
+        assert_eq!(q.parameters[0].name, "url");
+        assert_eq!(q.parameters[0].param_type, SearchParamType::Uri);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+        assert_eq!(q.parameters[1].name, "version");
+        assert_eq!(q.parameters[1].param_type, SearchParamType::Token);
+        assert_eq!(values(&q.parameters[1]), ["1.0.0"]);
+
+        let q = build(&[("url", "http://x/sd")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+
+        let q = build(&[("url", "http://x/sd|")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+
+        // Several unversioned alternatives are fine; a versioned one among
+        // several is not.
+        let q = build(&[("url", "http://x/a,http://x/b")]).unwrap();
+        assert_eq!(values(&q.parameters[0]), ["http://x/a", "http://x/b"]);
+        let err = build(&[("url", "http://x/a|1,http://x/b")]).unwrap_err();
+        assert!(matches!(err, RestError::InvalidParameter { param, .. } if param == "url"));
+
+        // `base=X|V` names the base's version: untouched.
+        let q = build(&[("base", "http://x/base|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/base|1.0.0"]);
+
+        // A modifier is left alone too.
+        let q = build(&[("url:below", "http://x/sd|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd|1.0.0"]);
+
+        // No `version` parameter on Device.
+        let q = build_search_query("Device", &sp(&[("url", "http://x/d|2")]), &registry).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/d|2"]);
+    }
+
+    /// Registry for the chain-validation tests: reference parameters with
+    /// declared targets, and a target type (`Group`) with no parameters.
+    fn chain_registry() -> SearchParameterRegistry {
+        let mut r = SearchParameterRegistry::new();
+        let def = |id: &str, code: &str, ty, base: &str| {
+            SearchParameterDefinition::new(
+                format!("http://hl7.org/fhir/SearchParameter/{id}"),
+                code,
+                ty,
+                "ignored",
+            )
+            .with_base(vec![base])
+        };
+        for d in [
+            def(
+                "Observation-code",
+                "code",
+                SearchParamType::Token,
+                "Observation",
+            ),
+            def(
+                "Observation-status",
+                "status",
+                SearchParamType::Token,
+                "Observation",
+            ),
+            def(
+                "Observation-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Observation",
+            )
+            .with_targets(["Patient", "Group"]),
+            def(
+                "Observation-encounter",
+                "encounter",
+                SearchParamType::Reference,
+                "Observation",
+            )
+            .with_targets(["Encounter"]),
+            def("Patient-name", "name", SearchParamType::String, "Patient"),
+            def(
+                "Patient-general-practitioner",
+                "general-practitioner",
+                SearchParamType::Reference,
+                "Patient",
+            )
+            .with_targets(["Practitioner", "Organization"]),
+            def(
+                "Practitioner-name",
+                "name",
+                SearchParamType::String,
+                "Practitioner",
+            ),
+            def(
+                "Organization-name",
+                "name",
+                SearchParamType::String,
+                "Organization",
+            ),
+            def(
+                "Encounter-status",
+                "status",
+                SearchParamType::Token,
+                "Encounter",
+            ),
+            def(
+                "Encounter-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Encounter",
+            )
+            .with_targets(["Patient", "Group"]),
+            def(
+                "Encounter-service-provider",
+                "service-provider",
+                SearchParamType::Reference,
+                "Encounter",
+            )
+            .with_targets(["Organization"]),
+            // No declared targets: followed to the inferred type (Patient).
+            def(
+                "Condition-subject",
+                "subject",
+                SearchParamType::Reference,
+                "Condition",
+            ),
+        ] {
+            r.register(d).unwrap();
+        }
+        r
+    }
+
+    /// Two-level chains and `_has` are checked hop by hop: an unknown or
+    /// non-reference hop, a `:[type]` outside the declared targets, and an
+    /// unknown terminal are each a `400` naming the chain; a valid chain, a
+    /// global terminal (`_id`) and a hop into a type the registry knows
+    /// nothing about pass.
+    #[test]
+    fn test_validate_chained_params() {
+        let registry = chain_registry();
+        let check = |resource_type: &str, key: &str| {
+            let params = SearchParams::from_pairs(vec![(key.to_string(), "x".to_string())]);
+            let query = build_search_query(resource_type, &params, &registry).unwrap();
+            validate_chained_params(resource_type, &query, &registry)
+        };
+        let message = |r: Result<(), RestError>| match r {
+            Err(RestError::InvalidParameter { message, .. }) => message,
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        };
+
+        for key in [
+            "subject.name",
+            "subject:Patient.name",
+            "subject.general-practitioner.name",
+            "subject:Patient.general-practitioner:Organization.name",
+            "encounter.service-provider.name",
+            "encounter.subject.general-practitioner.name",
+            "subject.general-practitioner._id",
+            "subject._lastUpdated",
+            // `Group` has no registered parameters: not judged.
+            "subject:Group.nosuch",
+            "subject:Group.nosuch.deeper",
+            // The first hop is `unknown_search_params`' business.
+            "nosuchref.name",
+        ] {
+            assert!(check("Observation", key).is_ok(), "{key}");
+        }
+
+        let m = message(check("Observation", "subject.nosuch.name"));
+        assert!(m.contains("invalid chain 'subject.nosuch.name'"), "{m}");
+        assert!(
+            m.contains("'nosuch' is not a search parameter of Patient"),
+            "{m}"
+        );
+
+        let m = message(check("Observation", "subject.name.foo"));
+        assert!(
+            m.contains("'name' is not a reference search parameter"),
+            "{m}"
+        );
+
+        let m = message(check("Observation", "subject:Practitioner.name"));
+        assert!(m.contains("'subject' cannot reference Practitioner"), "{m}");
+        assert!(m.contains("Patient, Group"), "{m}");
+
+        let m = message(check("Observation", "subject.general-practitioner.nosuch"));
+        assert!(
+            m.contains("'nosuch' is not a search parameter of Practitioner / Organization"),
+            "{m}"
+        );
+
+        let m = message(check("Observation", "encounter.service-provider.nosuch"));
+        assert!(
+            m.contains("invalid chain 'encounter.service-provider.nosuch'"),
+            "{m}"
+        );
+
+        // A reference parameter without declared targets is judged against the
+        // type the resolver infers from its name.
+        assert!(check("Condition", "subject.name").is_ok());
+        assert!(check("Condition", "subject.general-practitioner.name").is_ok());
+        let m = message(check("Condition", "subject.nosuch.name"));
+        assert!(
+            m.contains("'nosuch' is not a search parameter of Patient"),
+            "{m}"
+        );
+
+        // `_has`.
+        for (resource_type, key) in [
+            ("Patient", "_has:Observation:subject:code"),
+            ("Patient", "_has:Observation:subject:_id"),
+            (
+                "Patient",
+                "_has:Encounter:subject:_has:Observation:encounter:code",
+            ),
+            // `Group` has no parameters: not judged.
+            ("Patient", "_has:Group:member:nosuch"),
+        ] {
+            assert!(check(resource_type, key).is_ok(), "{key}");
+        }
+        let m = message(check("Patient", "_has:Observation:nosuch:code"));
+        assert!(
+            m.contains("'nosuch' is not a search parameter of Observation"),
+            "{m}"
+        );
+        let m = message(check("Patient", "_has:Observation:code:status"));
+        assert!(
+            m.contains("'code' is not a reference search parameter of Observation"),
+            "{m}"
+        );
+        let m = message(check("Patient", "_has:Observation:subject:nosuch"));
+        assert!(
+            m.contains("'nosuch' is not a search parameter of Observation"),
+            "{m}"
+        );
+        let m = message(check("Observation", "_has:Encounter:subject:status"));
+        assert!(
+            m.contains("Encounter.subject cannot reference Observation"),
+            "{m}"
+        );
+        // The nested level is checked too, and named in full.
+        let m = message(check(
+            "Patient",
+            "_has:Encounter:subject:_has:Observation:encounter:nosuch",
+        ));
+        assert!(
+            m.contains("'_has:Encounter:subject:_has:Observation:encounter:nosuch'"),
+            "{m}"
+        );
     }
 
     #[test]

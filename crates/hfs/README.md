@@ -102,7 +102,11 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `HFS_CORS_METHODS` | GET,POST,PUT,DELETE,OPTIONS | Allowed HTTP methods |
 | `HFS_CORS_HEADERS` | Content-Type,Authorization,X-Requested-With | Allowed headers |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
-| `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for `:in`/`:not-in` modifiers and FHIRPath `memberOf()`/`subsumes()` |
+| `HFS_TERMINOLOGY_SERVER` | (none) | Terminology server URL for the `:in`/`:not-in`/token `:above`/`:below` search modifiers and FHIRPath `memberOf()`/`subsumes()` |
+| `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: `closed` (error), `empty` (match nothing) or `open` (drop the parameter) |
+| `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used by search modifiers |
+| `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else `422 too-costly`) |
+| `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; `0` disables |
 | `HFS_TERMINOLOGY_PUBLIC_URL` | (none) | Browser-reachable URL for the web UI's Terminology link; defaults to `/ui/hts` when `HFS_TERMINOLOGY_SERVER` is an internal host |
 | `HFS_ADMIN_UI` | false | Enables FHIR package (IG) administration: the `/admin/packages` API and the console's IG Packages page (`/ui/packages`). Off by default; see [IG packages](../../docs/ops/ig-packages.md) |
 | `HFS_PACKAGE_REGISTRY` | on | Package sources: `on` (packages.fhir.org, then packages2.fhir.org), `off` (no network: upload and cache only), or comma-separated npm-compatible mirror URLs |

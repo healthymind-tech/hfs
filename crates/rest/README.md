@@ -88,6 +88,8 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | reindex (type) | POST | `/[type]/$reindex` |
 | reindex status | GET | `/$reindex-status/[job_id]` |
 | reindex cancel | DELETE | `/$reindex-status/[job_id]` |
+| meta (system / type / instance) | GET/POST | `/$meta`, `/[type]/$meta`, `/[type]/[id]/$meta` |
+| meta-add / meta-delete | POST | `/[type]/[id]/$meta-add`, `/[type]/[id]/$meta-delete` |
 
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
@@ -191,6 +193,23 @@ Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
 `0` / `4` / `8`) — each attributed to the requesting principal.
 
+### `$meta`, `$meta-add`, `$meta-delete`
+
+`GET|POST /$meta`, `/[type]/$meta` and `/[type]/[id]/$meta` answer a
+`Parameters` whose `return` parameter is a `Meta`: the resource's own `meta`
+at instance level, and at type / system level every profile, tag and
+security label in use on live resources (read from the search index, so it is
+what `_profile=` / `_tag=` / `_security=` would match; backends without a
+queryable index answer `501`).
+
+`POST /[type]/[id]/$meta-add` and `$meta-delete` take a `Parameters` with one
+`meta` parameter (`valueMeta`) and add or remove its `profile`, `security` and
+`tag` entries — Codings match on `system` + `code`, profiles on the canonical
+string. Like HAPI, the change is stored as a **new version** of the resource
+(`meta.versionId` advances, the change appears in `_history`, tag searches see
+it at once) even though nothing but `meta` changed; an input that changes
+nothing stores nothing. Both answer the resulting `Meta`.
+
 ### `Patient/$everything`
 
 `GET|POST /Patient/{id}/$everything` and `GET|POST /Patient/$everything`.
@@ -232,6 +251,63 @@ The server is configured via environment variables:
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+| `HFS_TERMINOLOGY_SERVER` | - | Terminology server for the `:in` / `:not-in` / token `:above` / `:below` search modifiers (see below) |
+| `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet / hierarchy expansion fails: `closed` (the search fails with an OperationOutcome), `empty` (the parameter matches nothing), `open` (the parameter is dropped; returns a superset) |
+| `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) for search modifiers; keep it below the terminology server's expansion limit (`HTS_MAX_EXPANSION_SIZE`) |
+| `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into; larger ones fail as `422 too-costly` |
+| `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long a successful expansion is reused by identical searches; `0` disables the cache |
+
+### Terminology-backed search modifiers
+
+With `HFS_TERMINOLOGY_SERVER` set, the token modifiers that need a
+terminology server are answered by expanding through its `ValueSet/$expand`
+and searching the codes:
+
+| Search | Expansion | Runs as |
+|--------|-----------|---------|
+| `code:in=<ValueSet url>` or `<url>\|<version>` | `url` (+ `valueSetVersion`) | `code=sys\|a,sys\|b,…` |
+| `code:not-in=<ValueSet url>` | the same | `code:not=sys\|a,sys\|b,…` — resources with **no** code in the set; an empty ValueSet excludes nothing |
+| `code:below=<system>\|<code>` | inline ValueSet, `is-a` filter | the code and its descendants |
+| `code:above=<system>\|<code>` | inline ValueSet, `generalizes` filter | the code and its ancestors |
+
+Every expansion is requested **flat** (`excludeNested=true`) and **paged**
+(`count` = `HFS_SEARCH_EXPANSION_PAGE_SIZE`, `offset` until `total`), so a
+ValueSet defined by an `is-a` filter yields the whole subtree rather than a
+tree whose top level is the root concept alone, and a large ValueSet stays
+below the terminology server's own expansion limit. Nested `contains` are
+flattened anyway. A comma-separated value (`code:in=vs1,vs2`) is the union of
+its alternatives. Successful expansions are cached for
+`HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`. The same applies to the terminal
+parameter of a chained or `_has` search (`subject:Patient.gender:in=…`,
+`_has:Observation:subject:code:not-in=…`).
+
+A search whose expansion **fails** does not quietly return a superset. With
+the default `HFS_SEARCH_TERMINOLOGY_FAIL=closed` it fails with an
+`OperationOutcome` naming the parameter and the cause:
+
+| Cause | Status |
+|-------|--------|
+| ValueSet / code system / code unknown to the terminology server (its `404`, or a `400`) | `400 invalid` |
+| Expansion over `HFS_SEARCH_EXPANSION_MAX_CODES`, or the terminology server's `422 too-costly` | `422` |
+| Terminology server unreachable, timed out, `5xx` or unparseable | `503 transient` |
+
+`empty` makes the parameter match nothing instead; `open` restores the
+pre-fork behaviour (the parameter is dropped with a warning in the log).
+Without `HFS_TERMINOLOGY_SERVER` these modifiers are `501`. An empty
+expansion matches nothing (`:in`, `:below`, `:above`) or excludes nothing
+(`:not-in`).
+
+### Versioned canonical search
+
+On a resource type with a `version` search parameter (StructureDefinition,
+ValueSet, CodeSystem, ConceptMap, Questionnaire, SearchParameter, …),
+`url=<canonical>|<version>` is searched as `url=<canonical>` **and**
+`version=<version>`; `url=<canonical>` alone matches every version. A
+versioned canonical cannot be one of several comma-separated alternatives
+(`400`; use `url=X&version=V`). Only the `url` parameter is rewritten — on
+`base=` or `reference=` a `|version` names the referenced artifact's version.
+`url:below=http://acme.org/fhir/` (a trailing slash, as in the spec's example)
+matches `http://acme.org/fhir/ValueSet/123` on every SQL backend.
 
 ### Batch entry concurrency
 

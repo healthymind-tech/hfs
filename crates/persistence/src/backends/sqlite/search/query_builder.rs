@@ -101,7 +101,7 @@ pub struct SqlFragment {
 }
 
 /// A bound SQL parameter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SqlParam {
     /// String parameter.
     String(String),
