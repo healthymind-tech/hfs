@@ -36,6 +36,7 @@ use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
 use crate::extractors::{
     SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+    validate_chained_params,
 };
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
@@ -421,6 +422,9 @@ where
         // `:[type]` qualifier cannot name a type only another version has.
         let built =
             build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
+        // A chain through a parameter the registry does not know (`subject.nosuch.name`)
+        // is a `400` here, not a silent empty searchset from the resolver.
+        validate_chained_params(resource_type, &built, &registry)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort

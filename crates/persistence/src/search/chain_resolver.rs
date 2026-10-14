@@ -2523,7 +2523,7 @@ mod tests {
 /// the longer-term fix is to pick the first declared target from the
 /// SearchParameter registry. Keeping it in one place is the prerequisite for that
 /// migration.
-pub(crate) fn infer_target_type(ref_param: &str) -> String {
+pub fn infer_target_type(ref_param: &str) -> String {
     match ref_param {
         "patient" | "subject" => "Patient".to_string(),
         "practitioner" | "performer" | "requester" | "author" => "Practitioner".to_string(),
