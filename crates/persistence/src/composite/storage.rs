@@ -963,6 +963,11 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn package_store(&self) -> Option<Arc<dyn crate::core::PackageStore>> {
+        // Bookkeeping lives with the primary store, where all writes land.
+        self.primary.package_store()
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,

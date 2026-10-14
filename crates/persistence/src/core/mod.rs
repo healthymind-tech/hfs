@@ -105,6 +105,7 @@ pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod history;
+pub mod package_registry;
 pub mod patch;
 pub mod patient_compartment;
 pub mod preconditions;
@@ -165,6 +166,10 @@ pub use capabilities::{
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+};
+pub use package_registry::{
+    OwnedPackageResource, PackageRecord, PackageResourceRecord, PackageStore, TARGET_HFS,
+    TARGET_HTS,
 };
 pub use patch::{PatchError, apply_patch, apply_patch_for_version, decode_bundle_patch_resource};
 pub use preconditions::{

@@ -226,6 +226,10 @@ impl ResourceStorage for SqliteBackend {
         Some(std::sync::Arc::new(SqliteInDbRunner::new(self.pool())))
     }
 
+    fn package_store(&self) -> Option<std::sync::Arc<dyn crate::core::PackageStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

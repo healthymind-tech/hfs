@@ -708,6 +708,16 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the installed-package registry this backend persists, if any
+    /// (see [`crate::core::package_registry`]).
+    ///
+    /// SQLite and PostgreSQL keep it in their own database; composites
+    /// delegate to their primary. The default `None` makes the package
+    /// manager fall back to a JSON file in the data directory.
+    fn package_store(&self) -> Option<Arc<dyn crate::core::PackageStore>> {
+        None
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the
