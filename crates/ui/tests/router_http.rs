@@ -8364,6 +8364,47 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
     );
 }
 
+/// The Batch page's paste mode and live checks ride on the shell: the mode
+/// tabs, the editor, the check report, and the shared check script and its
+/// messages.
+#[tokio::test]
+async fn batch_page_offers_paste_mode_checks_and_validation() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="batch-mode-file" role="tab" aria-selected="true""#));
+    assert!(html.contains(r#"id="batch-mode-paste" role="tab" aria-selected="false""#));
+    assert!(html.contains(r#"<textarea class="json-editor batch-paste__source" id="batch-paste""#));
+    assert!(html.contains(r#"id="batch-format""#));
+    assert!(html.contains(r#"id="batch-continue" disabled"#));
+    assert!(html.contains(r#"id="batch-check" aria-live="polite" hidden"#));
+    assert!(html.contains(r#"data-msg-bad-method="Entry %entry%: request.method"#));
+    assert!(html.contains(r#"data-msg-check-at="line %line%, col %col%""#));
+    let check = html
+        .find(r#"src="/ui/assets/bundle-check.js""#)
+        .expect("check");
+    let page = html.find(r#"src="/ui/assets/batch.js""#).expect("batch");
+    assert!(check < page, "the helper loads before the page script");
+
+    for (asset, needle) in [
+        ("bundle-check.js", "window.HfsBundleCheck"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/assets/{asset}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{asset}");
+        assert!(body_text(response).await.contains(needle), "{asset}");
+    }
+}
+
 /// The theme switcher is one shared button with a translated, mode-specific
 /// label in every locale.
 #[tokio::test]

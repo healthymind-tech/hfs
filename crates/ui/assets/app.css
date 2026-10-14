@@ -7055,6 +7055,139 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
 }
 
+/* ---- Batch: file / paste modes, live checks, validate (p1-ui) ---- */
+
+.card > .batch-modes {
+  margin: 12px 0 14px;
+}
+
+.batch-tab .icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.batch-paste__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.batch-paste__hint {
+  font-size: 12px;
+}
+
+/* The plain textarea is the no-JS / no-CodeMirror fallback: monospace with
+   the mounted editor's own footprint (`.editor__doc .cm-editor`). */
+.batch-paste__doc textarea.json-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+
+.batch-check {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.batch-check h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.batch-check__ok {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--ok);
+}
+
+.batch-check__group {
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+}
+
+.batch-check__group--error {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+.batch-check__group--warning {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.batch-check__group ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.batch-check__count {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.batch-check__at {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+button.batch-check__at {
+  min-height: 24px;
+  cursor: pointer;
+}
+
+.batch-check__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+}
+
+.batch-check__total {
+  flex-basis: 100%;
+  margin: 0;
+  font-weight: 600;
+}
+
+.batch-check__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.batch-check__blocked {
+  font-size: 12px;
+  margin-right: auto;
+}
+
+.batch-preflight-warnings ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
 /* The card head's right-hand cluster (#729): created count beside the
    status badge. */
 .card-head__meta {
