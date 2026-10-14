@@ -665,18 +665,23 @@ impl QueryBuilder {
             .collect::<Vec<_>>()
             .join(", ");
 
+        // The versioned forms are matched by the same seekable range as a
+        // `Type/id` search. The `= ? OR LIKE ? || '/_history/%'` this used to
+        // carry could not seek: the LIKE is case-insensitive, so the planner
+        // walked every reference row of the membership params (all of a
+        // type's patient references, ~30 ms per `$everything` segment on the
+        // benchmark data, against ~0.1 ms for the seek), and it matched a
+        // differently-cased id's versions besides.
         let base = strip_reference_version(&comp.reference);
-        let p1 = param_offset + 1;
-        let p2 = param_offset + 2;
+        let range = ReferenceHandler::versioned_reference_predicate(param_offset + 1);
 
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
-                 AND value_reference IS NOT NULL \
-                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+                 AND {range})"
             ),
-            vec![SqlParam::string(base), SqlParam::string(base)],
+            vec![SqlParam::string(base)],
         ))
     }
 
