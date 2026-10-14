@@ -155,10 +155,6 @@ mod inner {
     /// normalized rows before re-importing, so a failure part-way through leaves
     /// storage genuinely changed, and caches must be dropped anyway. The
     /// invariant is that a cache may be colder than storage, never hotter.
-    // `replace_id` is consumed only by the SQLite delete-then-reimport branch;
-    // a postgres-only build would otherwise trip `unused_variables` under the
-    // workspace's deny-warnings clippy job.
-    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
     async fn hts_reindex<B: TerminologyBackend>(
         state: &AppState<B>,
         resource_type: &'static str,
@@ -211,9 +207,16 @@ mod inner {
             return joined;
         }
 
-        // PostgreSQL: `import_bundle` upserts by URL, so no explicit delete is
-        // needed for the update path.
+        // PostgreSQL: same contract as the SQLite branch — the update path
+        // drops the replaced resource's rows first (so concepts the new
+        // content no longer has go away), then the importer re-indexes it and
+        // rebuilds the closure of the now-empty CodeSystem.
         if let Some(importer) = state.terminology_importer.clone() {
+            if let Some(ref resource_id) = replace_id {
+                importer
+                    .delete_normalized_by_id(resource_type, resource_id)
+                    .await?;
+            }
             return hts_reindex_via_importer(&*importer, resource_type, content, ctx).await;
         }
 
@@ -512,12 +515,6 @@ mod inner {
         if stored.is_none() && normalized.is_none() {
             return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
         }
-        let resource_url: Option<String> = stored
-            .as_ref()
-            .or(normalized.as_ref())
-            .and_then(|r| r.get("url"))
-            .and_then(|u| u.as_str())
-            .map(str::to_owned);
 
         // 2. Soft-delete in the persistence store (when it holds the resource).
         if stored.is_some() {
@@ -555,17 +552,13 @@ mod inner {
             })
             .await
             .map_err(|e| HtsError::Internal(e.to_string()))?;
-        } else if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        } else if let Some(importer) = terminology_importer.as_deref() {
+            removed = importer.delete_normalized_by_id(resource_type, &id).await;
         }
 
         #[cfg(not(feature = "sqlite"))]
-        if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        if let Some(importer) = terminology_importer.as_deref() {
+            removed = importer.delete_normalized_by_id(resource_type, &id).await;
         }
 
         // Evict both cache tiers so a deleted ValueSet (and any CodeSystem whose

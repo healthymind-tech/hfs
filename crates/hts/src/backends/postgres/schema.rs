@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS code_systems (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
 CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
+-- CRUD and `/CodeSystem/{id}` resolve a FHIR id through the stored resource
+-- (`resource_json->>'id'`), since multi-version rows carry synthetic ids.
+CREATE INDEX IF NOT EXISTS idx_code_systems_json_id ON code_systems ((resource_json->>'id'));
+CREATE INDEX IF NOT EXISTS idx_code_systems_id_base ON code_systems (split_part(id, '|', 1));
 
 -- Legacy installs created code_systems with `url TEXT NOT NULL UNIQUE`, which
 -- bakes uniqueness into a hidden constraint that blocks multi-version imports.
@@ -146,6 +150,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
 CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
+-- FHIR-id resolution of versioned rows (`<id>|<version>` storage ids).
+CREATE INDEX IF NOT EXISTS idx_value_sets_json_id ON value_sets ((resource_json->>'id'));
+CREATE INDEX IF NOT EXISTS idx_value_sets_id_base ON value_sets (split_part(id, '|', 1));
 
 -- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
 -- code_systems above had it removed: tx-ecosystem ships per-version VS
@@ -211,6 +218,13 @@ CREATE TABLE IF NOT EXISTS concept_map_elements (
 );
 CREATE INDEX IF NOT EXISTS idx_map_source
     ON concept_map_elements(map_id, source_system, source_code);
+-- Forward and reverse $translate by code without a map url (the common
+-- `system`+`code` form): without these every such request scans every
+-- ConceptMap element. Same indexes as the SQLite schema.
+CREATE INDEX IF NOT EXISTS idx_map_elements_source_code
+    ON concept_map_elements(source_code, source_system, map_id);
+CREATE INDEX IF NOT EXISTS idx_map_elements_target_code
+    ON concept_map_elements(target_code, target_system, map_id);
 
 -- ── Transitive ancestor closure ────────────────────────────────────────────────
 -- Precomputed (ancestor, descendant) pairs for every code system, including
@@ -227,6 +241,18 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+
+-- ── Reference set membership ──────────────────────────────────────────────────
+-- Active members of SNOMED CT Simple reference sets (RF2
+-- der2_Refset_Simple*): ECL `^ refset` and `?fhir_vs=refset/<id>` read it.
+-- Replaced per system on re-import; goes with the CodeSystem row. Mirrors the
+-- SQLite table of the same name.
+CREATE TABLE IF NOT EXISTS refset_members (
+    system_id       TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    refset_id       TEXT NOT NULL,
+    referenced_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, refset_id, referenced_code)
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -376,12 +402,63 @@ pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres
     client
         .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
         .await?;
-    let result = client.batch_execute(SCHEMA).await;
+    let result = apply_if_changed(client).await;
     // Always release the lock, even if schema apply failed.
     let _ = client
         .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
         .await;
     result
+}
+
+/// Fingerprint of [`SCHEMA`] (FNV-1a), recorded once the DDL has been applied.
+fn schema_fingerprint() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in SCHEMA.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Run [`SCHEMA`] unless this exact DDL has already been applied to the
+/// database.
+///
+/// Re-running it is idempotent but not free: `ALTER TABLE … ADD COLUMN IF NOT
+/// EXISTS` and the `DO` blocks take `ACCESS EXCLUSIVE` locks even when they end
+/// up doing nothing, and the whole script runs as one implicit transaction. A
+/// server starting while another process writes (a second replica, a running
+/// `hts import`) could then deadlock against it, and every start paid for
+/// the DDL. The fingerprint row makes an up-to-date database a single
+/// lookup; any change to the DDL text re-applies it.
+async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hts_schema_meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             )",
+        )
+        .await?;
+    let fingerprint = schema_fingerprint();
+    let current: Option<String> = client
+        .query_opt(
+            "SELECT value FROM hts_schema_meta WHERE key = 'schema_fingerprint'",
+            &[],
+        )
+        .await?
+        .map(|r| r.get(0));
+    if current.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    client.batch_execute(SCHEMA).await?;
+    client
+        .execute(
+            "INSERT INTO hts_schema_meta (key, value) VALUES ('schema_fingerprint', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            &[&fingerprint],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Backfill `version_sort` for every versioned `code_systems` / `value_sets`

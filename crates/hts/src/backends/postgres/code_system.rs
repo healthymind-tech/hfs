@@ -1011,86 +1011,14 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
     async fn search(
         &self,
         _ctx: &TenantContext,
-        mut query: ResourceSearchQuery,
+        query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let string_search = crate::string_search::ResourceStringSearch::new(&query);
-        if string_search.is_empty() {
-            query.name = None;
-            query.title = None;
-        }
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        if !string_search.is_empty() {
-            return super::search_resources(
-                &mut client,
-                "code_systems",
-                "CodeSystem",
-                query,
-                string_search,
-            )
-            .await;
-        }
-
-        let limit = i64::from(query.count.unwrap_or(20));
-        let offset = i64::from(query.offset.unwrap_or(0));
-
-        let rows = client
-            .query(
-                "SELECT id, url, version, name, title, status, resource_json
-                 FROM code_systems
-                 WHERE ($1::text IS NULL OR url = $1)
-                   AND ($2::text IS NULL OR version = $2)
-                   AND ($3::text IS NULL OR name = $3)
-                   AND ($4::text IS NULL OR title = $4)
-                   AND ($5::text IS NULL OR status = $5)
-                 ORDER BY created_at
-                 LIMIT $6 OFFSET $7",
-                &[
-                    &query.url,
-                    &query.version,
-                    &query.name,
-                    &query.title,
-                    &query.status,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get(0);
-            let url: String = row.get(1);
-            let version: Option<String> = row.get(2);
-            let name: Option<String> = row.get(3);
-            let title: Option<String> = row.get(4);
-            let status: String = row.get(5);
-            let resource_json: Option<serde_json::Value> = row.get(6);
-
-            let mut resource = resource_json.unwrap_or_else(|| {
-                build_synthetic_resource(
-                    "CodeSystem",
-                    &id,
-                    &url,
-                    version.as_deref(),
-                    name.as_deref(),
-                    title.as_deref(),
-                    &status,
-                )
-            });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-            }
-            results.push(resource);
-        }
-        Ok(results)
+        super::search_table(&mut client, "code_systems", "CodeSystem", query, true).await
     }
 
     async fn concept_resource_entries(

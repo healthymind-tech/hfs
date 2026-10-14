@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::error::HtsError;
 use crate::implicit_vs::{ImplicitVsPattern, parse_implicit_vs_url};
@@ -34,25 +34,23 @@ use super::{PostgresTerminologyBackend, error_chain};
 // Bounded to `CLOSURE_COUNT_CACHE_MAX` (16384) to mirror the existing
 // `PG_COMPOSE_CACHE_MAX` pattern — once full, new entries are silently
 // dropped. The bench pool is ~100 unique roots per system, far under the cap.
-#[allow(clippy::type_complexity)]
-static CLOSURE_COUNT_CACHE: OnceLock<Arc<RwLock<HashMap<(String, String), u32>>>> = OnceLock::new();
-
-pub(super) fn closure_count_cache() -> &'static Arc<RwLock<HashMap<(String, String), u32>>> {
-    CLOSURE_COUNT_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-}
+//
+// Per backend instance (not process-global): two backends on different
+// databases in one process must not share counts keyed by storage id.
+pub(super) type ClosureCountCache = Arc<RwLock<HashMap<(String, String), u32>>>;
 
 const CLOSURE_COUNT_CACHE_MAX: usize = 16384;
 
-fn closure_count_get(system_id: &str, root_code: &str) -> Option<u32> {
-    closure_count_cache()
+fn closure_count_get(cache: &ClosureCountCache, system_id: &str, root_code: &str) -> Option<u32> {
+    cache
         .read()
         .ok()?
         .get(&(system_id.to_owned(), root_code.to_owned()))
         .copied()
 }
 
-fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
-    if let Ok(mut g) = closure_count_cache().write() {
+fn closure_count_put(cache: &ClosureCountCache, system_id: &str, root_code: &str, count: u32) {
+    if let Ok(mut g) = cache.write() {
         if g.len() >= CLOSURE_COUNT_CACHE_MAX {
             return;
         }
@@ -78,7 +76,7 @@ fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
 //
 // Keyed by `fnv64(url | value_set_version)`. Cleared on import via
 // `clear_response_caches`. Bounded to `CLOSURE_PREFIX_CACHE_MAX`.
-pub(super) struct RootPrefix {
+pub(crate) struct RootPrefix {
     system: String,
     /// Total descendant count (closure rows for this ancestor).
     total: u32,
@@ -94,21 +92,17 @@ pub(super) struct RootPrefix {
 /// other callers while keeping the cold prefix fetch and memory bounded.
 const CLOSURE_PREFIX_LEN: usize = 4096;
 
-#[allow(clippy::type_complexity)]
-static CLOSURE_PREFIX_CACHE: OnceLock<Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>>> = OnceLock::new();
-
-pub(super) fn root_prefix_cache() -> &'static Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>> {
-    CLOSURE_PREFIX_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-}
+/// Per backend instance, like [`ClosureCountCache`].
+pub(super) type RootPrefixCache = Arc<RwLock<HashMap<u64, Arc<RootPrefix>>>>;
 
 const CLOSURE_PREFIX_CACHE_MAX: usize = 16384;
 
-fn root_prefix_get(key: u64) -> Option<Arc<RootPrefix>> {
-    root_prefix_cache().read().ok()?.get(&key).cloned()
+fn root_prefix_get(cache: &RootPrefixCache, key: u64) -> Option<Arc<RootPrefix>> {
+    cache.read().ok()?.get(&key).cloned()
 }
 
-fn root_prefix_put(key: u64, rp: Arc<RootPrefix>) {
-    if let Ok(mut g) = root_prefix_cache().write() {
+fn root_prefix_put(cache: &RootPrefixCache, key: u64, rp: Arc<RootPrefix>) {
+    if let Ok(mut g) = cache.write() {
         if g.len() >= CLOSURE_PREFIX_CACHE_MAX {
             return;
         }
@@ -265,7 +259,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     && req.tx_resources.is_empty()
                 {
                     let key = build_root_prefix_key(url, req.value_set_version.as_deref());
-                    if let Some(rp) = root_prefix_get(key) {
+                    if let Some(rp) = root_prefix_get(&self.root_prefix_cache, key) {
                         if let Some(resp) =
                             serve_root_prefix(&rp, req.offset.unwrap_or(0), count, req.offset)
                         {
@@ -295,7 +289,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // normal SNOMED hierarchy filter (mirrors sqlite's
             // `implicit_short_circuit` at backends/sqlite/value_set.rs).
             if let Some((cs_url, pattern)) = parse_implicit_vs_url(url) {
-                reject_ecl_pattern(&pattern)?;
                 // Resolve once and keep the id around: the iter 7k fast path
                 // below needs it for the closure-table query, and the
                 // existing slow path needs the existence check to reject
@@ -401,7 +394,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // COUNT(*) (invariant for the import lifetime).
                     let total: u32 = if complete {
                         prefix.len() as u32
-                    } else if let Some(c) = closure_count_get(&system_id, &root_code) {
+                    } else if let Some(c) =
+                        closure_count_get(&self.closure_count_cache, &system_id, &root_code)
+                    {
                         c
                     } else {
                         let total_row = client
@@ -415,7 +410,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         let c: i64 = total_row.get(0);
                         c.max(0) as u32
                     };
-                    closure_count_put(&system_id, &root_code, total);
+                    closure_count_put(&self.closure_count_cache, &system_id, &root_code, total);
 
                     let rp = Arc::new(RootPrefix {
                         system: cs_url.clone(),
@@ -424,6 +419,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         complete,
                     });
                     root_prefix_put(
+                        &self.root_prefix_cache,
                         build_root_prefix_key(url, req.value_set_version.as_deref()),
                         Arc::clone(&rp),
                     );
@@ -804,9 +800,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             // ancestor=root, self-link included); for
                             // `descendent-of` the strict-subtree total drops
                             // the root's own self-link.
-                            let raw_total: u32 = if let Some(c) =
-                                closure_count_get(&system_id_isa, &root_code_isa)
-                            {
+                            let raw_total: u32 = if let Some(c) = closure_count_get(
+                                &self.closure_count_cache,
+                                &system_id_isa,
+                                &root_code_isa,
+                            ) {
                                 c
                             } else {
                                 let total_row = client
@@ -819,7 +817,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                     .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                                 let c: i64 = total_row.get(0);
                                 let c = c.max(0) as u32;
-                                closure_count_put(&system_id_isa, &root_code_isa, c);
+                                closure_count_put(
+                                    &self.closure_count_cache,
+                                    &system_id_isa,
+                                    &root_code_isa,
+                                    c,
+                                );
                                 c
                             };
                             let total: u32 = if exclude_self {
@@ -1163,7 +1166,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 Err(HtsError::NotFound(_)) => {
                     // ?fhir_vs implicit ValueSet: targeted O(1)/O(depth) lookup.
                     if let Some((cs_url, pattern)) = parse_implicit_vs_url(&url) {
-                        reject_ecl_pattern(&pattern)?;
                         let found = validate_fhir_vs(
                             &client,
                             &cs_url,
@@ -1779,86 +1781,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
     async fn search(
         &self,
         _ctx: &TenantContext,
-        mut query: ResourceSearchQuery,
+        query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let string_search = crate::string_search::ResourceStringSearch::new(&query);
-        if string_search.is_empty() {
-            query.name = None;
-            query.title = None;
-        }
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        if !string_search.is_empty() {
-            return super::search_resources(
-                &mut client,
-                "value_sets",
-                "ValueSet",
-                query,
-                string_search,
-            )
-            .await;
-        }
-
-        let limit = i64::from(query.count.unwrap_or(20));
-        let offset = i64::from(query.offset.unwrap_or(0));
-
-        let rows = client
-            .query(
-                "SELECT id, url, version, name, title, status, resource_json
-                 FROM value_sets
-                 WHERE ($1::text IS NULL OR url = $1)
-                   AND ($2::text IS NULL OR version = $2)
-                   AND ($3::text IS NULL OR name = $3)
-                   AND ($4::text IS NULL OR title = $4)
-                   AND ($5::text IS NULL OR status = $5)
-                 ORDER BY created_at
-                 LIMIT $6 OFFSET $7",
-                &[
-                    &query.url,
-                    &query.version,
-                    &query.name,
-                    &query.title,
-                    &query.status,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get(0);
-            let url: String = row.get(1);
-            let version: Option<String> = row.get(2);
-            let name: Option<String> = row.get(3);
-            let title: Option<String> = row.get(4);
-            let status: String = row.get(5);
-            let resource_json: Option<serde_json::Value> = row.get(6);
-
-            let mut resource = resource_json.unwrap_or_else(|| {
-                build_synthetic_resource(
-                    "ValueSet",
-                    &id,
-                    &url,
-                    version.as_deref(),
-                    name.as_deref(),
-                    title.as_deref(),
-                    &status,
-                )
-            });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-            }
-            results.push(resource);
-        }
-        Ok(results)
+        super::search_table(&mut client, "value_sets", "ValueSet", query, true).await
     }
 }
 
@@ -2994,6 +2924,33 @@ async fn apply_compose_filters_pg(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
+        // `constraint = <ECL>`: evaluate the expression (SNOMED CT ECL, or the
+        // HTS alphanumeric-code extension), narrowing an earlier filter's
+        // candidates when there are some. Mirrors SQLite's phase-2 ECL path.
+        if property == "constraint" && op == "=" {
+            let codes: HashSet<String> = match result.as_ref() {
+                Some(prev) => {
+                    let cands: Vec<String> = prev.iter().cloned().collect();
+                    crate::ecl::filter_candidates_pg(client, system_id, value, &cands).await?
+                }
+                None => {
+                    let resolved =
+                        crate::ecl::parse_and_evaluate_pg(client, system_id, value).await?;
+                    let mut set = HashSet::with_capacity(resolved.len());
+                    for c in resolved {
+                        display_map.entry(c.code.clone()).or_insert(c.display);
+                        set.insert(c.code);
+                    }
+                    set
+                }
+            };
+            match result.as_mut() {
+                Some(prev) => prev.retain(|c| codes.contains(c)),
+                None => result = Some(codes),
+            }
+            continue;
+        }
+
         let matches: Vec<(String, Option<String>)> = match op {
             "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
             // `in`: comma-separated list — union of the per-value equalities;
@@ -3747,19 +3704,6 @@ async fn populate_cache(
 
 // ── Implicit-ValueSet (?fhir_vs) helpers ──────────────────────────────────────
 
-/// ECL-backed implicit ValueSets (`?fhir_vs=ecl/…`, `?fhir_vs=refset/…`)
-/// need the ECL evaluator, which only the SQLite backend has.
-fn reject_ecl_pattern(pattern: &ImplicitVsPattern) -> Result<(), HtsError> {
-    match pattern {
-        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => Err(HtsError::NotSupported(
-            "ECL implicit ValueSets (?fhir_vs=ecl/ and ?fhir_vs=refset/) are not supported by \
-             the PostgreSQL backend"
-                .into(),
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// Recognise the narrow inline-compose shape that iter 7k's paginated
 /// closure-table fast path can serve directly: a single `include` with a
 /// single hierarchy filter on `property=concept` and nothing else.
@@ -3962,8 +3906,26 @@ async fn validate_fhir_vs(
             }))
         }
         ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => {
-            reject_ecl_pattern(pattern)?;
-            Ok(None)
+            let expr = match pattern {
+                ImplicitVsPattern::Ecl(e) => e.clone(),
+                ImplicitVsPattern::Refset(id) => format!("^ {id}"),
+                _ => unreachable!(),
+            };
+            // One membership test, not a full evaluation.
+            let hit =
+                crate::ecl::filter_candidates_pg(client, &system_id, &expr, &[code.to_owned()])
+                    .await?;
+            if hit.is_empty() {
+                return Ok(None);
+            }
+            Box::pin(validate_fhir_vs(
+                client,
+                cs_url,
+                &ImplicitVsPattern::AllConcepts,
+                code,
+                system,
+            ))
+            .await
         }
     }
 }

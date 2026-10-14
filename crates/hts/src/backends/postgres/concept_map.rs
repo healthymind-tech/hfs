@@ -71,7 +71,23 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             (req.system.as_deref(), req.target_system.as_deref())
         };
 
-        let rows = query_translate_elements(
+        // A named ConceptMap that is not loaded is a 404, distinct from "no
+        // match found" (mirrors SQLite `translate_sync`).
+        if let Some(url) = req.url.as_deref() {
+            let exists: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = $1)",
+                    &[&url],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+                .get(0);
+            if !exists {
+                return Err(HtsError::NotFound(format!("ConceptMap not found: {url}")));
+            }
+        }
+
+        let mut rows = query_translate_elements(
             &client,
             lookup_code,
             search_sys,
@@ -81,6 +97,32 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             req.date.as_deref(),
         )
         .await?;
+
+        // Packages that encode several source codes as one comma-separated
+        // string are stored one row per code; a client may still send the
+        // compound string, so try each token when the whole one misses.
+        if rows.is_empty() && lookup_code.contains(',') {
+            for token in lookup_code.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let token_rows = query_translate_elements(
+                    &client,
+                    token,
+                    search_sys,
+                    other_side_sys,
+                    req.url.as_deref(),
+                    reverse,
+                    req.date.as_deref(),
+                )
+                .await?;
+                if !token_rows.is_empty() {
+                    rows = token_rows;
+                    break;
+                }
+            }
+        }
 
         let matches: Vec<TranslationMatch> = rows
             .into_iter()
@@ -229,86 +271,14 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
     async fn search(
         &self,
         _ctx: &TenantContext,
-        mut query: ResourceSearchQuery,
+        query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let string_search = crate::string_search::ResourceStringSearch::new(&query);
-        if string_search.is_empty() {
-            query.name = None;
-            query.title = None;
-        }
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        if !string_search.is_empty() {
-            return super::search_resources(
-                &mut client,
-                "concept_maps",
-                "ConceptMap",
-                query,
-                string_search,
-            )
-            .await;
-        }
-
-        let limit = i64::from(query.count.unwrap_or(20));
-        let offset = i64::from(query.offset.unwrap_or(0));
-
-        let rows = client
-            .query(
-                "SELECT id, url, version, name, title, status, resource_json
-                 FROM concept_maps
-                 WHERE ($1::text IS NULL OR url = $1)
-                   AND ($2::text IS NULL OR version = $2)
-                   AND ($3::text IS NULL OR name = $3)
-                   AND ($4::text IS NULL OR title = $4)
-                   AND ($5::text IS NULL OR status = $5)
-                 ORDER BY created_at
-                 LIMIT $6 OFFSET $7",
-                &[
-                    &query.url,
-                    &query.version,
-                    &query.name,
-                    &query.title,
-                    &query.status,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get(0);
-            let url: String = row.get(1);
-            let version: Option<String> = row.get(2);
-            let name: Option<String> = row.get(3);
-            let title: Option<String> = row.get(4);
-            let status: String = row.get(5);
-            let resource_json: Option<serde_json::Value> = row.get(6);
-
-            let mut resource = resource_json.unwrap_or_else(|| {
-                build_synthetic_resource(
-                    "ConceptMap",
-                    &id,
-                    &url,
-                    version.as_deref(),
-                    name.as_deref(),
-                    title.as_deref(),
-                    &status,
-                )
-            });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-            }
-            results.push(resource);
-        }
-        Ok(results)
+        super::search_table(&mut client, "concept_maps", "ConceptMap", query, false).await
     }
 }
 

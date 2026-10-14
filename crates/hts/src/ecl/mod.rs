@@ -42,18 +42,55 @@
 //! }
 //! ```
 
-// Parser is dialect-independent (pure syntax → AST) and stays available
-// to every backend. The evaluator currently translates the AST into
-// rusqlite queries, so it is gated on the `sqlite` feature; a future
-// Postgres-backed evaluator (Phase 2 hierarchy/closure port) will reuse
-// the same parser AST.
+// Parser is dialect-independent (pure syntax → AST) and serves every backend.
+// Each backend has its own evaluator over the same AST and the same tables:
+// `evaluator` (rusqlite) and `pg_evaluator` (tokio-postgres).
 #[cfg(feature = "sqlite")]
 pub mod evaluator;
 pub mod parser;
+#[cfg(feature = "postgres")]
+pub mod pg_evaluator;
 
-#[cfg(feature = "sqlite")]
-pub use evaluator::ResolvedConcept;
 pub use parser::{ConceptOperator, EclExpr, FocusConcept};
+
+/// A resolved concept from the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedConcept {
+    pub code: String,
+    pub display: Option<String>,
+}
+
+/// Parse `ecl`, mapping a syntax error to `InvalidRequest`.
+pub fn parse_expr(ecl: &str) -> Result<EclExpr, crate::error::HtsError> {
+    parser::parse(ecl)
+        .map_err(|e| crate::error::HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))
+}
+
+/// PostgreSQL twin of [`parse_and_evaluate`].
+#[cfg(feature = "postgres")]
+pub async fn parse_and_evaluate_pg(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    ecl: &str,
+) -> Result<Vec<ResolvedConcept>, crate::error::HtsError> {
+    let expr = parse_expr(ecl)?;
+    pg_evaluator::evaluate(client, system_id, &expr).await
+}
+
+/// PostgreSQL twin of [`filter_candidates`].
+#[cfg(feature = "postgres")]
+pub async fn filter_candidates_pg(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    ecl: &str,
+    candidates: &[String],
+) -> Result<std::collections::HashSet<String>, crate::error::HtsError> {
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let expr = parse_expr(ecl)?;
+    pg_evaluator::filter_codes(client, system_id, &expr, candidates).await
+}
 
 #[cfg(feature = "sqlite")]
 use std::collections::HashSet;
@@ -78,8 +115,7 @@ pub fn parse_and_evaluate(
     system_id: &str,
     ecl: &str,
 ) -> Result<Vec<ResolvedConcept>, HtsError> {
-    let expr = parser::parse(ecl)
-        .map_err(|e| HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))?;
+    let expr = parse_expr(ecl)?;
     evaluator::evaluate(conn, system_id, &expr)
 }
 
@@ -105,7 +141,6 @@ pub fn filter_candidates(
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
-    let expr = parser::parse(ecl)
-        .map_err(|e| HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))?;
+    let expr = parse_expr(ecl)?;
     evaluator::filter_codes(conn, system_id, &expr, candidates)
 }

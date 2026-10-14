@@ -41,12 +41,7 @@ use crate::error::HtsError;
 
 use super::parser::{ConceptOperator, EclExpr, FocusConcept};
 
-/// A resolved concept from the database.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedConcept {
-    pub code: String,
-    pub display: Option<String>,
-}
+pub use super::ResolvedConcept;
 
 /// Evaluate an [`EclExpr`] against the given code system and return the
 /// matching concepts ordered by code.

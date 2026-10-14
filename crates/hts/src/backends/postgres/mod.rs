@@ -12,13 +12,15 @@ mod value_set;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio_postgres::NoTls;
 use tracing::info;
 
 use crate::error::HtsError;
-use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
+use crate::import::bundle_parser::{
+    self, ParsedCodeSystem, ParsedConcept, ParsedConceptMap, ParsedValueSet,
+};
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows};
 use crate::traits::{TerminologyCaches, TerminologyMetadata};
@@ -147,15 +149,98 @@ impl PostgresTerminologyBackend {
     }
 }
 
+/// `GET /<ResourceType>` for `table`, mirroring the SQLite search contract:
+/// FHIR string matching on `name`/`title` when present; otherwise exact
+/// predicates in SQL. With `synthetic_summary` (CodeSystem, ValueSet),
+/// `_summary=true` — and an unfiltered listing — return synthetic metadata
+/// resources without reading `resource_json`; the stored resource is returned
+/// as stored (its `id` is not rewritten).
+async fn search_table(
+    client: &mut deadpool_postgres::Object,
+    table: &str,
+    resource_type: &str,
+    mut query: ResourceSearchQuery,
+    synthetic_summary: bool,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    let string_search = ResourceStringSearch::new(&query);
+    if string_search.is_empty() {
+        query.name = None;
+        query.title = None;
+    } else {
+        return search_resources(
+            client,
+            table,
+            resource_type,
+            query,
+            string_search,
+            synthetic_summary,
+        )
+        .await;
+    }
+    let limit = i64::from(query.count.unwrap_or(20));
+    let offset = i64::from(query.offset.unwrap_or(0));
+    let metadata_only = synthetic_summary
+        && (query.summary.as_deref() == Some("true")
+            || query.url.is_none()
+                && query.version.is_none()
+                && query.name.is_none()
+                && query.title.is_none()
+                && query.status.is_none());
+    let sql = format!(
+        "SELECT id, url, version, name, title, status{json}
+         FROM {table}
+         WHERE ($1::text IS NULL OR url = $1)
+           AND ($2::text IS NULL OR version = $2)
+           AND ($3::text IS NULL OR name = $3)
+           AND ($4::text IS NULL OR title = $4)
+           AND ($5::text IS NULL OR status = $5)
+         ORDER BY created_at
+         LIMIT $6 OFFSET $7",
+        json = if metadata_only { "" } else { ", resource_json" }
+    );
+    let rows = client
+        .query(
+            &sql,
+            &[
+                &query.url,
+                &query.version,
+                &query.name,
+                &query.title,
+                &query.status,
+                &limit,
+                &offset,
+            ],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let stored: Option<serde_json::Value> = if metadata_only { None } else { row.get(6) };
+        results.push(stored.unwrap_or_else(|| {
+            code_system::build_synthetic_resource(
+                resource_type,
+                &row.get::<_, String>(0),
+                &row.get::<_, String>(1),
+                row.get::<_, Option<String>>(2).as_deref(),
+                row.get::<_, Option<String>>(3).as_deref(),
+                row.get::<_, Option<String>>(4).as_deref(),
+                &row.get::<_, String>(5),
+            )
+        }));
+    }
+    Ok(results)
+}
+
 /// Search metadata using backend-neutral FHIR string matching, then hydrate
-/// only the selected page. PostgreSQL search historically returns full
-/// resources even for `_summary=true`, which this path preserves.
+/// only the selected page (synthetic resources for `_summary=true` when
+/// `synthetic_summary`, as SQLite does).
 async fn search_resources(
     client: &mut deadpool_postgres::Object,
     table: &str,
     resource_type: &str,
     query: ResourceSearchQuery,
     search: ResourceStringSearch,
+    synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
     // PostgreSQL's default READ COMMITTED level takes a fresh snapshot per
     // statement, so use REPEATABLE READ to keep metadata selection and JSON
@@ -166,8 +251,15 @@ async fn search_resources(
         .start()
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
-    let result =
-        search_resources_in_transaction(&transaction, table, resource_type, query, search).await;
+    let result = search_resources_in_transaction(
+        &transaction,
+        table,
+        resource_type,
+        query,
+        search,
+        synthetic_summary,
+    )
+    .await;
     match result {
         Ok(resources) => {
             transaction
@@ -191,6 +283,7 @@ async fn search_resources_in_transaction<C>(
     resource_type: &str,
     query: ResourceSearchQuery,
     search: ResourceStringSearch,
+    synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError>
 where
     C: GenericClient + Sync,
@@ -219,7 +312,8 @@ where
         .collect::<Vec<_>>();
     let selected = filter_rows(rows, &query, &search);
 
-    let stored_resources = if selected.is_empty() {
+    let use_synthetic = synthetic_summary && query.summary.as_deref() == Some("true");
+    let stored_resources = if selected.is_empty() || use_synthetic {
         HashMap::new()
     } else {
         let ids = selected
@@ -243,7 +337,7 @@ where
 
     let mut results = Vec::with_capacity(selected.len());
     for row in selected {
-        let mut resource = stored_resources
+        let resource = stored_resources
             .get(&row.id)
             .cloned()
             .flatten()
@@ -258,10 +352,6 @@ where
                     &row.status,
                 )
             });
-        // The table id is authoritative after URL-conflict upserts.
-        if let Some(object) = resource.as_object_mut() {
-            object.insert("id".to_owned(), serde_json::Value::String(row.id));
-        }
         results.push(resource);
     }
     Ok(results)
@@ -280,6 +370,8 @@ where
 #[derive(Clone)]
 pub struct PostgresTerminologyBackend {
     pub(super) pool: Pool,
+    /// Connection string, for the one-off connections of [`Self::sync_query`].
+    pub(super) database_url: String,
     /// Process-local inline-compose expansion cache. Hot path for repeated
     /// POST $expand requests with identical compose bodies — k6 EX02/04/05/06
     /// pool entries hit the same compose hundreds of times during a 30s run.
@@ -298,6 +390,10 @@ pub struct PostgresTerminologyBackend {
     /// `$translate` response memo — CM01/CM02 hot paths repeat the same
     /// (system, code, target) tuples across pool entries.
     pub(super) translate_response_cache: TranslateResponseCache,
+    /// Closure `COUNT(*)` memo per `(system_id, root)` (see `value_set.rs`).
+    pub(super) closure_count_cache: value_set::ClosureCountCache,
+    /// `?fhir_vs=isa/X` descendant-prefix memo (see `value_set.rs`).
+    pub(super) root_prefix_cache: value_set::RootPrefixCache,
 }
 
 impl PostgresTerminologyBackend {
@@ -349,11 +445,14 @@ impl PostgresTerminologyBackend {
 
         Ok(Self {
             pool,
+            database_url: database_url.to_owned(),
             inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             subsumes_response_cache: Arc::new(RwLock::new(HashMap::new())),
             translate_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            closure_count_cache: Arc::new(RwLock::new(HashMap::new())),
+            root_prefix_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -403,13 +502,16 @@ impl TerminologyCaches for PostgresTerminologyBackend {
     fn invalidate_caches(&self) {
         // Exhaustive by construction: no `..`. See the doc comment above.
         let Self {
-            // Not a cache: the connection pool itself.
+            // Not caches: the connection pool and its connection string.
             pool: _,
+            database_url: _,
             inline_compose_cache,
             lookup_response_cache,
             cs_resolved_meta_cache,
             subsumes_response_cache,
             translate_response_cache,
+            closure_count_cache,
+            root_prefix_cache,
         } = self;
 
         // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
@@ -427,11 +529,8 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             cs_resolved_meta_cache,
             subsumes_response_cache,
             translate_response_cache,
-            // Iter 7k+: process-global closure COUNT(*) memo (see
-            // backends/postgres/value_set.rs::CLOSURE_COUNT_CACHE).
-            self::value_set::closure_count_cache(),
-            // Iter 7n: process-global `?fhir_vs=isa/X` per-root prefix cache.
-            self::value_set::root_prefix_cache(),
+            closure_count_cache,
+            root_prefix_cache,
         );
     }
 }
@@ -444,7 +543,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
 /// error with `{e}` discards the one piece of information needed to diagnose
 /// it. Walking the chain preserves messages like
 /// `db error: ERROR: could not resize shared memory segment …`.
-pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut src = e.source();
     while let Some(s) = src {
@@ -472,30 +571,81 @@ fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
 
 // ── TerminologyMetadata ────────────────────────────────────────────────────────
 
+impl PostgresTerminologyBackend {
+    /// Run `f` against a connection from synchronous code (the
+    /// [`TerminologyMetadata`] methods are sync).
+    ///
+    /// On a multi-thread runtime this blocks the worker in place and uses the
+    /// pool. A current-thread runtime cannot be blocked that way — the pool's
+    /// connection tasks would need the very thread being blocked — so there the
+    /// query runs on a scoped helper thread with its own runtime and a one-off
+    /// connection. (`block_in_place` alone panics on a current-thread runtime.)
+    fn sync_query<T, F>(&self, f: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a tokio_postgres::Client,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                let pool = self.pool.clone();
+                tokio::task::block_in_place(|| {
+                    h.block_on(async move {
+                        let obj = pool.get().await.ok()?;
+                        let client: &tokio_postgres::Client = &obj;
+                        f(client).await
+                    })
+                })
+            }
+            _ => {
+                let url = self.database_url.clone();
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .ok()?;
+                            rt.block_on(async move {
+                                let (client, conn) =
+                                    tokio_postgres::connect(&url, NoTls).await.ok()?;
+                                let driver = tokio::spawn(conn);
+                                let out = f(&client).await;
+                                drop(client);
+                                let _ = driver.await;
+                                out
+                            })
+                        })
+                        .join()
+                        .ok()
+                        .flatten()
+                })
+            }
+        }
+    }
+}
+
 impl TerminologyMetadata for PostgresTerminologyBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
     }
 
     fn supported_systems(&self) -> Vec<String> {
-        let pool = self.pool.clone();
-        // Use block_in_place so we can safely block_on within a multi-threaded
-        // tokio runtime (avoids "cannot start a runtime from within a runtime").
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = match pool.get().await {
-                    Ok(c) => c,
-                    Err(_) => return vec![],
-                };
-                match client
+        self.sync_query(|client| {
+            Box::pin(async move {
+                let rows = client
                     .query("SELECT url FROM code_systems ORDER BY url", &[])
                     .await
-                {
-                    Ok(rows) => rows.into_iter().map(|r| r.get::<_, String>(0)).collect(),
-                    Err(_) => vec![],
-                }
+                    .ok()?;
+                Some(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
             })
         })
+        .unwrap_or_default()
     }
 
     fn supports_subsumption(&self) -> bool {
@@ -503,57 +653,43 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
     }
 
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
-        let pool = self.pool.clone();
-        let resource_type = resource_type.to_owned();
+        // Exact storage id first; then — multi-version rows carry synthetic
+        // `<id>|<version>` storage ids — the FHIR id captured in
+        // `resource_json`, best row by precedence. Mirrors the SQLite twin.
+        let fallback = match resource_type {
+            "CodeSystem" => Some(format!(
+                "SELECT url FROM code_systems WHERE (resource_json->>'id') = $1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            )),
+            "ValueSet" => Some(format!(
+                "SELECT url FROM value_sets WHERE (resource_json->>'id') = $1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::vs_precedence_order_by("value_sets")
+            )),
+            "ConceptMap" => None,
+            _ => return None,
+        };
+        let table = match resource_type {
+            "CodeSystem" => "code_systems",
+            "ValueSet" => "value_sets",
+            _ => "concept_maps",
+        };
+        let direct = format!("SELECT url FROM {table} WHERE id = $1");
         let id = id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = pool.get().await.ok()?;
-                match resource_type.as_str() {
-                    "CodeSystem" => {
-                        // Storage id may be the synthetic `<id>|<version>` form,
-                        // so first try a direct hit, then fall back to matching
-                        // the FHIR resource id captured in `resource_json` and
-                        // pick the latest version.
-                        if let Ok(rows) = client
-                            .query("SELECT url FROM code_systems WHERE id = $1", &[&id])
-                            .await
-                        {
-                            if let Some(row) = rows.into_iter().next() {
-                                return Some(row.get::<_, String>(0));
-                            }
-                        }
-                        let sql = format!(
-                            "SELECT url FROM code_systems \
-                             WHERE (resource_json->>'id') = $1 \
-                             ORDER BY {} LIMIT 1",
-                            crate::backends::cs_precedence_order_by("code_systems")
-                        );
-                        let rows = client.query(&sql, &[&id]).await.ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    "ValueSet" => {
-                        let rows = client
-                            .query("SELECT url FROM value_sets WHERE id = $1", &[&id])
-                            .await
-                            .ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    "ConceptMap" => {
-                        let rows = client
-                            .query("SELECT url FROM concept_maps WHERE id = $1", &[&id])
-                            .await
-                            .ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    _ => None,
+        self.sync_query(move |client| {
+            Box::pin(async move {
+                if let Some(row) = client.query_opt(&direct, &[&id]).await.ok()? {
+                    return Some(row.get::<_, String>(0));
                 }
+                let sql = fallback?;
+                let row = client.query_opt(&sql, &[&id]).await.ok()??;
+                Some(row.get::<_, String>(0))
             })
         })
     }
 
     fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
-        let pool = self.pool.clone();
         let (table, order_by) = match resource_type {
             "CodeSystem" => (
                 "code_systems",
@@ -570,18 +706,19 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
             _ => return None,
         };
         // Same matching rules as the SQLite twin: exact storage id, then the
-        // synthetic `<id>|<version>` storage ids (index-friendly range).
+        // synthetic `<id>|<version>` storage ids. Matched on the segment before
+        // the first `|` (expression-indexed) rather than an `id >= x||'|'`
+        // range, which does not hold under a linguistic collation.
         let sql = format!(
             "SELECT resource_json::text FROM {table} \
-             WHERE id = $1 OR (id >= $1 || '|' AND id < $1 || '}}') \
+             WHERE id = $1 OR (split_part(id, '|', 1) = $1 AND strpos(id, '|') > 0) \
              ORDER BY (id = $1) DESC, {order_by} LIMIT 1"
         );
         let id = id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = pool.get().await.ok()?;
-                let rows = client.query(&sql, &[&id]).await.ok()?;
-                let raw: Option<String> = rows.into_iter().next().and_then(|r| r.get(0));
+        self.sync_query(move |client| {
+            Box::pin(async move {
+                let row = client.query_opt(&sql, &[&id]).await.ok()??;
+                let raw: Option<String> = row.get(0);
                 raw.and_then(|s| serde_json::from_str(&s).ok())
             })
         })
@@ -746,6 +883,115 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         Ok(row.get(0))
+    }
+
+    /// Replace the `refset_members` rows of `url|version` in one transaction.
+    async fn import_refset_members(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let system_id: Option<String> = tx
+            .query_opt(
+                "SELECT id FROM code_systems \
+                 WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+                &[&url, &version],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+            .map(|r| r.get(0));
+        let Some(system_id) = system_id else {
+            return Err(HtsError::NotFound(format!(
+                "CodeSystem {url}|{} is not imported; cannot store its reference set members",
+                version.unwrap_or("")
+            )));
+        };
+        tx.execute(
+            "DELETE FROM refset_members WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let mut written = 0u64;
+        for chunk in members.chunks(50_000) {
+            let refsets: Vec<&str> = chunk.iter().map(|(r, _)| r.as_str()).collect();
+            let codes: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
+            written += tx
+                .execute(
+                    "INSERT INTO refset_members (system_id, refset_id, referenced_code)
+                     SELECT $1, r, c FROM UNNEST($2::text[], $3::text[]) AS t(r, c)
+                     ON CONFLICT DO NOTHING",
+                    &[&system_id, &refsets, &codes],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        // Cached expansions may hold ECL `^` results.
+        self.invalidate_caches();
+        Ok(written)
+    }
+
+    async fn delete_normalized_by_id(&self, resource_type: &str, id: &str) -> Result<(), HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+        match resource_type {
+            "CodeSystem" => {
+                // Expansions cached over this system are DB state too.
+                client
+                    .execute(
+                        "DELETE FROM value_set_expansions WHERE system_url IN \
+                         (SELECT url FROM code_systems \
+                          WHERE id = $1 OR resource_json->>'id' = $1)",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(db)?;
+                client
+                    .execute(
+                        "DELETE FROM code_systems WHERE id = $1 OR resource_json->>'id' = $1",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(db)?;
+            }
+            "ValueSet" => {
+                client
+                    .execute(
+                        "DELETE FROM value_sets WHERE id = $1 OR split_part(id, '|', 1) = $1 \
+                         AND position('|' in id) > 0",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(db)?;
+            }
+            "ConceptMap" => {
+                client
+                    .execute("DELETE FROM concept_maps WHERE id = $1", &[&id])
+                    .await
+                    .map_err(db)?;
+            }
+            _ => {}
+        }
+        self.invalidate_caches();
+        Ok(())
     }
 
     /// Delete all HTS normalized rows for the resource identified by `resource_url`.
@@ -941,104 +1187,26 @@ async fn write_code_system(
         })?
         .get(0);
 
+    // Concepts and their child rows go in set-based batches (one UNNEST
+    // statement per table per batch) instead of one round trip per row: a
+    // SNOMED CT import is ~4 M rows. A batch never holds the same code twice,
+    // so each batch behaves exactly like the per-concept sequence it replaces
+    // (upsert, drop the old child rows, insert the new ones).
+    let mut batch: Vec<&ParsedConcept> = Vec::with_capacity(CONCEPT_BATCH);
+    let mut batch_codes: HashSet<&str> = HashSet::with_capacity(CONCEPT_BATCH);
     for concept in &cs.concepts {
-        let rows = client
-            .query(
-                "INSERT INTO concepts (system_id, code, display, definition)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (system_id, code) DO UPDATE SET
-                   display    = EXCLUDED.display,
-                   definition = EXCLUDED.definition
-                 RETURNING id",
-                &[
-                    &system_id,
-                    &concept.code,
-                    &concept.display,
-                    &concept.definition,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let concept_id: i64 = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                HtsError::StorageError("INSERT concepts RETURNING id got no row".into())
-            })?
-            .get(0);
-
-        stats.concepts += 1;
-
-        // Hierarchy from nesting or "parent" property.
-        if let Some(ref parent) = concept.parent_code {
-            insert_hierarchy(client, &system_id, parent, &concept.code).await?;
+        if batch.len() >= CONCEPT_BATCH || batch_codes.contains(concept.code.as_str()) {
+            write_concept_batch(client, &system_id, &batch, skip_child_delete).await?;
+            stats.concepts += batch.len() as u32;
+            batch.clear();
+            batch_codes.clear();
         }
-
-        // Replace any prior child rows for this concept so a re-import fully
-        // supersedes the previous set rather than duplicating rows or leaving
-        // filtered-out languages behind (the concept row itself is upserted, so
-        // its id is stable). A concept that now yields zero designations after a
-        // narrower language filter must still lose its old ones. Stub
-        // "content=not-present" imports carry an empty concepts array, so this
-        // loop never runs for them. Skipped on a fresh load (nothing to
-        // delete). Mirrors import/fhir_bundle.rs (SQLite).
-        if !skip_child_delete {
-            client
-                .execute(
-                    "DELETE FROM concept_properties WHERE concept_id = $1",
-                    &[&concept_id],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-            client
-                .execute(
-                    "DELETE FROM concept_designations WHERE concept_id = $1",
-                    &[&concept_id],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        }
-
-        for prop in &concept.properties {
-            if prop.value.is_empty() {
-                continue;
-            }
-            client
-                .execute(
-                    "INSERT INTO concept_properties
-                     (concept_id, property, value_type, value)
-                     VALUES ($1, $2, $3, $4)",
-                    &[&concept_id, &prop.code, &prop.value_type, &prop.value],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-            // Extra hierarchy edge from a "parent" property.
-            if prop.is_parent_edge {
-                if let Some(ref pv) = prop.parent_code_value {
-                    insert_hierarchy(client, &system_id, pv, &concept.code).await?;
-                }
-            }
-        }
-
-        for desig in &concept.designations {
-            client
-                .execute(
-                    "INSERT INTO concept_designations
-                     (concept_id, language, use_system, use_code, value)
-                     VALUES ($1, $2, $3, $4, $5)",
-                    &[
-                        &concept_id,
-                        &desig.language,
-                        &desig.use_system,
-                        &desig.use_code,
-                        &desig.value,
-                    ],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        }
+        batch_codes.insert(concept.code.as_str());
+        batch.push(concept);
+    }
+    if !batch.is_empty() {
+        write_concept_batch(client, &system_id, &batch, skip_child_delete).await?;
+        stats.concepts += batch.len() as u32;
     }
 
     // Invalidate stale closure rows so the post-import / startup migration
@@ -1057,21 +1225,128 @@ async fn write_code_system(
     Ok(())
 }
 
-async fn insert_hierarchy(
+/// Concepts per set-based write batch (see [`write_code_system`]).
+const CONCEPT_BATCH: usize = 5_000;
+
+/// Upsert `batch` (distinct codes) and replace its properties, designations
+/// and hierarchy edges, one statement per table.
+async fn write_concept_batch(
     client: &impl GenericClient,
     system_id: &str,
-    parent_code: &str,
-    child_code: &str,
+    batch: &[&ParsedConcept],
+    skip_child_delete: bool,
 ) -> Result<(), HtsError> {
-    client
-        .execute(
-            "INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING",
-            &[&system_id, &parent_code, &child_code],
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let codes: Vec<&str> = batch.iter().map(|c| c.code.as_str()).collect();
+    let displays: Vec<Option<&str>> = batch.iter().map(|c| c.display.as_deref()).collect();
+    let definitions: Vec<Option<&str>> = batch.iter().map(|c| c.definition.as_deref()).collect();
+    let rows = client
+        .query(
+            "INSERT INTO concepts (system_id, code, display, definition)
+             SELECT $1, code, display, definition
+             FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(code, display, definition)
+             ON CONFLICT (system_id, code) DO UPDATE SET
+               display    = EXCLUDED.display,
+               definition = EXCLUDED.definition
+             RETURNING id, code",
+            &[&system_id, &codes, &displays, &definitions],
         )
         .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        .map_err(db)?;
+    let ids: HashMap<String, i64> = rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(1), r.get::<_, i64>(0)))
+        .collect();
+    let id_of = |code: &str| -> Result<i64, HtsError> {
+        ids.get(code).copied().ok_or_else(|| {
+            HtsError::StorageError(format!("INSERT concepts RETURNING id missed code {code}"))
+        })
+    };
+
+    if !skip_child_delete {
+        let all: Vec<i64> = ids.values().copied().collect();
+        client
+            .execute(
+                "DELETE FROM concept_properties WHERE concept_id = ANY($1)",
+                &[&all],
+            )
+            .await
+            .map_err(db)?;
+        client
+            .execute(
+                "DELETE FROM concept_designations WHERE concept_id = ANY($1)",
+                &[&all],
+            )
+            .await
+            .map_err(db)?;
+    }
+
+    let mut parents: Vec<&str> = Vec::new();
+    let mut children: Vec<&str> = Vec::new();
+    let (mut p_ids, mut p_codes, mut p_types, mut p_values) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut d_ids, mut d_langs, mut d_systems, mut d_codes, mut d_values) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for concept in batch {
+        let concept_id = id_of(&concept.code)?;
+        if let Some(ref parent) = concept.parent_code {
+            parents.push(parent.as_str());
+            children.push(concept.code.as_str());
+        }
+        for prop in &concept.properties {
+            if prop.value.is_empty() {
+                continue;
+            }
+            p_ids.push(concept_id);
+            p_codes.push(prop.code.as_str());
+            p_types.push(prop.value_type.as_str());
+            p_values.push(prop.value.as_str());
+            if prop.is_parent_edge {
+                if let Some(ref pv) = prop.parent_code_value {
+                    parents.push(pv.as_str());
+                    children.push(concept.code.as_str());
+                }
+            }
+        }
+        for desig in &concept.designations {
+            d_ids.push(concept_id);
+            d_langs.push(desig.language.as_deref());
+            d_systems.push(desig.use_system.as_deref());
+            d_codes.push(desig.use_code.as_deref());
+            d_values.push(desig.value.as_str());
+        }
+    }
+    if !parents.is_empty() {
+        client
+            .execute(
+                "INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+                 SELECT $1, p, c FROM UNNEST($2::text[], $3::text[]) AS t(p, c)
+                 ON CONFLICT DO NOTHING",
+                &[&system_id, &parents, &children],
+            )
+            .await
+            .map_err(db)?;
+    }
+    if !p_ids.is_empty() {
+        client
+            .execute(
+                "INSERT INTO concept_properties (concept_id, property, value_type, value)
+                 SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[])",
+                &[&p_ids, &p_codes, &p_types, &p_values],
+            )
+            .await
+            .map_err(db)?;
+    }
+    if !d_ids.is_empty() {
+        client
+            .execute(
+                "INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+                 SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[])",
+                &[&d_ids, &d_langs, &d_systems, &d_codes, &d_values],
+            )
+            .await
+            .map_err(db)?;
+    }
     Ok(())
 }
 
@@ -1274,21 +1549,19 @@ async fn write_concept_map(
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
-    for el in &cm.elements {
+    for chunk in cm.elements.chunks(10_000) {
+        let src_sys: Vec<&str> = chunk.iter().map(|e| e.source_system.as_str()).collect();
+        let src_code: Vec<&str> = chunk.iter().map(|e| e.source_code.as_str()).collect();
+        let tgt_sys: Vec<&str> = chunk.iter().map(|e| e.target_system.as_str()).collect();
+        let tgt_code: Vec<&str> = chunk.iter().map(|e| e.target_code.as_str()).collect();
+        let equiv: Vec<&str> = chunk.iter().map(|e| e.equivalence.as_str()).collect();
         client
             .execute(
                 "INSERT INTO concept_map_elements
                  (map_id, source_system, source_code, target_system, target_code, equivalence)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                 SELECT $1, * FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
                  ON CONFLICT DO NOTHING",
-                &[
-                    &map_id,
-                    &el.source_system,
-                    &el.source_code,
-                    &el.target_system,
-                    &el.target_code,
-                    &el.equivalence,
-                ],
+                &[&map_id, &src_sys, &src_code, &tgt_sys, &tgt_code, &equiv],
             )
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
