@@ -217,7 +217,13 @@ fn build_query(
         }
 
         // Parse the parameter
-        let param = parse_search_parameter_in(resource_type, name, value, registry, types)?;
+        let mut param = parse_search_parameter_in(resource_type, name, value, registry, types)?;
+        // `url=X|V` on a canonical resource: url=X AND version=V.
+        if let Some(version) = split_versioned_url(&mut param, resource_type, registry)? {
+            query.parameters.push(param);
+            query.parameters.push(version);
+            continue;
+        }
         query.parameters.push(param);
     }
 
@@ -244,6 +250,69 @@ fn build_query(
     helios_persistence::search::validate_value_presence(&query)?;
 
     Ok(query)
+}
+
+/// Rewrites a versioned canonical on the `url` parameter — `url=X|V`, as a
+/// canonical reference is written — into `url=X` plus `version=V`, for a
+/// resource type that has a `version` token parameter (StructureDefinition,
+/// ValueSet, CodeSystem, ConceptMap, Questionnaire, SearchParameter, …).
+///
+/// The `url` element itself never carries a version, so the uri index holds
+/// `X` alone and a literal search for `X|V` matched nothing (H8e). `url=X`
+/// still matches every version; `url=X|` is `url=X`. Returns the `version`
+/// parameter to add, with `param` narrowed to the url.
+///
+/// Only the `url` parameter is rewritten: on another uri parameter a `|V`
+/// names the version of the *referenced* artifact (`StructureDefinition?base=`,
+/// `ValueSet?reference=`), not of the resource searched for. A versioned
+/// canonical cannot be one of several comma-separated alternatives — the
+/// version would have to pair with its own url, which one `version` parameter
+/// cannot express — so that is a `400`.
+fn split_versioned_url(
+    param: &mut SearchParameter,
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> Result<Option<SearchParameter>, RestError> {
+    if param.name != "url"
+        || param.param_type != SearchParamType::Uri
+        || param.modifier.is_some()
+        || !param.chain.is_empty()
+        || !param.values.iter().any(|v| v.value.contains('|'))
+    {
+        return Ok(None);
+    }
+    let has_version_param = registry
+        .get_param(resource_type, "version")
+        .is_some_and(|def| def.param_type == SearchParamType::Token);
+    if !has_version_param {
+        return Ok(None);
+    }
+    if param.values.len() > 1 {
+        return Err(RestError::InvalidParameter {
+            param: "url".to_string(),
+            message: "a versioned canonical (url|version) cannot be one of several \
+                      comma-separated alternatives; search for one versioned canonical at a \
+                      time, or use url=X&version=V"
+                .to_string(),
+        });
+    }
+    let (url, version) = param.values[0]
+        .value
+        .split_once('|')
+        .expect("checked above: the value contains a '|'");
+    let (url, version) = (url.to_string(), version.to_string());
+    param.values = vec![SearchValue::eq(url)];
+    if version.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SearchParameter {
+        name: "version".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq(version)],
+        chain: vec![],
+        components: vec![],
+    }))
 }
 
 /// Drops every parameter that has no value: `family=`, a bare `family`, a
@@ -962,6 +1031,25 @@ mod tests {
                 SearchParamType::Number,
                 "RiskAssessment",
             ),
+            (
+                "StructureDefinition-url",
+                "url",
+                SearchParamType::Uri,
+                "StructureDefinition",
+            ),
+            (
+                "StructureDefinition-version",
+                "version",
+                SearchParamType::Token,
+                "StructureDefinition",
+            ),
+            (
+                "StructureDefinition-base",
+                "base",
+                SearchParamType::Uri,
+                "StructureDefinition",
+            ),
+            ("Device-url", "url", SearchParamType::Uri, "Device"),
         ];
         for (id, code, ty, base) in entries {
             r.register(
@@ -976,6 +1064,68 @@ mod tests {
             .unwrap();
         }
         r
+    }
+
+    /// H8e: `url=X|V` is url=X AND version=V on a canonical resource; `url=X`
+    /// alone, a trailing `|`, another uri parameter, a modifier, and a type
+    /// without a `version` parameter are left as written; several
+    /// alternatives with a version are a `400`.
+    #[test]
+    fn test_versioned_canonical_url_is_split_into_url_and_version() {
+        let registry = test_registry();
+        let sp = |pairs: &[(&str, &str)]| {
+            SearchParams::from_pairs(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let build = |pairs: &[(&str, &str)]| {
+            build_search_query("StructureDefinition", &sp(pairs), &registry)
+        };
+        fn values(p: &SearchParameter) -> Vec<&str> {
+            p.values.iter().map(|v| v.value.as_str()).collect()
+        }
+
+        let q = build(&[("url", "http://x/sd|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 2);
+        assert_eq!(q.parameters[0].name, "url");
+        assert_eq!(q.parameters[0].param_type, SearchParamType::Uri);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+        assert_eq!(q.parameters[1].name, "version");
+        assert_eq!(q.parameters[1].param_type, SearchParamType::Token);
+        assert_eq!(values(&q.parameters[1]), ["1.0.0"]);
+
+        let q = build(&[("url", "http://x/sd")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+
+        let q = build(&[("url", "http://x/sd|")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd"]);
+
+        // Several unversioned alternatives are fine; a versioned one among
+        // several is not.
+        let q = build(&[("url", "http://x/a,http://x/b")]).unwrap();
+        assert_eq!(values(&q.parameters[0]), ["http://x/a", "http://x/b"]);
+        let err = build(&[("url", "http://x/a|1,http://x/b")]).unwrap_err();
+        assert!(matches!(err, RestError::InvalidParameter { param, .. } if param == "url"));
+
+        // `base=X|V` names the base's version: untouched.
+        let q = build(&[("base", "http://x/base|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/base|1.0.0"]);
+
+        // A modifier is left alone too.
+        let q = build(&[("url:below", "http://x/sd|1.0.0")]).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/sd|1.0.0"]);
+
+        // No `version` parameter on Device.
+        let q = build_search_query("Device", &sp(&[("url", "http://x/d|2")]), &registry).unwrap();
+        assert_eq!(q.parameters.len(), 1);
+        assert_eq!(values(&q.parameters[0]), ["http://x/d|2"]);
     }
 
     #[test]

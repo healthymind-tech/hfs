@@ -278,6 +278,18 @@ Without `HFS_TERMINOLOGY_SERVER` these modifiers are `501`. An empty
 expansion matches nothing (`:in`, `:below`, `:above`) or excludes nothing
 (`:not-in`).
 
+### Versioned canonical search
+
+On a resource type with a `version` search parameter (StructureDefinition,
+ValueSet, CodeSystem, ConceptMap, Questionnaire, SearchParameter, …),
+`url=<canonical>|<version>` is searched as `url=<canonical>` **and**
+`version=<version>`; `url=<canonical>` alone matches every version. A
+versioned canonical cannot be one of several comma-separated alternatives
+(`400`; use `url=X&version=V`). Only the `url` parameter is rewritten — on
+`base=` or `reference=` a `|version` names the referenced artifact's version.
+`url:below=http://acme.org/fhir/` (a trailing slash, as in the spec's example)
+matches `http://acme.org/fhir/ValueSet/123` on every SQL backend.
+
 ### Batch entry concurrency
 
 Entries of a `batch` Bundle execute concurrently, bounded by whatever the

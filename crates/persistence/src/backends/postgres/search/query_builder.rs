@@ -3362,19 +3362,38 @@ impl PostgresQueryBuilder {
 
     /// The bare row predicate for one value of a `uri` search: equality, or
     /// the `:contains` / `:below` / `:above` string forms.
+    ///
+    /// `:below` matches the uri itself or one below it on a `/` boundary, as
+    /// the SQLite backend does; the value's trailing slashes are trimmed first
+    /// (`url:below=http://acme.org/fhir/`, the spec's own example, would
+    /// otherwise look for `http://acme.org/fhir//…`).
     fn uri_value_predicate(
         modifier: Option<&SearchModifier>,
         value: &SearchValue,
         next: &mut usize,
     ) -> (String, Vec<SqlParam>) {
         *next += 1;
-        let predicate = match modifier {
-            Some(SearchModifier::Contains) => format!("value_uri ILIKE '%' || ${} || '%'", next),
-            Some(SearchModifier::Below) => format!("value_uri LIKE ${} || '%'", next),
-            Some(SearchModifier::Above) => format!("${} LIKE value_uri || '%'", next),
-            _ => format!("value_uri = ${}", next),
+        let trimmed = {
+            let t = value.value.trim_end_matches('/');
+            if t.is_empty() {
+                value.value.as_str()
+            } else {
+                t
+            }
         };
-        (predicate, vec![SqlParam::text(&value.value)])
+        let (predicate, bound) = match modifier {
+            Some(SearchModifier::Contains) => (
+                format!("value_uri ILIKE '%' || ${} || '%'", next),
+                value.value.as_str(),
+            ),
+            Some(SearchModifier::Below) => (
+                format!("(value_uri = ${0} OR value_uri LIKE ${0} || '/%')", next),
+                trimmed,
+            ),
+            Some(SearchModifier::Above) => (format!("${} LIKE value_uri || '%'", next), trimmed),
+            _ => (format!("value_uri = ${}", next), value.value.as_str()),
+        };
+        (predicate, vec![SqlParam::text(bound)])
     }
 
     /// Converts a FHIR search prefix to a SQL comparison operator.
@@ -6240,7 +6259,8 @@ mod tests {
         assert_eq!(
             branch(uri(Some(SearchModifier::Below))),
             (
-                "(param_name = 'url' AND ((value_uri LIKE $3 || '%')))".to_string(),
+                "(param_name = 'url' AND (((value_uri = $3 OR value_uri LIKE $3 || '/%'))))"
+                    .to_string(),
                 1
             )
         );
