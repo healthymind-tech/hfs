@@ -345,6 +345,12 @@ pub(crate) fn msg_reference_urn_unresolved(reference: &str) -> String {
     format!("URN reference is not locally contained within the bundle {reference}")
 }
 
+/// [helios] a resource id outside the `id` pattern (HL7 validator
+/// wording).
+pub(crate) fn msg_resource_id(id: &str) -> String {
+    format!("Invalid Resource id: Invalid Characters ('{id}')")
+}
+
 /// [helios] an empty JSON object (HL7 validator wording).
 pub(crate) fn msg_empty_object() -> String {
     "Object must have some content".to_string()

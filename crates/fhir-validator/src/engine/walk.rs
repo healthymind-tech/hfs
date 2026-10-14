@@ -380,6 +380,7 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     let is_resource = obj.get("resourceType").is_some_and(Value::is_string);
     if is_resource {
         ctx.contained.push(contained_types(obj));
+        check_resource_id(ctx, set, obj);
     }
 
     // Choice branches seen on this node, keyed by choice group, in first-
@@ -412,6 +413,36 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
 
     if is_resource {
         ctx.contained.pop();
+    }
+}
+
+/// `Resource.id` is an `id` (`[A-Za-z0-9\-\.]{1,64}`), but R4 declares it
+/// as `System.String` with a `string` fhir-type, so the packs type it
+/// `string` and its pattern never ran. Checked here for every resource
+/// (root, contained, Bundle entries), as the HL7 validator does. Versions
+/// whose packs already type it `id` (R4B on) check it through the `id`
+/// pattern and are skipped here.
+fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::Map<String, Value>) {
+    let Some(id) = obj.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let typed_id = set.schemas().any(|s| {
+        s.elements
+            .as_ref()
+            .and_then(|els| els.get("id"))
+            .is_some_and(|el| el.type_.as_deref() == Some("id"))
+    });
+    if typed_id {
+        return;
+    }
+    let valid = (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    if !valid {
+        ctx.path.push_key("id");
+        ctx.error(ErrorKind::PrimitiveValue, errors::msg_resource_id(id));
+        ctx.path.pop();
     }
 }
 
@@ -1343,6 +1374,37 @@ mod tests {
             )
             .errors;
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn resource_ids_are_checked() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let ids = |resource: serde_json::Value| {
+            validator
+                .validate_sync(&resource, &crate::ValidationOptions::default())
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::PrimitiveValue)
+                .map(|e| e.path)
+                .collect::<Vec<_>>()
+        };
+        assert!(ids(json!({"resourceType": "Patient", "id": "abc-1.2"})).is_empty());
+        assert_eq!(
+            ids(json!({"resourceType": "Patient", "id": "bad id!"})),
+            vec!["Patient.id"]
+        );
+        assert_eq!(
+            ids(json!({"resourceType": "Patient", "id": "x".repeat(65)})),
+            vec!["Patient.id"]
+        );
+        assert_eq!(
+            ids(
+                json!({"resourceType": "Patient", "managingOrganization": {"reference": "#o_1"},
+                       "contained": [{"resourceType": "Organization", "id": "o_1"}]})
+            ),
+            vec!["Patient.contained.0.id"]
+        );
     }
 
     #[test]
