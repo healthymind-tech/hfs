@@ -599,13 +599,24 @@ fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::
     if pending.is_empty() {
         return Ok(());
     }
-    let mut update = conn.prepare(&format!(
-        "UPDATE {table} SET version_sort = ?1 WHERE id = ?2"
-    ))?;
-    for (id, version) in &pending {
-        let key = crate::version_order::version_sort_key(Some(version));
-        update.execute(rusqlite::params![key, id])?;
+    // One transaction for the whole backfill: ~24k individual autocommit
+    // UPDATEs on a 2 GB database took five minutes; batched they take seconds.
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> rusqlite::Result<()> {
+        let mut update = conn.prepare(&format!(
+            "UPDATE {table} SET version_sort = ?1 WHERE id = ?2"
+        ))?;
+        for (id, version) in &pending {
+            let key = crate::version_order::version_sort_key(Some(version));
+            update.execute(rusqlite::params![key, id])?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
     }
+    conn.execute_batch("COMMIT")?;
     tracing::info!(
         table,
         rows = pending.len(),
