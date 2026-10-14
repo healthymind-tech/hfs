@@ -447,12 +447,28 @@ impl PostgresBackend {
             } else {
                 String::new()
             };
+            // `last_updated IS NOT NULL` keeps the page to top-level rows.
+            // Rows extracted from a contained resource are filed under the
+            // container's id with a NULL `last_updated`, so without it the
+            // `DISTINCT` saw `(id, <ts>)` and `(id, NULL)` as two candidates
+            // and the join returned the container twice — every Synthea
+            // ExplanationOfBenefit, whose contained Coverage and
+            // ServiceRequest both carry `patient`, came back twice from
+            // `ExplanationOfBenefit?patient=` and from `Patient/$everything`
+            // (307 entries for 273 resources), and the NULL keys sorted first
+            // under `DESC`, ahead of every real one. A contained resource's
+            // values are not its container's (`_contained` searches them on
+            // their own path). The scan reads `last_updated` for its order
+            // anyway — from the key or INCLUDE list of the token, date and
+            // quantity indexes, from the heap for references — so the
+            // predicate costs nothing extra.
             let sql = format!(
                 "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
                         r.last_updated AS sort_key \
                  FROM ( \
                    SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                     AND last_updated IS NOT NULL{guard} \
                    ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
                  ) c \
                  JOIN resources r \

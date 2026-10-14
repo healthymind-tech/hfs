@@ -130,6 +130,53 @@ mod patient_everything_postgres_tests {
         TestServer::new(app).expect("failed to create test server")
     }
 
+    /// A resource whose contained resources reference the patient as well is
+    /// one match, not one per index row: PostgreSQL returned every Synthea
+    /// ExplanationOfBenefit twice (307 entries for 273 resources).
+    #[tokio::test]
+    async fn postgres_everything_returns_a_container_once() {
+        let server = create_test_server("everything-pg-contained").await;
+        seed(&server).await;
+        seed_eob_with_contained(&server).await;
+
+        for path in [
+            "/Patient/p1/$everything",
+            "/Patient/p1/$everything?_count=3",
+        ] {
+            let (matches, pages) = walk(&server, path).await;
+            for page in &pages {
+                assert_no_duplicate_entries(page);
+            }
+            assert_eq!(
+                matches
+                    .iter()
+                    .filter(|m| *m == "ExplanationOfBenefit/eob1")
+                    .count(),
+                1,
+                "{path}: {matches:?}"
+            );
+            let mut distinct = matches.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), matches.len(), "{path}: {matches:?}");
+        }
+
+        for path in [
+            "/ExplanationOfBenefit?patient=p1",
+            "/ExplanationOfBenefit?patient=Patient/p1",
+        ] {
+            let resp = server.get(path).await;
+            assert_eq!(resp.status_code(), axum::http::StatusCode::OK, "{path}");
+            let body: serde_json::Value = resp.json();
+            assert_no_duplicate_entries(&body);
+            assert_eq!(
+                entries(&body, "match"),
+                vec!["ExplanationOfBenefit/eob1"],
+                "{path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn postgres_everything_paged_walk_matches_unpaged() {
         let server = create_test_server("everything-pg").await;

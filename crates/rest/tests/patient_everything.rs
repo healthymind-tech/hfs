@@ -298,3 +298,34 @@ async fn capability_statement_declares_everything_on_patient() {
         "{ops:?}"
     );
 }
+
+/// A resource whose contained resources also reference the patient is one
+/// match (PostgreSQL used to return it once per index row; this is the SQLite
+/// side of the same guarantee).
+#[tokio::test]
+async fn a_container_is_returned_once() {
+    let server = server_with(10_000).await;
+    seed(&server).await;
+    seed_eob_with_contained(&server).await;
+    for path in [
+        "/Patient/p1/$everything",
+        "/Patient/p1/$everything?_count=3",
+    ] {
+        let (matches, pages) = walk(&server, path).await;
+        for page in &pages {
+            assert_no_duplicate_entries(page);
+        }
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|m| *m == "ExplanationOfBenefit/eob1")
+                .count(),
+            1,
+            "{path}: {matches:?}"
+        );
+    }
+    let resp = server.get("/ExplanationOfBenefit?patient=p1").await;
+    assert_eq!(resp.status_code(), StatusCode::OK);
+    let body: Value = resp.json();
+    assert_eq!(entries(&body, "match"), vec!["ExplanationOfBenefit/eob1"]);
+}
