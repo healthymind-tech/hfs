@@ -87,21 +87,34 @@ pub(super) struct WalkCtx<'a> {
     pub(super) path: PathTracker,
     /// Opt-in extension-context warnings (#615).
     check_extension_context: bool,
+    /// Issues already emitted, by `(kind, severity, path, message)`. A
+    /// profile compiled from its snapshot repeats every keyword it inherits
+    /// (`required`, `min`, slice cardinalities, ...), and each layer of the
+    /// cooperative set judges the node on its own — so a fact asserted by
+    /// the base and restated by two profiles would otherwise be reported
+    /// three times, identically.
+    emitted: HashSet<(ErrorKind, Severity, String, String)>,
+    /// Binding obligations already deferred, by `(path, valueSet,
+    /// strength)`: the same inherited binding from several layers is checked
+    /// (and reported) once. Constraints are deduplicated by `(path, id)` in
+    /// the effects pass; bindings carry no id, so they are folded here.
+    deferred_bindings: HashSet<(String, String, Option<String>)>,
 }
 
 impl WalkCtx<'_> {
     pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
-        self.errors.push(ValidationError::new(
-            kind,
-            self.path.render_dotted(),
-            message,
-        ));
+        self.error_with_severity(kind, message, Severity::Error);
     }
 
     fn error_with_severity(&mut self, kind: ErrorKind, message: String, severity: Severity) {
-        self.errors.push(
-            ValidationError::new(kind, self.path.render_dotted(), message).with_severity(severity),
-        );
+        let path = self.path.render_dotted();
+        if self
+            .emitted
+            .insert((kind, severity, path.clone(), message.clone()))
+        {
+            self.errors
+                .push(ValidationError::new(kind, path, message).with_severity(severity));
+        }
     }
 }
 
@@ -121,6 +134,8 @@ pub(super) fn validate(
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
         check_extension_context: opts.check_extension_context,
+        emitted: HashSet::new(),
+        deferred_bindings: HashSet::new(),
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -369,12 +384,19 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
             validate_excluded(ctx, excluded, data);
         }
         if let Some(binding) = &schema.binding {
-            ctx.deferred.push(Deferred::Binding {
-                path: ctx.path.render_dotted(),
-                binding: binding.clone(),
-                value: data.clone(),
-                type_hint: schema.type_.clone(),
-            });
+            let path = ctx.path.render_dotted();
+            if ctx.deferred_bindings.insert((
+                path.clone(),
+                binding.value_set.clone(),
+                binding.strength.clone(),
+            )) {
+                ctx.deferred.push(Deferred::Binding {
+                    path,
+                    binding: binding.clone(),
+                    value: data.clone(),
+                    type_hint: schema.type_.clone(),
+                });
+            }
         }
         if schema.elements.is_some() && !data.is_object() {
             ctx.error(
@@ -883,6 +905,51 @@ mod tests {
             "extension": [{ "url": "http://example.org/mystery", "valueString": "v" }]
         });
         assert!(warnings(&unknown).is_empty());
+    }
+
+    /// A keyword the base declares and every profile in the chain restates
+    /// (bp → vitalsigns → Observation all carry `required: [status]` and the
+    /// same `status` binding) is reported, and deferred, once.
+    #[test]
+    fn inherited_keywords_report_once() {
+        use crate::effects::Deferred;
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions {
+            profiles: vec!["http://hl7.org/fhir/StructureDefinition/bp".to_string()],
+            ..Default::default()
+        };
+
+        let no_status = json!({ "resourceType": "Observation", "code": {"text": "t"} });
+        let outcome = validator.validate_sync(&no_status, &opts);
+        let status_required: Vec<_> = outcome
+            .errors
+            .iter()
+            .filter(|e| e.kind == ErrorKind::Required && e.path == "Observation.status")
+            .collect();
+        assert_eq!(status_required.len(), 1, "{:?}", outcome.errors);
+        // No identical issue appears twice anywhere in the report.
+        for (i, a) in outcome.errors.iter().enumerate() {
+            for b in &outcome.errors[i + 1..] {
+                assert!(
+                    !(a.kind == b.kind
+                        && a.path == b.path
+                        && a.message == b.message
+                        && a.severity == b.severity),
+                    "duplicate issue {a:?}"
+                );
+            }
+        }
+
+        let with_status =
+            json!({ "resourceType": "Observation", "status": "final", "code": {"text": "t"} });
+        let outcome = validator.validate_sync(&with_status, &opts);
+        let status_bindings = outcome
+            .deferred
+            .iter()
+            .filter(|d| matches!(d, Deferred::Binding { path, .. } if path == "Observation.status"))
+            .count();
+        assert_eq!(status_bindings, 1, "{:?}", outcome.deferred);
     }
 
     #[test]

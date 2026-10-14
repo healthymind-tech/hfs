@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Stable error type strings — the cross-implementation contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
     /// A data key matched no element in any schema of the cooperative set.
@@ -71,7 +71,7 @@ pub enum ErrorKind {
 
 /// Issue severity. Internal only — deliberately not serialized, so the
 /// conformance error shape stays exactly `{type, path, message, ...extra}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Severity {
     #[default]
     Error,
