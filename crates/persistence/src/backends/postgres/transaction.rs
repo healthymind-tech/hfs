@@ -543,21 +543,17 @@ impl PostgresTransaction {
         if !self.search_offloaded && !self.defer_search_indexing {
             let client = self.client()?;
             let tenant_id = self.tenant.tenant_id().as_str();
-            for created in &pending {
-                if let Err(error) = self
-                    .backend
-                    .index_fts_content_guarded(
-                        client,
-                        tenant_id,
-                        &created.resource_type,
-                        &created.id,
-                        &created.data,
-                    )
-                    .await
-                {
-                    self.poisoned = true;
-                    return Err(error);
-                }
+            let items: Vec<(&str, &str, &Value)> = pending
+                .iter()
+                .map(|p| (p.resource_type.as_str(), p.id.as_str(), &p.data))
+                .collect();
+            if let Err(error) = self
+                .backend
+                .index_fts_content_batch_guarded(client, tenant_id, &items)
+                .await
+            {
+                self.poisoned = true;
+                return Err(error);
             }
         }
 

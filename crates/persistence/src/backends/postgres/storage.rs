@@ -2309,6 +2309,70 @@ impl PostgresBackend {
         result
     }
 
+    /// The full-text rows of a batch of resources, [`FTS_BATCH_SIZE`] per
+    /// statement, on an already guarded transaction.
+    ///
+    /// The transaction-bundle flush used to call
+    /// [`Self::index_fts_content_guarded`] once per created resource: a
+    /// SAVEPOINT, the upsert and a RELEASE, three round trips each, so an
+    /// import bundle of ~450 resources spent ~1,350 round trips on full text
+    /// alone. A group is one savepoint and one statement; only a group that
+    /// trips the 1 MB `tsvector` limit is replayed per resource, where the
+    /// oversized input is truncated exactly as before.
+    pub(super) async fn index_fts_content_batch_guarded<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        items: &[(&str, &str, &Value)],
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if items.is_empty() || !self.fts_table_exists(client).await? {
+            return Ok(());
+        }
+        let savepoint = |sql: &'static str, what: &'static str| async move {
+            client
+                .batch_execute(sql)
+                .await
+                .map_err(|e| internal_postgres_error(format!("Failed to {what}: {e}"), e))
+        };
+        for group in items.chunks(FTS_BATCH_SIZE) {
+            savepoint("SAVEPOINT guarded_fts_group", "create FTS group savepoint").await?;
+            match Self::index_fts_content_group(client, tenant_id, group).await {
+                Ok(()) => {}
+                Err(BatchFtsError::Other(error)) => return Err(error),
+                Err(BatchFtsError::ProgramLimitExceeded(error)) => {
+                    savepoint(
+                        "ROLLBACK TO SAVEPOINT guarded_fts_group",
+                        "rollback FTS group savepoint",
+                    )
+                    .await?;
+                    tracing::debug!(
+                        "Replaying a bundle FTS group per resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                        error
+                    );
+                    for &(resource_type, resource_id, content) in group {
+                        self.index_fts_content_guarded(
+                            client,
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            content,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            savepoint(
+                "RELEASE SAVEPOINT guarded_fts_group",
+                "release FTS group savepoint",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Whether `resource_fts` exists, asked of the catalog at most once.
     ///
     /// This used to be an `information_schema.tables` lookup on every resource
@@ -2517,7 +2581,7 @@ impl PostgresBackend {
     async fn index_fts_content_group<C>(
         client: &C,
         tenant_id: &str,
-        group: &[&StoredResource],
+        group: &[(&str, &str, &Value)],
     ) -> Result<(), BatchFtsError>
     where
         C: deadpool_postgres::GenericClient + ?Sized,
@@ -2530,15 +2594,15 @@ impl PostgresBackend {
         let mut empty_types: Vec<&str> = Vec::new();
         let mut empty_ids: Vec<&str> = Vec::new();
 
-        for resource in group {
-            let content = extract_searchable_content(resource.content());
+        for &(resource_type, resource_id, content) in group {
+            let content = extract_searchable_content(content);
             if content.is_empty() {
-                empty_types.push(resource.resource_type());
-                empty_ids.push(resource.id());
+                empty_types.push(resource_type);
+                empty_ids.push(resource_id);
                 continue;
             }
-            resource_types.push(resource.resource_type().to_string());
-            resource_ids.push(resource.id().to_string());
+            resource_types.push(resource_type.to_string());
+            resource_ids.push(resource_id.to_string());
             narratives.push(content.narrative);
             full_contents.push(content.full_content);
         }
@@ -2609,7 +2673,11 @@ impl PostgresBackend {
                     internal_postgres_error(message, e)
                 })?;
 
-            match Self::index_fts_content_group(transaction, tenant_id, group).await {
+            let items: Vec<(&str, &str, &Value)> = group
+                .iter()
+                .map(|r| (r.resource_type(), r.id(), r.content()))
+                .collect();
+            match Self::index_fts_content_group(transaction, tenant_id, &items).await {
                 Ok(()) => {}
                 Err(BatchFtsError::Other(error)) => return Err(error),
                 Err(BatchFtsError::ProgramLimitExceeded(error)) => {

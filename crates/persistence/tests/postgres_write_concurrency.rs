@@ -419,3 +419,59 @@ async fn bundle_post_with_client_id_conflicts_cleanly() {
         .to_string();
     assert!(error.contains("already exists"), "{error}");
 }
+
+/// A bundle's full-text rows are written a group at a time. A group holding
+/// a resource whose text overflows PostgreSQL's 1 MB `tsvector` is replayed
+/// per resource, so the oversized one is indexed truncated and its
+/// neighbours are indexed whole, and the bundle still commits.
+#[tokio::test]
+async fn bundle_full_text_survives_an_oversized_resource() {
+    let backend = backend(4).await;
+    let tenant = tenant("ftsgroup");
+    let text = (0..100_000)
+        .map(|index| format!("lexeme{index:08x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let patient = |id: &str, div: String| BundleEntry {
+        method: BundleMethod::Put,
+        url: format!("Patient/{id}"),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "id": id,
+            "text": {"status": "generated", "div": format!("<div>{div}</div>")}
+        })),
+        ..Default::default()
+    };
+    let entries = vec![
+        patient("small-a", "alphaword".to_string()),
+        patient("huge", text),
+        patient("small-b", "betaword".to_string()),
+    ];
+    backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let client = backend.get_client().await.unwrap();
+    let matches = |word: &'static str| {
+        let client = &client;
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        async move {
+            client
+                .query(
+                    "SELECT resource_id FROM resource_fts
+                     WHERE tenant_id = $1 AND content_tsvector @@ plainto_tsquery('english', $2)
+                     ORDER BY resource_id",
+                    &[&tenant_id, &word],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(matches("alphaword").await, vec!["small-a"]);
+    assert_eq!(matches("betaword").await, vec!["small-b"]);
+    assert_eq!(matches("lexeme00000000").await, vec!["huge"]);
+}
