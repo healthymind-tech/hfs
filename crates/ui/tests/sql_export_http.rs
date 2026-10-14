@@ -2965,7 +2965,7 @@ async fn sql_export_detail_page_isolates_jobs_by_tenant_and_user_with_a_404_insi
         let html = body_text(response).await;
         assert!(html.contains(">Not found<"), "{path}");
         // The full shell renders — the sidebar nav is present.
-        assert!(html.contains(r#"class="nav">"#), "{path}");
+        assert!(html.contains(r#"<nav class="nav""#), "{path}");
         assert!(
             html.contains(r#"<a class="btn" href="/ui/sql/export">SQL Exports</a>"#),
             "{path}"

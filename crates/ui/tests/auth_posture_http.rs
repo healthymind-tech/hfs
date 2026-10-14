@@ -108,8 +108,8 @@ async fn the_shell_says_once_that_no_browser_sign_in_is_configured() {
         .find(r#"if (document.getElementById("auth-bearer-only"))"#)
         .expect("batch.js checks the posture before executing");
     let send = script
-        .find(r#"fetch("/""#)
-        .expect("batch.js posts to the root");
+        .find(r#"fetch(fhirUrl("/")"#)
+        .expect("batch.js posts to the FHIR root (under the API prefix)");
     assert!(precheck < send, "the posture check runs before the POST");
 
     let spanish = html("/ui?lang=es").await;
