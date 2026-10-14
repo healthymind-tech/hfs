@@ -794,6 +794,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::ExtensionContext => IssueType::Invalid,
         // A batch/transaction entry filed under the wrong resource type.
         ErrorKind::BundleEntryMismatch => IssueType::Invalid,
+        // A malformed or wrongly-typed reference.
+        ErrorKind::ReferenceInvalid => IssueType::Invalid,
         ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,

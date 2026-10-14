@@ -67,6 +67,9 @@ pub enum ErrorKind {
     /// A `batch`/`transaction` entry whose `request.url` names a different
     /// resource type than the entry's `resource` (X10).
     BundleEntryMismatch,
+    /// A `Reference` that is malformed, contradicts its own `type`, or names
+    /// a target type the element does not allow.
+    ReferenceInvalid,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -303,6 +306,31 @@ pub(crate) fn msg_unknown_profile(reference: &str) -> String {
 pub(crate) fn msg_unknown_requested_profile(reference: &str) -> String {
     format!(
         "Profile '{reference}' was requested for validation but could not be found; the resource was not checked against it"
+    )
+}
+
+/// [helios] `Reference.reference` is not a reference (HL7 validator
+/// wording).
+pub(crate) fn msg_reference_malformed(reference: &str) -> String {
+    format!("The reference '{reference}' is not a valid reference")
+}
+
+/// [helios] the literal reference and `Reference.type` disagree.
+pub(crate) fn msg_reference_type_mismatch(
+    reference: &str,
+    literal: &str,
+    declared: &str,
+) -> String {
+    format!(
+        "The reference '{reference}' refers to a {literal}, but Reference.type says '{declared}'"
+    )
+}
+
+/// [helios] the target type is not allowed (HL7 validator wording).
+pub(crate) fn msg_reference_target_type(found: &str, allowed: &[String]) -> String {
+    format!(
+        "Invalid Resource target type. Found {found}, but expected one of ({})",
+        allowed.join(", ")
     )
 }
 

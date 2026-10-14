@@ -103,9 +103,25 @@ pub(super) struct WalkCtx<'a> {
     /// (and reported) once. Constraints are deduplicated by `(path, id)` in
     /// the effects pass; bindings carry no id, so they are folded here.
     deferred_bindings: HashSet<(String, String, Option<String>)>,
+    /// `(id, resourceType)` of the contained resources of each resource
+    /// being walked, innermost last (for `#id` reference targets).
+    contained: Vec<Vec<(String, String)>>,
 }
 
 impl WalkCtx<'_> {
+    pub(super) fn resolver(&self) -> &dyn SchemaResolver {
+        self.resolver
+    }
+
+    /// The type of the contained resource `id` of the innermost resource.
+    pub(super) fn contained_type(&self, id: &str) -> Option<String> {
+        self.contained
+            .last()?
+            .iter()
+            .find(|(cid, _)| cid == id)
+            .map(|(_, rt)| rt.clone())
+    }
+
     pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
         self.error_with_severity(kind, message, Severity::Error);
     }
@@ -142,6 +158,7 @@ pub(super) fn validate(
         unknown_profile: opts.unknown_profile,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
+        contained: Vec::new(),
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -346,10 +363,16 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     };
 
     eval_validators(ctx, set, data);
+    super::references::check_reference(ctx, set, data);
 
     let Some(obj) = data.as_object() else {
         return;
     };
+
+    let is_resource = obj.get("resourceType").is_some_and(Value::is_string);
+    if is_resource {
+        ctx.contained.push(contained_types(obj));
+    }
 
     // Choice branches seen on this node, keyed by choice group, in first-
     // encounter order.
@@ -378,6 +401,29 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
             ctx.path.pop();
         }
     }
+
+    if is_resource {
+        ctx.contained.pop();
+    }
+}
+
+/// `(id, resourceType)` of a resource's `contained` entries.
+fn contained_types(resource: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    resource
+        .get("contained")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| {
+                    Some((
+                        c.get("id")?.as_str()?.to_string(),
+                        c.get("resourceType")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Run every keyword validator of every schema in the set against the node.
@@ -1117,6 +1163,85 @@ mod tests {
         assert_eq!(errors[0].kind, ErrorKind::UnknownProfile);
         assert_eq!(errors[0].severity, Severity::Error);
         assert_eq!(errors[0].path, "Patient");
+    }
+
+    fn reference_errors(resource: &serde_json::Value, profiles: &[&str]) -> Vec<ValidationError> {
+        let validator = crate::engine::Validator::new(crate::packs::core_registry(
+            helios_fhir::FhirVersion::R4,
+        ));
+        let opts = crate::ValidationOptions {
+            profiles: profiles.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        validator
+            .validate_sync(resource, &opts)
+            .errors
+            .into_iter()
+            .filter(|e| e.kind == ErrorKind::ReferenceInvalid)
+            .collect()
+    }
+
+    fn observation(subject: serde_json::Value) -> serde_json::Value {
+        json!({
+            "resourceType": "Observation", "status": "final",
+            "code": {"text": "t"}, "subject": subject
+        })
+    }
+
+    #[test]
+    fn reference_target_types_are_checked() {
+        // Allowed targets, relative, absolute, versioned, conditional, logical.
+        for ok in [
+            json!({"reference": "Patient/p1"}),
+            json!({"reference": "Group/g1"}),
+            json!({"reference": "https://example.org/fhir/Patient/p1/_history/2"}),
+            json!({"reference": "Patient?identifier=http://x|1"}),
+            json!({"identifier": {"system": "http://x", "value": "1"}}),
+            json!({"reference": "Patient/p1", "type": "Patient"}),
+            json!({"display": "someone"}),
+        ] {
+            let errors = reference_errors(&observation(ok.clone()), &[]);
+            assert!(errors.is_empty(), "{ok}: {errors:?}");
+        }
+
+        // A type Observation.subject does not allow.
+        let errors = reference_errors(&observation(json!({"reference": "Medication/m1"})), &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].path, "Observation.subject");
+        assert!(errors[0].message.contains("Found Medication"), "{errors:?}");
+
+        // The reference contradicts its own `type`.
+        let errors = reference_errors(
+            &observation(json!({"reference": "Patient/p1", "type": "Group"})),
+            &[],
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("Reference.type"), "{errors:?}");
+
+        // A profile narrows the targets: vitalsigns allows Patient only.
+        let vitals = ["http://hl7.org/fhir/StructureDefinition/vitalsigns"];
+        let errors = reference_errors(&observation(json!({"reference": "Group/g1"})), &vitals);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.ends_with("expected one of (Patient)"),
+            "{errors:?}"
+        );
+
+        // Not a reference at all.
+        let errors = reference_errors(
+            &observation(json!({"reference": "not a reference at all"})),
+            &[],
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("is not a valid reference"));
+
+        // A contained target is typed by its resourceType.
+        let mut contained = observation(json!({"reference": "#m"}));
+        contained["contained"] = json!([{"resourceType": "Medication", "id": "m"}]);
+        let errors = reference_errors(&contained, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        contained["contained"] = json!([{"resourceType": "Patient", "id": "m"}]);
+        assert!(reference_errors(&contained, &[]).is_empty());
     }
 
     /// A profile that constrains a primitive's extensions gives the

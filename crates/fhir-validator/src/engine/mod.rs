@@ -10,6 +10,7 @@
 mod errors;
 mod path;
 mod primitives;
+mod references;
 pub(crate) mod slicing;
 mod walk;
 
