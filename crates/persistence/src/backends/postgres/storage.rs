@@ -932,7 +932,12 @@ impl ResourceStorage for PostgresBackend {
             }
 
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type != "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -1200,7 +1205,12 @@ impl ResourceStorage for PostgresBackend {
             // parameters. The `resource_fts` row stays either way:
             // `index_fts_content_guarded` upserts over it on the same connection.
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type != "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -2105,7 +2115,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type != "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -2292,6 +2307,70 @@ impl PostgresBackend {
                 .map_err(|e| internal_error(format!("Failed to release FTS savepoint: {e}")))?;
         }
         result
+    }
+
+    /// The full-text rows of a batch of resources, [`FTS_BATCH_SIZE`] per
+    /// statement, on an already guarded transaction.
+    ///
+    /// The transaction-bundle flush used to call
+    /// [`Self::index_fts_content_guarded`] once per created resource: a
+    /// SAVEPOINT, the upsert and a RELEASE, three round trips each, so an
+    /// import bundle of ~450 resources spent ~1,350 round trips on full text
+    /// alone. A group is one savepoint and one statement; only a group that
+    /// trips the 1 MB `tsvector` limit is replayed per resource, where the
+    /// oversized input is truncated exactly as before.
+    pub(super) async fn index_fts_content_batch_guarded<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        items: &[(&str, &str, &Value)],
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if items.is_empty() || !self.fts_table_exists(client).await? {
+            return Ok(());
+        }
+        let savepoint = |sql: &'static str, what: &'static str| async move {
+            client
+                .batch_execute(sql)
+                .await
+                .map_err(|e| internal_postgres_error(format!("Failed to {what}: {e}"), e))
+        };
+        for group in items.chunks(FTS_BATCH_SIZE) {
+            savepoint("SAVEPOINT guarded_fts_group", "create FTS group savepoint").await?;
+            match Self::index_fts_content_group(client, tenant_id, group).await {
+                Ok(()) => {}
+                Err(BatchFtsError::Other(error)) => return Err(error),
+                Err(BatchFtsError::ProgramLimitExceeded(error)) => {
+                    savepoint(
+                        "ROLLBACK TO SAVEPOINT guarded_fts_group",
+                        "rollback FTS group savepoint",
+                    )
+                    .await?;
+                    tracing::debug!(
+                        "Replaying a bundle FTS group per resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                        error
+                    );
+                    for &(resource_type, resource_id, content) in group {
+                        self.index_fts_content_guarded(
+                            client,
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            content,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            savepoint(
+                "RELEASE SAVEPOINT guarded_fts_group",
+                "release FTS group savepoint",
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Whether `resource_fts` exists, asked of the catalog at most once.
@@ -2502,7 +2581,7 @@ impl PostgresBackend {
     async fn index_fts_content_group<C>(
         client: &C,
         tenant_id: &str,
-        group: &[&StoredResource],
+        group: &[(&str, &str, &Value)],
     ) -> Result<(), BatchFtsError>
     where
         C: deadpool_postgres::GenericClient + ?Sized,
@@ -2515,15 +2594,15 @@ impl PostgresBackend {
         let mut empty_types: Vec<&str> = Vec::new();
         let mut empty_ids: Vec<&str> = Vec::new();
 
-        for resource in group {
-            let content = extract_searchable_content(resource.content());
+        for &(resource_type, resource_id, content) in group {
+            let content = extract_searchable_content(content);
             if content.is_empty() {
-                empty_types.push(resource.resource_type());
-                empty_ids.push(resource.id());
+                empty_types.push(resource_type);
+                empty_ids.push(resource_id);
                 continue;
             }
-            resource_types.push(resource.resource_type().to_string());
-            resource_ids.push(resource.id().to_string());
+            resource_types.push(resource_type.to_string());
+            resource_ids.push(resource_id.to_string());
             narratives.push(content.narrative);
             full_contents.push(content.full_content);
         }
@@ -2594,7 +2673,11 @@ impl PostgresBackend {
                     internal_postgres_error(message, e)
                 })?;
 
-            match Self::index_fts_content_group(transaction, tenant_id, group).await {
+            let items: Vec<(&str, &str, &Value)> = group
+                .iter()
+                .map(|r| (r.resource_type(), r.id(), r.content()))
+                .collect();
+            match Self::index_fts_content_group(transaction, tenant_id, &items).await {
                 Ok(()) => {}
                 Err(BatchFtsError::Other(error)) => return Err(error),
                 Err(BatchFtsError::ProgramLimitExceeded(error)) => {
@@ -4306,13 +4389,19 @@ impl BundleProvider for PostgresBackend {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
-        // Start a transaction
-        let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
-            .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Failed to begin transaction: {}", e),
-            })?;
+        // Start a transaction. A bundle whose every key is known up front runs
+        // under the shared tenant gate with those keys locked, so bundles over
+        // disjoint resources commit side by side; the rest keep the exclusive
+        // gate (see `plan_bundle_locks`).
+        let mut entries = entries;
+        let options = TransactionOptions::new().fhir_version(fhir_version);
+        let begun = match self.plan_bundle_locks(&mut entries) {
+            Some(plan) => self.begin_bundle_transaction(tenant, options, plan).await,
+            None => self.begin_transaction(tenant, options).await,
+        };
+        let mut tx = begun.map_err(|e| TransactionError::RolledBack {
+            reason: format!("Failed to begin transaction: {}", e),
+        })?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
@@ -4367,9 +4456,6 @@ impl BundleProvider for PostgresBackend {
         // delete checks below (create is conditional via `create_affects_overlay`;
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
-
-        // Make entries mutable for reference resolution
-        let mut entries = entries;
 
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
@@ -4512,6 +4598,78 @@ impl BundleProvider for PostgresBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
+    }
+}
+
+/// Above this many explicitly named resources a bundle takes the exclusive
+/// gate instead of one advisory lock per resource: the shared lock table holds
+/// `max_locks_per_transaction` (default 64) per connection, and a few
+/// concurrent bundles naming thousands of resources each would exhaust it.
+const MAX_PLANNED_BUNDLE_LOCKS: usize = 256;
+
+impl PostgresBackend {
+    /// The keys a transaction bundle will touch, when they can all be known
+    /// before BEGIN; `None` keeps the exclusive tenant gate.
+    ///
+    /// The exclusive gate made every transaction bundle wait for every other
+    /// write in its tenant. Under the benchmark's 16 concurrent importers that
+    /// queue outlasted the 30 s `statement_timeout`, and 4-5% of bundles came
+    /// back 500 "rolled back" while the server used half a core. What it buys
+    /// is needed only where a bundle's write set depends on what it finds:
+    ///
+    /// * conditional entries (`ifNoneExist`, `PUT/DELETE/PATCH [type]?…`) —
+    ///   their target is a search result, and two bundles racing on the same
+    ///   criteria must not both miss and create;
+    /// * SearchParameter writes, which change how every other write indexes.
+    ///
+    /// Every other entry names its key: `PUT`/`PATCH`/`DELETE`/`GET` by URL,
+    /// and `POST` by the id it will be created under. A `POST` without one is
+    /// given its server id here, before BEGIN, so the plan can list it as
+    /// fresh — exactly the id `Transaction::create` would have generated.
+    /// A malformed entry also returns `None`: the bundle then runs as before
+    /// and fails with the error it always did.
+    pub(super) fn plan_bundle_locks(
+        &self,
+        entries: &mut [BundleEntry],
+    ) -> Option<super::transaction::LockPlan> {
+        let mut plan = super::transaction::LockPlan::default();
+        for entry in entries.iter_mut() {
+            if entry.criteria.is_some() || entry.if_none_exist.is_some() {
+                return None;
+            }
+            let key = match entry.method {
+                BundleMethod::Post => {
+                    let resource = entry.resource.as_mut()?.as_object_mut()?;
+                    let resource_type = resource.get("resourceType")?.as_str()?.to_string();
+                    match resource.get("id") {
+                        Some(Value::String(id)) => {
+                            let id = id.clone();
+                            plan.locked.push((resource_type.clone(), id.clone()));
+                            (resource_type, id)
+                        }
+                        Some(_) => return None,
+                        None => {
+                            let id = crate::types::new_resource_id();
+                            resource.insert("id".to_string(), Value::String(id.clone()));
+                            plan.fresh.push((resource_type.clone(), id.clone()));
+                            (resource_type, id)
+                        }
+                    }
+                }
+                BundleMethod::Get
+                | BundleMethod::Put
+                | BundleMethod::Patch
+                | BundleMethod::Delete => {
+                    let key = self.parse_url(&entry.url).ok()?;
+                    plan.locked.push(key.clone());
+                    key
+                }
+            };
+            if key.0 == "SearchParameter" {
+                return None;
+            }
+        }
+        (plan.locked.len() <= MAX_PLANNED_BUNDLE_LOCKS).then_some(plan)
     }
 }
 
@@ -5686,7 +5844,7 @@ impl PostgresBackend {
                 return Ok::<_, StorageError>(None);
             };
             let extractor = self
-                .authoritative_extractor(&transaction, tenant_id)
+                .authoritative_extractor(&transaction, tenant_id, true)
                 .await?;
             Ok::<_, StorageError>(Some((resolved, live, extractor)))
         }

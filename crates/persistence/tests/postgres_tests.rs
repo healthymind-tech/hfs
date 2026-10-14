@@ -27066,6 +27066,16 @@ mod postgres_integration {
         drop(pooled);
 
         let locker = reindex_test_client_for(&dbname).await;
+        // The create above cached this tenant's registry; move the
+        // SearchParameter epoch so the batch must read the overlay again.
+        locker
+            .execute(
+                "INSERT INTO search_parameter_epochs (tenant_id, epoch) VALUES ($1, 1)
+                 ON CONFLICT (tenant_id) DO UPDATE SET epoch = search_parameter_epochs.epoch + 1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
         locker
             .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
             .await

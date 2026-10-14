@@ -29,6 +29,9 @@ use crate::search::{
 /// SearchParameter writes) populate this map and the loader reads it.
 type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
+/// Tenant id -> (SearchParameter epoch, registry built at that epoch).
+type WriteRegistryCache = Arc<RwLock<HashMap<String, (i64, Arc<RwLock<SearchParameterRegistry>>)>>>;
+
 /// PostgreSQL backend for FHIR resource storage.
 ///
 /// Cheap to clone: a pool handle, shared registries and the config.
@@ -58,6 +61,10 @@ pub struct PostgresBackend {
     pub(super) reindex_admission: Arc<Semaphore>,
     pub(super) reindex_width: usize,
     pub(super) cleanup_tracker: Arc<super::cleanup::CleanupTracker>,
+    /// Each tenant's persisted SearchParameter registry, keyed by the
+    /// SearchParameter epoch it was read at. See
+    /// [`PostgresBackend::authoritative_extractor`].
+    write_registry_cache: WriteRegistryCache,
     #[cfg(test)]
     pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
     #[cfg(test)]
@@ -485,6 +492,7 @@ impl PostgresBackend {
             reindex_admission: Arc::new(Semaphore::new(1)),
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
+            write_registry_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -915,21 +923,72 @@ impl PostgresBackend {
         Ok(count)
     }
 
-    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    /// The tenant's SearchParameter registry as persisted, read on the caller's
+    /// guarded transaction.
     ///
-    /// The process-local overlay cache can lag writes from another HFS process.
-    /// Reindex groups and guarded mutations therefore read the persisted overlay
-    /// after taking the tenant gate. The caller keeps this extractor for one
-    /// immutable extraction phase; this method never writes the cache or checks
-    /// out another connection.
+    /// The process-local overlay cache can lag writes from another HFS process,
+    /// so reindex groups and guarded mutations take the persisted overlay after
+    /// the tenant gate. Reading it used to mean `SELECT data` over every stored
+    /// SearchParameter — 1,372 seeded rows, ~1.5 MB of JSONB — on every single
+    /// write; that query was 77 of 91 non-idle samples during a 1-VU create
+    /// run, and most of its 74 ms.
+    ///
+    /// Now the caller first reads the tenant's SearchParameter epoch (schema
+    /// v47: a trigger bumps it on every SearchParameter row change, from any
+    /// process). The epoch is read after the gate and before the rows, and it
+    /// only grows, so a registry cached under epoch `e` was built from rows at
+    /// least as new as `e`: while the epoch is unchanged the cached registry is
+    /// the persisted one, and the rows are not read at all.
+    ///
+    /// `cacheable` must be false when the caller's transaction has itself
+    /// written a SearchParameter: its epoch and rows then include uncommitted
+    /// work that a rollback would take back, so they are read but neither
+    /// looked up in nor stored to the cache.
+    ///
+    /// The caller keeps this extractor for one immutable extraction phase; this
+    /// method never checks out another connection.
     pub(crate) async fn authoritative_extractor<C>(
         &self,
         client: &C,
         tenant_id: &str,
+        cacheable: bool,
     ) -> StorageResult<SearchParameterExtractor>
     where
         C: GenericClient + Sync + ?Sized,
     {
+        fn internal(what: &str, e: tokio_postgres::Error) -> crate::error::StorageError {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "postgres".to_string(),
+                message: format!("{what}: {e}"),
+                source: None,
+            })
+        }
+
+        let epoch = if cacheable {
+            // The empty tenant id is the TRUNCATE row (see migration v47):
+            // summing the two keeps the key monotonic for either kind of bump.
+            let statement = client
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(epoch), 0)::BIGINT FROM search_parameter_epochs
+                     WHERE tenant_id = $1 OR tenant_id = ''",
+                )
+                .await
+                .map_err(|e| internal("Failed to prepare SearchParameter epoch query", e))?;
+            let epoch: i64 = client
+                .query_one(&statement, &[&tenant_id])
+                .await
+                .map_err(|e| internal("Failed to query SearchParameter epoch", e))?
+                .get(0);
+            if let Some((cached_epoch, registry)) = self.write_registry_cache.read().get(tenant_id)
+                && *cached_epoch == epoch
+            {
+                return Ok(SearchParameterExtractor::new(registry.clone()));
+            }
+            Some(epoch)
+        } else {
+            None
+        };
+
         let rows = client
             .query(
                 "SELECT data FROM resources
@@ -939,13 +998,7 @@ impl PostgresBackend {
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "postgres".to_string(),
-                    message: format!("Failed to query tenant SearchParameters: {e}"),
-                    source: None,
-                })
-            })?;
+            .map_err(|e| internal("Failed to query tenant SearchParameters", e))?;
 
         let base = self.registries.base().clone();
         let overlays: Vec<serde_json::Value> = {
@@ -963,47 +1016,60 @@ impl PostgresBackend {
                 })
                 .collect()
         };
-        if overlays.is_empty() {
+        let registry = if overlays.is_empty() {
             // The common case has no tenant overlay. The base is loaded at
             // construction and remains shared, so a write need not clone its
             // 1,389 definitions before extracting one resource.
-            return Ok(SearchParameterExtractor::new(base));
-        }
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = base.read().clone();
-        for data in overlays {
-            if let Ok(mut definition) = loader.parse_resource(&data) {
-                if definition.status == SearchParameterStatus::Active {
+            base
+        } else {
+            let loader = SearchParameterLoader::new(self.config.fhir_version);
+            let mut registry = base.read().clone();
+            for data in overlays {
+                if let Ok(mut definition) = loader.parse_resource(&data)
+                    && definition.status == SearchParameterStatus::Active
+                {
                     definition.source = SearchParameterSource::Stored;
                     // Match TenantSearchRegistries::build_and_cache: a stored
                     // duplicate canonical URL cannot override the base entry.
                     let _ = registry.register(definition);
                 }
             }
+            Arc::new(RwLock::new(registry))
+        };
+        if let Some(epoch) = epoch {
+            let mut cache = self.write_registry_cache.write();
+            // Never move an entry backwards: a slower reader of an older epoch
+            // must not evict what a newer one just stored.
+            if cache
+                .get(tenant_id)
+                .is_none_or(|(cached, _)| *cached < epoch)
+            {
+                cache.insert(tenant_id.to_string(), (epoch, registry.clone()));
+            }
         }
-        Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
-            registry,
-        ))))
+        Ok(SearchParameterExtractor::new(registry))
     }
 
     /// The extractor a write hands to its index step.
     ///
     /// When `extracts` is false the write indexes nothing in PostgreSQL —
     /// search is offloaded (#939) or deferred to a later rebuild (#903) — so
-    /// reading the persisted overlay would be pure cost: one query and one
-    /// JSONB decode per stored SearchParameter (1,375 seeded, ~1.5 MB) on
-    /// every call. The shared base stands in; nothing extracts with it.
+    /// reading the persisted overlay would be pure cost. The shared base stands
+    /// in; nothing extracts with it. `cacheable` is as for
+    /// [`Self::authoritative_extractor`].
     pub(crate) async fn write_extractor<C>(
         &self,
         client: &C,
         tenant_id: &str,
         extracts: bool,
+        cacheable: bool,
     ) -> StorageResult<SearchParameterExtractor>
     where
         C: GenericClient + Sync + ?Sized,
     {
         if extracts {
-            self.authoritative_extractor(client, tenant_id).await
+            self.authoritative_extractor(client, tenant_id, cacheable)
+                .await
         } else {
             Ok(SearchParameterExtractor::new(
                 self.registries.base().clone(),
