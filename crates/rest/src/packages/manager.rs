@@ -1857,64 +1857,141 @@ fn quoted_url(message: &str) -> Option<&str> {
     Some(&message[start..start + len])
 }
 
+/// Whether the terminology server refused a batch for its size: too large a
+/// body (`413`), or more work than fits in its request timeout (`408`).
+fn is_oversized_batch(message: &str) -> bool {
+    message.contains("HTTP 413") || message.contains("HTTP 408")
+}
+
 /// Imports into the terminology server, retrying transient failures with
 /// backoff: the whole batch when the request fails, otherwise only the
-/// resources whose own error was transient. The import is an upsert, so a
-/// retry of something that did land is harmless.
-async fn import_with_retry(
+/// resources whose own error was transient. A batch refused for its size is
+/// split in half and each half sent on its own. The import is an upsert, so
+/// a retry of something that did land is harmless.
+fn import_with_retry(
     client: &HtsClient,
     mut resources: Vec<Value>,
-) -> Result<ImportOutcome, String> {
-    const DELAYS: [u64; 4] = [5, 15, 30, 60];
-    let mut kept_errors: Vec<String> = Vec::new();
-    let mut imported = 0;
-    let mut status = 200;
-    for delay in DELAYS.into_iter().map(Some).chain([None]) {
-        let last = delay.is_none();
-        match client.import(&resources).await {
-            Err(err) if !last && is_transient_terminology_error(&err) => {}
-            Err(err) if kept_errors.is_empty() && imported == 0 => return Err(err),
-            Err(err) => {
-                kept_errors.push(err);
-                break;
-            }
-            Ok(outcome) => {
-                status = outcome.status;
-                imported += outcome.imported;
-                let (transient, permanent): (Vec<String>, Vec<String>) = outcome
-                    .errors
-                    .into_iter()
-                    .partition(|e| is_transient_terminology_error(e));
-                kept_errors.extend(permanent);
-                let retry: Vec<Value> = resources
-                    .into_iter()
-                    .filter(|r| {
-                        r.get("url")
-                            .and_then(Value::as_str)
-                            .is_some_and(|url| transient.iter().any(|e| quoted_url(e) == Some(url)))
-                    })
-                    .collect();
-                if transient.is_empty() || last || retry.is_empty() {
-                    kept_errors.extend(transient);
+) -> futures::future::BoxFuture<'_, Result<ImportOutcome, String>> {
+    Box::pin(async move {
+        const DELAYS: [u64; 4] = [5, 15, 30, 60];
+        let mut kept_errors: Vec<String> = Vec::new();
+        let mut imported = 0;
+        let mut status = 200;
+        for delay in DELAYS.into_iter().map(Some).chain([None]) {
+            let last = delay.is_none();
+            match client.import(&resources).await {
+                Err(err) if resources.len() > 1 && is_oversized_batch(&err) => {
+                    let second = resources.split_off(resources.len() / 2);
+                    for half in [resources, second] {
+                        let labels: Vec<String> = half.iter().map(resource_label).collect();
+                        match import_with_retry(client, half).await {
+                            Ok(outcome) => {
+                                imported += outcome.imported;
+                                kept_errors.extend(outcome.errors);
+                            }
+                            Err(err) => kept_errors.extend(
+                                labels
+                                    .into_iter()
+                                    .map(|label| format!("{label} import failed: {err}")),
+                            ),
+                        }
+                    }
                     break;
                 }
-                resources = retry;
+                Err(err) if !last && is_transient_terminology_error(&err) => {}
+                Err(err) if kept_errors.is_empty() && imported == 0 => return Err(err),
+                Err(err) => {
+                    kept_errors.push(err);
+                    break;
+                }
+                Ok(outcome) => {
+                    status = outcome.status;
+                    imported += outcome.imported;
+                    let (transient, permanent): (Vec<String>, Vec<String>) = outcome
+                        .errors
+                        .into_iter()
+                        .partition(|e| is_transient_terminology_error(e));
+                    kept_errors.extend(permanent);
+                    let retry: Vec<Value> = resources
+                        .into_iter()
+                        .filter(|r| {
+                            r.get("url").and_then(Value::as_str).is_some_and(|url| {
+                                transient.iter().any(|e| quoted_url(e) == Some(url))
+                            })
+                        })
+                        .collect();
+                    if transient.is_empty() || last || retry.is_empty() {
+                        kept_errors.extend(transient);
+                        break;
+                    }
+                    resources = retry;
+                }
+            }
+            if let Some(secs) = delay {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
             }
         }
-        if let Some(secs) = delay {
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-        }
-    }
-    Ok(ImportOutcome {
-        status,
-        imported,
-        errors: kept_errors,
+        Ok(ImportOutcome {
+            status,
+            imported,
+            errors: kept_errors,
+        })
     })
+}
+
+/// `ValueSet 'http://…'`, the way the terminology server names a resource
+/// in its per-resource errors.
+fn resource_label(resource: &Value) -> String {
+    let resource_type = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or("resource");
+    match resource.get("url").and_then(Value::as_str) {
+        Some(url) => format!("{resource_type} '{url}'"),
+        None => resource_type.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_terminology_batch_is_split_until_it_fits() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        // Refuses any Bundle of more than two resources, like a body limit.
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sizes.clone();
+        let app = Router::new().route(
+            "/import",
+            post(move |Json(bundle): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let n = bundle["entry"].as_array().map_or(0, Vec::len);
+                    seen.lock().unwrap().push(n);
+                    if n > 2 {
+                        (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({})))
+                    } else {
+                        (StatusCode::OK, Json(json!({"value_sets": n})))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let resources: Vec<Value> = (0..5)
+            .map(|i| json!({"resourceType": "ValueSet", "url": format!("http://x/vs{i}")}))
+            .collect();
+        let outcome = import_with_retry(&HtsClient::new(&base), resources)
+            .await
+            .unwrap();
+        assert_eq!(outcome.imported, 5);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // 5 -> 2 + 3 -> 3 splits into 1 + 2.
+        assert_eq!(*sizes.lock().unwrap(), vec![5, 2, 3, 1, 2]);
+    }
 
     #[test]
     fn lock_and_timeout_failures_are_retried_and_others_are_not() {
