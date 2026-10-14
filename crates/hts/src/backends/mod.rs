@@ -209,6 +209,62 @@ pub(super) fn code_system_version_is_current(ver: &str) -> bool {
     ver.eq_ignore_ascii_case("current")
 }
 
+/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
+///
+/// Shared by both backends: SQLite ranks text-filtered expansions with it, and
+/// so does PostgreSQL, so a filtered page lists the same codes in the same order.
+/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
+/// and short common phrases over long FSNs.
+pub(crate) fn sort_typeahead_candidates(
+    candidates: &mut [crate::types::ExpansionContains],
+    query: &str,
+) {
+    candidates.sort_by(|a, b| {
+        typeahead_match_score(query, a)
+            .cmp(&typeahead_match_score(query, b))
+            .then_with(|| {
+                a.display
+                    .as_deref()
+                    .unwrap_or("")
+                    .len()
+                    .cmp(&b.display.as_deref().unwrap_or("").len())
+            })
+            .then_with(|| a.code.cmp(&b.code))
+    });
+}
+
+fn typeahead_match_score(query: &str, hit: &crate::types::ExpansionContains) -> i32 {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return i32::MAX;
+    }
+    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
+    let code = hit.code.to_lowercase();
+
+    if display == q {
+        return 0;
+    }
+    if code == q {
+        return 1;
+    }
+    if typeahead_word_match(&display, &q) {
+        return 20 + display.len() as i32;
+    }
+    if display.starts_with(&q) {
+        return 10 + display.len() as i32;
+    }
+    if let Some(pos) = display.find(&q) {
+        return 30 + pos as i32 + display.len() as i32;
+    }
+    i32::MAX
+}
+
+fn typeahead_word_match(display: &str, query: &str) -> bool {
+    display
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == query)
+}
+
 #[cfg(test)]
 mod precedence_tests {
     use super::*;

@@ -24,9 +24,7 @@ use crate::import::bundle_parser::{
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows};
 use crate::traits::{TerminologyCaches, TerminologyMetadata};
-use crate::types::{
-    ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
-};
+use crate::types::{LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse};
 use crate::version_order::version_sort_key;
 use helios_persistence::tenant::TenantContext;
 
@@ -44,8 +42,8 @@ use helios_persistence::tenant::TenantContext;
 /// `Arc` in O(1). Without this, the bench's cold-miss stampede burned
 /// 50× redundant 5,975-row INSERTs on a single VSAC VS (EX04). On error the
 /// cell stays empty so the next caller retries cleanly.
-pub type ComposeExpansionCache =
-    Arc<RwLock<HashMap<u64, Arc<tokio::sync::OnceCell<Arc<Vec<ExpansionContains>>>>>>>;
+pub(crate) type ComposeExpansionCache =
+    Arc<RwLock<HashMap<u64, Arc<tokio::sync::OnceCell<Arc<value_set::CachedExpansion>>>>>>;
 
 /// `$lookup` response memo. Mirrors SQLite's `lookup_response_cache`
 /// (backends/sqlite/code_system.rs:240+).
@@ -782,67 +780,118 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
         }
 
-        let tx = client.transaction().await.map_err(|e| {
+        let mut tx = client.transaction().await.map_err(|e| {
             HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
         })?;
 
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
+        // Each resource is written under its own savepoint: one failing
+        // statement aborts the whole PostgreSQL transaction, so without them a
+        // single bad resource would silently discard every other one in the
+        // bundle (while still reporting their counts). With them a failure
+        // drops just that resource and is reported, like SQLite.
+        macro_rules! guarded {
+            ($kind:literal, $url:expr, |$c:ident| $write:expr) => {{
+                let sp = tx.savepoint("hts_resource").await.map_err(|e| {
+                    HtsError::StorageError(format!("Savepoint: {}", error_chain(&e)))
+                })?;
+                let before = (
+                    stats.code_systems,
+                    stats.value_sets,
+                    stats.concept_maps,
+                    stats.concepts,
+                );
+                let res = {
+                    let $c = &sp;
+                    $write.await
+                };
+                match res {
+                    Ok(()) => sp.commit().await.map_err(|e| {
+                        HtsError::StorageError(format!("Release savepoint: {}", error_chain(&e)))
+                    })?,
+                    Err(e) => {
+                        sp.rollback().await.map_err(|e| {
+                            HtsError::StorageError(format!(
+                                "Rollback to savepoint: {}",
+                                error_chain(&e)
+                            ))
+                        })?;
+                        (
+                            stats.code_systems,
+                            stats.value_sets,
+                            stats.concept_maps,
+                            stats.concepts,
+                        ) = before;
+                        stats
+                            .errors
+                            .push(format!("{} '{}' import failed: {e}", $kind, $url));
+                    }
+                }
+            }};
+        }
+
         for cs in &parsed.code_systems {
-            if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
-                stats
-                    .errors
-                    .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
-            }
+            let fresh = parsed.fresh_load;
+            guarded!("CodeSystem", cs.url, |c| write_code_system(
+                c, cs, &mut stats, fresh
+            ));
         }
         for vs in &parsed.value_sets {
-            if let Err(e) = write_value_set(&tx, vs, &mut stats).await {
-                stats
-                    .errors
-                    .push(format!("ValueSet '{}' import failed: {e}", vs.url));
-            }
+            guarded!("ValueSet", vs.url, |c| write_value_set(c, vs, &mut stats));
         }
         for cm in &parsed.concept_maps {
-            if let Err(e) = write_concept_map(&tx, cm, &mut stats).await {
-                stats
-                    .errors
-                    .push(format!("ConceptMap '{}' import failed: {e}", cm.url));
-            }
+            guarded!("ConceptMap", cm.url, |c| write_concept_map(
+                c, cm, &mut stats
+            ));
         }
 
         tx.commit().await.map_err(|e| {
             HtsError::StorageError(format!("Commit transaction: {}", error_chain(&e)))
         })?;
 
-        // Rebuild concept_closure for newly-imported (previously empty) code
-        // systems. Skipped for batch imports of existing systems so SNOMED
-        // RF2's ~1300 batches don't each pay the closure-rebuild cost — the
-        // full closure is built once at end-of-CLI via
-        // `migrate_concept_closure_pg` (called from main.rs). Mirrors the
-        // SQLite post-commit closure rebuild.
+        // Closure maintenance, as SQLite does it (`import_parsed_sync`):
+        // `write_code_system` dropped the closure of every row it wrote.
+        // Systems that were empty before the bundle are rebuilt now. Rows of
+        // an already-populated URL are rebuilt now too when their closure is
+        // gone and the hierarchy is small (a re-import or a new version);
+        // above `CLOSURE_REBUILD_INLINE_MAX_EDGES` edges the system is a
+        // chunked bulk load (SNOMED CT, LOINC), whose closure is built once at
+        // the end of the CLI import / on the next start instead of per batch.
         //
-        // A URL may map to multiple `code_systems` rows when several versions
-        // share a canonical URL (e.g. the hl7.terminology@7.0.1 SNOMED stub
-        // sharing `http://snomed.info/sct` with the RF2 import that follows).
-        // Iterate every matching row and build the closure for each system_id
-        // that has hierarchy edges.
-        for url in &systems_needing_closure {
+        // A URL may map to several `code_systems` rows (versions sharing a
+        // canonical URL); each row with hierarchy edges gets its own closure.
+        let mut rebuilt: HashSet<String> = HashSet::new();
+        for cs in &parsed.code_systems {
             let rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[url])
+                .query("SELECT id FROM code_systems WHERE url = $1", &[&cs.url])
                 .await
                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             for row in rows {
                 let sid: String = row.get(0);
-                let has_hier: bool = client
+                if !rebuilt.insert(sid.clone()) {
+                    continue;
+                }
+                let (edges, has_closure): (i64, bool) = client
                     .query_one(
-                        "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
-                        &[&sid],
+                        "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM concept_hierarchy
+                                   WHERE system_id = $1 LIMIT $2) e),
+                                EXISTS(SELECT 1 FROM concept_closure WHERE system_id = $1)",
+                        &[&sid, &(CLOSURE_REBUILD_INLINE_MAX_EDGES + 1)],
                     )
                     .await
-                    .map(|r| r.get(0))
-                    .unwrap_or(false);
-                if has_hier {
+                    .map(|r| (r.get(0), r.get(1)))
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                if edges == 0 {
+                    continue;
+                }
+                let wanted = if systems_needing_closure.contains(&cs.url) {
+                    true
+                } else {
+                    !parsed.chunked && !has_closure && edges <= CLOSURE_REBUILD_INLINE_MAX_EDGES
+                };
+                if wanted {
                     if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
                         tracing::warn!(
                             system_id = %sid,
@@ -1225,6 +1274,11 @@ async fn write_code_system(
     Ok(())
 }
 
+/// Largest hierarchy (parent→child edges) whose closure is rebuilt inline
+/// after a bundle import of an already-populated system; the SQLite constant
+/// of the same name.
+const CLOSURE_REBUILD_INLINE_MAX_EDGES: i64 = 250_000;
+
 /// Concepts per set-based write batch (see [`write_code_system`]).
 const CONCEPT_BATCH: usize = 5_000;
 
@@ -1358,22 +1412,17 @@ async fn write_value_set(
     let resource_json = Some(vs.resource_json.clone());
     let now = utc_now();
 
-    // Invalidate expansion cache on re-import.
-    let existing = client
-        .query("SELECT id FROM value_sets WHERE url = $1", &[&vs.url])
+    // Invalidate the expansion cache of the (url, version) row being
+    // re-imported — not of whichever version of the url comes first.
+    client
+        .execute(
+            "DELETE FROM value_set_expansions WHERE value_set_id IN \
+             (SELECT id FROM value_sets \
+              WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, ''))",
+            &[&vs.url, &vs.version],
+        )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-    if let Some(row) = existing.into_iter().next() {
-        let existing_id: String = row.get(0);
-        client
-            .execute(
-                "DELETE FROM value_set_expansions WHERE value_set_id = $1",
-                &[&existing_id],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    }
 
     // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when
     // version is absent). Mirrors the code_systems strategy so multiple
@@ -1482,14 +1531,22 @@ async fn write_concept_map(
     let resource_json = Some(cm.resource_json.clone());
     let now = utc_now();
 
-    // Two-step upsert — see `write_code_system` for why `ON CONFLICT (url)`
-    // alone is not safe under concurrent imports that share `cm.id`.
+    // SQLite's `INSERT OR REPLACE`: whatever row holds this id or this url is
+    // replaced (its elements go with it through the FK cascade), so the map
+    // ends up under the new id even when only the url matched, and an id that
+    // moved to a new url does not fail the import.
+    client
+        .execute(
+            "DELETE FROM concept_maps WHERE id = $1 OR url = $2",
+            &[&cm.id, &cm.url],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     client
         .execute(
             "INSERT INTO concept_maps
              (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
                 &cm.id,
                 &cm.url,
@@ -1505,49 +1562,7 @@ async fn write_concept_map(
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-    let rows = client
-        .query(
-            "UPDATE concept_maps SET
-               version       = $1,
-               name          = $2,
-               title         = $3,
-               source_uri    = $4,
-               target_uri    = $5,
-               status        = $6,
-               resource_json = $7
-             WHERE url = $8
-             RETURNING id",
-            &[
-                &cm.version,
-                &cm.name,
-                &cm.title,
-                &cm.source_uri,
-                &cm.target_uri,
-                &cm.status,
-                &resource_json,
-                &cm.url,
-            ],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-    let map_id: String = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            HtsError::StorageError("UPDATE concept_maps RETURNING id got no row".into())
-        })?
-        .get(0);
-
-    // Remove stale elements before re-inserting.
-    client
-        .execute(
-            "DELETE FROM concept_map_elements WHERE map_id = $1",
-            &[&map_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    let map_id: &str = &cm.id;
 
     for chunk in cm.elements.chunks(10_000) {
         let src_sys: Vec<&str> = chunk.iter().map(|e| e.source_system.as_str()).collect();

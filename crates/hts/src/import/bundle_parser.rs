@@ -44,6 +44,13 @@ pub struct ParsedBundle {
     /// is purely a fast-path for first-time bulk loads. Importers MUST leave it
     /// `false` whenever the target may already contain concepts (re-import).
     pub fresh_load: bool,
+    /// `true` when this bundle is one concept batch of a chunked bulk load
+    /// (SNOMED RF2, LOINC). The importer's caller builds the closure once
+    /// when the whole load is in (`hts import`, the admin import job, the
+    /// bootstrap), so the write layer does not rebuild it after every batch —
+    /// which, for a hierarchy below the inline-rebuild limit, meant one full
+    /// closure build per batch.
+    pub chunked: bool,
 }
 
 /// Authority rank for a resource we have POSITIVE evidence is authoritative:

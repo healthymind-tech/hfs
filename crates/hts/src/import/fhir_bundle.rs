@@ -140,7 +140,7 @@ pub(crate) fn import_parsed_sync(
                     |r| r.get(0),
                 )
                 .unwrap_or(false);
-            if !closure_missing {
+            if !closure_missing || parsed.chunked {
                 continue;
             }
             let edges: i64 = conn

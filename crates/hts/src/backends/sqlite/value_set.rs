@@ -1240,7 +1240,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     })
                     .collect();
                 // Rank cached full expansions for typeahead UX.
-                sort_typeahead_candidates(&mut hits, &lower);
+                crate::backends::sort_typeahead_candidates(&mut hits, &lower);
                 hits
             } else {
                 all_codes
@@ -2907,7 +2907,7 @@ fn expand_inline_filtered(
                     compose_filters,
                     candidates,
                 )?;
-                sort_typeahead_candidates(&mut candidates, &filter_lower);
+                crate::backends::sort_typeahead_candidates(&mut candidates, &filter_lower);
                 results.extend(candidates);
             }
             continue;
@@ -5542,7 +5542,7 @@ fn batch_direct_children_in_set(
 ///
 /// Searches `concepts_search_fts` (preferred display + synonym designations)
 /// with FTS5 `bm25`, then applies clinical heuristics via
-/// [`sort_typeahead_candidates`]. The caller must have run
+/// [`crate::backends::sort_typeahead_candidates`]. The caller must have run
 /// [`ensure_concepts_fts`] for `system_id`.
 fn fts_candidates_ranked_for_system(
     conn: &Connection,
@@ -5632,58 +5632,6 @@ fn fts_candidates_ranked_for_system(
         })
         .collect();
     Ok((found, capped))
-}
-
-/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
-///
-/// Secondary sort after FTS5 `bm25` in [`fts_candidates_ranked_for_system`].
-/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
-/// and short common phrases over long FSNs.
-fn sort_typeahead_candidates(candidates: &mut [ExpansionContains], query: &str) {
-    candidates.sort_by(|a, b| {
-        typeahead_match_score(query, a)
-            .cmp(&typeahead_match_score(query, b))
-            .then_with(|| {
-                a.display
-                    .as_deref()
-                    .unwrap_or("")
-                    .len()
-                    .cmp(&b.display.as_deref().unwrap_or("").len())
-            })
-            .then_with(|| a.code.cmp(&b.code))
-    });
-}
-
-fn typeahead_match_score(query: &str, hit: &ExpansionContains) -> i32 {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return i32::MAX;
-    }
-    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
-    let code = hit.code.to_lowercase();
-
-    if display == q {
-        return 0;
-    }
-    if code == q {
-        return 1;
-    }
-    if typeahead_word_match(&display, &q) {
-        return 20 + display.len() as i32;
-    }
-    if display.starts_with(&q) {
-        return 10 + display.len() as i32;
-    }
-    if let Some(pos) = display.find(&q) {
-        return 30 + pos as i32 + display.len() as i32;
-    }
-    i32::MAX
-}
-
-fn typeahead_word_match(display: &str, query: &str) -> bool {
-    display
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| word == query)
 }
 
 /// Apply compose `filter[]` entries to an already-bounded candidate set.

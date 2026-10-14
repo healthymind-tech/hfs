@@ -384,6 +384,52 @@ BEGIN
         VALUES ('#migration:hierarchy-from-subsumedby-p1b', '', 0);
     END IF;
 END $$;
+
+-- ── Byte-order collation for codes and versions ───────────────────────────────
+-- SQLite compares TEXT bytewise (BINARY). A PostgreSQL database usually runs a
+-- linguistic default collation (`en_US.utf8` in the official image), under
+-- which `ORDER BY code` puts LOINC `10000-8` before `1000-9`, `version_sort`
+-- keys (`2:…`, `1:…`) stop sorting as bytes and storage-id prefix ranges stop
+-- being prefixes. Code, hierarchy, closure, refset, map and version columns are
+-- therefore `COLLATE \"C\"`: identical order to SQLite, and cheaper (memcmp)
+-- comparisons. Display and designation text keep the database collation so
+-- case folding stays Unicode-aware. Every column a code is compared with is in
+-- the list, so joins never mix collations. On an existing database this
+-- rewrites the affected indexes once.
+DO $$
+DECLARE
+    c_coll oid := (SELECT oid FROM pg_collation
+                   WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace);
+    r record;
+BEGIN
+    FOR r IN
+        SELECT a.attrelid::regclass AS tbl,
+               string_agg(format('ALTER COLUMN %I TYPE text COLLATE \"C\"', a.attname), ', ') AS alters
+        FROM pg_attribute a
+        JOIN (VALUES
+                ('concepts', 'code'),
+                ('concept_hierarchy', 'parent_code'),
+                ('concept_hierarchy', 'child_code'),
+                ('concept_closure', 'ancestor_code'),
+                ('concept_closure', 'descendant_code'),
+                ('concept_properties', 'value'),
+                ('value_set_expansions', 'code'),
+                ('refset_members', 'refset_id'),
+                ('refset_members', 'referenced_code'),
+                ('concept_map_elements', 'source_code'),
+                ('concept_map_elements', 'target_code'),
+                ('code_systems', 'version'),
+                ('code_systems', 'version_sort'),
+                ('value_sets', 'version'),
+                ('value_sets', 'version_sort')
+             ) AS want(tbl, col)
+          ON a.attrelid = to_regclass(want.tbl) AND a.attname = want.col
+        WHERE NOT a.attisdropped AND a.attcollation <> c_coll
+        GROUP BY a.attrelid
+    LOOP
+        EXECUTE format('ALTER TABLE %s %s', r.tbl, r.alters);
+    END LOOP;
+END $$;
 ";
 
 /// Apply the HTS PostgreSQL schema to the given client connection.
@@ -430,6 +476,36 @@ fn schema_fingerprint() -> String {
 /// `hts import`) could then deadlock against it, and every start paid for
 /// the DDL. The fingerprint row makes an up-to-date database a single
 /// lookup; any change to the DDL text re-applies it.
+/// Run [`SCHEMA`] unconditionally (under the schema advisory lock) and record
+/// its fingerprint. `hts migrate` uses it to re-create the secondary indexes
+/// it dropped for the bulk load.
+pub async fn apply_ddl(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
+        .await?;
+    let result = async {
+        client.batch_execute(SCHEMA).await?;
+        record_fingerprint(client).await
+    }
+    .await;
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
+        .await;
+    result
+}
+
+async fn record_fingerprint(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "INSERT INTO hts_schema_meta (key, value) VALUES ('schema_fingerprint', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            &[&schema_fingerprint()],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(
@@ -451,14 +527,7 @@ async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_p
         return Ok(());
     }
     client.batch_execute(SCHEMA).await?;
-    client
-        .execute(
-            "INSERT INTO hts_schema_meta (key, value) VALUES ('schema_fingerprint', $1)
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            &[&fingerprint],
-        )
-        .await?;
-    Ok(())
+    record_fingerprint(client).await
 }
 
 /// Backfill `version_sort` for every versioned `code_systems` / `value_sets`
@@ -534,9 +603,11 @@ pub async fn build_concept_closure_pg(
     // already gone, another writer deleted the system first, so there is
     // nothing to build.
     let tx = client.transaction().await?;
+    // FOR UPDATE (not SHARE) also serializes two builders of the same
+    // system: the pairs are streamed with COPY, which has no ON CONFLICT.
     if tx
         .query_opt(
-            "SELECT 1 FROM code_systems WHERE id = $1 FOR SHARE",
+            "SELECT 1 FROM code_systems WHERE id = $1 FOR UPDATE",
             &[&system_id],
         )
         .await?
@@ -592,22 +663,32 @@ pub async fn build_concept_closure_pg(
     }
     drop(rows);
 
-    // BFS from every concept to enumerate descendants. Batch the resulting
-    // pairs in chunks of `BATCH` before flushing to PG via UNNEST.
-    const BATCH: usize = 50_000;
-    let mut anc_batch: Vec<&str> = Vec::with_capacity(BATCH);
-    let mut des_batch: Vec<&str> = Vec::with_capacity(BATCH);
-
+    // BFS from every concept to enumerate descendants, streaming each pair
+    // straight into a binary COPY: every (ancestor, descendant) pair is
+    // produced exactly once (per-ancestor visited marks), so no conflict
+    // handling is needed after the DELETE below. COPY is several times faster
+    // than batched INSERTs for SNOMED CT's ~10 M pairs.
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
         &[&system_id],
     )
     .await?;
 
-    let insert_sql = "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
-         SELECT $1, anc, des
-         FROM UNNEST($2::text[], $3::text[]) AS t(anc, des)
-         ON CONFLICT DO NOTHING";
+    let sink = tx
+        .copy_in(
+            "COPY concept_closure (system_id, ancestor_code, descendant_code) \
+             FROM STDIN (FORMAT binary)",
+        )
+        .await?;
+    let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
+        sink,
+        &[
+            tokio_postgres::types::Type::TEXT,
+            tokio_postgres::types::Type::TEXT,
+            tokio_postgres::types::Type::TEXT,
+        ],
+    );
+    futures::pin_mut!(writer);
 
     let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
     let mut queue: VecDeque<usize> = VecDeque::new();
@@ -624,15 +705,10 @@ pub async fn build_concept_closure_pg(
             }
             visit_gen[idx] = g;
 
-            anc_batch.push(concepts[anc_idx].as_str());
-            des_batch.push(concepts[idx].as_str());
-
-            if anc_batch.len() >= BATCH {
-                tx.execute(insert_sql, &[&system_id, &anc_batch, &des_batch])
-                    .await?;
-                anc_batch.clear();
-                des_batch.clear();
-            }
+            writer
+                .as_mut()
+                .write(&[&system_id, &concepts[anc_idx], &concepts[idx]])
+                .await?;
 
             for &ci in &children[idx] {
                 if visit_gen[ci] != g {
@@ -641,11 +717,7 @@ pub async fn build_concept_closure_pg(
             }
         }
     }
-
-    if !anc_batch.is_empty() {
-        tx.execute(insert_sql, &[&system_id, &anc_batch, &des_batch])
-            .await?;
-    }
+    writer.finish().await?;
 
     tx.commit().await?;
     Ok(())
