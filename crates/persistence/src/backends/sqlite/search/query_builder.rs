@@ -4,7 +4,7 @@
 //! against the SQLite search_index table.
 
 use crate::backends::sql_literal::sql_string_literal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::SearchError;
 use crate::types::{
@@ -245,6 +245,11 @@ pub struct QueryBuilder {
     param_offset: usize,
     /// Whether to skip tenant/resource type params (they're shared with outer query).
     skip_base_params: bool,
+    /// Declared target types of reference parameters, by parameter name. A
+    /// bare-id value of a listed parameter is matched as a local reference to
+    /// one of them (see [`ReferenceHandler::bare_id_arms`]); any other keeps
+    /// the suffix match.
+    reference_targets: HashMap<String, Vec<String>>,
 }
 
 impl QueryBuilder {
@@ -255,7 +260,14 @@ impl QueryBuilder {
             resource_type: resource_type.into(),
             param_offset: 0,
             skip_base_params: false,
+            reference_targets: HashMap::new(),
         }
+    }
+
+    /// Sets the declared target types of reference parameters, by name.
+    pub fn with_reference_targets(mut self, targets: HashMap<String, Vec<String>>) -> Self {
+        self.reference_targets = targets;
+        self
     }
 
     /// Sets the parameter offset for embedded subqueries.
@@ -861,6 +873,62 @@ impl QueryBuilder {
                 .values
                 .iter()
                 .all(|v| strip_reference_version(&v.value).contains('/'));
+
+        // Bare ids of a parameter with declared targets: one seekable arm per
+        // target and form, listed as a `UNION ALL` (SQLite plans an `OR` of
+        // them as a scan of the whole parameter, never as one probe per arm).
+        let bare_id_targets = (matches!(param.param_type, SearchParamType::Reference)
+            && param.modifier.is_none()
+            && !is_plain_multi_reference
+            && param
+                .values
+                .iter()
+                .any(|v| !strip_reference_version(&v.value).contains('/')))
+        .then(|| self.reference_targets.get(&param.name))
+        .flatten()
+        .filter(|targets| !targets.is_empty());
+        if let Some(targets) = bare_id_targets {
+            let mut arms: Vec<SqlFragment> = Vec::new();
+            let mut next = param_offset;
+            for value in &param.values {
+                let base = strip_reference_version(&value.value);
+                let value_arms = if base.contains('/') {
+                    vec![ReferenceHandler::build_sql(value, None, next)]
+                } else {
+                    ReferenceHandler::bare_id_arms(base, targets, next)
+                };
+                for arm in value_arms {
+                    next += arm.params.len();
+                    arms.push(arm);
+                }
+            }
+            let row_prefix = format!(
+                "tenant_id = ?1 AND resource_type = ?2 AND param_name = {}",
+                sql_string_literal(&param.name)
+            );
+            let select = arms
+                .iter()
+                .map(|a| {
+                    format!(
+                        "SELECT resource_key FROM search_index WHERE {row_prefix} AND ({})",
+                        a.sql
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            let row_where = format!(
+                "{row_prefix} AND ({})",
+                arms.iter()
+                    .map(|a| format!("({})", a.sql))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            );
+            return Some(FilterPart::Membership(Membership {
+                select,
+                row_where,
+                params: arms.into_iter().flat_map(|a| a.params).collect(),
+            }));
+        }
 
         let combined = if is_plain_multi_reference {
             let mut params = Vec::with_capacity(param.values.len());

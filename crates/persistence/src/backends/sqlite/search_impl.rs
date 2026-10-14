@@ -379,6 +379,44 @@ fn argmin(counts: &[usize]) -> usize {
 }
 
 impl SqliteBackend {
+    /// The declared target types of the query's reference parameters that
+    /// carry a bare-id value, for [`QueryBuilder::with_reference_targets`].
+    fn reference_targets(
+        &self,
+        tenant_id: &str,
+        query: &SearchQuery,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut targets = std::collections::HashMap::new();
+        let bare: Vec<&str> = query
+            .parameters
+            .iter()
+            .filter(|p| {
+                matches!(p.param_type, crate::types::SearchParamType::Reference)
+                    && p.modifier.is_none()
+                    && p.values
+                        .iter()
+                        .any(|v| !crate::types::strip_reference_version(&v.value).contains('/'))
+            })
+            .map(|p| p.name.as_str())
+            .collect();
+        if bare.is_empty() {
+            return targets;
+        }
+        let registry = self.tenant_registry(tenant_id);
+        let registry = registry.read();
+        for name in bare {
+            let declared = registry
+                .get_param(&query.resource_type, name)
+                .or_else(|| registry.get_param("Resource", name))
+                .and_then(|def| def.target.clone())
+                .filter(|t| !t.is_empty());
+            if let Some(declared) = declared {
+                targets.insert(name.to_string(), declared);
+            }
+        }
+        targets
+    }
+
     /// The body of [`SearchProvider::search`], run on a caller-supplied
     /// connection.
     ///
@@ -424,8 +462,9 @@ impl SqliteBackend {
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
         let plan = if !query.parameters.is_empty() || query.compartment.is_some() {
-            let builder =
-                QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
+            let builder = QueryBuilder::new(tenant_id, resource_type)
+                .with_param_offset(param_offset)
+                .with_reference_targets(self.reference_targets(tenant_id, query));
             plan_filter(
                 conn,
                 builder.build_parts(query),
@@ -711,6 +750,7 @@ impl SearchProvider for SqliteBackend {
         let plan = if !query.parameters.is_empty() {
             let parts = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
+                .with_reference_targets(self.reference_targets(tenant_id, query))
                 .build_parts(query);
             plan_filter(
                 &conn,
@@ -821,7 +861,9 @@ impl SearchProvider for SqliteBackend {
             .is_empty()
             || query.compartment.is_some()
         {
-            let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+            let builder = QueryBuilder::new(tenant_id, resource_type)
+                .with_param_offset(2)
+                .with_reference_targets(self.reference_targets(tenant_id, query));
             // Planned like a search, but the outer query is left free to
             // answer `is_deleted` from `idx_resources_live_type` (covering,
             // one seek per candidate rowid) even when the filter is

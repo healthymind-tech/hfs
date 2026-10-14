@@ -130,6 +130,50 @@ impl ReferenceHandler {
         )
     }
 
+    /// The arms of a bare-id search (`patient=123`) on a parameter whose
+    /// declared targets are `targets`, each a predicate the reference index can
+    /// seek. Any one arm matching is a match.
+    ///
+    /// A bare id names a local reference to one of the parameter's target types
+    /// (FHIR search, reference parameters), so it is `T/123` (or a `_history`
+    /// version of it)
+    /// for each target `T`, the stored bare `123` itself, or — kept from the
+    /// suffix match this replaces — an absolute URL ending in `/123`. Absolute
+    /// URLs start with a lower-case scheme, which sorts above every type name,
+    /// so their arm seeks `value_reference >= 'a'` and only pays the suffix
+    /// `LIKE` on those rows.
+    ///
+    /// The suffix match, `= ? OR LIKE '%/' || ? OR LIKE '%/' || ? ||
+    /// '/_history/%'`, could not seek and read every reference row of the
+    /// parameter: ~110 ms for `Observation?patient=<id>` on 527k resources,
+    /// against ~0.1 ms for these arms. It also matched what a local reference
+    /// to a target cannot be — `Patient/ABC` for `patient=abc` (the `LIKE` is
+    /// case-insensitive) or a reference to a type outside the targets.
+    pub(crate) fn bare_id_arms(base: &str, targets: &[String], offset: usize) -> Vec<SqlFragment> {
+        let mut arms = Vec::with_capacity(targets.len() + 2);
+        let mut p = offset + 1;
+        arms.push(SqlFragment::with_params(
+            format!("value_reference = ?{p}"),
+            vec![SqlParam::string(base)],
+        ));
+        for target in targets {
+            p += 1;
+            arms.push(SqlFragment::with_params(
+                Self::versioned_reference_predicate(p),
+                vec![SqlParam::string(format!("{target}/{base}"))],
+            ));
+        }
+        p += 1;
+        arms.push(SqlFragment::with_params(
+            format!(
+                "value_reference >= 'a' AND (value_reference LIKE '%/' || ?{p} \
+                 OR value_reference LIKE '%/' || ?{p} || '/_history/%')"
+            ),
+            vec![SqlParam::string(base)],
+        ));
+        arms
+    }
+
     /// Builds a condition for a standard reference value.
     ///
     /// Reference matching is **version-agnostic** per the FHIR spec: a versioned
