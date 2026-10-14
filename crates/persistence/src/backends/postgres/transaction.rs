@@ -88,6 +88,25 @@ pub struct PostgresTransaction {
     search_snapshot_dirty: bool,
 }
 
+/// The keys a shared-gate transaction may touch, declared before BEGIN.
+///
+/// Any key outside the plan poisons the transaction (see
+/// `ensure_planned_key`), so a plan is a promise, not a hint.
+#[derive(Debug, Default)]
+pub(crate) struct LockPlan {
+    /// Locked exclusively, in ascending key order, right after BEGIN.
+    pub locked: Vec<(String, String)>,
+    /// Ids this server generated for the transaction's own creates just before
+    /// BEGIN. No other writer can name one before this transaction commits,
+    /// so there is nothing to serialise against and they take no lock; a
+    /// primary-key collision would still surface as the usual conflict. They
+    /// stay out of the lock set because a 1,600-entry import bundle would
+    /// otherwise hold 1,600 advisory locks, and sixteen of those overflow
+    /// PostgreSQL's shared lock table (`max_locks_per_transaction` x
+    /// `max_connections`).
+    pub fresh: Vec<(String, String)>,
+}
+
 /// A create whose `resources`/`resource_history`/`search_index` rows are built
 /// and waiting to be sent with its neighbours'.
 struct PendingCreate {
@@ -144,7 +163,7 @@ impl PostgresTransaction {
         backend: &PostgresBackend,
         client: Client,
         tenant: TenantContext,
-        planned_keys: Option<Vec<(String, String)>>,
+        plan: Option<LockPlan>,
         options: TransactionOptions,
     ) -> StorageResult<Self> {
         // Start the transaction.
@@ -166,8 +185,8 @@ impl PostgresTransaction {
         })?;
 
         let tenant_id = tenant.tenant_id().as_str();
-        let lock_result = match planned_keys.as_ref() {
-            Some(keys) => acquire_shared_write_locks(&*guarded, tenant_id, keys).await,
+        let lock_result = match plan.as_ref() {
+            Some(plan) => acquire_shared_write_locks(&*guarded, tenant_id, &plan.locked).await,
             None => acquire_exclusive_write_gate(&*guarded, tenant_id).await,
         };
         if let Err(error) = lock_result {
@@ -206,7 +225,7 @@ impl PostgresTransaction {
             pending_index_rows: 0,
             creates_seen: 0,
             conflict: None,
-            planned_keys: planned_keys.map(|keys| keys.into_iter().collect()),
+            planned_keys: plan.map(|plan| plan.locked.into_iter().chain(plan.fresh).collect()),
             poisoned: false,
             search_snapshot_dirty: false,
         })
@@ -389,8 +408,22 @@ impl PostgresBackend {
         options: TransactionOptions,
         keys: Vec<(String, String)>,
     ) -> StorageResult<PostgresTransaction> {
+        let plan = LockPlan {
+            locked: keys,
+            fresh: Vec::new(),
+        };
+        self.begin_bundle_transaction(tenant, options, plan).await
+    }
+
+    /// Begins a transaction under the shared tenant gate and `plan`'s keys.
+    pub(super) async fn begin_bundle_transaction(
+        &self,
+        tenant: &TenantContext,
+        options: TransactionOptions,
+        plan: LockPlan,
+    ) -> StorageResult<PostgresTransaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), Some(keys), options).await
+        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options).await
     }
 }
 

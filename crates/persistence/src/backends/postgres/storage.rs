@@ -4321,13 +4321,19 @@ impl BundleProvider for PostgresBackend {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
-        // Start a transaction
-        let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
-            .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Failed to begin transaction: {}", e),
-            })?;
+        // Start a transaction. A bundle whose every key is known up front runs
+        // under the shared tenant gate with those keys locked, so bundles over
+        // disjoint resources commit side by side; the rest keep the exclusive
+        // gate (see `plan_bundle_locks`).
+        let mut entries = entries;
+        let options = TransactionOptions::new().fhir_version(fhir_version);
+        let begun = match self.plan_bundle_locks(&mut entries) {
+            Some(plan) => self.begin_bundle_transaction(tenant, options, plan).await,
+            None => self.begin_transaction(tenant, options).await,
+        };
+        let mut tx = begun.map_err(|e| TransactionError::RolledBack {
+            reason: format!("Failed to begin transaction: {}", e),
+        })?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
@@ -4382,9 +4388,6 @@ impl BundleProvider for PostgresBackend {
         // delete checks below (create is conditional via `create_affects_overlay`;
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
-
-        // Make entries mutable for reference resolution
-        let mut entries = entries;
 
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
@@ -4527,6 +4530,78 @@ impl BundleProvider for PostgresBackend {
             bundle_type: BundleType::Transaction,
             entries: results,
         })
+    }
+}
+
+/// Above this many explicitly named resources a bundle takes the exclusive
+/// gate instead of one advisory lock per resource: the shared lock table holds
+/// `max_locks_per_transaction` (default 64) per connection, and a few
+/// concurrent bundles naming thousands of resources each would exhaust it.
+const MAX_PLANNED_BUNDLE_LOCKS: usize = 256;
+
+impl PostgresBackend {
+    /// The keys a transaction bundle will touch, when they can all be known
+    /// before BEGIN; `None` keeps the exclusive tenant gate.
+    ///
+    /// The exclusive gate made every transaction bundle wait for every other
+    /// write in its tenant. Under the benchmark's 16 concurrent importers that
+    /// queue outlasted the 30 s `statement_timeout`, and 4-5% of bundles came
+    /// back 500 "rolled back" while the server used half a core. What it buys
+    /// is needed only where a bundle's write set depends on what it finds:
+    ///
+    /// * conditional entries (`ifNoneExist`, `PUT/DELETE/PATCH [type]?…`) —
+    ///   their target is a search result, and two bundles racing on the same
+    ///   criteria must not both miss and create;
+    /// * SearchParameter writes, which change how every other write indexes.
+    ///
+    /// Every other entry names its key: `PUT`/`PATCH`/`DELETE`/`GET` by URL,
+    /// and `POST` by the id it will be created under. A `POST` without one is
+    /// given its server id here, before BEGIN, so the plan can list it as
+    /// fresh — exactly the id `Transaction::create` would have generated.
+    /// A malformed entry also returns `None`: the bundle then runs as before
+    /// and fails with the error it always did.
+    pub(super) fn plan_bundle_locks(
+        &self,
+        entries: &mut [BundleEntry],
+    ) -> Option<super::transaction::LockPlan> {
+        let mut plan = super::transaction::LockPlan::default();
+        for entry in entries.iter_mut() {
+            if entry.criteria.is_some() || entry.if_none_exist.is_some() {
+                return None;
+            }
+            let key = match entry.method {
+                BundleMethod::Post => {
+                    let resource = entry.resource.as_mut()?.as_object_mut()?;
+                    let resource_type = resource.get("resourceType")?.as_str()?.to_string();
+                    match resource.get("id") {
+                        Some(Value::String(id)) => {
+                            let id = id.clone();
+                            plan.locked.push((resource_type.clone(), id.clone()));
+                            (resource_type, id)
+                        }
+                        Some(_) => return None,
+                        None => {
+                            let id = crate::types::new_resource_id();
+                            resource.insert("id".to_string(), Value::String(id.clone()));
+                            plan.fresh.push((resource_type.clone(), id.clone()));
+                            (resource_type, id)
+                        }
+                    }
+                }
+                BundleMethod::Get
+                | BundleMethod::Put
+                | BundleMethod::Patch
+                | BundleMethod::Delete => {
+                    let key = self.parse_url(&entry.url).ok()?;
+                    plan.locked.push(key.clone());
+                    key
+                }
+            };
+            if key.0 == "SearchParameter" {
+                return None;
+            }
+        }
+        (plan.locked.len() <= MAX_PLANNED_BUNDLE_LOCKS).then_some(plan)
     }
 }
 

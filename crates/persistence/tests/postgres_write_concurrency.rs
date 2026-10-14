@@ -11,11 +11,13 @@
 mod container_cleanup;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use helios_persistence::core::{
-    ResourceStorage, Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleMethod, BundleProvider, ResourceStorage, Transaction, TransactionOptions,
+    TransactionProvider,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::{Value, json};
@@ -218,4 +220,202 @@ async fn rolled_back_search_parameter_does_not_poison_write_cache() {
         0,
         "a rolled-back SearchParameter must not stay in the write cache"
     );
+}
+
+fn post_patient_entry(family: &str, n: usize) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(
+            json!({"resourceType": "Patient", "name": [{"family": family, "given": [format!("g{n}")]}]}),
+        ),
+        full_url: Some(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+        ..Default::default()
+    }
+}
+
+/// Sixteen import-shaped bundles at once must all commit. They used to take
+/// the exclusive tenant gate one after another, and whichever waited past
+/// `statement_timeout` came back 500 "rolled back".
+#[tokio::test]
+async fn concurrent_transaction_bundles_all_commit() {
+    // A short statement timeout makes queueing behind a global lock fail
+    // fast, the way the benchmark's 30 s did under 16 clients: serialised,
+    // the last of sixteen 400-entry bundles waits well past 1.5 s.
+    let pg = shared_pg().await;
+    let backend = Arc::new(
+        PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 16,
+            statement_timeout_ms: 1_500,
+            data_dir: Some(data_dir()),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    backend.init_schema().await.unwrap();
+    let tenant = tenant("bundles");
+
+    let mut tasks = Vec::new();
+    for client in 0..16 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..2 {
+                let entries: Vec<BundleEntry> = (0..400)
+                    .map(|n| post_patient_entry(&format!("c{client}r{round}"), n))
+                    .collect();
+                backend
+                    .process_transaction(&tenant, entries, FhirVersion::default())
+                    .await
+                    .map_err(|e| format!("client {client} round {round}: {e}"))?;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        16 * 2 * 400
+    );
+}
+
+/// Concurrent bundles that update the same resource serialise on it: every
+/// one commits, versions are gapless, and history has one row per version.
+#[tokio::test]
+async fn concurrent_bundles_updating_one_resource_serialise() {
+    let backend = Arc::new(backend(16).await);
+    let tenant = tenant("hotspot");
+    create_patient(&backend, &tenant, "hot").await;
+
+    let mut tasks = Vec::new();
+    for client in 0..12 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let entries = vec![
+                post_patient_entry("side", client),
+                BundleEntry {
+                    method: BundleMethod::Put,
+                    url: "Patient/hot".to_string(),
+                    resource: Some(json!({"resourceType": "Patient", "id": "hot", "name": [{"family": format!("v{client}")}]})),
+                    ..Default::default()
+                },
+            ];
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let current = backend
+        .read(&tenant, "Patient", "hot")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id(), "13");
+    let client = backend.get_client().await.unwrap();
+    let versions: Vec<String> = client
+        .query(
+            "SELECT version_id FROM resource_history
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = 'hot'
+             ORDER BY version_id::int",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        versions,
+        (1..=13).map(|v| v.to_string()).collect::<Vec<_>>()
+    );
+}
+
+/// `ifNoneExist` bundles racing on the same criteria still create exactly one
+/// resource: a conditional bundle cannot plan its keys, so it keeps the
+/// exclusive tenant gate.
+#[tokio::test]
+async fn concurrent_if_none_exist_bundles_create_once() {
+    let backend = Arc::new(backend(16).await);
+    let tenant = tenant("ifnone");
+    let mut tasks = Vec::new();
+    for client in 0..8 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let entries = vec![
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({
+                        "resourceType": "Patient",
+                        "identifier": [{"system": "http://example.org/mrn", "value": "RACE-1"}],
+                        "name": [{"family": format!("c{client}")}]
+                    })),
+                    if_none_exist: Some("identifier=http://example.org/mrn|RACE-1".to_string()),
+                    full_url: Some(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+                    ..Default::default()
+                },
+                post_patient_entry("other", client),
+            ];
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let client = backend.get_client().await.unwrap();
+    let matching: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM resources
+             WHERE tenant_id = $1 AND resource_type = 'Patient'
+               AND data @> '{\"identifier\": [{\"value\": \"RACE-1\"}]}'",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(matching, 1);
+}
+
+/// A POST whose resource names its own id keeps it, and that client-chosen
+/// id is locked rather than treated as fresh: a second bundle creating the
+/// same id fails with a conflict, not a lock-plan violation.
+#[tokio::test]
+async fn bundle_post_with_client_id_conflicts_cleanly() {
+    let backend = backend(4).await;
+    let tenant = tenant("postid");
+    let entry = || BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(json!({"resourceType": "Patient", "id": "chosen"})),
+        ..Default::default()
+    };
+    backend
+        .process_transaction(&tenant, vec![entry()], FhirVersion::default())
+        .await
+        .unwrap();
+    let error = backend
+        .process_transaction(&tenant, vec![entry()], FhirVersion::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already exists"), "{error}");
 }
