@@ -133,7 +133,9 @@ pub(crate) fn import_parsed_sync(
             }
             let closure_missing: bool = conn
                 .query_row(
-                    "SELECT NOT EXISTS(SELECT 1 FROM concept_closure WHERE system_id = ?1)",
+                    // INDEXED BY: see `schema::migrate_concept_closure`.
+                    "SELECT NOT EXISTS(SELECT 1 FROM concept_closure \
+                     INDEXED BY idx_closure_descendant WHERE system_id = ?1)",
                     rusqlite::params![sid],
                     |r| r.get(0),
                 )
