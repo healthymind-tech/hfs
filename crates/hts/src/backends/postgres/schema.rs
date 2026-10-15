@@ -51,6 +51,10 @@ CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
 -- (`resource_json->>'id'`), since multi-version rows carry synthetic ids.
 CREATE INDEX IF NOT EXISTS idx_code_systems_json_id ON code_systems ((resource_json->>'id'));
 CREATE INDEX IF NOT EXISTS idx_code_systems_id_base ON code_systems (split_part(id, '|', 1));
+-- A ValueSet URL that names no stored ValueSet is tried as a CodeSystem's
+-- `valueSet` (its implicit all-codes ValueSet): an index probe instead of
+-- reading every CodeSystem's JSON.
+CREATE INDEX IF NOT EXISTS idx_code_systems_json_valueset ON code_systems ((resource_json->>'valueSet'));
 
 -- Legacy installs created code_systems with `url TEXT NOT NULL UNIQUE`, which
 -- bakes uniqueness into a hidden constraint that blocks multi-version imports.

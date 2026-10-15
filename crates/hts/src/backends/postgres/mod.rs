@@ -66,6 +66,60 @@ pub type ResolvedMetaCache =
 /// resolved direction.
 pub type SubsumesResponseCache = Arc<RwLock<HashMap<String, Arc<SubsumesResponse>>>>;
 
+/// Small per-backend memos of CodeSystem / ValueSet metadata that the
+/// validate-code and expansion paths look up for every request — the
+/// PostgreSQL counterpart of the SQLite backend's `cs_id_cache`,
+/// `cs_version_for_msg`, `cs_content`, property-alias and concept-flag
+/// caches. Cleared with every other cache on any write.
+#[derive(Default)]
+pub(crate) struct PgMeta {
+    pub(super) system_id: RwLock<HashMap<String, Option<String>>>,
+    pub(super) cs_version: RwLock<HashMap<String, Option<String>>>,
+    pub(super) cs_content: RwLock<HashMap<String, Option<String>>>,
+    pub(super) case_insensitive: RwLock<HashMap<String, bool>>,
+    pub(super) prop_codes: RwLock<HashMap<(String, String), Arc<Vec<String>>>>,
+    /// `(0 = inactive | 1 = abstract, system url, code)` → flag.
+    pub(super) concept_flags: RwLock<HashMap<(u8, String, String), bool>>,
+    pub(super) vs_version: RwLock<HashMap<String, Option<String>>>,
+}
+
+impl PgMeta {
+    fn clear(&self) {
+        macro_rules! clear {
+            ($($m:ident),*) => { $(if let Ok(mut g) = self.$m.write() { g.clear(); })* };
+        }
+        clear!(
+            system_id,
+            cs_version,
+            cs_content,
+            case_insensitive,
+            prop_codes,
+            concept_flags,
+            vs_version
+        );
+    }
+}
+
+/// Bound of each [`PgMeta`] map (random eviction beyond it).
+pub(super) const PG_META_CACHE_MAX: usize = 50_000;
+
+/// Memoise `compute` in `map` under `key` (bounded, random eviction).
+pub(super) async fn memo<K, V, F>(map: &RwLock<HashMap<K, V>>, key: K, compute: F) -> V
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+    F: std::future::Future<Output = V>,
+{
+    if let Some(v) = map.read().ok().and_then(|g| g.get(&key).cloned()) {
+        return v;
+    }
+    let v = compute.await;
+    if let Ok(mut w) = map.write() {
+        crate::backends::bounded_cache_insert(&mut *w, key, v.clone(), PG_META_CACHE_MAX);
+    }
+    v
+}
+
 /// `ValueSet/$validate-code` response memo, keyed on every request field
 /// that shapes the answer.
 pub type ValidateCodeResponseCache =
@@ -400,6 +454,8 @@ pub struct PostgresTerminologyBackend {
     /// `ValueSet/$validate-code` response memo (SQLite's
     /// `validate_code_response_cache`).
     pub(super) validate_code_response_cache: ValidateCodeResponseCache,
+    /// CodeSystem / ValueSet metadata memos (see [`PgMeta`]).
+    pub(super) meta: Arc<PgMeta>,
     /// Closure `COUNT(*)` memo per `(system_id, root)` (see `value_set.rs`).
     pub(super) closure_count_cache: value_set::ClosureCountCache,
     /// `?fhir_vs=isa/X` descendant-prefix memo (see `value_set.rs`).
@@ -462,6 +518,7 @@ impl PostgresTerminologyBackend {
             subsumes_response_cache: Arc::new(RwLock::new(HashMap::new())),
             translate_response_cache: Arc::new(RwLock::new(HashMap::new())),
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            meta: Arc::new(PgMeta::default()),
             closure_count_cache: Arc::new(RwLock::new(HashMap::new())),
             root_prefix_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -522,6 +579,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             subsumes_response_cache,
             translate_response_cache,
             validate_code_response_cache,
+            meta,
             closure_count_cache,
             root_prefix_cache,
         } = self;
@@ -545,6 +603,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             closure_count_cache,
             root_prefix_cache,
         );
+        meta.clear();
     }
 }
 

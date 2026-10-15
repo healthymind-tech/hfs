@@ -181,6 +181,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     .into(),
             ));
         }
+        let meta_ref: &super::PgMeta = &self.meta;
 
         // ── Pool-free warm-hit fast path ─────────────────────────────────
         // Check the in-memory inline_compose_cache before acquiring a pool
@@ -291,7 +292,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 // below needs it for the closure-table query, and the
                 // existing slow path needs the existence check to reject
                 // unknown CodeSystems before recurring into `compute_expansion`.
-                let system_id = match resolve_system_id_pg(&client, &cs_url).await? {
+                let system_id = match resolve_system_id_pg(&client, &self.meta, &cs_url).await? {
                     Some(id) => id,
                     None => {
                         return Err(HtsError::NotFound(format!(
@@ -466,6 +467,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let compose_str = compose_val.to_string();
                             let mut codes = compute_expansion(
                                 client_ref,
+                                meta_ref,
                                 Some(&compose_str),
                                 force_sv,
                                 sysv,
@@ -486,6 +488,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 let compose_str = compose_val.to_string();
                 let mut codes = compute_expansion(
                     &client,
+                    meta_ref,
                     Some(&compose_str),
                     &req.force_system_versions,
                     &req.system_version_defaults,
@@ -538,6 +541,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 let page_offset = req.offset.unwrap_or(0) as usize;
                                 if let Some((page, total)) = compose_page_fast_pg(
                                     &client,
+                                    &self.meta,
                                     compose_json.as_deref(),
                                     page_offset,
                                     count as usize,
@@ -584,6 +588,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                     let codes = if db_cached.is_empty() {
                                         let mut computed = compute_expansion(
                                             &*client_ref,
+                                            meta_ref,
                                             compose_json_ref,
                                             force_sv,
                                             sysv,
@@ -612,6 +617,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         if db_cached.is_empty() {
                             let mut codes = compute_expansion(
                                 &client,
+                                meta_ref,
                                 compose_json.as_deref(),
                                 &req.force_system_versions,
                                 &req.system_version_defaults,
@@ -639,6 +645,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         .to_string();
                         let mut codes = compute_expansion(
                             &client,
+                            meta_ref,
                             Some(&compose),
                             &req.force_system_versions,
                             &req.system_version_defaults,
@@ -731,7 +738,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         extract_single_hierarchy_include(compose_val)
                     {
                         if let Some(system_id_isa) =
-                            resolve_system_id_pg(&client, &cs_url_isa).await?
+                            resolve_system_id_pg(&client, &self.meta, &cs_url_isa).await?
                         {
                             let limit = i64::from(req.count.unwrap());
                             let offset = i64::from(req.offset.unwrap_or(0));
@@ -857,6 +864,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         .get_or_try_init(|| async move {
                             let (codes, warnings) = compute_expansion_inline(
                                 client_ref,
+                                meta_ref,
                                 Some(compose_str_ref),
                                 force_sv,
                                 sysv,
@@ -879,6 +887,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 // cache at capacity: unprotected compute, no caching.
                 let (codes, warnings) = compute_expansion_inline(
                     &client,
+                    meta_ref,
                     Some(&compose_str),
                     &req.force_system_versions,
                     &req.system_version_defaults,
@@ -932,7 +941,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        Ok(lookup_value_set_version(&client, url).await)
+        Ok(lookup_value_set_version(&client, &self.meta, url).await)
     }
 
     async fn validate_code(
@@ -1027,6 +1036,7 @@ impl PostgresTerminologyBackend {
         url: String,
         req: ValidateCodeRequest,
     ) -> Result<ValidateCodeResponse, HtsError> {
+        let meta_ref: &super::PgMeta = &self.meta;
         let mut client = self
             .pool
             .get()
@@ -1101,6 +1111,7 @@ impl PostgresTerminologyBackend {
                         let empty: HashMap<String, String> = HashMap::new();
                         let codes = match compute_expansion(
                             &client,
+                            meta_ref,
                             compose_json.as_deref(),
                             &empty,
                             &empty,
@@ -1130,6 +1141,7 @@ impl PostgresTerminologyBackend {
                     if let Some((cs_url, pattern)) = parse_implicit_vs_url(&url) {
                         let found = validate_fhir_vs(
                             &client,
+                            &self.meta,
                             &cs_url,
                             &pattern,
                             &req.code,
@@ -1138,16 +1150,23 @@ impl PostgresTerminologyBackend {
                         .await?;
                         let abstract_for_msg = req.include_abstract == Some(false)
                             && match found.as_ref() {
-                                Some(c) => is_concept_abstract(&client, &c.system, &c.code).await,
+                                Some(c) => {
+                                    is_concept_abstract(&client, &self.meta, &c.system, &c.code)
+                                        .await
+                                }
                                 None => false,
                             };
                         let inactive_for_msg = match found.as_ref() {
-                            Some(c) => is_concept_inactive(&client, &c.system, &c.code).await,
+                            Some(c) => {
+                                is_concept_inactive(&client, &self.meta, &c.system, &c.code).await
+                            }
                             None => false,
                         };
                         let inactive_in_cs = if found.is_none() {
                             match req.system.as_deref() {
-                                Some(s) => is_concept_inactive(&client, s, &req.code).await,
+                                Some(s) => {
+                                    is_concept_inactive(&client, &self.meta, s, &req.code).await
+                                }
                                 None => false,
                             }
                         } else {
@@ -1162,16 +1181,18 @@ impl PostgresTerminologyBackend {
                             false
                         };
                         let cs_version = match req.system.as_deref() {
-                            Some(s) => cs_version_for_msg(&client, s).await,
+                            Some(s) => cs_version_for_msg(&client, &self.meta, s).await,
                             None => None,
                         };
                         let cs_is_fragment = match req.system.as_deref() {
                             Some(s) => {
-                                cs_content_for_url(&client, s).await.as_deref() == Some("fragment")
+                                cs_content_for_url(&client, &self.meta, s).await.as_deref()
+                                    == Some("fragment")
                             }
                             None => false,
                         };
-                        let vs_version_owned = lookup_value_set_version(&client, &url).await;
+                        let vs_version_owned =
+                            lookup_value_set_version(&client, &self.meta, &url).await;
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -1202,6 +1223,7 @@ impl PostgresTerminologyBackend {
                             let pattern = ImplicitVsPattern::AllConcepts;
                             let found = validate_fhir_vs(
                                 &client,
+                                &self.meta,
                                 &cs_url,
                                 &pattern,
                                 &req.code,
@@ -1211,17 +1233,23 @@ impl PostgresTerminologyBackend {
                             let abstract_for_msg = req.include_abstract == Some(false)
                                 && match found.as_ref() {
                                     Some(c) => {
-                                        is_concept_abstract(&client, &c.system, &c.code).await
+                                        is_concept_abstract(&client, &self.meta, &c.system, &c.code)
+                                            .await
                                     }
                                     None => false,
                                 };
                             let inactive_for_msg = match found.as_ref() {
-                                Some(c) => is_concept_inactive(&client, &c.system, &c.code).await,
+                                Some(c) => {
+                                    is_concept_inactive(&client, &self.meta, &c.system, &c.code)
+                                        .await
+                                }
                                 None => false,
                             };
                             let inactive_in_cs = if found.is_none() {
                                 match req.system.as_deref() {
-                                    Some(s) => is_concept_inactive(&client, s, &req.code).await,
+                                    Some(s) => {
+                                        is_concept_inactive(&client, &self.meta, s, &req.code).await
+                                    }
                                     None => false,
                                 }
                             } else {
@@ -1236,17 +1264,18 @@ impl PostgresTerminologyBackend {
                                 false
                             };
                             let cs_version = match req.system.as_deref() {
-                                Some(s) => cs_version_for_msg(&client, s).await,
+                                Some(s) => cs_version_for_msg(&client, &self.meta, s).await,
                                 None => None,
                             };
                             let cs_is_fragment = match req.system.as_deref() {
                                 Some(s) => {
-                                    cs_content_for_url(&client, s).await.as_deref()
+                                    cs_content_for_url(&client, &self.meta, s).await.as_deref()
                                         == Some("fragment")
                                 }
                                 None => false,
                             };
-                            let vs_version_owned = lookup_value_set_version(&client, &url).await;
+                            let vs_version_owned =
+                                lookup_value_set_version(&client, &self.meta, &url).await;
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -1319,7 +1348,7 @@ impl PostgresTerminologyBackend {
             };
             let mut ci_filtered: Vec<&ExpansionContains> = Vec::new();
             for c in ci_candidates {
-                if cs_is_case_insensitive(&client, &c.system).await {
+                if cs_is_case_insensitive(&client, &self.meta, &c.system).await {
                     ci_filtered.push(c);
                 }
             }
@@ -1344,7 +1373,7 @@ impl PostgresTerminologyBackend {
                 candidates.iter().map(|c| c.system.clone()).collect();
             if distinct_systems.len() >= 2 {
                 let systems_list: Vec<String> = distinct_systems.into_iter().collect();
-                let vs_v = lookup_value_set_version(&client, &url).await;
+                let vs_v = lookup_value_set_version(&client, &self.meta, &url).await;
                 let vs_canonical = match vs_v.as_deref() {
                     Some(v) if !v.is_empty() => format!("{url}|{v}"),
                     _ => url.clone(),
@@ -1500,7 +1529,7 @@ impl PostgresTerminologyBackend {
         // Version mismatch: the caller's version (wildcards included) against
         // the stored versions and the VS include pin; without a caller version,
         // a VS pin naming a version that is not stored.
-        let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
+        let vs_version_for_mismatch = lookup_value_set_version(&client, &self.meta, &url).await;
         let mismatch = if let (Some(req_ver), Some(system)) =
             (req.version.as_deref(), effective_system.as_deref())
         {
@@ -1564,7 +1593,7 @@ impl PostgresTerminologyBackend {
         let found = if compose_inactive_false {
             match found {
                 Some(c) => {
-                    if is_concept_inactive(&client, &c.system, &c.code).await {
+                    if is_concept_inactive(&client, &self.meta, &c.system, &c.code).await {
                         None
                     } else {
                         Some(c)
@@ -1594,16 +1623,16 @@ impl PostgresTerminologyBackend {
             .or_else(|| found.as_ref().map(|c| c.system.clone()));
         let abstract_for_msg = req.include_abstract == Some(false)
             && match found.as_ref() {
-                Some(c) => is_concept_abstract(&client, &c.system, &c.code).await,
+                Some(c) => is_concept_abstract(&client, &self.meta, &c.system, &c.code).await,
                 None => false,
             };
         let inactive_for_msg = match found.as_ref() {
-            Some(c) => is_concept_inactive(&client, &c.system, &c.code).await,
+            Some(c) => is_concept_inactive(&client, &self.meta, &c.system, &c.code).await,
             None => false,
         };
         let inactive_in_cs = if found.is_none() {
             match req.system.as_deref() {
-                Some(s) => is_concept_inactive(&client, s, &req.code).await,
+                Some(s) => is_concept_inactive(&client, &self.meta, s, &req.code).await,
                 None => false,
             }
         } else {
@@ -1652,14 +1681,16 @@ impl PostgresTerminologyBackend {
                 };
                 match from_req.or(from_found).or(from_compose) {
                     Some(v) => Some(v),
-                    None => cs_version_for_msg(&client, s).await,
+                    None => cs_version_for_msg(&client, &self.meta, s).await,
                 }
             }
             None => None,
         };
-        let vs_version_owned = lookup_value_set_version(&client, &url).await;
+        let vs_version_owned = lookup_value_set_version(&client, &self.meta, &url).await;
         let cs_is_fragment = match system_for_msg.as_deref() {
-            Some(s) => cs_content_for_url(&client, s).await.as_deref() == Some("fragment"),
+            Some(s) => {
+                cs_content_for_url(&client, &self.meta, s).await.as_deref() == Some("fragment")
+            }
             None => false,
         };
         // Display echoed for a code that is in the CodeSystem but not in the
@@ -1877,6 +1908,7 @@ fn compose_has_multi_version_pins(compose_json: Option<&str>) -> bool {
 /// (depth 0, empty `visited` set).
 async fn compute_expansion(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
@@ -1884,6 +1916,7 @@ async fn compute_expansion(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     // Stored ValueSets: like SQLite, expansion warnings are not reported.
     let ctx = PgExpandCtx::new(
+        meta,
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
@@ -1901,6 +1934,7 @@ async fn compute_expansion(
 /// `InlineResolutionContext` path.
 async fn compute_expansion_inline(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
@@ -1909,6 +1943,7 @@ async fn compute_expansion_inline(
     tx_resources: &[serde_json::Value],
 ) -> Result<(Vec<ExpansionContains>, Vec<String>), HtsError> {
     let ctx = PgExpandCtx::new(
+        meta,
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
@@ -1925,6 +1960,7 @@ async fn compute_expansion_inline(
 /// nested reference, so `visited` and `exclude_chain` follow the path.
 #[derive(Clone)]
 struct PgExpandCtx<'a> {
+    meta: &'a super::PgMeta,
     force_system_versions: &'a HashMap<String, String>,
     system_version_defaults: &'a HashMap<String, String>,
     default_value_set_versions: &'a HashMap<String, String>,
@@ -1938,6 +1974,7 @@ struct PgExpandCtx<'a> {
 
 impl<'a> PgExpandCtx<'a> {
     fn new(
+        meta: &'a super::PgMeta,
         force_system_versions: &'a HashMap<String, String>,
         system_version_defaults: &'a HashMap<String, String>,
         default_value_set_versions: &'a HashMap<String, String>,
@@ -1945,6 +1982,7 @@ impl<'a> PgExpandCtx<'a> {
         tx_resources: &'a [serde_json::Value],
     ) -> Self {
         PgExpandCtx {
+            meta,
             force_system_versions,
             system_version_defaults,
             default_value_set_versions,
@@ -2269,7 +2307,7 @@ async fn compute_expansion_inner_body(
             && inc["filter"].as_array().is_some_and(|a| !a.is_empty())
         {
             if let Some(mut filtered) =
-                apply_compose_filters_pg(client, system_url, &system_id, inc).await?
+                apply_compose_filters_pg(client, ctx.meta, system_url, &system_id, inc).await?
             {
                 for item in &mut filtered {
                     item.version = cs_version.clone();
@@ -2369,7 +2407,7 @@ async fn compute_expansion_inner_body(
                 let mut abstract_codes_in_set: Vec<String> = Vec::new();
                 if depth == 0 {
                     for c in &out {
-                        if is_concept_abstract(client, &c.system, &c.code).await {
+                        if is_concept_abstract(client, ctx.meta, &c.system, &c.code).await {
                             abstract_codes_in_set.push(c.code.clone());
                         }
                     }
@@ -2443,7 +2481,7 @@ async fn compute_expansion_inner_body(
         // operate on the underlying CodeSystem; we intersect each filter's
         // matching code set against `candidates`.
         if let Some(filtered) =
-            apply_compose_filters_pg(client, system_url, &system_id, inc).await?
+            apply_compose_filters_pg(client, ctx.meta, system_url, &system_id, inc).await?
         {
             let keep: HashSet<String> = filtered.into_iter().map(|c| c.code).collect();
             candidates.retain(|c| keep.contains(&c.code));
@@ -2622,8 +2660,14 @@ async fn compute_expansion_inner_body(
                 // Either apply the explicit filters or, when there are
                 // none, expand the entire CodeSystem (whole-system exclude).
                 let codes_to_deny: Vec<String> = if has_exc_filter {
-                    let filtered =
-                        apply_compose_filters_pg(client, &exc_system, &exc_system_id, exc).await?;
+                    let filtered = apply_compose_filters_pg(
+                        client,
+                        ctx.meta,
+                        &exc_system,
+                        &exc_system_id,
+                        exc,
+                    )
+                    .await?;
                     filtered
                         .unwrap_or_default()
                         .into_iter()
@@ -2784,6 +2828,7 @@ async fn pg_expand_vs_reference(
 /// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
 async fn apply_compose_filters_pg(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
     inc: &serde_json::Value,
@@ -2919,7 +2964,9 @@ async fn apply_compose_filters_pg(
         }
 
         let matches: Vec<(String, Option<String>)> = match op {
-            "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
+            "=" => {
+                pg_filter_property_eq(client, meta, system_url, system_id, property, value).await?
+            }
             // `in`: comma-separated list — union of the per-value equalities;
             // `property=concept|code` means code-list membership. Mirrors the
             // SQLite `query_property_in`.
@@ -2931,8 +2978,9 @@ async fn apply_compose_filters_pg(
                     let mut seen: HashSet<String> = HashSet::new();
                     let mut out = Vec::new();
                     for v in values {
-                        for row in pg_filter_property_eq(client, system_url, system_id, property, v)
-                            .await?
+                        for row in
+                            pg_filter_property_eq(client, meta, system_url, system_id, property, v)
+                                .await?
                         {
                             if seen.insert(row.0.clone()) {
                                 out.push(row);
@@ -2960,13 +3008,20 @@ async fn apply_compose_filters_pg(
                 if property == "concept" || property == "code" {
                     // Every concept has a code: `true` keeps all, `false` none.
                     if want_present {
-                        pg_filter_property_ne(client, system_url, system_id, "", "").await?
+                        pg_filter_property_ne(client, meta, system_url, system_id, "", "").await?
                     } else {
                         Vec::new()
                     }
                 } else {
-                    pg_filter_property_exists(client, system_url, system_id, property, want_present)
-                        .await?
+                    pg_filter_property_exists(
+                        client,
+                        meta,
+                        system_url,
+                        system_id,
+                        property,
+                        want_present,
+                    )
+                    .await?
                 }
             }
             // `descendent-of` is `is-a` minus the root itself — strict subtree.
@@ -2984,7 +3039,9 @@ async fn apply_compose_filters_pg(
             // Single-value `not-in` reduces to `!=`; both return concepts
             // whose property is NOT this value (concepts without the
             // property pass). Drives notSelectable-prop-out* IG fixtures.
-            "!=" => pg_filter_property_ne(client, system_url, system_id, property, value).await?,
+            "!=" => {
+                pg_filter_property_ne(client, meta, system_url, system_id, property, value).await?
+            }
             // `not-in`: a concept passes when it matches none of the listed
             // values — the intersection of the per-value `!=` sets.
             "not-in" => {
@@ -2992,14 +3049,15 @@ async fn apply_compose_filters_pg(
                 if property == "concept" || property == "code" {
                     let unwanted: HashSet<&str> = values.iter().copied().collect();
                     let mut all =
-                        pg_filter_property_ne(client, system_url, system_id, "", "").await?;
+                        pg_filter_property_ne(client, meta, system_url, system_id, "", "").await?;
                     all.retain(|(code, _)| !unwanted.contains(code.as_str()));
                     all
                 } else {
                     let mut acc: Option<Vec<(String, Option<String>)>> = None;
                     for v in values {
-                        let ne = pg_filter_property_ne(client, system_url, system_id, property, v)
-                            .await?;
+                        let ne =
+                            pg_filter_property_ne(client, meta, system_url, system_id, property, v)
+                                .await?;
                         acc = Some(match acc {
                             None => ne,
                             Some(prev) => {
@@ -3080,12 +3138,13 @@ async fn apply_compose_filters_pg(
 /// expects filtered out).
 async fn pg_filter_property_eq(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
     property: &str,
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
-    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+    let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
 
     // Drive the query from `idx_props_property_value` (property, value,
     // concept_id): the inner scan returns the (small) set of concept ids
@@ -3123,12 +3182,13 @@ async fn pg_filter_property_eq(
 /// Mirrors sqlite/value_set.rs:3998-4021.
 async fn pg_filter_property_ne(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
     property: &str,
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
-    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+    let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
 
     let rows = client
         .query(
@@ -3189,12 +3249,13 @@ async fn pg_filter_codes_in(
 /// the equality filters.
 async fn pg_filter_property_exists(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
     property: &str,
     want_present: bool,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
-    let property_aliases = cs_property_local_codes(client, system_url, property).await;
+    let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
     let sql = if want_present {
         "SELECT c.code, c.display
            FROM concepts c
@@ -3748,6 +3809,31 @@ fn extract_single_hierarchy_include(compose: &serde_json::Value) -> Option<(Stri
 /// bug this ordering also fixes.
 async fn resolve_system_id_pg(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    cs_url: &str,
+) -> Result<Option<String>, HtsError> {
+    if let Some(hit) = meta
+        .system_id
+        .read()
+        .ok()
+        .and_then(|g| g.get(cs_url).cloned())
+    {
+        return Ok(hit);
+    }
+    let id = resolve_system_id_uncached(client, cs_url).await?;
+    if let Ok(mut w) = meta.system_id.write() {
+        crate::backends::bounded_cache_insert(
+            &mut *w,
+            cs_url.to_owned(),
+            id.clone(),
+            super::PG_META_CACHE_MAX,
+        );
+    }
+    Ok(id)
+}
+
+async fn resolve_system_id_uncached(
+    client: &tokio_postgres::Client,
     cs_url: &str,
 ) -> Result<Option<String>, HtsError> {
     let sql = format!(
@@ -3769,6 +3855,7 @@ async fn resolve_system_id_pg(
 ///   `root` to check whether `code` is a descendant-or-self.
 async fn validate_fhir_vs(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     cs_url: &str,
     pattern: &ImplicitVsPattern,
     code: &str,
@@ -3780,7 +3867,7 @@ async fn validate_fhir_vs(
         }
     }
 
-    let system_id = match resolve_system_id_pg(client, cs_url).await? {
+    let system_id = match resolve_system_id_pg(client, meta, cs_url).await? {
         Some(id) => id,
         None => {
             return Err(HtsError::NotFound(format!(
@@ -3875,6 +3962,7 @@ async fn validate_fhir_vs(
             }
             Box::pin(validate_fhir_vs(
                 client,
+                meta,
                 cs_url,
                 &ImplicitVsPattern::AllConcepts,
                 code,
@@ -3889,17 +3977,24 @@ async fn validate_fhir_vs(
 
 /// Highest stored ValueSet version for a URL, used to format `url|version`
 /// in IG-spec not-found messages.
-async fn lookup_value_set_version(client: &tokio_postgres::Client, url: &str) -> Option<String> {
-    let sql = format!(
-        "SELECT version FROM value_sets WHERE url = $1 ORDER BY {} LIMIT 1",
-        crate::backends::vs_precedence_order_by("value_sets")
-    );
-    client
-        .query_opt(&sql, &[&url])
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.get::<_, Option<String>>(0))
+async fn lookup_value_set_version(
+    client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    url: &str,
+) -> Option<String> {
+    super::memo(&meta.vs_version, url.to_owned(), async {
+        let sql = format!(
+            "SELECT version FROM value_sets WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::vs_precedence_order_by("value_sets")
+        );
+        client
+            .query_opt(&sql, &[&url])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<String>>(0))
+    })
+    .await
 }
 
 /// Highest stored CodeSystem version for a URL.
@@ -3944,18 +4039,22 @@ async fn pg_lookup_cs_display(
 
 pub(super) async fn cs_version_for_msg(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
 ) -> Option<String> {
-    let sql = format!(
-        "SELECT version FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
-        crate::backends::cs_precedence_order_by("code_systems")
-    );
-    client
-        .query_opt(&sql, &[&system_url])
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.get::<_, Option<String>>(0))
+    super::memo(&meta.cs_version, system_url.to_owned(), async {
+        let sql = format!(
+            "SELECT version FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        client
+            .query_opt(&sql, &[&system_url])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<String>>(0))
+    })
+    .await
 }
 
 /// Look up the `content` column for a stored CodeSystem URL. `Some("fragment")`
@@ -3963,23 +4062,38 @@ pub(super) async fn cs_version_for_msg(
 /// `finish_validate_code_response`.
 pub(super) async fn cs_content_for_url(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
 ) -> Option<String> {
-    let sql = format!(
-        "SELECT content FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
-        crate::backends::cs_precedence_order_by("code_systems")
-    );
-    client
-        .query_opt(&sql, &[&system_url])
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.get::<_, Option<String>>(0))
+    super::memo(&meta.cs_content, system_url.to_owned(), async {
+        let sql = format!(
+            "SELECT content FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        client
+            .query_opt(&sql, &[&system_url])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<String>>(0))
+    })
+    .await
 }
 
 /// Returns `true` when the CodeSystem at `system_url` has `caseSensitive: false`
 /// explicitly set. The FHIR default (absent) is treated as case-sensitive.
 pub(super) async fn cs_is_case_insensitive(
+    client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    system_url: &str,
+) -> bool {
+    super::memo(&meta.case_insensitive, system_url.to_owned(), async {
+        cs_is_case_insensitive_uncached(client, system_url).await
+    })
+    .await
+}
+
+async fn cs_is_case_insensitive_uncached(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> bool {
@@ -4062,6 +4176,20 @@ async fn cs_version_exists(
 /// canonical name miss those concepts.
 pub(super) async fn cs_property_local_codes(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    system_url: &str,
+    canonical: &str,
+) -> Vec<String> {
+    let key = (system_url.to_owned(), canonical.to_owned());
+    let codes = super::memo(&meta.prop_codes, key, async {
+        Arc::new(cs_property_local_codes_uncached(client, system_url, canonical).await)
+    })
+    .await;
+    (*codes).clone()
+}
+
+async fn cs_property_local_codes_uncached(
+    client: &tokio_postgres::Client,
     system_url: &str,
     canonical: &str,
 ) -> Vec<String> {
@@ -4103,10 +4231,24 @@ pub(super) async fn cs_property_local_codes(
 /// relies on this — deprecated codes survive `activeOnly=true` filtering).
 pub(super) async fn is_concept_inactive(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     code: &str,
 ) -> bool {
-    let inactive_codes = cs_property_local_codes(client, system_url, "inactive").await;
+    let key = (0u8, system_url.to_owned(), code.to_owned());
+    super::memo(&meta.concept_flags, key, async {
+        is_concept_inactive_uncached(client, meta, system_url, code).await
+    })
+    .await
+}
+
+async fn is_concept_inactive_uncached(
+    client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    system_url: &str,
+    code: &str,
+) -> bool {
+    let inactive_codes = cs_property_local_codes(client, meta, system_url, "inactive").await;
     let placeholders = (3..=inactive_codes.len() + 2)
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
@@ -4143,10 +4285,24 @@ pub(super) async fn is_concept_inactive(
 /// several tx-ecosystem fixtures use).
 pub(super) async fn is_concept_abstract(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     system_url: &str,
     code: &str,
 ) -> bool {
-    let abstract_codes = cs_property_local_codes(client, system_url, "notSelectable").await;
+    let key = (1u8, system_url.to_owned(), code.to_owned());
+    super::memo(&meta.concept_flags, key, async {
+        is_concept_abstract_uncached(client, meta, system_url, code).await
+    })
+    .await
+}
+
+async fn is_concept_abstract_uncached(
+    client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
+    system_url: &str,
+    code: &str,
+) -> bool {
+    let abstract_codes = cs_property_local_codes(client, meta, system_url, "notSelectable").await;
     let placeholders = (3..=abstract_codes.len() + 2)
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
@@ -5113,6 +5269,7 @@ fn build_implicit_compose_value(cs_url: &str, pattern: &ImplicitVsPattern) -> se
 /// so the typical fast path makes zero DB calls.
 async fn compose_page_fast_pg(
     client: &tokio_postgres::Client,
+    meta: &super::PgMeta,
     compose_json: Option<&str>,
     offset: usize,
     limit: usize,
@@ -5216,7 +5373,7 @@ async fn compose_page_fast_pg(
             let system_id = if let Some(sid) = system_id_cache.get(system_url) {
                 sid.clone()
             } else {
-                let sid = resolve_system_id_pg(client, system_url).await?;
+                let sid = resolve_system_id_pg(client, meta, system_url).await?;
                 system_id_cache.insert(system_url.clone(), sid.clone());
                 sid
             };

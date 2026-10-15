@@ -118,12 +118,36 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let (concept_id, display, definition) =
             find_concept(&client, &system_id, &req.code).await?;
 
-        let stored_props = fetch_properties(&client, concept_id).await?;
         // Per FHIR spec, property="*" is the wildcard meaning "include
-        // every property the concept has".
+        // every property the concept has". The synthesised parent / child /
+        // inactive properties are skipped when an explicit list names none
+        // of them (as SQLite does).
         let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
-        let synth_props =
-            fetch_synthesised_properties(&client, &system_id, &req.code, &stored_props).await?;
+        let needs_synth = want_all
+            || req
+                .properties
+                .iter()
+                .any(|p| p == "parent" || p == "child" || p == "inactive");
+        // The independent reads go out together: tokio-postgres pipelines
+        // concurrent queries on one connection, so this is one round trip
+        // instead of five.
+        let (stored_props, designations_first, synth_rows) = futures::try_join!(
+            fetch_properties(&client, concept_id),
+            fetch_designations(&client, concept_id),
+            async {
+                if needs_synth {
+                    fetch_synthesised_rows(&client, &system_id, &req.code)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
+        let synth_props = match synth_rows {
+            Some(rows) => build_synthesised_properties(rows, &stored_props),
+            None => Vec::new(),
+        };
         let properties = if want_all {
             let mut out = stored_props;
             out.extend(synth_props);
@@ -141,7 +165,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             out
         };
 
-        let mut all_designations = fetch_designations(&client, concept_id).await?;
+        let mut all_designations = designations_first;
 
         // Cross-version designation fallback: when the caller pinned no
         // version and the resolved (newest) version has no designation in the
@@ -682,8 +706,10 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // → local-code mapping when available; always fall back to the
         // canonical name so a CS that never declares property[] still
         // reports correctly. Mirrors sqlite/code_system.rs:980-1012.
-        let abstract_codes = cs_property_local_codes(&client, system_url, "notSelectable").await;
-        let inactive_codes = cs_property_local_codes(&client, system_url, "inactive").await;
+        let abstract_codes =
+            cs_property_local_codes(&client, &self.meta, system_url, "notSelectable").await;
+        let inactive_codes =
+            cs_property_local_codes(&client, &self.meta, system_url, "inactive").await;
 
         let rows = client
             .query(
@@ -1220,42 +1246,87 @@ async fn fetch_properties(
         .collect())
 }
 
-/// Synthesise hierarchy- and status-derived properties for `$lookup`.
-///
-/// Mirrors the SQLite backend implementation — see
-/// [`super::super::sqlite::code_system::fetch_synthesised_properties`] for
-/// rationale.
-async fn fetch_synthesised_properties(
+/// Raw rows behind the synthesised `$lookup` properties: parent edges, child
+/// edges (each with the related concept's display) and whether a `status`
+/// property marks the concept inactive — three queries issued concurrently.
+async fn fetch_synthesised_rows(
     client: &tokio_postgres::Client,
     system_id: &str,
     code: &str,
-    stored: &[PropertyValue],
-) -> Result<Vec<PropertyValue>, HtsError> {
-    let mut out = Vec::new();
+) -> Result<SynthRows, HtsError> {
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let (parents, children, inactive) = futures::try_join!(
+        async {
+            client
+                .query(
+                    "SELECT h.parent_code, c.display
+                     FROM concept_hierarchy h
+                     LEFT JOIN concepts c
+                            ON c.system_id = h.system_id AND c.code = h.parent_code
+                     WHERE h.system_id = $1 AND h.child_code = $2
+                     ORDER BY h.parent_code",
+                    &[&system_id, &code],
+                )
+                .await
+                .map_err(db)
+        },
+        async {
+            client
+                .query(
+                    "SELECT h.child_code, c.display
+                     FROM concept_hierarchy h
+                     LEFT JOIN concepts c
+                            ON c.system_id = h.system_id AND c.code = h.child_code
+                     WHERE h.system_id = $1 AND h.parent_code = $2
+                     ORDER BY h.child_code",
+                    &[&system_id, &code],
+                )
+                .await
+                .map_err(db)
+        },
+        async {
+            client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM concept_properties cp
+                         JOIN concepts c ON c.id = cp.concept_id
+                         WHERE c.system_id = $1
+                           AND c.code = $2
+                           AND cp.property = 'status'
+                           AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+                     )",
+                    &[&system_id, &code],
+                )
+                .await
+                .map(|r| r.get::<_, bool>(0))
+                .map_err(db)
+        }
+    )?;
+    Ok(SynthRows {
+        parents: parents.into_iter().map(|r| (r.get(0), r.get(1))).collect(),
+        children: children.into_iter().map(|r| (r.get(0), r.get(1))).collect(),
+        inactive,
+    })
+}
 
-    // Parents — synthesised from concept_hierarchy. Skip when the concept
-    // already carries explicit `parent` properties (the bundle importer
-    // mirrors `parent` properties into concept_hierarchy, so synthesising
-    // here would duplicate every stored parent edge).
+struct SynthRows {
+    parents: Vec<(String, Option<String>)>,
+    children: Vec<(String, Option<String>)>,
+    inactive: bool,
+}
+
+/// Synthesise hierarchy- and status-derived properties for `$lookup` from
+/// [`fetch_synthesised_rows`]: parents not already stored as explicit
+/// `parent` properties, children, and `inactive` unless stored explicitly.
+/// Mirrors the SQLite backend.
+fn build_synthesised_properties(rows: SynthRows, stored: &[PropertyValue]) -> Vec<PropertyValue> {
     let stored_parent_codes: std::collections::HashSet<&str> = stored
         .iter()
         .filter(|p| p.code == "parent")
         .map(|p| p.value.as_str())
         .collect();
-    let parent_rows = client
-        .query(
-            "SELECT h.parent_code, c.display
-             FROM concept_hierarchy h
-             LEFT JOIN concepts c
-                    ON c.system_id = h.system_id AND c.code = h.parent_code
-             WHERE h.system_id = $1 AND h.child_code = $2
-             ORDER BY h.parent_code",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    for row in parent_rows {
-        let parent_code: String = row.get(0);
+    let mut out = Vec::new();
+    for (parent_code, display) in rows.parents {
         if stored_parent_codes.contains(parent_code.as_str()) {
             continue;
         }
@@ -1263,58 +1334,26 @@ async fn fetch_synthesised_properties(
             code: "parent".into(),
             value_type: "code".into(),
             value: parent_code,
-            description: row.get(1),
+            description: display,
         });
     }
-
-    // Children.
-    let child_rows = client
-        .query(
-            "SELECT h.child_code, c.display
-             FROM concept_hierarchy h
-             LEFT JOIN concepts c
-                    ON c.system_id = h.system_id AND c.code = h.child_code
-             WHERE h.system_id = $1 AND h.parent_code = $2
-             ORDER BY h.child_code",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    for row in child_rows {
+    for (child_code, display) in rows.children {
         out.push(PropertyValue {
             code: "child".into(),
             value_type: "code".into(),
-            value: row.get(0),
-            description: row.get(1),
+            value: child_code,
+            description: display,
         });
     }
-
-    // Inactive flag (only when not already stored explicitly).
     if !stored.iter().any(|p| p.code == "inactive") {
-        let row = client
-            .query_one(
-                "SELECT EXISTS (
-                     SELECT 1 FROM concept_properties cp
-                     JOIN concepts c ON c.id = cp.concept_id
-                     WHERE c.system_id = $1
-                       AND c.code = $2
-                       AND cp.property = 'status'
-                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
-                 )",
-                &[&system_id, &code],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let inactive: bool = row.get(0);
         out.push(PropertyValue {
             code: "inactive".into(),
             value_type: "boolean".into(),
-            value: inactive.to_string(),
+            value: rows.inactive.to_string(),
             description: None,
         });
     }
-
-    Ok(out)
+    out
 }
 
 /// Fetch all designations for a concept.
