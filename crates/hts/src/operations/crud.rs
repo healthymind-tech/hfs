@@ -121,6 +121,20 @@ mod inner {
                 "Unsupported resource type for CRUD: {resource_type}"
             )));
         }
+        // Same validation and errors as the SQLite path's `import_*`: a
+        // resource the parser rejects (no `url`) is a 400, and a write
+        // failure is not swallowed into a 201.
+        use crate::import::bundle_parser;
+        let parsable = match resource_type {
+            "CodeSystem" => bundle_parser::parse_code_system_value(&content).is_some(),
+            "ValueSet" => bundle_parser::parse_value_set_value(&content).is_some(),
+            _ => bundle_parser::parse_concept_map_value(&content).is_some(),
+        };
+        if !parsable {
+            return Err(HtsError::InvalidRequest(format!(
+                "{resource_type}.url is required"
+            )));
+        }
         let bundle = serde_json::json!({
             "resourceType": "Bundle",
             "type": "collection",
@@ -128,10 +142,16 @@ mod inner {
         });
         let bytes =
             serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail");
-        importer
+        let stats = importer
             .import_bundle(ctx, &bytes)
             .await
             .map_err(|e| HtsError::StorageError(format!("HTS re-index failed: {e}")))?;
+        if !stats.errors.is_empty() {
+            return Err(HtsError::StorageError(format!(
+                "HTS re-index failed: {}",
+                stats.errors.join("; ")
+            )));
+        }
         Ok(())
     }
 

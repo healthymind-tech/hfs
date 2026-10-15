@@ -152,8 +152,22 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .await
             .map_err(pg)?
             .get(0);
+        // Space held by dead row versions, which VACUUM (the `compact`
+        // job) makes reusable — PostgreSQL's analogue of SQLite's free list
+        // (estimated from the statistics collector's live/dead counts).
+        let reclaimable: i64 = c
+            .query_one(
+                "SELECT COALESCE(SUM(pg_relation_size(relid) * n_dead_tup::float8
+                                     / NULLIF(n_live_tup + n_dead_tup, 0)), 0)::bigint
+                   FROM pg_stat_user_tables",
+                &[],
+            )
+            .await
+            .map_err(pg)?
+            .get(0);
         Ok(DbFootprint {
             bytes: bytes.max(0) as u64,
+            reclaimable_bytes: reclaimable.max(0) as u64,
             ..Default::default()
         })
     }
