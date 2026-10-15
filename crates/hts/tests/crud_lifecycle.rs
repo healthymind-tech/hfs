@@ -66,9 +66,9 @@ async fn subsumes(app: &TestApp, a: &str, b: &str) -> (StatusCode, Value) {
 // ── T5a: closure after REST writes ────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn posted_code_system_is_immediately_subsumable_and_filterable() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
 
     let (st, body) = app
         .post_fhir("/CodeSystem", code_system("crud-cs", "1.0").to_string())
@@ -100,9 +100,9 @@ async fn posted_code_system_is_immediately_subsumable_and_filterable() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn updated_code_system_rebuilds_its_closure() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
     let (st, _) = app
         .post_fhir("/CodeSystem", code_system("crud-cs", "1.0").to_string())
         .await;
@@ -129,9 +129,9 @@ async fn updated_code_system_rebuilds_its_closure() {
 // ── T5b: imported resources are addressable by id ─────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn imported_resources_are_readable_by_id() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
     app.import_bundle_ok(&import_bundle()).await;
 
     let (st, body) = app.get_fhir("/CodeSystem/crud-cs").await;
@@ -158,9 +158,9 @@ async fn imported_resources_are_readable_by_id() {
 // ── T5c: DELETE status codes ──────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn delete_returns_204_then_404_for_imported_and_rest_resources() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
     app.import_bundle_ok(&import_bundle()).await;
 
     // Imported-only ValueSet.
@@ -207,9 +207,9 @@ async fn delete_returns_204_then_404_for_imported_and_rest_resources() {
 // ── T5d: PUT update-as-create ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn put_to_unknown_id_creates_then_updates() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
 
     let (st, body) = app
         .put_fhir(
@@ -247,9 +247,9 @@ async fn put_to_unknown_id_creates_then_updates() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn put_over_imported_resource_replaces_it() {
-    let app = TestApp::with_resource_store();
+    let app = TestApp::with_resource_store().await;
     app.import_bundle_ok(&import_bundle()).await;
 
     let mut replaced = code_system("crud-cs", "1.0");

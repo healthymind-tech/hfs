@@ -2,6 +2,7 @@
 
 #![cfg(feature = "postgres")]
 
+use super::CachedQuery;
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use std::sync::Arc;
@@ -16,10 +17,7 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::value_set::{
-    cs_content_for_url, cs_is_case_insensitive, cs_property_local_codes, cs_version_for_msg,
-    detect_cs_version_mismatch, is_concept_abstract, is_concept_inactive,
-};
+use super::value_set::cs_property_local_codes;
 use super::{
     PG_LOOKUP_RESPONSE_CACHE_MAX, PG_SUBSUMES_RESPONSE_CACHE_MAX, PostgresTerminologyBackend,
     ResolvedMetaCache, error_chain,
@@ -35,7 +33,7 @@ use super::{
 /// Mirrors backends/sqlite/code_system.rs:1683-1700.
 async fn resolve_code_system_cached(
     cache: &ResolvedMetaCache,
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
@@ -118,15 +116,39 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         )
         .await?;
 
-        let (concept_id, display, definition) =
-            find_concept(&client, &system_id, &req.code).await?;
-
-        let stored_props = fetch_properties(&client, concept_id).await?;
         // Per FHIR spec, property="*" is the wildcard meaning "include
-        // every property the concept has".
+        // every property the concept has". The synthesised parent / child /
+        // inactive properties are skipped when an explicit list names none
+        // of them (as SQLite does).
         let want_all = req.properties.is_empty() || req.properties.iter().any(|p| p == "*");
-        let synth_props =
-            fetch_synthesised_properties(&client, &system_id, &req.code, &stored_props).await?;
+        let needs_synth = want_all
+            || req
+                .properties
+                .iter()
+                .any(|p| p == "parent" || p == "child" || p == "inactive");
+        // The independent reads go out together: tokio-postgres pipelines
+        // concurrent queries on one connection, so this is one round trip
+        // instead of five.
+        // The concept row itself goes out in the same batch; its NotFound
+        // takes precedence over the (then empty) other results.
+        let ((_, display, definition), stored_props, designations_first, synth_rows) = futures::try_join!(
+            find_concept(&client, &system_id, &req.code),
+            fetch_properties(&client, &system_id, &req.code),
+            fetch_designations(&client, &system_id, &req.code),
+            async {
+                if needs_synth {
+                    fetch_synthesised_rows(&client, &system_id, &req.code)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
+        let synth_props = match synth_rows {
+            Some(rows) => build_synthesised_properties(rows, &stored_props),
+            None => Vec::new(),
+        };
         let properties = if want_all {
             let mut out = stored_props;
             out.extend(synth_props);
@@ -144,7 +166,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             out
         };
 
-        let mut all_designations = fetch_designations(&client, concept_id).await?;
+        let mut all_designations = designations_first;
 
         // Cross-version designation fallback: when the caller pinned no
         // version and the resolved (newest) version has no designation in the
@@ -222,6 +244,12 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(response)
     }
 
+    /// `CodeSystem/$validate-code`, the SQLite backend's checks verbatim: an
+    /// unresolvable system (or version) is UNKNOWN_CODESYSTEM, an unknown code
+    /// `Unknown_Code_in_Version` (a warning for a fragment CodeSystem;
+    /// composed UCUM units validate structurally), and a display mismatch is
+    /// an error unless `lenient-display-validation`. The operations layer adds
+    /// the rest (status, language, supplements) for both backends alike.
     async fn validate_code(
         &self,
         _ctx: &TenantContext,
@@ -232,238 +260,56 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 "CodeSystem/$validate-code requires 'system' (or 'url') parameter".into(),
             )
         })?;
-
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
-        // Location strings depend on the FHIR input form. Mirrors
-        // `postgres/value_set.rs:447-454` and is rewritten by the operations
-        // layer for bare-code requests (`Coding.X` → `X`) and CodeableConcept
-        // (`Coding.X` → `CodeableConcept.coding[0].X`).
-        let (version_loc, system_loc, code_loc, display_loc) = match req.input_form.as_deref() {
-            Some("code") => ("version", "system", "code", "display"),
-            Some("codeableConcept") => (
-                "CodeableConcept.coding[0].version",
-                "CodeableConcept.coding[0].system",
-                "CodeableConcept.coding[0].code",
-                "CodeableConcept.coding[0].display",
-            ),
-            _ => (
-                "Coding.version",
-                "Coding.system",
-                "Coding.code",
-                "Coding.display",
-            ),
-        };
-
-        // ─── Resolve the CS. NotFound has two flavours:
-        //
-        // 1. URL not stored at all → UNKNOWN_CODESYSTEM (single issue).
-        // 2. URL exists at some version but not the requested one →
-        //    delegate to `detect_cs_version_mismatch` for the
-        //    UNKNOWN_CODESYSTEM_VERSION shape (+ caused-by canonical).
-        //
-        // Mirrors `sqlite/code_system.rs:396-419` for path 1; path 2 is the
-        // PG-specific enhancement that re-uses the VS-port detector.
-        let resolve_result = resolve_code_system_cached(
+        let (system_id, resolved_cs_version) = match resolve_code_system_cached(
             &self.cs_resolved_meta_cache,
             &client,
             &system,
             req.version.as_deref(),
             req.date.as_deref(),
         )
-        .await;
-
-        // (system_id, version) — both None when the URL exists but the
-        // requested version doesn't (the version-mismatch detector below
-        // handles that case).
-        let (resolved_system_id, resolved_cs_version) = match resolve_result {
-            Ok((id, _, version)) => (Some(id), version),
-            Err(HtsError::NotFound(_)) => {
-                // Probe whether the URL exists at all (any version).
-                let url_exists = client
-                    .query_one(
-                        "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
-                        &[&system],
-                    )
-                    .await
-                    .map(|r| r.get::<_, bool>(0))
-                    .unwrap_or(false);
-                if !url_exists {
-                    let text = format!(
-                        "A definition for CodeSystem {system} could not be found, so the code cannot be validated"
-                    );
-                    return Ok(ValidateCodeResponse {
-                        result: false,
-                        message: Some(text.clone()),
-                        display: None,
-                        system: None,
-                        cs_version: None,
-                        inactive: None,
-                        issues: vec![crate::types::ValidationIssue {
-                            severity: "error".into(),
-                            fhir_code: "not-found".into(),
-                            tx_code: "not-found".into(),
-                            text,
-                            expression: Some(system_loc.into()),
-                            location: None,
-                            message_id: Some("UNKNOWN_CODESYSTEM".into()),
-                        }],
-                        caused_by_unknown_system: None,
-                        concept_status: None,
-                        normalized_code: None,
-                    });
-                }
-                // URL exists at some version; fall through to the version-mismatch
-                // detector. The detector will produce the proper issues.
-                (None, None)
-            }
-            Err(e) => return Err(e),
-        };
-
-        // ─── CS-version-mismatch detection: when the caller pinned a version
-        //     that doesn't exist in the DB (or that the CS doesn't actually
-        //     define at the requested version), produce the
-        //     UNKNOWN_CODESYSTEM_VERSION shape from the version-detector. CS
-        //     `$validate-code` has no VS compose context — `compose_json` and
-        //     `vs_version` are both `None`.
-        if let Some(req_ver) = req
-            .version
-            .as_deref()
-            .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
+        .await
         {
-            if let Some((issues, caused_by, echo_version)) = detect_cs_version_mismatch(
-                &client,
-                &system,
-                req_ver,
-                None,
-                None,
-                version_loc,
-                system_loc,
-            )
-            .await
-            {
-                // Echo the code's display from any stored version of the CS,
-                // so consumers can see the concept exists (only the version is
-                // wrong). Matches `postgres/value_set.rs:506-517`.
-                let sql = format!(
-                    "SELECT c.display FROM concepts c \
-                     JOIN code_systems s ON s.id = c.system_id \
-                     WHERE s.url = $1 AND c.code = $2 \
-                     ORDER BY {} LIMIT 1",
-                    crate::backends::cs_precedence_order_by("s")
+            Ok((id, _, version)) => (id, version),
+            Err(HtsError::NotFound(_)) => {
+                let text = format!(
+                    "A definition for CodeSystem {system} could not be found, so the code cannot be validated"
                 );
-                let display = client
-                    .query_opt(&sql, &[&system, &req.code])
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.get::<_, Option<String>>(0));
-                let mut texts: Vec<&str> = issues
-                    .iter()
-                    .filter(|i| i.severity == "error")
-                    .map(|i| i.text.as_str())
-                    .collect();
-                texts.sort_unstable();
-                let message = texts.join("; ");
                 return Ok(ValidateCodeResponse {
                     result: false,
-                    message: Some(message),
-                    display,
-                    system: Some(system.clone()),
-                    cs_version: echo_version,
+                    message: Some(text.clone()),
+                    display: None,
+                    system: None,
+                    cs_version: None,
                     inactive: None,
-                    issues,
-                    caused_by_unknown_system: caused_by,
+                    issues: vec![crate::types::ValidationIssue {
+                        severity: "error".into(),
+                        fhir_code: "not-found".into(),
+                        tx_code: "not-found".into(),
+                        text,
+                        expression: Some("Coding.system".into()),
+                        location: None,
+                        message_id: Some("UNKNOWN_CODESYSTEM".into()),
+                    }],
+                    caused_by_unknown_system: None,
                     concept_status: None,
                     normalized_code: None,
                 });
             }
-        }
-
-        // ─── Find the concept. ────────────────────────────────────────────────
-        //
-        // Try the literal code first. When the CS is case-insensitive and
-        // there's no literal hit, fall back to a case-insensitive scan and
-        // record the canonical (correct-case) `normalized_code` for the IG
-        // `case/case-coding-insensitive-*` fixtures.
-        //
-        // Scope to the resolved CS row's `system_id` when available so a
-        // request pinned to version 1.0.0 doesn't accidentally pick up a
-        // concept that only exists in version 2.0.0 of the same URL.
-        //
-        // TODO: parity — wildcard versions ("1.x") whose pattern doesn't
-        // match any stored version fall through here unhandled. The exact-
-        // version detector above filters them out. SQLite has the same gap.
-        let mut normalized_code: Option<String> = None;
-        let concept_lookup = if let Some(sid) = resolved_system_id.as_deref() {
-            match find_concept_by_system_id(&client, sid, &req.code).await {
-                Some(c) => Some(c),
-                None => {
-                    if cs_is_case_insensitive(&client, &system).await {
-                        if let Some(c) = find_concept_by_system_id_ci(&client, sid, &req.code).await
-                        {
-                            if c.code != req.code {
-                                normalized_code = Some(c.code.clone());
-                            }
-                            Some(c)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            }
-        } else {
-            // CS URL exists but the requested version doesn't — search across
-            // all stored versions so the unknown-code branch can still produce
-            // accurate "code does/doesn't exist in this CS" messaging.
-            match find_concept_by_url(&client, &system, &req.code).await {
-                Some(c) => Some(c),
-                None => {
-                    if cs_is_case_insensitive(&client, &system).await {
-                        if let Some(c) = find_concept_by_url_ci(&client, &system, &req.code).await {
-                            if c.code != req.code {
-                                normalized_code = Some(c.code.clone());
-                            }
-                            Some(c)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            }
+            Err(e) => return Err(e),
         };
 
-        let concept = match concept_lookup {
-            Some(c) => c,
-            None => {
-                // Match the IG `validation/cs-code-bad-code` text format exactly.
-                //
-                // Report the row we ACTUALLY validated against. These used to
-                // re-query by URL (`cs_version_for_msg` / `cs_content_for_url`),
-                // which picks the best-ranked row for the canonical — NOT
-                // necessarily the row `resolve_code_system` chose. With a version
-                // pin (now honoured, per issue #200) the two diverge, so the
-                // message could cite a version the code was never checked against
-                // and, worse, `content` gates the fragment→warning vs
-                // complete→error branch below: reading `content` off a different
-                // row can silently downgrade a genuine error to a warning.
-                // Mirrors the SQLite fix in `sqlite/code_system.rs`.
+        let display = match find_concept(&client, &system_id, &req.code).await {
+            Ok((_, display, _)) => display,
+            Err(HtsError::NotFound(_)) => {
                 let cs_version_str = resolved_cs_version.clone();
-                let cs_content = match resolved_system_id.as_deref() {
-                    Some(id) => cs_content_for_system_id(&client, id).await,
-                    // URL unknown entirely — no resolved row to read from.
-                    None => cs_content_for_url(&client, &system).await,
-                };
-
-                // Fragment CodeSystems: unknown code is a *warning*, not an error.
+                let cs_content: Option<String> =
+                    cs_content_for_system_id(&client, &system_id).await;
                 if cs_content.as_deref() == Some("fragment") {
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
@@ -487,8 +333,8 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                             fhir_code: "code-invalid".into(),
                             tx_code: "invalid-code".into(),
                             text,
-                            expression: Some(code_loc.into()),
-                            location: Some(code_loc.into()),
+                            expression: Some("Coding.code".into()),
+                            location: Some("Coding.code".into()),
                             message_id: Some("UNKNOWN_CODE_IN_FRAGMENT".into()),
                         }],
                         caused_by_unknown_system: None,
@@ -496,7 +342,6 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                         normalized_code: None,
                     });
                 }
-
                 if crate::ucum_validate::is_ucum_url(&system)
                     && crate::ucum_validate::is_valid_ucum_code(&req.code)
                 {
@@ -505,7 +350,6 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                         cs_version_str,
                     ));
                 }
-
                 let text = match cs_version_str.as_deref() {
                     Some(v) => format!(
                         "Unknown code '{}' in the CodeSystem '{}' version '{}'",
@@ -517,7 +361,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     result: false,
                     message: Some(text.clone()),
                     display: None,
-                    system: Some(system.clone()),
+                    system: None,
                     cs_version: cs_version_str,
                     inactive: None,
                     issues: vec![crate::types::ValidationIssue {
@@ -525,7 +369,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                         fhir_code: "code-invalid".into(),
                         tx_code: "invalid-code".into(),
                         text,
-                        expression: Some(code_loc.into()),
+                        expression: Some("Coding.code".into()),
                         location: None,
                         message_id: Some("Unknown_Code_in_Version".into()),
                     }],
@@ -534,132 +378,41 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     normalized_code: None,
                 });
             }
+            Err(e) => return Err(e),
         };
 
-        // ─── Concept found. Compute flag attributes. ─────────────────────────
-        let canonical_code = concept.code.clone();
-        let display = concept.display.clone();
-        let is_inactive = is_concept_inactive(&client, &system, &canonical_code).await;
-        let is_abstract = is_concept_abstract(&client, &system, &canonical_code).await;
-
+        let lenient = req.lenient_display_validation == Some(true);
         let mut issues: Vec<crate::types::ValidationIssue> = Vec::new();
-        let qualified = format!("{system}#{canonical_code}");
-
-        // Abstract concept with `abstract=false` request: reject with the IG
-        // "Code 'X' is abstract, and not allowed in this context" message.
-        // TODO: parity — SQLite CS validate_code doesn't currently emit this
-        // (only the VS path does); included here for IG conformance.
-        if is_abstract && req.include_abstract == Some(false) {
-            let abstract_text =
-                format!("Code '{qualified}' is abstract, and not allowed in this context");
-            issues.push(crate::types::ValidationIssue {
-                severity: "error".into(),
-                fhir_code: "business-rule".into(),
-                tx_code: "code-rule".into(),
-                text: abstract_text.clone(),
-                expression: Some(code_loc.into()),
-                location: None,
-                message_id: Some("ABSTRACT_CODE_NOT_ALLOWED".into()),
-            });
-        }
-
-        // Case-insensitive normalisation note. The IG `case/case-coding-
-        // insensitive-*` fixtures expect a CODE_CASE_DIFFERENCE informational
-        // issue identifying the canonical code.
-        // TODO: parity — SQLite CS validate_code doesn't currently emit this.
-        if let Some(canonical) = normalized_code.as_deref() {
-            let cs_qualifier = match cs_version_for_msg(&client, &system).await {
-                Some(v) => format!("{system}|{v}"),
-                None => system.clone(),
-            };
-            let text = format!(
-                "The code '{}' differs from the correct code '{canonical}' by case. Although the code system '{cs_qualifier}' is case insensitive, implementers are strongly encouraged to use the correct case anyway",
-                req.code
-            );
-            issues.push(crate::types::ValidationIssue {
-                severity: "information".into(),
-                fhir_code: "business-rule".into(),
-                tx_code: "code-rule".into(),
-                text,
-                expression: Some(code_loc.into()),
-                location: Some(code_loc.into()),
-                message_id: Some("CODE_CASE_DIFFERENCE".into()),
-            });
-        }
-
-        // Inactive concept: emit the canonical INACTIVE_CONCEPT_FOUND warning.
-        // The operations layer also appends a specific-status companion (e.g.
-        // "...status of retired...") via `lookup_concept_status`.
-        //
-        // No `location` field — the IG `validation/validate-contained-good`
-        // fixture (inline-VS path) pins this warning WITHOUT a location.
-        // The operations layer then clones the template for the
-        // specific-status companion, so the location-less template flows
-        // through both issues. URL-based VS-validate-code paths (e.g.
-        // `inactive-2a-validate`) emit their own INACTIVE_CONCEPT_FOUND
-        // WITH location via finish_validate_code_response, separately.
-        // Mirrors SQLite's CS-side behaviour (which doesn't emit at all).
-        if is_inactive {
-            issues.push(crate::types::ValidationIssue {
-                severity: "warning".into(),
-                fhir_code: "business-rule".into(),
-                tx_code: "code-comment".into(),
-                text: format!(
-                    "The concept '{}' has a status of inactive and its use should be reviewed",
-                    canonical_code
-                ),
-                expression: Some("Coding".into()),
-                location: None,
-                message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
-            });
-        }
-
-        // Display mismatch. The IG `validation/simple-*-bad-display` fixtures
-        // expect the "Wrong Display Name 'X' for Y. Valid display is 'Z'..."
-        // wording. With `lenient-display-validation=true`, the issue is a
-        // warning and result stays true; otherwise it's an error.
-        let mut display_message: Option<String> = None;
-        if let Some(expected) = req.display.as_deref() {
-            if let Some(actual) = display.as_deref() {
-                if actual != expected {
-                    let text = format!(
-                        "Wrong Display Name '{expected}' for {qualified}. Valid display is '{actual}' (en) (for the language(s) '--')"
-                    );
-                    display_message = Some(text.clone());
-                    let lenient = req.lenient_display_validation == Some(true);
-                    issues.push(crate::types::ValidationIssue {
-                        severity: if lenient { "warning" } else { "error" }.into(),
-                        fhir_code: "invalid".into(),
-                        tx_code: "invalid-display".into(),
-                        text,
-                        expression: Some(display_loc.into()),
-                        location: None,
-                        message_id: Some("Display_Name_for__should_be_one_of__instead_of".into()),
-                    });
-                }
+        let message = req.display.as_ref().and_then(|expected| {
+            let actual = display.as_deref().unwrap_or("");
+            if actual != expected.as_str() {
+                let text = format!("Display mismatch: expected '{expected}', found '{actual}'");
+                issues.push(crate::types::ValidationIssue {
+                    severity: if lenient { "warning" } else { "error" }.into(),
+                    fhir_code: "invalid".into(),
+                    tx_code: "invalid-display".into(),
+                    text: text.clone(),
+                    expression: Some("Coding.display".into()),
+                    location: None,
+                    message_id: Some("Display_Name_for__should_be_one_of__instead_of".into()),
+                });
+                Some(text)
+            } else {
+                None
             }
-        }
-
-        let has_error = issues.iter().any(|i| i.severity == "error");
-        let message = if !issues.is_empty() {
-            let mut sorted: Vec<&str> = issues.iter().map(|i| i.text.as_str()).collect();
-            sorted.sort();
-            Some(sorted.join("; "))
-        } else {
-            display_message
-        };
+        });
 
         Ok(ValidateCodeResponse {
-            result: !has_error,
+            result: message.is_none() || lenient,
             message,
             display,
-            system: Some(system.clone()),
-            cs_version: resolved_cs_version.or(cs_version_for_msg(&client, &system).await),
-            inactive: if is_inactive { Some(true) } else { None },
+            system: None,
+            cs_version: resolved_cs_version,
+            inactive: None,
             issues,
             caused_by_unknown_system: None,
             concept_status: None,
-            normalized_code,
+            normalized_code: None,
         })
     }
 
@@ -699,14 +452,22 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         )
         .await?;
 
-        find_concept(&client, &system_id, &req.code_a).await?;
-        find_concept(&client, &system_id, &req.code_b).await?;
+        // Both concept checks and both closure directions go out together
+        // (pipelined on the one connection); the errors keep SQLite's order
+        // (code A reported first).
+        let (found_a, found_b, (a_over_b, b_over_a)) = futures::join!(
+            find_concept(&client, &system_id, &req.code_a),
+            find_concept(&client, &system_id, &req.code_b),
+            closure_relation(&client, &system_id, &req.code_a, &req.code_b),
+        );
+        found_a?;
+        found_b?;
 
         let outcome = if req.code_a == req.code_b {
             SubsumptionOutcome::Equivalent
-        } else if check_ancestor(&client, &system_id, &req.code_a, &req.code_b).await? {
+        } else if a_over_b? {
             SubsumptionOutcome::Subsumes
-        } else if check_ancestor(&client, &system_id, &req.code_b, &req.code_a).await? {
+        } else if b_over_a? {
             SubsumptionOutcome::SubsumedBy
         } else {
             SubsumptionOutcome::NotSubsumed
@@ -732,6 +493,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // `overload/validate-bad-unknown` fixture pins the latest version
         // in the response — sort DESC and LIMIT 1. Mirrors
         // sqlite/code_system.rs:651-655.
+        if let Some(v) = self
+            .meta
+            .latest_version
+            .read()
+            .ok()
+            .and_then(|g| g.get(url).cloned())
+        {
+            return Ok(v);
+        }
         let client = self
             .pool
             .get()
@@ -742,10 +512,19 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let row = client
-            .query_opt(&sql, &[&url])
+            .cq_opt(&sql, &[&url])
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+        let v = row.and_then(|r| r.get::<_, Option<String>>(0));
+        if let Ok(mut w) = self.meta.latest_version.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                url.to_owned(),
+                v.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(v)
     }
 
     /// Existence-only check that skips reading the row's `resource_json`
@@ -762,7 +541,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let row = client
-            .query_one(
+            .cq_one(
                 "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
                 &[&url],
             )
@@ -776,6 +555,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         url: &str,
     ) -> Result<Option<String>, HtsError> {
+        if let Some(v) = self
+            .meta
+            .cs_language
+            .read()
+            .ok()
+            .and_then(|g| g.get(url).cloned())
+        {
+            return Ok(v);
+        }
         let client = self
             .pool
             .get()
@@ -787,10 +575,19 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let row = client
-            .query_opt(&sql, &[&url])
+            .cq_opt(&sql, &[&url])
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+        let lang = row.and_then(|r| r.get::<_, Option<String>>(0));
+        if let Ok(mut w) = self.meta.cs_language.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                url.to_owned(),
+                lang.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(lang)
     }
 
     async fn code_system_is_hierarchical(
@@ -808,7 +605,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // one materialised parent/child edge. `$2 IS NULL` lets an unpinned
         // request match any version of the URL.
         let row = client
-            .query_opt(
+            .cq_opt(
                 "SELECT 1 FROM code_systems s \
                  JOIN concept_hierarchy h ON h.system_id = s.id \
                  WHERE s.url = $1 \
@@ -836,15 +633,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let ids = self.system_ids_for_url(&client, system_url).await?;
         let rows = client
-            .query(
+            .cq(
                 "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value
-                 FROM concept_designations cd
-                 JOIN concepts c ON c.id = cd.concept_id
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = $1
-                   AND c.code = ANY($2)",
-                &[&system_url, &codes],
+                 FROM concepts c
+                 JOIN concept_designations cd ON cd.concept_id = c.id
+                 WHERE c.system_id = ANY($1::text[])
+                   AND c.code = ANY($2::text[])
+                 ORDER BY cd.id",
+                &[&ids, &codes],
             )
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -878,16 +676,17 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let ids = self.system_ids_for_url(&client, system_url).await?;
         let rows = client
-            .query(
+            .cq(
                 "SELECT c.code, cp.property, cp.value
-                 FROM concept_properties cp
-                 JOIN concepts c ON c.id = cp.concept_id
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = $1
-                   AND c.code = ANY($2)
-                   AND cp.property = ANY($3)",
-                &[&system_url, &codes, &properties],
+                 FROM concepts c
+                 JOIN concept_properties cp ON cp.concept_id = c.id
+                 WHERE c.system_id = ANY($1::text[])
+                   AND c.code = ANY($2::text[])
+                   AND cp.property = ANY($3::text[])
+                 ORDER BY cp.id",
+                &[&ids, &codes, &properties],
             )
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -908,14 +707,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // sqlite/code_system.rs:899-942.
         if properties.iter().any(|p| p == "definition") {
             let def_rows = client
-                .query(
+                .cq(
                     "SELECT c.code, c.definition
                        FROM concepts c
-                       JOIN code_systems s ON s.id = c.system_id
-                      WHERE s.url = $1
-                        AND c.code = ANY($2)
+                      WHERE c.system_id = ANY($1::text[])
+                        AND c.code = ANY($2::text[])
                         AND c.definition IS NOT NULL",
-                    &[&system_url, &codes],
+                    &[&ids, &codes],
                 )
                 .await
                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -954,11 +752,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // → local-code mapping when available; always fall back to the
         // canonical name so a CS that never declares property[] still
         // reports correctly. Mirrors sqlite/code_system.rs:980-1012.
-        let abstract_codes = cs_property_local_codes(&client, system_url, "notSelectable").await;
-        let inactive_codes = cs_property_local_codes(&client, system_url, "inactive").await;
+        let abstract_codes =
+            cs_property_local_codes(&client, &self.meta, system_url, "notSelectable").await;
+        let inactive_codes =
+            cs_property_local_codes(&client, &self.meta, system_url, "inactive").await;
 
         let rows = client
-            .query(
+            .cq(
                 "SELECT c.code, cp.property, cp.value
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
@@ -1011,86 +811,14 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
     async fn search(
         &self,
         _ctx: &TenantContext,
-        mut query: ResourceSearchQuery,
+        query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let string_search = crate::string_search::ResourceStringSearch::new(&query);
-        if string_search.is_empty() {
-            query.name = None;
-            query.title = None;
-        }
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        if !string_search.is_empty() {
-            return super::search_resources(
-                &mut client,
-                "code_systems",
-                "CodeSystem",
-                query,
-                string_search,
-            )
-            .await;
-        }
-
-        let limit = i64::from(query.count.unwrap_or(20));
-        let offset = i64::from(query.offset.unwrap_or(0));
-
-        let rows = client
-            .query(
-                "SELECT id, url, version, name, title, status, resource_json
-                 FROM code_systems
-                 WHERE ($1::text IS NULL OR url = $1)
-                   AND ($2::text IS NULL OR version = $2)
-                   AND ($3::text IS NULL OR name = $3)
-                   AND ($4::text IS NULL OR title = $4)
-                   AND ($5::text IS NULL OR status = $5)
-                 ORDER BY created_at
-                 LIMIT $6 OFFSET $7",
-                &[
-                    &query.url,
-                    &query.version,
-                    &query.name,
-                    &query.title,
-                    &query.status,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get(0);
-            let url: String = row.get(1);
-            let version: Option<String> = row.get(2);
-            let name: Option<String> = row.get(3);
-            let title: Option<String> = row.get(4);
-            let status: String = row.get(5);
-            let resource_json: Option<serde_json::Value> = row.get(6);
-
-            let mut resource = resource_json.unwrap_or_else(|| {
-                build_synthetic_resource(
-                    "CodeSystem",
-                    &id,
-                    &url,
-                    version.as_deref(),
-                    name.as_deref(),
-                    title.as_deref(),
-                    &status,
-                )
-            });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-            }
-            results.push(resource);
-        }
-        Ok(results)
+        super::search_table(&mut client, "code_systems", "CodeSystem", query, true).await
     }
 
     async fn concept_resource_entries(
@@ -1108,6 +836,21 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
+        // The codes the stored JSON carries are memoised per URL: most
+        // large systems are stored without an inline concept[] tree, and a
+        // request for a code the tree lacks needs no read at all.
+        let known = self
+            .meta
+            .json_concept_codes
+            .read()
+            .ok()
+            .and_then(|g| g.get(system_url).cloned());
+        if let Some(known) = &known
+            && !codes.iter().any(|c| known.contains(c))
+        {
+            return Ok(std::collections::HashMap::new());
+        }
+
         // Read the base CodeSystem's resource_json (highest version), then
         // walk concept[] picking entries whose code is in the requested set.
         // Mirrors sqlite/code_system.rs:1436-1475.
@@ -1118,16 +861,29 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let row = client
-            .query_opt(&sql, &[&system_url])
+            .cq_opt(&sql, &[&system_url])
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
-        if let Some(r) = row
-            && let Some(v) = r.get::<_, Option<serde_json::Value>>(0)
-        {
-            walk_concepts(&v, codes, &mut out);
+        let json = row.and_then(|r| r.get::<_, Option<serde_json::Value>>(0));
+        if let Some(v) = &json {
+            walk_concepts(v, codes, &mut out);
+        }
+        if known.is_none() {
+            let mut all = std::collections::HashSet::new();
+            if let Some(v) = &json {
+                collect_concept_codes(v, &mut all);
+            }
+            if let Ok(mut w) = self.meta.json_concept_codes.write() {
+                crate::backends::bounded_cache_insert(
+                    &mut *w,
+                    system_url.to_owned(),
+                    Arc::new(all),
+                    super::PG_META_CACHE_MAX,
+                );
+            }
         }
         Ok(out)
     }
@@ -1149,7 +905,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
 
         // Mirrors sqlite/code_system.rs:1477-1532.
         let rows = client
-            .query(
+            .cq(
                 "SELECT resource_json FROM code_systems
                  WHERE url = ANY($1) AND content = 'supplement'",
                 &[&supplement_urls],
@@ -1181,41 +937,25 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // Supplements live in the same code_systems table as any other CS;
         // distinguishing field is `content='supplement'` and a `supplements`
         // pointer in resource_json. Mirrors sqlite/code_system.rs:1208-1259.
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        let sql = format!(
-            "SELECT content, version, resource_json->>'supplements' \
-             FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY {} LIMIT 1",
-            crate::backends::cs_precedence_order_by("code_systems")
-        );
-        let row = client
-            .query_opt(&sql, &[&supplement_url])
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let Some(r) = row else { return Ok(None) };
-        let content: String = r.get(0);
-        if content != "supplement" {
-            return Ok(None);
+        if let Some(v) = self
+            .meta
+            .supplement_target
+            .read()
+            .ok()
+            .and_then(|g| g.get(supplement_url).cloned())
+        {
+            return Ok(v);
         }
-        let version: Option<String> = r.get(1);
-        let target: Option<String> = r.get(2);
-        let Some(target_url) = target else {
-            return Ok(None);
-        };
-        let supplement_canonical = match version {
-            Some(v) => format!("{supplement_url}|{v}"),
-            None => supplement_url.to_owned(),
-        };
-        Ok(Some(SupplementInfo {
-            target_url,
-            supplement_canonical,
-        }))
+        let v = self.supplement_target_uncached(supplement_url).await?;
+        if let Ok(mut w) = self.meta.supplement_target.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                supplement_url.to_owned(),
+                v.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(v)
     }
 
     async fn supplements_for_system(
@@ -1223,44 +963,25 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         system_url: &str,
     ) -> Result<Vec<SupplementInfo>, HtsError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        // Mirrors the SQLite twin: bare or `|version`-qualified target match,
-        // one row per supplement URL in precedence order.
-        let sql = format!(
-            "SELECT url, version FROM code_systems \
-             WHERE content = 'supplement' \
-               AND ((resource_json->>'supplements') = $1 \
-                    OR (resource_json->>'supplements') LIKE $1 || '|%') \
-             ORDER BY url, {}",
-            crate::backends::cs_precedence_order_by("code_systems")
-        );
-        let rows = client
-            .query(&sql, &[&system_url])
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let mut out: Vec<SupplementInfo> = Vec::new();
-        for r in rows {
-            let url: String = r.get(0);
-            let version: Option<String> = r.get(1);
-            if out
-                .iter()
-                .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
-            {
-                continue;
-            }
-            out.push(SupplementInfo {
-                target_url: system_url.to_owned(),
-                supplement_canonical: match version {
-                    Some(v) => format!("{url}|{v}"),
-                    None => url,
-                },
-            });
+        if let Some(hit) = self
+            .meta
+            .supplements
+            .read()
+            .ok()
+            .and_then(|g| g.get(system_url).cloned())
+        {
+            return Ok(hit);
         }
-        Ok(out)
+        let found = self.supplements_for_system_uncached(system_url).await?;
+        if let Ok(mut w) = self.meta.supplements.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                system_url.to_owned(),
+                found.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(found)
     }
 
     async fn supplement_designations(
@@ -1278,42 +999,45 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
-        // Mirrors sqlite/code_system.rs:1261-1345.
+        // Mirrors sqlite/code_system.rs:1261-1345. The supplement rows are
+        // resolved once (memo), so the per-request query is a two-table
+        // point lookup.
+        let systems = self
+            .supplement_systems_with_codes(&client, supplement_urls, codes)
+            .await?;
+        if systems.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids: Vec<&str> = systems.iter().map(|(id, _)| id.as_str()).collect();
         let rows = client
-            .query(
-                "SELECT c.code, cd.language, cd.use_system, cd.use_code, cd.value,
-                        s.url, s.version
-                   FROM concept_designations cd
-                   JOIN concepts c ON c.id = cd.concept_id
-                   JOIN code_systems s ON s.id = c.system_id
-                  WHERE s.url = ANY($1)
-                    AND s.content = 'supplement'
-                    AND c.code = ANY($2)",
-                &[&supplement_urls, &codes],
+            .cq(
+                "SELECT c.system_id, c.code, cd.language, cd.use_system, cd.use_code, cd.value
+                   FROM concepts c
+                   JOIN concept_designations cd ON cd.concept_id = c.id
+                  WHERE c.system_id = ANY($1::text[]) AND c.code = ANY($2::text[])
+                  ORDER BY cd.id",
+                &[&ids, &codes],
             )
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let source_of = |sid: &str| {
+            systems
+                .iter()
+                .find(|(id, _)| id == sid)
+                .map(|(_, src)| src.clone())
+        };
 
         let mut out: std::collections::HashMap<String, Vec<ConceptDesignation>> =
             std::collections::HashMap::new();
         for row in rows {
-            let code: String = row.get(0);
-            let language: Option<String> = row.get(1);
-            let use_system: Option<String> = row.get(2);
-            let use_code: Option<String> = row.get(3);
-            let value: String = row.get(4);
-            let supp_url: String = row.get(5);
-            let supp_ver: Option<String> = row.get(6);
-            let source = match supp_ver {
-                Some(v) => format!("{supp_url}|{v}"),
-                None => supp_url,
-            };
+            let sid: String = row.get(0);
+            let code: String = row.get(1);
             out.entry(code).or_default().push(ConceptDesignation {
-                language,
-                use_system,
-                use_code,
-                value,
-                source: Some(source),
+                language: row.get(2),
+                use_system: row.get(3),
+                use_code: row.get(4),
+                value: row.get(5),
+                source: source_of(&sid),
             });
         }
         Ok(out)
@@ -1337,37 +1061,25 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
 
         // Empty `properties` slice = "every property" (lookup wildcard mode).
         // Mirrors sqlite/code_system.rs:1347-1434.
-        let want_all_props = properties.is_empty();
-        let rows = if want_all_props {
-            client
-                .query(
-                    "SELECT c.code, cp.property, cp.value
-                       FROM concept_properties cp
-                       JOIN concepts c ON c.id = cp.concept_id
-                       JOIN code_systems s ON s.id = c.system_id
-                      WHERE s.url = ANY($1)
-                        AND s.content = 'supplement'
-                        AND c.code = ANY($2)",
-                    &[&supplement_urls, &codes],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-        } else {
-            client
-                .query(
-                    "SELECT c.code, cp.property, cp.value
-                       FROM concept_properties cp
-                       JOIN concepts c ON c.id = cp.concept_id
-                       JOIN code_systems s ON s.id = c.system_id
-                      WHERE s.url = ANY($1)
-                        AND s.content = 'supplement'
-                        AND c.code = ANY($2)
-                        AND cp.property = ANY($3)",
-                    &[&supplement_urls, &codes, &properties],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-        };
+        let systems = self
+            .supplement_systems_with_codes(&client, supplement_urls, codes)
+            .await?;
+        if systems.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids: Vec<&str> = systems.iter().map(|(id, _)| id.as_str()).collect();
+        let rows = client
+            .cq(
+                "SELECT c.code, cp.property, cp.value
+                   FROM concepts c
+                   JOIN concept_properties cp ON cp.concept_id = c.id
+                  WHERE c.system_id = ANY($1::text[]) AND c.code = ANY($2::text[])
+                    AND (cardinality($3::text[]) = 0 OR cp.property = ANY($3::text[]))
+                  ORDER BY cp.id",
+                &[&ids, &codes, &properties],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
@@ -1406,6 +1118,22 @@ fn walk_concepts(
     }
 }
 
+/// Every `code` in a CodeSystem JSON's (nested) `concept[]` tree.
+fn collect_concept_codes(
+    resource: &serde_json::Value,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let Some(concepts) = resource.get("concept").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for c in concepts {
+        if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
+            out.insert(code.to_string());
+        }
+        collect_concept_codes(c, out);
+    }
+}
+
 // ── Private DB helpers ─────────────────────────────────────────────────────────
 
 /// Resolve a code system by URL, optional version, and optional date.
@@ -1421,12 +1149,9 @@ fn walk_concepts(
 /// Keyed on `id`, never on `url`: a canonical URL can have several rows, and the
 /// caller has already chosen one. Re-deriving it from the URL is how the two
 /// backends drifted apart.
-async fn cs_content_for_system_id(
-    client: &tokio_postgres::Client,
-    system_id: &str,
-) -> Option<String> {
+async fn cs_content_for_system_id(client: &super::PgClient, system_id: &str) -> Option<String> {
     client
-        .query_opt(
+        .cq_opt(
             "SELECT content FROM code_systems WHERE id = $1",
             &[&system_id],
         )
@@ -1437,7 +1162,7 @@ async fn cs_content_for_system_id(
 }
 
 async fn resolve_code_system(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
@@ -1453,7 +1178,7 @@ async fn resolve_code_system(
         crate::backends::cs_precedence_order_by("code_systems")
     );
     let rows = client
-        .query(&sql, &[&url, &date])
+        .cq(&sql, &[&url, &date])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -1514,150 +1239,43 @@ fn version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
         .all(|(p, a)| *p == "x" || *p == *a)
 }
 
-/// A concept row resolved for `$validate-code` purposes — carries the literal
-/// stored code so case-insensitive matches can echo the canonical form back to
-/// the caller via `normalized_code`.
-struct ValidateConcept {
-    code: String,
-    display: Option<String>,
-}
-
-/// Look up a concept scoped to a specific CS row (`system_id`) by literal
-/// code. Use this when the caller has pinned a CS version and we need to
-/// confirm the code exists in *that* row, not just somewhere under the URL.
-async fn find_concept_by_system_id(
-    client: &tokio_postgres::Client,
-    system_id: &str,
-    code: &str,
-) -> Option<ValidateConcept> {
-    let row = client
-        .query_opt(
-            "SELECT code, display FROM concepts
-             WHERE system_id = $1 AND code = $2 LIMIT 1",
-            &[&system_id, &code],
-        )
-        .await
-        .ok()
-        .flatten()?;
-    Some(ValidateConcept {
-        code: row.get(0),
-        display: row.get(1),
-    })
-}
-
-/// Case-insensitive variant of [`find_concept_by_system_id`]. Only called when
-/// the CodeSystem has `caseSensitive: false`.
-async fn find_concept_by_system_id_ci(
-    client: &tokio_postgres::Client,
-    system_id: &str,
-    code: &str,
-) -> Option<ValidateConcept> {
-    let row = client
-        .query_opt(
-            "SELECT code, display FROM concepts
-             WHERE system_id = $1 AND LOWER(code) = LOWER($2) LIMIT 1",
-            &[&system_id, &code],
-        )
-        .await
-        .ok()
-        .flatten()?;
-    Some(ValidateConcept {
-        code: row.get(0),
-        display: row.get(1),
-    })
-}
-
-/// Look up a concept by CodeSystem URL + literal code. Walks all CS rows that
-/// share `system_url` (handles URLs with multiple stored versions), preferring
-/// the row whose `version` sorts highest.
-async fn find_concept_by_url(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-    code: &str,
-) -> Option<ValidateConcept> {
-    let sql = format!(
-        "SELECT c.code, c.display FROM concepts c \
-         JOIN code_systems s ON s.id = c.system_id \
-         WHERE s.url = $1 AND c.code = $2 \
-         ORDER BY {} LIMIT 1",
-        crate::backends::cs_precedence_order_by("s")
-    );
-    let row = client
-        .query_opt(&sql, &[&system_url, &code])
-        .await
-        .ok()
-        .flatten()?;
-    Some(ValidateConcept {
-        code: row.get(0),
-        display: row.get(1),
-    })
-}
-
-/// Case-insensitive variant of [`find_concept_by_url`]. Only called when the
-/// CodeSystem has `caseSensitive: false` — returns the canonical (stored)
-/// code so the caller can populate `normalized_code` when it differs from
-/// the request.
-async fn find_concept_by_url_ci(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-    code: &str,
-) -> Option<ValidateConcept> {
-    let sql = format!(
-        "SELECT c.code, c.display FROM concepts c \
-         JOIN code_systems s ON s.id = c.system_id \
-         WHERE s.url = $1 AND LOWER(c.code) = LOWER($2) \
-         ORDER BY {} LIMIT 1",
-        crate::backends::cs_precedence_order_by("s")
-    );
-    let row = client
-        .query_opt(&sql, &[&system_url, &code])
-        .await
-        .ok()
-        .flatten()?;
-    Some(ValidateConcept {
-        code: row.get(0),
-        display: row.get(1),
-    })
-}
-
 /// Look up a concept row by `(system_id, code)`.
 ///
 /// Returns `(concept_id, display, definition)`.
 async fn find_concept(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_id: &str,
     code: &str,
 ) -> Result<(i64, Option<String>, Option<String>), HtsError> {
-    let rows = client
-        .query(
-            "SELECT id, display, definition FROM concepts
-             WHERE system_id = $1 AND code = $2",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("Concept not found: {code}")))?;
+    let row = super::query_text_opt(
+        client,
+        "SELECT id, display, definition FROM concepts
+         WHERE system_id = $1 AND code = $2",
+        &[&system_id, &code],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+    .ok_or_else(|| HtsError::NotFound(format!("Concept not found: {code}")))?;
 
     Ok((row.get(0), row.get(1), row.get(2)))
 }
 
 /// Fetch all properties for a concept.
 async fn fetch_properties(
-    client: &tokio_postgres::Client,
-    concept_id: i64,
+    client: &super::PgClient,
+    system_id: &str,
+    code: &str,
 ) -> Result<Vec<PropertyValue>, HtsError> {
-    let rows = client
-        .query(
-            "SELECT property, value_type, value
-             FROM concept_properties WHERE concept_id = $1 ORDER BY property",
-            &[&concept_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    let rows = super::query_text(
+        client,
+        "SELECT p.property, p.value_type, p.value
+           FROM concepts c JOIN concept_properties p ON p.concept_id = c.id
+          WHERE c.system_id = $1 AND c.code = $2
+          ORDER BY p.property, p.id",
+        &[&system_id, &code],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -1670,79 +1288,47 @@ async fn fetch_properties(
         .collect())
 }
 
-/// Synthesise hierarchy- and status-derived properties for `$lookup`.
-///
-/// Mirrors the SQLite backend implementation — see
-/// [`super::super::sqlite::code_system::fetch_synthesised_properties`] for
-/// rationale.
-async fn fetch_synthesised_properties(
-    client: &tokio_postgres::Client,
+/// Raw rows behind the synthesised `$lookup` properties: parent edges, child
+/// edges (each with the related concept's display) and whether a `status`
+/// property marks the concept inactive — three queries issued concurrently.
+async fn fetch_synthesised_rows(
+    client: &super::PgClient,
     system_id: &str,
     code: &str,
-    stored: &[PropertyValue],
-) -> Result<Vec<PropertyValue>, HtsError> {
-    let mut out = Vec::new();
-
-    // Parents — synthesised from concept_hierarchy. Skip when the concept
-    // already carries explicit `parent` properties (the bundle importer
-    // mirrors `parent` properties into concept_hierarchy, so synthesising
-    // here would duplicate every stored parent edge).
-    let stored_parent_codes: std::collections::HashSet<&str> = stored
-        .iter()
-        .filter(|p| p.code == "parent")
-        .map(|p| p.value.as_str())
-        .collect();
-    let parent_rows = client
-        .query(
-            "SELECT h.parent_code, c.display
-             FROM concept_hierarchy h
-             LEFT JOIN concepts c
-                    ON c.system_id = h.system_id AND c.code = h.parent_code
-             WHERE h.system_id = $1 AND h.child_code = $2
-             ORDER BY h.parent_code",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    for row in parent_rows {
-        let parent_code: String = row.get(0);
-        if stored_parent_codes.contains(parent_code.as_str()) {
-            continue;
-        }
-        out.push(PropertyValue {
-            code: "parent".into(),
-            value_type: "code".into(),
-            value: parent_code,
-            description: row.get(1),
-        });
-    }
-
-    // Children.
-    let child_rows = client
-        .query(
-            "SELECT h.child_code, c.display
-             FROM concept_hierarchy h
-             LEFT JOIN concepts c
-                    ON c.system_id = h.system_id AND c.code = h.child_code
-             WHERE h.system_id = $1 AND h.parent_code = $2
-             ORDER BY h.child_code",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    for row in child_rows {
-        out.push(PropertyValue {
-            code: "child".into(),
-            value_type: "code".into(),
-            value: row.get(0),
-            description: row.get(1),
-        });
-    }
-
-    // Inactive flag (only when not already stored explicitly).
-    if !stored.iter().any(|p| p.code == "inactive") {
-        let row = client
-            .query_one(
+) -> Result<SynthRows, HtsError> {
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let (parents, children, inactive) = futures::try_join!(
+        async {
+            super::query_text(
+                client,
+                "SELECT h.parent_code, c.display
+                     FROM concept_hierarchy h
+                     LEFT JOIN concepts c
+                            ON c.system_id = h.system_id AND c.code = h.parent_code
+                     WHERE h.system_id = $1 AND h.child_code = $2
+                     ORDER BY h.parent_code",
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(db)
+        },
+        async {
+            super::query_text(
+                client,
+                "SELECT h.child_code, c.display
+                     FROM concept_hierarchy h
+                     LEFT JOIN concepts c
+                            ON c.system_id = h.system_id AND c.code = h.child_code
+                     WHERE h.system_id = $1 AND h.parent_code = $2
+                     ORDER BY h.child_code",
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(db)
+        },
+        async {
+            super::query_text(
+                client,
                 "SELECT EXISTS (
                      SELECT 1 FROM concept_properties cp
                      JOIN concepts c ON c.id = cp.concept_id
@@ -1754,32 +1340,80 @@ async fn fetch_synthesised_properties(
                 &[&system_id, &code],
             )
             .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let inactive: bool = row.get(0);
+            .map(|rows| rows.first().is_some_and(|r| r.get::<_, bool>(0)))
+            .map_err(db)
+        }
+    )?;
+    Ok(SynthRows {
+        parents: parents.into_iter().map(|r| (r.get(0), r.get(1))).collect(),
+        children: children.into_iter().map(|r| (r.get(0), r.get(1))).collect(),
+        inactive,
+    })
+}
+
+struct SynthRows {
+    parents: Vec<(String, Option<String>)>,
+    children: Vec<(String, Option<String>)>,
+    inactive: bool,
+}
+
+/// Synthesise hierarchy- and status-derived properties for `$lookup` from
+/// [`fetch_synthesised_rows`]: parents not already stored as explicit
+/// `parent` properties, children, and `inactive` unless stored explicitly.
+/// Mirrors the SQLite backend.
+fn build_synthesised_properties(rows: SynthRows, stored: &[PropertyValue]) -> Vec<PropertyValue> {
+    let stored_parent_codes: std::collections::HashSet<&str> = stored
+        .iter()
+        .filter(|p| p.code == "parent")
+        .map(|p| p.value.as_str())
+        .collect();
+    let mut out = Vec::new();
+    for (parent_code, display) in rows.parents {
+        if stored_parent_codes.contains(parent_code.as_str()) {
+            continue;
+        }
+        out.push(PropertyValue {
+            code: "parent".into(),
+            value_type: "code".into(),
+            value: parent_code,
+            description: display,
+        });
+    }
+    for (child_code, display) in rows.children {
+        out.push(PropertyValue {
+            code: "child".into(),
+            value_type: "code".into(),
+            value: child_code,
+            description: display,
+        });
+    }
+    if !stored.iter().any(|p| p.code == "inactive") {
         out.push(PropertyValue {
             code: "inactive".into(),
             value_type: "boolean".into(),
-            value: inactive.to_string(),
+            value: rows.inactive.to_string(),
             description: None,
         });
     }
-
-    Ok(out)
+    out
 }
 
 /// Fetch all designations for a concept.
 async fn fetch_designations(
-    client: &tokio_postgres::Client,
-    concept_id: i64,
+    client: &super::PgClient,
+    system_id: &str,
+    code: &str,
 ) -> Result<Vec<DesignationValue>, HtsError> {
-    let rows = client
-        .query(
-            "SELECT language, use_system, use_code, value
-             FROM concept_designations WHERE concept_id = $1",
-            &[&concept_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    let rows = super::query_text(
+        client,
+        "SELECT d.language, d.use_system, d.use_code, d.value
+           FROM concepts c JOIN concept_designations d ON d.concept_id = c.id
+          WHERE c.system_id = $1 AND c.code = $2
+          ORDER BY d.id",
+        &[&system_id, &code],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -1799,7 +1433,7 @@ async fn fetch_designations(
 /// that has any (insertion order within that version is preserved so
 /// preferred terms stay first).
 async fn fetch_designations_cross_version(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     url: &str,
     code: &str,
     exclude_system_id: &str,
@@ -1815,7 +1449,7 @@ async fn fetch_designations_cross_version(
         crate::backends::cs_precedence_order_by("s")
     );
     let rows = client
-        .query(&sql, &[&url, &code, &exclude_system_id])
+        .cq(&sql, &[&url, &code, &exclude_system_id])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -1842,34 +1476,82 @@ async fn fetch_designations_cross_version(
         .collect())
 }
 
-/// Return `true` if `ancestor_code` is a (possibly indirect) ancestor of
-/// `descendant_code` within the given code system.
-///
-/// Uses a recursive CTE to walk up the parent chain.
-pub(super) async fn check_ancestor(
-    client: &tokio_postgres::Client,
+/// `(a is an ancestor of b, b is an ancestor of a)` from one closure query —
+/// primary-key probes, as SQLite answers `$subsumes`. Only for a concept whose
+/// closure is not built yet (no self-link) is the hierarchy walked instead.
+async fn closure_relation(
+    client: &super::PgClient,
+    system_id: &str,
+    code_a: &str,
+    code_b: &str,
+) -> (Result<bool, HtsError>, Result<bool, HtsError>) {
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let row = match super::query_text_opt(
+        client,
+        "SELECT EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $3),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $2),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $3),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $2)",
+        &[&system_id, &code_a, &code_b],
+    )
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return (Ok(false), Ok(false)),
+        Err(e) => {
+            let msg = error_chain(&e);
+            return (
+                Err(HtsError::StorageError(msg.clone())),
+                Err(HtsError::StorageError(msg)),
+            );
+        }
+    };
+    let (a_b, b_a, b_built, a_built): (bool, bool, bool, bool) =
+        (row.get(0), row.get(1), row.get(2), row.get(3));
+    let a_over_b = if a_b || b_built {
+        Ok(a_b)
+    } else {
+        hierarchy_ancestor(client, system_id, code_a, code_b)
+            .await
+            .map_err(db)
+    };
+    let b_over_a = if b_a || a_built {
+        Ok(b_a)
+    } else {
+        hierarchy_ancestor(client, system_id, code_b, code_a)
+            .await
+            .map_err(db)
+    };
+    (a_over_b, b_over_a)
+}
+
+/// Recursive walk of `concept_hierarchy` (closure not built yet).
+async fn hierarchy_ancestor(
+    client: &super::PgClient,
     system_id: &str,
     ancestor_code: &str,
     descendant_code: &str,
-) -> Result<bool, HtsError> {
-    let rows = client
-        .query(
-            "WITH RECURSIVE ancestors(code) AS (
-                 SELECT parent_code
-                 FROM   concept_hierarchy
-                 WHERE  system_id = $1 AND child_code = $3
-                 UNION
-                 SELECT h.parent_code
-                 FROM   concept_hierarchy h
-                 INNER JOIN ancestors a ON a.code = h.child_code
-                 WHERE  h.system_id = $1
-             )
-             SELECT 1 FROM ancestors WHERE code = $2 LIMIT 1",
-            &[&system_id, &ancestor_code, &descendant_code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
+) -> Result<bool, tokio_postgres::Error> {
+    let rows = super::query_text(
+        client,
+        "WITH RECURSIVE ancestors(code) AS (
+             SELECT parent_code
+             FROM   concept_hierarchy
+             WHERE  system_id = $1 AND child_code = $3
+             UNION
+             SELECT h.parent_code
+             FROM   concept_hierarchy h
+             INNER JOIN ancestors a ON a.code = h.child_code
+             WHERE  h.system_id = $1
+         )
+         SELECT 1 FROM ancestors WHERE code = $2 LIMIT 1",
+        &[&system_id, &ancestor_code, &descendant_code],
+    )
+    .await?;
     Ok(!rows.is_empty())
 }
 
@@ -1899,4 +1581,232 @@ pub(super) fn build_synthetic_resource(
         obj["title"] = t.into();
     }
     obj
+}
+
+impl PostgresTerminologyBackend {
+    /// `supplements_for_system` without the memo.
+    async fn supplements_for_system_uncached(
+        &self,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        // Mirrors the SQLite twin: bare or `|version`-qualified target match,
+        // one row per supplement URL in precedence order.
+        let sql = format!(
+            "SELECT url, version FROM code_systems \
+             WHERE content = 'supplement' \
+               AND ((resource_json->>'supplements') = $1 \
+                    OR (resource_json->>'supplements') LIKE $1 || '|%') \
+             ORDER BY url, {}",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        let rows = client
+            .cq(&sql, &[&system_url])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let mut out: Vec<SupplementInfo> = Vec::new();
+        for r in rows {
+            let url: String = r.get(0);
+            let version: Option<String> = r.get(1);
+            if out
+                .iter()
+                .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
+            {
+                continue;
+            }
+            out.push(SupplementInfo {
+                target_url: system_url.to_owned(),
+                supplement_canonical: match version {
+                    Some(v) => format!("{url}|{v}"),
+                    None => url,
+                },
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl PostgresTerminologyBackend {
+    /// Storage ids of every `code_systems` row with this canonical URL
+    /// (memoised; cleared with the other metadata).
+    async fn system_ids_for_url(
+        &self,
+        client: &super::PgClient,
+        url: &str,
+    ) -> Result<Vec<String>, HtsError> {
+        if let Some(v) = self
+            .meta
+            .url_system_ids
+            .read()
+            .ok()
+            .and_then(|g| g.get(url).cloned())
+        {
+            return Ok(v);
+        }
+        let ids: Vec<String> = client
+            .cq("SELECT id FROM code_systems WHERE url = $1", &[&url])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        if let Ok(mut w) = self.meta.url_system_ids.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                url.to_owned(),
+                ids.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(ids)
+    }
+
+    /// [`Self::supplement_systems`] restricted to the supplements that define
+    /// at least one of `codes`. Each supplement's code set is loaded once
+    /// (memo), so a lookup of a code no supplement covers — the common case —
+    /// needs no supplement query at all.
+    async fn supplement_systems_with_codes(
+        &self,
+        client: &super::PgClient,
+        urls: &[String],
+        codes: &[String],
+    ) -> Result<Vec<(String, String)>, HtsError> {
+        let mut out = Vec::new();
+        for (id, src) in self.supplement_systems(client, urls).await? {
+            let cached = self
+                .meta
+                .supplement_codes
+                .read()
+                .ok()
+                .and_then(|g| g.get(&id).cloned());
+            let set = match cached {
+                Some(set) => set,
+                None => {
+                    let set: Arc<std::collections::HashSet<String>> = Arc::new(
+                        client
+                            .cq("SELECT code FROM concepts WHERE system_id = $1", &[&id])
+                            .await
+                            .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+                            .into_iter()
+                            .map(|r| r.get(0))
+                            .collect(),
+                    );
+                    if let Ok(mut w) = self.meta.supplement_codes.write() {
+                        crate::backends::bounded_cache_insert(
+                            &mut *w,
+                            id.clone(),
+                            set.clone(),
+                            super::PG_META_CACHE_MAX,
+                        );
+                    }
+                    set
+                }
+            };
+            if codes.iter().any(|c| set.contains(c)) {
+                out.push((id, src));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(storage id, "url|version")` of the stored supplement CodeSystems
+    /// with the given URLs (memoised; cleared with the other metadata).
+    async fn supplement_systems(
+        &self,
+        client: &super::PgClient,
+        urls: &[String],
+    ) -> Result<Vec<(String, String)>, HtsError> {
+        let mut out = Vec::new();
+        for url in urls {
+            let cached = self
+                .meta
+                .supplement_rows
+                .read()
+                .ok()
+                .and_then(|g| g.get(url).cloned());
+            let rows = match cached {
+                Some(r) => r,
+                None => {
+                    let rows: Vec<(String, String)> = client
+                        .cq(
+                            "SELECT id, url, version FROM code_systems
+                              WHERE url = $1 AND content = 'supplement'",
+                            &[url],
+                        )
+                        .await
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+                        .into_iter()
+                        .map(|r| {
+                            let id: String = r.get(0);
+                            let u: String = r.get(1);
+                            let v: Option<String> = r.get(2);
+                            let src = match v {
+                                Some(v) => format!("{u}|{v}"),
+                                None => u,
+                            };
+                            (id, src)
+                        })
+                        .collect();
+                    if let Ok(mut w) = self.meta.supplement_rows.write() {
+                        crate::backends::bounded_cache_insert(
+                            &mut *w,
+                            url.clone(),
+                            rows.clone(),
+                            super::PG_META_CACHE_MAX,
+                        );
+                    }
+                    rows
+                }
+            };
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+}
+
+impl PostgresTerminologyBackend {
+    async fn supplement_target_uncached(
+        &self,
+        supplement_url: &str,
+    ) -> Result<Option<SupplementInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+
+        let sql = format!(
+            "SELECT content, version, resource_json->>'supplements' \
+             FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        let row = client
+            .cq_opt(&sql, &[&supplement_url])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let Some(r) = row else { return Ok(None) };
+        let content: String = r.get(0);
+        if content != "supplement" {
+            return Ok(None);
+        }
+        let version: Option<String> = r.get(1);
+        let target: Option<String> = r.get(2);
+        let Some(target_url) = target else {
+            return Ok(None);
+        };
+        let supplement_canonical = match version {
+            Some(v) => format!("{supplement_url}|{v}"),
+            None => supplement_url.to_owned(),
+        };
+        Ok(Some(SupplementInfo {
+            target_url,
+            supplement_canonical,
+        }))
+    }
 }

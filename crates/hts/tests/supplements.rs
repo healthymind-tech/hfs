@@ -77,9 +77,9 @@ fn designation_values(body: &Value, lang: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_returns_supplement_designations_without_use_supplement() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&bundle()).await;
 
     let (st, body) = app
@@ -110,9 +110,9 @@ async fn lookup_returns_supplement_designations_without_use_supplement() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_display_language_selects_supplement_translation() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&bundle()).await;
 
     let (st, body) = app
@@ -144,9 +144,9 @@ async fn lookup_display_language_selects_supplement_translation() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_display_language_and_designations_use_supplement() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&bundle()).await;
 
     let (st, body) = app

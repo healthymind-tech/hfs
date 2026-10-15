@@ -61,7 +61,12 @@ async fn start_http_postgres_for_test()
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default().with_tag("16-alpine").start().await {
+        match Postgres::default()
+            .with_tag("16-alpine")
+            .with_cmd(["-c", "fsync=off", "-c", "max_connections=2000"])
+            .start()
+            .await
+        {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
@@ -103,70 +108,170 @@ pub async fn pg_http_url() -> &'static str {
         .await
 }
 
-/// Ensures the HTS + persistence schemas are applied exactly once per test
-/// binary, avoiding concurrent `CREATE EXTENSION` race conditions.
+/// `true` when the generic HTTP tests should run against PostgreSQL:
+/// `HTS_TEST_BACKEND=postgres` (needs the `postgres` feature and Docker, or
+/// `HTS_TEST_PG_URL` pointing at a server the tests may create databases on).
+pub fn pg_mode() -> bool {
+    cfg!(feature = "postgres")
+        && std::env::var("HTS_TEST_BACKEND").is_ok_and(|v| v.eq_ignore_ascii_case("postgres"))
+}
+
+/// Base URL (without database name) of the server the per-test PostgreSQL
+/// databases are created on.
 #[cfg(feature = "postgres")]
-static PG_SCHEMA_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+async fn pg_server_base() -> String {
+    let url = match std::env::var("HTS_TEST_PG_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => pg_http_url().await.to_owned(),
+    };
+    match url.rfind('/') {
+        Some(i) if i > "postgres://".len() => url[..i].to_owned(),
+        _ => url,
+    }
+}
 
 #[cfg(feature = "postgres")]
-async fn ensure_pg_schemas(url: &str) {
-    PG_SCHEMA_INIT
+static PG_TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// Run one statement on the server's maintenance database.
+#[cfg(feature = "postgres")]
+async fn pg_admin_exec(base: &str, sql: &str) -> Result<(), tokio_postgres::Error> {
+    let (client, conn) =
+        tokio_postgres::connect(&format!("{base}/postgres"), tokio_postgres::NoTls).await?;
+    let driver = tokio::spawn(conn);
+    let res = client.batch_execute(sql).await;
+    drop(client);
+    let _ = driver.await;
+    res
+}
+
+/// A fresh database holding the HTS and resource-store schemas, cloned from a
+/// per-process template so each test starts empty and isolated.
+#[cfg(feature = "postgres")]
+pub async fn fresh_pg_database() -> String {
+    let base = pg_server_base().await;
+    let template = PG_TEMPLATE
         .get_or_init(|| async {
             use helios_hts::backends::PostgresTerminologyBackend;
             use helios_persistence::backends::postgres::PostgresBackend;
-
-            // Apply HTS terminology schema.
-            PostgresTerminologyBackend::new(url)
+            let name = format!("hts_tpl_{}", std::process::id());
+            pg_admin_exec(&base, &format!("DROP DATABASE IF EXISTS {name}"))
                 .await
-                .expect("Failed to create PostgresTerminologyBackend (schema init)");
-
-            // Apply persistence resource-store schema.
-            let resource_store = PostgresBackend::from_connection_string(url)
+                .expect("drop stale template");
+            pg_admin_exec(&base, &format!("CREATE DATABASE {name}"))
                 .await
-                .expect("Failed to open PostgreSQL resource store (schema init)");
-            resource_store
-                .init_schema()
-                .await
-                .expect("Failed to initialize PostgreSQL resource store schema (schema init)");
+                .expect("create template database");
+            let url = format!("{base}/{name}");
+            {
+                let backend = PostgresTerminologyBackend::new(&url)
+                    .await
+                    .expect("HTS schema on template");
+                let store = PostgresBackend::from_connection_string(&url)
+                    .await
+                    .expect("resource store on template");
+                store.init_schema().await.expect("resource store schema");
+                backend.pool().close();
+                drop(store);
+            }
+            name
         })
         .await;
+    let db = format!("hts_t_{}", uuid::Uuid::new_v4().simple());
+    // The template must have no open sessions; the ones used to build it may
+    // take a moment to go away.
+    let mut last = None;
+    for _ in 0..100 {
+        match pg_admin_exec(&base, &format!("CREATE DATABASE {db} TEMPLATE {template}")).await {
+            Ok(()) => return format!("{base}/{db}"),
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("could not create test database from template: {last:?}");
 }
 
 /// A lightweight test application that wraps the full HTS Axum router backed
-/// by an isolated in-memory SQLite database.
+/// by an isolated store: an in-memory SQLite database, or — with
+/// `HTS_TEST_BACKEND=postgres` — a fresh PostgreSQL database per instance.
 pub struct TestApp {
     router: Router,
 }
 
 impl TestApp {
-    /// Create a new `TestApp` with a fresh, empty in-memory SQLite store.
-    #[cfg(feature = "sqlite")]
-    pub fn new() -> Self {
-        let backend =
-            SqliteTerminologyBackend::in_memory().expect("failed to create in-memory HTS backend");
-        let state = AppState::new(backend);
-        let config = HtsConfig::default();
-        let router = helios_hts::server::create_app(&config, state);
-        TestApp { router }
+    /// Create a new `TestApp` with a fresh, empty store.
+    pub async fn new() -> Self {
+        #[cfg(feature = "postgres")]
+        if pg_mode() {
+            return Self::new_pg(false).await;
+        }
+        #[cfg(feature = "sqlite")]
+        {
+            let backend = SqliteTerminologyBackend::in_memory()
+                .expect("failed to create in-memory HTS backend");
+            let state = AppState::new(backend);
+            let config = HtsConfig::default();
+            let router = helios_hts::server::create_app(&config, state);
+            TestApp { router }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        panic!("no backend: build with `sqlite`, or set HTS_TEST_BACKEND=postgres")
     }
 
     /// Like [`Self::new`] but wired the way `hts run` wires production: with a
-    /// persistence resource store and the HTS pool, so the REST CRUD
+    /// persistence resource store and the HTS re-index path, so the REST CRUD
     /// endpoints (`POST`/`PUT`/`DELETE /CodeSystem/{id}` …) are live.
-    #[cfg(feature = "sqlite")]
-    pub fn with_resource_store() -> Self {
-        use helios_persistence::backends::sqlite::SqliteBackend;
-        let backend =
-            SqliteTerminologyBackend::in_memory().expect("failed to create in-memory HTS backend");
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().expect("persistence in-memory backend");
-        resource_store
-            .init_schema()
-            .expect("persistence schema init");
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool);
-        let config = HtsConfig::default();
+    pub async fn with_resource_store() -> Self {
+        #[cfg(feature = "postgres")]
+        if pg_mode() {
+            return Self::new_pg(true).await;
+        }
+        #[cfg(feature = "sqlite")]
+        {
+            use helios_persistence::backends::sqlite::SqliteBackend;
+            let backend = SqliteTerminologyBackend::in_memory()
+                .expect("failed to create in-memory HTS backend");
+            let hts_pool = backend.pool().clone();
+            let resource_store = SqliteBackend::in_memory().expect("persistence in-memory backend");
+            resource_store
+                .init_schema()
+                .expect("persistence schema init");
+            let state = AppState::new(backend)
+                .with_resource_store(resource_store)
+                .with_hts_pool(hts_pool);
+            let config = HtsConfig::default();
+            let router = helios_hts::server::create_app(&config, state);
+            TestApp { router }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        panic!("no backend: build with `sqlite`, or set HTS_TEST_BACKEND=postgres")
+    }
+
+    /// A PostgreSQL-backed app on a fresh database, wired like
+    /// `run_server_postgres` (resource store + importer) when `crud` is set.
+    #[cfg(feature = "postgres")]
+    async fn new_pg(crud: bool) -> Self {
+        use helios_hts::backends::PostgresTerminologyBackend;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        let url = fresh_pg_database().await;
+        let backend = PostgresTerminologyBackend::new(&url)
+            .await
+            .expect("Failed to create PostgresTerminologyBackend");
+        let mut state = PgAppState::new(backend.clone());
+        if crud {
+            let resource_store = PostgresBackend::from_connection_string(&url)
+                .await
+                .expect("Failed to open PostgreSQL resource store");
+            state = state
+                .with_resource_store_pg(resource_store)
+                .with_terminology_importer(std::sync::Arc::new(backend));
+        }
+        let config = PgHtsConfig {
+            storage_backend: "postgres".into(),
+            database_url: url,
+            ..PgHtsConfig::default()
+        };
         let router = helios_hts::server::create_app(&config, state);
         TestApp { router }
     }
@@ -364,30 +469,26 @@ pub fn build_params(entries: &[(&str, &str, &str)]) -> String {
 /// PostgreSQL instance (via testcontainers).
 ///
 /// Uses the same `pg_http_url()` shared container so all `TestAppPg` instances
-/// within a single test binary share one Docker container.
-///
-/// Because each `TestAppPg` connects to the *same* database, tests that write
-/// data should use unique resource URLs to avoid cross-test interference.
+/// within a single test binary share one Docker container, but each instance
+/// gets its own database (see [`fresh_pg_database`]): tests importing the
+/// same fixtures concurrently would otherwise replace each other's rows
+/// between a search and the request that uses its result.
 #[cfg(feature = "postgres")]
 pub struct TestAppPg {
     router: Router,
+    url: String,
 }
 
 #[cfg(feature = "postgres")]
 impl TestAppPg {
-    /// Create a new `TestAppPg` wired to the shared PostgreSQL container.
-    ///
-    /// Schema initialization (HTS + persistence) is serialized via
-    /// [`ensure_pg_schemas`] so concurrent tests never race on DDL.
+    /// Create a new `TestAppPg` on a fresh database in the shared container.
     pub async fn new() -> Self {
         use helios_hts::backends::PostgresTerminologyBackend;
         use helios_persistence::backends::postgres::PostgresBackend;
         use std::sync::Arc;
 
-        let url = pg_http_url().await;
-
-        // Ensure schemas are applied exactly once (no concurrent DDL races).
-        ensure_pg_schemas(url).await;
+        let db_url = fresh_pg_database().await;
+        let url = db_url.as_str();
 
         let backend = PostgresTerminologyBackend::new(url)
             .await
@@ -403,7 +504,16 @@ impl TestAppPg {
 
         let config = PgHtsConfig::default();
         let router = helios_hts::server::create_app(&config, state);
-        TestAppPg { router }
+        TestAppPg {
+            router,
+            url: db_url,
+        }
+    }
+
+    /// Connection URL of this app's database.
+    #[allow(dead_code)]
+    pub fn database_url(&self) -> &str {
+        &self.url
     }
 
     /// POST a FHIR JSON body to `path`, returning `(status, response_body)`.

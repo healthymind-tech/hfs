@@ -52,9 +52,9 @@ fn issue_severities(body: &Value) -> Vec<String> {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn enumerated_code_validates_true_with_warning_when_system_missing() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&bundle()).await;
 
     // Expansion lists the enumerated codes.

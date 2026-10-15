@@ -1,7 +1,9 @@
 //! Entry point for the `hts` binary.
 
 use clap::Parser;
-use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
+use helios_hts::config::{
+    Cli, Command, HtsConfig, ImportArgs, ImportFormat, MigrateArgs, detect_format,
+};
 use helios_hts::import::dispatch::dispatch_import;
 use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
 use helios_persistence::tenant::TenantContext;
@@ -42,6 +44,17 @@ async fn main() -> anyhow::Result<()> {
             );
             run_server(config).await
         }
+        Command::Migrate(args) => {
+            // Schema DDL replays as NOTICEs that tokio-postgres logs at INFO;
+            // keep them out of the migration log unless asked for explicitly.
+            let filter = if args.log_level.contains('=') {
+                args.log_level.clone()
+            } else {
+                format!("{},tokio_postgres=warn", args.log_level)
+            };
+            helios_observability::telemetry::init("hts", &filter);
+            run_migrate(args).await
+        }
         Command::Import(args) => {
             let log_level = if args.verbose {
                 "debug"
@@ -53,6 +66,54 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
     }
+}
+
+// ── Migrate ───────────────────────────────────────────────────────────────────
+
+#[cfg(all(feature = "sqlite", feature = "postgres"))]
+async fn run_migrate(args: MigrateArgs) -> anyhow::Result<()> {
+    use helios_hts::migrate::{MigrateOptions, migrate_sqlite_to_postgres};
+    let opts = MigrateOptions {
+        from: args.from,
+        to: args.to,
+        replace: args.replace,
+        skip_resources: args.skip_resources,
+        jobs: args.jobs,
+    };
+    let report = migrate_sqlite_to_postgres(&opts).await?;
+    println!(
+        "{:<24} {:>12} {:>12} {:>9}",
+        "table", "source", "copied", "seconds"
+    );
+    for t in &report.tables {
+        println!(
+            "{:<24} {:>12} {:>12} {:>9.1}",
+            t.table, t.source_rows, t.copied_rows, t.seconds
+        );
+    }
+    println!(
+        "resources: {}  NUL chars removed: {}  unparseable JSON: {}  total: {:.1}s",
+        report.resources, report.nul_chars_removed, report.json_unparseable, report.seconds
+    );
+    if let Some(path) = args.report {
+        std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
+    }
+    let bad = report.mismatches();
+    if !bad.is_empty() {
+        anyhow::bail!(
+            "row counts differ for: {}",
+            bad.iter()
+                .map(|t| t.table.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "sqlite", feature = "postgres")))]
+async fn run_migrate(_args: MigrateArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`hts migrate` needs both the `sqlite` and `postgres` features")
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────

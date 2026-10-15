@@ -278,8 +278,8 @@ pub trait BundleImportBackend: Send + Sync {
     /// pairs, and return how many were stored. The CodeSystem must already be
     /// imported. Read by ECL `^` and `?fhir_vs=refset/<id>`.
     ///
-    /// The default stores nothing: a backend without an ECL evaluator (the
-    /// PostgreSQL one) has no reader for the rows.
+    /// The default stores nothing, for a backend without an ECL evaluator to
+    /// read the rows; both shipped backends override it.
     async fn import_refset_members(
         &self,
         _ctx: &TenantContext,
@@ -303,6 +303,22 @@ pub trait BundleImportBackend: Send + Sync {
         &self,
         _resource_type: &str,
         _resource_url: &str,
+    ) -> Result<(), HtsError> {
+        Ok(())
+    }
+
+    /// Remove the HTS normalized rows of the resource with FHIR id `id` —
+    /// what the SQLite CRUD path does through `hts_pool`: a CodeSystem by its
+    /// storage id or `resource_json.id` (every stored version), a ValueSet by
+    /// its storage id or the `<id>|<version>` ids derived from it, a
+    /// ConceptMap by id. Cached expansions over a deleted CodeSystem go too.
+    ///
+    /// Used by the CRUD update (replace) and delete handlers for backends
+    /// wired through `terminology_importer`. The default is a no-op.
+    async fn delete_normalized_by_id(
+        &self,
+        _resource_type: &str,
+        _id: &str,
     ) -> Result<(), HtsError> {
         Ok(())
     }

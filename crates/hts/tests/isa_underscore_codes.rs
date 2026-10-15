@@ -99,9 +99,9 @@ async fn expand_inline(app: &TestApp, filters: Value) -> Vec<String> {
 // ── T3: underscore-prefixed codes ─────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn is_a_underscore_code_expands_subtree() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     let (st, body) = app
@@ -130,9 +130,9 @@ async fn is_a_underscore_code_expands_subtree() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn is_a_underscore_code_validates_membership() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     for (code, expected) in [("A2.1", true), ("_Abstract", true), ("B", false)] {
@@ -153,9 +153,9 @@ async fn is_a_underscore_code_validates_membership() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_constraint_accepts_underscore_and_dotted_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     let (st, body) = app

@@ -118,9 +118,9 @@ async fn validate_inline(app: &TestApp, filters: Value, code: &str) -> bool {
 // ── T4: in / not-in / exists ──────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn in_filter_with_multiple_values_is_a_union() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     let codes = expand_inline(
@@ -165,9 +165,9 @@ async fn in_filter_with_multiple_values_is_a_union() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn not_in_filter_with_multiple_values_excludes_all_listed() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     let codes = expand_inline(
@@ -208,9 +208,9 @@ async fn not_in_filter_with_multiple_values_excludes_all_listed() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn exists_filter_selects_by_property_presence() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(&fixture_bundle()).await;
 
     let codes = expand_inline(

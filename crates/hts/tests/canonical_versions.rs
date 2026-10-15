@@ -92,9 +92,9 @@ fn is_operation_outcome_400(status: StatusCode, body: &Value) -> bool {
 // ── $expand ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_piped_version_matches_explicit_value_set_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     for (ver, expected) in [("1.0", vec!["a"]), ("2.0", vec!["a", "b"])] {
@@ -127,9 +127,9 @@ async fn expand_piped_version_matches_explicit_value_set_version() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_piped_version_not_found_does_not_poison_other_versions() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     let (st, _) = app
@@ -148,9 +148,9 @@ async fn expand_piped_version_not_found_does_not_poison_other_versions() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_conflicting_versions_is_400() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     let (st, body) = app
@@ -173,9 +173,9 @@ async fn expand_conflicting_versions_is_400() {
 // ── ValueSet/$validate-code ───────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_piped_version_selects_that_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     // `b` is only in version 2.0.
@@ -214,9 +214,9 @@ async fn vs_validate_code_piped_version_selects_that_version() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_piped_system_version_is_honoured() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     // Code `b` exists only in CS 2.0; pin the system to 1.0 via the pipe.
@@ -240,9 +240,9 @@ async fn vs_validate_code_piped_system_version_is_honoured() {
 // ── CodeSystem/$validate-code ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cs_validate_code_piped_version_selects_that_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     let (st, v1) = app
@@ -277,9 +277,9 @@ async fn cs_validate_code_piped_version_selects_that_version() {
 // ── $lookup ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_piped_system_version_matches_explicit_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     for (ver, display) in [("1.0", "A v1"), ("2.0", "A v2")] {
@@ -324,9 +324,9 @@ async fn lookup_piped_system_version_matches_explicit_version() {
 // ── $subsumes ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_piped_system_version_is_honoured() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     // `b` exists only in 2.0 → in 1.0 it is unknown (404), in 2.0 it is subsumed by root.
@@ -353,9 +353,9 @@ async fn subsumes_piped_system_version_is_honoured() {
 // ── $translate ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn translate_piped_concept_map_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     let (st, ok) = app
@@ -392,9 +392,9 @@ async fn translate_piped_concept_map_version() {
 // ── Search ────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_url_pipe_version_matches_explicit_version_param() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(versioned_bundle()).await;
 
     for resource in ["CodeSystem", "ValueSet"] {

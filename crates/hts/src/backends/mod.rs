@@ -209,6 +209,105 @@ pub(super) fn code_system_version_is_current(ver: &str) -> bool {
     ver.eq_ignore_ascii_case("current")
 }
 
+/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
+///
+/// Shared by both backends: SQLite ranks text-filtered expansions with it, and
+/// so does PostgreSQL, so a filtered page lists the same codes in the same order.
+/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
+/// and short common phrases over long FSNs.
+pub(crate) fn sort_typeahead_candidates(
+    candidates: &mut [crate::types::ExpansionContains],
+    query: &str,
+) {
+    candidates.sort_by(|a, b| {
+        typeahead_match_score(query, a)
+            .cmp(&typeahead_match_score(query, b))
+            .then_with(|| {
+                a.display
+                    .as_deref()
+                    .unwrap_or("")
+                    .len()
+                    .cmp(&b.display.as_deref().unwrap_or("").len())
+            })
+            .then_with(|| a.code.cmp(&b.code))
+    });
+}
+
+fn typeahead_match_score(query: &str, hit: &crate::types::ExpansionContains) -> i32 {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return i32::MAX;
+    }
+    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
+    let code = hit.code.to_lowercase();
+
+    if display == q {
+        return 0;
+    }
+    if code == q {
+        return 1;
+    }
+    if typeahead_word_match(&display, &q) {
+        return 20 + display.len() as i32;
+    }
+    if display.starts_with(&q) {
+        return 10 + display.len() as i32;
+    }
+    if let Some(pos) = display.find(&q) {
+        return 30 + pos as i32 + display.len() as i32;
+    }
+    i32::MAX
+}
+
+fn typeahead_word_match(display: &str, query: &str) -> bool {
+    display
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == query)
+}
+
+/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
+/// the map is already at `max` capacity.
+///
+/// The response and concept-flag caches are read under a shared (`read`) lock
+/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
+/// track per-entry recency: true LRU would require taking a write lock on every
+/// read to bump a recency counter, serializing the very lookups the cache
+/// exists to speed up. Instead, when the map is full we evict a single
+/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
+/// this is effectively random replacement) and admit the new key.
+///
+/// This replaces the previous "insert only while `len < max`" policy, which
+/// *froze* each cache once it filled: the first `max` distinct keys held their
+/// slots permanently and every later key missed forever, making the cache
+/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
+/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
+/// same memory ceiling while letting hot keys re-enter the cache.
+pub(crate) fn bounded_cache_insert<K, V, S>(
+    map: &mut std::collections::HashMap<K, V, S>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
+{
+    if max == 0 {
+        return;
+    }
+    // Only evict when inserting a genuinely new key would exceed the bound;
+    // overwriting an existing key does not grow the map.
+    if map.len() >= max && !map.contains_key(&key) {
+        // Clone one key to end the immutable borrow before removing. The keys
+        // here are small (`String` / `(String, String)`) and this only runs on
+        // a cache miss, so the clone is negligible next to the SQLite work that
+        // produced `value`.
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, value);
+}
+
 #[cfg(test)]
 mod precedence_tests {
     use super::*;

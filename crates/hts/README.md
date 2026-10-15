@@ -77,7 +77,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 
 - `hts import <dir>` imports every bundled file in one command (auto-detects format per file)
 - Automatic format detection - no `--format` flag needed for most files
-- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
+- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup), and `hts migrate` to move an SQLite database to PostgreSQL
 
 > **Maintainers:** the checked-in `crates/hts/terminology-data/` directory is refreshed before each release via `crates/hts/scripts/download-bundled-terminologies.sh` (Bash) or `.ps1` (PowerShell). See [RELEASING.md](../../RELEASING.md) for the refresh workflow. End users never need to run the scripts.
 
@@ -437,7 +437,7 @@ On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches
 
 ### PostgreSQL
 
-HTS fully supports PostgreSQL as an alternative backend, with feature parity with SQLite across all terminology operations, CRUD, search, and import formats. The schema mirrors the SQLite layout and is applied automatically on first connection, so no manual migration step is required.
+HTS supports PostgreSQL as an alternative backend with the same behaviour as SQLite: every terminology operation (including ECL, reference sets and the implicit ValueSet URLs), CRUD, search, every import format and the terminology admin API. The schema mirrors the SQLite layout and is applied automatically on first connection; a database created by an older HTS is upgraded in place on the next start (new tables and indexes, and the collation change below, run once — the applied DDL is fingerprinted in `hts_schema_meta`, so an up-to-date database starts without taking DDL locks).
 
 Build with the `postgres` feature, then select the backend with `--storage-backend postgres` (or `HTS_STORAGE_BACKEND=postgres`) and a `postgresql://` connection string:
 
@@ -449,6 +449,28 @@ cargo build --release -p helios-hts --features postgres
 hts run --storage-backend postgres \
   --database-url "postgresql://user:pass@localhost/hts"
 ```
+
+Notes:
+
+- **Collation.** Code, hierarchy, closure, reference-set, property-value, map-code and version columns are `COLLATE "C"`, so codes sort byte-wise exactly as in SQLite (LOINC `1000-9` before `10000-8`) whatever the database's default collation; displays and designations keep the database collation (Unicode-aware case folding).
+- **Text filters** are served from an in-memory trigram index over the materialised expansion, with the same matching (case-insensitive substring of code or display), ordering (implicit ValueSets in code order, other expansions typeahead-ranked) and exact `expansion.total` as SQLite.
+- **Server settings.** For a SNOMED CT + LOINC sized database, `shared_buffers` of a few GB, `work_mem=64MB` and `maintenance_work_mem` ≥ 1 GB (closure builds, index rebuilds after `hts migrate`) are sensible starting points; `random_page_cost=1.1` on SSD storage.
+
+#### Moving an existing SQLite database to PostgreSQL
+
+`hts migrate` copies an SQLite `hts.db` into an empty PostgreSQL database without re-importing any source file:
+
+```bash
+# 1. stop the SQLite server (or work from a copy of hts.db)
+# 2. create the target database
+createdb -h db-host -U hts hts
+# 3. copy
+hts migrate --from /data/hts.db --to "postgresql://hts:secret@db-host/hts" --report migrate-report.json
+# 4. start the server on PostgreSQL with the same HTS_BOOTSTRAP_DIR as before
+HTS_STORAGE_BACKEND=postgres HTS_DATABASE_URL="postgresql://hts:secret@db-host/hts" hts run
+```
+
+Every normalized table (CodeSystems, ValueSets, ConceptMaps, concepts, properties, designations, hierarchy, closure, reference set members, map elements, the persistent expansion cache) is streamed with binary `COPY`, ids preserved; the `bootstrap_imports` ledger is copied, so the PostgreSQL server does not re-import the bootstrap directory; the REST-created resources of the persistence store are copied at their latest version. Secondary indexes are dropped for the load and rebuilt afterwards, then the database is `VACUUM (ANALYZE)`d (statistics plus the visibility map that index-only scans rely on) and any missing closure is built. The command prints per-table source/copied row counts and fails if any differ. The source is opened read-only. Not copied: the SQLite FTS tables and `implicit_expansion_cache` (PostgreSQL derives these in memory), and persistence version history. `--replace` empties a non-empty target first; `--skip-resources` leaves the persistence store alone. A 6.6 GB production database (3,049 CodeSystems, 1.3 M concepts, 12.1 M closure rows, 23,142 ValueSets) migrates in about 2 minutes (128 s on the test server).
 
 ## API Endpoints
 
@@ -870,11 +892,10 @@ Lateralizable body structure reference set*) are imported as membership,
 so ECL `^ <refset>` works in a compose `constraint` filter, in
 `?fhir_vs=ecl/…` and as `?fhir_vs=refset/<id>`. Map reference sets are not
 read. A database whose SNOMED CT was imported before this answers `^` with
-`501`; re-import the release to load the members.
+`501` (on either backend); re-import the release to load the members.
 
 SNOMED CT's implicit ValueSet URLs are recognised by `$expand` and
-`$validate-code` (SQLite backend; the PostgreSQL backend answers the ECL
-forms with `501`):
+`$validate-code` on both storage backends:
 
 | URL | Members |
 |---|---|

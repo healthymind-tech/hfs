@@ -445,6 +445,7 @@ pub async fn import_loinc_csv(
 
         let mut parsed = build_parsed_code_system(&meta, &builder);
         parsed.fresh_load = fresh_load;
+        parsed.chunked = true;
         let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;

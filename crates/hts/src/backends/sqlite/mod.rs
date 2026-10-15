@@ -252,48 +252,7 @@ impl SqliteTerminologyBackend {
     }
 }
 
-/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
-/// the map is already at `max` capacity.
-///
-/// The response and concept-flag caches are read under a shared (`read`) lock
-/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
-/// track per-entry recency: true LRU would require taking a write lock on every
-/// read to bump a recency counter, serializing the very lookups the cache
-/// exists to speed up. Instead, when the map is full we evict a single
-/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
-/// this is effectively random replacement) and admit the new key.
-///
-/// This replaces the previous "insert only while `len < max`" policy, which
-/// *froze* each cache once it filled: the first `max` distinct keys held their
-/// slots permanently and every later key missed forever, making the cache
-/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
-/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
-/// same memory ceiling while letting hot keys re-enter the cache.
-pub(crate) fn bounded_cache_insert<K, V, S>(
-    map: &mut HashMap<K, V, S>,
-    key: K,
-    value: V,
-    max: usize,
-) where
-    K: std::hash::Hash + Eq + Clone,
-    S: std::hash::BuildHasher,
-{
-    if max == 0 {
-        return;
-    }
-    // Only evict when inserting a genuinely new key would exceed the bound;
-    // overwriting an existing key does not grow the map.
-    if map.len() >= max && !map.contains_key(&key) {
-        // Clone one key to end the immutable borrow before removing. The keys
-        // here are small (`String` / `(String, String)`) and this only runs on
-        // a cache miss, so the clone is negligible next to the SQLite work that
-        // produced `value`.
-        if let Some(evict) = map.keys().next().cloned() {
-            map.remove(&evict);
-        }
-    }
-    map.insert(key, value);
-}
+pub(crate) use crate::backends::bounded_cache_insert;
 
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
@@ -446,6 +405,11 @@ pub struct SqliteTerminologyBackend {
     /// `resource_json` only to discard everything except `is_empty()`.
     /// Invalidated alongside the other per-instance caches on `import_bundle`.
     pub(crate) cs_exists_cache: Arc<RwLock<BoolMap>>,
+    /// `supplements_for_system` memo, keyed by the base CodeSystem URL. The
+    /// query reads `supplements` out of each supplement's `resource_json`,
+    /// i.e. parses every supplement's full JSON (megabytes for a translation
+    /// supplement of ICD-10) on every uncached `$lookup` / `$expand`.
+    pub(crate) supplements_cache: Arc<RwLock<HashMap<String, Vec<crate::traits::SupplementInfo>>>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -660,6 +624,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -818,6 +783,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1042,6 +1008,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         } = self;
 
         // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
@@ -1070,6 +1037,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         );
 
         // Process-global caches shared by every backend instance in this

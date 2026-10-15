@@ -36,6 +36,43 @@ pub enum Command {
     Run(HtsConfig),
     /// Bulk-import a terminology package from the filesystem
     Import(ImportArgs),
+    /// Copy an HTS SQLite database into PostgreSQL (backend switch without
+    /// re-importing the source terminologies)
+    Migrate(MigrateArgs),
+}
+
+/// Arguments for `hts migrate`.
+#[derive(Parser, Debug)]
+pub struct MigrateArgs {
+    /// SQLite `hts.db` to copy (opened read-only; stop the server first or
+    /// pass a copy)
+    #[arg(long)]
+    pub from: std::path::PathBuf,
+
+    /// PostgreSQL connection string of the target database
+    #[arg(long)]
+    pub to: String,
+
+    /// Empty the target's terminology tables first instead of refusing a
+    /// database that already holds terminology
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Do not copy the REST-created resources of the persistence store
+    #[arg(long)]
+    pub skip_resources: bool,
+
+    /// Tables copied concurrently
+    #[arg(long, default_value = "4")]
+    pub jobs: usize,
+
+    /// Write the per-table report as JSON to this file
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, env = "HTS_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
 }
 
 // ── Server config ─────────────────────────────────────────────────────────────
