@@ -267,6 +267,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let mut compose_is_enumerated = false;
+        // Warnings of an inline expansion (`expansion.parameter` "warning").
+        let mut expansion_warnings: Vec<String> = Vec::new();
         // Implicit ValueSets keep expansion order for text-filtered pages
         // (SQLite's implicit index); other expansions rank the hits.
         let mut implicit_result = false;
@@ -840,6 +842,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 } else {
                     None
                 };
+                let include_count = compose_val["include"].as_array().map_or(0, |a| a.len());
                 if let Some(cell) = cell.as_ref() {
                     let force_sv = &req.force_system_versions;
                     let sysv = &req.system_version_defaults;
@@ -849,33 +852,40 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     let contained_ref = contained_vec.as_slice();
                     let arc = cell
                         .get_or_try_init(|| async move {
-                            let codes = compute_expansion_with_contained(
+                            let (codes, warnings) = compute_expansion_inline(
                                 client_ref,
                                 Some(compose_str_ref),
                                 force_sv,
                                 sysv,
                                 defvs,
                                 contained_ref,
+                                &[],
                             )
                             .await?;
-                            Ok::<_, HtsError>(std::sync::Arc::new(CachedExpansion::new(
-                                codes, /*implicit=*/ false,
-                            )))
+                            total_miss_guard(include_count, &codes, &warnings)?;
+                            Ok::<_, HtsError>(std::sync::Arc::new(
+                                CachedExpansion::new(codes, /*implicit=*/ false)
+                                    .with_warnings(warnings),
+                            ))
                         })
                         .await?;
                     return serve_from_cached(arc, &req);
                 }
                 // Non-cacheable branch (hierarchical / tx_resources) or
                 // cache at capacity: unprotected compute, no caching.
-                compute_expansion_with_contained(
+                let (codes, warnings) = compute_expansion_inline(
                     &client,
                     Some(&compose_str),
                     &req.force_system_versions,
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
                     &contained_vec,
+                    &req.tx_resources,
                 )
-                .await?
+                .await?;
+                total_miss_guard(include_count, &codes, &warnings)?;
+                expansion_warnings = warnings;
+                codes
             } else {
                 // No compose: nothing to expand (SQLite returns an empty
                 // expansion too, also when the body carries an `expansion`).
@@ -896,10 +906,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 total: Some(total),
                 offset: None,
                 contains: tree,
-                warnings: vec![],
+                warnings: expansion_warnings,
             });
         }
-        serve_from_cached(&CachedExpansion::new(all_codes, implicit_result), &req)
+        serve_from_cached(
+            &CachedExpansion::new(all_codes, implicit_result).with_warnings(expansion_warnings),
+            &req,
+        )
     }
 
     async fn value_set_version_for_url(
@@ -1862,87 +1875,159 @@ async fn compute_expansion(
     system_version_defaults: &HashMap<String, String>,
     default_value_set_versions: &HashMap<String, String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    compute_expansion_with_contained(
-        client,
-        compose_json,
+    // Stored ValueSets: like SQLite, expansion warnings are not reported.
+    let ctx = PgExpandCtx::new(
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
         &[],
-    )
-    .await
+        &[],
+    );
+    let mut warnings = Vec::new();
+    compute_expansion_inner(client, compose_json, &ctx, 0, &mut warnings).await
 }
 
-/// Like [`compute_expansion`] but also accepts the inline VS body's
-/// `contained[]` array so `compose.include[].valueSet[]: ["#fragment"]`
-/// references resolve to inline contained ValueSets. Used by callers that
-/// have the full inline VS body in hand (the `expand` inline-VS branch and
-/// the `validate_code` inline-VS branch when forwarding to the inline
-/// validator). Mirrors the SQLite `InlineResolutionContext` / Cluster 5c.
-async fn compute_expansion_with_contained(
+/// Expansion of an inline ValueSet body: `#fragment` references resolve to
+/// its `contained[]`, canonical ones to `tx-resource` ValueSets before the
+/// database, and the warnings (unknown systems, unresolved references,
+/// cycles, depth limit) are returned for `expansion.parameter`. SQLite's
+/// `InlineResolutionContext` path.
+async fn compute_expansion_inline(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
     system_version_defaults: &HashMap<String, String>,
     default_value_set_versions: &HashMap<String, String>,
     contained: &[serde_json::Value],
-) -> Result<Vec<ExpansionContains>, HtsError> {
-    let mut visited: HashSet<String> = HashSet::new();
-    compute_expansion_inner(
-        client,
-        compose_json,
+    tx_resources: &[serde_json::Value],
+) -> Result<(Vec<ExpansionContains>, Vec<String>), HtsError> {
+    let ctx = PgExpandCtx::new(
         force_system_versions,
         system_version_defaults,
         default_value_set_versions,
         contained,
-        0,
-        &mut visited,
-    )
-    .await
+        tx_resources,
+    );
+    let mut warnings = Vec::new();
+    let codes = compute_expansion_inner(client, compose_json, &ctx, 0, &mut warnings).await?;
+    Ok((codes, warnings))
 }
 
-/// Recursive worker for `compute_expansion`. `depth` and `visited` thread
-/// through `compose.include[].valueSet[]` references (Cluster C). The
-/// reference handling intersects every referenced VS expansion (mirroring
-/// FHIR R5 §4.9.5) with any local system/concept/filter base set on the
-/// same include. Cycle detection raises `HtsError::VsInvalid`; depth >= 4
-/// emits a warning and skips the nested ref. Mirrors
-/// `sqlite/value_set.rs:expand_includes_per_clause` (3220-3354) +
-/// `expand_vs_reference` (2944-3058).
-#[allow(clippy::too_many_arguments)]
-fn compute_expansion_inner<'a>(
-    client: &'a tokio_postgres::Client,
-    compose_json: Option<&'a str>,
+/// Resolution context threaded through nested `valueSet[]` references — the
+/// PostgreSQL twin of SQLite's `InlineResolutionContext`. Cloned for each
+/// nested reference, so `visited` and `exclude_chain` follow the path.
+#[derive(Clone)]
+struct PgExpandCtx<'a> {
     force_system_versions: &'a HashMap<String, String>,
     system_version_defaults: &'a HashMap<String, String>,
     default_value_set_versions: &'a HashMap<String, String>,
     contained: &'a [serde_json::Value],
+    tx_resources: Vec<&'a serde_json::Value>,
+    visited: std::collections::BTreeSet<String>,
+    /// `Some((origin, chain))` while resolving an `exclude.valueSet[]`
+    /// reference: a cycle found there is a hard error naming the path.
+    exclude_chain: Option<(String, Vec<String>)>,
+}
+
+impl<'a> PgExpandCtx<'a> {
+    fn new(
+        force_system_versions: &'a HashMap<String, String>,
+        system_version_defaults: &'a HashMap<String, String>,
+        default_value_set_versions: &'a HashMap<String, String>,
+        contained: &'a [serde_json::Value],
+        tx_resources: &'a [serde_json::Value],
+    ) -> Self {
+        PgExpandCtx {
+            force_system_versions,
+            system_version_defaults,
+            default_value_set_versions,
+            contained,
+            tx_resources: tx_resources
+                .iter()
+                .filter(|r| r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet"))
+                .collect(),
+            visited: std::collections::BTreeSet::new(),
+            exclude_chain: None,
+        }
+    }
+
+    /// The compose of a reference found in the request itself: `#id` in the
+    /// inline `contained[]`, a canonical among the `tx-resource` ValueSets
+    /// (an exact `(url, version)` match when the reference or a
+    /// `default-valueset-version` pins one, else the highest version).
+    fn lookup_compose(&self, ref_str: &str) -> Option<String> {
+        if let Some(id) = ref_str.strip_prefix('#') {
+            return self.contained.iter().find_map(|r| {
+                (r.get("id").and_then(|v| v.as_str()) == Some(id)
+                    && r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet"))
+                .then(|| r.get("compose").map(|c| c.to_string()))
+                .flatten()
+            });
+        }
+        let (bare, pinned) = match ref_str.split_once('|') {
+            Some((u, v)) => (u, Some(v)),
+            None => (ref_str, None),
+        };
+        let want = pinned.or_else(|| {
+            self.default_value_set_versions
+                .get(bare)
+                .map(String::as_str)
+        });
+        if let Some(want) = want {
+            return self.tx_resources.iter().find_map(|r| {
+                (r.get("url").and_then(|v| v.as_str()) == Some(bare)
+                    && r.get("version").and_then(|v| v.as_str()) == Some(want))
+                .then(|| r.get("compose").map(|c| c.to_string()))
+                .flatten()
+            });
+        }
+        let mut best: Option<&serde_json::Value> = None;
+        for r in self.tx_resources.iter().copied() {
+            if r.get("url").and_then(|v| v.as_str()) != Some(bare) {
+                continue;
+            }
+            best = Some(match (best, r.get("version").and_then(|v| v.as_str())) {
+                (None, _) => r,
+                (Some(prev), Some(this_v)) => {
+                    let prev_v = prev.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    if this_v > prev_v { r } else { prev }
+                }
+                (Some(prev), None) => prev,
+            });
+        }
+        best.and_then(|r| r.get("compose").map(|c| c.to_string()))
+    }
+}
+
+/// Recursive worker for `compute_expansion`. `depth` and the context thread
+/// through `compose.include[].valueSet[]` references; depth >= 4 warns and
+/// skips the nested reference. Mirrors SQLite's
+/// `compute_expansion_depth_inner` / `expand_includes_per_clause`.
+fn compute_expansion_inner<'a>(
+    client: &'a tokio_postgres::Client,
+    compose_json: Option<&'a str>,
+    ctx: &'a PgExpandCtx<'a>,
     depth: u8,
-    visited: &'a mut HashSet<String>,
+    warnings: &'a mut Vec<String>,
 ) -> futures::future::BoxFuture<'a, Result<Vec<ExpansionContains>, HtsError>> {
     Box::pin(compute_expansion_inner_body(
         client,
         compose_json,
-        force_system_versions,
-        system_version_defaults,
-        default_value_set_versions,
-        contained,
+        ctx,
         depth,
-        visited,
+        warnings,
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn compute_expansion_inner_body(
     client: &tokio_postgres::Client,
     compose_json: Option<&str>,
-    force_system_versions: &HashMap<String, String>,
-    system_version_defaults: &HashMap<String, String>,
-    default_value_set_versions: &HashMap<String, String>,
-    contained: &[serde_json::Value],
+    ctx: &PgExpandCtx<'_>,
     depth: u8,
-    visited: &mut HashSet<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    let force_system_versions = ctx.force_system_versions;
+    let system_version_defaults = ctx.system_version_defaults;
     let Some(raw) = compose_json else {
         return Ok(vec![]);
     };
@@ -1966,8 +2051,9 @@ async fn compute_expansion_inner_body(
         // valueSet[] entries, the result is the intersection of the refs.
         if vs_refs_present {
             if depth >= 4 {
-                tracing::warn!(
+                warnings.push(
                     "Max ValueSet include depth (4) reached; skipping nested valueSet references"
+                        .to_owned(),
                 );
                 continue;
             }
@@ -1987,17 +2073,7 @@ async fn compute_expansion_inner_body(
                     Some(u) => u,
                     None => continue,
                 };
-                let codes = pg_expand_vs_reference(
-                    client,
-                    ref_url,
-                    depth,
-                    visited,
-                    force_system_versions,
-                    system_version_defaults,
-                    default_value_set_versions,
-                    contained,
-                )
-                .await?;
+                let codes = pg_expand_vs_reference(client, ref_url, depth, ctx, warnings).await?;
                 let mut set: HashSet<(String, String)> = HashSet::new();
                 for c in codes {
                     let key = (c.system.clone(), c.code.clone());
@@ -2031,18 +2107,14 @@ async fn compute_expansion_inner_body(
                 if let Some(obj) = single_inc.as_object_mut() {
                     obj.remove("valueSet");
                 }
+                // The local part is expanded at this include's own depth, as
+                // SQLite's `expand_single_include_local` does (abstract
+                // concepts still pull in their children at depth 0).
                 let single_compose = serde_json::json!({ "include": [single_inc] });
-                let base_codes = compute_expansion_inner(
-                    client,
-                    Some(&single_compose.to_string()),
-                    force_system_versions,
-                    system_version_defaults,
-                    default_value_set_versions,
-                    contained,
-                    depth + 1,
-                    visited,
-                )
-                .await?;
+                let single_compose = single_compose.to_string();
+                let base_codes =
+                    compute_expansion_inner(client, Some(&single_compose), ctx, depth, warnings)
+                        .await?;
                 let mut bs: HashSet<(String, String)> = HashSet::new();
                 for c in &base_codes {
                     let key = (c.system.clone(), c.code.clone());
@@ -2068,10 +2140,9 @@ async fn compute_expansion_inner_body(
                 }
                 let (system, code) = key.clone();
                 let display = display_index.get(key).cloned().unwrap_or(None);
-                let version = version_index.get(key).cloned().unwrap_or(None);
                 included.push(ExpansionContains {
                     system,
-                    version,
+                    version: None,
                     code,
                     display,
                     is_abstract: None,
@@ -2140,11 +2211,11 @@ async fn compute_expansion_inner_body(
                 // Enumerated include for an unknown system: return the listed
                 // codes as-is (see the SQLite twin, fork issue T8).
                 if let Some(explicit) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
-                    tracing::warn!(
-                        system_url,
-                        inc_version,
-                        "CodeSystem not found; enumerated codes included as listed"
-                    );
+                    warnings.push(format!(
+                        "CodeSystem {system_url} was not found; its {} enumerated codes are \
+                         included as listed in the ValueSet",
+                        explicit.len()
+                    ));
                     included.extend(crate::backends::enumerated_from_compose(
                         system_url,
                         inc_version,
@@ -2153,11 +2224,9 @@ async fn compute_expansion_inner_body(
                     ));
                     continue;
                 }
-                tracing::warn!(
-                    system_url,
-                    inc_version,
-                    "Skipping unknown code system in ValueSet compose"
-                );
+                warnings.push(format!(
+                    "CodeSystem {system_url} was not found and has been excluded from the expansion"
+                ));
                 continue;
             }
         };
@@ -2264,12 +2333,20 @@ async fn compute_expansion_inner_body(
                         .map(|r| r.get::<_, bool>(0))
                         .unwrap_or(false);
                     if !has_concepts {
-                        for c in crate::backends::enumerated_from_compose(
+                        let extra = crate::backends::enumerated_from_compose(
                             system_url,
                             cs_version.as_deref(),
                             explicit_codes,
                             &seen_codes,
-                        ) {
+                        );
+                        if !extra.is_empty() {
+                            warnings.push(format!(
+                                "CodeSystem {system_url} has no concept content loaded; {} \
+                                 enumerated codes are included as listed in the ValueSet",
+                                extra.len()
+                            ));
+                        }
+                        for c in extra {
                             seen_codes.insert(c.code.clone());
                             out.push(c);
                         }
@@ -2429,8 +2506,9 @@ async fn compute_expansion_inner_body(
         // by the local set.
         if exc_vs_refs_present {
             if depth >= 4 {
-                tracing::warn!(
+                warnings.push(
                     "Max ValueSet exclude depth (4) reached; skipping nested valueSet references"
+                        .to_owned(),
                 );
                 continue;
             }
@@ -2440,17 +2518,14 @@ async fn compute_expansion_inner_body(
                     Some(u) => u,
                     None => continue,
                 };
-                let resolved = pg_expand_vs_reference(
-                    client,
-                    ref_url,
-                    depth,
-                    visited,
-                    force_system_versions,
-                    system_version_defaults,
-                    default_value_set_versions,
-                    contained,
-                )
-                .await?;
+                // Start the exclude chain, so a cycle found while resolving
+                // this exclusion is a hard error naming the path.
+                let mut excl_ctx = ctx.clone();
+                if excl_ctx.exclude_chain.is_none() {
+                    excl_ctx.exclude_chain = Some((ref_url.to_owned(), Vec::new()));
+                }
+                let resolved =
+                    pg_expand_vs_reference(client, ref_url, depth, &excl_ctx, warnings).await?;
                 let mut set = HashSet::new();
                 for c in resolved {
                     set.insert((c.system, c.code));
@@ -2476,17 +2551,10 @@ async fn compute_expansion_inner_body(
                 // codes — same shape as the SQLite expand_single_include_local
                 // helper.
                 let single_compose = serde_json::json!({ "include": [single_exc] });
-                let local = compute_expansion_inner(
-                    client,
-                    Some(&single_compose.to_string()),
-                    force_system_versions,
-                    system_version_defaults,
-                    default_value_set_versions,
-                    contained,
-                    depth + 1,
-                    visited,
-                )
-                .await?;
+                let single_compose = single_compose.to_string();
+                let local =
+                    compute_expansion_inner(client, Some(&single_compose), ctx, depth, warnings)
+                        .await?;
                 let local_set: HashSet<(String, String)> =
                     local.into_iter().map(|c| (c.system, c.code)).collect();
                 intersected.retain(|k| local_set.contains(k));
@@ -2611,72 +2679,51 @@ async fn compute_expansion_inner_body(
     Ok(included)
 }
 
-/// Resolve a `compose.include[].valueSet[]` reference to its expansion.
+/// Resolve a `compose.include[].valueSet[]` / `exclude.valueSet[]`
+/// reference to its expansion — SQLite's `expand_vs_reference`:
 ///
-/// - Bubbles `HtsError::VsInvalid` when the URL is already in `visited` —
-///   cycles are reported as hard errors so the operations layer can render
-///   the FHIR-spec OperationOutcome (4xx). Mirrors sqlite/value_set.rs:2952-2980.
-/// - Honours an explicit `|version` suffix on the ref, falling back to a
-///   `default-valueset-version` request-level pin when the ref is bare
-///   (mirrors sqlite/value_set.rs:3016-3026).
-/// - Recurses via `compute_expansion_inner` at depth+1 so further nested
-///   `valueSet[]` refs participate in cycle detection and depth limits.
-/// - `#fragment` (contained-VS) refs are resolved against the supplied
-///   `contained[]` array. The matched contained VS's compose is then
-///   expanded recursively — same code path as a stored VS reference but
-///   without a DB lookup.
-#[allow(clippy::too_many_arguments)]
+/// - A reference already on the path is a cycle: inside an exclusion a hard
+///   `VsInvalid` naming the chain, otherwise a warning and an empty set.
+/// - `#fragment` and `tx-resource` references resolve from the request
+///   ([`PgExpandCtx::lookup_compose`]); an unmatched `#fragment` warns.
+/// - Otherwise the stored ValueSet (an explicit `|version` or a
+///   `default-valueset-version` pin is honoured; an unresolvable pin is a
+///   NotFound), served from its persistent expansion cache when it has one.
 async fn pg_expand_vs_reference(
     client: &tokio_postgres::Client,
     ref_url: &str,
     depth: u8,
-    visited: &mut HashSet<String>,
-    force_system_versions: &HashMap<String, String>,
-    system_version_defaults: &HashMap<String, String>,
-    default_value_set_versions: &HashMap<String, String>,
-    contained: &[serde_json::Value],
+    ctx: &PgExpandCtx<'_>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
-    if visited.contains(ref_url) {
-        return Err(HtsError::VsInvalid(format!(
-            "Cyclic reference detected when excluding {ref_url} via [{ref_url}]"
-        )));
+    if ctx.visited.contains(ref_url) {
+        if let Some((origin, chain)) = ctx.exclude_chain.as_ref() {
+            let mut full_chain = chain.clone();
+            full_chain.push(ref_url.to_owned());
+            return Err(HtsError::VsInvalid(format!(
+                "Cyclic reference detected when excluding {origin} via [{}]",
+                full_chain.join(", ")
+            )));
+        }
+        warnings.push(format!(
+            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
+        ));
+        return Ok(vec![]);
     }
-    visited.insert(ref_url.to_owned());
+    let mut child = ctx.clone();
+    child.visited.insert(ref_url.to_owned());
+    if let Some((_, chain)) = child.exclude_chain.as_mut() {
+        chain.push(ref_url.to_owned());
+    }
 
-    if let Some(id) = ref_url.strip_prefix('#') {
-        // Look up the matching contained ValueSet and recurse into its
-        // compose. Mirrors sqlite/value_set.rs:lookup_compose +
-        // expand_vs_reference.
-        let compose_str = contained.iter().find_map(|r| {
-            if r.get("id").and_then(|v| v.as_str()) == Some(id)
-                && r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
-            {
-                r.get("compose").map(|c| c.to_string())
-            } else {
-                None
-            }
-        });
-        let result = if let Some(compose) = compose_str {
-            compute_expansion_inner(
-                client,
-                Some(&compose),
-                force_system_versions,
-                system_version_defaults,
-                default_value_set_versions,
-                contained,
-                depth + 1,
-                visited,
-            )
-            .await
-        } else {
-            tracing::warn!(
-                ref_url,
-                "Contained ValueSet reference not found in inline contained[] array; treating as empty"
-            );
-            Ok(vec![])
-        };
-        visited.remove(ref_url);
-        return result;
+    if let Some(compose) = ctx.lookup_compose(ref_url) {
+        return compute_expansion_inner(client, Some(&compose), &child, depth + 1, warnings).await;
+    }
+    if ref_url.starts_with('#') {
+        warnings.push(format!(
+            "Referenced contained ValueSet {ref_url} not found; excluded from expansion"
+        ));
+        return Ok(vec![]);
     }
 
     let (bare_url, ref_version) = match ref_url.split_once('|') {
@@ -2685,49 +2732,27 @@ async fn pg_expand_vs_reference(
     };
     let effective_version: Option<String> = ref_version
         .clone()
-        .or_else(|| default_value_set_versions.get(bare_url).cloned());
+        .or_else(|| ctx.default_value_set_versions.get(bare_url).cloned());
     let pin_was_explicit = ref_version.is_some() || effective_version.is_some();
-
-    let result =
-        match resolve_value_set_versioned(client, bare_url, effective_version.as_deref(), None)
-            .await
-        {
-            Ok((_ref_vs_id, ref_compose)) => {
-                // Recurse — the bypass for the cache mirrors compute_expansion's
-                // own multi-version handling implicitly; for ref expansion the
-                // cache is fine but we pay re-compute cost here for simplicity.
-                compute_expansion_inner(
-                    client,
-                    ref_compose.as_deref(),
-                    force_system_versions,
-                    system_version_defaults,
-                    default_value_set_versions,
-                    contained,
-                    depth + 1,
-                    visited,
-                )
+    match resolve_value_set_versioned(client, bare_url, effective_version.as_deref(), None).await {
+        Ok((ref_vs_id, ref_compose)) => {
+            let cached = fetch_cache(client, &ref_vs_id).await?;
+            if !cached.is_empty() {
+                return Ok(cached);
+            }
+            compute_expansion_inner(client, ref_compose.as_deref(), &child, depth + 1, warnings)
                 .await
+        }
+        Err(e) => {
+            if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
+                return Err(e);
             }
-            Err(e) => {
-                // Explicit version pin that doesn't resolve must surface as a
-                // hard NotFound (mirrors SQLite valueset-version/expand-indirect-
-                // expand-zero-pinned-wrong fixture). Otherwise, warn and
-                // contribute an empty set so a missing optional ref doesn't
-                // collapse the whole expansion.
-                if pin_was_explicit && matches!(e, HtsError::NotFound(_)) {
-                    Err(e)
-                } else {
-                    tracing::warn!(
-                        ref_url,
-                        "Referenced ValueSet not found; excluded from expansion"
-                    );
-                    Ok(vec![])
-                }
-            }
-        };
-
-    visited.remove(ref_url);
-    result
+            warnings.push(format!(
+                "Referenced ValueSet {ref_url} not found; excluded from expansion"
+            ));
+            Ok(vec![])
+        }
+    }
 }
 
 /// Apply `compose.include[].filter[]` (or `compose.exclude[].filter[]`) to
@@ -5268,6 +5293,8 @@ fn cache_cell(
 /// with a text index built on the first filtered request.
 pub(crate) struct CachedExpansion {
     codes: Vec<ExpansionContains>,
+    /// Expansion warnings (inline ValueSets), returned with every page.
+    warnings: Vec<String>,
     /// Implicit ValueSet: text-filtered pages keep expansion order, as
     /// SQLite's implicit index serves them. Otherwise the hits are ranked
     /// with [`crate::backends::sort_typeahead_candidates`], as SQLite's
@@ -5370,9 +5397,15 @@ impl CachedExpansion {
     pub(crate) fn new(codes: Vec<ExpansionContains>, implicit: bool) -> Self {
         CachedExpansion {
             codes,
+            warnings: Vec::new(),
             implicit,
             index: std::sync::OnceLock::new(),
         }
+    }
+
+    fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
     }
 
     fn index(&self) -> &TextIndex {
@@ -5465,6 +5498,22 @@ fn serve_from_cached(
         total: Some(total as u32),
         offset: req.offset,
         contains: page,
-        warnings: vec![],
+        warnings: cached.warnings.clone(),
     })
+}
+
+/// SQLite's total-miss guard for inline ValueSets: when every include failed
+/// to resolve (each produced a warning) and nothing was expanded, the
+/// request is a 404 rather than an empty expansion.
+fn total_miss_guard(
+    include_count: usize,
+    codes: &[ExpansionContains],
+    warnings: &[String],
+) -> Result<(), HtsError> {
+    if include_count > 0 && codes.is_empty() && warnings.len() >= include_count {
+        return Err(HtsError::NotFound(
+            "None of the systems in the inline ValueSet compose could be resolved".into(),
+        ));
+    }
+    Ok(())
 }
