@@ -66,6 +66,15 @@ pub type ResolvedMetaCache =
 /// resolved direction.
 pub type SubsumesResponseCache = Arc<RwLock<HashMap<String, Arc<SubsumesResponse>>>>;
 
+/// `ValueSet/$validate-code` response memo, keyed on every request field
+/// that shapes the answer.
+pub type ValidateCodeResponseCache =
+    Arc<RwLock<HashMap<String, Arc<crate::types::ValidateCodeResponse>>>>;
+
+/// Bound of [`ValidateCodeResponseCache`] (SQLite's
+/// `VALIDATE_CODE_RESPONSE_CACHE_MAX`).
+pub(super) const PG_VALIDATE_CODE_RESPONSE_CACHE_MAX: usize = 4096;
+
 /// `$translate` response memo (CM01/CM02 hot path).
 /// Key = `"url|system|code|source|target|target_system|target_code|reverse|date"`.
 pub type TranslateResponseCache = Arc<RwLock<HashMap<String, Arc<TranslateResponse>>>>;
@@ -388,6 +397,9 @@ pub struct PostgresTerminologyBackend {
     /// `$translate` response memo — CM01/CM02 hot paths repeat the same
     /// (system, code, target) tuples across pool entries.
     pub(super) translate_response_cache: TranslateResponseCache,
+    /// `ValueSet/$validate-code` response memo (SQLite's
+    /// `validate_code_response_cache`).
+    pub(super) validate_code_response_cache: ValidateCodeResponseCache,
     /// Closure `COUNT(*)` memo per `(system_id, root)` (see `value_set.rs`).
     pub(super) closure_count_cache: value_set::ClosureCountCache,
     /// `?fhir_vs=isa/X` descendant-prefix memo (see `value_set.rs`).
@@ -449,6 +461,7 @@ impl PostgresTerminologyBackend {
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
             subsumes_response_cache: Arc::new(RwLock::new(HashMap::new())),
             translate_response_cache: Arc::new(RwLock::new(HashMap::new())),
+            validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             closure_count_cache: Arc::new(RwLock::new(HashMap::new())),
             root_prefix_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -508,6 +521,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             cs_resolved_meta_cache,
             subsumes_response_cache,
             translate_response_cache,
+            validate_code_response_cache,
             closure_count_cache,
             root_prefix_cache,
         } = self;
@@ -527,6 +541,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             cs_resolved_meta_cache,
             subsumes_response_cache,
             translate_response_cache,
+            validate_code_response_cache,
             closure_count_cache,
             root_prefix_cache,
         );

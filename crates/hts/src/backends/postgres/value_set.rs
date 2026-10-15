@@ -930,12 +930,83 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             return Ok(resp);
         }
 
-        // TODO: cache — port the per-instance response cache from SQLite
-        // (validate_code_response_cache). The SQLite cache key folds in
-        //   url, value_set_version, system, code, version, display,
-        //   include_abstract, date, input_form, lenient_display_validation
-        // and skips entirely when `default_value_set_versions` is non-empty.
+        // Per-instance response memo, keyed like SQLite's on every request
+        // field that shapes the answer; skipped when a default-valueset-version
+        // pin is set (as SQLite does). Errors are never cached.
+        let cache_key: Option<String> = req.default_value_set_versions.is_empty().then(|| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                url,
+                req.value_set_version.as_deref().unwrap_or(""),
+                req.system.as_deref().unwrap_or(""),
+                req.code,
+                req.version.as_deref().unwrap_or(""),
+                req.display.as_deref().unwrap_or(""),
+                req.include_abstract
+                    .map(|b| if b { "1" } else { "0" })
+                    .unwrap_or(""),
+                req.date.as_deref().unwrap_or(""),
+                req.input_form.as_deref().unwrap_or(""),
+                req.lenient_display_validation
+                    .map(|b| if b { "1" } else { "0" })
+                    .unwrap_or(""),
+            )
+        });
+        if let Some(k) = cache_key.as_ref() {
+            if let Ok(read) = self.validate_code_response_cache.read() {
+                if let Some(hit) = read.get(k) {
+                    return Ok((**hit).clone());
+                }
+            }
+        }
+        let response = self.validate_code_uncached(url, req).await?;
+        if let Some(k) = cache_key {
+            if let Ok(mut w) = self.validate_code_response_cache.write() {
+                crate::backends::bounded_cache_insert(
+                    &mut *w,
+                    k,
+                    Arc::new(response.clone()),
+                    super::PG_VALIDATE_CODE_RESPONSE_CACHE_MAX,
+                );
+            }
+        }
+        Ok(response)
+    }
 
+    async fn count(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        self.count_search_matches("value_sets", query).await
+    }
+
+    /// Search ValueSet resources by query parameters.
+    ///
+    /// `url`, `version`, and `status` use exact matching. `name` and `title`
+    /// use normalized FHIR prefix matching by default and support `:contains`
+    /// and `:exact`. Multiple populated fields are ANDed.
+    async fn search(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        super::search_table(&mut client, "value_sets", "ValueSet", query, true).await
+    }
+}
+
+impl PostgresTerminologyBackend {
+    /// `ValueSet/$validate-code` without the response memo.
+    async fn validate_code_uncached(
+        &self,
+        url: String,
+        req: ValidateCodeRequest,
+    ) -> Result<ValidateCodeResponse, HtsError> {
         let mut client = self
             .pool
             .get()
@@ -1192,107 +1263,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 Err(e) => return Err(e),
             };
 
-        // Version mismatch detection: verify the caller's version (when
-        // supplied) against stored CS versions and the VS include pin. Also
-        // fires when the caller supplies no version but the VS pins a version
-        // that doesn't exist in the DB. Skipped on the `?fhir_vs` short-circuit
-        // paths above (those already `return`ed).
-        //
-        // Location strings depend on which FHIR input form was used (mirrors
-        // `sqlite/value_set.rs:1747-1754`). Tx-ecosystem fixtures pin the
-        // location/expression to "system" / "version" for bare `code` input,
-        // "CodeableConcept.coding[0].*" for CodeableConcept, and "Coding.*"
-        // otherwise.
-        let (version_loc, system_loc) = match req.input_form.as_deref() {
-            Some("code") => ("version", "system"),
-            Some("codeableConcept") => (
-                "CodeableConcept.coding[0].version",
-                "CodeableConcept.coding[0].system",
-            ),
-            _ => ("Coding.version", "Coding.system"),
-        };
-        let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
-        let mismatch = if let Some(system) = req.system.as_deref() {
-            // Short-circuit when the system itself isn't loaded — caller-facing
-            // unknown-system messaging is handled elsewhere.
-            if !code_system_exists_inline(&client, system).await {
-                None
-            } else if let Some(req_ver) = req
-                .version
-                .as_deref()
-                .filter(|v| !v.is_empty() && !v.contains(".x") && *v != "x")
-            {
-                detect_cs_version_mismatch(
-                    &client,
-                    system,
-                    req_ver,
-                    compose_json_for_version.as_deref(),
-                    vs_version_for_mismatch.as_deref(),
-                    version_loc,
-                    system_loc,
-                )
-                .await
-            } else if req.version.is_none() {
-                // Caller supplied no version → check whether the VS include
-                // pins a version that doesn't exist in the DB.
-                detect_vs_pin_unknown(
-                    &client,
-                    system,
-                    compose_json_for_version.as_deref(),
-                    system_loc,
-                )
-                .await
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some((issues, caused_by, echo_version)) = mismatch {
-            let mut texts: Vec<&str> = issues
-                .iter()
-                .filter(|i| i.severity == "error")
-                .map(|i| i.text.as_str())
-                .collect();
-            texts.sort_unstable();
-            let message = texts.join("; ");
-            // Echo the code's display from the underlying CS even when the
-            // requested version is wrong — tx-ecosystem fixtures expect the
-            // \`display\` parameter on mismatch responses (the concept itself
-            // is still discoverable, only the version is unknown).
-            let system_unwrapped = req.system.clone().unwrap();
-            let sql = format!(
-                "SELECT c.display FROM concepts c \
-                 JOIN code_systems s ON s.id = c.system_id \
-                 WHERE s.url = $1 AND c.code = $2 \
-                 ORDER BY {} LIMIT 1",
-                crate::backends::cs_precedence_order_by("s")
-            );
-            let display = client
-                .query_opt(&sql, &[&system_unwrapped, &req.code])
-                .await
-                .ok()
-                .flatten()
-                .and_then(|r| r.get::<_, Option<String>>(0));
-            return Ok(ValidateCodeResponse {
-                result: false,
-                message: Some(message),
-                display,
-                system: Some(system_unwrapped),
-                cs_version: echo_version,
-                inactive: None,
-                issues,
-                caused_by_unknown_system: caused_by,
-                concept_status: None,
-                normalized_code: None,
-            });
-        }
-
-        // Search the expansion for the requested code.
-        // TODO: parity — overload pattern (same (system, code) at multiple
-        // pinned versions), version-pin candidate selection, inferSystem
-        // ambiguity branch, compose.inactive=false filter all still skipped.
+        // Search the expansion for the requested code — the same steps, in
+        // the same order, as SQLite's `validate_code`: candidates (with the
+        // case-insensitive fallback), inferSystem ambiguity, candidate choice
+        // for overloads and version pins, then version-mismatch detection
+        // against the effective system.
         let req_ver_exact: Option<&str> = req
             .version
             .as_deref()
@@ -1484,6 +1459,75 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         };
 
+        // Effective system: the caller's, else the one inferred from the
+        // matched code, so version-mismatch detection also fires for a bare
+        // code.
+        let effective_system: Option<String> = req
+            .system
+            .clone()
+            .or_else(|| found.as_ref().map(|c| c.system.clone()));
+
+        // Location strings depend on which FHIR input form was used.
+        let (version_loc, system_loc) = match req.input_form.as_deref() {
+            Some("code") => ("version", "system"),
+            Some("codeableConcept") => (
+                "CodeableConcept.coding[0].version",
+                "CodeableConcept.coding[0].system",
+            ),
+            _ => ("Coding.version", "Coding.system"),
+        };
+
+        // Version mismatch: the caller's version (wildcards included) against
+        // the stored versions and the VS include pin; without a caller version,
+        // a VS pin naming a version that is not stored.
+        let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
+        let mismatch = if let (Some(req_ver), Some(system)) =
+            (req.version.as_deref(), effective_system.as_deref())
+        {
+            detect_cs_version_mismatch(
+                &client,
+                system,
+                req_ver,
+                compose_json_for_version.as_deref(),
+                vs_version_for_mismatch.as_deref(),
+                version_loc,
+                system_loc,
+            )
+            .await
+        } else if let Some(system) = effective_system.as_deref() {
+            detect_vs_pin_unknown(
+                &client,
+                system,
+                compose_json_for_version.as_deref(),
+                system_loc,
+            )
+            .await
+        } else {
+            None
+        };
+        if let Some((issues, caused_by, echo_version)) = mismatch {
+            let display = found.as_ref().and_then(|c| c.display.clone());
+            let mut texts: Vec<&str> = issues
+                .iter()
+                .filter(|i| i.severity == "error")
+                .map(|i| i.text.as_str())
+                .collect();
+            texts.sort_unstable();
+            let message = texts.join("; ");
+            return Ok(ValidateCodeResponse {
+                result: false,
+                message: Some(message),
+                display,
+                system: None,
+                cs_version: echo_version,
+                inactive: None,
+                issues,
+                caused_by_unknown_system: caused_by,
+                concept_status: None,
+                normalized_code: None,
+            });
+        }
+
         // When compose.inactive=false the VS excludes inactive concepts.
         // The expansion may have been computed without applying this filter
         // (the cache path doesn't honour it), so apply it here: when the
@@ -1510,6 +1554,18 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
         } else {
             found
+        };
+
+        // An exact caller version shows that version's display, even when
+        // the expansion resolved another one (e.g. `1.x` → 1.2.0).
+        let found = match (found, req.version.as_deref(), effective_system.as_deref()) {
+            (Some(mut concept), Some(ver), Some(sys)) if !ver.contains(".x") && ver != "x" => {
+                if let Some(disp) = pg_lookup_cs_display(&client, sys, Some(ver), &req.code).await {
+                    concept.display = Some(disp);
+                }
+                Some(concept)
+            }
+            (f, _, _) => f,
         };
 
         let system_for_msg: Option<String> = req
@@ -1555,31 +1611,28 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             !code_unknown_in_cs_anywhere && code_unknown_in_cs_at_version;
         let code_unknown_in_cs = code_unknown_in_cs_anywhere || code_unknown_in_cs_at_version;
 
-        // cs_version priority: caller's exact request version > matched
-        // concept's version > latest stored CS version.
-        // TODO: parity — VS compose include pin (rule 3 in SQLite) skipped.
-        //
-        // EXCEPTION: when the code is unknown in the CS at any version
-        // (code_unknown_in_cs_anywhere=true), the caller's version pin
-        // is meaningless — the IG `overload/validate-bad-unknown`
-        // fixture expects the response to echo the LATEST stored CS
-        // version rather than the (irrelevant) requested one. Override
-        // by going straight to cs_version_for_msg in that case.
-        let cs_version: Option<String> = match system_for_msg.as_deref() {
+        // cs_version for the response and messages, SQLite's rules (only when
+        // the caller named the system): (1) the caller's exact version,
+        // (2) the matched concept's version, (3) the VS include pin when it is
+        // the only one for this system, (4) the latest stored version.
+        let cs_version: Option<String> = match req.system.as_deref() {
             Some(s) => {
-                if code_unknown_in_cs_anywhere {
-                    cs_version_for_msg(&client, s).await
-                } else {
-                    let from_req = req
-                        .version
-                        .as_deref()
-                        .filter(|v| !v.contains(".x") && *v != "x")
-                        .map(str::to_string);
-                    let from_found = found.as_ref().and_then(|c| c.version.clone());
-                    match from_req.or(from_found) {
-                        Some(v) => Some(v),
-                        None => cs_version_for_msg(&client, s).await,
-                    }
+                let from_req = req
+                    .version
+                    .as_deref()
+                    .filter(|v| !v.contains(".x") && *v != "x")
+                    .map(str::to_string);
+                let from_found = found.as_ref().and_then(|c| c.version.clone());
+                let pins = compose_json_for_version
+                    .as_deref()
+                    .and_then(|cj| vs_all_pinned_include_versions(cj, s));
+                let from_compose = match pins.as_deref() {
+                    Some([Some(v)]) if !v.contains(".x") && v.as_str() != "x" => Some(v.clone()),
+                    _ => None,
+                };
+                match from_req.or(from_found).or(from_compose) {
+                    Some(v) => Some(v),
+                    None => cs_version_for_msg(&client, s).await,
                 }
             }
             None => None,
@@ -1589,16 +1642,13 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             Some(s) => cs_content_for_url(&client, s).await.as_deref() == Some("fragment"),
             None => false,
         };
-        // Echo display lookup: when the caller didn't provide a display but
-        // the code lives in the underlying CS, look it up from `concepts` so
-        // finish_validate_code_response can emit the `display` Parameters
-        // entry. Drives IG `regex-bad/validate-regex-bad-2` (code in CS but
-        // not in VS, expected response echoes the CS display).
-        let cs_display_lookup: Option<String> = if !code_unknown_in_cs {
-            match system_for_msg.as_deref() {
-                Some(s) => pg_lookup_cs_display(&client, s, cs_version.as_deref(), &req.code).await,
-                None => None,
-            }
+        // Display echoed for a code that is in the CodeSystem but not in the
+        // ValueSet, when the caller sent none: the CodeSystem's display at the
+        // resolved version (never put into the not-in-vs message text).
+        let cs_display_lookup: Option<String> = if req.display.is_some() || code_unknown_in_cs {
+            None
+        } else if let (Some(sys), Some(ver)) = (system_for_msg.as_deref(), cs_version.as_deref()) {
+            pg_lookup_cs_display(&client, sys, Some(ver), &req.code).await
         } else {
             None
         };
@@ -1634,32 +1684,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
         }
         Ok(response)
-    }
-
-    async fn count(
-        &self,
-        _ctx: &TenantContext,
-        query: ResourceSearchQuery,
-    ) -> Result<u64, HtsError> {
-        self.count_search_matches("value_sets", query).await
-    }
-
-    /// Search ValueSet resources by query parameters.
-    ///
-    /// `url`, `version`, and `status` use exact matching. `name` and `title`
-    /// use normalized FHIR prefix matching by default and support `:contains`
-    /// and `:exact`. Multiple populated fields are ANDed.
-    async fn search(
-        &self,
-        _ctx: &TenantContext,
-        query: ResourceSearchQuery,
-    ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        super::search_table(&mut client, "value_sets", "ValueSet", query, true).await
     }
 }
 
@@ -4126,20 +4150,6 @@ pub(super) async fn is_concept_abstract(
 // version) and [`detect_vs_pin_unknown`] (caller did not pin a version but the
 // VS compose did). IG fixtures match the message text byte-for-byte, so the
 // strings and message_ids here must stay aligned with the SQLite source.
-
-/// Inline `code_systems` existence check. The trait method
-/// `code_system_exists` takes `&self` and a `TenantContext`, which we don't
-/// have at the helper boundary — this just runs the same EXISTS query.
-async fn code_system_exists_inline(client: &tokio_postgres::Client, url: &str) -> bool {
-    client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
-            &[&url],
-        )
-        .await
-        .map(|r| r.get::<_, bool>(0))
-        .unwrap_or(false)
-}
 
 /// Returns all non-null stored versions for a CS URL, sorted ascending for
 /// display in "Valid versions: X or Y" messages.

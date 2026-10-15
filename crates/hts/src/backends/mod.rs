@@ -265,6 +265,49 @@ fn typeahead_word_match(display: &str, query: &str) -> bool {
         .any(|word| word == query)
 }
 
+/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
+/// the map is already at `max` capacity.
+///
+/// The response and concept-flag caches are read under a shared (`read`) lock
+/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
+/// track per-entry recency: true LRU would require taking a write lock on every
+/// read to bump a recency counter, serializing the very lookups the cache
+/// exists to speed up. Instead, when the map is full we evict a single
+/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
+/// this is effectively random replacement) and admit the new key.
+///
+/// This replaces the previous "insert only while `len < max`" policy, which
+/// *froze* each cache once it filled: the first `max` distinct keys held their
+/// slots permanently and every later key missed forever, making the cache
+/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
+/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
+/// same memory ceiling while letting hot keys re-enter the cache.
+pub(crate) fn bounded_cache_insert<K, V, S>(
+    map: &mut std::collections::HashMap<K, V, S>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
+{
+    if max == 0 {
+        return;
+    }
+    // Only evict when inserting a genuinely new key would exceed the bound;
+    // overwriting an existing key does not grow the map.
+    if map.len() >= max && !map.contains_key(&key) {
+        // Clone one key to end the immutable borrow before removing. The keys
+        // here are small (`String` / `(String, String)`) and this only runs on
+        // a cache miss, so the clone is negligible next to the SQLite work that
+        // produced `value`.
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, value);
+}
+
 #[cfg(test)]
 mod precedence_tests {
     use super::*;
