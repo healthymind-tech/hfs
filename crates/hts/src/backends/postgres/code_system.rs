@@ -451,14 +451,22 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         )
         .await?;
 
-        find_concept(&client, &system_id, &req.code_a).await?;
-        find_concept(&client, &system_id, &req.code_b).await?;
+        // Both concept checks and both closure directions go out together
+        // (pipelined on the one connection); the errors keep SQLite's order
+        // (code A reported first).
+        let (found_a, found_b, (a_over_b, b_over_a)) = futures::join!(
+            find_concept(&client, &system_id, &req.code_a),
+            find_concept(&client, &system_id, &req.code_b),
+            closure_relation(&client, &system_id, &req.code_a, &req.code_b),
+        );
+        found_a?;
+        found_b?;
 
         let outcome = if req.code_a == req.code_b {
             SubsumptionOutcome::Equivalent
-        } else if check_ancestor(&client, &system_id, &req.code_a, &req.code_b).await? {
+        } else if a_over_b? {
             SubsumptionOutcome::Subsumes
-        } else if check_ancestor(&client, &system_id, &req.code_b, &req.code_a).await? {
+        } else if b_over_a? {
             SubsumptionOutcome::SubsumedBy
         } else {
             SubsumptionOutcome::NotSubsumed
@@ -905,44 +913,25 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         system_url: &str,
     ) -> Result<Vec<SupplementInfo>, HtsError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        // Mirrors the SQLite twin: bare or `|version`-qualified target match,
-        // one row per supplement URL in precedence order.
-        let sql = format!(
-            "SELECT url, version FROM code_systems \
-             WHERE content = 'supplement' \
-               AND ((resource_json->>'supplements') = $1 \
-                    OR (resource_json->>'supplements') LIKE $1 || '|%') \
-             ORDER BY url, {}",
-            crate::backends::cs_precedence_order_by("code_systems")
-        );
-        let rows = client
-            .query(&sql, &[&system_url])
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let mut out: Vec<SupplementInfo> = Vec::new();
-        for r in rows {
-            let url: String = r.get(0);
-            let version: Option<String> = r.get(1);
-            if out
-                .iter()
-                .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
-            {
-                continue;
-            }
-            out.push(SupplementInfo {
-                target_url: system_url.to_owned(),
-                supplement_canonical: match version {
-                    Some(v) => format!("{url}|{v}"),
-                    None => url,
-                },
-            });
+        if let Some(hit) = self
+            .meta
+            .supplements
+            .read()
+            .ok()
+            .and_then(|g| g.get(system_url).cloned())
+        {
+            return Ok(hit);
         }
-        Ok(out)
+        let found = self.supplements_for_system_uncached(system_url).await?;
+        if let Ok(mut w) = self.meta.supplements.write() {
+            crate::backends::bounded_cache_insert(
+                &mut *w,
+                system_url.to_owned(),
+                found.clone(),
+                super::PG_META_CACHE_MAX,
+            );
+        }
+        Ok(found)
     }
 
     async fn supplement_designations(
@@ -1204,19 +1193,15 @@ async fn find_concept(
     system_id: &str,
     code: &str,
 ) -> Result<(i64, Option<String>, Option<String>), HtsError> {
-    let rows = client
-        .query(
-            "SELECT id, display, definition FROM concepts
-             WHERE system_id = $1 AND code = $2",
-            &[&system_id, &code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| HtsError::NotFound(format!("Concept not found: {code}")))?;
+    let row = super::query_text_opt(
+        client,
+        "SELECT id, display, definition FROM concepts
+         WHERE system_id = $1 AND code = $2",
+        &[&system_id, &code],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+    .ok_or_else(|| HtsError::NotFound(format!("Concept not found: {code}")))?;
 
     Ok((row.get(0), row.get(1), row.get(2)))
 }
@@ -1227,10 +1212,10 @@ async fn fetch_properties(
     concept_id: i64,
 ) -> Result<Vec<PropertyValue>, HtsError> {
     let rows = client
-        .query(
+        .query_typed(
             "SELECT property, value_type, value
              FROM concept_properties WHERE concept_id = $1 ORDER BY property",
-            &[&concept_id],
+            &[(&concept_id, tokio_postgres::types::Type::INT8)],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -1257,49 +1242,49 @@ async fn fetch_synthesised_rows(
     let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
     let (parents, children, inactive) = futures::try_join!(
         async {
-            client
-                .query(
-                    "SELECT h.parent_code, c.display
+            super::query_text(
+                client,
+                "SELECT h.parent_code, c.display
                      FROM concept_hierarchy h
                      LEFT JOIN concepts c
                             ON c.system_id = h.system_id AND c.code = h.parent_code
                      WHERE h.system_id = $1 AND h.child_code = $2
                      ORDER BY h.parent_code",
-                    &[&system_id, &code],
-                )
-                .await
-                .map_err(db)
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(db)
         },
         async {
-            client
-                .query(
-                    "SELECT h.child_code, c.display
+            super::query_text(
+                client,
+                "SELECT h.child_code, c.display
                      FROM concept_hierarchy h
                      LEFT JOIN concepts c
                             ON c.system_id = h.system_id AND c.code = h.child_code
                      WHERE h.system_id = $1 AND h.parent_code = $2
                      ORDER BY h.child_code",
-                    &[&system_id, &code],
-                )
-                .await
-                .map_err(db)
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(db)
         },
         async {
-            client
-                .query_one(
-                    "SELECT EXISTS (
-                         SELECT 1 FROM concept_properties cp
-                         JOIN concepts c ON c.id = cp.concept_id
-                         WHERE c.system_id = $1
-                           AND c.code = $2
-                           AND cp.property = 'status'
-                           AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
-                     )",
-                    &[&system_id, &code],
-                )
-                .await
-                .map(|r| r.get::<_, bool>(0))
-                .map_err(db)
+            super::query_text(
+                client,
+                "SELECT EXISTS (
+                     SELECT 1 FROM concept_properties cp
+                     JOIN concepts c ON c.id = cp.concept_id
+                     WHERE c.system_id = $1
+                       AND c.code = $2
+                       AND cp.property = 'status'
+                       AND cp.value IN ('retired', 'deprecated', 'withdrawn', 'inactive')
+                 )",
+                &[&system_id, &code],
+            )
+            .await
+            .map(|rows| rows.first().is_some_and(|r| r.get::<_, bool>(0)))
+            .map_err(db)
         }
     )?;
     Ok(SynthRows {
@@ -1362,10 +1347,10 @@ async fn fetch_designations(
     concept_id: i64,
 ) -> Result<Vec<DesignationValue>, HtsError> {
     let rows = client
-        .query(
+        .query_typed(
             "SELECT language, use_system, use_code, value
              FROM concept_designations WHERE concept_id = $1",
-            &[&concept_id],
+            &[(&concept_id, tokio_postgres::types::Type::INT8)],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -1431,51 +1416,82 @@ async fn fetch_designations_cross_version(
         .collect())
 }
 
-/// Return `true` if `ancestor_code` is a (possibly indirect) ancestor of
-/// `descendant_code` within the given code system.
-///
-/// Uses a recursive CTE to walk up the parent chain.
-pub(super) async fn check_ancestor(
+/// `(a is an ancestor of b, b is an ancestor of a)` from one closure query —
+/// primary-key probes, as SQLite answers `$subsumes`. Only for a concept whose
+/// closure is not built yet (no self-link) is the hierarchy walked instead.
+async fn closure_relation(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    code_a: &str,
+    code_b: &str,
+) -> (Result<bool, HtsError>, Result<bool, HtsError>) {
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let row = match super::query_text_opt(
+        client,
+        "SELECT EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $3),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $2),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $3),
+                EXISTS(SELECT 1 FROM concept_closure
+                        WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $2)",
+        &[&system_id, &code_a, &code_b],
+    )
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return (Ok(false), Ok(false)),
+        Err(e) => {
+            let msg = error_chain(&e);
+            return (
+                Err(HtsError::StorageError(msg.clone())),
+                Err(HtsError::StorageError(msg)),
+            );
+        }
+    };
+    let (a_b, b_a, b_built, a_built): (bool, bool, bool, bool) =
+        (row.get(0), row.get(1), row.get(2), row.get(3));
+    let a_over_b = if a_b || b_built {
+        Ok(a_b)
+    } else {
+        hierarchy_ancestor(client, system_id, code_a, code_b)
+            .await
+            .map_err(db)
+    };
+    let b_over_a = if b_a || a_built {
+        Ok(b_a)
+    } else {
+        hierarchy_ancestor(client, system_id, code_b, code_a)
+            .await
+            .map_err(db)
+    };
+    (a_over_b, b_over_a)
+}
+
+/// Recursive walk of `concept_hierarchy` (closure not built yet).
+async fn hierarchy_ancestor(
     client: &tokio_postgres::Client,
     system_id: &str,
     ancestor_code: &str,
     descendant_code: &str,
-) -> Result<bool, HtsError> {
-    // One primary-key probe of the closure, as SQLite answers it. Only when
-    // the closure is not built for this concept (no self-link — a system whose
-    // build is still pending) walk the hierarchy instead.
-    let (in_closure, built): (bool, bool) = client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM concept_closure
-                            WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $3),
-                    EXISTS(SELECT 1 FROM concept_closure
-                            WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $3)",
-            &[&system_id, &ancestor_code, &descendant_code],
-        )
-        .await
-        .map(|r| (r.get(0), r.get(1)))
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    if in_closure || built {
-        return Ok(in_closure);
-    }
-    let rows = client
-        .query(
-            "WITH RECURSIVE ancestors(code) AS (
-                 SELECT parent_code
-                 FROM   concept_hierarchy
-                 WHERE  system_id = $1 AND child_code = $3
-                 UNION
-                 SELECT h.parent_code
-                 FROM   concept_hierarchy h
-                 INNER JOIN ancestors a ON a.code = h.child_code
-                 WHERE  h.system_id = $1
-             )
-             SELECT 1 FROM ancestors WHERE code = $2 LIMIT 1",
-            &[&system_id, &ancestor_code, &descendant_code],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
+) -> Result<bool, tokio_postgres::Error> {
+    let rows = super::query_text(
+        client,
+        "WITH RECURSIVE ancestors(code) AS (
+             SELECT parent_code
+             FROM   concept_hierarchy
+             WHERE  system_id = $1 AND child_code = $3
+             UNION
+             SELECT h.parent_code
+             FROM   concept_hierarchy h
+             INNER JOIN ancestors a ON a.code = h.child_code
+             WHERE  h.system_id = $1
+         )
+         SELECT 1 FROM ancestors WHERE code = $2 LIMIT 1",
+        &[&system_id, &ancestor_code, &descendant_code],
+    )
+    .await?;
     Ok(!rows.is_empty())
 }
 
@@ -1505,4 +1521,51 @@ pub(super) fn build_synthetic_resource(
         obj["title"] = t.into();
     }
     obj
+}
+
+impl PostgresTerminologyBackend {
+    /// `supplements_for_system` without the memo.
+    async fn supplements_for_system_uncached(
+        &self,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        // Mirrors the SQLite twin: bare or `|version`-qualified target match,
+        // one row per supplement URL in precedence order.
+        let sql = format!(
+            "SELECT url, version FROM code_systems \
+             WHERE content = 'supplement' \
+               AND ((resource_json->>'supplements') = $1 \
+                    OR (resource_json->>'supplements') LIKE $1 || '|%') \
+             ORDER BY url, {}",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
+        let rows = client
+            .query(&sql, &[&system_url])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        let mut out: Vec<SupplementInfo> = Vec::new();
+        for r in rows {
+            let url: String = r.get(0);
+            let version: Option<String> = r.get(1);
+            if out
+                .iter()
+                .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
+            {
+                continue;
+            }
+            out.push(SupplementInfo {
+                target_url: system_url.to_owned(),
+                supplement_canonical: match version {
+                    Some(v) => format!("{url}|{v}"),
+                    None => url,
+                },
+            });
+        }
+        Ok(out)
+    }
 }

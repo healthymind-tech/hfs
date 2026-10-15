@@ -405,6 +405,11 @@ pub struct SqliteTerminologyBackend {
     /// `resource_json` only to discard everything except `is_empty()`.
     /// Invalidated alongside the other per-instance caches on `import_bundle`.
     pub(crate) cs_exists_cache: Arc<RwLock<BoolMap>>,
+    /// `supplements_for_system` memo, keyed by the base CodeSystem URL. The
+    /// query reads `supplements` out of each supplement's `resource_json`,
+    /// i.e. parses every supplement's full JSON (megabytes for a translation
+    /// supplement of ICD-10) on every uncached `$lookup` / `$expand`.
+    pub(crate) supplements_cache: Arc<RwLock<HashMap<String, Vec<crate::traits::SupplementInfo>>>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -619,6 +624,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -777,6 +783,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1001,6 +1008,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         } = self;
 
         // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
@@ -1029,6 +1037,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         );
 
         // Process-global caches shared by every backend instance in this

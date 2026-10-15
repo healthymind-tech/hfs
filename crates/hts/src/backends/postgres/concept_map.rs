@@ -72,30 +72,38 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
 
         // A named ConceptMap that is not loaded is a 404, distinct from "no
         // match found" (mirrors SQLite `translate_sync`).
-        if let Some(url) = req.url.as_deref() {
-            let exists: bool = client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = $1)",
-                    &[&url],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-                .get(0);
-            if !exists {
-                return Err(HtsError::NotFound(format!("ConceptMap not found: {url}")));
-            }
+        // The map-exists probe and the element query go out together.
+        let (exists, rows) = futures::join!(
+            async {
+                match req.url.as_deref() {
+                    Some(url) => super::query_text_opt(
+                        &client,
+                        "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = $1)",
+                        &[&url],
+                    )
+                    .await
+                    .map(|r| r.is_some_and(|r| r.get::<_, bool>(0)))
+                    .map_err(|e| HtsError::StorageError(error_chain(&e))),
+                    None => Ok(true),
+                }
+            },
+            query_translate_elements(
+                &client,
+                lookup_code,
+                search_sys,
+                other_side_sys,
+                req.url.as_deref(),
+                reverse,
+                req.date.as_deref(),
+            )
+        );
+        if !exists? {
+            return Err(HtsError::NotFound(format!(
+                "ConceptMap not found: {}",
+                req.url.as_deref().unwrap_or("")
+            )));
         }
-
-        let mut rows = query_translate_elements(
-            &client,
-            lookup_code,
-            search_sys,
-            other_side_sys,
-            req.url.as_deref(),
-            reverse,
-            req.date.as_deref(),
-        )
-        .await?;
+        let mut rows = rows?;
 
         // Packages that encode several source codes as one comma-separated
         // string are stored one row per code; a client may still send the
@@ -340,10 +348,13 @@ async fn query_translate_elements(
            AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
     );
 
-    let rows = client
-        .query(&sql, &[&code, &system, &other_side_sys, &map_url, &date])
-        .await
-        .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;
+    let rows = super::query_text(
+        client,
+        &sql,
+        &[&code, &system, &other_side_sys, &map_url, &date],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;
 
     Ok(rows
         .into_iter()

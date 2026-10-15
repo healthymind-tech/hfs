@@ -81,6 +81,10 @@ pub(crate) struct PgMeta {
     /// `(0 = inactive | 1 = abstract, system url, code)` → flag.
     pub(super) concept_flags: RwLock<HashMap<(u8, String, String), bool>>,
     pub(super) vs_version: RwLock<HashMap<String, Option<String>>>,
+    /// `supplements_for_system` by base CodeSystem URL: the query reads
+    /// `supplements` out of every supplement's `resource_json` (megabytes
+    /// for an ICD-10 translation supplement) — ~140 ms uncached.
+    pub(super) supplements: RwLock<HashMap<String, Vec<crate::traits::SupplementInfo>>>,
 }
 
 impl PgMeta {
@@ -95,7 +99,8 @@ impl PgMeta {
             case_insensitive,
             prop_codes,
             concept_flags,
-            vs_version
+            vs_version,
+            supplements
         );
     }
 }
@@ -605,6 +610,37 @@ impl TerminologyCaches for PostgresTerminologyBackend {
         );
         meta.clear();
     }
+}
+
+/// Run `sql` with every parameter typed `TEXT` in a single round trip.
+///
+/// `Client::query` with a SQL string first prepares the statement (one round
+/// trip) and then executes it (a second); `query_typed` sends parse, bind and
+/// execute together because the parameter types are given. The hot lookup /
+/// validate / subsumes / translate queries bind only text, so this halves
+/// their latency against a remote (or proxied) server.
+pub(crate) async fn query_text(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let typed: Vec<(
+        &(dyn tokio_postgres::types::ToSql + Sync),
+        tokio_postgres::types::Type,
+    )> = params
+        .iter()
+        .map(|p| (*p, tokio_postgres::types::Type::TEXT))
+        .collect();
+    client.query_typed(sql, &typed).await
+}
+
+/// [`query_text`] returning the first row, if any.
+pub(crate) async fn query_text_opt(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Option<tokio_postgres::Row>, tokio_postgres::Error> {
+    Ok(query_text(client, sql, params).await?.into_iter().next())
 }
 
 /// Render an error together with its full `source()` chain.

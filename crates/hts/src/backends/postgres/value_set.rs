@@ -3885,14 +3885,14 @@ async fn validate_fhir_vs(
 
     match pattern {
         ImplicitVsPattern::AllConcepts => {
-            let row = client
-                .query_opt(
-                    "SELECT code, display FROM concepts \
-                     WHERE system_id = $1 AND code = $2",
-                    &[&system_id, &code],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+            let row = super::query_text_opt(
+                client,
+                "SELECT code, display FROM concepts \
+                 WHERE system_id = $1 AND code = $2",
+                &[&system_id, &code],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             Ok(row.map(|r| ExpansionContains {
                 system: cs_url.to_owned(),
@@ -4121,18 +4121,19 @@ async fn cs_is_case_insensitive_uncached(
 
 /// `true` when the code exists in the named CodeSystem (any version).
 async fn is_code_in_cs(client: &tokio_postgres::Client, system_url: &str, code: &str) -> bool {
-    client
-        .query_one(
-            "SELECT EXISTS(
-                 SELECT 1 FROM concepts c
-                 JOIN code_systems s ON s.id = c.system_id
-                 WHERE s.url = $1 AND c.code = $2
-             )",
-            &[&system_url, &code],
-        )
-        .await
-        .map(|r| r.get::<_, bool>(0))
-        .unwrap_or(false)
+    super::query_text_opt(
+        client,
+        "SELECT EXISTS(
+             SELECT 1 FROM concepts c
+             JOIN code_systems s ON s.id = c.system_id
+             WHERE s.url = $1 AND c.code = $2
+         )",
+        &[&system_url, &code],
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|r| r.get::<_, bool>(0))
 }
 
 /// Like [`is_code_in_cs`] but scoped to a specific stored CS version.
