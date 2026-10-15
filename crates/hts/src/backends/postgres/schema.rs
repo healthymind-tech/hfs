@@ -172,6 +172,10 @@ BEGIN
     END LOOP;
 END $$;
 
+-- Metadata listing (`GET /CodeSystem`, `/ValueSet`) orders by created_at.
+CREATE INDEX IF NOT EXISTS idx_code_systems_created_at ON code_systems(created_at);
+CREATE INDEX IF NOT EXISTS idx_value_sets_created_at ON value_sets(created_at);
+
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
 -- `version` carries the resolved CodeSystem version for each cached entry so
 -- that callers reading from the cache can echo the right CS version on
@@ -191,6 +195,8 @@ CREATE TABLE IF NOT EXISTS value_set_expansions (
 -- Legacy installs may have a value_set_expansions table without the `version`
 -- column; add it idempotently so upgrades round-trip.
 ALTER TABLE value_set_expansions ADD COLUMN IF NOT EXISTS version TEXT;
+-- Re-importing or deleting a CodeSystem drops the cached expansions over it.
+CREATE INDEX IF NOT EXISTS idx_value_set_expansions_system ON value_set_expansions(system_url);
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (

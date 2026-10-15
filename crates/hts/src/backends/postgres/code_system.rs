@@ -1780,6 +1780,23 @@ pub(super) async fn check_ancestor(
     ancestor_code: &str,
     descendant_code: &str,
 ) -> Result<bool, HtsError> {
+    // One primary-key probe of the closure, as SQLite answers it. Only when
+    // the closure is not built for this concept (no self-link — a system whose
+    // build is still pending) walk the hierarchy instead.
+    let (in_closure, built): (bool, bool) = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM concept_closure
+                            WHERE system_id = $1 AND ancestor_code = $2 AND descendant_code = $3),
+                    EXISTS(SELECT 1 FROM concept_closure
+                            WHERE system_id = $1 AND ancestor_code = $3 AND descendant_code = $3)",
+            &[&system_id, &ancestor_code, &descendant_code],
+        )
+        .await
+        .map(|r| (r.get(0), r.get(1)))
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    if in_closure || built {
+        return Ok(in_closure);
+    }
     let rows = client
         .query(
             "WITH RECURSIVE ancestors(code) AS (

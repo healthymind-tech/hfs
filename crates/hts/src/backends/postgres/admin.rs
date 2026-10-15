@@ -318,21 +318,40 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
                 break;
             }
         }
-        progress.set_phase("closure");
-        report.closure = c
-            .execute(
-                "DELETE FROM concept_closure WHERE system_id = $1",
-                &[&row.id],
-            )
-            .await
-            .map_err(pg)?;
-        report.hierarchy = c
-            .execute(
-                "DELETE FROM concept_hierarchy WHERE system_id = $1",
-                &[&row.id],
-            )
-            .await
-            .map_err(pg)?;
+        // Closure and hierarchy in bounded batches with progress, as SQLite
+        // does: SNOMED CT's ~10 M closure rows in one statement is one huge
+        // transaction with no progress and no cancellation point.
+        for (phase, table) in [
+            ("closure", "concept_closure"),
+            ("hierarchy", "concept_hierarchy"),
+        ] {
+            progress.set_phase(phase);
+            let total: i64 = c
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE system_id = $1"),
+                    &[&row.id],
+                )
+                .await
+                .map_err(pg)?
+                .get(0);
+            progress.set_total(total.max(0) as u64);
+            let sql = format!(
+                "DELETE FROM {table} WHERE ctid = ANY(ARRAY(
+                     SELECT ctid FROM {table} WHERE system_id = $1 LIMIT 50000))"
+            );
+            loop {
+                let n = c.execute(&sql, &[&row.id]).await.map_err(pg)?;
+                if phase == "closure" {
+                    report.closure += n;
+                } else {
+                    report.hierarchy += n;
+                }
+                progress.add(n);
+                if n == 0 {
+                    break;
+                }
+            }
+        }
         progress.set_phase("caches");
         report.expansion_cache = c
             .execute(
@@ -341,10 +360,14 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             )
             .await
             .map_err(pg)?;
-        c.execute("DELETE FROM code_systems WHERE id = $1", &[&row.id])
+        let deleted = c
+            .execute("DELETE FROM code_systems WHERE id = $1", &[&row.id])
             .await
-            .map_err(pg)?;
+            .map_err(pg);
+        // Rows may already be gone even when a later step failed: drop the
+        // caches either way (as SQLite does).
         self.invalidate_caches();
+        deleted?;
         Ok(report)
     }
 
