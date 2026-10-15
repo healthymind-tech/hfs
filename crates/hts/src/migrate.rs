@@ -778,8 +778,11 @@ pub async fn migrate_sqlite_to_postgres(opts: &MigrateOptions) -> anyhow::Result
         copy_resources(&opts.from, &opts.to).await?
     };
 
-    info!("ANALYZE");
-    client.batch_execute("ANALYZE").await?;
+    // VACUUM as well as ANALYZE: the freshly copied tables have no
+    // visibility map yet, so index-only scans (closure probes, concept
+    // lookups) would still visit the heap until autovacuum gets to them.
+    info!("VACUUM (ANALYZE)");
+    client.batch_execute("VACUUM (ANALYZE)").await?;
 
     // Closures the source did not have yet (e.g. a system imported while the
     // SQLite server was down) are built now rather than on first start.
