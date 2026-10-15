@@ -810,3 +810,104 @@ async fn inline_references_warnings_and_cycles() {
         "vs-invalid: Cyclic reference detected when excluding http://p.test/vs/cyc-a via"
     ));
 }
+
+/// Two includes of one system that overlap: both backends return the same
+/// expansion.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_includes() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    for (_, b, _) in &bs {
+        import(
+            b,
+            &bundle(vec![
+                property_cs(),
+                hierarchy_cs("http://example.org/cs-ov", false),
+            ]),
+        )
+        .await;
+    }
+    let vs = |compose: Value| ExpandRequest {
+        value_set: Some(
+            json!({"resourceType": "ValueSet", "status": "active", "compose": compose}),
+        ),
+        ..Default::default()
+    };
+    let sorted = |r: Result<(Vec<String>, Option<u32>), String>| {
+        r.map(|(mut c, t)| {
+            c.sort();
+            (c, t)
+        })
+    };
+    let props = same_on_all!(bs, |b| {
+        sorted(
+        expand(
+            b,
+            vs(json!({"include": [
+                {"system": "http://p.test/cs", "filter": [{"property": "colour", "op": "exists", "value": "true"}]},
+                {"system": "http://p.test/cs", "filter": [{"property": "colour", "op": "=", "value": "red"}]}
+            ]}))
+        )
+        .await
+    )
+    });
+    // Both backends currently repeat a code two includes select (a shared
+    // defect, recorded here so a change on either side is noticed).
+    assert_eq!(props.unwrap().0, ["A1", "A1", "A2"]);
+    let hier = same_on_all!(bs, |b| {
+        sorted(
+        expand(
+            b,
+            vs(json!({"include": [
+                {"system": "http://example.org/cs-ov", "filter": [{"property": "concept", "op": "is-a", "value": "child1"}]},
+                {"system": "http://example.org/cs-ov", "filter": [{"property": "concept", "op": "is-a", "value": "root"}]}
+            ]}))
+        )
+        .await
+    )
+    });
+    assert!(hier.is_ok());
+}
+
+/// Which expansions carry a per-code version (it decides how
+/// `used-codesystem` is reported): none for implicit ValueSets and for
+/// cacheable inline ones (SQLite serves those from indexes without it), the
+/// CodeSystem version for stored ValueSets. Second pass = steady state.
+#[tokio::test(flavor = "multi_thread")]
+async fn contains_versions() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![loinc_like()])).await;
+    }
+    let versions = |b: &Backend, req: ExpandRequest| {
+        let b = b.clone();
+        async move {
+            let r = b.expand(&ctx(), req).await.unwrap();
+            let mut v: Vec<Option<String>> = r.contains.iter().map(|c| c.version.clone()).collect();
+            v.dedup();
+            v
+        }
+    };
+    let inline = |filter: Option<&str>| ExpandRequest {
+        value_set: Some(inline_vs(json!({"system": "http://loinc.org"}))),
+        filter: filter.map(str::to_owned),
+        ..Default::default()
+    };
+    let vs = json!({
+        "resourceType": "ValueSet", "id": "all-l", "url": "http://p.test/vs/all-l",
+        "status": "active", "compose": {"include": [{"system": "http://loinc.org"}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![vs.clone()])).await;
+        let _ = versions(b, inline(None)).await;
+    }
+    let implicit = same_on_all!(bs, |b| versions(b, url_req("http://loinc.org/vs")).await);
+    assert_eq!(implicit, [None]);
+    let plain = same_on_all!(bs, |b| versions(b, inline(None)).await);
+    assert_eq!(plain, [None]);
+    let filtered = same_on_all!(bs, |b| versions(b, inline(Some("glucose"))).await);
+    assert_eq!(filtered, [None]);
+    let stored = same_on_all!(bs, |b| versions(b, url_req("http://p.test/vs/all-l")).await);
+    assert_eq!(stored, [Some("2.80".to_string())]);
+}

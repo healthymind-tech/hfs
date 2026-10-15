@@ -273,9 +273,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // Implicit ValueSets keep expansion order for text-filtered pages
         // (SQLite's implicit index); other expansions rank the hits.
         let mut implicit_result = false;
-        // Inline ValueSet: text-filtered hits carry no per-code version, as
-        // SQLite's inline text-filter path returns them.
-        let mut inline_result = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
             // ── `?fhir_vs` implicit ValueSet short-circuit (FHIR R4 §4.8.7) ──
             // A CodeSystem URL with `?fhir_vs` or `?fhir_vs=isa/<code>` is an
@@ -874,10 +871,16 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             )
                             .await?;
                             total_miss_guard(include_count, &codes, &warnings)?;
+                            let mut codes = codes;
+                            strip_cacheable_inline_versions(
+                                &mut codes,
+                                &warnings,
+                                contained_ref,
+                                &[],
+                            );
                             Ok::<_, HtsError>(std::sync::Arc::new(
                                 CachedExpansion::new(codes, /*implicit=*/ false)
-                                    .with_warnings(warnings)
-                                    .inline(),
+                                    .with_warnings(warnings),
                             ))
                         })
                         .await?;
@@ -897,8 +900,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 )
                 .await?;
                 total_miss_guard(include_count, &codes, &warnings)?;
+                let mut codes = codes;
+                strip_cacheable_inline_versions(
+                    &mut codes,
+                    &warnings,
+                    &contained_vec,
+                    &req.tx_resources,
+                );
                 expansion_warnings = warnings;
-                inline_result = true;
                 codes
             } else {
                 // No compose: nothing to expand (SQLite returns an empty
@@ -923,12 +932,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 warnings: expansion_warnings,
             });
         }
-        let mut cached =
-            CachedExpansion::new(all_codes, implicit_result).with_warnings(expansion_warnings);
-        if inline_result {
-            cached = cached.inline();
-        }
-        serve_from_cached(&cached, &req)
+        serve_from_cached(
+            &CachedExpansion::new(all_codes, implicit_result).with_warnings(expansion_warnings),
+            &req,
+        )
     }
 
     async fn value_set_version_for_url(
@@ -5468,8 +5475,6 @@ pub(crate) struct CachedExpansion {
     codes: Vec<ExpansionContains>,
     /// Expansion warnings (inline ValueSets), returned with every page.
     warnings: Vec<String>,
-    /// Inline ValueSet: text-filtered pages drop the per-code version.
-    inline: bool,
     /// Implicit ValueSet: text-filtered pages keep expansion order, as
     /// SQLite's implicit index serves them. Otherwise the hits are ranked
     /// with [`crate::backends::sort_typeahead_candidates`], as SQLite's
@@ -5573,15 +5578,9 @@ impl CachedExpansion {
         CachedExpansion {
             codes,
             warnings: Vec::new(),
-            inline: false,
             implicit,
             index: std::sync::OnceLock::new(),
         }
-    }
-
-    fn inline(mut self) -> Self {
-        self.inline = true;
-        self
     }
 
     fn with_warnings(mut self, warnings: Vec<String>) -> Self {
@@ -5661,11 +5660,6 @@ fn serve_from_cached(
                     .map(|&i| cached.codes[i as usize].clone())
                     .collect();
                 crate::backends::sort_typeahead_candidates(&mut ranked, &lower);
-                if cached.inline {
-                    for c in &mut ranked {
-                        c.version = None;
-                    }
-                }
                 (total, ranked.into_iter().skip(offset).take(count).collect())
             }
         }
@@ -5686,6 +5680,23 @@ fn serve_from_cached(
         contains: page,
         warnings: cached.warnings.clone(),
     })
+}
+
+/// An inline expansion SQLite caches (no warnings, no `contained[]`, no
+/// `tx-resource`s) is served from its inline-compose index, whose entries
+/// carry no per-code version; strip it the same way so `used-codesystem` is
+/// derived identically.
+fn strip_cacheable_inline_versions(
+    codes: &mut [ExpansionContains],
+    warnings: &[String],
+    contained: &[serde_json::Value],
+    tx_resources: &[serde_json::Value],
+) {
+    if warnings.is_empty() && contained.is_empty() && tx_resources.is_empty() {
+        for c in codes.iter_mut() {
+            c.version = None;
+        }
+    }
 }
 
 /// SQLite's total-miss guard for inline ValueSets: when every include failed
