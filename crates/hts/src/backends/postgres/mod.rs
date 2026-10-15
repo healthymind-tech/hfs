@@ -12,6 +12,10 @@ mod value_set;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
+
+/// A pooled connection: a `tokio_postgres::Client` with a per-connection
+/// prepared-statement cache.
+pub(crate) type PgClient = deadpool_postgres::ClientWrapper;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio_postgres::NoTls;
@@ -85,6 +89,20 @@ pub(crate) struct PgMeta {
     /// `supplements` out of every supplement's `resource_json` (megabytes
     /// for an ICD-10 translation supplement) — ~140 ms uncached.
     pub(super) supplements: RwLock<HashMap<String, Vec<crate::traits::SupplementInfo>>>,
+    /// `code_system_language` by CodeSystem URL.
+    pub(super) cs_language: RwLock<HashMap<String, Option<String>>>,
+    /// Supplement CodeSystem URL → `(storage id, "url|version")` rows.
+    pub(super) supplement_rows: RwLock<HashMap<String, Vec<(String, String)>>>,
+    /// CodeSystem URL → storage ids of its rows.
+    pub(super) url_system_ids: RwLock<HashMap<String, Vec<String>>>,
+    /// Supplement storage id → the codes it defines.
+    pub(super) supplement_codes: RwLock<HashMap<String, Arc<HashSet<String>>>>,
+    /// `code_system_version_for_url` by URL.
+    pub(super) latest_version: RwLock<HashMap<String, Option<String>>>,
+    /// `supplement_target` by supplement URL.
+    pub(super) supplement_target: RwLock<HashMap<String, Option<crate::traits::SupplementInfo>>>,
+    /// CodeSystem URL → codes of the `concept[]` tree in its stored JSON.
+    pub(super) json_concept_codes: RwLock<HashMap<String, Arc<HashSet<String>>>>,
 }
 
 impl PgMeta {
@@ -100,7 +118,14 @@ impl PgMeta {
             prop_codes,
             concept_flags,
             vs_version,
-            supplements
+            supplements,
+            cs_language,
+            supplement_rows,
+            url_system_ids,
+            supplement_codes,
+            latest_version,
+            supplement_target,
+            json_concept_codes
         );
     }
 }
@@ -264,8 +289,8 @@ async fn search_table(
          LIMIT $6 OFFSET $7",
         json = if metadata_only { "" } else { ", resource_json" }
     );
-    let rows = client
-        .query(
+    let rows = (**client)
+        .cq(
             &sql,
             &[
                 &query.url,
@@ -612,36 +637,147 @@ impl TerminologyCaches for PostgresTerminologyBackend {
     }
 }
 
-/// Run `sql` with every parameter typed `TEXT` in a single round trip.
+/// Run `sql` with every parameter typed `TEXT` through the connection's
+/// prepared-statement cache.
 ///
-/// `Client::query` with a SQL string first prepares the statement (one round
-/// trip) and then executes it (a second); `query_typed` sends parse, bind and
-/// execute together because the parameter types are given. The hot lookup /
-/// validate / subsumes / translate queries bind only text, so this halves
-/// their latency against a remote (or proxied) server.
+/// The first use on a connection prepares the statement (one extra round
+/// trip); later uses only bind and execute, and after a few executions
+/// PostgreSQL switches to a cached generic plan, so the hot lookup / validate
+/// / subsumes / translate queries skip parsing and planning (0.5–2 ms per
+/// statement on the production database with custom plans).
 pub(crate) async fn query_text(
-    client: &tokio_postgres::Client,
+    client: &PgClient,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    let typed: Vec<(
-        &(dyn tokio_postgres::types::ToSql + Sync),
-        tokio_postgres::types::Type,
-    )> = params
-        .iter()
-        .map(|p| (*p, tokio_postgres::types::Type::TEXT))
-        .collect();
-    client.query_typed(sql, &typed).await
+    const TEXT: tokio_postgres::types::Type = tokio_postgres::types::Type::TEXT;
+    let types = [TEXT; 8];
+    let stmt = if params.len() <= types.len() {
+        client
+            .prepare_typed_cached(sql, &types[..params.len()])
+            .await?
+    } else {
+        client
+            .prepare_typed_cached(sql, &vec![TEXT; params.len()])
+            .await?
+    };
+    client.query(&stmt, params).await
 }
 
 /// [`query_text`] returning the first row, if any.
 pub(crate) async fn query_text_opt(
-    client: &tokio_postgres::Client,
+    client: &PgClient,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Option<tokio_postgres::Row>, tokio_postgres::Error> {
     Ok(query_text(client, sql, params).await?.into_iter().next())
 }
+
+/// Statement-cached `query` / `query_opt` / `query_one` on a pooled
+/// connection (see [`query_text`]): the statement is prepared once per
+/// connection, later calls bind and execute only.
+pub(crate) trait CachedQuery {
+    fn cq<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<Output = Result<Vec<tokio_postgres::Row>, tokio_postgres::Error>>
+    + Send
+    + 'a;
+    fn cq_opt<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<
+        Output = Result<Option<tokio_postgres::Row>, tokio_postgres::Error>,
+    > + Send
+    + 'a;
+    fn cq_one<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<Output = Result<tokio_postgres::Row, tokio_postgres::Error>> + Send + 'a;
+}
+
+impl CachedQuery for PgClient {
+    fn cq<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<Output = Result<Vec<tokio_postgres::Row>, tokio_postgres::Error>>
+    + Send
+    + 'a {
+        async move {
+            let stmt = self.prepare_cached(sql).await?;
+            self.query(&stmt, params).await
+        }
+    }
+    fn cq_opt<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<
+        Output = Result<Option<tokio_postgres::Row>, tokio_postgres::Error>,
+    > + Send
+    + 'a {
+        async move {
+            let stmt = self.prepare_cached(sql).await?;
+            self.query_opt(&stmt, params).await
+        }
+    }
+    fn cq_one<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> impl std::future::Future<Output = Result<tokio_postgres::Row, tokio_postgres::Error>> + Send + 'a
+    {
+        async move {
+            let stmt = self.prepare_cached(sql).await?;
+            self.query_one(&stmt, params).await
+        }
+    }
+}
+
+/// Statement-cached writes for the import path: `write_*` run on a pooled
+/// connection or a transaction / savepoint of one, all of which keep a
+/// per-connection prepared-statement cache, so each statement is parsed once
+/// per connection instead of once per resource (two round trips → one).
+trait CachedWrite: GenericClient {
+    async fn cexec(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<u64, tokio_postgres::Error> {
+        let stmt = self.prepare_cached(sql).await?;
+        self.execute(&stmt, params).await
+    }
+    async fn cquery(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+        let stmt = self.prepare_cached(sql).await?;
+        self.query(&stmt, params).await
+    }
+    async fn cquery_opt(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Option<tokio_postgres::Row>, tokio_postgres::Error> {
+        let stmt = self.prepare_cached(sql).await?;
+        self.query_opt(&stmt, params).await
+    }
+    async fn cquery_one(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<tokio_postgres::Row, tokio_postgres::Error> {
+        let stmt = self.prepare_cached(sql).await?;
+        self.query_one(&stmt, params).await
+    }
+}
+
+impl<T: GenericClient + ?Sized> CachedWrite for T {}
 
 /// Render an error together with its full `source()` chain.
 ///
@@ -835,61 +971,16 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────
 
-#[async_trait]
-impl BundleImportBackend for PostgresTerminologyBackend {
-    /// Parse a FHIR Bundle via the shared [`bundle_parser`] and write all
-    /// contained resources into the PostgreSQL normalized tables.
-    async fn import_bundle(
+impl PostgresTerminologyBackend {
+    /// Write a bundle with a savepoint per resource: one failing statement
+    /// aborts the whole PostgreSQL transaction, so without them a single bad
+    /// resource would discard every other one in the bundle. With them a
+    /// failure drops just that resource and is reported, like SQLite.
+    async fn import_guarded(
         &self,
-        ctx: &TenantContext,
-        data: &[u8],
+        client: &mut deadpool_postgres::Object,
+        parsed: &bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError> {
-        let parsed = bundle_parser::parse_bundle(data)?;
-        self.import_parsed(ctx, parsed).await
-    }
-
-    /// Write an already-parsed bundle, skipping the JSON parse step.
-    async fn import_parsed(
-        &self,
-        _ctx: &TenantContext,
-        parsed: bundle_parser::ParsedBundle,
-    ) -> Result<ImportStats, HtsError> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        // Before the transaction: record which CodeSystems currently have zero
-        // concepts in the DB so the post-commit closure build only touches
-        // newly-imported (or empty-stub) systems. Systems being updated in a
-        // batch import (e.g. SNOMED RF2 chunks) skip the per-batch rebuild
-        // because rebuilding per chunk is O(n²) — the SNOMED full closure
-        // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
-        // Mirrors the SQLite import_bundle pattern.
-        // Probed with EXISTS rather than COUNT(*): the answer only
-        // distinguishes empty from non-empty, and a COUNT over an
-        // ever-growing concept set would make each batch of a chunked bulk
-        // load scan all previously imported rows.
-        let mut systems_needing_closure: Vec<String> = Vec::new();
-        for cs in &parsed.code_systems {
-            let row = client
-                .query_opt(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM concepts c
-                         JOIN code_systems s ON c.system_id = s.id
-                         WHERE s.url = $1
-                     )",
-                    &[&cs.url],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
-            if !has_concepts {
-                systems_needing_closure.push(cs.url.clone());
-            }
-        }
-
         let mut tx = client.transaction().await.map_err(|e| {
             HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
         })?;
@@ -897,11 +988,6 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
-        // Each resource is written under its own savepoint: one failing
-        // statement aborts the whole PostgreSQL transaction, so without them a
-        // single bad resource would silently discard every other one in the
-        // bundle (while still reporting their counts). With them a failure
-        // drops just that resource and is reported, like SQLite.
         macro_rules! guarded {
             ($kind:literal, $url:expr, |$c:ident| $write:expr) => {{
                 let sp = tx.savepoint("hts_resource").await.map_err(|e| {
@@ -960,6 +1046,108 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         tx.commit().await.map_err(|e| {
             HtsError::StorageError(format!("Commit transaction: {}", error_chain(&e)))
         })?;
+        Ok(stats)
+    }
+}
+
+#[async_trait]
+impl BundleImportBackend for PostgresTerminologyBackend {
+    /// Parse a FHIR Bundle via the shared [`bundle_parser`] and write all
+    /// contained resources into the PostgreSQL normalized tables.
+    async fn import_bundle(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+    ) -> Result<ImportStats, HtsError> {
+        let parsed = bundle_parser::parse_bundle(data)?;
+        self.import_parsed(ctx, parsed).await
+    }
+
+    /// Write an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+
+        // Before the transaction: record which CodeSystems currently have zero
+        // concepts in the DB so the post-commit closure build only touches
+        // newly-imported (or empty-stub) systems. Systems being updated in a
+        // batch import (e.g. SNOMED RF2 chunks) skip the per-batch rebuild
+        // because rebuilding per chunk is O(n²) — the SNOMED full closure
+        // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
+        // Mirrors the SQLite import_bundle pattern.
+        // Probed with EXISTS rather than COUNT(*): the answer only
+        // distinguishes empty from non-empty, and a COUNT over an
+        // ever-growing concept set would make each batch of a chunked bulk
+        // load scan all previously imported rows.
+        let mut systems_needing_closure: Vec<String> = Vec::new();
+        for cs in &parsed.code_systems {
+            let row = client
+                .query_opt(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = $1
+                     )",
+                    &[&cs.url],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+            if !has_concepts {
+                systems_needing_closure.push(cs.url.clone());
+            }
+        }
+
+        // First attempt: the whole bundle in one transaction without
+        // savepoints (two round trips per resource fewer). Only when a
+        // resource fails is the bundle rolled back and written again with a
+        // savepoint per resource, below.
+        let optimistic = {
+            let tx = client.transaction().await.map_err(|e| {
+                HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
+            })?;
+            let mut stats = ImportStats::default();
+            stats.errors.extend(parsed.parse_errors.iter().cloned());
+            let res: Result<(), HtsError> = async {
+                for cs in &parsed.code_systems {
+                    write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await?;
+                }
+                for vs in &parsed.value_sets {
+                    write_value_set(&tx, vs, &mut stats).await?;
+                }
+                for cm in &parsed.concept_maps {
+                    write_concept_map(&tx, cm, &mut stats).await?;
+                }
+                Ok(())
+            }
+            .await;
+            match res {
+                Ok(()) => {
+                    tx.commit().await.map_err(|e| {
+                        HtsError::StorageError(format!("Commit transaction: {}", error_chain(&e)))
+                    })?;
+                    Some(stats)
+                }
+                Err(_) => {
+                    tx.rollback().await.map_err(|e| {
+                        HtsError::StorageError(format!("Rollback: {}", error_chain(&e)))
+                    })?;
+                    None
+                }
+            }
+        };
+
+        let stats = match optimistic {
+            Some(stats) => stats,
+            None => self.import_guarded(&mut client, &parsed).await?,
+        };
 
         // Closure maintenance, as SQLite does it (`import_parsed_sync`):
         // `write_code_system` dropped the closure of every row it wrote.
@@ -1246,7 +1434,7 @@ async fn write_code_system(
     // sqlite/import/fhir_bundle.rs:189-215.
     let preferred_id = crate::import::fhir_bundle::storage_id_for(&cs.id, cs.version.as_deref());
     let existing_for_url_version: Option<String> = client
-        .query_opt(
+        .cquery_opt(
             "SELECT id FROM code_systems \
              WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
             &[&cs.url, &cs.version],
@@ -1258,7 +1446,7 @@ async fn write_code_system(
         id
     } else {
         let preferred_taken: bool = client
-            .query_one(
+            .cquery_one(
                 "SELECT EXISTS(SELECT 1 FROM code_systems WHERE id = $1)",
                 &[&preferred_id],
             )
@@ -1278,7 +1466,7 @@ async fn write_code_system(
     // a URL. `ON CONFLICT DO NOTHING` keeps a prior row in place; the UPDATE
     // below then refreshes its mutable columns by (url, version).
     client
-        .execute(
+        .cexec(
             "INSERT INTO code_systems
              (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
               authority_rank, version_sort)
@@ -1320,7 +1508,7 @@ async fn write_code_system(
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
     let cs_rows = client
-        .query(
+        .cquery(
             &cs_update,
             &[
                 &cs.name,
@@ -1373,7 +1561,7 @@ async fn write_code_system(
     // this, a partial closure from an earlier batch would be mistakenly treated
     // as complete. Mirrors sqlite/import/fhir_bundle.rs.
     client
-        .execute(
+        .cexec(
             "DELETE FROM concept_closure WHERE system_id = $1",
             &[&system_id],
         )
@@ -1405,7 +1593,7 @@ async fn write_concept_batch(
     let displays: Vec<Option<&str>> = batch.iter().map(|c| c.display.as_deref()).collect();
     let definitions: Vec<Option<&str>> = batch.iter().map(|c| c.definition.as_deref()).collect();
     let rows = client
-        .query(
+        .cquery(
             "INSERT INTO concepts (system_id, code, display, definition)
              SELECT $1, code, display, definition
              FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(code, display, definition)
@@ -1430,14 +1618,14 @@ async fn write_concept_batch(
     if !skip_child_delete {
         let all: Vec<i64> = ids.values().copied().collect();
         client
-            .execute(
+            .cexec(
                 "DELETE FROM concept_properties WHERE concept_id = ANY($1)",
                 &[&all],
             )
             .await
             .map_err(db)?;
         client
-            .execute(
+            .cexec(
                 "DELETE FROM concept_designations WHERE concept_id = ANY($1)",
                 &[&all],
             )
@@ -1482,7 +1670,7 @@ async fn write_concept_batch(
     }
     if !parents.is_empty() {
         client
-            .execute(
+            .cexec(
                 "INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
                  SELECT $1, p, c FROM UNNEST($2::text[], $3::text[]) AS t(p, c)
                  ON CONFLICT DO NOTHING",
@@ -1493,7 +1681,7 @@ async fn write_concept_batch(
     }
     if !p_ids.is_empty() {
         client
-            .execute(
+            .cexec(
                 "INSERT INTO concept_properties (concept_id, property, value_type, value)
                  SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[])",
                 &[&p_ids, &p_codes, &p_types, &p_values],
@@ -1503,7 +1691,7 @@ async fn write_concept_batch(
     }
     if !d_ids.is_empty() {
         client
-            .execute(
+            .cexec(
                 "INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
                  SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[])",
                 &[&d_ids, &d_langs, &d_systems, &d_codes, &d_values],
@@ -1525,7 +1713,7 @@ async fn write_value_set(
     // Invalidate the expansion cache of the (url, version) row being
     // re-imported — not of whichever version of the url comes first.
     client
-        .execute(
+        .cexec(
             "DELETE FROM value_set_expansions WHERE value_set_id IN \
              (SELECT id FROM value_sets \
               WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, ''))",
@@ -1546,7 +1734,7 @@ async fn write_value_set(
     // Mirrors sqlite/import/fhir_bundle.rs:443-478.
     let preferred_id = crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
     let existing_for_url_version: Option<String> = client
-        .query_opt(
+        .cquery_opt(
             "SELECT id FROM value_sets \
              WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
             &[&vs.url, &vs.version],
@@ -1558,7 +1746,7 @@ async fn write_value_set(
         id
     } else {
         let preferred_taken: bool = client
-            .query_one(
+            .cquery_one(
                 "SELECT EXISTS(SELECT 1 FROM value_sets WHERE id = $1)",
                 &[&preferred_id],
             )
@@ -1573,7 +1761,7 @@ async fn write_value_set(
     };
 
     client
-        .execute(
+        .cexec(
             "INSERT INTO value_sets
              (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
               authority_rank, version_sort)
@@ -1611,7 +1799,7 @@ async fn write_value_set(
         unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
     );
     client
-        .execute(
+        .cexec(
             &vs_update,
             &[
                 &vs.name,
@@ -1646,14 +1834,14 @@ async fn write_concept_map(
     // ends up under the new id even when only the url matched, and an id that
     // moved to a new url does not fail the import.
     client
-        .execute(
+        .cexec(
             "DELETE FROM concept_maps WHERE id = $1 OR url = $2",
             &[&cm.id, &cm.url],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     client
-        .execute(
+        .cexec(
             "INSERT INTO concept_maps
              (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -1681,7 +1869,7 @@ async fn write_concept_map(
         let tgt_code: Vec<&str> = chunk.iter().map(|e| e.target_code.as_str()).collect();
         let equiv: Vec<&str> = chunk.iter().map(|e| e.equivalence.as_str()).collect();
         client
-            .execute(
+            .cexec(
                 "INSERT INTO concept_map_elements
                  (map_id, source_system, source_code, target_system, target_code, equivalence)
                  SELECT $1, * FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[])

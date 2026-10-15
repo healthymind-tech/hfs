@@ -2,6 +2,7 @@
 
 #![cfg(feature = "postgres")]
 
+use super::CachedQuery;
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
@@ -204,7 +205,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 crate::backends::cs_precedence_order_by("code_systems")
             );
             let id_rows = client
-                .query(&sql, &[system_url])
+                .cq(&sql, &[system_url])
                 .await
                 .map_err(|e| HtsError::StorageError(format!("DB error: {}", error_chain(&e))))?;
 
@@ -311,7 +312,7 @@ struct TranslateRow {
 /// `other_side_sys` restricts the result-side system (target side in forward
 /// mode, source side in reverse mode).
 async fn query_translate_elements(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     code: &str,
     system: Option<&str>,
     other_side_sys: Option<&str>,
@@ -374,13 +375,13 @@ async fn query_translate_elements(
 /// Returns `true` if `ancestor_code` is a (possibly transitive) ancestor of
 /// `descendant_code` in the given code system.
 async fn is_ancestor_of(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_id: &str,
     ancestor_code: &str,
     descendant_code: &str,
 ) -> Result<bool, HtsError> {
     let rows = client
-        .query(
+        .cq(
             "WITH RECURSIVE ancestors(code) AS (
                 SELECT parent_code
                 FROM concept_hierarchy

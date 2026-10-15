@@ -960,3 +960,97 @@ async fn stored_expansion_first_and_cached_shape() {
     let later = same_on_all!(bs, |b| expand(b, req(Some(10), Some(1))).await);
     assert_eq!(later, Ok((vec!["child2".into(), "grand1".into()], Some(3))));
 }
+
+/// Supplement designations and properties, before and after the supplement
+/// is imported (the PostgreSQL metadata memos must notice the new
+/// supplement), and the base CodeSystem's inline concept entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn supplements_reach_lookup_helpers_after_import() {
+    use helios_hts::traits::CodeSystemOperations;
+    let _g = SERIAL.lock().await;
+    let bs = backends().await;
+    let base = json!({
+        "resourceType": "CodeSystem", "id": "supp-base", "url": "http://parity.test/supp-base",
+        "version": "1", "status": "active", "content": "complete",
+        "concept": [{"code": "a", "display": "Alpha"}, {"code": "b", "display": "Beta"}]
+    });
+    let supp = json!({
+        "resourceType": "CodeSystem", "id": "supp-de", "url": "http://parity.test/supp-de",
+        "version": "2", "status": "active", "content": "supplement",
+        "supplements": "http://parity.test/supp-base",
+        "concept": [{"code": "a", "designation": [{"language": "de", "value": "Alfa"}],
+                     "property": [{"code": "note", "valueString": "n-a"}]}]
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![base.clone()])).await;
+    }
+    let urls = vec!["http://parity.test/supp-de".to_string()];
+    let codes = vec!["a".to_string(), "b".to_string()];
+    let probe = |b: &Backend| {
+        let (urls, codes) = (urls.clone(), codes.clone());
+        let b = b.clone();
+        async move {
+            let target = b
+                .supplement_target(&ctx(), "http://parity.test/supp-de")
+                .await
+                .unwrap()
+                .map(|i| (i.target_url, i.supplement_canonical));
+            let mut d: Vec<(String, String, Option<String>)> = b
+                .supplement_designations(&ctx(), &urls, &codes)
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|(c, v)| v.into_iter().map(move |x| (c.clone(), x.value, x.source)))
+                .collect();
+            d.sort();
+            let mut p: Vec<(String, String, String)> = b
+                .supplement_property_values(&ctx(), &urls, &codes, &[])
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|(c, v)| v.into_iter().map(move |(k, x)| (c.clone(), k, x)))
+                .collect();
+            p.sort();
+            let mut entries: Vec<String> = b
+                .concept_resource_entries(&ctx(), "http://parity.test/supp-base", &codes)
+                .await
+                .unwrap()
+                .into_keys()
+                .collect();
+            entries.sort();
+            let version = b
+                .code_system_version_for_url(&ctx(), "http://parity.test/supp-base")
+                .await
+                .unwrap();
+            (target, d, p, entries, version)
+        }
+    };
+    let before = same_on_all!(bs, |b| probe(b).await);
+    assert_eq!(before.0, None);
+    assert!(before.1.is_empty() && before.2.is_empty());
+    assert_eq!(before.3, ["a", "b"]);
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![supp.clone()])).await;
+    }
+    let after = same_on_all!(bs, |b| probe(b).await);
+    assert_eq!(
+        after.0,
+        Some((
+            "http://parity.test/supp-base".into(),
+            "http://parity.test/supp-de|2".into()
+        ))
+    );
+    assert_eq!(
+        after.1,
+        [(
+            "a".to_string(),
+            "Alfa".to_string(),
+            Some("http://parity.test/supp-de|2".to_string())
+        )]
+    );
+    assert_eq!(
+        after.2,
+        [("a".to_string(), "note".to_string(), "n-a".to_string())]
+    );
+    assert_eq!(after.4.as_deref(), Some("1"));
+}

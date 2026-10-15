@@ -2,6 +2,7 @@
 
 #![cfg(feature = "postgres")]
 
+use super::CachedQuery;
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use std::collections::{HashMap, HashSet};
@@ -365,7 +366,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     // then serves warm from the cached prefix.
                     let prefix_limit = (CLOSURE_PREFIX_LEN as i64) + 1;
                     let rows = client
-                        .query(
+                        .cq(
                             "SELECT cc.descendant_code, c.display
                                FROM concept_closure cc
                                JOIN concepts c
@@ -396,7 +397,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         c
                     } else {
                         let total_row = client
-                            .query_one(
+                            .cq_one(
                                 "SELECT COUNT(*) FROM concept_closure \
                                   WHERE system_id = $1 AND ancestor_code = $2",
                                 &[&system_id, &root_code],
@@ -773,7 +774,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 c
                             } else {
                                 let total_row = client
-                                    .query_one(
+                                    .cq_one(
                                         "SELECT COUNT(*) FROM concept_closure \
                                           WHERE system_id = $1 AND ancestor_code = $2",
                                         &[&system_id_isa, &root_code_isa],
@@ -821,7 +822,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                       LIMIT $3 OFFSET $4"
                             };
                             let rows = client
-                                .query(page_sql, &[&system_id_isa, &root_code_isa, &limit, &offset])
+                                .cq(page_sql, &[&system_id_isa, &root_code_isa, &limit, &offset])
                                 .await
                                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -1774,7 +1775,7 @@ impl PostgresTerminologyBackend {
 /// NotFound). When `version` is `None`, the highest-versioned row sharing
 /// the URL wins.
 async fn resolve_value_set_versioned(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     url: &str,
     version: Option<&str>,
     date: Option<&str>,
@@ -1787,7 +1788,7 @@ async fn resolve_value_set_versioned(
         crate::backends::vs_precedence_order_by("value_sets")
     );
     let rows = client
-        .query(&sql, &[&url, &date])
+        .cq(&sql, &[&url, &date])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -1818,11 +1819,11 @@ async fn resolve_value_set_versioned(
 
 /// Fetch all cached expansion entries for `vs_id`.
 async fn fetch_cache(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     vs_id: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let rows = client
-        .query(
+        .cq(
             "SELECT system_url, code, display, version
              FROM value_set_expansions
              WHERE value_set_id = $1
@@ -1934,7 +1935,7 @@ fn compose_has_multi_version_pins(compose_json: Option<&str>) -> bool {
 /// `expand` and `validate_code` callers — sets up the recursion context
 /// (depth 0, empty `visited` set).
 async fn compute_expansion(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
@@ -1960,7 +1961,7 @@ async fn compute_expansion(
 /// cycles, depth limit) are returned for `expansion.parameter`. SQLite's
 /// `InlineResolutionContext` path.
 async fn compute_expansion_inline(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     compose_json: Option<&str>,
     force_system_versions: &HashMap<String, String>,
@@ -2076,7 +2077,7 @@ impl<'a> PgExpandCtx<'a> {
 /// skips the nested reference. Mirrors SQLite's
 /// `compute_expansion_depth_inner` / `expand_includes_per_clause`.
 fn compute_expansion_inner<'a>(
-    client: &'a tokio_postgres::Client,
+    client: &'a super::PgClient,
     compose_json: Option<&'a str>,
     ctx: &'a PgExpandCtx<'a>,
     depth: u8,
@@ -2092,7 +2093,7 @@ fn compute_expansion_inner<'a>(
 }
 
 async fn compute_expansion_inner_body(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     compose_json: Option<&str>,
     ctx: &PgExpandCtx<'_>,
     depth: u8,
@@ -2260,7 +2261,7 @@ async fn compute_expansion_inner_body(
                 // Mirrors sqlite/value_set.rs:3392-3429.
                 if let Some(inc_ver) = inc_version {
                     let any_row: bool = client
-                        .query_one(
+                        .cq_one(
                             "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
                             &[&system_url],
                         )
@@ -2311,7 +2312,7 @@ async fn compute_expansion_inner_body(
         // Mirrors the SQLite `cs_version.clone()` writes in
         // `sqlite/value_set.rs:compute_expansion_with_versions`.
         let cs_version: Option<String> = client
-            .query_opt(
+            .cq_opt(
                 "SELECT version FROM code_systems WHERE id = $1",
                 &[&system_id],
             )
@@ -2357,15 +2358,12 @@ async fn compute_expansion_inner_body(
                     .filter_map(|e| e["code"].as_str())
                     .collect();
                 let rows = client
-                    .query_typed(
+                    .cq(
                         "SELECT c.code, c.display
                            FROM UNNEST($2::text[]) WITH ORDINALITY AS l(code, ord)
-                           JOIN concepts c ON c.system_id = $1 AND c.code = l.code
+                           JOIN concepts c ON c.system_id = $1::text AND c.code = l.code
                           ORDER BY l.ord",
-                        &[
-                            (&system_id, tokio_postgres::types::Type::TEXT),
-                            (&listed, tokio_postgres::types::Type::TEXT_ARRAY),
-                        ],
+                        &[&system_id, &listed],
                     )
                     .await
                     .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -2396,7 +2394,7 @@ async fn compute_expansion_inner_body(
                 // enumerated codes the lookup dropped (SQLite twin, T8).
                 if seen_codes.len() < explicit_codes.len() {
                     let has_concepts: bool = client
-                        .query_one(
+                        .cq_one(
                             "SELECT EXISTS(SELECT 1 FROM concepts WHERE system_id = $1)",
                             &[&system_id],
                         )
@@ -2440,7 +2438,7 @@ async fn compute_expansion_inner_body(
                 }
                 for parent_code in abstract_codes_in_set {
                     let child_rows = client
-                        .query(
+                        .cq(
                             "SELECT c.code, c.display
                                FROM concept_hierarchy h
                                JOIN concepts c
@@ -2480,7 +2478,7 @@ async fn compute_expansion_inner_body(
                 // autoincrement column doubles as a stable definition-order
                 // column. Mirrors sqlite/value_set.rs:3547-3556.
                 let code_rows = client
-                    .query(
+                    .cq(
                         "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY id",
                         &[&system_id],
                     )
@@ -2701,7 +2699,7 @@ async fn compute_expansion_inner_body(
                         .collect()
                 } else {
                     let rows = client
-                        .query(
+                        .cq(
                             "SELECT code FROM concepts WHERE system_id = $1",
                             &[&exc_system_id],
                         )
@@ -2767,7 +2765,7 @@ async fn compute_expansion_inner_body(
 ///   `default-valueset-version` pin is honoured; an unresolvable pin is a
 ///   NotFound), served from its persistent expansion cache when it has one.
 async fn pg_expand_vs_reference(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     ref_url: &str,
     depth: u8,
     ctx: &PgExpandCtx<'_>,
@@ -2853,7 +2851,7 @@ async fn pg_expand_vs_reference(
 /// the include. TODO: parity — these are handled in SQLite via
 /// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
 async fn apply_compose_filters_pg(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
@@ -3163,7 +3161,7 @@ async fn apply_compose_filters_pg(
 /// =true marker, which silently included unannotated codes the IG
 /// expects filtered out).
 async fn pg_filter_property_eq(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
@@ -3179,7 +3177,7 @@ async fn pg_filter_property_eq(
     // scan every concept in the system and probe per row — ~350k probes for
     // SNOMED, the dominant cost of cold EX05 property-filter expansions.
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concepts c
               WHERE c.system_id = $1
@@ -3207,7 +3205,7 @@ async fn pg_filter_property_eq(
 /// "select every concept whose `notSelectable` is NOT `true` (or absent)".
 /// Mirrors sqlite/value_set.rs:3998-4021.
 async fn pg_filter_property_ne(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
@@ -3217,7 +3215,7 @@ async fn pg_filter_property_ne(
     let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
 
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concepts c
               WHERE c.system_id = $1
@@ -3250,13 +3248,13 @@ fn pg_split_filter_values(value: &str) -> Vec<&str> {
 
 /// The listed codes that exist in `system_id` (`property=concept, op=in`).
 async fn pg_filter_codes_in(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_id: &str,
     codes: &[&str],
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
     let owned: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concepts c
               WHERE c.system_id = $1 AND c.code = ANY($2::text[])",
@@ -3274,7 +3272,7 @@ async fn pg_filter_codes_in(
 /// the FHIR `exists` operator. Honours locally-renamed property aliases like
 /// the equality filters.
 async fn pg_filter_property_exists(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     system_id: &str,
@@ -3300,7 +3298,7 @@ async fn pg_filter_property_exists(
             )"
     };
     let rows = client
-        .query(sql, &[&system_id, &property_aliases])
+        .cq(sql, &[&system_id, &property_aliases])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(rows
@@ -3312,7 +3310,7 @@ async fn pg_filter_property_exists(
 /// `generalizes`: every ancestor of `value_code` plus the code itself (the
 /// closure stores self-links). Mirrors the SQLite `query_ancestors_full`.
 async fn pg_filter_generalizes(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     system_id: &str,
     value_code: &str,
@@ -3323,7 +3321,7 @@ async fn pg_filter_generalizes(
         )));
     }
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concept_closure cc
                JOIN concepts c ON c.system_id = $1 AND c.code = cc.ancestor_code
@@ -3352,7 +3350,7 @@ async fn pg_filter_generalizes(
 /// migration?), an empty result falls through here — same UX as an unknown
 /// root code.
 async fn pg_filter_is_a(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     system_id: &str,
     root_code: &str,
@@ -3364,7 +3362,7 @@ async fn pg_filter_is_a(
     }
 
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concept_closure cc
                JOIN concepts c ON c.system_id = $1 AND c.code = cc.descendant_code
@@ -3384,7 +3382,7 @@ async fn pg_filter_is_a(
 /// Mirrors the SQLite `child-of` filter semantics: returns the codes whose
 /// `concept_hierarchy.parent_code` literally equals the supplied code.
 async fn pg_filter_child_of(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     system_id: &str,
     parent_code: &str,
@@ -3396,7 +3394,7 @@ async fn pg_filter_child_of(
     }
 
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display
                FROM concept_hierarchy h
                JOIN concepts c
@@ -3419,7 +3417,7 @@ async fn pg_filter_child_of(
 /// rows for that property name (resolving FHIR-canonical aliases via
 /// `cs_property_local_codes`), then anchored regex is applied to the value.
 async fn pg_filter_regex(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_id: &str,
     property: &str,
     value: &str,
@@ -3431,7 +3429,7 @@ async fn pg_filter_regex(
     let regex = compile_vs_regex(value)?;
     if property == "code" || property.is_empty() {
         let rows = client
-            .query(
+            .cq(
                 "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY code",
                 &[&system_id],
             )
@@ -3444,7 +3442,7 @@ async fn pg_filter_regex(
             .collect());
     }
     let rows = client
-        .query(
+        .cq(
             "SELECT c.code, c.display, cp.value
                FROM concept_properties cp
                JOIN concepts c ON c.id = cp.concept_id AND c.system_id = $1
@@ -3490,7 +3488,7 @@ fn compile_vs_regex(pattern: &str) -> Result<regex::Regex, HtsError> {
 /// version sharing the literal segments, an exact version requires a literal
 /// match, and `None` falls back to the latest revision.
 async fn resolve_compose_system_id(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     url: &str,
     version: Option<&str>,
 ) -> Result<Option<String>, HtsError> {
@@ -3503,7 +3501,7 @@ async fn resolve_compose_system_id(
         crate::backends::cs_precedence_order_by("code_systems")
     );
     let rows = client
-        .query(&sql, &[&url])
+        .cq(&sql, &[&url])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -3561,12 +3559,12 @@ fn compose_version_matches(actual: &str, pattern_segments: &[&str]) -> bool {
 
 /// Find the canonical URL of a CodeSystem whose `valueSet` property equals `vs_url`.
 async fn find_cs_for_implicit_vs(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     vs_url: &str,
     date: Option<&str>,
 ) -> Result<String, HtsError> {
     let rows = client
-        .query(
+        .cq(
             "SELECT url FROM code_systems
              WHERE (resource_json->>'valueSet') = $1
                AND ($2::text IS NULL OR (resource_json->>'date') <= $2)",
@@ -3587,7 +3585,7 @@ async fn find_cs_for_implicit_vs(
 
 /// Build a tree-structured expansion from a flat list of concepts.
 async fn build_hierarchical_expansion(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     flat: Vec<ExpansionContains>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     if flat.is_empty() {
@@ -3613,7 +3611,7 @@ async fn build_hierarchical_expansion(
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let rows = client
-            .query(&sql, &[sys_url])
+            .cq(&sql, &[sys_url])
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         if let Some(row) = rows.into_iter().next() {
@@ -3626,7 +3624,7 @@ async fn build_hierarchical_expansion(
 
     for (sys_url, sys_id) in &system_id_map {
         let edge_rows = client
-            .query(
+            .cq(
                 "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
                 &[sys_id],
             )
@@ -3834,7 +3832,7 @@ fn extract_single_hierarchy_include(compose: &serde_json::Value) -> Option<(Stri
 /// nothing. That was a Postgres-only defect independent of the copy-vs-original
 /// bug this ordering also fixes.
 async fn resolve_system_id_pg(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     cs_url: &str,
 ) -> Result<Option<String>, HtsError> {
@@ -3859,7 +3857,7 @@ async fn resolve_system_id_pg(
 }
 
 async fn resolve_system_id_uncached(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     cs_url: &str,
 ) -> Result<Option<String>, HtsError> {
     let sql = format!(
@@ -3867,7 +3865,7 @@ async fn resolve_system_id_uncached(
         crate::backends::cs_precedence_order_by("code_systems")
     );
     let row = client
-        .query_opt(&sql, &[&cs_url])
+        .cq_opt(&sql, &[&cs_url])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(row.map(|r| r.get::<_, String>(0)))
@@ -3880,7 +3878,7 @@ async fn resolve_system_id_uncached(
 /// - `IsA(root)` — recursive CTE walking `concept_hierarchy` downward from
 ///   `root` to check whether `code` is a descendant-or-self.
 async fn validate_fhir_vs(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     cs_url: &str,
     pattern: &ImplicitVsPattern,
@@ -3934,7 +3932,7 @@ async fn validate_fhir_vs(
             // Same assumption as `pg_filter_is_a` — closure is built by the
             // time we serve requests.
             let is_member: bool = client
-                .query_one(
+                .cq_one(
                     "SELECT EXISTS(
                          SELECT 1 FROM concept_closure
                           WHERE system_id = $1
@@ -3952,7 +3950,7 @@ async fn validate_fhir_vs(
             }
 
             let display: Option<String> = client
-                .query_opt(
+                .cq_opt(
                     "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
                     &[&system_id, &code],
                 )
@@ -4004,7 +4002,7 @@ async fn validate_fhir_vs(
 /// Highest stored ValueSet version for a URL, used to format `url|version`
 /// in IG-spec not-found messages.
 async fn lookup_value_set_version(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     url: &str,
 ) -> Option<String> {
@@ -4014,7 +4012,7 @@ async fn lookup_value_set_version(
             crate::backends::vs_precedence_order_by("value_sets")
         );
         client
-            .query_opt(&sql, &[&url])
+            .cq_opt(&sql, &[&url])
             .await
             .ok()
             .flatten()
@@ -4029,14 +4027,14 @@ async fn lookup_value_set_version(
 /// stored version. Returns None when the code isn't present in any version
 /// of the system.
 async fn pg_lookup_cs_display(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     version: Option<&str>,
     code: &str,
 ) -> Option<String> {
     let row = match version {
         Some(v) => client
-            .query_opt(
+            .cq_opt(
                 "SELECT c.display FROM concepts c
                    JOIN code_systems s ON s.id = c.system_id
                   WHERE s.url = $1 AND s.version = $2 AND c.code = $3",
@@ -4046,7 +4044,7 @@ async fn pg_lookup_cs_display(
             .ok()
             .flatten(),
         None => client
-            .query_opt(
+            .cq_opt(
                 &format!(
                     "SELECT c.display FROM concepts c \
                      JOIN code_systems s ON s.id = c.system_id \
@@ -4064,7 +4062,7 @@ async fn pg_lookup_cs_display(
 }
 
 pub(super) async fn cs_version_for_msg(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
 ) -> Option<String> {
@@ -4074,7 +4072,7 @@ pub(super) async fn cs_version_for_msg(
             crate::backends::cs_precedence_order_by("code_systems")
         );
         client
-            .query_opt(&sql, &[&system_url])
+            .cq_opt(&sql, &[&system_url])
             .await
             .ok()
             .flatten()
@@ -4087,7 +4085,7 @@ pub(super) async fn cs_version_for_msg(
 /// drives the `UNKNOWN_CODE_IN_FRAGMENT` warning shape in
 /// `finish_validate_code_response`.
 pub(super) async fn cs_content_for_url(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
 ) -> Option<String> {
@@ -4097,7 +4095,7 @@ pub(super) async fn cs_content_for_url(
             crate::backends::cs_precedence_order_by("code_systems")
         );
         client
-            .query_opt(&sql, &[&system_url])
+            .cq_opt(&sql, &[&system_url])
             .await
             .ok()
             .flatten()
@@ -4109,7 +4107,7 @@ pub(super) async fn cs_content_for_url(
 /// Returns `true` when the CodeSystem at `system_url` has `caseSensitive: false`
 /// explicitly set. The FHIR default (absent) is treated as case-sensitive.
 pub(super) async fn cs_is_case_insensitive(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
 ) -> bool {
@@ -4119,16 +4117,13 @@ pub(super) async fn cs_is_case_insensitive(
     .await
 }
 
-async fn cs_is_case_insensitive_uncached(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-) -> bool {
+async fn cs_is_case_insensitive_uncached(client: &super::PgClient, system_url: &str) -> bool {
     let sql = format!(
         "SELECT (resource_json->>'caseSensitive') FROM code_systems \
          WHERE url = $1 ORDER BY {} LIMIT 1",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let row = match client.query_opt(&sql, &[&system_url]).await {
+    let row = match client.cq_opt(&sql, &[&system_url]).await {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -4139,7 +4134,7 @@ async fn cs_is_case_insensitive_uncached(
 }
 
 /// `true` when the code exists in the named CodeSystem (any version).
-async fn is_code_in_cs(client: &tokio_postgres::Client, system_url: &str, code: &str) -> bool {
+async fn is_code_in_cs(client: &super::PgClient, system_url: &str, code: &str) -> bool {
     super::query_text_opt(
         client,
         "SELECT EXISTS(
@@ -4157,13 +4152,13 @@ async fn is_code_in_cs(client: &tokio_postgres::Client, system_url: &str, code: 
 
 /// Like [`is_code_in_cs`] but scoped to a specific stored CS version.
 async fn is_code_in_cs_at_version(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     version: &str,
     code: &str,
 ) -> bool {
     client
-        .query_one(
+        .cq_one(
             "SELECT EXISTS(
                  SELECT 1 FROM concepts c
                  JOIN code_systems s ON s.id = c.system_id
@@ -4177,13 +4172,9 @@ async fn is_code_in_cs_at_version(
 }
 
 /// Returns true when the (system_url, version) pair is stored as a CS row.
-async fn cs_version_exists(
-    client: &tokio_postgres::Client,
-    system_url: &str,
-    version: &str,
-) -> bool {
+async fn cs_version_exists(client: &super::PgClient, system_url: &str, version: &str) -> bool {
     client
-        .query_one(
+        .cq_one(
             "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1 AND version = $2)",
             &[&system_url, &version],
         )
@@ -4202,7 +4193,7 @@ async fn cs_version_exists(
 /// properties locally and the FHIR spec allows it — queries hardcoded to the
 /// canonical name miss those concepts.
 pub(super) async fn cs_property_local_codes(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     canonical: &str,
@@ -4216,7 +4207,7 @@ pub(super) async fn cs_property_local_codes(
 }
 
 async fn cs_property_local_codes_uncached(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     canonical: &str,
 ) -> Vec<String> {
@@ -4225,7 +4216,7 @@ async fn cs_property_local_codes_uncached(
         "SELECT resource_json FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let row = match client.query_opt(&sql, &[&system_url]).await {
+    let row = match client.cq_opt(&sql, &[&system_url]).await {
         Ok(Some(r)) => r,
         _ => return codes,
     };
@@ -4257,7 +4248,7 @@ async fn cs_property_local_codes_uncached(
 /// codes are discouraged but still active (the `deprecated/` test group
 /// relies on this — deprecated codes survive `activeOnly=true` filtering).
 pub(super) async fn is_concept_inactive(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     code: &str,
@@ -4270,7 +4261,7 @@ pub(super) async fn is_concept_inactive(
 }
 
 async fn is_concept_inactive_uncached(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     code: &str,
@@ -4311,7 +4302,7 @@ async fn is_concept_inactive_uncached(
 /// [`cs_property_local_codes`] (e.g. `not-selectable` with a hyphen, as
 /// several tx-ecosystem fixtures use).
 pub(super) async fn is_concept_abstract(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     code: &str,
@@ -4324,7 +4315,7 @@ pub(super) async fn is_concept_abstract(
 }
 
 async fn is_concept_abstract_uncached(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     system_url: &str,
     code: &str,
@@ -4368,9 +4359,9 @@ async fn is_concept_abstract_uncached(
 
 /// Returns all non-null stored versions for a CS URL, sorted ascending for
 /// display in "Valid versions: X or Y" messages.
-async fn cs_all_stored_versions(client: &tokio_postgres::Client, system_url: &str) -> Vec<String> {
+async fn cs_all_stored_versions(client: &super::PgClient, system_url: &str) -> Vec<String> {
     let rows = match client
-        .query(
+        .cq(
             "SELECT version FROM code_systems \
              WHERE url = $1 AND version IS NOT NULL \
              ORDER BY COALESCE(version, '') ASC",
@@ -4518,7 +4509,7 @@ fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
 ///
 /// Returns `None` when there is no mismatch (caller should proceed normally).
 pub(super) async fn detect_cs_version_mismatch(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     req_ver: &str,
     compose_json: Option<&str>,
@@ -4537,7 +4528,7 @@ pub(super) async fn detect_cs_version_mismatch(
         "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let rows = client.query(&sql, &[&system_url]).await.ok()?;
+    let rows = client.cq(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -4791,7 +4782,7 @@ pub(super) async fn detect_cs_version_mismatch(
 /// Returns `None` when there is no issue (versionless include, pin resolves
 /// OK, or no VS compose context).
 async fn detect_vs_pin_unknown(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_url: &str,
     compose_json: Option<&str>,
     system_loc: &str,
@@ -4809,7 +4800,7 @@ async fn detect_vs_pin_unknown(
         "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let rows = client.query(&sql, &[&system_url]).await.ok()?;
+    let rows = client.cq(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -5310,7 +5301,7 @@ fn build_implicit_compose_value(cs_url: &str, pattern: &ImplicitVsPattern) -> se
 /// row exists in the local `concepts` table. VSAC URLs always embed display,
 /// so the typical fast path makes zero DB calls.
 async fn compose_page_fast_pg(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     meta: &super::PgMeta,
     compose_json: Option<&str>,
     offset: usize,
@@ -5421,7 +5412,7 @@ async fn compose_page_fast_pg(
             };
             if let Some(sid) = system_id {
                 client
-                    .query_opt(
+                    .cq_opt(
                         "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
                         &[&sid, &code],
                     )
