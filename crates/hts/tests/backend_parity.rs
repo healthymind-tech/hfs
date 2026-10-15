@@ -911,3 +911,52 @@ async fn contains_versions() {
     let stored = same_on_all!(bs, |b| versions(b, url_req("http://p.test/vs/all-l")).await);
     assert_eq!(stored, [Some("2.80".to_string())]);
 }
+
+/// A stored ValueSet whose includes overlap: the request that computes the
+/// expansion gets the computed list (duplicates, compose order); later
+/// requests with other paging are read from the persistent expansion cache
+/// (one row per code, code order) — on both backends.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_expansion_first_and_cached_shape() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let url = "http://example.org/cs-shape";
+    let vs = json!({
+        "resourceType": "ValueSet", "id": "shape", "url": "http://p.test/vs/shape", "status": "active",
+        "compose": {"include": [
+            {"system": url, "concept": [{"code": "grand1"}, {"code": "child2"}]},
+            {"system": url, "filter": [{"property": "concept", "op": "is-a", "value": "child1"}]}
+        ]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![hierarchy_cs(url, false), vs.clone()])).await;
+    }
+    let req = |count: Option<u32>, offset: Option<u32>| ExpandRequest {
+        count,
+        offset,
+        ..url_req("http://p.test/vs/shape")
+    };
+    // Within the first answer, SQLite's order for the enumerated include
+    // follows its query plan (code order for a tiny system, the listed order
+    // otherwise); PostgreSQL keeps the listed order. Compare as multisets.
+    let first = same_on_all!(bs, |b| expand(b, req(Some(10), None)).await.map(
+        |(mut c, t)| {
+            c.sort();
+            (c, t)
+        }
+    ));
+    assert_eq!(
+        first,
+        Ok((
+            vec![
+                "child1".into(),
+                "child2".into(),
+                "grand1".into(),
+                "grand1".into()
+            ],
+            Some(4)
+        ))
+    );
+    let later = same_on_all!(bs, |b| expand(b, req(Some(10), Some(1))).await);
+    assert_eq!(later, Ok((vec!["child2".into(), "grand1".into()], Some(3))));
+}

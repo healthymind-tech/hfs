@@ -424,6 +424,7 @@ BEGIN
                 ('concept_closure', 'descendant_code'),
                 ('concept_properties', 'value'),
                 ('value_set_expansions', 'code'),
+                ('value_set_expansions', 'system_url'),
                 ('refset_members', 'refset_id'),
                 ('refset_members', 'referenced_code'),
                 ('concept_map_elements', 'source_code'),

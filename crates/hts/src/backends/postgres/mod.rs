@@ -1117,7 +1117,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                 client
                     .execute(
                         "DELETE FROM value_set_expansions WHERE system_url IN \
-                         (SELECT url FROM code_systems \
+                         (SELECT url COLLATE \"C\" FROM code_systems \
                           WHERE id = $1 OR resource_json->>'id' = $1)",
                         &[&id],
                     )

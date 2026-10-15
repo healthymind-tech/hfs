@@ -557,8 +557,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         }
 
                         // Single-flight in-memory cache keyed by URL, version,
-                        // date and pins. A DB-cached expansion is served in the
-                        // order SQLite reads that cache: `(system_url, code)`.
+                        // date and pins. A freshly computed expansion keeps its
+                        // compose order (SQLite's first response, which its
+                        // handler cache then keeps serving); one read back from
+                        // the DB cache comes in `(system_url, code)` order, as
+                        // on SQLite after a restart.
                         let cache_key = build_url_cache_key(
                             url,
                             req.value_set_version.as_deref(),
@@ -580,10 +583,18 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let client_ref = &mut client;
                             let vs_id_ref = vs_id.as_str();
                             let compose_json_ref = compose_json.as_deref();
+                            // SQLite answers the request that computes the
+                            // expansion with the computed list, and every later
+                            // request (other count / offset / filter) from its
+                            // DB cache — deduplicated by (system, code) and in
+                            // that order. Same here: the computing request gets
+                            // `first`, the cell keeps the DB-cache form.
+                            let mut first: Option<Vec<ExpansionContains>> = None;
+                            let first_ref = &mut first;
                             let arc = cell
                                 .get_or_try_init(|| async move {
                                     let codes = if db_cached.is_empty() {
-                                        let mut computed = compute_expansion(
+                                        let computed = compute_expansion(
                                             &*client_ref,
                                             meta_ref,
                                             compose_json_ref,
@@ -595,9 +606,12 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                         if use_db_cache {
                                             populate_cache(client_ref, vs_id_ref, &computed)
                                                 .await?;
-                                            sort_implicit_expansion(&mut computed);
+                                            let stored = db_cache_form(&computed);
+                                            *first_ref = Some(computed);
+                                            stored
+                                        } else {
+                                            computed
                                         }
-                                        computed
                                     } else {
                                         db_cached
                                     };
@@ -606,13 +620,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                     )))
                                 })
                                 .await?;
+                            if let Some(first) = first {
+                                return serve_from_cached(
+                                    &CachedExpansion::new(first, /*implicit=*/ false),
+                                    &req,
+                                );
+                            }
                             return serve_from_cached(arc, &req);
                         }
 
                         // Not cacheable in memory (hierarchical / multi-version)
                         // or the cache is full: compute without it.
                         if db_cached.is_empty() {
-                            let mut codes = compute_expansion(
+                            let codes = compute_expansion(
                                 &client,
                                 meta_ref,
                                 compose_json.as_deref(),
@@ -623,7 +643,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             .await?;
                             if use_db_cache {
                                 populate_cache(&mut client, &vs_id, &codes).await?;
-                                sort_implicit_expansion(&mut codes);
                             }
                             codes
                         } else {
@@ -5235,6 +5254,21 @@ fn build_url_cache_key(
 /// so paging an implicit URL returns the same codes on both backends.
 fn sort_implicit_expansion(codes: &mut [ExpansionContains]) {
     codes.sort_by(|a, b| a.system.cmp(&b.system).then_with(|| a.code.cmp(&b.code)));
+}
+
+/// What the persistent expansion cache hands back for `codes`: one row per
+/// `(system, code)` (the table's primary key keeps the first) in
+/// `(system_url, code)` order — the shape of every SQLite answer read from
+/// `value_set_expansions`.
+fn db_cache_form(codes: &[ExpansionContains]) -> Vec<ExpansionContains> {
+    let mut seen: HashSet<(&str, &str)> = HashSet::with_capacity(codes.len());
+    let mut out: Vec<ExpansionContains> = codes
+        .iter()
+        .filter(|c| seen.insert((c.system.as_str(), c.code.as_str())))
+        .cloned()
+        .collect();
+    sort_implicit_expansion(&mut out);
+    out
 }
 
 /// Shape an implicit expansion like SQLite's implicit cache: byte order and
