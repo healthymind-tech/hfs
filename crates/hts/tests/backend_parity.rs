@@ -691,3 +691,122 @@ async fn translate_and_concept_map_replacement() {
     ));
     assert_eq!(ids, (Some("http://p.test/cm".to_string()), None));
 }
+
+/// Inline ValueSets: warnings for what could not be resolved, a 404 when
+/// nothing could, `#contained` and `tx-resource` references, and cycles
+/// (a warning in an include, an error in an exclude).
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_references_warnings_and_cycles() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let vs_a = json!({
+        "resourceType": "ValueSet", "id": "cyc-a", "url": "http://p.test/vs/cyc-a", "status": "active",
+        "compose": {"include": [{"valueSet": ["http://p.test/vs/cyc-b"]}, {"system": "http://p.test/cs", "concept": [{"code": "A1"}]}]}
+    });
+    let vs_b = json!({
+        "resourceType": "ValueSet", "id": "cyc-b", "url": "http://p.test/vs/cyc-b", "status": "active",
+        "compose": {"include": [{"valueSet": ["http://p.test/vs/cyc-a"]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![property_cs(), vs_a.clone(), vs_b.clone()])).await;
+    }
+    let run = |b: &Backend, req: ExpandRequest| {
+        let b = b.clone();
+        async move {
+            b.expand(&ctx(), req)
+                .await
+                .map(|r| {
+                    let (mut codes, total) = shape(&r);
+                    codes.sort();
+                    (codes, total, r.warnings)
+                })
+                .map_err(|e| error_kind(&e))
+        }
+    };
+    let vs = |compose: Value| ExpandRequest {
+        value_set: Some(
+            json!({"resourceType": "ValueSet", "status": "active", "compose": compose}),
+        ),
+        ..Default::default()
+    };
+    let nothing = same_on_all!(bs, |b| run(
+        b,
+        vs(json!({"include": [{"system": "http://nowhere.test/cs"}]}))
+    )
+    .await);
+    assert_eq!(nothing, Err("not-found".to_string()));
+    let partial = same_on_all!(bs, |b| run(
+        b,
+        vs(json!({"include": [
+            {"system": "http://nowhere.test/cs"},
+            {"system": "http://p.test/cs", "concept": [{"code": "B2"}]}
+        ]}))
+    )
+    .await);
+    let partial = partial.unwrap();
+    assert_eq!(partial.0, ["B2"]);
+    assert_eq!(
+        partial.2,
+        [
+            "CodeSystem http://nowhere.test/cs was not found and has been excluded from the expansion"
+        ]
+    );
+    let contained = same_on_all!(bs, |b| {
+        run(
+        b,
+        ExpandRequest {
+            value_set: Some(json!({
+                "resourceType": "ValueSet", "status": "active",
+                "contained": [{"resourceType": "ValueSet", "id": "c1", "status": "active",
+                               "compose": {"include": [{"system": "http://p.test/cs", "concept": [{"code": "A2"}]}]}}],
+                "compose": {"include": [{"valueSet": ["#c1"]}, {"valueSet": ["#missing"]}]}
+            })),
+            ..Default::default()
+        }
+    )
+    .await
+    });
+    let contained = contained.unwrap();
+    assert_eq!(contained.0, ["A2"]);
+    assert_eq!(
+        contained.2,
+        ["Referenced contained ValueSet #missing not found; excluded from expansion"]
+    );
+    let tx = same_on_all!(bs, |b| {
+        run(
+        b,
+        ExpandRequest {
+            tx_resources: vec![json!({
+                "resourceType": "ValueSet", "url": "http://p.test/vs/tx-only", "status": "active",
+                "compose": {"include": [{"system": "http://p.test/cs", "concept": [{"code": "B1"}]}]}
+            })],
+            ..vs(json!({"include": [{"valueSet": ["http://p.test/vs/tx-only"]}]}))
+        }
+    )
+    .await
+    });
+    assert_eq!(tx.unwrap().0, ["B1"]);
+    let include_cycle = same_on_all!(bs, |b| run(
+        b,
+        vs(json!({"include": [{"valueSet": ["http://p.test/vs/cyc-a"]}]}))
+    )
+    .await);
+    let include_cycle = include_cycle.unwrap();
+    assert_eq!(include_cycle.0, ["A1"]);
+    assert_eq!(
+        include_cycle.2,
+        [
+            "Cyclic ValueSet reference detected for http://p.test/vs/cyc-a; excluded from expansion (vs-invalid)"
+        ]
+    );
+    let exclude_cycle = same_on_all!(bs, |b| {
+        run(
+        b,
+        vs(json!({"include": [{"system": "http://p.test/cs"}], "exclude": [{"valueSet": ["http://p.test/vs/cyc-a"]}]}))
+    )
+    .await
+    });
+    assert!(exclude_cycle.unwrap_err().starts_with(
+        "vs-invalid: Cyclic reference detected when excluding http://p.test/vs/cyc-a via"
+    ));
+}
