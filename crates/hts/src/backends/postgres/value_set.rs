@@ -1237,14 +1237,15 @@ impl PostgresTerminologyBackend {
                                 req.system.as_deref(),
                             )
                             .await?;
-                            let abstract_for_msg = req.include_abstract == Some(false)
-                                && match found.as_ref() {
-                                    Some(c) => {
-                                        is_concept_abstract(&client, &self.meta, &c.system, &c.code)
-                                            .await
-                                    }
-                                    None => false,
-                                };
+                            // SQLite reports abstract here whatever
+                            // `includeAbstract` says.
+                            let abstract_for_msg = match found.as_ref() {
+                                Some(c) => {
+                                    is_concept_abstract(&client, &self.meta, &c.system, &c.code)
+                                        .await
+                                }
+                                None => false,
+                            };
                             let inactive_for_msg = match found.as_ref() {
                                 Some(c) => {
                                     is_concept_inactive(&client, &self.meta, &c.system, &c.code)
@@ -2328,33 +2329,32 @@ async fn compute_expansion_inner_body(
         // by enumerating the whole CodeSystem.
         let mut candidates: Vec<ExpansionContains> =
             if let Some(explicit_codes) = inc["concept"].as_array() {
-                let mut out = Vec::with_capacity(explicit_codes.len());
+                // One batched join in compose order (SQLite's `json_each`
+                // join) instead of a query per listed code. Codes the
+                // CodeSystem does not define drop out (IG
+                // `simple-expand-enum-bad`).
+                let listed: Vec<&str> = explicit_codes
+                    .iter()
+                    .filter_map(|e| e["code"].as_str())
+                    .collect();
+                let rows = client
+                    .query_typed(
+                        "SELECT c.code, c.display
+                           FROM UNNEST($2::text[]) WITH ORDINALITY AS l(code, ord)
+                           JOIN concepts c ON c.system_id = $1 AND c.code = l.code
+                          ORDER BY l.ord",
+                        &[
+                            (&system_id, tokio_postgres::types::Type::TEXT),
+                            (&listed, tokio_postgres::types::Type::TEXT_ARRAY),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                let mut out = Vec::with_capacity(rows.len());
                 let mut seen_codes: HashSet<String> = HashSet::new();
-                for entry in explicit_codes {
-                    let code = match entry["code"].as_str() {
-                        Some(c) => c.to_owned(),
-                        None => continue,
-                    };
-
-                    // Drop codes that don't actually exist in the CS — the
-                    // IG `simple-expand-enum-bad` fixture asserts that an
-                    // unknown code in compose.include[].concept[] is
-                    // silently filtered out of the expansion rather than
-                    // surfacing as a phantom entry. Mirrors the SQLite
-                    // INNER JOIN at sqlite/value_set.rs:3441-3470.
-                    let row = match client
-                        .query_opt(
-                            "SELECT display FROM concepts WHERE system_id = $1 AND code = $2",
-                            &[&system_id, &code],
-                        )
-                        .await
-                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-                    {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    let display: Option<String> = row.get(0);
-
+                for row in rows {
+                    let code: String = row.get(0);
+                    let display: Option<String> = row.get(1);
                     seen_codes.insert(code.clone());
                     out.push(ExpansionContains {
                         system: system_url.to_owned(),
