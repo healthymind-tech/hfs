@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
                 port = config.port,
                 host = %config.host,
                 storage_backend = %config.storage_backend,
-                database_url = %config.database_url,
+                database_url = %helios_persistence::core::bulk_submit_input::redact_url(&config.database_url),
                 // Eagerly resolve the HELIOS_OBS_MODE OnceLock at boot and stamp
                 // it into the startup line. The same-session A/B benchmark (#297)
                 // greps this to assert each arm's server actually resolved to the
@@ -614,7 +614,7 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     info!(
         path = %args.path.display(),
         is_dir,
-        database_url = %args.database_url,
+        database_url = %helios_persistence::core::bulk_submit_input::redact_url(&args.database_url),
         storage_backend = %args.storage_backend,
         dry_run = args.dry_run,
         verbose = args.verbose,

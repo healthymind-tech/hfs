@@ -537,7 +537,10 @@ impl PostgresTerminologyBackend {
                 })?;
         }
 
-        info!(database_url, "PostgreSQL terminology backend initialized");
+        info!(
+            database_url = %helios_persistence::core::bulk_submit_input::redact_url(database_url),
+            "PostgreSQL terminology backend initialized"
+        );
 
         Ok(Self {
             pool,

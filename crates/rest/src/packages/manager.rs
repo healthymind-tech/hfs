@@ -251,10 +251,20 @@ pub fn cache_dir(config: &ServerConfig) -> std::path::PathBuf {
         };
         return base.join("packages");
     }
+    // No SQLite file to sit next to (PostgreSQL etc.): the container images
+    // mount their writable volume at `/data`; `./data` is under the read-only
+    // `/app` there.
     config
         .data_dir
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("./data"))
+        .unwrap_or_else(|| {
+            let volume = std::path::Path::new("/data");
+            if volume.is_dir() {
+                volume.to_path_buf()
+            } else {
+                std::path::PathBuf::from("./data")
+            }
+        })
         .join("packages")
 }
 

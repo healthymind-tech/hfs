@@ -770,7 +770,10 @@ async fn create_postgres_backend(
 
     let mut backend_config = if let Some(ref url) = config.database_url {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            info!(url = %url, "Initializing PostgreSQL backend from connection string");
+            info!(
+                url = %helios_persistence::core::bulk_submit_input::redact_url(url),
+                "Initializing PostgreSQL backend from connection string"
+            );
             PostgresBackend::config_from_connection_string(url)?
         } else {
             info!("Initializing PostgreSQL backend from environment variables");

@@ -130,9 +130,18 @@ impl AdminConfig {
             })
             .flatten();
         let data_dir = if c.admin_data_dir.trim().is_empty() {
+            // PostgreSQL has no database directory: use the images' writable
+            // `/data` volume when present (`./data` sits under read-only `/app`).
             db_dir
                 .clone()
-                .unwrap_or_else(|| PathBuf::from("./data"))
+                .unwrap_or_else(|| {
+                    let volume = std::path::Path::new("/data");
+                    if volume.is_dir() {
+                        volume.to_path_buf()
+                    } else {
+                        PathBuf::from("./data")
+                    }
+                })
                 .join("hts-admin")
         } else {
             PathBuf::from(c.admin_data_dir.trim())
