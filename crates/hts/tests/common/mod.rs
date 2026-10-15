@@ -108,35 +108,6 @@ pub async fn pg_http_url() -> &'static str {
         .await
 }
 
-/// Ensures the HTS + persistence schemas are applied exactly once per test
-/// binary, avoiding concurrent `CREATE EXTENSION` race conditions.
-#[cfg(feature = "postgres")]
-static PG_SCHEMA_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
-#[cfg(feature = "postgres")]
-async fn ensure_pg_schemas(url: &str) {
-    PG_SCHEMA_INIT
-        .get_or_init(|| async {
-            use helios_hts::backends::PostgresTerminologyBackend;
-            use helios_persistence::backends::postgres::PostgresBackend;
-
-            // Apply HTS terminology schema.
-            PostgresTerminologyBackend::new(url)
-                .await
-                .expect("Failed to create PostgresTerminologyBackend (schema init)");
-
-            // Apply persistence resource-store schema.
-            let resource_store = PostgresBackend::from_connection_string(url)
-                .await
-                .expect("Failed to open PostgreSQL resource store (schema init)");
-            resource_store
-                .init_schema()
-                .await
-                .expect("Failed to initialize PostgreSQL resource store schema (schema init)");
-        })
-        .await;
-}
-
 /// `true` when the generic HTTP tests should run against PostgreSQL:
 /// `HTS_TEST_BACKEND=postgres` (needs the `postgres` feature and Docker, or
 /// `HTS_TEST_PG_URL` pointing at a server the tests may create databases on).
@@ -498,30 +469,26 @@ pub fn build_params(entries: &[(&str, &str, &str)]) -> String {
 /// PostgreSQL instance (via testcontainers).
 ///
 /// Uses the same `pg_http_url()` shared container so all `TestAppPg` instances
-/// within a single test binary share one Docker container.
-///
-/// Because each `TestAppPg` connects to the *same* database, tests that write
-/// data should use unique resource URLs to avoid cross-test interference.
+/// within a single test binary share one Docker container, but each instance
+/// gets its own database (see [`fresh_pg_database`]): tests importing the
+/// same fixtures concurrently would otherwise replace each other's rows
+/// between a search and the request that uses its result.
 #[cfg(feature = "postgres")]
 pub struct TestAppPg {
     router: Router,
+    url: String,
 }
 
 #[cfg(feature = "postgres")]
 impl TestAppPg {
-    /// Create a new `TestAppPg` wired to the shared PostgreSQL container.
-    ///
-    /// Schema initialization (HTS + persistence) is serialized via
-    /// [`ensure_pg_schemas`] so concurrent tests never race on DDL.
+    /// Create a new `TestAppPg` on a fresh database in the shared container.
     pub async fn new() -> Self {
         use helios_hts::backends::PostgresTerminologyBackend;
         use helios_persistence::backends::postgres::PostgresBackend;
         use std::sync::Arc;
 
-        let url = pg_http_url().await;
-
-        // Ensure schemas are applied exactly once (no concurrent DDL races).
-        ensure_pg_schemas(url).await;
+        let db_url = fresh_pg_database().await;
+        let url = db_url.as_str();
 
         let backend = PostgresTerminologyBackend::new(url)
             .await
@@ -537,7 +504,16 @@ impl TestAppPg {
 
         let config = PgHtsConfig::default();
         let router = helios_hts::server::create_app(&config, state);
-        TestAppPg { router }
+        TestAppPg {
+            router,
+            url: db_url,
+        }
+    }
+
+    /// Connection URL of this app's database.
+    #[allow(dead_code)]
+    pub fn database_url(&self) -> &str {
+        &self.url
     }
 
     /// POST a FHIR JSON body to `path`, returning `(status, response_body)`.

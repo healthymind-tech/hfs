@@ -254,10 +254,9 @@ async fn postgres_matches_string_and_hydration_contract() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
-    let (client, connection) =
-        tokio_postgres::connect(common::pg_http_url().await, tokio_postgres::NoTls)
-            .await
-            .expect("connect to PostgreSQL test database");
+    let (client, connection) = tokio_postgres::connect(app.database_url(), tokio_postgres::NoTls)
+        .await
+        .expect("connect to PostgreSQL test database");
     tokio::spawn(async move {
         connection.await.expect("PostgreSQL test connection");
     });
