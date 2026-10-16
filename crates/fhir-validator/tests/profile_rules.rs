@@ -558,3 +558,30 @@ async fn ele1_fires_on_an_id_only_element() {
     .await;
     assert!(fine.is_empty(), "{fine:#?}");
 }
+
+/// A resource the typed model cannot read (gender as an array) reports its
+/// structural error plus one note that invariants could not run — not one
+/// warning per invariant.
+#[tokio::test]
+async fn unparseable_resources_report_unevaluated_invariants_once() {
+    let errors = validate(
+        &json!({"resourceType": "Patient", "gender": ["male", "female"],
+                "identifier": [{"system": "http://x", "value": "1"}]}),
+        &[],
+    )
+    .await;
+    let not_evaluated: Vec<_> = errors
+        .iter()
+        .filter(|e| e.kind == ErrorKind::FhirpathConstraint)
+        .collect();
+    assert_eq!(not_evaluated.len(), 1, "{errors:#?}");
+    assert_eq!(not_evaluated[0].path, "Patient");
+    assert_eq!(
+        not_evaluated[0].severity,
+        helios_fhir_validator::Severity::Warning
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == ErrorKind::NotSingular),
+        "{errors:#?}"
+    );
+}

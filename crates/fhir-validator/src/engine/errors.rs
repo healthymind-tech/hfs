@@ -345,6 +345,11 @@ pub(crate) fn msg_constraint_not_evaluable(id: &str, detail: &str) -> String {
     format!("FHIRPath constraint {id} could not be evaluated: {detail}")
 }
 
+/// [helios] no constraint could be evaluated, all for the same reason.
+pub(crate) fn msg_constraints_not_evaluable(detail: &str) -> String {
+    format!("FHIRPath constraints could not be evaluated: {detail}")
+}
+
 /// [helios] a schema reference could not be resolved (reference validator
 /// throws `could not resolve ["…"]`; we report and continue).
 pub(crate) fn msg_unknown_schema(reference: &str) -> String {
