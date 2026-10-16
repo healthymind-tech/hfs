@@ -1632,6 +1632,15 @@ impl PostgresTerminologyBackend {
         } else {
             found
         };
+        // UCUM is a grammar: a value set taking all of UCUM contains every
+        // well-formed unit expression, which no expansion enumerates.
+        let found = found.or_else(|| {
+            crate::ucum_validate::whole_ucum_member(
+                compose_json_for_version.as_deref(),
+                effective_system.as_deref(),
+                &req.code,
+            )
+        });
 
         // An exact caller version shows that version's display, even when
         // the expansion resolved another one (e.g. `1.x` → 1.2.0).
