@@ -416,15 +416,6 @@ impl EvaluationContext {
         self.check_ordered_functions = check;
     }
 
-    /// Sets the 'this' context for direct evaluation
-    ///
-    /// This sets the default context item that will be used when an expression
-    /// references $this. When set, this overrides the current_item parameter
-    /// passed to the evaluate function. This is primarily used in testing.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The value to set as the 'this' context
     /// Memoize `%resource`/`%rootResource`-rooted navigation chains for the
     /// lifetime of this context (and its clones).
     ///
@@ -442,6 +433,15 @@ impl EvaluationContext {
         self.root_memo = Some(Arc::new(Mutex::new(HashMap::new())));
     }
 
+    /// Sets the 'this' context for direct evaluation
+    ///
+    /// This sets the default context item that will be used when an expression
+    /// references $this. When set, this overrides the current_item parameter
+    /// passed to the evaluate function. This is primarily used in testing.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The value to set as the 'this' context
     pub fn set_this(&mut self, value: EvaluationResult) {
         self.this = Some(Arc::new(value));
     }
