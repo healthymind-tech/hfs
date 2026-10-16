@@ -227,6 +227,11 @@ pub async fn execute(
 ) {
     execute_constraints(resource, version, deferred, handlers, errors);
     execute_bindings(deferred, handlers, errors).await;
+    // Wrong displays on required-bound codings, judged offline against
+    // the embedded core code systems whenever bindings are checked at all.
+    if handlers.terminology.is_some() {
+        errors.extend(crate::terminology::display_issues(version, deferred));
+    }
 }
 
 fn execute_constraints(
@@ -281,6 +286,30 @@ fn execute_constraints(
         .collect();
     let outcomes = evaluator.evaluate_all(resource, version, &refs);
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
+
+    // When nothing could be evaluated for the same reason (the resource does
+    // not parse into the typed model — its structural errors are already on
+    // the report), say so once instead of once per invariant.
+    if outcomes.len() > 1
+        && let Some(ConstraintOutcome::NotEvaluable(first)) = outcomes.first()
+        && outcomes
+            .iter()
+            .all(|o| matches!(o, ConstraintOutcome::NotEvaluable(d) if d == first))
+    {
+        let root = resource
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        errors.push(
+            ValidationError::new(
+                ErrorKind::FhirpathConstraint,
+                root.to_string(),
+                messages::constraints_not_evaluable(first),
+            )
+            .with_severity(Severity::Warning),
+        );
+        return;
+    }
 
     for ((path, id, _, human, severity), outcome) in selected.iter().zip(outcomes) {
         match outcome {

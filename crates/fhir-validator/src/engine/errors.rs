@@ -43,6 +43,8 @@ pub enum ErrorKind {
     FhirpathConstraint,
     /// A coded value failed its required-strength ValueSet binding.
     TerminologyBinding,
+    /// A coding's `display` is not a display of its code (warning).
+    DisplayMismatch,
     // ------------------------------------------------------------------
     // Helios extensions — not pinned by (and never triggered in) the
     // upstream conformance fixtures.
@@ -60,10 +62,14 @@ pub enum ErrorKind {
     /// A profile named in `meta.profile` or the caller's profile list could
     /// not be resolved.
     UnknownProfile,
-    /// A known extension used outside its declared context (#615). Always
-    /// warning severity: context matching is conservative and ad-hoc
-    /// extensions must stay permissive.
+    /// A known extension used outside its declared context (#615). Error
+    /// severity (warning on canonical resources); context matching is
+    /// conservative — only resource-root placements against resource-rooted
+    /// contexts are judged.
     ExtensionContext,
+    /// An extension url in an HL7 namespace that resolves to no known
+    /// definition (warning severity).
+    UnknownExtension,
     /// A `batch`/`transaction` entry whose `request.url` names a different
     /// resource type than the entry's `resource` (X10).
     BundleEntryMismatch,
@@ -102,6 +108,16 @@ pub struct ValidationError {
     /// Internal severity; REST maps it onto OperationOutcome.
     #[serde(skip)]
     pub severity: Severity,
+    /// The canonical URL of the profile (or extension definition) whose
+    /// rule produced the issue, when known — rendered by REST as the HL7
+    /// validator's `(from <url>)`. Not part of the conformance shape.
+    #[serde(skip)]
+    pub source: Option<String>,
+    /// The HL7 validator's wording of the issue, when it differs from the
+    /// conformance-pinned `message` (slice cardinality names the slice
+    /// there). REST reports it in preference to `message`.
+    #[serde(skip)]
+    pub hl7_message: Option<String>,
 }
 
 impl ValidationError {
@@ -112,7 +128,19 @@ impl ValidationError {
             message,
             extra: serde_json::Map::new(),
             severity: Severity::Error,
+            source: None,
+            hl7_message: None,
         }
+    }
+
+    pub fn with_hl7_message(mut self, message: Option<String>) -> Self {
+        self.hl7_message = message;
+        self
+    }
+
+    pub fn with_source(mut self, source: Option<String>) -> Self {
+        self.source = source;
+        self
     }
 
     pub fn with_severity(mut self, severity: Severity) -> Self {
@@ -172,14 +200,26 @@ pub(crate) fn msg_expected_object_comma(json_type: &str) -> String {
     format!("expected object, got {json_type}")
 }
 
-/// [reference] `expected {min} > {actual_len}`
+/// [helios] an extension used outside its declared context (HL7
+/// validator wording).
 pub(crate) fn msg_extension_context(url: &str, at: &str, contexts: &[String]) -> String {
     format!(
-        "extension {url} is not declared for use at {at}; its contexts are [{}]",
-        contexts.join(", ")
+        "The extension {url} is not allowed to be used at this point (this element is [{at}]; allowed = {})",
+        contexts
+            .iter()
+            .map(|c| format!("e:{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
+/// [helios] an HL7-namespace extension with no known definition (HL7
+/// validator wording).
+pub(crate) fn msg_unknown_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
+/// [reference] `expected {min} > {actual_len}`
 pub(crate) fn msg_min(min: u64, actual_len: usize) -> String {
     format!("expected {min} > {actual_len}")
 }
@@ -210,6 +250,30 @@ pub(crate) fn msg_slice_min(min: u64, actual: u64) -> String {
 /// [pinned] `Slice defines the following max cardinality: '{max}', actual cardinality: '{n}'`
 pub(crate) fn msg_slice_max(max: u64, actual: u64) -> String {
     format!("Slice defines the following max cardinality: '{max}', actual cardinality: '{actual}'")
+}
+
+/// [helios] HL7 validator wording of an element minimum violation.
+pub(crate) fn hl7_min(element: &str, min: u64, found: usize) -> String {
+    format!("{element}: minimum required = {min}, but only found {found}")
+}
+
+/// [helios] HL7 validator wording of an element maximum violation.
+pub(crate) fn hl7_max(element: &str, max: u64, found: usize) -> String {
+    format!("{element}: max allowed = {max}, but found {found}")
+}
+
+/// [helios] HL7 validator wording of a slice minimum violation.
+pub(crate) fn hl7_slice_min(element: &str, slice: &str, min: u64, found: u64) -> String {
+    if found == 0 {
+        format!("Slice '{element}:{slice}': a matching slice is required, but not found")
+    } else {
+        format!("{element}:{slice}: minimum required = {min}, but only found {found}")
+    }
+}
+
+/// [helios] HL7 validator wording of a slice maximum violation.
+pub(crate) fn hl7_slice_max(element: &str, slice: &str, max: u64, found: u64) -> String {
+    format!("{element}:{slice}: max allowed = {max}, but found {found}")
 }
 
 /// Render a value for message text: bare strings (like the reference
@@ -283,6 +347,28 @@ pub(crate) fn msg_terminology_binding(value: &Value, value_set: &str) -> String 
     )
 }
 
+/// [helios] a coding's display is not one of its code's displays (HL7
+/// validator wording).
+pub(crate) fn msg_wrong_display(
+    display: &str,
+    system: &str,
+    code: &str,
+    valid: &[String],
+) -> String {
+    let valid = match valid {
+        [one] => format!("'{one}'"),
+        many => format!(
+            "one of {} choices: {}",
+            many.len(),
+            many.iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    format!("Wrong Display Name '{display}' for {system}#{code}. Valid display is {valid}")
+}
+
 /// [helios] the terminology service could not be reached / errored.
 pub(crate) fn msg_terminology_unavailable(value_set: &str, detail: &str) -> String {
     format!("terminology validation against '{value_set}' could not be performed: {detail}")
@@ -292,6 +378,11 @@ pub(crate) fn msg_terminology_unavailable(value_set: &str, detail: &str) -> Stri
 /// result, typed-model mismatch).
 pub(crate) fn msg_constraint_not_evaluable(id: &str, detail: &str) -> String {
     format!("FHIRPath constraint {id} could not be evaluated: {detail}")
+}
+
+/// [helios] no constraint could be evaluated, all for the same reason.
+pub(crate) fn msg_constraints_not_evaluable(detail: &str) -> String {
+    format!("FHIRPath constraints could not be evaluated: {detail}")
 }
 
 /// [helios] a schema reference could not be resolved (reference validator

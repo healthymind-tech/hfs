@@ -6,9 +6,10 @@
 //! against storage. A target type is taken from a relative or absolute
 //! RESTful URL (`Patient/1`, `Patient?identifier=…`,
 //! `https://x/fhir/Patient/1/_history/2`), a contained `#id`, or
-//! `Reference.type`. `urn:uuid:` and logical (identifier-only) references
-//! name no type here; Bundle-level `urn:uuid:` resolution is checked by
-//! the Bundle pass in `engine/mod.rs`.
+//! `Reference.type`. A `urn:uuid:`/`urn:oid:` reference inside a Bundle is
+//! typed by the entry whose `fullUrl` it names (whether such an entry
+//! exists is checked by the Bundle pass in `engine/mod.rs`); logical
+//! (identifier-only) references name no type.
 //!
 //! A `refers` entry that does not resolve to a known type (an uninstalled
 //! profile) makes that layer unjudgeable rather than restrictive, so
@@ -130,7 +131,8 @@ fn target_type(ctx: &WalkCtx<'_>, reference: &str) -> Option<String> {
         return ctx.contained_type(id);
     }
     if reference.starts_with("urn:") {
-        return None;
+        // A Bundle-internal URN names the entry with that fullUrl.
+        return ctx.bundle_entry_type(reference);
     }
     let path = reference.split(['?', '#']).next().unwrap_or_default();
     let conditional = reference.contains('?');

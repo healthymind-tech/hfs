@@ -346,6 +346,16 @@ fn equal_helper(
             EvaluationResult::Quantity(l_val, l_unit, _, _),
             EvaluationResult::Quantity(r_val, r_unit, _, _),
         ) => l_val == r_val && units_are_equivalent(l_unit, r_unit),
+        // Complex values (Coding, CodeableConcept, ...) are equal when they
+        // carry the same properties with equal values, whatever the order
+        // the model produced them in (FHIRPath `=` on complex types). obs-7
+        // runs `coding.intersect(%resource.code.coding)`; without this every
+        // Coding compared unequal and the invariant never fired.
+        (EvaluationResult::Object { map: l, .. }, EvaluationResult::Object { map: r, .. }) => {
+            l.len() == r.len()
+                && l.iter()
+                    .all(|(key, lv)| r.get(key).is_some_and(|rv| equal_helper(lv, rv, _context)))
+        }
         // Fallback: not equal for different types
         _ => false,
     }
@@ -1069,5 +1079,31 @@ mod tests {
             &singleton,
             &context
         ));
+    }
+
+    #[test]
+    fn intersect_compares_complex_values_by_content() {
+        use std::collections::HashMap;
+        let coding = |order: &[(&str, &str)]| {
+            let mut map = HashMap::new();
+            for (k, v) in order {
+                map.insert(k.to_string(), EvaluationResult::string(v.to_string()));
+            }
+            EvaluationResult::Object {
+                map,
+                type_info: None,
+            }
+        };
+        let left = coding(&[("system", "http://loinc.org"), ("code", "8480-6")]);
+        let same = coding(&[("code", "8480-6"), ("system", "http://loinc.org")]);
+        let other = coding(&[("code", "8462-4"), ("system", "http://loinc.org")]);
+        let context = EvaluationContext::new_empty_with_default_version();
+        let result = intersect_function(&left, &same, &context).unwrap();
+        assert!(!matches!(result, EvaluationResult::Empty), "{result:?}");
+        let result = intersect_function(&left, &other, &context).unwrap();
+        assert_eq!(result, EvaluationResult::Empty);
+        let partial = coding(&[("code", "8480-6")]);
+        let result = intersect_function(&left, &partial, &context).unwrap();
+        assert_eq!(result, EvaluationResult::Empty);
     }
 }

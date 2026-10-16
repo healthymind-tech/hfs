@@ -6488,9 +6488,21 @@ fn call_function(
             // Returns false if element is empty or is a primitive with extensions but no value
             match invocation_base {
                 EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
-                obj @ EvaluationResult::Object { .. } => Ok(EvaluationResult::boolean(
-                    !obj.is_valueless_primitive_element(),
-                )),
+                // A complex element (HumanName, CodeableConcept, ...) never
+                // has a value: only a primitive does. Treating every object
+                // as valued made ele-1 (`hasValue() or (children().count() >
+                // id.count())`) pass on an element carrying nothing but an
+                // `id`. A primitive surfaces as an object when it carries an
+                // id/extension; its type is then the lower-case primitive name.
+                obj @ EvaluationResult::Object { map, type_info } => {
+                    let primitive = match type_info {
+                        Some(ti) => ti.name.starts_with(|c: char| c.is_ascii_lowercase()),
+                        None => map.contains_key("value"),
+                    };
+                    Ok(EvaluationResult::boolean(
+                        primitive && !obj.is_valueless_primitive_element(),
+                    ))
+                }
                 _ => Ok(EvaluationResult::boolean(true)),
             }
         }

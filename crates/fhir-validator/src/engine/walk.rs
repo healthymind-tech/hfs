@@ -71,7 +71,7 @@ impl SchemaSet {
         self.map.contains_key(key)
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&str, &Arc<FhirSchema>)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, &Arc<FhirSchema>)> {
         self.map.iter().map(|(k, v)| (k.as_str(), v))
     }
 
@@ -106,14 +106,32 @@ pub(super) struct WalkCtx<'a> {
     /// `(id, resourceType)` of the contained resources of each resource
     /// being walked, innermost last (for `#id` reference targets).
     contained: Vec<Vec<(String, String)>>,
+    /// `(fullUrl, resourceType)` of the entries of each Bundle being
+    /// walked, innermost last (for Bundle-internal reference targets).
+    bundle_entries: Vec<Vec<(String, String)>>,
 }
 
-impl WalkCtx<'_> {
+impl<'a> WalkCtx<'a> {
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
         self.resolver
     }
 
+    /// The resolver, detached from the borrow of the context.
+    pub(super) fn resolver_handle(&self) -> &'a dyn SchemaResolver {
+        self.resolver
+    }
+
     /// The type of the contained resource `id` of the innermost resource.
+    /// The type of the entry whose `fullUrl` is `url` in the innermost
+    /// Bundle being walked.
+    pub(super) fn bundle_entry_type(&self, url: &str) -> Option<String> {
+        self.bundle_entries
+            .last()?
+            .iter()
+            .find(|(full_url, _)| full_url == url)
+            .map(|(_, rt)| rt.clone())
+    }
+
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
         self.contained
             .last()?
@@ -126,14 +144,48 @@ impl WalkCtx<'_> {
         self.error_with_severity(kind, message, Severity::Error);
     }
 
-    fn error_with_severity(&mut self, kind: ErrorKind, message: String, severity: Severity) {
+    pub(super) fn error_with_severity(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+    ) {
+        self.error_from(kind, message, severity, None);
+    }
+
+    /// Emit an issue attributed to the profile `source` (see
+    /// [`ValidationError::source`]).
+    pub(super) fn error_from(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+        source: Option<String>,
+    ) {
+        self.error_full(kind, message, severity, source, None);
+    }
+
+    /// Emit an issue with its HL7-validator wording (see
+    /// [`ValidationError::hl7_message`]). Deduplication keys on that wording
+    /// when given: two slices failing the same bound at one array share the
+    /// pinned `message` but are distinct issues.
+    pub(super) fn error_full(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+        source: Option<String>,
+        hl7_message: Option<String>,
+    ) {
         let path = self.path.render_dotted();
-        if self
-            .emitted
-            .insert((kind, severity, path.clone(), message.clone()))
-        {
-            self.errors
-                .push(ValidationError::new(kind, path, message).with_severity(severity));
+        let key = hl7_message.clone().unwrap_or_else(|| message.clone());
+        if self.emitted.insert((kind, severity, path.clone(), key)) {
+            self.errors.push(
+                ValidationError::new(kind, path, message)
+                    .with_severity(severity)
+                    .with_source(source)
+                    .with_hl7_message(hl7_message),
+            );
         }
     }
 }
@@ -159,6 +211,7 @@ pub(super) fn validate(
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
+        bundle_entries: Vec::new(),
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -312,6 +365,20 @@ pub(super) fn add_schemas_to_set(
     set.map.insert(key.to_string(), schema);
 }
 
+/// The canonical URL a schema-set key descends from. Layer keys are the
+/// canonical (or type name) a schema was added under, element subsets
+/// append `.{element}` per step: `http://x/StructureDefinition/bp.component`
+/// came from `http://x/StructureDefinition/bp`. Type-name keys
+/// (`Observation.component`) name no profile.
+pub(super) fn key_origin(key: &str) -> Option<String> {
+    if !key.contains("://") {
+        return None;
+    }
+    let tail = key.rfind('/').map_or(0, |i| i + 1);
+    let end = key[tail..].find('.').map_or(key.len(), |i| tail + i);
+    Some(key[..end].to_string())
+}
+
 /// Navigate an element reference: `["Questionnaire", "elements", "item"]` —
 /// a root schema name followed by alternating `"elements"` / element-name
 /// segments.
@@ -378,8 +445,12 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     }
 
     let is_resource = obj.get("resourceType").is_some_and(Value::is_string);
+    let is_bundle = obj.get("resourceType").and_then(Value::as_str) == Some("Bundle");
     if is_resource {
         ctx.contained.push(contained_types(obj));
+        if is_bundle {
+            ctx.bundle_entries.push(bundle_entry_types(obj));
+        }
         check_resource_id(ctx, set, obj);
     }
 
@@ -413,6 +484,9 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
 
     if is_resource {
         ctx.contained.pop();
+        if is_bundle {
+            ctx.bundle_entries.pop();
+        }
     }
 }
 
@@ -444,6 +518,28 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
         ctx.error(ErrorKind::PrimitiveValue, errors::msg_resource_id(id));
         ctx.path.pop();
     }
+}
+
+/// `(fullUrl, resourceType)` of a Bundle's entries.
+fn bundle_entry_types(bundle: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    bundle
+        .get("entry")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some((
+                        e.get("fullUrl")?.as_str()?.to_string(),
+                        e.get("resource")?
+                            .get("resourceType")?
+                            .as_str()?
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
@@ -641,17 +737,33 @@ fn eval_element(
         }
 
         // Whole-collection keywords, per schema: min then max.
-        let schemas: Vec<Arc<FhirSchema>> = elset.schemas().cloned().collect();
-        for schema in &schemas {
+        let schemas: Vec<(Option<String>, Arc<FhirSchema>)> = elset
+            .iter()
+            .map(|(key, schema)| (key_origin(key), Arc::clone(schema)))
+            .collect();
+        let element = ctx.path.render_unindexed();
+        for (source, schema) in &schemas {
             if let Some(min) = schema.min
                 && (items.len() as u64) < min
             {
-                ctx.error(ErrorKind::Min, errors::msg_min(min, items.len()));
+                ctx.error_full(
+                    ErrorKind::Min,
+                    errors::msg_min(min, items.len()),
+                    Severity::Error,
+                    source.clone(),
+                    Some(errors::hl7_min(&element, min, items.len())),
+                );
             }
             if let Some(max) = schema.max
                 && (items.len() as u64) > max
             {
-                ctx.error(ErrorKind::Max, errors::msg_max(max, items.len()));
+                ctx.error_full(
+                    ErrorKind::Max,
+                    errors::msg_max(max, items.len()),
+                    Severity::Error,
+                    source.clone(),
+                    Some(errors::hl7_max(&element, max, items.len())),
+                );
             }
         }
 
@@ -708,13 +820,85 @@ fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Valu
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
+            } else if is_hl7_namespace(url) && knows_hl7_extensions(ctx.resolver) {
+                // HL7 publishes every extension it defines; a url in its
+                // namespace that resolves to nothing is a typo or an
+                // uninstalled package (the HL7 validator rejects it). Other
+                // namespaces stay allowed silently: FHIR permits extensions
+                // the receiver does not know.
+                ctx.error_with_severity(
+                    ErrorKind::UnknownExtension,
+                    errors::msg_unknown_extension(url),
+                    Severity::Warning,
+                );
             }
             validate_node(ctx, elset, item);
         }
     }
 }
 
-/// Warn when an extension item is used outside its declared context (#615).
+/// Extension urls in HL7's own namespaces, which HL7 publishes definitions
+/// for.
+fn is_hl7_namespace(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or_default();
+    host == "hl7.org" || host.ends_with(".hl7.org") || host == "fhir.org"
+}
+
+/// Whether HL7's extension definitions are loaded at all. R4/R4B ship them
+/// in the core packs; from R5 on they live in `hl7.fhir.uv.extensions`,
+/// and without that package every HL7 extension would look unknown.
+fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
+    resolver
+        .resolve("http://hl7.org/fhir/StructureDefinition/data-absent-reason")
+        .is_some()
+}
+
+/// Canonical (conformance) resource types. HL7's publisher places
+/// `structuredefinition-*` metadata extensions on their roots outside the
+/// extensions' declared contexts throughout the published spec, so a
+/// context mismatch there stays a warning.
+const CANONICAL_RESOURCES: &[&str] = &[
+    "ActivityDefinition",
+    "CapabilityStatement",
+    "ChargeItemDefinition",
+    "CodeSystem",
+    "CompartmentDefinition",
+    "ConceptMap",
+    "EffectEvidenceSynthesis",
+    "EventDefinition",
+    "Evidence",
+    "EvidenceVariable",
+    "ExampleScenario",
+    "GraphDefinition",
+    "ImplementationGuide",
+    "Library",
+    "Measure",
+    "MessageDefinition",
+    "NamingSystem",
+    "ObservationDefinition",
+    "OperationDefinition",
+    "PlanDefinition",
+    "Questionnaire",
+    "ResearchDefinition",
+    "ResearchElementDefinition",
+    "RiskEvidenceSynthesis",
+    "SearchParameter",
+    "SpecimenDefinition",
+    "StructureDefinition",
+    "StructureMap",
+    "TerminologyCapabilities",
+    "TestScript",
+    "ValueSet",
+];
+
+/// Report an extension item used outside its declared context (#615): an
+/// error, as the HL7 validator reports it (`patient-birthPlace` on an
+/// Observation), except on canonical resources (warning, see
+/// [`CANONICAL_RESOURCES`]).
 ///
 /// Conservative on purpose, twice over. Only extensions at the **resource
 /// root** are judged: an element-level instance path cannot be compared to a
@@ -770,7 +954,12 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
 
         ctx.path.push_index(index);
         let message = errors::msg_extension_context(url, &parent, contexts);
-        ctx.error_with_severity(ErrorKind::ExtensionContext, message, Severity::Warning);
+        let severity = if CANONICAL_RESOURCES.contains(&parent.as_str()) {
+            Severity::Warning
+        } else {
+            Severity::Error
+        };
+        ctx.error_with_severity(ErrorKind::ExtensionContext, message, severity);
         ctx.path.pop();
     }
 }
@@ -1072,15 +1261,32 @@ mod tests {
         });
         assert!(warnings(&ok).is_empty());
 
-        // Out of context (an Observation): one warning, warning-severity.
+        // Out of context (an Observation): one error, as the HL7 validator
+        // reports it, attributed to the extension definition.
         let wrong = json!({
             "resourceType": "Observation", "status": "final", "code": {"text": "t"},
             "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
         });
         let found = warnings(&wrong);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].severity, Severity::Error);
         assert_eq!(found[0].path, "Observation.extension.0");
+        assert!(
+            found[0]
+                .message
+                .contains("is not allowed to be used at this point"),
+            "{found:?}"
+        );
+
+        // On a canonical resource root the publisher's own placements are
+        // tolerated: a warning.
+        let canonical = json!({
+            "resourceType": "ValueSet", "status": "draft",
+            "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
+        });
+        let found = warnings(&canonical);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, Severity::Warning);
 
         // Unknown url: silent, wherever it sits.
         let unknown = json!({
@@ -1366,6 +1572,34 @@ mod tests {
         assert_eq!(errors[0].severity, Severity::Warning);
     }
 
+    /// A Bundle-internal URN reference is typed by the entry it names:
+    /// Observation.subject pointing at an Organization entry is invalid.
+    #[test]
+    fn bundle_urn_references_are_type_checked() {
+        let bundle = |target_type: &str| {
+            json!({
+                "resourceType": "Bundle", "type": "transaction",
+                "entry": [
+                    {"fullUrl": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                     "resource": {"resourceType": target_type},
+                     "request": {"method": "POST", "url": target_type}},
+                    {"fullUrl": "urn:uuid:22222222-2222-2222-2222-222222222222",
+                     "resource": observation(json!({"reference": "urn:uuid:11111111-1111-1111-1111-111111111111"})),
+                     "request": {"method": "POST", "url": "Observation"}}
+                ]
+            })
+        };
+        assert!(reference_errors(&bundle("Patient"), &[]).is_empty());
+        let errors = reference_errors(&bundle("Organization"), &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].kind, ErrorKind::ReferenceInvalid);
+        assert_eq!(errors[0].path, "Bundle.entry.1.resource.subject");
+        assert!(
+            errors[0].message.contains("Found Organization"),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn empty_objects_are_reported() {
         use crate::engine::Validator;
@@ -1483,10 +1717,71 @@ mod tests {
                 "extension": [{"url": "http://example.org/x", "valueString": "v"}]}))
             .is_empty()
         );
+        // ...except in HL7's namespace, where every extension is published:
+        // an unknown one there warns.
+        let hl7 = errors(json!({"resourceType": "Patient",
+            "extension": [{"url": "http://hl7.org/fhir/StructureDefinition/nope-extension",
+                "valueString": "v"}]}));
+        assert_eq!(hl7.len(), 1, "{hl7:?}");
+        assert_eq!(hl7[0].kind, ErrorKind::UnknownExtension);
+        assert_eq!(hl7[0].severity, Severity::Warning);
+        assert_eq!(hl7[0].path, "Patient.extension.0");
         let modifier = errors(json!({"resourceType": "Patient",
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
+    }
+
+    /// Without HL7's extension definitions loaded (R5 core without the
+    /// extensions package), an HL7-namespace url proves nothing: silent.
+    #[test]
+    fn unknown_hl7_extensions_need_hl7_definitions_loaded() {
+        use crate::engine::Validator;
+        use crate::resolver::SchemaRegistry;
+        let registry = |with_hl7: bool| {
+            let mut r = SchemaRegistry::new();
+            for p in ["string", "uri", "code"] {
+                r.insert_named(
+                    p,
+                    serde_json::from_value(json!({"kind": "primitive-type"})).unwrap(),
+                );
+            }
+            r.insert_named(
+                "Extension",
+                serde_json::from_value(json!({"elements": {
+                    "url": {"type": "uri"}, "valueString": {"type": "string"}
+                }}))
+                .unwrap(),
+            );
+            r.insert_named(
+                "Patient",
+                serde_json::from_value(json!({"elements": {
+                    "resourceType": {"type": "code"},
+                    "extension": {"type": "Extension", "array": true}
+                }}))
+                .unwrap(),
+            );
+            if with_hl7 {
+                r.insert_named(
+                    "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+                    serde_json::from_value(json!({"kind": "extension", "base": "Extension"}))
+                        .unwrap(),
+                );
+            }
+            Arc::new(r)
+        };
+        let patient = json!({"resourceType": "Patient", "extension": [
+            {"url": "http://hl7.org/fhir/StructureDefinition/nope", "valueString": "x"}]});
+        let unknown = |with_hl7| {
+            Validator::new(registry(with_hl7))
+                .validate_sync(&patient, &crate::ValidationOptions::default())
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::UnknownExtension)
+                .count()
+        };
+        assert_eq!(unknown(false), 0);
+        assert_eq!(unknown(true), 1);
     }
 
     /// A required primitive (or value[x] branch) carried only by its `_`

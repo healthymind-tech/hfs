@@ -219,7 +219,9 @@ impl ValidationService {
             profiles,
             use_meta_profiles: self.use_meta_profiles,
             unknown_profile: self.unknown_profile,
-            ..Default::default()
+            // An extension outside its declared context is an error, as
+            // the HL7 validator reports it (warning on canonical resources).
+            check_extension_context: true,
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -792,13 +794,15 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         // A known extension outside its declared context (#615): invalid
         // content by placement, not a structural malformation.
         ErrorKind::ExtensionContext => IssueType::Invalid,
+        // An HL7-namespace extension nobody defines.
+        ErrorKind::UnknownExtension => IssueType::Structure,
         // A batch/transaction entry filed under the wrong resource type.
         ErrorKind::BundleEntryMismatch => IssueType::Invalid,
         // A malformed or wrongly-typed reference.
         ErrorKind::ReferenceInvalid => IssueType::Invalid,
         // A Bundle-internal URN reference no entry provides.
         ErrorKind::ReferenceUnresolved => IssueType::NotFound,
-        ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
+        ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.
@@ -820,8 +824,13 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         Severity::Error => IssueSeverity::Error,
         Severity::Warning => IssueSeverity::Warning,
     };
-    Issue::new(severity, code, error.message.clone())
-        .with_expression(dotted_to_fhirpath(&error.path))
+    // The profile behind the rule, as the HL7 validator names it.
+    let text = error.hl7_message.as_deref().unwrap_or(&error.message);
+    let message = match &error.source {
+        Some(source) => format!("{text} (from {source})"),
+        None => text.to_string(),
+    };
+    Issue::new(severity, code, message).with_expression(dotted_to_fhirpath(&error.path))
 }
 
 /// Build the `$validate` OperationOutcome: the mapped issues, or the
