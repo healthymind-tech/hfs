@@ -527,3 +527,49 @@ async fn admin_api_is_off_by_default() {
     let (s, _) = send(&e.app, "GET", "/ui/hts/api/admin/formats", None).await;
     assert_ne!(s, StatusCode::OK);
 }
+
+/// A release *directory* in the import dir is resolved to the release file
+/// inside it (it used to be classified as RxNorm whatever it held).
+#[tokio::test(flavor = "multi_thread")]
+async fn import_dir_directory_resolves_to_the_release_inside() {
+    let e = env(true).await;
+    let app = &e.app;
+    let release = e.import_dir.join("release/1.0");
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("terminology.json"), bundle("1.0.0", 10)).unwrap();
+    // macOS AppleDouble companion and a HAPI-style properties file.
+    std::fs::write(release.join("._terminology.json"), b"\0\x05\x16\x07").unwrap();
+    std::fs::write(release.join("upload.properties"), "x=y\n").unwrap();
+
+    let (s, d) = send(app, "GET", "/admin/import-dir/detect?path=release", None).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    assert_eq!(d["detection"]["format"], "fhir-bundle", "{d}");
+    assert_eq!(d["detection"]["import_path"], "1.0/terminology.json", "{d}");
+
+    let (_, job) = send(
+        app,
+        "POST",
+        "/admin/imports",
+        Some(json!({"source": {"type": "import-dir", "path": "release"}})),
+    )
+    .await;
+    let job = wait_job(app, job["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+
+    // An unpacked LOINC tree is recognised, but its importer reads the ZIP.
+    let unpacked = e.import_dir.join("Loinc_2.80");
+    std::fs::create_dir_all(unpacked.join("LoincTable")).unwrap();
+    std::fs::write(unpacked.join("LoincTable/Loinc.csv"), "LOINC_NUM\n").unwrap();
+    let (_, d) = send(app, "GET", "/admin/import-dir/detect?path=Loinc_2.80", None).await;
+    assert_eq!(d["detection"]["format"], "loinc", "{d}");
+    let (_, job) = send(
+        app,
+        "POST",
+        "/admin/imports",
+        Some(json!({"source": {"type": "import-dir", "path": "Loinc_2.80"}, "format": "loinc"})),
+    )
+    .await;
+    let job = wait_job(app, job["id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(job.to_string().contains("directory"), "{job}");
+}

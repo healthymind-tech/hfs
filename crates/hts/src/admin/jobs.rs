@@ -864,6 +864,37 @@ async fn exec_import(
                 })?
         }
     };
+    // A directory is resolved to the release inside it (`Loinc_2.80.zip`
+    // next to `loincupload.properties`, the `rrf/` folder of RxNorm): only
+    // the RxNorm importer reads a directory itself.
+    let path = if path.is_dir() {
+        let p = path.clone();
+        let d = tokio::task::spawn_blocking(move || formats::detect(&p))
+            .await
+            .map_err(|e| AdminError::Internal(e.to_string()))?;
+        let same_format = d.format.as_deref().and_then(formats::parse_format) == Some(format);
+        let resolved = match d.import_path.as_deref() {
+            Some(rel) if same_format => path.join(rel),
+            _ => path.clone(),
+        };
+        if resolved.is_dir() && format != crate::config::ImportFormat::Rxnorm {
+            return Err(AdminError::BadRequest(format!(
+                "{} is a directory and no single {format} release file was found in it ({}); \
+                 import the release file itself",
+                source_label,
+                d.evidence.as_deref().unwrap_or("nothing recognised")
+            )));
+        }
+        if resolved != path {
+            core.jobs.log(
+                &job.id,
+                &format!("directory resolved to {}", resolved.display()),
+            );
+        }
+        resolved
+    } else {
+        path
+    };
     let fi = formats::info(format);
     if args.version.is_some() && !fi.single_system {
         return Err(AdminError::BadRequest(format!(
