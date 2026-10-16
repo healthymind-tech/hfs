@@ -79,3 +79,36 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
     Ok(context)
 }
+
+fn context_for(json: serde_json::Value) -> EvaluationContext {
+    let resource: r4::Resource = serde_json::from_value(json).expect("valid R4 resource");
+    EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))])
+}
+
+/// `Timing.repeat.periodUnit` is a sibling of `period`, not a `period[x]`
+/// variant: core invariant tim-5 (`period.exists() implies period >= 0`)
+/// must hold for a repeat with only `periodUnit` (IPS bundle-minimal), not
+/// fail to evaluate comparing the unit code with 0.
+#[test]
+fn timing_period_unit_is_not_a_period_variant() {
+    let context = context_for(serde_json::json!({
+        "resourceType": "MedicationStatement",
+        "status": "active",
+        "medicationCodeableConcept": { "text": "x" },
+        "subject": { "reference": "Patient/p" },
+        "dosage": [{ "timing": { "repeat": { "count": 1, "periodUnit": "d", "durationMax": 2 } } }]
+    }));
+    let repeat = "MedicationStatement.dosage.timing.repeat";
+    assert_eq!(
+        run_expression(&context, &format!("{repeat}.period.exists()")),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        run_expression(&context, &format!("{repeat}.all(period.exists() implies period >= 0)")),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&context, &format!("{repeat}.periodUnit")),
+        EvaluationResult::string("d".to_string())
+    );
+}

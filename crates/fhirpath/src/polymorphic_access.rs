@@ -251,13 +251,14 @@ fn get_polymorphic_fields(
                 continue;
             }
             if field_name.starts_with(base_name) && field_name.len() > base_name.len() {
-                if let Some(c) = field_name.chars().nth(base_name.len()) {
-                    if c.is_uppercase() {
-                        let type_suffix = &field_name[base_name.len()..];
-                        let converted_value =
-                            convert_fhir_field_to_fhirpath_type(value, type_suffix);
-                        matches.push((field_name.clone(), converted_value));
-                    }
+                let type_suffix = &field_name[base_name.len()..];
+                // Only a FHIR data-type suffix makes a choice variant:
+                // `Timing.repeat.periodUnit` / `periodMax` are siblings of
+                // `period`, not `period[x]` (tim-5 `period >= 0` compared
+                // the unit code "d" with 0).
+                if is_choice_type_suffix(type_suffix) {
+                    let converted_value = convert_fhir_field_to_fhirpath_type(value, type_suffix);
+                    matches.push((field_name.clone(), converted_value));
                 }
             }
         }
@@ -279,6 +280,73 @@ fn get_polymorphic_fields(
     }
 
     matches
+}
+
+/// The type names a choice element `x[x]` can carry as its JSON suffix
+/// (FHIR R4–R6 data types allowed in `[x]` elements).
+const CHOICE_TYPE_SUFFIXES: &[&str] = &[
+    "Address",
+    "Age",
+    "Annotation",
+    "Attachment",
+    "Availability",
+    "Base64Binary",
+    "Boolean",
+    "Canonical",
+    "Code",
+    "CodeableConcept",
+    "CodeableReference",
+    "Coding",
+    "ContactDetail",
+    "ContactPoint",
+    "Contributor",
+    "Count",
+    "DataRequirement",
+    "Date",
+    "DateTime",
+    "Decimal",
+    "Distance",
+    "Dosage",
+    "Duration",
+    "Expression",
+    "ExtendedContactDetail",
+    "HumanName",
+    "Id",
+    "Identifier",
+    "Instant",
+    "Integer",
+    "Integer64",
+    "Markdown",
+    "Meta",
+    "Money",
+    "Oid",
+    "ParameterDefinition",
+    "Period",
+    "PositiveInt",
+    "Quantity",
+    "Range",
+    "Ratio",
+    "RatioRange",
+    "Reference",
+    "RelatedArtifact",
+    "SampledData",
+    "Signature",
+    "String",
+    "Time",
+    "Timing",
+    "TriggerDefinition",
+    "UnsignedInt",
+    "Uri",
+    "Url",
+    "UsageContext",
+    "Uuid",
+    "Xhtml",
+];
+
+/// Whether `suffix` (the part after a choice element's base name) is a FHIR
+/// data type, i.e. names a `[x]` variant rather than a sibling element.
+fn is_choice_type_suffix(suffix: &str) -> bool {
+    CHOICE_TYPE_SUFFIXES.contains(&suffix)
 }
 
 /// Converts a FHIR field value to the appropriate FHIRPath type based on the field suffix.
@@ -1390,6 +1458,37 @@ mod tests {
     // in all four, and `identifier` is a base in none. They therefore hold at
     // `default_enabled()` whichever single version that resolves to.
     // ---------------------------------------------------------------------
+
+    /// Sibling elements that share a choice element's prefix are not its
+    /// variants: `Timing.repeat` has `periodUnit`/`periodMax` next to
+    /// `period`, so with only `periodUnit` present `period` is empty.
+    #[test]
+    fn sibling_fields_are_not_choice_variants() {
+        let mut repeat = HashMap::new();
+        repeat.insert("count".to_string(), EvaluationResult::integer(1));
+        repeat.insert(
+            "periodUnit".to_string(),
+            EvaluationResult::String("d".to_string(), None, None),
+        );
+        repeat.insert("durationMax".to_string(), EvaluationResult::integer(3));
+        assert!(
+            access_polymorphic_element(&repeat, "period", FhirVersion::default_enabled()).is_none()
+        );
+        assert!(
+            access_polymorphic_element(&repeat, "duration", FhirVersion::default_enabled())
+                .is_none()
+        );
+
+        let mut ext = HashMap::new();
+        ext.insert(
+            "valueCodeableConcept".to_string(),
+            EvaluationResult::String("x".to_string(), None, None),
+        );
+        assert!(
+            access_polymorphic_element(&ext, "value", FhirVersion::default_enabled()).is_some(),
+            "a real data-type suffix still resolves"
+        );
+    }
 
     #[test]
     fn access_polymorphic_element_resolves_a_dotted_choice_path() {
