@@ -532,3 +532,29 @@ fn fhirpath_contexts_keep_the_context_check_quiet() {
         "{errors:#?}"
     );
 }
+
+/// ele-1: an element carrying nothing but an `id` has neither a value nor
+/// children.
+#[tokio::test]
+async fn ele1_fires_on_an_id_only_element() {
+    let errors = validate(
+        &json!({"resourceType": "Patient", "name": [{"id": "a"}]}),
+        &[],
+    )
+    .await;
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.extra.get("constraint") == Some(&json!("ele-1"))
+                && e.path == "Patient.name.0"
+                && e.severity == helios_fhir_validator::Severity::Error),
+        "{errors:#?}"
+    );
+    let fine = validate(
+        &json!({"resourceType": "Patient", "name": [{"id": "a", "family": "x"}],
+                "birthDate": "1980-01-01", "_birthDate": {"id": "b"}}),
+        &[],
+    )
+    .await;
+    assert!(fine.is_empty(), "{fine:#?}");
+}
