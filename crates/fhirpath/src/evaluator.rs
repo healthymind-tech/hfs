@@ -131,8 +131,14 @@ pub struct EvaluationContext {
     pub variables: HashMap<String, EvaluationResult>,
 
     /// The 'this' context for direct evaluation (primarily used in tests)
-    /// When set, this overrides the current item passed to the evaluate function
-    pub this: Option<EvaluationResult>,
+    /// When set, this overrides the current item passed to the evaluate function.
+    ///
+    /// Shared (`Arc`): it is the whole root resource, and every lambda
+    /// (`where`, `select`, `all`, `exists(criteria)`, ...) clones the context
+    /// — twice, with its parent link. A deep copy there copied every map of
+    /// the resource per lambda call, which dominated invariant evaluation on
+    /// large resources (a StructureDefinition snapshot: seconds per SD).
+    pub this: Option<Arc<EvaluationResult>>,
 
     /// Flag to enable strict mode evaluation
     /// When enabled, operations on non-existent members produce errors instead of Empty
@@ -168,7 +174,16 @@ pub struct EvaluationContext {
     /// Debug tracer for step-by-step evaluation tracing.
     /// When set (gated by FHIRPATH_DEBUG_TRACE env var), records every evaluate() step.
     pub debug_tracer: Option<Arc<Mutex<crate::debug_trace::DebugTracer>>>,
+
+    /// Opt-in memo of `%resource`-rooted navigation chains (see
+    /// [`EvaluationContext::enable_root_memo`]); shared by clones.
+    pub root_memo: Option<RootMemo>,
 }
+
+/// Results of `%resource`/`%rootResource` navigation chains, keyed by the
+/// address of their AST node. Only sound while those ASTs stay alive and
+/// unchanged for as long as the context is used.
+pub type RootMemo = Arc<Mutex<HashMap<usize, EvaluationResult>>>;
 
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
@@ -187,6 +202,7 @@ impl Clone for EvaluationContext {
             parent_context: self.parent_context.clone(),
             terminology_server_url: self.terminology_server_url.clone(),
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
+            root_memo: self.root_memo.clone(),
         }
     }
 }
@@ -236,7 +252,9 @@ impl EvaluationContext {
         });
 
         // Set 'this' to the first resource if available
-        let this = resources.first().map(convert_resource_to_result);
+        let this = resources
+            .first()
+            .map(|r| Arc::new(convert_resource_to_result(r)));
 
         Self {
             resources: Arc::new(resources),
@@ -251,6 +269,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -269,7 +288,9 @@ impl EvaluationContext {
     /// A new `EvaluationContext` instance with the provided resources and version
     pub fn new_with_version(resources: Vec<FhirResource>, fhir_version: FhirVersion) -> Self {
         // Set 'this' to the first resource if available
-        let this = resources.first().map(convert_resource_to_result);
+        let this = resources
+            .first()
+            .map(|r| Arc::new(convert_resource_to_result(r)));
 
         Self {
             resources: Arc::new(resources),
@@ -284,6 +305,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -314,6 +336,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -393,6 +416,23 @@ impl EvaluationContext {
         self.check_ordered_functions = check;
     }
 
+    /// Memoize `%resource`/`%rootResource`-rooted navigation chains for the
+    /// lifetime of this context (and its clones).
+    ///
+    /// Such a chain does not depend on the focus, yet an invariant like
+    /// `sdf-8` (`snapshot.element.tail().all(path.startsWith(%resource.snapshot
+    /// .element.first().path & '.'))`) re-evaluates it — converting and
+    /// navigating the whole root resource — for every item. With the memo it
+    /// runs once per context.
+    ///
+    /// The memo is keyed by AST node address, so the caller must keep every
+    /// expression it evaluates against this context alive and unmodified
+    /// while the context is in use (e.g. ASTs held by a long-lived parse
+    /// cache), and must not evaluate after changing `resources`.
+    pub fn enable_root_memo(&mut self) {
+        self.root_memo = Some(Arc::new(Mutex::new(HashMap::new())));
+    }
+
     /// Sets the 'this' context for direct evaluation
     ///
     /// This sets the default context item that will be used when an expression
@@ -403,7 +443,7 @@ impl EvaluationContext {
     ///
     /// * `value` - The value to set as the 'this' context
     pub fn set_this(&mut self, value: EvaluationResult) {
-        self.this = Some(value);
+        self.this = Some(Arc::new(value));
     }
 
     /// Adds a resource to the context
@@ -555,6 +595,7 @@ impl EvaluationContext {
             parent_context: Some(Box::new(self.clone())), // Clone entire parent context
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
+            root_memo: self.root_memo.clone(),
         }
     }
 
@@ -763,6 +804,21 @@ pub fn evaluate(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
+    if let Some(memo) = &context.root_memo
+        && is_root_chain(expr)
+    {
+        let key = expr as *const Expression as usize;
+        if let Some(hit) = memo.lock().get(&key).cloned() {
+            return Ok(hit);
+        }
+        let Expression::Invocation(left_expr, invocation) = expr else {
+            unreachable!("is_root_chain only accepts invocations");
+        };
+        let left = evaluate(left_expr, context, None)?;
+        let result = evaluate_invocation(&left, invocation, context, None)?;
+        memo.lock().insert(key, result.clone());
+        return Ok(result);
+    }
     // FHIRPath Spec Section 3: Path Selection
     // "When resolving an identifier that is also the root of a FHIRPath expression,
     // it is resolved as a type name first, and if it resolves to a type, it must
@@ -772,18 +828,23 @@ pub fn evaluate(
     // starts with a simple member identifier.
     if current_item.is_none() {
         if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
-            let global_context_item = if let Some(this_item) = &context.this {
-                this_item.clone()
+            // Borrowed: the common answer is "no match", and copying the
+            // whole root resource just to read its resourceType cost a deep
+            // clone per root-level member access.
+            let converted;
+            let global_context_item: &EvaluationResult = if let Some(this_item) = &context.this {
+                this_item
             } else if !context.resources.is_empty() {
-                convert_resource_to_result(&context.resources[0])
+                converted = convert_resource_to_result(&context.resources[0]);
+                &converted
             } else {
-                EvaluationResult::Empty
+                &EvaluationResult::Empty
             };
 
             if let EvaluationResult::Object {
                 map: obj_map,
                 type_info: _,
-            } = &global_context_item
+            } = global_context_item
             {
                 if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType")
                 {
@@ -791,7 +852,7 @@ pub fn evaluate(
                     if initial_name.eq_ignore_ascii_case(ctx_type) {
                         // The initial identifier matches the context type.
                         // The expression resolves to the context item itself.
-                        return Ok(global_context_item);
+                        return Ok(global_context_item.clone());
                     }
                 }
             }
@@ -867,8 +928,8 @@ pub fn evaluate(
                             // Find the parent object
                             if let Some(EvaluationResult::Object { map, .. }) = current_item {
                                 parent_obj = Some(map.clone());
-                            } else if let Some(EvaluationResult::Object { ref map, .. }) =
-                                context.this
+                            } else if let Some(EvaluationResult::Object { map, .. }) =
+                                context.this.as_deref()
                             {
                                 parent_obj = Some(map.clone());
                             }
@@ -953,7 +1014,7 @@ pub fn evaluate(
             if current_item.is_none()
                 && let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) =
                     left_expr.as_ref()
-                && let Some(this_item) = context.this.as_ref()
+                && let Some(this_item) = context.this.as_deref()
                 && let EvaluationResult::Object { map: this_map, .. } = this_item
                 && let Some(EvaluationResult::String(ctx_type, _, _)) = this_map.get("resourceType")
                 && initial_name.eq_ignore_ascii_case(ctx_type)
@@ -1425,25 +1486,28 @@ fn evaluate_with_context(
     // Check if the expression is a simple type name that matches a resource in context
     if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
         // Try to find a matching resource in context
-        let global_context_item = if let Some(this_item) = &context.this {
-            this_item.clone()
+        let converted;
+        let global_context_item: &EvaluationResult = if let Some(this_item) = &context.this {
+            this_item
         } else if !context.resources.is_empty() {
-            convert_resource_to_result(&context.resources[0])
+            converted = convert_resource_to_result(&context.resources[0]);
+            &converted
         } else if let Some(current) = current_item {
             // Also check current_item if no resources in context
-            current.clone()
+            current
         } else {
-            EvaluationResult::Empty
+            &EvaluationResult::Empty
         };
 
         if let EvaluationResult::Object {
             map: obj_map,
             type_info: _,
-        } = &global_context_item
+        } = global_context_item
         {
             if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType") {
                 if initial_name.eq_ignore_ascii_case(ctx_type) {
-                    return Ok((global_context_item, context));
+                    let item = global_context_item.clone();
+                    return Ok((item, context));
                 }
             }
         }
@@ -1589,7 +1653,7 @@ fn evaluate_term(
                     item // Return the item if Some
                 } else if let Some(this_context) = &context.this {
                     // Use the explicitly set 'this' context if available (for testing)
-                    this_context.clone()
+                    (**this_context).clone()
                 } else {
                     // Return the default context if None
                     if context.resources.is_empty() {
@@ -1679,7 +1743,7 @@ fn evaluate_term(
             let base_context: std::borrow::Cow<'_, EvaluationResult> = match current_item {
                 Some(item) => std::borrow::Cow::Borrowed(item),
                 None => match &context.this {
-                    Some(this_item) => std::borrow::Cow::Borrowed(this_item),
+                    Some(this_item) => std::borrow::Cow::Borrowed(&**this_item),
                     None => std::borrow::Cow::Owned({
                         // Fallback to resources if context.this is also None
                         if context.resources.is_empty() {
@@ -3333,6 +3397,82 @@ fn extract_precision_keyword(expr: &Expression) -> Result<String, EvaluationErro
     }
 }
 
+/// Whether `expr` is a navigation chain rooted at `%resource` or
+/// `%rootResource` that depends on nothing but the root resource: member
+/// accesses and argument-less, side-effect-free functions only.
+fn is_root_chain(expr: &Expression) -> bool {
+    const PURE: &[&str] = &[
+        "first", "last", "tail", "single", "count", "exists", "empty", "distinct",
+        "isDistinct", "children", "descendants", "hasValue", "not",
+    ];
+    let mut current = expr;
+    let mut steps = 0;
+    loop {
+        match current {
+            Expression::Invocation(left, invocation) => {
+                match invocation {
+                    Invocation::Member(_) => {}
+                    Invocation::Function(name, args)
+                        if args.is_empty() && PURE.contains(&name.as_str()) => {}
+                    _ => return false,
+                }
+                steps += 1;
+                current = left;
+            }
+            Expression::Term(Term::ExternalConstant(name)) => {
+                return steps > 0 && (name == "resource" || name == "rootResource");
+            }
+            Expression::Term(Term::Invocation(Invocation::Member(name))) => {
+                return steps > 0 && (name == "%resource" || name == "%rootResource");
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// A compiled regex for `matches` / `matchesFull` / `replaceMatches`,
+/// memoized per process. FHIR invariants such as `eld-19`/`eld-20` call
+/// `matches` with the same literal pattern on every ElementDefinition of a
+/// snapshot, and compiling it each time dominated validating a
+/// StructureDefinition. Patterns can come from data in ad-hoc expressions,
+/// so the cache is dropped wholesale once it holds `REGEX_CACHE_MAX`
+/// entries rather than growing without bound.
+fn cached_regex(
+    pattern: &str,
+    flags: Option<&str>,
+    dot_matches_new_line: bool,
+) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, RwLock};
+    const REGEX_CACHE_MAX: usize = 4096;
+    type Key = (String, String, bool);
+    static CACHE: OnceLock<RwLock<HashMap<Key, Arc<regex::Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key: Key = (
+        pattern.to_string(),
+        flags.unwrap_or_default().to_string(),
+        dot_matches_new_line,
+    );
+    if let Some(re) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(re);
+    }
+    let mut builder = RegexBuilder::new(pattern);
+    if let Some(flags) = flags {
+        apply_regex_flags(&mut builder, flags);
+    }
+    if dot_matches_new_line {
+        builder.dot_matches_new_line(true);
+    }
+    let re = Arc::new(builder.build()?);
+    if let Ok(mut c) = cache.write() {
+        if c.len() >= REGEX_CACHE_MAX {
+            c.clear();
+        }
+        c.insert(key, Arc::clone(&re));
+    }
+    Ok(re)
+}
+
 /// Applies FHIRPath regex flags to a RegexBuilder.
 /// Supported flags: s (dotAll), m (multiLine), i (caseInsensitive), x (comments/whitespace).
 fn apply_regex_flags(builder: &mut RegexBuilder, flags: &str) {
@@ -4741,14 +4881,8 @@ fn call_function(
                     EvaluationResult::String(s, _, _),
                     EvaluationResult::String(regex_pattern, _, _),
                 ) => {
-                    let mut builder = RegexBuilder::new(regex_pattern);
-                    if let Some(flags) = flags {
-                        apply_regex_flags(&mut builder, flags);
-                    } else {
-                        // Backward compat: no flags arg means dot_matches_new_line is on
-                        builder.dot_matches_new_line(true);
-                    }
-                    match builder.build() {
+                    // Backward compat: no flags arg means dot_matches_new_line is on
+                    match cached_regex(regex_pattern, flags, flags.is_none()) {
                         Ok(re) => EvaluationResult::boolean(re.is_match(s)),
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())),
                     }
@@ -4796,11 +4930,7 @@ fn call_function(
                     EvaluationResult::String(regex_pattern, _, _),
                 ) => {
                     let full_pattern = format!("^{}$", regex_pattern);
-                    let mut builder = RegexBuilder::new(&full_pattern);
-                    if let Some(flags) = flags {
-                        apply_regex_flags(&mut builder, flags);
-                    }
-                    match builder.build() {
+                    match cached_regex(&full_pattern, flags, false) {
                         Ok(re) => EvaluationResult::boolean(re.is_match(s)),
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())),
                     }
@@ -4851,11 +4981,7 @@ fn call_function(
                     if regex_pattern.is_empty() {
                         EvaluationResult::string(s.clone())
                     } else {
-                        let mut builder = RegexBuilder::new(regex_pattern);
-                        if let Some(flags) = flags {
-                            apply_regex_flags(&mut builder, flags);
-                        }
-                        match builder.build() {
+                        match cached_regex(regex_pattern, flags, false) {
                             Ok(re) => EvaluationResult::string(
                                 re.replace_all(s, substitution.as_str()).to_string(),
                             ),

@@ -221,11 +221,14 @@ impl<S: ResourceStorage> AppState<S> {
         config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .with_profile_cache(crate::validation_cache::cache_dir(&config)),
+        );
         let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,
@@ -281,11 +284,14 @@ impl<S: ResourceStorage> AppState<S> {
         config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .with_profile_cache(crate::validation_cache::cache_dir(&config)),
+        );
         let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,

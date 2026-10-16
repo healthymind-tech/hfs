@@ -601,7 +601,7 @@ fn preserve_underscore_properties(context: &mut EvaluationContext, resource_json
     if let Value::Object(obj) = resource_json {
         if let Some(Value::String(resource_type)) = obj.get("resourceType") {
             // Clone the existing resource from context
-            if let Some(existing_resource) = context.this.as_ref() {
+            if let Some(existing_resource) = context.this.as_deref() {
                 if let EvaluationResult::Object {
                     map: existing_map,
                     type_info,

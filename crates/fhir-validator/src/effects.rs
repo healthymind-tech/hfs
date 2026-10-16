@@ -88,6 +88,20 @@ pub trait TerminologyProvider: Send + Sync {
         value_set: &str,
         coded: &CodedValue,
     ) -> Result<bool, TerminologyError>;
+
+    /// Every check of one resource at once, answers aligned with `checks`.
+    /// The validator calls this once per resource, so a remote provider can
+    /// answer them in a single round trip; the default asks one by one.
+    async fn validate_codes(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Vec<Result<bool, TerminologyError>> {
+        let mut out = Vec::with_capacity(checks.len());
+        for (value_set, coded) in checks {
+            out.push(self.validate_code(value_set, coded).await);
+        }
+        out
+    }
 }
 
 /// Why a terminology check could not produce a verdict.
@@ -366,6 +380,8 @@ async fn execute_bindings(
         return;
     };
 
+    // Collect every required binding first, then ask the provider once.
+    let mut checks: Vec<(&String, &Binding, &Value, CodedValue)> = Vec::new();
     for d in deferred {
         let Deferred::Binding {
             path,
@@ -382,7 +398,23 @@ async fn execute_bindings(
         let Some(coded) = coded_value(value, type_hint.as_deref()) else {
             continue; // shape not coded (e.g. null gap) — structural checks own it
         };
-        match provider.validate_code(&binding.value_set, &coded).await {
+        checks.push((path, binding, value, coded));
+    }
+    if checks.is_empty() {
+        return;
+    }
+    let requests: Vec<(&str, &CodedValue)> = checks
+        .iter()
+        .map(|(_, binding, _, coded)| (binding.value_set.as_str(), coded))
+        .collect();
+    let verdicts = provider.validate_codes(&requests).await;
+    debug_assert_eq!(verdicts.len(), checks.len(), "provider must align verdicts");
+
+    for ((path, binding, value, _), verdict) in checks.iter().zip(verdicts) {
+        let path = *path;
+        let binding = *binding;
+        let value = *value;
+        match verdict {
             Ok(true) => {}
             Ok(false) => {
                 errors.push(

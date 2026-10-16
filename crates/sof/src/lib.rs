@@ -3947,7 +3947,7 @@ fn evaluate_path_on_item(
             // Convert the iteration item to a resource-like structure for FHIRPath evaluation
             // For simplicity, we'll create a basic context where the item is available for evaluation
             let mut context = EvaluationContext::new(vec![]);
-            context.this = Some(item.clone());
+            context.this = Some(std::sync::Arc::new(item.clone()));
             context
         }
         _ => EvaluationContext::new(vec![]),
@@ -3988,7 +3988,7 @@ fn create_iteration_context(
 ) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
-    context.this = Some(item.clone());
+    context.this = Some(std::sync::Arc::new(item.clone()));
     // Keep the bundle-wide resolution pool available to nested selects/columns
     // evaluated against this iteration item, so `resolve()` still works here.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));

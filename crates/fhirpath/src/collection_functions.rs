@@ -494,7 +494,7 @@ pub fn sort_function(
         for (is_descending, sort_expr) in &sort_keys {
             // Set up context with $this as the current item
             let mut sort_context = context.clone();
-            sort_context.this = Some(item.clone());
+            sort_context.this = Some(std::sync::Arc::new(item.clone()));
 
             // Evaluate the sort expression
             let sort_key = crate::evaluator::evaluate(sort_expr, &sort_context, Some(item))?;
