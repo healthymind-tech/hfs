@@ -8252,6 +8252,22 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
 }
 
 /// Compares two values for inequality - Returns Result now
+/// `(value, unit)` of a FHIR Quantity object: a numeric `value` and the
+/// `code` (falling back to `unit`). `None` when `map` has no numeric value.
+fn fhir_quantity_parts(map: &HashMap<String, EvaluationResult>) -> Option<(Decimal, Option<String>)> {
+    let value = match map.get("value")? {
+        EvaluationResult::Decimal(d, _, _) => *d,
+        EvaluationResult::Integer(i, _, _) => Decimal::from(*i),
+        EvaluationResult::Integer64(i, _, _) => Decimal::from(*i),
+        _ => return None,
+    };
+    let unit = match map.get("code").or_else(|| map.get("unit")) {
+        Some(EvaluationResult::String(s, _, _)) => Some(s.clone()),
+        _ => None,
+    };
+    Some((value, unit))
+}
+
 fn compare_inequality(
     left: &EvaluationResult,
     op: &str,
@@ -8502,6 +8518,26 @@ fn compare_inequality(
                     "Cannot compare Primitive Quantity and Object (expected Quantity representation). Left Quantity: {} {}, Right Object: {:?}",
                     val_l_prim, unit_l_prim, obj_r
                 )));
+            }
+        }
+        // Two FHIR Quantity objects (rng-2 `low <= high` on a Range): compare
+        // values when the units agree (code, else unit), converting through
+        // UCUM when they differ but are comparable.
+        (EvaluationResult::Object { map: obj_l, .. }, EvaluationResult::Object { map: obj_r, .. })
+            if fhir_quantity_parts(obj_l).is_some() && fhir_quantity_parts(obj_r).is_some() =>
+        {
+            let (val_l, unit_l) = fhir_quantity_parts(obj_l).expect("checked");
+            let (val_r, unit_r) = fhir_quantity_parts(obj_r).expect("checked");
+            match (unit_l.as_deref(), unit_r.as_deref()) {
+                (l, r) if l == r => Some(val_l.cmp(&val_r)),
+                (Some(l), Some(r)) if crate::ucum::units_are_comparable(l, r) => {
+                    match crate::ucum::convert_units(val_r, r, l) {
+                        Ok(converted) => Some(val_l.cmp(&converted)),
+                        Err(_) => return Ok(EvaluationResult::Empty),
+                    }
+                }
+                // Different, incomparable units: the comparison is undefined.
+                _ => return Ok(EvaluationResult::Empty),
             }
         }
         // Incomparable types - Return error

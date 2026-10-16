@@ -112,3 +112,25 @@ fn timing_period_unit_is_not_a_period_variant() {
         EvaluationResult::string("d".to_string())
     );
 }
+
+/// Core invariant rng-2 (`low.empty() or high.empty() or (low <= high)`)
+/// compares two Quantity objects, also with a UCUM code the converter does
+/// not know (`/[HPF]`, IPS urine-wbc-range).
+#[test]
+fn range_low_high_quantities_compare() {
+    let range = |low: i64, high: i64, code: &str| {
+        context_for(serde_json::json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": { "text": "x" },
+            "valueRange": {
+                "low": { "value": low, "system": "http://unitsofmeasure.org", "code": code },
+                "high": { "value": high, "system": "http://unitsofmeasure.org", "code": code }
+            }
+        }))
+    };
+    let rng2 = "Observation.value.all(low.empty() or high.empty() or (low <= high))";
+    assert_eq!(run_expression(&range(10, 20, "/[HPF]"), rng2), EvaluationResult::boolean(true));
+    assert_eq!(run_expression(&range(30, 20, "/[HPF]"), rng2), EvaluationResult::boolean(false));
+    assert_eq!(run_expression(&range(10, 20, "mg"), rng2), EvaluationResult::boolean(true));
+}
