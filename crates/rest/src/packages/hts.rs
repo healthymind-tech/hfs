@@ -141,6 +141,64 @@ impl HtsClient {
             .unwrap_or_default())
     }
 
+    /// `(url, version)` of every stored `resource_type` resource, read in
+    /// pages of summaries (no concept lists).
+    pub async fn list_canonicals(
+        &self,
+        resource_type: &str,
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        const PAGE: usize = 1000;
+        let mut out = Vec::new();
+        let mut first_of_first_page: Option<Value> = None;
+        for page in 0..10_000 {
+            let offset = (page * PAGE).to_string();
+            let response = self
+                .http
+                .get(format!("{}/{resource_type}", self.base))
+                .header("Accept", "application/fhir+json")
+                .timeout(Duration::from_secs(120))
+                .query(&[
+                    ("_summary", "true"),
+                    ("_count", &PAGE.to_string()),
+                    ("_offset", &offset),
+                ])
+                .send()
+                .await
+                .map_err(|e| format!("terminology server unreachable: {e}"))?;
+            if !response.status().is_success() {
+                return Err(format!("terminology search HTTP {}", response.status()));
+            }
+            let bundle: Value = response.json().await.map_err(|e| e.to_string())?;
+            let entries = bundle
+                .get("entry")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let n = entries.len();
+            // A server that ignores `_offset` repeats the first page.
+            let first = entries.first().map(|e| e.pointer("/resource/id").cloned());
+            if page == 0 {
+                first_of_first_page = first.flatten();
+            } else if first.flatten() == first_of_first_page {
+                break;
+            }
+            out.extend(entries.iter().filter_map(|e| {
+                let url = e.pointer("/resource/url").and_then(Value::as_str)?;
+                let version = e
+                    .pointer("/resource/version")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Some((url.to_string(), version))
+            }));
+            // A last (short) page; a server that ignores `_count` returns
+            // everything at once.
+            if n != PAGE {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Deletes one resource by id. A `404`/`410` counts as already gone.
     pub async fn delete(&self, resource_type: &str, id: &str) -> Result<(), String> {
         let response = self

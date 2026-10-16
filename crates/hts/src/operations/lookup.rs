@@ -145,6 +145,14 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
     // the backend lookup agree on which CodeSystem version is meant.
     let mut params = params;
     normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // `version=http://snomed.info/sct/<module>[/version/<date>]` → the stored
+    // SNOMED CT release it names.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
@@ -415,7 +423,13 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     }
 
     for prop in resp.properties {
-        let value_part = property_value_part(&prop.value_type, &prop.value);
+        // A Coding property is stored as the code of a concept of this
+        // same system (LOINC part links: `SCALE_TYP` → `LP32888-7`).
+        let value_part = if prop.value_type == "coding" {
+            json!({"name": "value", "valueCoding": {"system": system, "code": prop.value}})
+        } else {
+            property_value_part(&prop.value_type, &prop.value)
+        };
         let mut parts = vec![json!({"name": "code", "valueCode": prop.code}), value_part];
         if let Some(desc) = prop.description {
             parts.push(json!({"name": "description", "valueString": desc}));

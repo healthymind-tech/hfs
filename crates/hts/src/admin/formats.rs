@@ -95,6 +95,14 @@ pub fn info(format: ImportFormat) -> FormatInfo {
             note: Some("loinc"),
             ..base
         },
+        // Measured on the test server (LOINC 2.80, 1.7 M properties).
+        ImportFormat::LoincProperties => FormatInfo {
+            licence: Licence::UserSupplied,
+            growth_floor: GIB / 2,
+            growth_per_byte: 8.0,
+            note: Some("loinc"),
+            ..base
+        },
         ImportFormat::Rxnorm => FormatInfo {
             licence: Licence::UserSupplied,
             growth_floor: GIB,

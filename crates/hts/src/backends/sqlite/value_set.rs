@@ -4875,6 +4875,83 @@ fn query_subtree_with_property(
     value: &str,
     text_filter: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for v in &values {
+        for c in query_subtree_with_property_exact(
+            conn,
+            system_url,
+            system_id,
+            root_code,
+            include_self,
+            property,
+            v,
+            text_filter,
+        )? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The values a filter value on `property` stands for: itself, plus — for
+/// a LOINC part property naming a part (`SCALE_TYP = DOC`) — the codes of
+/// the parts with that name (see [`crate::loinc_filters`]).
+fn loinc_filter_values(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<String>, HtsError> {
+    if !crate::loinc_filters::wants_name_lookup(property, value) {
+        return Ok(vec![value.to_string()]);
+    }
+    if let Some(codes) = crate::loinc_filters::cached(system_id, value) {
+        return Ok(crate::loinc_filters::with_codes(value, codes));
+    }
+    let is_loinc: bool = conn
+        .query_row(
+            "SELECT url = ?2 FROM code_systems WHERE id = ?1",
+            rusqlite::params![system_id, crate::loinc_filters::LOINC_URL],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let codes: Vec<String> = if is_loinc {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code FROM concepts c
+                 WHERE c.system_id = ?1 AND c.code >= 'LP' AND c.code < 'LQ'
+                   AND (lower(c.display) = lower(?2)
+                        OR EXISTS (SELECT 1 FROM concept_designations d
+                                   WHERE d.concept_id = c.id AND lower(d.value) = lower(?2)))
+                 ORDER BY c.code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        stmt.query_map(rusqlite::params![system_id, value.trim()], |r| r.get(0))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+    crate::loinc_filters::remember(system_id, value, &codes);
+    Ok(crate::loinc_filters::with_codes(value, codes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_subtree_with_property_exact(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+    include_self: bool,
+    property: &str,
+    value: &str,
+    text_filter: Option<&str>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
     // Property-first: idx_concept_properties_value narrows candidates to
     // O(K_property) rows before the closure PK checks ancestry.
     // For large SNOMED subtrees (e.g. "Disease" → 50 K descendants) with a
@@ -4959,6 +5036,29 @@ fn query_subtree_with_property(
 /// Look up all concepts in `system_id` that have a property matching
 /// `(property = value)` in the `concept_properties` table.
 fn query_property_eq(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    if values.len() == 1 {
+        return query_property_eq_exact(conn, system_url, system_id, property, value);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for v in &values {
+        for c in query_property_eq_exact(conn, system_url, system_id, property, v)? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn query_property_eq_exact(
     conn: &Connection,
     system_url: &str,
     system_id: &str,
@@ -5811,6 +5911,26 @@ fn batch_property_eq_in_set(
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    if values.len() == 1 {
+        return batch_property_eq_in_set_exact(conn, system_id, property, value, candidates);
+    }
+    let mut out = HashSet::new();
+    for v in &values {
+        out.extend(batch_property_eq_in_set_exact(
+            conn, system_id, property, v, candidates,
+        )?);
+    }
+    Ok(out)
+}
+
+fn batch_property_eq_in_set_exact(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+    value: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
     let json_candidates =
         serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
     let mut stmt = conn

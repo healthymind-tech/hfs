@@ -105,6 +105,8 @@ serde_json = "1"
 # assert what the binary actually serves, not what a `cfg` says.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Data directories for the tests that run the binary (tests/shutdown_signal.rs).
+tempfile = "3"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification

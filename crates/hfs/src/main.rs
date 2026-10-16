@@ -944,6 +944,9 @@ async fn serve(
         ));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    if let Some(stop) = STOP.get() {
+        stop.serving();
+    }
 
     // Peer address in request extensions: the natural-language search rate
     // limiter falls back to it when auth is disabled and there is no principal
@@ -1414,8 +1417,47 @@ async fn init_audit(
     Ok((sink, audit_state))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The stop-signal guard (see [`helios_observability::shutdown::StopGuard`]),
+/// installed first thing in [`run`]; [`serve`] marks it serving.
+static STOP: std::sync::OnceLock<helios_observability::shutdown::StopGuard> =
+    std::sync::OnceLock::new();
+
+/// `HFS_SHUTDOWN_TIMEOUT` (seconds): how long a stop may drain requests and
+/// bulk workers before the process exits anyway. Default 9 s, under the
+/// 10 s `docker stop` grace period — or, when `HFS_WORKER_SHUTDOWN_TIMEOUT`
+/// is set, 2 s more than that.
+fn shutdown_grace() -> std::time::Duration {
+    let default = std::env::var("HFS_WORKER_SHUTDOWN_TIMEOUT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|_| worker_shutdown::drain_timeout() + std::time::Duration::from_secs(2))
+        .unwrap_or(std::time::Duration::from_secs(9))
+        .max(std::time::Duration::from_secs(1));
+    helios_observability::shutdown::parse_grace(
+        std::env::var("HFS_SHUTDOWN_TIMEOUT").ok().as_deref(),
+        default,
+    )
+}
+
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Dropping the runtime would wait without limit for blocking tasks still
+    // running (a long SQLite query, a package being parsed); a stopped
+    // server must not linger — and keep its port — for them.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
+    // Listen for SIGTERM/SIGINT before the (possibly minutes-long) startup:
+    // as PID 1 in a container, an unhandled SIGTERM is discarded.
+    let _ = STOP.set(helios_observability::shutdown::StopGuard::install(
+        "hfs",
+        shutdown_grace(),
+    ));
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.

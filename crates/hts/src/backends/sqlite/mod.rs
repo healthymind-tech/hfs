@@ -1058,6 +1058,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
         // regardless of which resource type was written, and both are cheap.
         invalidate_cs_id_cache();
         invalidate_cs_language_cache();
+        crate::loinc_filters::clear();
     }
 }
 
@@ -1157,6 +1158,149 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         self.invalidate_caches();
         Ok(written)
     }
+
+    async fn write_concept_properties(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        clear: &[String],
+        properties: Vec<crate::import::PropertyRow>,
+        designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        let pool = self.pool.clone();
+        let (url, version, clear) = (url.to_string(), version.map(str::to_string), clear.to_vec());
+        let nothing = clear.is_empty() && properties.is_empty() && designations.is_empty();
+        let written = tokio::task::spawn_blocking(move || -> Result<(u64, u64), HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            write_concept_properties(
+                &mut conn,
+                &url,
+                version.as_deref(),
+                &clear,
+                &properties,
+                &designations,
+            )
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        if !nothing {
+            self.invalidate_caches();
+        }
+        Ok(written)
+    }
+}
+
+/// The `code_systems.id` of `url|version`; with no version, of the only
+/// stored version of `url`.
+fn resolve_system_id(
+    conn: &rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+) -> Result<String, HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let ids: Vec<String> = match version {
+        Some(v) => conn
+            .prepare("SELECT id FROM code_systems WHERE url = ?1 AND version = ?2")
+            .map_err(err)?
+            .query_map(rusqlite::params![url, v], |r| r.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?,
+        None => conn
+            .prepare("SELECT id FROM code_systems WHERE url = ?1")
+            .map_err(err)?
+            .query_map(rusqlite::params![url], |r| r.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?,
+    };
+    match ids.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Err(HtsError::NotFound(format!(
+            "CodeSystem {url}{} is not imported",
+            version.map(|v| format!("|{v}")).unwrap_or_default()
+        ))),
+        _ => Err(HtsError::InvalidRequest(format!(
+            "CodeSystem {url} is stored in {} versions; name the version",
+            ids.len()
+        ))),
+    }
+}
+
+/// [`BundleImportBackend::write_concept_properties`] in one transaction.
+fn write_concept_properties(
+    conn: &mut rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+    clear: &[String],
+    properties: &[crate::import::PropertyRow],
+    designations: &[(String, String, String)],
+) -> Result<(u64, u64), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(err)?;
+    let system_id = resolve_system_id(&tx, url, version)?;
+    if !clear.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "DELETE FROM concept_properties
+                 WHERE property = ?2
+                   AND concept_id IN (SELECT id FROM concepts WHERE system_id = ?1)",
+            )
+            .map_err(err)?;
+        for property in clear {
+            stmt.execute(rusqlite::params![system_id, property])
+                .map_err(err)?;
+        }
+    }
+    let mut props = 0u64;
+    if !properties.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO concept_properties (concept_id, property, value_type, value)
+                 SELECT id, ?3, ?4, ?5 FROM concepts WHERE system_id = ?1 AND code = ?2",
+            )
+            .map_err(err)?;
+        for row in properties {
+            props += stmt
+                .execute(rusqlite::params![
+                    system_id,
+                    row.code,
+                    row.property,
+                    row.value_type,
+                    row.value
+                ])
+                .map_err(err)? as u64;
+        }
+    }
+    let mut desigs = 0u64;
+    if !designations.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO concept_designations (concept_id, language, value)
+                 SELECT c.id, ?3, ?4 FROM concepts c
+                 WHERE c.system_id = ?1 AND c.code = ?2
+                   AND lower(COALESCE(c.display, '')) <> lower(?4)
+                   AND NOT EXISTS (SELECT 1 FROM concept_designations d
+                                   WHERE d.concept_id = c.id AND lower(d.value) = lower(?4))",
+            )
+            .map_err(err)?;
+        for (code, language, value) in designations {
+            desigs += stmt
+                .execute(rusqlite::params![system_id, code, language, value])
+                .map_err(err)? as u64;
+        }
+    }
+    if !clear.is_empty() || props > 0 || desigs > 0 {
+        crate::import::fhir_bundle::invalidate_expansion_cache_for_system(&tx, url)?;
+        crate::import::fhir_bundle::invalidate_implicit_expansions(&tx, url)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok((props, desigs))
 }
 
 /// Replace the `refset_members` rows of the CodeSystem `url|version` in one

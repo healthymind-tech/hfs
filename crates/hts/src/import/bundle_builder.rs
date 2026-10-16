@@ -146,6 +146,8 @@ fn parsed_property(code: &str, value_key: &str, value: &str) -> ParsedProperty {
         "valueInteger" => "integer",
         "valueDecimal" => "decimal",
         "valueDateTime" => "dateTime",
+        // Stored as the target code; the system is the CodeSystem's own.
+        "valueCoding" => "coding",
         _ => "string",
     };
     let is_parent_edge = code == "parent" && value_type == "code";
@@ -224,6 +226,13 @@ fn encode_concept(c: &BuilderConcept<'_>) -> Value {
         }));
     }
     for p in c.extra_properties {
+        if p.value_key == "valueCoding" {
+            properties.push(json!({
+                "code": p.code,
+                "valueCoding": {"code": p.value},
+            }));
+            continue;
+        }
         properties.push(json!({
             "code": p.code,
             p.value_key: p.value,

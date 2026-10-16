@@ -45,6 +45,7 @@ pub mod error;
 pub(crate) mod implicit_vs;
 pub mod import;
 pub(crate) mod language;
+pub mod loinc_filters;
 #[cfg(all(feature = "sqlite", feature = "postgres"))]
 pub mod migrate;
 pub mod operations;

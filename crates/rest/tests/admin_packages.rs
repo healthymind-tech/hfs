@@ -567,6 +567,16 @@ async fn id_clash_with_a_different_canonical_gets_its_own_id() {
 /// ValueSet / ConceptMap by (type, url, version), `GET /{type}?url=&version=`
 /// searches, `DELETE /{type}/{id}` removes. Returns its base URL and store.
 async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let (url, store, _) = mock_hts_counting().await;
+    (url, store)
+}
+
+/// [`mock_hts`] that also counts the resources `POST /import` received.
+async fn mock_hts_counting() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     use axum::{
         Json, Router,
         extract::{Path, Query, State},
@@ -575,8 +585,16 @@ async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     type Store = Arc<Mutex<Vec<Value>>>;
-    async fn import(State(store): State<Store>, Json(bundle): Json<Value>) -> Json<Value> {
+    type Imported = Arc<std::sync::atomic::AtomicUsize>;
+    async fn import(
+        State((store, imported)): State<(Store, Imported)>,
+        Json(bundle): Json<Value>,
+    ) -> Json<Value> {
         let mut s = store.lock().unwrap();
+        imported.fetch_add(
+            bundle["entry"].as_array().map_or(0, Vec::len),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let mut n = 0;
         for e in bundle["entry"].as_array().cloned().unwrap_or_default() {
             let r = e["resource"].clone();
@@ -591,7 +609,7 @@ async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         Json(json!({"code_systems": n, "value_sets": 0, "concept_maps": 0, "concepts": 0}))
     }
     async fn search(
-        State(store): State<Store>,
+        State((store, _)): State<(Store, Imported)>,
         Path(t): Path<String>,
         Query(q): Query<HashMap<String, String>>,
     ) -> Json<Value> {
@@ -608,7 +626,7 @@ async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         )
     }
     async fn remove(
-        State(store): State<Store>,
+        State((store, _)): State<(Store, Imported)>,
         Path((t, id)): Path<(String, String)>,
     ) -> axum::http::StatusCode {
         store
@@ -618,15 +636,123 @@ async fn mock_hts() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         axum::http::StatusCode::NO_CONTENT
     }
     let store: Store = Arc::new(Mutex::new(Vec::new()));
+    let imported: Imported = Arc::default();
     let app = Router::new()
         .route("/import", post(import))
         .route("/{t}", get(search))
         .route("/{t}/{id}", delete(remove))
-        .with_state(Arc::clone(&store));
+        .with_state((Arc::clone(&store), Arc::clone(&imported)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), store)
+    (format!("http://{addr}"), store, imported)
+}
+
+fn hts_server(hts: &str, cache: &std::path::Path) -> TestServer {
+    let backend = SqliteBackend::in_memory().expect("sqlite");
+    backend.init_schema().expect("schema");
+    let config = ServerConfig {
+        seed_conformance: false,
+        request_timeout: 60,
+        terminology_server: Some(hts.to_string()),
+        packages: PackageConfig {
+            admin_ui: true,
+            registry: RegistryMode::Off,
+            cache_dir: Some(cache.to_path_buf()),
+            ..PackageConfig::default()
+        },
+        ..ServerConfig::for_testing()
+    };
+    TestServer::new(helios_rest::create_app_with_config(backend, config)).unwrap()
+}
+
+/// The core package is never installed (its definitions are embedded), but
+/// its CodeSystems, ValueSets and ConceptMaps must reach the terminology
+/// server: an install sends those the server lacks — not what it already
+/// has, not the StructureDefinitions — and a restarted server sends nothing.
+#[tokio::test]
+async fn core_terminology_reaches_the_terminology_server_once() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (hts, store, imported) = mock_hts_counting().await;
+    let vs = |id: &str| {
+        json!({
+            "resourceType": "ValueSet", "id": id, "url": format!("http://hl7.org/fhir/ValueSet/{id}"),
+            "version": "4.0.1", "status": "active",
+            "compose": {"include": [{"system": "http://hl7.org/fhir/days-of-week"}]}
+        })
+    };
+    // Production already has the core terminology (loaded by hand).
+    store.lock().unwrap().push(vs("units-of-time"));
+    let core = package(
+        "hl7.fhir.r4.core",
+        "4.0.1",
+        json!({}),
+        &[
+            (
+                "CodeSystem-days-of-week.json",
+                json!({
+                    "resourceType": "CodeSystem", "id": "days-of-week",
+                    "url": "http://hl7.org/fhir/days-of-week", "version": "4.0.1",
+                    "status": "active", "content": "complete", "concept": [{"code": "mon"}]
+                }),
+            ),
+            ("ValueSet-units-of-time.json", vs("units-of-time")),
+            ("ValueSet-days-of-week.json", vs("days-of-week")),
+            (
+                "ConceptMap-cm.json",
+                json!({"resourceType": "ConceptMap", "id": "cm",
+                       "url": "http://hl7.org/fhir/ConceptMap/cm", "version": "4.0.1",
+                       "status": "active"}),
+            ),
+            (
+                "StructureDefinition-core-patient.json",
+                profile("core-patient", "4.0.1", "gender"),
+            ),
+        ],
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let server = hts_server(&hts, cache.path());
+    // Offline with an empty cache: the startup sync gives up quietly.
+    upload(&server, core, "").await.assert_status(StatusCode::OK);
+    upload(&server, base_v1(), "")
+        .await
+        .assert_status(StatusCode::OK);
+    let job = install(&server, "acme.base#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let stored = store.lock().unwrap().clone();
+    let has = |t: &str, url: &str| stored.iter().any(|r| r["resourceType"] == t && r["url"] == url);
+    assert!(has("CodeSystem", "http://hl7.org/fhir/days-of-week"), "{stored:?}");
+    assert!(has("ValueSet", "http://hl7.org/fhir/ValueSet/days-of-week"));
+    assert!(has("ConceptMap", "http://hl7.org/fhir/ConceptMap/cm"));
+    assert!(
+        !stored.iter().any(|r| r["resourceType"] == "StructureDefinition"),
+        "only terminology goes to the terminology server"
+    );
+    // acme.base's own CodeSystem + the three core resources it lacked.
+    assert_eq!(imported.load(SeqCst), 4, "{stored:?}");
+    // The core package was not installed.
+    let list: Value = server.get("/admin/packages").await.json();
+    assert!(
+        list["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["name"] != "hl7.fhir.r4.core"),
+        "{list}"
+    );
+
+    // A restarted server (same cache, same terminology server) sends no
+    // core terminology again, at startup or on install.
+    drop(server);
+    let server = hts_server(&hts, cache.path());
+    let job = install(&server, "acme.base#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        imported.load(SeqCst),
+        5,
+        "only acme.base's CodeSystem is re-sent by its reinstall"
+    );
 }
 
 /// With a terminology server configured, CodeSystems go there (not into

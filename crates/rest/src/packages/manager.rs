@@ -79,6 +79,19 @@ pub enum TerminologyTarget {
     Both,
 }
 
+/// What [`PackageManager::ensure_core_terminology`] did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CoreTerminologyReport {
+    /// `name#version` of the core package.
+    pub package: String,
+    /// Its terminology resources.
+    pub total: usize,
+    /// Resources sent (those the terminology server did not have).
+    pub sent: usize,
+    /// Per-resource errors the terminology server reported.
+    pub errors: Vec<String>,
+}
+
 /// Install options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -231,6 +244,10 @@ pub struct PackageManager {
     config: PackageConfig,
     jobs: JobTable,
     install_lock: tokio::sync::Mutex<()>,
+    /// `true` once the core terminology is known to be on the terminology
+    /// server (see [`PackageManager::ensure_core_terminology`]); the lock
+    /// keeps the startup sync and an install from sending it twice.
+    core_synced: tokio::sync::Mutex<bool>,
 }
 
 /// The cache directory for a server configuration.
@@ -297,6 +314,7 @@ impl PackageManager {
             deps,
             jobs: JobTable::default(),
             install_lock: tokio::sync::Mutex::new(()),
+            core_synced: tokio::sync::Mutex::new(false),
         }
     }
 
@@ -851,6 +869,19 @@ impl PackageManager {
         job.phase("waiting for other package jobs");
         let _guard = self.install_lock.lock().await;
         job.start();
+        if self.routes_terminology_to_hts(options) {
+            job.phase("checking the core terminology on the terminology server");
+            match self.ensure_core_terminology().await {
+                Ok(report) if report.sent > 0 => job.log(format!(
+                    "core terminology: sent {} of {} {} resources to the terminology server",
+                    report.sent, report.total, report.package
+                )),
+                Ok(_) => {}
+                // Not fatal: the IG installs; bindings to core value sets
+                // the terminology server lacks are reported as unchecked.
+                Err(e) => job.log(format!("core terminology not sent: {e}")),
+            }
+        }
         job.phase("resolving dependencies");
         let plan = match self.make_plan(tenant, name, version, options).await {
             Ok(plan) => plan,
@@ -1656,12 +1687,175 @@ impl PackageManager {
         }
     }
 
+    // ------------------------------------------------- core terminology
+
+    /// The FHIR core package of this server's FHIR version.
+    fn core_package(&self) -> Option<(&'static str, &'static str)> {
+        match self.release().as_str() {
+            "r4" => Some(("hl7.fhir.r4.core", "4.0.1")),
+            "r4b" => Some(("hl7.fhir.r4b.core", "4.3.0")),
+            "r5" => Some(("hl7.fhir.r5.core", "5.0.0")),
+            _ => None,
+        }
+    }
+
+    /// Makes sure the terminology server has the CodeSystems, ValueSets and
+    /// ConceptMaps of the FHIR core package (`hl7.fhir.r4.core#4.0.1`).
+    ///
+    /// The package manager never installs the core package — its
+    /// definitions are embedded — so without this a fresh terminology
+    /// server lacks `units-of-time`, `ucum-units`, `observation-codes` and
+    /// the other core value sets that IG profiles bind to. The package comes
+    /// from the cache or the registry like any other. Only what the
+    /// terminology server does not have under the same url and version is
+    /// sent, so this is a no-op on a server that has it (production loaded
+    /// it by hand) and after the first successful run; nothing is recorded
+    /// as owned by a package, so no uninstall removes it.
+    pub async fn ensure_core_terminology(&self) -> Result<CoreTerminologyReport, String> {
+        let Some(client) = self.hts.clone() else {
+            return Err("no terminology server is configured".into());
+        };
+        let Some((name, version)) = self.core_package() else {
+            return Err(format!(
+                "no core package is known for FHIR {}",
+                self.fhir_version.as_str()
+            ));
+        };
+        let package = format!("{name}#{version}");
+        let mut synced = self.core_synced.lock().await;
+        if *synced || !self.config.core_terminology {
+            return Ok(CoreTerminologyReport {
+                package,
+                ..Default::default()
+            });
+        }
+        let (bytes, _) = self.registry.fetch(name, version).await?;
+        let limits = *self.registry.limits();
+        let parsed = tokio::task::spawn_blocking(move || parse_package(&bytes, &limits))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let mut wanted: Vec<&PackageEntry> = parsed
+            .entries
+            .iter()
+            .filter(|e| !e.example && TERMINOLOGY_TYPES.contains(&e.resource_type.as_str()))
+            .filter(|e| e.url.is_some())
+            .collect();
+        wanted.sort_by_key(|e| {
+            TERMINOLOGY_TYPES
+                .iter()
+                .position(|t| *t == e.resource_type)
+                .unwrap_or(9)
+        });
+        let total = wanted.len();
+        let mut present: HashSet<(String, String, Option<String>)> = HashSet::new();
+        for resource_type in TERMINOLOGY_TYPES {
+            for (url, version) in client.list_canonicals(resource_type).await? {
+                present.insert((resource_type.to_string(), url, version));
+            }
+        }
+        let missing: Vec<&PackageEntry> = wanted
+            .into_iter()
+            .filter(|e| {
+                let url = e.url.clone().unwrap_or_default();
+                let key = (e.resource_type.clone(), url.clone(), e.version.clone());
+                // A versionless resource is there when any version is.
+                !(present.contains(&key)
+                    || e.version.is_none()
+                        && present
+                            .iter()
+                            .any(|(t, u, _)| *t == e.resource_type && *u == url))
+            })
+            .collect();
+        let mut report = CoreTerminologyReport {
+            package,
+            total,
+            sent: 0,
+            errors: Vec::new(),
+        };
+        let mut start = 0;
+        while start < missing.len() {
+            let mut end = start;
+            let mut size = 0usize;
+            while end < missing.len()
+                && end - start < HTS_CHUNK_RESOURCES
+                && (end == start || size + missing[end].bytes.len() <= HTS_CHUNK_BYTES)
+                && missing[end].resource_type == missing[start].resource_type
+            {
+                size += missing[end].bytes.len();
+                end += 1;
+            }
+            let mut resources = Vec::with_capacity(end - start);
+            for e in &missing[start..end] {
+                match e.json() {
+                    Ok(v) => resources.push(v),
+                    Err(err) => report.errors.push(format!("{}: {err}", hts_label(e))),
+                }
+            }
+            start = end;
+            match import_with_retry(&client, resources).await {
+                Ok(outcome) => {
+                    report.sent += outcome.imported as usize;
+                    report.errors.extend(outcome.errors);
+                }
+                Err(err) => return Err(format!("{err} (after {} sent)", report.sent)),
+            }
+        }
+        // Per-resource errors (a ValueSet over a code system the server
+        // refuses, say) are reported but do not make the next start retry
+        // the whole package.
+        *synced = true;
+        if report.sent > 0 || !report.errors.is_empty() {
+            info!(
+                package = %report.package,
+                total = report.total,
+                sent = report.sent,
+                errors = report.errors.len(),
+                "Core terminology sent to the terminology server"
+            );
+            for e in report.errors.iter().take(20) {
+                warn!(package = %report.package, error = %e, "Core terminology resource not imported");
+            }
+        } else {
+            info!(package = %report.package, total = report.total, "Core terminology already on the terminology server");
+        }
+        Ok(report)
+    }
+
+    /// [`Self::ensure_core_terminology`] at startup: the terminology server
+    /// may come up after this one, so an unreachable server is retried for
+    /// about ten minutes; a missing package (offline, not cached) is not.
+    async fn sync_core_terminology_at_startup(&self) {
+        let mut delay = 5u64;
+        for attempt in 1.. {
+            match self.ensure_core_terminology().await {
+                Ok(_) => return,
+                Err(e) if e.contains("unreachable") && attempt < 20 => {
+                    info!(attempt, error = %e, "Core terminology: terminology server not reachable yet; retrying");
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay * 2).min(60);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Core terminology was not sent to the terminology server; bindings to core \
+                         value sets it lacks stay unchecked. Make the core package available \
+                         (HFS_PACKAGE_REGISTRY online, or upload it to the package cache) and \
+                         restart, or set HFS_CORE_TERMINOLOGY=false"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------ startup
 
     /// Installs `HFS_PACKAGES` entries that are not installed yet, one after
     /// another, in the background.
     pub fn spawn_startup(self: &Arc<Self>) {
-        if self.config.startup.is_empty() {
+        let sync_core = self.hts.is_some() && self.config.core_terminology;
+        if self.config.startup.is_empty() && !sync_core {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -1670,6 +1864,9 @@ impl PackageManager {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            if sync_core {
+                this.sync_core_terminology_at_startup().await;
+            }
             let tenant = this.default_tenant.clone();
             for spec in this.config.startup.clone() {
                 let (name, version) = match parse_spec(&spec) {

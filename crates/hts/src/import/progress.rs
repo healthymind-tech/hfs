@@ -245,6 +245,22 @@ impl BundleImportBackend for ProgressBackend {
             .await
     }
 
+    async fn write_concept_properties(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        clear: &[String],
+        properties: Vec<crate::import::PropertyRow>,
+        designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        self.check_cancel()?;
+        self.progress.writing.store(true, Ordering::SeqCst);
+        self.inner
+            .write_concept_properties(ctx, url, version, clear, properties, designations)
+            .await
+    }
+
     async fn delete_normalized(
         &self,
         resource_type: &str,

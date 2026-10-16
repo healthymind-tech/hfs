@@ -295,6 +295,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used by search modifiers |
 | `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else `422 too-costly`) |
 | `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; `0` disables |
+| `HFS_CORE_TERMINOLOGY` | true | With `HFS_TERMINOLOGY_SERVER`: at startup (and before a package install) send the terminology server the CodeSystems, ValueSets and ConceptMaps of the FHIR core package (`hl7.fhir.r4.core#4.0.1`) it lacks — compared by url and version, so a server that has them gets nothing. The core package comes from the package cache or registry like any other (offline: upload it once). |
 | `HFS_TERMINOLOGY_PUBLIC_URL` | *(none)* | Browser-reachable URL for the web UI's Terminology link (the server-side URL above is often an internal address); defaults to `/ui/hts` on the UI's own origin when `HFS_TERMINOLOGY_SERVER` names an internal host |
 
 **Elasticsearch**

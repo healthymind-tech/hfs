@@ -572,6 +572,10 @@ pub fn extract_property_value(prop: &Value) -> (String, String) {
     if let Some(v) = prop["valueDateTime"].as_str() {
         return ("dateTime".into(), v.into());
     }
+    // A Coding property is stored as its code (filters compare codes).
+    if let Some(v) = prop["valueCoding"]["code"].as_str() {
+        return ("coding".into(), v.into());
+    }
     if let Some(v) = prop["value"].as_str() {
         return ("string".into(), v.into());
     }

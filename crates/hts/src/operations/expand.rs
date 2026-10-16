@@ -232,9 +232,12 @@ fn serialize_expansion_contains(
                     "Decimal" => "valueDecimal",
                     "DateTime" => "valueDateTime",
                     "Code" => "valueCode",
+                    "Coding" => "valueCoding",
                     _ => "valueString",
                 };
-                let value: Value = if key == "valueBoolean" {
+                let value: Value = if key == "valueCoding" {
+                    json!({"system": c.system, "code": p.value})
+                } else if key == "valueBoolean" {
                     json!(p.value == "true")
                 } else if key == "valueInteger" {
                     json!(p.value.parse::<i64>().unwrap_or(0))
@@ -551,7 +554,8 @@ fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
         "decimal" | "Decimal" => "Decimal".to_string(),
         "dateTime" | "DateTime" => "DateTime".to_string(),
         "code" | "Code" => "Code".to_string(),
-        // string, Coding, and any unrecognised type fall back to a string
+        "coding" | "Coding" => "Coding".to_string(),
+        // string and any unrecognised type fall back to a string
         // serialization so the FHIR `valueString` field carries the value.
         _ => "string".to_string(),
     }

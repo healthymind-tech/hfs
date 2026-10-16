@@ -378,6 +378,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be greater than the heartbeat interval. |
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released export is claimable by another instance at once, without spending one of its `HFS_BULK_EXPORT_MAX_ATTEMPTS`, and restarts from scratch. Past the deadline, leases lapse after the lease duration as before. |
+| `HFS_SHUTDOWN_TIMEOUT` | `9` | Seconds a stop (SIGTERM/SIGINT) may spend draining requests and workers before the process exits anyway; a second signal exits at once, and a signal during startup exits at once. Defaults to 9 s, under the 10 s `docker stop` grace period — or to `HFS_WORKER_SHUTDOWN_TIMEOUT` + 2 s when that is set (set both for longer drains, e.g. under Kubernetes' 30 s). |
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence, seconds. A background task renews the lease at this cadence for the whole run, so long batches do not let it expire. Must be less than the lease duration. |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
