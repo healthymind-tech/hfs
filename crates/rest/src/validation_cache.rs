@@ -226,6 +226,7 @@ impl ProfileCache {
         let count = entries.len();
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
+            remove_stale_temporaries(dir);
         }
         let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
         let result = (|| {
@@ -250,6 +251,30 @@ impl ProfileCache {
             let _ = std::fs::remove_file(&tmp);
         }
         result.map(|()| count)
+    }
+}
+
+/// Drop temporary files a killed writer left behind (`profiles.json.tmp.<pid>`
+/// older than a minute; a concurrent writer's fresh one is left alone).
+fn remove_stale_temporaries(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("profiles.json.tmp.") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 

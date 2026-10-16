@@ -627,7 +627,10 @@ impl ValidationService {
             report.ready_after = started.elapsed();
         }
         self.rehydrating.send_replace(false);
-        self.save_profile_cache().await;
+        // A warm start that found nothing to change leaves the file as is.
+        if report.cached == 0 || report.converted > 0 || report.removed > 0 {
+            self.save_profile_cache().await;
+        }
 
         report.elapsed = started.elapsed();
         if report.storage_errors == 0 {
