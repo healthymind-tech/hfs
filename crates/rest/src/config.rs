@@ -511,6 +511,14 @@ pub struct PackageConfig {
     /// Largest single file inside a package, bytes —
     /// `HFS_PACKAGE_MAX_ENTRY`, default 64 MiB.
     pub max_entry: u64,
+    /// Send the FHIR core package's CodeSystems, ValueSets and ConceptMaps
+    /// (`hl7.fhir.r4.core#4.0.1` for R4) to the terminology server at
+    /// startup, those it does not have yet — `HFS_CORE_TERMINOLOGY`,
+    /// default `true`. The core package itself is never installed (its
+    /// definitions are embedded), so without this a fresh terminology
+    /// server lacks `units-of-time`, `ucum-units`, `observation-codes`, ….
+    /// Only applies with `HFS_TERMINOLOGY_SERVER`.
+    pub core_terminology: bool,
 }
 
 /// Where the package manager looks for packages online.
@@ -589,6 +597,7 @@ impl Default for PackageConfig {
             max_size: 256 * 1024 * 1024,
             max_unpacked: 1024 * 1024 * 1024,
             max_entry: 64 * 1024 * 1024,
+            core_terminology: true,
         }
     }
 }
@@ -629,6 +638,14 @@ impl PackageConfig {
             max_size: bytes("HFS_PACKAGE_MAX_SIZE", d.max_size),
             max_unpacked: bytes("HFS_PACKAGE_MAX_UNPACKED", d.max_unpacked),
             max_entry: bytes("HFS_PACKAGE_MAX_ENTRY", d.max_entry),
+            core_terminology: env("HFS_CORE_TERMINOLOGY")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    )
+                })
+                .unwrap_or(d.core_terminology),
         }
     }
 }
