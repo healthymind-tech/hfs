@@ -3333,6 +3333,49 @@ fn extract_precision_keyword(expr: &Expression) -> Result<String, EvaluationErro
     }
 }
 
+/// A compiled regex for `matches` / `matchesFull` / `replaceMatches`,
+/// memoized per process. FHIR invariants such as `eld-19`/`eld-20` call
+/// `matches` with the same literal pattern on every ElementDefinition of a
+/// snapshot, and compiling it each time dominated validating a
+/// StructureDefinition. Patterns can come from data in ad-hoc expressions,
+/// so the cache is dropped wholesale once it holds `REGEX_CACHE_MAX`
+/// entries rather than growing without bound.
+fn cached_regex(
+    pattern: &str,
+    flags: Option<&str>,
+    dot_matches_new_line: bool,
+) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, RwLock};
+    const REGEX_CACHE_MAX: usize = 4096;
+    type Key = (String, String, bool);
+    static CACHE: OnceLock<RwLock<HashMap<Key, Arc<regex::Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key: Key = (
+        pattern.to_string(),
+        flags.unwrap_or_default().to_string(),
+        dot_matches_new_line,
+    );
+    if let Some(re) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(re);
+    }
+    let mut builder = RegexBuilder::new(pattern);
+    if let Some(flags) = flags {
+        apply_regex_flags(&mut builder, flags);
+    }
+    if dot_matches_new_line {
+        builder.dot_matches_new_line(true);
+    }
+    let re = Arc::new(builder.build()?);
+    if let Ok(mut c) = cache.write() {
+        if c.len() >= REGEX_CACHE_MAX {
+            c.clear();
+        }
+        c.insert(key, Arc::clone(&re));
+    }
+    Ok(re)
+}
+
 /// Applies FHIRPath regex flags to a RegexBuilder.
 /// Supported flags: s (dotAll), m (multiLine), i (caseInsensitive), x (comments/whitespace).
 fn apply_regex_flags(builder: &mut RegexBuilder, flags: &str) {
@@ -4741,14 +4784,8 @@ fn call_function(
                     EvaluationResult::String(s, _, _),
                     EvaluationResult::String(regex_pattern, _, _),
                 ) => {
-                    let mut builder = RegexBuilder::new(regex_pattern);
-                    if let Some(flags) = flags {
-                        apply_regex_flags(&mut builder, flags);
-                    } else {
-                        // Backward compat: no flags arg means dot_matches_new_line is on
-                        builder.dot_matches_new_line(true);
-                    }
-                    match builder.build() {
+                    // Backward compat: no flags arg means dot_matches_new_line is on
+                    match cached_regex(regex_pattern, flags, flags.is_none()) {
                         Ok(re) => EvaluationResult::boolean(re.is_match(s)),
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())),
                     }
@@ -4796,11 +4833,7 @@ fn call_function(
                     EvaluationResult::String(regex_pattern, _, _),
                 ) => {
                     let full_pattern = format!("^{}$", regex_pattern);
-                    let mut builder = RegexBuilder::new(&full_pattern);
-                    if let Some(flags) = flags {
-                        apply_regex_flags(&mut builder, flags);
-                    }
-                    match builder.build() {
+                    match cached_regex(&full_pattern, flags, false) {
                         Ok(re) => EvaluationResult::boolean(re.is_match(s)),
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())),
                     }
@@ -4851,11 +4884,7 @@ fn call_function(
                     if regex_pattern.is_empty() {
                         EvaluationResult::string(s.clone())
                     } else {
-                        let mut builder = RegexBuilder::new(regex_pattern);
-                        if let Some(flags) = flags {
-                            apply_regex_flags(&mut builder, flags);
-                        }
-                        match builder.build() {
+                        match cached_regex(regex_pattern, flags, false) {
                             Ok(re) => EvaluationResult::string(
                                 re.replace_all(s, substitution.as_str()).to_string(),
                             ),
