@@ -52,6 +52,18 @@ pub struct ProfileRehydrationReport {
     /// Storage failures; a non-zero count means some tenant's profiles may be
     /// missing until they are re-written.
     pub storage_errors: usize,
+    /// Entries taken from the compiled-profile cache before the database
+    /// was read (validation stopped waiting once these were registered).
+    pub cached: usize,
+    /// StructureDefinitions read from storage and converted in this pass
+    /// (new, changed, or everything on a cold start).
+    pub converted: usize,
+    /// Cached entries whose row had disappeared from storage; dropped.
+    pub removed: usize,
+    /// Time until the registries were complete enough for validation to
+    /// stop waiting (the cache load on a warm start, the whole pass on a
+    /// cold one).
+    pub ready_after: Duration,
     /// Wall-clock duration of the pass.
     pub elapsed: Duration,
 }
@@ -97,6 +109,13 @@ pub struct ValidationService {
     rehydrating: tokio::sync::watch::Sender<bool>,
     /// Upper bound on that wait (`HFS_VALIDATION_REHYDRATE_WAIT_MS`).
     rehydrate_wait: Duration,
+    /// Compiled-profile cache on disk (`HFS_VALIDATION_PROFILE_CACHE`).
+    profile_cache: Option<crate::validation_cache::ProfileCache>,
+    /// The stored StructureDefinitions folded into the registries, with
+    /// their row stamps and schemas — what the cache file is written from.
+    stored_index: std::sync::Mutex<crate::validation_cache::StoredIndex>,
+    /// Signalled when `stored_index` changed and the cache file is stale.
+    cache_dirty: tokio::sync::Notify,
 }
 
 impl Default for ValidationService {
@@ -113,6 +132,9 @@ impl Default for ValidationService {
             shadow_core: false,
             rehydrating: tokio::sync::watch::Sender::new(false),
             rehydrate_wait: Duration::from_millis(60_000),
+            profile_cache: None,
+            stored_index: Default::default(),
+            cache_dirty: tokio::sync::Notify::new(),
         }
     }
 }
@@ -184,7 +206,33 @@ impl ValidationService {
             shadow_core: config.shadow_core,
             rehydrating: tokio::sync::watch::Sender::new(false),
             rehydrate_wait: Duration::from_millis(config.rehydrate_wait_ms),
+            profile_cache: None,
+            stored_index: Default::default(),
+            cache_dirty: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Persist compiled stored profiles under `dir` so a restart only
+    /// converts what changed (see [`crate::validation_cache`]). `None`
+    /// leaves the cache off.
+    pub fn with_profile_cache(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.profile_cache = dir.and_then(|dir| {
+            let cache = crate::validation_cache::ProfileCache::new(&dir, self.shadow_core);
+            if cache.is_none() {
+                warn!(dir = %dir.display(), "cannot fingerprint this build; compiled-profile cache disabled");
+            }
+            cache
+        });
+        self
+    }
+
+    /// Use an explicit cache (tests pin the fingerprint).
+    pub fn with_profile_cache_at(
+        mut self,
+        cache: Option<crate::validation_cache::ProfileCache>,
+    ) -> Self {
+        self.profile_cache = cache;
+        self
     }
 
     /// Replace the terminology provider (bindings stay unchecked without one).
@@ -208,11 +256,43 @@ impl ValidationService {
         profiles: Vec<String>,
         tenant: Option<&str>,
     ) -> Vec<ValidationError> {
-        self.await_rehydration().await;
+        // While a cold rehydration is still filling the registries, validate
+        // right away and only wait (then validate again) when the pass hit a
+        // definition the registries could not resolve — a request whose
+        // profiles are already there, or that needs none, never waits.
+        if self.is_rehydrating() {
+            let misses = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let issues = self
+                .validate_with(version, resource, profiles.clone(), tenant, Some(&misses))
+                .await;
+            if !misses.load(std::sync::atomic::Ordering::Relaxed) {
+                return issues;
+            }
+            self.await_rehydration().await;
+        }
+        self.validate_with(version, resource, profiles, tenant, None)
+            .await
+    }
+
+    async fn validate_with(
+        &self,
+        version: FhirVersion,
+        resource: &Value,
+        profiles: Vec<String>,
+        tenant: Option<&str>,
+        misses: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Vec<ValidationError> {
         let core = helios_fhir_validator::packs::core_registry(version);
         let resolver: Arc<dyn SchemaResolver> = match self.tenant_overlay(tenant, version) {
             Some(overlay) => Arc::new(CompositeResolver::new(vec![overlay, core])),
             None => core,
+        };
+        let resolver: Arc<dyn SchemaResolver> = match misses {
+            Some(flag) => Arc::new(MissRecorder {
+                inner: resolver,
+                missed: Arc::clone(flag),
+            }),
+            None => resolver,
         };
         let validator = Validator::new(resolver);
         let opts = ValidationOptions {
@@ -318,66 +398,81 @@ impl ValidationService {
     ///
     /// Returns `true` when the definition ended up in the registry.
     pub fn upsert_stored_profile(&self, tenant: &str, version: FhirVersion, sd: &Value) -> bool {
+        if self.tenant_profiles.is_none() {
+            return false;
+        }
+        let schema = prepare_stored_profile(self.shadow_core, tenant, version, sd);
+        let registered = match &schema {
+            Some(schema) => self.install_profile(tenant, version, schema.clone()),
+            None => false,
+        };
+        // Index it for the compiled-profile cache. The body handed to the
+        // write path carries no server `meta`, so the stamp has no version:
+        // the next start re-reads this row once and records the real one.
+        if let Some(stamp) = crate::validation_cache::RowStamp::of(sd) {
+            let url = sd.get("url").and_then(Value::as_str).map(str::to_string);
+            self.stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .put(crate::validation_cache::StoredProfile {
+                    tenant: tenant.to_string(),
+                    fhir_version: version,
+                    stamp,
+                    url,
+                    schema: schema.filter(|_| registered),
+                    seq: 0,
+                    confirmed: true,
+                    live: true,
+                });
+            self.cache_dirty.notify_one();
+        }
+        registered
+    }
+
+    /// Insert a converted stored definition into the tenant registry under
+    /// the registration rules of [`Self::upsert_stored_profile`]. Returns
+    /// `false` when the schema has no URL.
+    fn install_profile(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        schema: helios_fhir_validator::FhirSchema,
+    ) -> bool {
         let Some(registries) = &self.tenant_profiles else {
             return false;
         };
         let core = helios_fhir_validator::packs::core_registry(version);
-        let url = sd.get("url").and_then(Value::as_str);
-        if !self.shadow_core
-            && let Some(url) = url
-            && core.resolve(url).is_some()
-        {
-            debug!(
-                tenant = %tenant,
-                url = %url,
-                "stored StructureDefinition matches an embedded core definition; not registered \
-                 (set HFS_VALIDATION_SHADOW_CORE=true to override core definitions)"
-            );
-            return false;
-        }
-        match helios_fhir_validator::converter::convert(sd) {
-            Ok(conversion) => {
-                for w in &conversion.warnings {
-                    warn!(tenant = %tenant, "profile conversion warning: {w}");
-                }
-                let schema = conversion.schema;
-                let is_constraint = schema.derivation.as_deref() == Some("constraint")
-                    || schema.kind.as_deref()
-                        == Some(helios_fhir_validator::schema::kind::EXTENSION);
-                let name_is_core_type = schema
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| core.resolve(name).is_some());
-                let registry = registries
-                    .entry((tenant.to_string(), version))
-                    .or_insert_with(|| Arc::new(RwLock::new(SchemaRegistry::new())))
-                    .clone();
-                let mut registry = registry.write().expect("tenant profile registry lock");
-                let inserted = if is_constraint || name_is_core_type {
-                    if name_is_core_type && !is_constraint {
-                        warn!(
-                            tenant = %tenant,
-                            url = ?url,
-                            name = ?schema.name,
-                            "stored StructureDefinition is named like a core type; registered by url only"
-                        );
-                    }
-                    registry.insert_by_url(schema)
-                } else {
-                    registry.insert(schema)
-                };
-                if inserted {
-                    debug!(tenant = %tenant, url = ?url, "tenant profile registered");
-                } else {
-                    warn!(tenant = %tenant, "stored StructureDefinition has no url; not registered");
-                }
-                inserted
+        let url = schema.url.clone();
+        let is_constraint = schema.derivation.as_deref() == Some("constraint")
+            || schema.kind.as_deref() == Some(helios_fhir_validator::schema::kind::EXTENSION);
+        let name_is_core_type = schema
+            .name
+            .as_deref()
+            .is_some_and(|name| core.resolve(name).is_some());
+        let registry = registries
+            .entry((tenant.to_string(), version))
+            .or_insert_with(|| Arc::new(RwLock::new(SchemaRegistry::new())))
+            .clone();
+        let mut registry = registry.write().expect("tenant profile registry lock");
+        let inserted = if is_constraint || name_is_core_type {
+            if name_is_core_type && !is_constraint {
+                warn!(
+                    tenant = %tenant,
+                    url = ?url,
+                    name = ?schema.name,
+                    "stored StructureDefinition is named like a core type; registered by url only"
+                );
             }
-            Err(e) => {
-                warn!(tenant = %tenant, "stored StructureDefinition failed to convert: {e}");
-                false
-            }
+            registry.insert_by_url(schema)
+        } else {
+            registry.insert(schema)
+        };
+        if inserted {
+            debug!(tenant = %tenant, url = ?url, "tenant profile registered");
+        } else {
+            warn!(tenant = %tenant, "stored StructureDefinition has no url; not registered");
         }
+        inserted
     }
 
     /// Drop a stored StructureDefinition from the tenant's profile registry
@@ -387,6 +482,16 @@ impl ValidationService {
         let Some(registries) = &self.tenant_profiles else {
             return false;
         };
+        {
+            let mut index = self.stored_index.lock().expect("stored profile index lock");
+            let before = index.entries.len();
+            index.entries.retain(|(t, _), p| {
+                !(t == tenant && p.fhir_version == version && p.url.as_deref() == Some(url))
+            });
+            if index.entries.len() != before {
+                self.cache_dirty.notify_one();
+            }
+        }
         let Some(registry) = registries.get(&(tenant.to_string(), version)) else {
             return false;
         };
@@ -401,11 +506,15 @@ impl ValidationService {
     }
 
     /// Announce that a startup rehydration pass is about to run. Until
-    /// [`Self::rehydrate_stored_profiles`] finishes, validation waits for it
-    /// (at most `HFS_VALIDATION_REHYDRATE_WAIT_MS`) instead of answering from
-    /// a half-filled registry: a `$validate` right after a restart would
+    /// [`Self::rehydrate_stored_profiles`] has registered the stored
+    /// profiles (from the compiled-profile cache when there is one, else
+    /// from storage), a validation that needs a definition the registries
+    /// cannot resolve yet waits for it (at most
+    /// `HFS_VALIDATION_REHYDRATE_WAIT_MS`) instead of answering from a
+    /// half-filled registry: a `$validate` right after a restart would
     /// otherwise report the profile as not found, and an enforce-mode
     /// write claiming a stored profile would be accepted unchecked.
+    /// Validations that resolve everything they need never wait.
     pub fn begin_rehydration(&self) {
         if self.tenant_profiles.is_some() {
             self.rehydrating.send_replace(true);
@@ -444,12 +553,18 @@ impl ValidationService {
     /// the registries were in-memory only, so every restart silently
     /// forgot every uploaded profile until it was re-written.
     ///
+    /// With a compiled-profile cache ([`crate::validation_cache`]) the
+    /// cached schemas are registered first and validation stops waiting;
+    /// the storage scan then only converts rows whose `meta.versionId` /
+    /// `meta.lastUpdated` changed, and drops cached rows that are gone.
+    ///
     /// Pages through storage with [`ExportDataProvider::fetch_export_batch`]
     /// (the one enumeration primitive every backend implements, deleted
     /// resources already filtered out) for the default tenant plus every
-    /// registered tenant, then reads each page back through
-    /// [`ResourceStorage::read_batch`] so the definition is registered under
-    /// the FHIR version it was stored with — exactly as the write path did.
+    /// registered tenant, then reads the changed rows back through
+    /// [`ResourceStorage::read_batch`] so each definition is registered
+    /// under the FHIR version it was stored with — exactly as the write path
+    /// did. Conversion runs on blocking threads, in parallel.
     ///
     /// Errors are absorbed and counted, never propagated: one tenant's
     /// storage failure must not stop the others, one malformed
@@ -481,6 +596,12 @@ impl ValidationService {
         let _done = Done(&self.rehydrating);
         let batch_size = batch_size.max(1);
 
+        self.load_profile_cache(&mut report).await;
+        if report.cached > 0 {
+            report.ready_after = started.elapsed();
+            self.rehydrating.send_replace(false);
+        }
+
         let mut tenants: BTreeSet<String> = BTreeSet::new();
         tenants.insert(default_tenant.to_string());
         if storage.supports_tenant_registry() {
@@ -498,6 +619,15 @@ impl ValidationService {
             self.rehydrate_tenant_profiles(storage, tenant_id, batch_size, &mut report)
                 .await;
         }
+        // Rows that are gone are only known for certain after a clean scan.
+        if report.storage_errors == 0 {
+            self.prune_unconfirmed_profiles(&mut report);
+        }
+        if report.cached == 0 {
+            report.ready_after = started.elapsed();
+        }
+        self.rehydrating.send_replace(false);
+        self.save_profile_cache().await;
 
         report.elapsed = started.elapsed();
         if report.storage_errors == 0 {
@@ -505,6 +635,10 @@ impl ValidationService {
                 tenants = report.tenants,
                 registered = report.registered,
                 skipped = report.skipped,
+                cached = report.cached,
+                converted = report.converted,
+                removed = report.removed,
+                ready_ms = report.ready_after.as_millis() as u64,
                 elapsed_ms = report.elapsed.as_millis() as u64,
                 "stored StructureDefinitions rehydrated into the profile registry"
             );
@@ -513,12 +647,159 @@ impl ValidationService {
                 tenants = report.tenants,
                 registered = report.registered,
                 skipped = report.skipped,
+                cached = report.cached,
+                converted = report.converted,
                 storage_errors = report.storage_errors,
                 elapsed_ms = report.elapsed.as_millis() as u64,
                 "profile rehydration incomplete; some stored profiles may not resolve until re-written"
             );
         }
         report
+    }
+
+    /// Register the compiled-profile cache's entries (warm start).
+    async fn load_profile_cache(&self, report: &mut ProfileRehydrationReport) {
+        let Some(cache) = self.profile_cache.clone() else {
+            return;
+        };
+        let started = Instant::now();
+        let entries = match tokio::task::spawn_blocking(move || cache.load()).await {
+            Ok(Ok(Some(entries))) => entries,
+            Ok(Ok(None)) => {
+                debug!("no compiled-profile cache for this build; converting every stored profile");
+                return;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "compiled-profile cache unreadable; converting every stored profile");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "loading the compiled-profile cache failed");
+                return;
+            }
+        };
+        for mut entry in entries {
+            let key = (entry.tenant.clone(), entry.stamp.id.clone());
+            if self
+                .stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .entries
+                .get(&key)
+                .is_some_and(|e| e.live)
+            {
+                continue; // written since this process started: newer
+            }
+            if let Some(schema) = entry.schema.clone() {
+                self.install_profile(&entry.tenant, entry.fhir_version, schema);
+            }
+            entry.confirmed = false;
+            entry.live = false;
+            self.stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .put(entry);
+            report.cached += 1;
+        }
+        info!(
+            cached = report.cached,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "compiled-profile cache loaded; validation no longer waits for rehydration"
+        );
+    }
+
+    /// Drop cached entries the storage scan did not see (deleted while the
+    /// server was down), re-registering any other row that shares the URL.
+    fn prune_unconfirmed_profiles(&self, report: &mut ProfileRehydrationReport) {
+        let stale: Vec<crate::validation_cache::StoredProfile> = {
+            let mut index = self.stored_index.lock().expect("stored profile index lock");
+            let keys: Vec<(String, String)> = index
+                .entries
+                .iter()
+                .filter(|(_, p)| !p.confirmed && !p.live)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.iter()
+                .filter_map(|k| index.entries.remove(k))
+                .collect()
+        };
+        for gone in stale {
+            report.removed += 1;
+            let Some(url) = gone.url.as_deref() else {
+                continue;
+            };
+            if gone.schema.is_some()
+                && let Some(registries) = &self.tenant_profiles
+                && let Some(registry) = registries.get(&(gone.tenant.clone(), gone.fhir_version))
+            {
+                registry
+                    .write()
+                    .expect("tenant profile registry lock")
+                    .remove(url);
+            }
+            let survivor = self
+                .stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .entries
+                .values()
+                .filter(|p| {
+                    p.tenant == gone.tenant
+                        && p.fhir_version == gone.fhir_version
+                        && p.url.as_deref() == Some(url)
+                })
+                .max_by_key(|p| p.seq)
+                .and_then(|p| p.schema.clone());
+            if let Some(schema) = survivor {
+                self.install_profile(&gone.tenant, gone.fhir_version, schema);
+            }
+        }
+        if report.removed > 0 {
+            debug!(removed = report.removed, "dropped cached profiles no longer in storage");
+        }
+    }
+
+    /// Write the compiled-profile cache (no-op without one).
+    pub async fn save_profile_cache(&self) {
+        let Some(cache) = self.profile_cache.clone() else {
+            return;
+        };
+        let entries = self
+            .stored_index
+            .lock()
+            .expect("stored profile index lock")
+            .ordered();
+        let started = Instant::now();
+        match tokio::task::spawn_blocking(move || cache.save(entries)).await {
+            Ok(Ok(count)) => debug!(
+                entries = count,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "compiled-profile cache written"
+            ),
+            Ok(Err(e)) => warn!(error = %e, "writing the compiled-profile cache failed"),
+            Err(e) => warn!(error = %e, "writing the compiled-profile cache failed"),
+        }
+    }
+
+    /// Keep the compiled-profile cache current after StructureDefinition
+    /// writes: rewritten at most every few seconds while writes continue
+    /// (an IG install), never during a rehydration pass (which writes it
+    /// when done).
+    pub fn spawn_profile_cache_writer(self: &Arc<Self>) {
+        if self.profile_cache.is_none() {
+            return;
+        }
+        // The service lives as long as the server; the task with it.
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                svc.cache_dirty.notified().await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if !svc.is_rehydrating() {
+                    svc.save_profile_cache().await;
+                }
+            }
+        });
     }
 
     async fn rehydrate_tenant_profiles<S>(
@@ -530,12 +811,8 @@ impl ValidationService {
     ) where
         S: ResourceStorage + ExportDataProvider + ?Sized,
     {
+        use crate::validation_cache::{RowStamp, StoredProfile};
         const TYPE: &str = "StructureDefinition";
-        /// Just enough of an exported line to address the row again.
-        #[derive(serde::Deserialize)]
-        struct IdOnly {
-            id: String,
-        }
 
         let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
         let mut request = ExportRequest::system();
@@ -560,25 +837,104 @@ impl ValidationService {
                     return;
                 }
             };
-            let ids: Vec<String> = batch
-                .lines
-                .iter()
-                .filter_map(|line| serde_json::from_str::<IdOnly>(line).ok().map(|r| r.id))
-                .collect();
-            if !ids.is_empty() {
-                let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-                match storage.read_batch(&tenant, TYPE, &id_refs).await {
-                    Ok(stored) => {
-                        for sd in &stored {
-                            if self.upsert_stored_profile(
-                                tenant_id,
-                                sd.fhir_version(),
-                                sd.content(),
-                            ) {
+            // Rows whose cached entry is still current are kept as they are.
+            let mut changed: std::collections::HashMap<String, RowStamp> =
+                std::collections::HashMap::new();
+            {
+                let mut index = self.stored_index.lock().expect("stored profile index lock");
+                for stamp in batch.lines.iter().filter_map(|l| RowStamp::of_line(l)) {
+                    match index
+                        .entries
+                        .get_mut(&(tenant_id.to_string(), stamp.id.clone()))
+                    {
+                        Some(entry)
+                            if entry.live
+                                || (entry.stamp == stamp && stamp.version_id.is_some()) =>
+                        {
+                            entry.confirmed = true;
+                            if entry.schema.is_some() {
                                 report.registered += 1;
                             } else {
                                 report.skipped += 1;
                             }
+                        }
+                        _ => {
+                            changed.insert(stamp.id.clone(), stamp);
+                        }
+                    }
+                }
+            }
+            if !changed.is_empty() {
+                let id_refs: Vec<&str> = changed.keys().map(String::as_str).collect();
+                match storage.read_batch(&tenant, TYPE, &id_refs).await {
+                    Ok(stored) => {
+                        let items: Vec<(FhirVersion, Value)> = stored
+                            .into_iter()
+                            .map(|sd| (sd.fhir_version(), sd.into_content()))
+                            .collect();
+                        let shadow_core = self.shadow_core;
+                        let owner = tenant_id.to_string();
+                        let converted = match tokio::task::spawn_blocking(move || {
+                            prepare_stored_profiles(shadow_core, &owner, items)
+                        })
+                        .await
+                        {
+                            Ok(converted) => converted,
+                            Err(e) => {
+                                warn!(tenant = %tenant_id, error = %e, "converting stored StructureDefinitions failed");
+                                report.storage_errors += 1;
+                                return;
+                            }
+                        };
+                        for (version, content, schema) in converted {
+                            report.converted += 1;
+                            let Some(id) = content.get("id").and_then(Value::as_str) else {
+                                report.skipped += 1;
+                                continue;
+                            };
+                            let key = (tenant_id.to_string(), id.to_string());
+                            if self
+                                .stored_index
+                                .lock()
+                                .expect("stored profile index lock")
+                                .entries
+                                .get(&key)
+                                .is_some_and(|e| e.live)
+                            {
+                                report.registered += 1;
+                                continue; // a live write already registered a newer one
+                            }
+                            let registered = match &schema {
+                                Some(schema) => {
+                                    self.install_profile(tenant_id, version, schema.clone())
+                                }
+                                None => false,
+                            };
+                            if registered {
+                                report.registered += 1;
+                            } else {
+                                report.skipped += 1;
+                            }
+                            let stamp = changed
+                                .remove(id)
+                                .or_else(|| RowStamp::of(&content))
+                                .expect("row has an id");
+                            self.stored_index
+                                .lock()
+                                .expect("stored profile index lock")
+                                .put(StoredProfile {
+                                    tenant: tenant_id.to_string(),
+                                    fhir_version: version,
+                                    stamp,
+                                    url: content
+                                        .get("url")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    schema: schema.filter(|_| registered),
+                                    seq: 0,
+                                    confirmed: true,
+                                    live: false,
+                                });
                         }
                     }
                     Err(e) => {
@@ -617,6 +973,112 @@ impl SchemaResolver for LockedRegistryResolver {
             .expect("tenant profile registry lock")
             .resolve(reference)
     }
+}
+
+/// Resolver adapter that notes whether any lookup came back empty — how a
+/// validation running during a cold rehydration learns that it needed a
+/// definition the registries do not have yet.
+struct MissRecorder {
+    inner: Arc<dyn SchemaResolver>,
+    missed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SchemaResolver for MissRecorder {
+    fn resolve(&self, reference: &str) -> Option<Arc<helios_fhir_validator::FhirSchema>> {
+        let found = self.inner.resolve(reference);
+        if found.is_none() {
+            self.missed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        found
+    }
+}
+
+/// The pure half of registering a stored StructureDefinition: the
+/// core-canonical check and the conversion. `None` = not registered.
+fn prepare_stored_profile(
+    shadow_core: bool,
+    tenant: &str,
+    version: FhirVersion,
+    sd: &Value,
+) -> Option<helios_fhir_validator::FhirSchema> {
+    let url = sd.get("url").and_then(Value::as_str);
+    if !shadow_core
+        && let Some(url) = url
+        && helios_fhir_validator::packs::core_registry(version)
+            .resolve(url)
+            .is_some()
+    {
+        debug!(
+            tenant = %tenant,
+            url = %url,
+            "stored StructureDefinition matches an embedded core definition; not registered \
+             (set HFS_VALIDATION_SHADOW_CORE=true to override core definitions)"
+        );
+        return None;
+    }
+    match helios_fhir_validator::converter::convert(sd) {
+        Ok(conversion) => {
+            for w in &conversion.warnings {
+                warn!(tenant = %tenant, "profile conversion warning: {w}");
+            }
+            Some(conversion.schema)
+        }
+        Err(e) => {
+            warn!(tenant = %tenant, "stored StructureDefinition failed to convert: {e}");
+            None
+        }
+    }
+}
+
+/// [`prepare_stored_profile`] over a page of rows, spread across threads
+/// (blocking context). Output order follows input order.
+fn prepare_stored_profiles(
+    shadow_core: bool,
+    tenant: &str,
+    items: Vec<(FhirVersion, Value)>,
+) -> Vec<(FhirVersion, Value, Option<helios_fhir_validator::FhirSchema>)> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+        .min(items.len().max(1));
+    if threads <= 1 {
+        return items
+            .into_iter()
+            .map(|(v, sd)| {
+                let schema = prepare_stored_profile(shadow_core, tenant, v, &sd);
+                (v, sd, schema)
+            })
+            .collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    let mut chunks: Vec<Vec<(FhirVersion, Value)>> = Vec::with_capacity(threads);
+    let mut rest = items;
+    while !rest.is_empty() {
+        let tail = rest.split_off(chunk.min(rest.len()));
+        chunks.push(rest);
+        rest = tail;
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|part| {
+                scope.spawn(move || {
+                    part.into_iter()
+                        .map(|(v, sd)| {
+                            let schema = prepare_stored_profile(shadow_core, tenant, v, &sd);
+                            (v, sd, schema)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("profile conversion thread"))
+            .collect()
+    })
 }
 
 // ---------------------------------------------------------------------

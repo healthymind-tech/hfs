@@ -687,6 +687,11 @@ pub struct ValidationConfig {
     /// before validating against the profiles registered so far
     /// (`HFS_VALIDATION_REHYDRATE_WAIT_MS`, default 60000).
     pub rehydrate_wait_ms: u64,
+    /// Directory of the compiled-profile cache that lets a restart skip
+    /// re-converting unchanged StructureDefinitions
+    /// (`HFS_VALIDATION_PROFILE_CACHE`: a path, or `off`). Unset: next to
+    /// the package cache; see [`crate::validation_cache::cache_dir`].
+    pub profile_cache: Option<String>,
 }
 
 impl Default for ValidationConfig {
@@ -705,6 +710,7 @@ impl Default for ValidationConfig {
             rehydrate: true,
             rehydrate_batch_size: 100,
             rehydrate_wait_ms: 60_000,
+            profile_cache: None,
         }
     }
 }
@@ -758,6 +764,7 @@ impl ValidationConfig {
             )
             .clamp(1, u64::from(u32::MAX)) as u32,
             rehydrate_wait_ms: env_u64("HFS_VALIDATION_REHYDRATE_WAIT_MS", d.rehydrate_wait_ms),
+            profile_cache: std::env::var("HFS_VALIDATION_PROFILE_CACHE").ok(),
         }
     }
 

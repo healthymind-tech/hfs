@@ -169,6 +169,7 @@ pub mod state;
 pub mod tenant;
 pub mod terminology;
 pub mod validation;
+pub mod validation_cache;
 
 /// Test-only support helpers shared across the crate's unit tests.
 #[cfg(test)]
@@ -1238,6 +1239,7 @@ fn spawn_profile_rehydration<S>(
     // Announced before the spawn, so no request can observe the empty
     // registry between the port opening and the task starting.
     validation.begin_rehydration();
+    validation.spawn_profile_cache_writer();
     tokio::spawn(async move {
         validation
             .rehydrate_stored_profiles(storage.as_ref(), &default_tenant, batch_size)
