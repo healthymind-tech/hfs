@@ -564,6 +564,14 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
+      "file": "diagnosticreport-example-lri.json",
+      "issues": 16,
+      "kinds": [
+        "bundle-entry-mismatch"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID): RESTful fullUrls whose last segment is not the entry resource's id (e.g. .../Observation/lri-gramstain1 for id gramstain1)."
+    },
+    {
       "file": "diagnosticreport-genetics-questionnaire.json",
       "issues": 42,
       "kinds": [
@@ -580,6 +588,14 @@
         "unknown-extension"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
+    },
+    {
+      "file": "document-example-dischargesummary.json",
+      "issues": 1,
+      "kinds": [
+        "reference-unresolved"
+      ],
+      "reason": "Genuine per the FHIR Bundle reference rules the HL7 Java validator applies (BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): the MedicationRequest entry has a urn:uuid fullUrl and references Practitioner/example, which cannot resolve against a URN."
     },
     {
       "file": "documentmanifest-questionnaire.json",
@@ -1125,6 +1141,23 @@
         "unknown-extension"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
+    },
+    {
+      "file": "message-request-link.json",
+      "issues": 1,
+      "kinds": [
+        "bundle-entry-mismatch"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID / BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): fullUrl .../Patient/pat12 carries id pat2, and relative references from urn:uuid entries cannot resolve."
+    },
+    {
+      "file": "message-response-link.json",
+      "issues": 3,
+      "kinds": [
+        "bundle-entry-mismatch",
+        "reference-unresolved"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID / BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): fullUrl .../Patient/pat12 carries id pat2, and relative references from urn:uuid entries cannot resolve."
     },
     {
       "file": "messagedefinition-questionnaire.json",

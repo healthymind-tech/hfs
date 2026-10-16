@@ -33,6 +33,14 @@
       "reason": "Genuine defect in the published example, not an engine bug: BiologicallyDerivedProduct.request is Reference(ServiceRequest), the example points at a BiologicallyDerivedProduct."
     },
     {
+      "file": "bundle-lri-example.json",
+      "issues": 16,
+      "kinds": [
+        "bundle-entry-mismatch"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID): RESTful fullUrls whose last segment is not the entry resource's id (e.g. .../Observation/lri-gramstain1 for id gramstain1)."
+    },
+    {
       "file": "codesystem-account-aggregate.json",
       "issues": 1,
       "kinds": [
@@ -3169,6 +3177,14 @@
       "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
     },
     {
+      "file": "document-example-dischargesummary.json",
+      "issues": 1,
+      "kinds": [
+        "reference-unresolved"
+      ],
+      "reason": "Genuine per the FHIR Bundle reference rules the HL7 Java validator applies (BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): the MedicationRequest entry has a urn:uuid fullUrl and references Practitioner/example, which cannot resolve against a URN."
+    },
+    {
       "file": "documentreference-example-xray.json",
       "issues": 1,
       "kinds": [
@@ -3191,6 +3207,23 @@
         "unknown-schema"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
+      "file": "message-request-link.json",
+      "issues": 1,
+      "kinds": [
+        "bundle-entry-mismatch"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID / BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): fullUrl .../Patient/pat12 carries id pat2, and relative references from urn:uuid entries cannot resolve."
+    },
+    {
+      "file": "message-response-link.json",
+      "issues": 3,
+      "kinds": [
+        "bundle-entry-mismatch",
+        "reference-unresolved"
+      ],
+      "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID / BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): fullUrl .../Patient/pat12 carries id pat2, and relative references from urn:uuid entries cannot resolve."
     },
     {
       "file": "researchsubject-example-crossover-placebo-to-drug.json",
