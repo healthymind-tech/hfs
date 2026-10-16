@@ -340,7 +340,9 @@ impl fmt::Display for ImportFormat {
 /// - `.xml` containing "tabular" in the filename → [`ImportFormat::Icd10Cm`]
 /// - `.txt` containing "icd10pcs" in the filename → [`ImportFormat::Icd10Pcs`]
 /// - `.rrf` (case-insensitive) → [`ImportFormat::Rxnorm`]
-/// - directory → [`ImportFormat::Rxnorm`]
+/// - directory holding `RXNCONSO.RRF` → [`ImportFormat::Rxnorm`] (other
+///   directories: `None`; the admin API inspects their contents, see
+///   `admin::formats::detect`)
 /// - `.zip` → peeks into the archive to distinguish formats
 /// - `.json` → peeks to check for `"resourceType":"Bundle"` → [`ImportFormat::FhirBundle`]
 /// - anything else → `None` (user must pass `--format`)
@@ -387,7 +389,14 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
         return Some(ImportFormat::Rxnorm);
     }
     if path.is_dir() {
-        return Some(ImportFormat::Rxnorm);
+        // Only an RxNorm RRF folder is importable as a directory. Anything else
+        // (a LOINC release folder holding `Loinc_2.80.zip`, a SNOMED tree …)
+        // used to be reported as RxNorm here.
+        return std::fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .any(|e| e.file_name().eq_ignore_ascii_case("RXNCONSO.RRF"))
+            .then_some(ImportFormat::Rxnorm);
     }
     if name.ends_with(".zip") {
         return detect_zip_format(path);
@@ -401,7 +410,8 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
 /// Peek into a ZIP to identify the terminology distribution format.
 ///
 /// Checks entry names in order:
-/// - Contains `concept_full` or `description_full` (RF2) → SNOMED RF2
+/// - Contains `concept_full` / `description_full`, or a `sct2_*.txt` /
+///   `der2_*.txt` table (RF2, incl. Snapshot-only archives) → SNOMED RF2
 /// - Ends with `loinctable.csv` → LOINC
 /// - Ends with `rxnconso.rrf` → RxNorm
 /// - Ends with `.xml` and contains `tabular` → ICD-10-CM
@@ -416,7 +426,14 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
             continue; // skip unreadable entries (zip64, encoding issues, etc.)
         };
         let entry_name = entry.name().to_lowercase();
-        if entry_name.contains("concept_full") || entry_name.contains("description_full") {
+        // RF2 tables: `sct2_Concept_Full_…`, but also Snapshot-only archives
+        // (`sct2_Concept_Snapshot_…`, `der2_…Refset…`).
+        let fname = entry_name.rsplit('/').next().unwrap_or(&entry_name);
+        if entry_name.contains("concept_full")
+            || entry_name.contains("description_full")
+            || ((fname.starts_with("sct2_") || fname.starts_with("der2_"))
+                && fname.ends_with(".txt"))
+        {
             return Some(ImportFormat::SnomedRf2);
         }
         // Match the LOINC main table however it is named inside the ZIP.
@@ -635,8 +652,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_directory_returns_rxnorm() {
+    fn detect_directory_is_rxnorm_only_with_rrf_files() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_format(dir.path()), None);
+        std::fs::write(dir.path().join("Loinc_2.80.zip"), b"x").unwrap();
+        assert_eq!(detect_format(dir.path()), None);
+        std::fs::write(dir.path().join("RXNCONSO.RRF"), b"").unwrap();
         assert_eq!(detect_format(dir.path()), Some(ImportFormat::Rxnorm));
     }
 
@@ -649,6 +670,24 @@ mod tests {
             let opts = zip::write::FileOptions::default();
             zip.start_file(
                 "SnomedCT/Snapshot/Terminology/Concept_Full_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::SnomedRf2));
+    }
+
+    #[test]
+    fn detect_zip_snomed_snapshot_only() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            zip.start_file(
+                "SnomedCT_ManagedServiceTW/Snapshot/Terminology/sct2_Concept_Snapshot_TW_20250901.txt",
                 opts,
             )
             .unwrap();

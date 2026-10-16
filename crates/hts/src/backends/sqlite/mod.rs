@@ -96,12 +96,13 @@ fn search_resources_in_transaction(
     synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
     let metadata_sql = format!(
-        "SELECT id, url, version, name, title, status
+        "SELECT {columns}
          FROM {table}
          WHERE (?1 IS NULL OR url = ?1)
            AND (?2 IS NULL OR version = ?2)
            AND (?3 IS NULL OR status = ?3)
-         ORDER BY created_at"
+         ORDER BY created_at",
+        columns = crate::string_search::metadata_select_list(table, &search, false)
     );
     let mut statement = conn
         .prepare(&metadata_sql)
@@ -113,16 +114,7 @@ fn search_resources_in_transaction(
                 query.version.as_deref(),
                 query.status.as_deref()
             ],
-            |row| {
-                Ok(ResourceSearchRow {
-                    id: row.get(0)?,
-                    url: row.get(1)?,
-                    version: row.get(2)?,
-                    name: row.get(3)?,
-                    title: row.get(4)?,
-                    status: row.get(5)?,
-                })
-            },
+            search_row,
         )
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
@@ -183,8 +175,8 @@ fn search_resources_in_transaction(
 /// `_offset`, so a searchset Bundle can report the full match count.
 ///
 /// Uses the same predicates as the search paths: exact `url`/`version`/
-/// `status` in SQL and, when present, FHIR string matching of `name`/`title`
-/// over the metadata rows.
+/// `status` in SQL and, when present, the Rust-side filters
+/// ([`ResourceStringSearch`]) over the metadata rows.
 fn count_resources(
     conn: &rusqlite::Connection,
     table: &str,
@@ -209,24 +201,38 @@ fn count_resources(
     }
 
     let mut statement = conn
-        .prepare_cached(&format!("SELECT name, title FROM {table} {filter}"))
+        .prepare_cached(&format!(
+            "SELECT {columns} FROM {table} {filter}",
+            columns = crate::string_search::metadata_select_list(table, &search, false)
+        ))
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
-        .query_map(params, |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        })
+        .query_map(params, search_row)
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let mut count = 0;
     for row in rows {
-        let (name, title) = row.map_err(|error| HtsError::StorageError(error.to_string()))?;
-        if search.matches(name.as_deref(), title.as_deref()) {
+        let row = row.map_err(|error| HtsError::StorageError(error.to_string()))?;
+        if search.matches_row(&row) {
             count += 1;
         }
     }
     Ok(count)
+}
+
+/// Map a row of [`crate::string_search::metadata_select_list`].
+fn search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceSearchRow> {
+    Ok(ResourceSearchRow {
+        id: row.get(0)?,
+        url: row.get(1)?,
+        version: row.get(2)?,
+        name: row.get(3)?,
+        title: row.get(4)?,
+        status: row.get(5)?,
+        content: row.get(6)?,
+        supplements: row.get(7)?,
+        publisher: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
 }
 
 /// Newly full-text-indexed rows at startup below which planner statistics
@@ -542,6 +548,9 @@ impl SqliteTerminologyBackend {
             schema::migrate_current_pin(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
             })?;
+            schema::migrate_search_param_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
+            })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
@@ -746,6 +755,9 @@ impl SqliteTerminologyBackend {
             })?;
             schema::migrate_current_pin(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
+            })?;
+            schema::migrate_search_param_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
             })?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an

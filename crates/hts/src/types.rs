@@ -514,6 +514,30 @@ pub struct ResourceSearchQuery {
     pub title_mode: crate::string_search::FhirStringSearchMode,
     /// Filter by status: `draft`, `active`, `retired`, or `unknown`.
     pub status: Option<String>,
+    /// `_id`: the logical id (exact). Also matches the version-qualified
+    /// storage ids (`<id>|<version>`) that multi-version imports use.
+    #[serde(rename = "_id")]
+    pub id: Option<String>,
+    /// CodeSystem `system`: same as `url` (exact), ANDed with it.
+    #[serde(skip)]
+    pub system: Option<String>,
+    /// CodeSystem `supplements`: the supplemented canonical, `url` or
+    /// `url|version` (exact).
+    #[serde(skip)]
+    pub supplements: Option<String>,
+    /// CodeSystem `content-mode` (exact token).
+    #[serde(skip)]
+    pub content_mode: Option<String>,
+    /// Filter by publisher using FHIR `string` search semantics.
+    #[serde(skip)]
+    pub publisher: Option<String>,
+    /// Matching mode for [`Self::publisher`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub publisher_mode: crate::string_search::FhirStringSearchMode,
+    /// `_lastUpdated` predicates (each `[prefix]dateTime`), all ANDed.
+    #[serde(skip)]
+    pub last_updated: Vec<crate::string_search::DateSearch>,
     /// Maximum number of results to return (default: 20).
     #[serde(rename = "_count")]
     pub count: Option<u32>,
