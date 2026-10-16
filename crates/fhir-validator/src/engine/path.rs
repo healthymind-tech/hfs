@@ -63,6 +63,21 @@ impl PathTracker {
     }
 
     /// Dot-joined conformance rendering: `Patient.name.0.given`.
+    /// The dotted path without array indices (`Observation.component`),
+    /// as the HL7 validator names an element in its messages.
+    pub(crate) fn render_unindexed(&self) -> String {
+        let mut out = String::new();
+        for seg in &self.segs {
+            if let PathSeg::Key(k) = seg {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+        }
+        out
+    }
+
     pub(crate) fn render_dotted(&self) -> String {
         let mut out = String::new();
         for (i, seg) in self.segs.iter().enumerate() {

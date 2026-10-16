@@ -196,13 +196,7 @@ pub(super) fn validate_slices(
 
         // The element the slicing sits on, without array indices, for the
         // HL7 wording (`Observation.component:SystolicBP`).
-        let element = ctx
-            .path
-            .render_dotted()
-            .split('.')
-            .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
-            .collect::<Vec<_>>()
-            .join(".");
+        let element = ctx.path.render_unindexed();
         for (name, slice) in &mark.slicing.slices {
             let found = mark.counters[name];
             if let Some(min) = slice.min

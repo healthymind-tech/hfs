@@ -287,10 +287,18 @@ fn nested_slice_constants_discriminate_components() {
         Some("Observation.component:Sys: max allowed = 1, but found 2")
     );
 
-    // Diastolic missing: slice min 1.
+    // Diastolic missing: slice min 1, and the element minimum of 2 in the
+    // HL7 wording, attributed to the profile.
     let mut missing = bp_observation();
     missing["component"].as_array_mut().unwrap().pop();
     let errors = structural(&r, &missing, &[BP_LIKE]);
+    assert!(
+        errors.iter().any(|e| e.kind == ErrorKind::Min
+            && e.hl7_message.as_deref()
+                == Some("Observation.component: minimum required = 2, but only found 1")
+            && e.source.as_deref() == Some(BP_LIKE)),
+        "{errors:#?}"
+    );
     assert!(
         errors.iter().any(|e| e.kind == ErrorKind::SliceCardinality
             && e.message

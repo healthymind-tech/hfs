@@ -737,17 +737,33 @@ fn eval_element(
         }
 
         // Whole-collection keywords, per schema: min then max.
-        let schemas: Vec<Arc<FhirSchema>> = elset.schemas().cloned().collect();
-        for schema in &schemas {
+        let schemas: Vec<(Option<String>, Arc<FhirSchema>)> = elset
+            .iter()
+            .map(|(key, schema)| (key_origin(key), Arc::clone(schema)))
+            .collect();
+        let element = ctx.path.render_unindexed();
+        for (source, schema) in &schemas {
             if let Some(min) = schema.min
                 && (items.len() as u64) < min
             {
-                ctx.error(ErrorKind::Min, errors::msg_min(min, items.len()));
+                ctx.error_full(
+                    ErrorKind::Min,
+                    errors::msg_min(min, items.len()),
+                    Severity::Error,
+                    source.clone(),
+                    Some(errors::hl7_min(&element, min, items.len())),
+                );
             }
             if let Some(max) = schema.max
                 && (items.len() as u64) > max
             {
-                ctx.error(ErrorKind::Max, errors::msg_max(max, items.len()));
+                ctx.error_full(
+                    ErrorKind::Max,
+                    errors::msg_max(max, items.len()),
+                    Severity::Error,
+                    source.clone(),
+                    Some(errors::hl7_max(&element, max, items.len())),
+                );
             }
         }
 

@@ -252,6 +252,16 @@ pub(crate) fn msg_slice_max(max: u64, actual: u64) -> String {
     format!("Slice defines the following max cardinality: '{max}', actual cardinality: '{actual}'")
 }
 
+/// [helios] HL7 validator wording of an element minimum violation.
+pub(crate) fn hl7_min(element: &str, min: u64, found: usize) -> String {
+    format!("{element}: minimum required = {min}, but only found {found}")
+}
+
+/// [helios] HL7 validator wording of an element maximum violation.
+pub(crate) fn hl7_max(element: &str, max: u64, found: usize) -> String {
+    format!("{element}: max allowed = {max}, but found {found}")
+}
+
 /// [helios] HL7 validator wording of a slice minimum violation.
 pub(crate) fn hl7_slice_min(element: &str, slice: &str, min: u64, found: u64) -> String {
     if found == 0 {
