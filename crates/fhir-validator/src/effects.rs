@@ -335,6 +335,12 @@ pub struct EffectHandlers<'a> {
     /// value set's codes draws a warning (HL7 validator default). Off by
     /// default — only `required` bindings are enforced.
     pub check_extensible: bool,
+    /// Report internal narrative hyperlinks (`<a href="#x">`) that resolve
+    /// to nothing in the resource (error, as the HL7 validator does).
+    pub narrative_links: bool,
+    /// The HL7 validator's best-practice warnings (an Observation without
+    /// a subject or performer).
+    pub best_practice: bool,
 }
 
 impl Default for EffectHandlers<'_> {
@@ -346,6 +352,8 @@ impl Default for EffectHandlers<'_> {
             terminology_fail: TerminologyFailMode::default(),
             display_issues: Severity::Warning,
             check_extensible: false,
+            narrative_links: false,
+            best_practice: false,
         }
     }
 }

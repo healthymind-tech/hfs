@@ -676,6 +676,10 @@ pub struct ValidationConfig {
     /// the value set's codes draws a warning) or `off` (only `required`
     /// bindings are checked).
     pub extensible_bindings: String,
+    /// The HL7 validator's best-practice recommendations
+    /// (`HFS_VALIDATION_BEST_PRACTICE`): `warning` (default; e.g. "all
+    /// observations should have a performer") or `off`.
+    pub best_practice: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
@@ -717,6 +721,7 @@ impl Default for ValidationConfig {
             terminology_fail: "open".to_string(),
             display_issues: "warning".to_string(),
             extensible_bindings: "warning".to_string(),
+            best_practice: "warning".to_string(),
             stored_profiles: true,
             shadow_core: false,
             rehydrate: true,
@@ -773,6 +778,9 @@ impl ValidationConfig {
             extensible_bindings: std::env::var("HFS_VALIDATION_EXTENSIBLE_BINDINGS")
                 .map(|s| s.to_lowercase())
                 .unwrap_or(d.extensible_bindings),
+            best_practice: std::env::var("HFS_VALIDATION_BEST_PRACTICE")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.best_practice),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
             shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
             rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
@@ -829,6 +837,12 @@ impl ValidationConfig {
             errors.push(format!(
                 "HFS_VALIDATION_EXTENSIBLE_BINDINGS '{}' invalid (expected warning|off)",
                 self.extensible_bindings
+            ));
+        }
+        if !matches!(self.best_practice.as_str(), "warning" | "off") {
+            errors.push(format!(
+                "HFS_VALIDATION_BEST_PRACTICE '{}' invalid (expected warning|off)",
+                self.best_practice
             ));
         }
         if self.terminology_timeout_ms == 0 {

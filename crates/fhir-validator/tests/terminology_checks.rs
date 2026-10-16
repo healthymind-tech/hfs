@@ -1,4 +1,5 @@
-//! Display, code-system and extensible-binding checks, aligned with the HL7 Java validator (stream P2-R), on the
+//! Display, code-system, extensible-binding, narrative and best-practice
+//! checks, aligned with the HL7 Java validator (stream P2-R), on the
 //! embedded R4 pack.
 //!
 //! Run with: `cargo test -p helios-fhir-validator --features fhirpath --test terminology_checks`
@@ -280,6 +281,33 @@ async fn extensible_bindings_warn_when_enabled() {
     let issues = run(&gender, &on).await;
     assert_eq!(issues.len(), 1, "{issues:#?}");
     assert_eq!(issues[0].severity, Severity::Error);
+}
+
+/// Narrative links and best-practice warnings run when the handlers ask for
+/// them.
+#[tokio::test]
+async fn narrative_links_and_best_practice_are_opt_in() {
+    let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "x"},
+        "subject": {"reference": "Patient/p"},
+        "text": {"status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><a href=\"#Patient_p\">See above</a></p></div>"}});
+    let issues = run(&obs, &EffectHandlers::default()).await;
+    assert!(issues.is_empty(), "{issues:#?}");
+
+    let handlers = EffectHandlers {
+        narrative_links: true,
+        best_practice: true,
+        ..Default::default()
+    };
+    let issues = run(&obs, &handlers).await;
+    let narrative = of_kind(&issues, ErrorKind::Narrative);
+    assert_eq!(narrative.len(), 1, "{issues:#?}");
+    assert_eq!(narrative[0].severity, Severity::Error);
+    assert_eq!(narrative[0].path, "Observation.text.div");
+    let bp = of_kind(&issues, ErrorKind::BestPractice);
+    assert_eq!(bp.len(), 1, "{issues:#?}");
+    assert_eq!(bp[0].severity, Severity::Warning);
+    assert!(bp[0].message.contains("should have a performer"));
 }
 
 /// cpb-16 on a `kind = requirements` CapabilityStatement looks at

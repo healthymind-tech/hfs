@@ -9,6 +9,7 @@
 
 mod bundle;
 mod errors;
+mod narrative;
 mod path;
 mod primitives;
 mod references;
@@ -281,6 +282,12 @@ impl Validator {
             mut errors,
             deferred,
         } = self.validate_sync(resource, opts);
+        if effects.narrative_links {
+            errors.extend(narrative::narrative_link_errors(resource));
+        }
+        if effects.best_practice {
+            errors.extend(narrative::best_practice_warnings(resource));
+        }
         crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
         errors
     }

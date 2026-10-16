@@ -99,6 +99,8 @@ pub struct ValidationService {
     display_issues: Severity,
     /// Check `extensible` bindings (`HFS_VALIDATION_EXTENSIBLE_BINDINGS`).
     check_extensible: bool,
+    /// HL7 best-practice warnings (`HFS_VALIDATION_BEST_PRACTICE`).
+    best_practice: bool,
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
@@ -132,6 +134,7 @@ impl Default for ValidationService {
             terminology_fail: TerminologyFailMode::Open,
             display_issues: Severity::Warning,
             check_extensible: true,
+            best_practice: true,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
@@ -211,6 +214,7 @@ impl ValidationService {
                 _ => Severity::Warning,
             },
             check_extensible: config.extensible_bindings != "off",
+            best_practice: config.best_practice != "off",
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
@@ -324,6 +328,10 @@ impl ValidationService {
             terminology_fail: self.terminology_fail,
             display_issues: self.display_issues,
             check_extensible: self.check_extensible,
+            // Unresolved internal narrative links are errors, as the HL7
+            // validator reports them.
+            narrative_links: true,
+            best_practice: self.best_practice,
         };
         validator
             .validate(resource, version, &opts, &handlers)
@@ -1751,8 +1759,11 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         // A Bundle-internal URN reference no entry provides.
         ErrorKind::ReferenceUnresolved => IssueType::NotFound,
         ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
-        // An HL7-namespace code system nobody defines: invalid content.
-        ErrorKind::UnknownCodeSystem => IssueType::Invalid,
+        // An HL7-namespace code system nobody defines, a narrative link to
+        // nothing, a best-practice recommendation: invalid content.
+        ErrorKind::UnknownCodeSystem | ErrorKind::Narrative | ErrorKind::BestPractice => {
+            IssueType::Invalid
+        }
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.

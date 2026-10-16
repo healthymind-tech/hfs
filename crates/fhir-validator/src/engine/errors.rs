@@ -85,6 +85,13 @@ pub enum ErrorKind {
     /// names no known code system (HL7 validator:
     /// Type_Specific_Checks_DT_URL_Resolve, error).
     UnknownCodeSystem,
+    /// Narrative problems: an internal hyperlink (`<a href="#x">`) that
+    /// resolves to nothing in the resource (HL7 validator:
+    /// Type_Specific_Checks_DT_XHTML_Resolve, error).
+    Narrative,
+    /// Best-practice recommendations the HL7 validator warns about by
+    /// default (e.g. an Observation without a performer).
+    BestPractice,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -413,6 +420,22 @@ pub(crate) fn msg_extensible_binding(coded: &crate::effects::CodedValue, value_s
 /// validator wording).
 pub(crate) fn msg_url_unresolved(url: &str) -> String {
     format!("No definition could be found for URL value '{url}'")
+}
+
+/// [helios] an internal narrative hyperlink with no target (HL7 validator
+/// wording).
+pub(crate) fn msg_narrative_link(href: &str, at: &str, text: &str) -> String {
+    format!("Hyperlink '{href}' at '{at}' for '{text}' does not resolve")
+}
+
+/// [helios] HL7 validator best-practice recommendations for Observation.
+pub(crate) fn msg_observation_performer() -> String {
+    "Best Practice Recommendation: In general, all observations should have a performer".into()
+}
+
+/// [helios] see [`msg_observation_performer`].
+pub(crate) fn msg_observation_subject() -> String {
+    "Best Practice Recommendation: In general, all observations should have a subject".into()
 }
 
 /// [helios] the terminology service could not be reached / errored.
