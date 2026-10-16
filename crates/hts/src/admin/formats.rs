@@ -463,11 +463,21 @@ fn evidence_for(format: ImportFormat, name: &str, entries: &[String]) -> String 
         ImportFormat::SnomedRf2 => &["concept_full", "concept_snapshot", "description_full"],
         ImportFormat::Loinc => &["loinctable/loinc.csv", "loinctable.csv", "loinc.csv"],
         ImportFormat::Rxnorm => &["rxnconso.rrf"],
-        ImportFormat::Icd10Cm => &["tabular"],
+        ImportFormat::Icd10Cm => &["tabular-", "tabular_"],
+        ImportFormat::Icd10Pcs => &["icd10pcs_codes", "icd10pcs"],
         _ => &[],
     };
+    // The data file over its PDF/XSD companions (`icd-10-cm-tabular-2025.pdf`).
+    let data = |e: &&String| {
+        let l = e.to_ascii_lowercase();
+        !(l.ends_with(".pdf") || l.ends_with(".xsd"))
+    };
     for n in needle {
-        if let Some(e) = entries.iter().find(|e| e.to_ascii_lowercase().contains(n)) {
+        if let Some(e) = entries
+            .iter()
+            .filter(data)
+            .find(|e| e.to_ascii_lowercase().contains(n))
+        {
             return format!("archive entry {e}");
         }
     }
@@ -797,6 +807,7 @@ mod tests {
         let d = detect(dir.path());
         assert_eq!(d.format.as_deref(), Some("icd10-cm"), "{d:?}");
         assert_eq!(d.import_path.as_deref(), Some("icd10cm-table-index-2025.zip"));
+        assert!(d.evidence.unwrap().ends_with("icd-10-cm-tabular-2025.xml"));
 
         let dir = tree(
             &[],
@@ -808,6 +819,7 @@ mod tests {
         let d = detect(dir.path());
         assert_eq!(d.format.as_deref(), Some("icd10-pcs"), "{d:?}");
         assert_eq!(d.import_path.as_deref(), Some("icd10pcs_tables_2025.zip"));
+        assert!(d.evidence.unwrap().ends_with("icd10pcs_codes_2025.txt"));
 
         // Unpacked: the tabular XML / the codes file is the source.
         let dir = tree(
