@@ -5,9 +5,11 @@
 //! inside the slice's subtree (`$this` meaning the item root; constants
 //! inside nested slices count, as in the core `bp` profile). `type` and
 //! `profile` discriminators read the types/profiles declared at `P` and
-//! compile to an `all` match (see `build_match`). Discriminators we cannot
-//! evaluate (`exists`, and any path containing `resolve()` or
-//! `extension(...)`) produce a slice with **no match and no minimum**: it
+//! compile to an `all` match (see `build_match`), as do `exists`
+//! discriminators and `type`/`profile` discriminators through `resolve()`
+//! (judged on the resolved target). Discriminators we cannot evaluate
+//! (`extension(...)`, value/pattern through `resolve()`) produce a slice
+//! with **no match and no minimum**: it
 //! can never produce false cardinality errors, its constraints simply stay
 //! dormant, and the generator surfaces a warning.
 //!
@@ -89,9 +91,9 @@ pub(super) fn build_slicing(
 /// discriminators (`Bundle.entry` by `resource`, `component` by `value`)
 /// read the slice's declared types/profiles at their path; a slicing that
 /// uses any of them compiles to an `all` match whose parts the engine
-/// checks together (`pattern`, `type`, `profile`). Paths through
-/// `resolve()` or `extension(...)`, and `exists` discriminators, stay
-/// untranslatable.
+/// checks together (`pattern`, `type`, `profile`, `exists`; `type` and
+/// `profile` through `resolve()` judge the reference target). Paths through
+/// `extension(...)` stay untranslatable.
 fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> Option<Match> {
     if discriminators.is_empty() {
         return None;
@@ -102,8 +104,12 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
     let mut parts: Vec<Value> = Vec::new();
 
     for disc in discriminators {
-        if disc.path.contains("resolve()") || disc.path.contains("extension(") {
+        if disc.path.contains("extension(") {
             return None;
+        }
+        if disc.path.contains("resolve()") {
+            parts.push(resolve_part(node, disc)?);
+            continue;
         }
         match disc.type_.as_str() {
             "value" | "pattern" => {
@@ -135,6 +141,12 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
                     "type": "profile", "path": disc.path, "profiles": target.type_profiles,
                 }));
             }
+            "exists" => {
+                let exists = exists_at(node, &disc.path)?;
+                parts.push(serde_json::json!({
+                    "type": "exists", "path": disc.path, "exists": exists,
+                }));
+            }
             _ => return None,
         }
     }
@@ -161,10 +173,59 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
     })
 }
 
+/// A `type`/`profile` discriminator through `resolve()` (`resolve()`,
+/// `$this.resolve()`, `item.resolve()`): the References at the path before
+/// `resolve()` must resolve to a resource of the slice's target types /
+/// conforming to one of its target profiles (`type.targetProfile` of the
+/// Reference element, as the HL7 validator reads it). A path continuing
+/// after `resolve()`, or a value/pattern discriminator through it, stays
+/// untranslatable.
+fn resolve_part(node: &super::tree::Node, disc: &EdDiscriminator) -> Option<Value> {
+    let prefix = disc.path.strip_suffix("resolve()")?;
+    let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
+    let prefix = if prefix.is_empty() { "$this" } else { prefix };
+    if !matches!(disc.type_.as_str(), "type" | "profile") {
+        return None;
+    }
+    let target = node_at(node, prefix)?;
+    if target.type_target_profiles.is_empty() {
+        return None;
+    }
+    let profiles = &target.type_target_profiles;
+    Some(serde_json::json!({
+        "type": disc.type_, "path": prefix, "resolve": true, "profiles": profiles,
+    }))
+}
+
+/// `exists` discriminator: the slice requires the element at `path`
+/// (`min >= 1` → `true`) or prohibits it (`max = 0` → `false`); otherwise
+/// the slice does not say, and the discriminator is untranslatable.
+fn exists_at(node: &super::tree::Node, path: &str) -> Option<bool> {
+    let (parent_path, name) = match path.rsplit_once('.') {
+        Some((p, n)) => (p, n),
+        None => ("$this", path),
+    };
+    let name = name.strip_suffix("[x]").unwrap_or(name);
+    let parent = node_at(node, parent_path)?;
+    let listed = |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| l.iter().any(|k| k == name));
+    if listed(&parent.schema.required) {
+        return Some(true);
+    }
+    if listed(&parent.schema.excluded) || parent.children.get(name).is_some_and(|c| c.dead) {
+        return Some(false);
+    }
+    let child = parent.children.get(name)?;
+    if child.schema.min.is_some_and(|m| m >= 1) {
+        return Some(true);
+    }
+    None
+}
+
 /// The node at a discriminator path within the slice subtree (`$this` →
 /// the subtree root). A `foo[x]` / `foo` step resolves to the choice
 /// declarer `foo`.
 fn node_at<'a>(node: &'a super::tree::Node, path: &str) -> Option<&'a super::tree::Node> {
+    let path = path.strip_prefix("$this.").unwrap_or(path);
     if path == "$this" {
         return Some(node);
     }

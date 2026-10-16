@@ -36,13 +36,16 @@
 
 use super::errors::{self, ErrorKind, Severity, ValidationError};
 use super::path::PathTracker;
+use super::bundle::{Entry, Resolution};
 use super::{SyncOutcome, UnknownProfilePolicy, ValidationOptions};
 use crate::effects::Deferred;
 use crate::resolver::SchemaResolver;
 use crate::schema::FhirSchema;
 use indexmap::IndexMap;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// The special element type resolved dynamically from `data.resourceType`.
@@ -106,30 +109,128 @@ pub(super) struct WalkCtx<'a> {
     /// `(id, resourceType)` of the contained resources of each resource
     /// being walked, innermost last (for `#id` reference targets).
     contained: Vec<Vec<(String, String)>>,
-    /// `(fullUrl, resourceType)` of the entries of each Bundle being
-    /// walked, innermost last (for Bundle-internal reference targets).
-    bundle_entries: Vec<Vec<(String, String)>>,
+    /// The entries of each Bundle being walked, innermost last (for
+    /// Bundle-internal reference targets and `resolve()` discriminators).
+    bundles: Vec<Rc<Vec<Entry<'a>>>>,
+    /// The resources being walked, innermost last (the source of a
+    /// reference: its `fullUrl` and `contained`).
+    resources: Vec<&'a Value>,
+    /// How many slice-membership validations enclose this walk (each
+    /// validates a value against a profile in a fresh context).
+    nesting: usize,
+    /// Slice-membership verdicts by `(value address, profile)`, shared by
+    /// the nested walks of one validation. An entry is written `true` while
+    /// its validation runs, so reference cycles terminate.
+    conformance: Rc<RefCell<HashMap<(usize, String), bool>>>,
 }
+
+/// Nested slice-membership validations deeper than this are assumed to
+/// conform (profile chains through `resolve()` rarely exceed three).
+const MAX_NESTING: usize = 6;
 
 impl<'a> WalkCtx<'a> {
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
         self.resolver
     }
 
-    /// The resolver, detached from the borrow of the context.
-    pub(super) fn resolver_handle(&self) -> &'a dyn SchemaResolver {
-        self.resolver
-    }
 
     /// The type of the contained resource `id` of the innermost resource.
     /// The type of the entry whose `fullUrl` is `url` in the innermost
     /// Bundle being walked.
     pub(super) fn bundle_entry_type(&self, url: &str) -> Option<String> {
-        self.bundle_entries
+        self.bundles
             .last()?
             .iter()
-            .find(|(full_url, _)| full_url == url)
-            .map(|(_, rt)| rt.clone())
+            .find(|e| e.full_url == Some(url))
+            .and_then(|e| e.resource.get("resourceType"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Resolve a literal reference from the node being walked: `#id` to a
+    /// contained resource of an enclosing resource, anything else to an
+    /// entry of the innermost Bundle (by the Bundle rules, from the entry
+    /// the walk is inside). `None` when it names nothing at hand.
+    pub(super) fn resolve_reference(&self, reference: &str) -> Option<&'a Value> {
+        if let Some(id) = reference.strip_prefix('#') {
+            for resource in self.resources.iter().rev() {
+                if id.is_empty() {
+                    return Some(resource);
+                }
+                let found = resource
+                    .get("contained")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+                    });
+                if found.is_some() {
+                    return found;
+                }
+            }
+            return None;
+        }
+        let entries = self.bundles.last()?;
+        // The entry the walk is inside: the innermost resource that is one
+        // of the Bundle's entry resources.
+        let source = self.resources.iter().rev().find_map(|r| {
+            entries
+                .iter()
+                .find(|e| std::ptr::eq(e.resource, *r))
+        });
+        match super::bundle::resolve(entries, reference, source.and_then(|e| e.full_url)) {
+            Resolution::Found(index) => Some(entries[index].resource),
+            Resolution::Cannot(_) | Resolution::NotFound => None,
+        }
+    }
+
+    /// Does `value` (a node of the data being walked) conform to
+    /// `profile`? It is validated against the profile in this walk's
+    /// context (its Bundle and enclosing resources stay resolvable), and
+    /// conforms without error-severity structural issues — how the HL7
+    /// validator decides `profile` slice membership. Verdicts are memoised
+    /// per validation.
+    pub(super) fn conforms_to(&self, value: &'a Value, profile: &str) -> bool {
+        let key = (std::ptr::from_ref(value) as usize, profile.to_string());
+        if let Some(&known) = self.conformance.borrow().get(&key) {
+            return known;
+        }
+        if self.nesting >= MAX_NESTING {
+            return true;
+        }
+        self.conformance.borrow_mut().insert(key.clone(), true);
+        let opts = ValidationOptions {
+            profiles: vec![profile.to_string()],
+            use_meta_profiles: false,
+            unknown_profile: UnknownProfilePolicy::Ignore,
+            check_extension_context: false,
+        };
+        let mut nested = WalkCtx {
+            resolver: self.resolver,
+            errors: Vec::new(),
+            deferred: Vec::new(),
+            path: PathTracker::new(
+                value
+                    .get("resourceType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            check_extension_context: false,
+            use_meta_profiles: false,
+            unknown_profile: UnknownProfilePolicy::Ignore,
+            emitted: HashSet::new(),
+            deferred_bindings: HashSet::new(),
+            contained: Vec::new(),
+            bundles: self.bundles.clone(),
+            resources: self.resources.clone(),
+            nesting: self.nesting + 1,
+            conformance: Rc::clone(&self.conformance),
+        };
+        let outcome = run(&mut nested, value, &opts);
+        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        self.conformance.borrow_mut().insert(key, conforms);
+        conforms
     }
 
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
@@ -211,31 +312,44 @@ pub(super) fn validate(
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
-        bundle_entries: Vec::new(),
+        bundles: Vec::new(),
+        resources: Vec::new(),
+        nesting: 0,
+        conformance: Rc::default(),
     };
+    run(&mut ctx, resource, opts)
+}
+
+/// Validate `resource` as the root of `ctx`'s walk.
+fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions) -> SyncOutcome {
+    let resolver = ctx.resolver;
+    let resource_type = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     // Root schema-set: resourceType, then meta.profile claims, then
     // caller-supplied profiles (the draft-algorithm order).
     let mut set = SchemaSet::new();
     if !resource_type.is_empty() {
         match resolver.resolve(resource_type) {
-            Some(schema) => add_schemas_to_set(&mut ctx, &mut set, schema, resource_type),
+            Some(schema) => add_schemas_to_set(ctx, &mut set, schema, resource_type),
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(resource_type),
             ),
         }
     }
-    add_meta_profiles(&mut ctx, &mut set, resource);
+    add_meta_profiles(ctx, &mut set, resource);
     for profile in &opts.profiles {
-        add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, true);
+        add_profile(ctx, &mut set, profile, Some(resource), opts.unknown_profile, true);
     }
 
-    validate_node(&mut ctx, &set, resource);
+    validate_node(ctx, &set, resource);
 
     SyncOutcome {
-        errors: ctx.errors,
-        deferred: ctx.deferred,
+        errors: std::mem::take(&mut ctx.errors),
+        deferred: std::mem::take(&mut ctx.deferred),
     }
 }
 
@@ -251,7 +365,7 @@ fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Valu
         ctx.path.push_key("meta");
         ctx.path.push_key("profile");
         ctx.path.push_index(index);
-        add_profile(ctx, set, profile, policy, false);
+        add_profile(ctx, set, profile, Some(resource), policy, false);
         ctx.path.pop();
         ctx.path.pop();
         ctx.path.pop();
@@ -273,14 +387,34 @@ fn meta_profiles(resource: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Layer `profile` onto the set of `resource`. A resource profile of
+/// another type (a Practitioner profile claimed by a Patient) is not
+/// layered: the HL7 validator rejects the claim, and the cooperative set
+/// would otherwise judge the Patient by Practitioner's elements — every key
+/// the two share passes, so the wrong profile "conformed".
 fn add_profile(
     ctx: &mut WalkCtx<'_>,
     set: &mut SchemaSet,
     profile: &str,
+    resource: Option<&Value>,
     policy: UnknownProfilePolicy,
     requested: bool,
 ) {
     if let Some(schema) = ctx.resolver.resolve(profile) {
+        let actual = resource
+            .and_then(|r| r.get("resourceType"))
+            .and_then(Value::as_str);
+        if let (Some(actual), Some(expected)) = (actual, schema.type_.as_deref())
+            && crate::editor::is_resource(&schema)
+            && actual != expected
+            && !matches!(expected, "Resource" | "DomainResource")
+        {
+            ctx.error(
+                ErrorKind::Type,
+                errors::msg_profile_wrong_type(expected, actual, profile),
+            );
+            return;
+        }
         add_schemas_to_set(ctx, set, schema, profile);
         return;
     }
@@ -401,7 +535,7 @@ fn resolve_element_reference(
 }
 
 /// Validate one data node against a cooperative schema set.
-pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
+pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'a Value) {
     // Dynamic `Resource` resolution: an element typed `Resource` takes its
     // concrete schema from the nested `resourceType` at validation time
     // (Bundle.entry.resource, contained, Parameters.parameter.resource).
@@ -448,8 +582,10 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     let is_bundle = obj.get("resourceType").and_then(Value::as_str) == Some("Bundle");
     if is_resource {
         ctx.contained.push(contained_types(obj));
+        ctx.resources.push(data);
         if is_bundle {
-            ctx.bundle_entries.push(bundle_entry_types(obj));
+            let entries = super::bundle::entries(data).into_iter().map(|(_, e)| e);
+            ctx.bundles.push(Rc::new(entries.collect()));
         }
         check_resource_id(ctx, set, obj);
     }
@@ -484,8 +620,9 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
 
     if is_resource {
         ctx.contained.pop();
+        ctx.resources.pop();
         if is_bundle {
-            ctx.bundle_entries.pop();
+            ctx.bundles.pop();
         }
     }
 }
@@ -518,28 +655,6 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
         ctx.error(ErrorKind::PrimitiveValue, errors::msg_resource_id(id));
         ctx.path.pop();
     }
-}
-
-/// `(fullUrl, resourceType)` of a Bundle's entries.
-fn bundle_entry_types(bundle: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
-    bundle
-        .get("entry")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|e| {
-                    Some((
-                        e.get("fullUrl")?.as_str()?.to_string(),
-                        e.get("resource")?
-                            .get("resourceType")?
-                            .as_str()?
-                            .to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
@@ -703,12 +818,12 @@ fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
 
 /// Validate one data key against the element schemas collected from every
 /// layer of the set.
-fn eval_element(
-    ctx: &mut WalkCtx<'_>,
+fn eval_element<'a>(
+    ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
     multi_choice: &mut IndexMap<String, Vec<String>>,
     key: &str,
-    value: &Value,
+    value: &'a Value,
 ) {
     let mut elset = SchemaSet::new();
     collect_schemas_for_element(ctx, set, &mut elset, multi_choice, key);
@@ -798,7 +913,12 @@ fn eval_element(
 /// passed. An unknown url stays allowed on `extension`, but a modifier
 /// extension changes the meaning of its element, so one nobody can look up
 /// is an error (FHIR: unknown modifier extensions SHALL NOT be ignored).
-fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Value, modifier: bool) {
+fn validate_extension_item<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    item: &'a Value,
+    modifier: bool,
+) {
     let url = item
         .get("url")
         .and_then(Value::as_str)
@@ -970,12 +1090,12 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
 /// layer declares `foo` with a primitive type, it mirrors `foo`'s
 /// array-vs-singular shape, and its content (per item for arrays, with
 /// `null` gaps allowed) validates against the resolver's `Element` schema.
-fn handle_sidecar(
-    ctx: &mut WalkCtx<'_>,
+fn handle_sidecar<'a>(
+    ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
     key: &str,
     base_key: &str,
-    value: &Value,
+    value: &'a Value,
 ) {
     // Collect the base element's sub-set; choice bookkeeping is discarded
     // (a sidecar is not a branch occurrence).
