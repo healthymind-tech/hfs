@@ -225,6 +225,20 @@ impl ImportResult {
     }
 }
 
+/// One concept property for [`BundleImportBackend::write_concept_properties`]:
+/// `value_type` uses the stored labels (`string`, `code`, `coding`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyRow {
+    /// The concept's code.
+    pub code: String,
+    /// The property code (e.g. `SCALE_TYP`).
+    pub property: String,
+    /// The stored value type label.
+    pub value_type: String,
+    /// The value (for `coding`, the code of the target concept).
+    pub value: String,
+}
+
 /// Backend capability for FHIR Bundle import.
 ///
 /// Separate from [`crate::traits::TerminologyBackend`] so that backends can opt
@@ -288,6 +302,35 @@ pub trait BundleImportBackend: Send + Sync {
         _members: Vec<(String, String)>,
     ) -> Result<u64, HtsError> {
         Ok(0)
+    }
+
+    /// Add concept properties and designations to the already imported
+    /// CodeSystem `url` (at `version`) without touching its concepts — the
+    /// LOINC property backfill (`hts import --format loinc-properties`).
+    ///
+    /// First every stored value of the properties named in `clear` is deleted
+    /// for the whole system (pass them with the first chunk only, so a rerun
+    /// replaces rather than duplicates). Then each [`PropertyRow`] is stored
+    /// against its concept, and each designation row
+    /// `(code, language, value)` is added unless the concept already has that
+    /// value in that language. Rows for codes the system does not have are
+    /// skipped. Cached expansions over the system are dropped. Returns
+    /// `(properties written, designations written)`.
+    ///
+    /// The default stores nothing, for a backend that cannot do it; both
+    /// shipped backends override it.
+    async fn write_concept_properties(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _clear: &[String],
+        _properties: Vec<PropertyRow>,
+        _designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        Err(HtsError::NotSupported(
+            "this terminology backend cannot add properties to an imported code system".into(),
+        ))
     }
 
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.

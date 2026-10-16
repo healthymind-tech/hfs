@@ -651,6 +651,7 @@ impl TerminologyCaches for PostgresTerminologyBackend {
             root_prefix_cache,
         );
         meta.clear();
+        crate::loinc_filters::clear();
     }
 }
 
@@ -1307,6 +1308,117 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // Cached expansions may hold ECL `^` results.
         self.invalidate_caches();
         Ok(written)
+    }
+
+    async fn write_concept_properties(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        clear: &[String],
+        properties: Vec<crate::import::PropertyRow>,
+        designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let tx = client.transaction().await.map_err(db)?;
+        let ids: Vec<String> = match version {
+            Some(v) => tx
+                .query(
+                    "SELECT id FROM code_systems WHERE url = $1 AND version = $2",
+                    &[&url, &v],
+                )
+                .await
+                .map_err(db)?,
+            None => tx
+                .query("SELECT id FROM code_systems WHERE url = $1", &[&url])
+                .await
+                .map_err(db)?,
+        }
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+        let system_id = match ids.as_slice() {
+            [id] => id.clone(),
+            [] => {
+                return Err(HtsError::NotFound(format!(
+                    "CodeSystem {url}{} is not imported",
+                    version.map(|v| format!("|{v}")).unwrap_or_default()
+                )));
+            }
+            _ => {
+                return Err(HtsError::InvalidRequest(format!(
+                    "CodeSystem {url} is stored in {} versions; name the version",
+                    ids.len()
+                )));
+            }
+        };
+        if !clear.is_empty() {
+            tx.execute(
+                "DELETE FROM concept_properties cp USING concepts c
+                  WHERE cp.concept_id = c.id AND c.system_id = $1
+                    AND cp.property = ANY($2::text[])",
+                &[&system_id, &clear],
+            )
+            .await
+            .map_err(db)?;
+        }
+        let mut props = 0u64;
+        for chunk in properties.chunks(50_000) {
+            let codes: Vec<&str> = chunk.iter().map(|r| r.code.as_str()).collect();
+            let names: Vec<&str> = chunk.iter().map(|r| r.property.as_str()).collect();
+            let types: Vec<&str> = chunk.iter().map(|r| r.value_type.as_str()).collect();
+            let values: Vec<&str> = chunk.iter().map(|r| r.value.as_str()).collect();
+            props += tx
+                .execute(
+                    "INSERT INTO concept_properties (concept_id, property, value_type, value)
+                     SELECT c.id, t.p, t.vt, t.v
+                       FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[])
+                            AS t(code, p, vt, v)
+                       JOIN concepts c ON c.system_id = $1 AND c.code = t.code",
+                    &[&system_id, &codes, &names, &types, &values],
+                )
+                .await
+                .map_err(db)?;
+        }
+        let mut desigs = 0u64;
+        for chunk in designations.chunks(50_000) {
+            let codes: Vec<&str> = chunk.iter().map(|d| d.0.as_str()).collect();
+            let langs: Vec<&str> = chunk.iter().map(|d| d.1.as_str()).collect();
+            let values: Vec<&str> = chunk.iter().map(|d| d.2.as_str()).collect();
+            desigs += tx
+                .execute(
+                    "INSERT INTO concept_designations (concept_id, language, value)
+                     SELECT DISTINCT ON (c.id, lower(t.v)) c.id, t.l, t.v
+                       FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(code, l, v)
+                       JOIN concepts c ON c.system_id = $1 AND c.code = t.code
+                      WHERE lower(COALESCE(c.display, '')) <> lower(t.v)
+                        AND NOT EXISTS (SELECT 1 FROM concept_designations d
+                                         WHERE d.concept_id = c.id
+                                           AND lower(d.value) = lower(t.v))",
+                    &[&system_id, &codes, &langs, &values],
+                )
+                .await
+                .map_err(db)?;
+        }
+        let wrote = !clear.is_empty() || props > 0 || desigs > 0;
+        if wrote {
+            tx.execute(
+                "DELETE FROM value_set_expansions WHERE system_url = $1",
+                &[&url],
+            )
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        if wrote {
+            self.invalidate_caches();
+        }
+        Ok((props, desigs))
     }
 
     async fn delete_normalized_by_id(&self, resource_type: &str, id: &str) -> Result<(), HtsError> {

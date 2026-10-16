@@ -36,6 +36,31 @@
 //! * `LoincAnswerListLink.csv` gives each linked term an `answer-list`
 //!   property.
 //!
+//! ## Properties
+//!
+//! Following the LOINC FHIR terminology guidance (<https://loinc.org/fhir/>,
+//! property codes as in the official LOINC `CodeSystem` resource), each LOINC
+//! term carries
+//!
+//! * the `string` properties of `Loinc.csv` listed in
+//!   [`LOINC_STRING_PROPERTIES`] (`STATUS`, `CLASSTYPE`, `ORDER_OBS`, …);
+//! * one `Coding` property per row of `LoincPartLink_Primary.csv` and
+//!   `LoincPartLink_Supplementary.csv` — `COMPONENT`, `PROPERTY`,
+//!   `TIME_ASPCT`, `SYSTEM`, `SCALE_TYP`, `METHOD_TYP`, `CLASS`, `analyte`,
+//!   `category`, `document-kind`, `rad-modality-type`, … — whose value is the
+//!   part code (`LP…`). The `search` links (278 000 rows that no filter uses)
+//!   are left out.
+//!
+//! A ValueSet filter on one of the part properties may name the part either
+//! by code (`SCALE_TYP = LP32888-7`) or by name (`SCALE_TYP = DOC`, matched
+//! case-insensitively against the parts' names; see
+//! [`crate::loinc_filters`]). Each part also gets its `PartName` and
+//! `PartDisplayName` as designations, so `Bld` is a valid display of
+//! `LP7057-5` (display `Blood`). `HTS_LOINC_PROPERTIES=false` skips all of
+//! this. An existing import gets the properties without re-importing its
+//! concepts through `hts import --format loinc-properties <zip>`
+//! ([`backfill_loinc_properties`]).
+//!
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real LOINC data requires a free license from the Regenstrief Institute.
@@ -52,6 +77,7 @@ use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::LanguageFilter;
+use crate::import::PropertyRow;
 use crate::import::bundle_builder::{
     BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_parsed_code_system,
 };
@@ -70,7 +96,31 @@ struct LoincConcept {
     display: String,
     /// Raw STATUS value from LoincTable: ACTIVE, DEPRECATED, DISCOURAGED, TRIAL.
     status: String,
+    /// Non-empty [`LOINC_STRING_PROPERTIES`] values, in that order.
+    props: Vec<(&'static str, String)>,
 }
+
+/// `Loinc.csv` columns stored as `string` properties, under the same codes
+/// the official LOINC FHIR CodeSystem uses.
+pub(crate) const LOINC_STRING_PROPERTIES: &[&str] = &[
+    "STATUS",
+    "CLASSTYPE",
+    "ORDER_OBS",
+    "VersionFirstReleased",
+    "VersionLastChanged",
+    "CHNG_TYPE",
+    "UNITSREQUIRED",
+    "EXAMPLE_UCUM_UNITS",
+    "EXAMPLE_UNITS",
+    "PanelType",
+];
+
+/// Part-link properties not stored: the `search` links are 278 000 rows of
+/// search keywords that no ValueSet filter uses.
+const SKIPPED_PART_LINK_PROPERTIES: &[&str] = &["search"];
+
+/// One stored property of a LOINC term: (code, FHIR value key, value).
+type OwnedProperty = (std::sync::Arc<str>, &'static str, String);
 
 /// Merged concept map: code → (display, optional definition, optional parent).
 type ConceptEntries = HashMap<String, MergedConcept>;
@@ -85,6 +135,8 @@ struct MergedConcept {
     designations: Vec<OwnedDesignation>,
     /// `answer-list` codes from `LoincAnswerListLink.csv`.
     answer_lists: Vec<String>,
+    /// String and part-link properties (see the module docs).
+    properties: Vec<OwnedProperty>,
 }
 
 /// One answer list from `AnswerList.csv`.
@@ -121,6 +173,8 @@ struct LoincParseResult {
     /// Answer lists keyed by `LL…` code, in code order.
     answer_lists: std::collections::BTreeMap<String, AnswerList>,
     answer_count: usize,
+    /// Properties attached to terms (string + part links).
+    property_count: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -268,11 +322,22 @@ pub async fn import_loinc_csv(
                 },
             );
         }
+        let with_properties = loinc_properties_enabled();
+        let mut interner = PropertyInterner::default();
         for (code, concept) in &loinc_concepts {
             let definition = if concept.status != "ACTIVE" {
                 Some(format!("STATUS:{}", concept.status))
             } else {
                 None
+            };
+            let properties = if with_properties {
+                concept
+                    .props
+                    .iter()
+                    .map(|(p, v)| (interner.get(p), "valueString", v.clone()))
+                    .collect()
+            } else {
+                Vec::new()
             };
             all_concepts.insert(
                 code.clone(),
@@ -280,6 +345,7 @@ pub async fn import_loinc_csv(
                     display: concept.display.clone(),
                     definition,
                     parent: parent_of.get(code).cloned(),
+                    properties,
                     ..Default::default()
                 },
             );
@@ -291,6 +357,26 @@ pub async fn import_loinc_csv(
         } else {
             Default::default()
         };
+
+        // Part links: one `Coding` property per (term, property, part).
+        if with_properties {
+            for name in &paths.part_links {
+                let bytes = read_entry(&path_owned, name)?;
+                for (loinc, property, part) in parse_part_links(bytes.as_slice(), name, &mut parse_errors)? {
+                    if let Some(concept) = all_concepts.get_mut(&loinc) {
+                        let property = interner.get(&property);
+                        if !concept
+                            .properties
+                            .iter()
+                            .any(|(p, _, v)| *p == property && *v == part)
+                        {
+                            concept.properties.push((property, "valueCoding", part));
+                        }
+                    }
+                }
+            }
+        }
+        let property_count = all_concepts.values().map(|c| c.properties.len()).sum();
 
         // Attach translated display names as designations on the concepts that
         // exist in this CodeSystem. Translations for unknown codes are recorded
@@ -331,6 +417,7 @@ pub async fn import_loinc_csv(
             extra_part_count,
             answer_lists,
             answer_count,
+            property_count,
         })
     })
     .await
@@ -351,13 +438,14 @@ pub async fn import_loinc_csv(
         eprintln!(
             "[{FORMAT}] dry-run — would import {total_concepts} concepts \
              ({} LOINC codes, {} LP category nodes, {} further parts, {} answer lists, \
-             {} answers), {} hierarchy edges, {} translated designations{lang_summary}",
+             {} answers), {} hierarchy edges, {} properties, {} translated designations{lang_summary}",
             parsed.loinc_count,
             parsed.lp_count,
             parsed.extra_part_count,
             parsed.answer_lists.len(),
             parsed.answer_count,
             parsed.edge_count,
+            parsed.property_count,
             parsed.designation_count,
         );
         stats.value_sets = answer_list_value_sets(&parsed.answer_lists) as u32;
@@ -426,6 +514,11 @@ pub async fn import_loinc_csv(
                         value_key: "valueCode",
                         value: ll.as_str(),
                     })
+                    .chain(entry.properties.iter().map(|(code, key, value)| BuilderProperty {
+                        code,
+                        value_key: key,
+                        value: value.as_str(),
+                    }))
                     .collect()
             })
             .collect();
@@ -490,6 +583,170 @@ pub async fn import_loinc_csv(
     Ok(stats)
 }
 
+/// Adds the LOINC properties and part-name designations (see the module
+/// docs) to an existing LOINC import, without re-importing its concepts:
+/// `hts import --format loinc-properties <Loinc_x.yz.zip>`.
+///
+/// Reads `Loinc.csv`, the `LoincPartLink_*.csv` files and `Part.csv` from
+/// the distribution, replaces every stored value of the properties it
+/// writes (so a rerun does not duplicate them) and adds the part names that
+/// are missing. Targets the CodeSystem `http://loinc.org` of the archive's
+/// release version, else the only stored version. Concepts and hierarchy
+/// stay as they are; cached expansions over LOINC are dropped. A server
+/// running against the same database keeps in-memory caches until it is
+/// restarted (run it as an admin import job to avoid that).
+pub async fn backfill_loinc_properties(
+    backend: &dyn BundleImportBackend,
+    ctx: &TenantContext,
+    path: &Path,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<ImportStats, HtsError> {
+    const FORMAT: &str = "loinc-properties";
+    // Property rows per backend call: large batches, as each is a few
+    // UNNEST / prepared-statement inserts.
+    let batch_size = batch_size.max(1).saturating_mul(10).max(10_000);
+    let path_owned = path.to_path_buf();
+    #[allow(clippy::type_complexity)]
+    let (version, rows, designations, errors) = tokio::task::spawn_blocking(
+        move || -> Result<(Option<String>, Vec<PropertyRow>, Vec<(String, String, String)>, Vec<String>), HtsError> {
+            let paths = find_loinc_paths(&path_owned)?;
+            let mut errors = Vec::new();
+            let table = parse_loinc_table(
+                read_entry(&path_owned, &paths.loinc_table)?.as_slice(),
+                &mut errors,
+            )?;
+            let mut rows: Vec<PropertyRow> = Vec::new();
+            let mut codes: Vec<&String> = table.keys().collect();
+            codes.sort();
+            for code in codes {
+                for (p, v) in &table[code].props {
+                    rows.push(PropertyRow {
+                        code: code.clone(),
+                        property: (*p).to_string(),
+                        value_type: "string".into(),
+                        value: v.clone(),
+                    });
+                }
+            }
+            let mut seen: HashSet<(String, String, String)> = HashSet::new();
+            for name in &paths.part_links {
+                for (loinc, property, part) in
+                    parse_part_links(read_entry(&path_owned, name)?.as_slice(), name, &mut errors)?
+                {
+                    if !table.contains_key(&loinc) {
+                        continue;
+                    }
+                    let key = (loinc, property, part);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key.clone());
+                    let (code, property, value) = key;
+                    rows.push(PropertyRow {
+                        code,
+                        property,
+                        value_type: "coding".into(),
+                        value,
+                    });
+                }
+            }
+            if paths.part_links.is_empty() {
+                errors.push(
+                    "no LoincPartLink_*.csv in the archive: only the Loinc.csv properties are written"
+                        .into(),
+                );
+            }
+            let mut designations = Vec::new();
+            if let Some(name) = &paths.parts {
+                for part in parse_parts(read_entry(&path_owned, name)?.as_slice(), &mut errors)? {
+                    let mut values = vec![part.display];
+                    if !values[0].eq_ignore_ascii_case(&part.name) && !part.name.is_empty() {
+                        values.push(part.name);
+                    }
+                    for value in values.into_iter().filter(|v| !v.is_empty()) {
+                        designations.push((
+                            part.code.clone(),
+                            PART_NAME_LANGUAGE.to_string(),
+                            value,
+                        ));
+                    }
+                }
+            }
+            Ok((paths.release_version, rows, designations, errors))
+        },
+    )
+    .await
+    .map_err(|e| HtsError::Internal(format!("LOINC parser panicked: {e}")))??;
+
+    let mut stats = ImportStats {
+        errors,
+        ..Default::default()
+    };
+    let mut clear: Vec<String> = rows.iter().map(|r| r.property.clone()).collect();
+    clear.sort();
+    clear.dedup();
+    if dry_run {
+        eprintln!(
+            "[{FORMAT}] dry-run — would write {} properties ({} property codes) and up to {} \
+             part-name designations",
+            rows.len(),
+            clear.len(),
+            designations.len()
+        );
+        return Ok(stats);
+    }
+    eprintln!(
+        "[{FORMAT}] writing {} properties ({} property codes) and up to {} part-name designations",
+        rows.len(),
+        clear.len(),
+        designations.len()
+    );
+    let version = match version {
+        Some(v)
+            if backend
+                .write_concept_properties(ctx, LOINC_URL, Some(&v), &[], vec![], vec![])
+                .await
+                .is_ok() =>
+        {
+            Some(v)
+        }
+        _ => None,
+    };
+    let num_batches = rows.len().div_ceil(batch_size).max(1);
+    let mut rows = rows.into_iter().peekable();
+    let mut designations = Some(designations);
+    let (mut props_written, mut desig_written) = (0u64, 0u64);
+    for i in 0..num_batches {
+        let chunk: Vec<PropertyRow> = rows.by_ref().take(batch_size).collect();
+        let first = i == 0;
+        let (p, d) = backend
+            .write_concept_properties(
+                ctx,
+                LOINC_URL,
+                version.as_deref(),
+                if first { &clear } else { &[] },
+                chunk,
+                if first {
+                    designations.take().unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+            )
+            .await?;
+        props_written += p;
+        desig_written += d;
+        crate::import::progress::report_batch(i + 1, num_batches);
+        eprintln!("[{FORMAT}] batch {}/{num_batches} — {props_written} properties", i + 1);
+    }
+    debug_assert!(rows.peek().is_none());
+    eprintln!(
+        "[{FORMAT}] wrote {props_written} properties and {desig_written} part-name designations"
+    );
+    stats.code_systems = 1;
+    Ok(stats)
+}
+
 /// `HTS_LOINC_PARTS_AND_ANSWERS` (default on): import `Part.csv` and the
 /// answer files.
 fn parts_and_answers_enabled() -> bool {
@@ -529,15 +786,24 @@ fn load_parts_and_answers(
     };
 
     let mut extra_parts = 0;
+    let part_names = loinc_properties_enabled();
     if let Some(name) = &paths.parts {
-        for (code, display, status) in parse_parts(open(name)?.as_slice(), errors)? {
-            if let std::collections::hash_map::Entry::Vacant(slot) = concepts.entry(code) {
-                slot.insert(MergedConcept {
-                    display,
-                    definition: status_definition(&status),
-                    ..Default::default()
-                });
-                extra_parts += 1;
+        for part in parse_parts(open(name)?.as_slice(), errors)? {
+            let concept = match concepts.entry(part.code) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    extra_parts += 1;
+                    slot.insert(MergedConcept {
+                        display: part.display.clone(),
+                        definition: status_definition(&part.status),
+                        ..Default::default()
+                    })
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+            };
+            if part_names {
+                for value in [part.name, part.display] {
+                    add_part_name(concept, value);
+                }
             }
         }
     }
@@ -576,6 +842,69 @@ fn load_parts_and_answers(
         }
     }
     Ok((extra_parts, lists, answers))
+}
+
+/// Language of the part-name designations (LOINC is published in en-US).
+const PART_NAME_LANGUAGE: &str = "en-US";
+
+/// Adds `value` as an English designation of a part unless it is empty or
+/// already the display or a designation (case-insensitively: display checks
+/// ignore case anyway).
+fn add_part_name(concept: &mut MergedConcept, value: String) {
+    if value.is_empty()
+        || concept.display.eq_ignore_ascii_case(&value)
+        || concept
+            .designations
+            .iter()
+            .any(|d| d.value.eq_ignore_ascii_case(&value))
+    {
+        return;
+    }
+    concept.designations.push(OwnedDesignation {
+        language: PART_NAME_LANGUAGE.to_string(),
+        value,
+    });
+}
+
+/// `HTS_LOINC_PROPERTIES` (default on): store the `Loinc.csv` string
+/// properties, the part links and the part-name designations.
+fn loinc_properties_enabled() -> bool {
+    std::env::var("HTS_LOINC_PROPERTIES").map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Shares one allocation per property code across the ~1.6 million stored
+/// part links.
+#[derive(Default)]
+struct PropertyInterner(HashMap<String, std::sync::Arc<str>>);
+
+impl PropertyInterner {
+    fn get(&mut self, code: &str) -> std::sync::Arc<str> {
+        if let Some(a) = self.0.get(code) {
+            return a.clone();
+        }
+        let a: std::sync::Arc<str> = std::sync::Arc::from(code);
+        self.0.insert(code.to_string(), a.clone());
+        a
+    }
+}
+
+/// Reads one ZIP entry fully.
+fn read_entry(zip_path: &Path, name: &str) -> Result<Vec<u8>, HtsError> {
+    use std::io::Read;
+    let mut zip = open_zip(zip_path)?;
+    let mut entry = zip
+        .by_name(name)
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot open {name}: {e}")))?;
+    let mut buf = Vec::new();
+    entry
+        .read_to_end(&mut buf)
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read {name}: {e}")))?;
+    Ok(buf)
 }
 
 /// How many answer lists become ValueSets (those with answers; externally
@@ -650,6 +979,9 @@ struct LoincArchivePaths {
     answer_lists: Option<String>,
     /// `LoincAnswerListLink.csv` (the `AnswerFile/` copy preferred), if present.
     answer_list_links: Option<String>,
+    /// `LoincPartLink_Primary.csv` / `LoincPartLink_Supplementary.csv`
+    /// (`LoincPartLink.csv` before 2.67), sorted.
+    part_links: Vec<String>,
 }
 
 /// Extract LOINC release version from a ZIP entry path such as
@@ -683,6 +1015,7 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
     let mut parts: Option<String> = None;
     let mut answer_lists: Option<String> = None;
     let mut answer_list_links: Option<String> = None;
+    let mut part_links: Vec<String> = Vec::new();
     // `PanelsAndForms/` carries copies of the answer files; `AnswerFile/` wins.
     let prefer_answer_file = |slot: &mut Option<String>, name: &str| {
         if slot.is_none() || name.to_lowercase().contains("answerfile/") {
@@ -724,6 +1057,8 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
                 hierarchy_path = Some(name);
             } else if filename == "part.csv" {
                 parts = Some(name);
+            } else if filename.starts_with("loincpartlink") {
+                part_links.push(name);
             } else if filename == "answerlist.csv" {
                 prefer_answer_file(&mut answer_lists, &name);
             } else if filename == "loincanswerlistlink.csv" {
@@ -739,6 +1074,7 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
     }
 
     lv_variants.sort();
+    part_links.sort();
 
     // Current official ZIPs have no `Loinc_<ver>/` top-level folder — the
     // version is only in the archive name (`Loinc_2.80.zip`). Fall back to it
@@ -767,6 +1103,7 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
         parts,
         answer_lists,
         answer_list_links,
+        part_links,
     })
 }
 
@@ -1008,6 +1345,10 @@ fn parse_loinc_table(
     let long_idx = find_col(&headers, "LONG_COMMON_NAME").ok();
     let short_idx = find_col(&headers, "ShortName").ok();
     let status_idx = find_col(&headers, "STATUS").ok();
+    let prop_idxs: Vec<(&'static str, usize)> = LOINC_STRING_PROPERTIES
+        .iter()
+        .filter_map(|p| find_col(&headers, p).ok().map(|i| (*p, i)))
+        .collect();
 
     let mut concepts: HashMap<String, LoincConcept> = HashMap::new();
     let mut record_no: usize = 0;
@@ -1044,7 +1385,22 @@ fn parse_loinc_table(
             .unwrap_or("ACTIVE")
             .to_string();
 
-        concepts.insert(code, LoincConcept { display, status });
+        let props = prop_idxs
+            .iter()
+            .filter_map(|(p, i)| {
+                let v = record.get(*i).map(str::trim).unwrap_or("");
+                (!v.is_empty()).then(|| (*p, v.to_string()))
+            })
+            .collect();
+
+        concepts.insert(
+            code,
+            LoincConcept {
+                display,
+                status,
+                props,
+            },
+        );
     }
 
     Ok(concepts)
@@ -1106,12 +1462,22 @@ fn parse_hierarchy(
     Ok((concepts, edges))
 }
 
-/// `Part.csv`: `(PartNumber, display, Status)`; display is
-/// `PartDisplayName`, else `PartName`.
+/// One `Part.csv` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartRow {
+    code: String,
+    /// `PartDisplayName`, else `PartName`.
+    display: String,
+    /// `PartName` (e.g. `Bld` for display `Blood`).
+    name: String,
+    status: String,
+}
+
+/// `Part.csv` rows.
 fn parse_parts(
     reader: impl std::io::Read,
     errors: &mut Vec<String>,
-) -> Result<Vec<(String, String, String)>, HtsError> {
+) -> Result<Vec<PartRow>, HtsError> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
     let headers = rdr
         .headers()
@@ -1139,11 +1505,76 @@ fn parse_parts(
             ));
             continue;
         }
+        let name = field(&record, name_idx);
         let mut display = field(&record, display_idx);
         if display.is_empty() {
-            display = field(&record, name_idx);
+            display = name.clone();
         }
-        out.push((code, display, field(&record, status_idx)));
+        out.push(PartRow {
+            code,
+            display,
+            name,
+            status: field(&record, status_idx),
+        });
+    }
+    Ok(out)
+}
+
+/// `LoincPartLink_*.csv`: `(LoincNumber, property code, PartNumber)` per
+/// row. The property code is the last segment of the `Property` column
+/// (`http://loinc.org/property/SCALE_TYP` → `SCALE_TYP`). Rows linking to
+/// another code system than LOINC, and [`SKIPPED_PART_LINK_PROPERTIES`],
+/// are left out.
+fn parse_part_links(
+    reader: impl std::io::Read,
+    name: &str,
+    errors: &mut Vec<String>,
+) -> Result<Vec<(String, String, String)>, HtsError> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
+    let headers = rdr
+        .headers()
+        .map_err(|e| HtsError::InvalidRequest(format!("Cannot read {name} headers: {e}")))?
+        .clone();
+    // A file without the expected columns (a subset or an older layout) is
+    // skipped, not fatal: the terms import without its links.
+    let (Ok(loinc_idx), Ok(part_idx), Ok(property_idx)) = (
+        find_col(&headers, "LoincNumber"),
+        find_col(&headers, "PartNumber"),
+        find_col(&headers, "Property"),
+    ) else {
+        errors.push(format!(
+            "{name}: no LoincNumber/PartNumber/Property columns — part links not imported"
+        ));
+        return Ok(Vec::new());
+    };
+    let system_idx = find_col(&headers, "PartCodeSystem").ok();
+    let mut out = Vec::new();
+    for (n, result) in rdr.records().enumerate() {
+        let record =
+            result.map_err(|e| HtsError::InvalidRequest(format!("{name} record error: {e}")))?;
+        let loinc = record.get(loinc_idx).unwrap_or("").trim();
+        let part = record.get(part_idx).unwrap_or("").trim();
+        let property = record
+            .get(property_idx)
+            .unwrap_or("")
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        if loinc.is_empty() || part.is_empty() || property.is_empty() {
+            errors.push(format!(
+                "{name} record {}: empty LoincNumber, PartNumber or Property — skipped",
+                n + 1
+            ));
+            continue;
+        }
+        let system = system_idx.and_then(|i| record.get(i)).unwrap_or("").trim();
+        if (!system.is_empty() && system != LOINC_URL)
+            || SKIPPED_PART_LINK_PROPERTIES.contains(&property)
+        {
+            continue;
+        }
+        out.push((loinc.to_string(), property.to_string(), part.to_string()));
     }
     Ok(out)
 }

@@ -273,6 +273,10 @@ pub enum ImportFormat {
     /// LOINC CSV distribution (.zip) from loinc.org
     #[value(name = "loinc")]
     Loinc,
+    /// The properties of a LOINC distribution (.zip), added to an existing
+    /// LOINC import without re-importing its concepts. Never auto-detected.
+    #[value(name = "loinc-properties")]
+    LoincProperties,
     /// ICD-10-CM tabular XML from CMS
     #[value(name = "icd10-cm")]
     Icd10Cm,
@@ -317,6 +321,7 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Hl7Npm => write!(f, "hl7-npm"),
             ImportFormat::SnomedRf2 => write!(f, "snomed-rf2"),
             ImportFormat::Loinc => write!(f, "loinc"),
+            ImportFormat::LoincProperties => write!(f, "loinc-properties"),
             ImportFormat::Icd10Cm => write!(f, "icd10-cm"),
             ImportFormat::Icd10Pcs => write!(f, "icd10-pcs"),
             ImportFormat::Icd9Cm => write!(f, "icd9-cm"),

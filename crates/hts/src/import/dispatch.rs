@@ -41,6 +41,12 @@ pub async fn dispatch_import(
         ImportFormat::Loinc => {
             import_loinc_csv(backend, ctx, path, batch_size, dry_run, languages).await
         }
+        ImportFormat::LoincProperties => {
+            crate::import::loinc_csv::backfill_loinc_properties(
+                backend, ctx, path, batch_size, dry_run,
+            )
+            .await
+        }
         ImportFormat::Icd10Cm => import_icd10_cm(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Icd10Pcs => import_icd10_pcs(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Icd9Cm => import_icd9_cm(backend, ctx, path, batch_size, dry_run).await,

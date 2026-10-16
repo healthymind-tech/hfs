@@ -3178,6 +3178,7 @@ async fn pg_filter_property_eq(
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
     let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
+    let values = pg_loinc_filter_values(client, system_url, system_id, property, value).await?;
 
     // Drive the query from `idx_props_property_value` (property, value,
     // concept_id): the inner scan returns the (small) set of concept ids
@@ -3194,9 +3195,9 @@ async fn pg_filter_property_eq(
                     SELECT cp.concept_id
                       FROM concept_properties cp
                      WHERE cp.property = ANY($2::text[])
-                       AND cp.value = $3
+                       AND cp.value = ANY($3::text[])
                 )",
-            &[&system_id, &property_aliases, &value],
+            &[&system_id, &property_aliases, &values],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -3205,6 +3206,43 @@ async fn pg_filter_property_eq(
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
         .collect())
+}
+
+/// The values a filter value on `property` stands for: itself, plus — for
+/// a LOINC part property naming a part (`SCALE_TYP = DOC`) — the codes of
+/// the parts with that name (see [`crate::loinc_filters`]). Mirrors the
+/// SQLite `loinc_filter_values`.
+async fn pg_loinc_filter_values(
+    client: &super::PgClient,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<String>, HtsError> {
+    if system_url != crate::loinc_filters::LOINC_URL
+        || !crate::loinc_filters::wants_name_lookup(property, value)
+    {
+        return Ok(vec![value.to_string()]);
+    }
+    if let Some(codes) = crate::loinc_filters::cached(system_id, value) {
+        return Ok(crate::loinc_filters::with_codes(value, codes));
+    }
+    let name = value.trim();
+    let rows = client
+        .cq(
+            "SELECT c.code FROM concepts c
+              WHERE c.system_id = $1 AND c.code >= 'LP' AND c.code < 'LQ'
+                AND (lower(c.display) = lower($2)
+                     OR EXISTS (SELECT 1 FROM concept_designations d
+                                 WHERE d.concept_id = c.id AND lower(d.value) = lower($2)))
+              ORDER BY c.code",
+            &[&system_id, &name],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    let codes: Vec<String> = rows.into_iter().map(|r| r.get(0)).collect();
+    crate::loinc_filters::remember(system_id, value, &codes);
+    Ok(crate::loinc_filters::with_codes(value, codes))
 }
 
 /// Inverse of [`pg_filter_property_eq`]: returns every concept in
@@ -3222,6 +3260,7 @@ async fn pg_filter_property_ne(
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
     let property_aliases = cs_property_local_codes(client, meta, system_url, property).await;
+    let values = pg_loinc_filter_values(client, system_url, system_id, property, value).await?;
 
     let rows = client
         .cq(
@@ -3232,9 +3271,9 @@ async fn pg_filter_property_ne(
                     SELECT 1 FROM concept_properties cp
                      WHERE cp.concept_id = c.id
                        AND cp.property = ANY($2::text[])
-                       AND cp.value = $3
+                       AND cp.value = ANY($3::text[])
                 )",
-            &[&system_id, &property_aliases, &value],
+            &[&system_id, &property_aliases, &values],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
