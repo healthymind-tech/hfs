@@ -2199,6 +2199,13 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     let mut params = params;
     normalize_canonical_params(&mut params, "url", Some("version"))?;
     normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // SNOMED CT version URIs → the stored release they name.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &TenantContext::system(),
+        &mut params,
+    )
+    .await;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
@@ -4104,6 +4111,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     let mut params = params;
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
     normalize_canonical_params(&mut params, "system", Some("systemVersion"))?;
+    // SNOMED CT version URIs (codings, `systemVersion`) → the stored release.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &TenantContext::system(),
+        &mut params,
+    )
+    .await;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {

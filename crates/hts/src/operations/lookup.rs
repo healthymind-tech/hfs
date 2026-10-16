@@ -145,6 +145,14 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
     // the backend lookup agree on which CodeSystem version is meant.
     let mut params = params;
     normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // `version=http://snomed.info/sct/<module>[/version/<date>]` → the stored
+    // SNOMED CT release it names.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the

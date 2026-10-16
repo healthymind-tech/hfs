@@ -906,6 +906,21 @@ SNOMED CT's implicit ValueSet URLs are recognised by `$expand` and
 | `http://snomed.info/sct?fhir_vs=ecl/<expr>` | the URL-encoded ECL expression, e.g. `ecl/%3C%3C%2073211009` |
 | `http://snomed.info/sct?fhir_vs=refset/<id>` | the members of reference set `<id>` |
 
+**Version URIs.** The importer stores a release as its date (`20250601`).
+`$validate-code` and `$lookup` also accept the FHIR SNOMED CT version URIs
+for what is loaded — `http://snomed.info/sct/900000000000207008` (the
+International edition, latest release) and
+`http://snomed.info/sct/900000000000207008/version/20250601` — as `version`
+/ `systemVersion` parameters and as the `version` of SNOMED codings. An
+edition that is not loaded (the US edition `731000124108` when only
+International is) stays an unknown version: the code cannot be validated
+and the message lists the valid versions, which is also what tx.fhir.org
+answers for an edition it lacks. (The HL7 validator additionally reports
+`VALUESET_VALUE_MISMATCH_CHANGED` when a coding's edition differs from the
+one an unversioned ValueSet include resolves to — e.g. US Core examples
+coded with the US edition against International; that is a validator rule,
+not a terminology-server answer.)
+
 Multiple editions of the same code system (e.g. the SNOMED International
 release plus a national edition) coexist as separate versions keyed on
 `(url, version)`; unversioned requests resolve to the highest version.
