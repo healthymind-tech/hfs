@@ -10,67 +10,75 @@
   "knownFailures": [
     {
       "file": "account-questionnaire.json",
-      "issues": 32,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "activitydefinition-questionnaire.json",
-      "issues": 71,
+      "issues": 80,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "actualgroup-questionnaire.json",
-      "issues": 34,
+      "issues": 36,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "adverseevent-questionnaire.json",
-      "issues": 41,
+      "issues": 52,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "allergyintolerance-questionnaire.json",
-      "issues": 36,
+      "issues": 40,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "appointment-questionnaire.json",
-      "issues": 39,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "appointmentresponse-questionnaire.json",
-      "issues": 17,
+      "issues": 19,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "auditevent-questionnaire.json",
-      "issues": 66,
+      "issues": 70,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "basic-example.json",
@@ -82,75 +90,84 @@
     },
     {
       "file": "basic-questionnaire.json",
-      "issues": 14,
+      "issues": 16,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "binary-questionnaire.json",
-      "issues": 9,
+      "issues": 10,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "biologicallyderivedproduct-questionnaire.json",
-      "issues": 46,
+      "issues": 51,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bmi-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bodyheight-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bodystructure-questionnaire.json",
-      "issues": 17,
+      "issues": 18,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bodytemp-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bodyweight-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bp-questionnaire.json",
-      "issues": 78,
+      "issues": 88,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "bundle-questionnaire.json",
@@ -162,123 +179,138 @@
     },
     {
       "file": "capabilitystatement-questionnaire.json",
-      "issues": 142,
+      "issues": 143,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "careplan-questionnaire.json",
-      "issues": 60,
+      "issues": 81,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "careteam-questionnaire.json",
-      "issues": 29,
+      "issues": 35,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "catalog-questionnaire.json",
-      "issues": 59,
+      "issues": 69,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "catalogentry-questionnaire.json",
-      "issues": 27,
+      "issues": 29,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cdshooksguidanceresponse-questionnaire.json",
-      "issues": 25,
+      "issues": 32,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cdshooksrequestgroup-questionnaire.json",
-      "issues": 62,
+      "issues": 73,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cdshooksserviceplandefinition-questionnaire.json",
-      "issues": 116,
+      "issues": 121,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "chargeitem-questionnaire.json",
-      "issues": 40,
+      "issues": 55,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "chargeitemdefinition-questionnaire.json",
-      "issues": 54,
+      "issues": 55,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cholesterol-questionnaire.json",
-      "issues": 55,
+      "issues": 68,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "claim-questionnaire.json",
-      "issues": 154,
+      "issues": 177,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "claimresponse-questionnaire.json",
-      "issues": 146,
+      "issues": 155,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "clinicaldocument-questionnaire.json",
-      "issues": 59,
+      "issues": 69,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "clinicalimpression-questionnaire.json",
-      "issues": 40,
+      "issues": 49,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "codesystem-extensions-CodeSystem-author.json",
@@ -330,19 +362,21 @@
     },
     {
       "file": "communication-questionnaire.json",
-      "issues": 36,
+      "issues": 46,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "communicationrequest-questionnaire.json",
-      "issues": 35,
+      "issues": 45,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "compartmentdefinition-questionnaire.json",
@@ -354,19 +388,21 @@
     },
     {
       "file": "composition-questionnaire.json",
-      "issues": 59,
+      "issues": 69,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "computableplandefinition-questionnaire.json",
-      "issues": 116,
+      "issues": 121,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "conceptmap-questionnaire.json",
@@ -378,91 +414,102 @@
     },
     {
       "file": "condition-questionnaire.json",
-      "issues": 38,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "consent-questionnaire.json",
-      "issues": 58,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "contract-questionnaire.json",
-      "issues": 185,
+      "issues": 217,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "coverage-questionnaire.json",
-      "issues": 46,
+      "issues": 51,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "coverageeligibilityrequest-questionnaire.json",
-      "issues": 54,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "coverageeligibilityresponse-questionnaire.json",
-      "issues": 59,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cqf-questionnaire-questionnaire.json",
-      "issues": 72,
+      "issues": 75,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "cqllibrary-questionnaire.json",
-      "issues": 43,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "detectedissue-questionnaire.json",
-      "issues": 32,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "device-questionnaire.json",
-      "issues": 67,
+      "issues": 72,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "devicedefinition-questionnaire.json",
-      "issues": 65,
+      "issues": 68,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "devicemetric-example.json",
@@ -474,27 +521,30 @@
     },
     {
       "file": "devicemetric-questionnaire.json",
-      "issues": 26,
+      "issues": 31,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "devicemetricobservation-questionnaire.json",
-      "issues": 55,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "devicerequest-questionnaire.json",
-      "issues": 38,
+      "issues": 52,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "deviceusestatement-example.json",
@@ -506,123 +556,138 @@
     },
     {
       "file": "deviceusestatement-questionnaire.json",
-      "issues": 22,
+      "issues": 31,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "diagnosticreport-genetics-questionnaire.json",
-      "issues": 33,
+      "issues": 42,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "diagnosticreport-questionnaire.json",
-      "issues": 33,
+      "issues": 42,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "documentmanifest-questionnaire.json",
-      "issues": 27,
+      "issues": 32,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "documentreference-questionnaire.json",
-      "issues": 48,
+      "issues": 56,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "effectevidencesynthesis-questionnaire.json",
-      "issues": 86,
+      "issues": 91,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "elementdefinition-de-questionnaire.json",
-      "issues": 512,
+      "issues": 560,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "encounter-questionnaire.json",
-      "issues": 76,
+      "issues": 89,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "endpoint-questionnaire.json",
-      "issues": 20,
+      "issues": 21,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "enrollmentrequest-questionnaire.json",
-      "issues": 16,
+      "issues": 20,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "enrollmentresponse-questionnaire.json",
-      "issues": 17,
+      "issues": 20,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "episodeofcare-questionnaire.json",
-      "issues": 32,
+      "issues": 39,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "eventdefinition-questionnaire.json",
-      "issues": 40,
+      "issues": 41,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "evidence-questionnaire.json",
-      "issues": 40,
+      "issues": 43,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "evidencevariable-questionnaire.json",
-      "issues": 97,
+      "issues": 106,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "examplescenario-questionnaire.json",
@@ -634,43 +699,48 @@
     },
     {
       "file": "explanationofbenefit-questionnaire.json",
-      "issues": 261,
+      "issues": 287,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "familymemberhistory-genetic-questionnaire.json",
-      "issues": 35,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "familymemberhistory-questionnaire.json",
-      "issues": 35,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "flag-questionnaire.json",
-      "issues": 17,
+      "issues": 20,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "goal-questionnaire.json",
-      "issues": 33,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "graphdefinition-questionnaire.json",
@@ -682,235 +752,272 @@
     },
     {
       "file": "group-questionnaire.json",
-      "issues": 34,
+      "issues": 36,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "groupdefinition-questionnaire.json",
-      "issues": 34,
+      "issues": 36,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "guidanceresponse-questionnaire.json",
-      "issues": 24,
+      "issues": 31,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "hdlcholesterol-questionnaire.json",
-      "issues": 55,
+      "issues": 68,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "headcircum-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "healthcareservice-questionnaire.json",
-      "issues": 51,
+      "issues": 55,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "heartrate-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "hlaresult-questionnaire.json",
-      "issues": 33,
+      "issues": 42,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "imagingstudy-questionnaire.json",
-      "issues": 57,
+      "issues": 69,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "immunization-questionnaire.json",
-      "issues": 64,
+      "issues": 72,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
+    },
+    {
+      "file": "immunizationevaluation-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     },
     {
       "file": "immunizationrecommendation-questionnaire.json",
-      "issues": 34,
+      "issues": 38,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "implementationguide-questionnaire.json",
-      "issues": 107,
+      "issues": 110,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "insuranceplan-questionnaire.json",
-      "issues": 81,
+      "issues": 89,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "invoice-questionnaire.json",
-      "issues": 43,
+      "issues": 49,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "json-edge-cases.json",
-      "issues": 2,
+      "issues": 4,
       "kinds": [
+        "unknown-extension",
         "unknown-schema"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\"). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "ldlcholesterol-questionnaire.json",
-      "issues": 55,
+      "issues": 68,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "library-questionnaire.json",
-      "issues": 43,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "linkage-questionnaire.json",
-      "issues": 17,
+      "issues": 19,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "lipidprofile-questionnaire.json",
-      "issues": 37,
+      "issues": 50,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "list-questionnaire.json",
-      "issues": 30,
+      "issues": 34,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "location-questionnaire.json",
-      "issues": 40,
+      "issues": 43,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "measure-questionnaire.json",
-      "issues": 89,
+      "issues": 90,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "measurereport-questionnaire.json",
-      "issues": 56,
+      "issues": 61,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "media-questionnaire.json",
-      "issues": 31,
+      "issues": 37,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medication-questionnaire.json",
-      "issues": 29,
+      "issues": 31,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicationadministration-questionnaire.json",
-      "issues": 42,
+      "issues": 52,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicationdispense-questionnaire.json",
-      "issues": 46,
+      "issues": 60,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicationknowledge-questionnaire.json",
-      "issues": 116,
+      "issues": 124,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicationrequest-questionnaire.json",
-      "issues": 63,
+      "issues": 78,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicationrequest0301.json",
@@ -922,91 +1029,102 @@
     },
     {
       "file": "medicationstatement-questionnaire.json",
-      "issues": 28,
+      "issues": 36,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproduct-questionnaire.json",
-      "issues": 65,
+      "issues": 74,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductauthorization-questionnaire.json",
-      "issues": 40,
+      "issues": 43,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductcontraindication-questionnaire.json",
-      "issues": 21,
+      "issues": 24,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductindication-questionnaire.json",
-      "issues": 23,
+      "issues": 26,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductingredient-questionnaire.json",
-      "issues": 45,
+      "issues": 46,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductinteraction-questionnaire.json",
-      "issues": 20,
+      "issues": 22,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductmanufactured-questionnaire.json",
-      "issues": 16,
+      "issues": 18,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductpackaged-questionnaire.json",
-      "issues": 38,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductpharmaceutical-questionnaire.json",
-      "issues": 42,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "medicinalproductundesirableeffect-questionnaire.json",
-      "issues": 14,
+      "issues": 15,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "messagedefinition-questionnaire.json",
@@ -1018,19 +1136,21 @@
     },
     {
       "file": "messageheader-questionnaire.json",
-      "issues": 42,
+      "issues": 50,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "molecularsequence-questionnaire.json",
-      "issues": 101,
+      "issues": 108,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "namingsystem-questionnaire.json",
@@ -1042,11 +1162,12 @@
     },
     {
       "file": "nutritionorder-questionnaire.json",
-      "issues": 73,
+      "issues": 86,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "observation-example-clinical-gender.json",
@@ -1057,28 +1178,39 @@
       "reason": "Genuine defect in the published example, not an engine bug: R4 Observation.performer does not allow Encounter."
     },
     {
-      "file": "observation-genetics-questionnaire.json",
-      "issues": 54,
+      "file": "observation-example-genetics-brcapat.json",
+      "issues": 1,
       "kinds": [
-        "required"
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "observation-genetics-questionnaire.json",
+      "issues": 67,
+      "kinds": [
+        "required",
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "observation-questionnaire.json",
-      "issues": 54,
+      "issues": 67,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "observationdefinition-questionnaire.json",
-      "issues": 41,
+      "issues": 45,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "operationdefinition-questionnaire.json",
@@ -1098,131 +1230,147 @@
     },
     {
       "file": "organization-questionnaire.json",
-      "issues": 27,
+      "issues": 29,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "organizationaffiliation-questionnaire.json",
-      "issues": 21,
+      "issues": 27,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "oxygensat-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "parameters-questionnaire.json",
-      "issues": 120,
+      "issues": 132,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "patient-questionnaire.json",
-      "issues": 48,
+      "issues": 52,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "paymentnotice-questionnaire.json",
-      "issues": 21,
+      "issues": 27,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "paymentreconciliation-questionnaire.json",
-      "issues": 42,
+      "issues": 50,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "person-questionnaire.json",
-      "issues": 25,
+      "issues": 27,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "picoelement-questionnaire.json",
-      "issues": 97,
+      "issues": 106,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "plandefinition-questionnaire.json",
-      "issues": 116,
+      "issues": 121,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "practitioner-questionnaire.json",
-      "issues": 26,
+      "issues": 27,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "practitionerrole-questionnaire.json",
-      "issues": 36,
+      "issues": 41,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "procedure-questionnaire.json",
-      "issues": 48,
+      "issues": 62,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "provenance-questionnaire.json",
-      "issues": 35,
+      "issues": 40,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "provenance-relevant-history-questionnaire.json",
-      "issues": 44,
+      "issues": 51,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "questionnaire-questionnaire.json",
-      "issues": 72,
+      "issues": 75,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
@@ -1234,91 +1382,102 @@
     },
     {
       "file": "questionnaireresponse-questionnaire.json",
-      "issues": 36,
+      "issues": 43,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "relatedperson-questionnaire.json",
-      "issues": 27,
+      "issues": 28,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "requestgroup-questionnaire.json",
-      "issues": 62,
+      "issues": 73,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "researchdefinition-questionnaire.json",
-      "issues": 46,
+      "issues": 51,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "researchelementdefinition-questionnaire.json",
-      "issues": 97,
+      "issues": 105,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "researchstudy-questionnaire.json",
-      "issues": 45,
+      "issues": 51,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "researchsubject-questionnaire.json",
-      "issues": 18,
+      "issues": 21,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "resprate-questionnaire.json",
-      "issues": 56,
+      "issues": 66,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "riskassessment-questionnaire.json",
-      "issues": 36,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "riskevidencesynthesis-questionnaire.json",
-      "issues": 78,
+      "issues": 81,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "schedule-questionnaire.json",
-      "issues": 17,
+      "issues": 18,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "searchparameter-questionnaire.json",
@@ -1330,27 +1489,30 @@
     },
     {
       "file": "servicerequest-genetics-questionnaire.json",
-      "issues": 42,
+      "issues": 57,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "servicerequest-questionnaire.json",
-      "issues": 42,
+      "issues": 57,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "shareableactivitydefinition-questionnaire.json",
-      "issues": 71,
+      "issues": 80,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "shareablecodesystem-questionnaire.json",
@@ -1362,27 +1524,30 @@
     },
     {
       "file": "shareablelibrary-questionnaire.json",
-      "issues": 43,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "shareablemeasure-questionnaire.json",
-      "issues": 89,
+      "issues": 90,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "shareableplandefinition-questionnaire.json",
-      "issues": 116,
+      "issues": 121,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "shareablevalueset-questionnaire.json",
@@ -1394,27 +1559,30 @@
     },
     {
       "file": "slot-questionnaire.json",
-      "issues": 20,
+      "issues": 21,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "specimen-questionnaire.json",
-      "issues": 48,
+      "issues": 54,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "specimendefinition-questionnaire.json",
-      "issues": 48,
+      "issues": 49,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "structuredefinition-questionnaire.json",
@@ -1426,11 +1594,12 @@
     },
     {
       "file": "structuremap-questionnaire.json",
-      "issues": 202,
+      "issues": 214,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "subscription-questionnaire.json",
@@ -1442,11 +1611,12 @@
     },
     {
       "file": "substance-questionnaire.json",
-      "issues": 27,
+      "issues": 28,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "substancenucleicacid-questionnaire.json",
@@ -1474,11 +1644,12 @@
     },
     {
       "file": "substancereferenceinformation-questionnaire.json",
-      "issues": 44,
+      "issues": 48,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "substancesourcematerial-questionnaire.json",
@@ -1490,43 +1661,48 @@
     },
     {
       "file": "substancespecification-questionnaire.json",
-      "issues": 115,
+      "issues": 127,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "supplydelivery-questionnaire.json",
-      "issues": 25,
+      "issues": 35,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "supplyrequest-questionnaire.json",
-      "issues": 29,
+      "issues": 38,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "synthesis-questionnaire.json",
-      "issues": 41,
+      "issues": 44,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "task-questionnaire.json",
-      "issues": 266,
+      "issues": 302,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "terminologycapabilities-questionnaire.json",
@@ -1538,27 +1714,30 @@
     },
     {
       "file": "testreport-questionnaire.json",
-      "issues": 70,
+      "issues": 71,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "testscript-questionnaire.json",
-      "issues": 170,
+      "issues": 172,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "triglyceride-questionnaire.json",
-      "issues": 55,
+      "issues": 68,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "valueset-extensions-ValueSet-author.json",
@@ -1610,35 +1789,39 @@
     },
     {
       "file": "verificationresult-questionnaire.json",
-      "issues": 50,
+      "issues": 58,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "visionprescription-questionnaire.json",
-      "issues": 39,
+      "issues": 42,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "vitalsigns-questionnaire.json",
-      "issues": 55,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     },
     {
       "file": "vitalspanel-questionnaire.json",
-      "issues": 55,
+      "issues": 65,
       "kinds": [
-        "required"
+        "required",
+        "unknown-extension"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
     }
   ]
 }

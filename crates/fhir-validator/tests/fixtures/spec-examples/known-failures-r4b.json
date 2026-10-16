@@ -9,12 +9,372 @@
   ],
   "knownFailures": [
     {
+      "file": "account-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "activitydefinition-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "actualgroup-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "address.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "administrableproductdefinition-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "adverseevent-questionnaire.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "age.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "allergyintolerance-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "appointment-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "appointmentresponse-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "attachment.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "auditevent-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
       "file": "basic-example.json",
       "issues": 3,
       "kinds": [
         "unknown-schema"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+    },
+    {
+      "file": "basic-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "binary-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "biologicallyderivedproduct-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bmi-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bmi.profile.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodyheight-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodyheight.profile.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodystructure-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodytemp-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodytemp.profile.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodyweight-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bodyweight.profile.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bp-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "bp.profile.json",
+      "issues": 17,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "capabilitystatement-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "careplan-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "careteam-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "catalog-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "catalog.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "catalogentry-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cdshooksguidanceresponse-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cdshooksrequestgroup-questionnaire.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cdshooksserviceplandefinition-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "chargeitem-questionnaire.json",
+      "issues": 15,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "chargeitemdefinition-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cholesterol-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cholesterol.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "citation-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "claim-questionnaire.json",
+      "issues": 23,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "claimresponse-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "clinicaldocument-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "clinicalimpression-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "clinicalusedefinition-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     },
     {
       "file": "codesystem-adjudication-reason.json",
@@ -1313,12 +1673,388 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
+      "file": "codesystem.profile.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "coding.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "communication-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "communicationrequest-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "composition-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "computableplandefinition-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "conceptmap.profile.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "condition-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "consent-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "contactpoint.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "contract-questionnaire.json",
+      "issues": 51,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "contributor.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "count.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "coverage-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "coverageeligibilityrequest-questionnaire.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "coverageeligibilityresponse-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cqf-questionnaire-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "cqllibrary-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "dataelements.json",
+      "issues": 52,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "datarequirement.profile.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "definition.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "detectedissue-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "device-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "devicedefinition-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
       "file": "devicemetric-example.json",
       "issues": 1,
       "kinds": [
         "reference-invalid"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: DeviceMetric.parent is Reference(Device), the example points at DeviceDefinition/dc102."
+    },
+    {
+      "file": "devicemetric-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "devicemetricobservation-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "devicerequest-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "deviceusestatement-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "diagnosticreport-genetics-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "diagnosticreport-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "distance.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "documentmanifest-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "documentreference-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "dosage.profile.json",
+      "issues": 12,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "duration.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "elementdefinition-de-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "elementdefinition-de.profile.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "elementdefinition.profile.json",
+      "issues": 20,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "encounter-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "endpoint-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "enrollmentrequest-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "enrollmentresponse-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "episodeofcare-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "event.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "eventdefinition-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "evidence-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "evidencereport-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     },
     {
       "file": "evidencevariable-example-Wardlaw2014Analysis1.16.3EvidenceSet.json",
@@ -1329,12 +2065,1085 @@
       "reason": "Genuine defect in the published example, not an engine bug: characteristic.definitionReference is Reference(Group|EvidenceVariable), the example declares type Evidence."
     },
     {
-      "file": "json-edge-cases.json",
+      "file": "evidencevariable-questionnaire.json",
       "issues": 2,
       "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "explanationofbenefit-questionnaire.json",
+      "issues": 26,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "expression.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-11179-objectclass.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-11179-objectclassproperty.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-allergyintolerance-certainty.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-allergyintolerance-substanceexposurerisk.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-capabilities.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-capabilitystatement-expectation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-codesystem-alternate.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-condition-dueto.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-condition-occurredfollowing.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-condition-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-certainty.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-qualityofevidence.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-recipientlanguage.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-relativedatetime.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-strengthofrecommendation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-cqf-systemuserlanguage.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-data-absent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-definitions.json",
+      "issues": 168,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-device-implantstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-devicerequest-patientinstruction.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-diagnosticreport-geneticsreferences.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-elementdefinition-allowedunits.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-elementdefinition-bestpractice.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-elementdefinition-equivalence.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-encounter-modeofarrival.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-event-statusreason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-family-member-history-genetics-parent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-family-member-history-genetics-sibling.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-familymemberhistory-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-flag-priority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-goal-acceptance.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-goal-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-humanname-assembly-order.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-ad-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-en-qualifier.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-en-representation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-en-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-nullflavor.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-sc-coding.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-iso21090-uncertaintytype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-language.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-match-grade.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-messageheader-response-request.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-mimetype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-nutritionorder-adaptivefeedingdevice.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-focuscode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-geneticsallele.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-geneticsaminoacidchange.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-geneticsgene.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-geneticsvariant.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-observation-secondaryfinding.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-openehr-location.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-patient-animal.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-patient-proficiency.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-practitioner-animalspecies.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-procedure-progressstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-basetype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-choiceorientation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-constraint.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-displaycategory.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-itemcontrol.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-referenceresource.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-signaturerequired.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaire-usagemode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaireresponse-completionmode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-questionnaireresponse-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-relative-date.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-request-statusreason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-specimen-collectionpriority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-applicable-version.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-normative-version.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-security-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-standards-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-template-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-structuredefinition-wg.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-translation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-tz-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-valueset-expand-rules.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "extension-valueset-parametersource.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "familymemberhistory-genetic-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "familymemberhistory-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "fivews.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "flag-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "goal-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "group-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "groupdefinition-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "guidanceresponse-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "hdlcholesterol-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "headcircum-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "headcircum.profile.json",
+      "issues": 11,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "healthcareservice-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "heartrate-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "heartrate.profile.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "hlaresult-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "humanname.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "identifier.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "imagingstudy-questionnaire.json",
+      "issues": 12,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "immunization-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "immunizationevaluation-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "immunizationrecommendation-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "implementationguide-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "implementationguide.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "ingredient-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "insuranceplan-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "invoice-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "json-edge-cases.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension",
         "unknown-schema"
       ],
-      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\")."
+      "reason": "Genuine defect in the published example, not an engine bug: its modifierExtensions use example.org URLs no definition exists for, and an unknown modifier extension must be rejected (the HL7 validator also reports \"could not be found so is not allowed here\"). The unknown-extension warnings are genuine too: HL7-namespace extension urls this FHIR version does not define (e.g. questionnaire-allowedResource), which the HL7 validator also rejects."
+    },
+    {
+      "file": "ldlcholesterol-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "library-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "linkage-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "lipidprofile-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "lipidprofile.profile.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "list-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "location-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "manufactureditemdefinition-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "measure-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "measurereport-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "media-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medication-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicationadministration-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicationdispense-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicationknowledge-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicationrequest-questionnaire.json",
+      "issues": 15,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicationstatement-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "medicinalproductdefinition-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "messageheader-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "meta.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "molecularsequence-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "money.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "moneyquantity.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "narrative.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "nutritionorder-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "nutritionproduct-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     },
     {
       "file": "observation-example-clinical-gender.json",
@@ -1345,12 +3154,580 @@
       "reason": "Genuine defect in the published example, not an engine bug: Observation.performer does not allow Encounter."
     },
     {
+      "file": "observation-example-genetics-brcapat.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "observation-genetics-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "observation-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "observationdefinition-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "operationdefinition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "organization-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "organizationaffiliation-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "oxygensat-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "oxygensat.profile.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "packagedproductdefinition-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "parameterdefinition.profile.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "parameters-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "parameters.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "patient-questionnaire.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "paymentnotice-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "paymentreconciliation-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "person-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "plandefinition-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "practitioner-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "practitionerrole-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "procedure-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "profiles-others.json",
+      "issues": 140,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "profiles-resources.json",
+      "issues": 42,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "profiles-types.json",
+      "issues": 122,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "provenance-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "provenance-relevant-history-questionnaire.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "provenance-relevant-history.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "quantity.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "questionnaire-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
       "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
       "issues": 1,
       "kinds": [
         "primitive-value"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter's `id` is 67 characters, exceeding the 64-character limit FHIR's own `id` type imposes (`[A-Za-z0-9\\-\\.]{1,64}`). This is `Resource.id`, which is correctly typed `id` -- unlike the `Element.id`-derived ids of #424, whose fix deliberately leaves genuine resource-id validation intact. Previously misattributed to #424."
+    },
+    {
+      "file": "questionnaireresponse-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "reference.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "regulatedauthorization-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "relatedartifact.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "relatedperson-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "request.json",
+      "issues": 7,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "requestgroup-questionnaire.json",
+      "issues": 16,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "researchdefinition-questionnaire.json",
+      "issues": 5,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "researchelementdefinition-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "researchstudy-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "researchsubject-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "resprate-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "resprate.profile.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "riskassessment-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "schedule-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "searchparameter.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "servicerequest-genetics-questionnaire.json",
+      "issues": 15,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "servicerequest-questionnaire.json",
+      "issues": 15,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "shareableactivitydefinition-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "shareablecodesystem.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "shareablelibrary-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "shareablemeasure-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "shareablevalueset.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "signature.profile.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "simplequantity.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "slot-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "specimen-questionnaire.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "specimendefinition-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "structuremap-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "subscriptionstatus-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "substance-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "substancedefinition-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "supplydelivery-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "supplyrequest-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "task-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "terminologycapabilities.profile.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "testreport-questionnaire.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "testscript-questionnaire.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "timing.profile.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "triggerdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "triglyceride-questionnaire.json",
+      "issues": 13,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "usagecontext.profile.json",
+      "issues": 4,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     },
     {
       "file": "valueset-catalogType.json",
@@ -1441,12 +3818,68 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
+      "file": "valueset.profile.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
       "file": "valuesets.json",
       "issues": 186,
       "kinds": [
         "required"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: its entries declare `meta.profile` `shareablecodesystem`/`shareablevalueset` and omit elements that profile requires (`publisher`, `description`; a few also omit base-required `status`). Most of these were silent until nested Bundle entries were held to their own meta.profile claims. The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone."
+    },
+    {
+      "file": "verificationresult-questionnaire.json",
+      "issues": 8,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "visionprescription-questionnaire.json",
+      "issues": 3,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "vitalsigns-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "vitalsigns.profile.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "vitalspanel-questionnaire.json",
+      "issues": 10,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
+    },
+    {
+      "file": "vitalspanel.profile.json",
+      "issues": 6,
+      "kinds": [
+        "unknown-extension"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it uses HL7-namespace extension urls this FHIR version does not define (questionnaire-allowedResource in the generated *-questionnaire examples, the publisher's http://hl7.org/fhir/build/StructureDefinition/* build extensions); the HL7 validator reports them too (\"could not be found so is not allowed here\"). Warning severity here."
     }
   ]
 }

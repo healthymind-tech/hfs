@@ -747,7 +747,7 @@ fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Valu
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
-            } else if is_hl7_namespace(url) {
+            } else if is_hl7_namespace(url) && knows_hl7_extensions(ctx.resolver) {
                 // HL7 publishes every extension it defines; a url in its
                 // namespace that resolves to nothing is a typo or an
                 // uninstalled package (the HL7 validator rejects it). Other
@@ -773,6 +773,15 @@ fn is_hl7_namespace(url: &str) -> bool {
         .unwrap_or(url);
     let host = rest.split('/').next().unwrap_or_default();
     host == "hl7.org" || host.ends_with(".hl7.org") || host == "fhir.org"
+}
+
+/// Whether HL7's extension definitions are loaded at all. R4/R4B ship them
+/// in the core packs; from R5 on they live in `hl7.fhir.uv.extensions`,
+/// and without that package every HL7 extension would look unknown.
+fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
+    resolver
+        .resolve("http://hl7.org/fhir/StructureDefinition/data-absent-reason")
+        .is_some()
 }
 
 /// Canonical (conformance) resource types. HL7's publisher places
@@ -1620,6 +1629,58 @@ mod tests {
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
+    }
+
+    /// Without HL7's extension definitions loaded (R5 core without the
+    /// extensions package), an HL7-namespace url proves nothing: silent.
+    #[test]
+    fn unknown_hl7_extensions_need_hl7_definitions_loaded() {
+        use crate::engine::Validator;
+        use crate::resolver::SchemaRegistry;
+        let registry = |with_hl7: bool| {
+            let mut r = SchemaRegistry::new();
+            for p in ["string", "uri", "code"] {
+                r.insert_named(
+                    p,
+                    serde_json::from_value(json!({"kind": "primitive-type"})).unwrap(),
+                );
+            }
+            r.insert_named(
+                "Extension",
+                serde_json::from_value(json!({"elements": {
+                    "url": {"type": "uri"}, "valueString": {"type": "string"}
+                }}))
+                .unwrap(),
+            );
+            r.insert_named(
+                "Patient",
+                serde_json::from_value(json!({"elements": {
+                    "resourceType": {"type": "code"},
+                    "extension": {"type": "Extension", "array": true}
+                }}))
+                .unwrap(),
+            );
+            if with_hl7 {
+                r.insert_named(
+                    "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+                    serde_json::from_value(json!({"kind": "extension", "base": "Extension"}))
+                        .unwrap(),
+                );
+            }
+            Arc::new(r)
+        };
+        let patient = json!({"resourceType": "Patient", "extension": [
+            {"url": "http://hl7.org/fhir/StructureDefinition/nope", "valueString": "x"}]});
+        let unknown = |with_hl7| {
+            Validator::new(registry(with_hl7))
+                .validate_sync(&patient, &crate::ValidationOptions::default())
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::UnknownExtension)
+                .count()
+        };
+        assert_eq!(unknown(false), 0);
+        assert_eq!(unknown(true), 1);
     }
 
     /// A required primitive (or value[x] branch) carried only by its `_`
