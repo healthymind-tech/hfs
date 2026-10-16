@@ -162,15 +162,29 @@ impl<'a> WalkCtx<'a> {
         severity: Severity,
         source: Option<String>,
     ) {
+        self.error_full(kind, message, severity, source, None);
+    }
+
+    /// Emit an issue with its HL7-validator wording (see
+    /// [`ValidationError::hl7_message`]). Deduplication keys on that wording
+    /// when given: two slices failing the same bound at one array share the
+    /// pinned `message` but are distinct issues.
+    pub(super) fn error_full(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+        source: Option<String>,
+        hl7_message: Option<String>,
+    ) {
         let path = self.path.render_dotted();
-        if self
-            .emitted
-            .insert((kind, severity, path.clone(), message.clone()))
-        {
+        let key = hl7_message.clone().unwrap_or_else(|| message.clone());
+        if self.emitted.insert((kind, severity, path.clone(), key)) {
             self.errors.push(
                 ValidationError::new(kind, path, message)
                     .with_severity(severity)
-                    .with_source(source),
+                    .with_source(source)
+                    .with_hl7_message(hl7_message),
             );
         }
     }

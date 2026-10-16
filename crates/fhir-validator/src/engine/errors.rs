@@ -113,6 +113,11 @@ pub struct ValidationError {
     /// validator's `(from <url>)`. Not part of the conformance shape.
     #[serde(skip)]
     pub source: Option<String>,
+    /// The HL7 validator's wording of the issue, when it differs from the
+    /// conformance-pinned `message` (slice cardinality names the slice
+    /// there). REST reports it in preference to `message`.
+    #[serde(skip)]
+    pub hl7_message: Option<String>,
 }
 
 impl ValidationError {
@@ -124,7 +129,13 @@ impl ValidationError {
             extra: serde_json::Map::new(),
             severity: Severity::Error,
             source: None,
+            hl7_message: None,
         }
+    }
+
+    pub fn with_hl7_message(mut self, message: Option<String>) -> Self {
+        self.hl7_message = message;
+        self
     }
 
     pub fn with_source(mut self, source: Option<String>) -> Self {
@@ -239,6 +250,20 @@ pub(crate) fn msg_slice_min(min: u64, actual: u64) -> String {
 /// [pinned] `Slice defines the following max cardinality: '{max}', actual cardinality: '{n}'`
 pub(crate) fn msg_slice_max(max: u64, actual: u64) -> String {
     format!("Slice defines the following max cardinality: '{max}', actual cardinality: '{actual}'")
+}
+
+/// [helios] HL7 validator wording of a slice minimum violation.
+pub(crate) fn hl7_slice_min(element: &str, slice: &str, min: u64, found: u64) -> String {
+    if found == 0 {
+        format!("Slice '{element}:{slice}': a matching slice is required, but not found")
+    } else {
+        format!("{element}:{slice}: minimum required = {min}, but only found {found}")
+    }
+}
+
+/// [helios] HL7 validator wording of a slice maximum violation.
+pub(crate) fn hl7_slice_max(element: &str, slice: &str, max: u64, found: u64) -> String {
+    format!("{element}:{slice}: max allowed = {max}, but found {found}")
 }
 
 /// Render a value for message text: bare strings (like the reference

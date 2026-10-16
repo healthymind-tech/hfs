@@ -282,6 +282,10 @@ fn nested_slice_constants_discriminate_components() {
     assert_eq!(max.len(), 1, "{errors:#?}");
     assert!(max[0].message.contains("max cardinality: '1'"), "{max:?}");
     assert_eq!(max[0].source.as_deref(), Some(BP_LIKE));
+    assert_eq!(
+        max[0].hl7_message.as_deref(),
+        Some("Observation.component:Sys: max allowed = 1, but found 2")
+    );
 
     // Diastolic missing: slice min 1.
     let mut missing = bp_observation();
@@ -291,6 +295,28 @@ fn nested_slice_constants_discriminate_components() {
         errors.iter().any(|e| e.kind == ErrorKind::SliceCardinality
             && e.message
                 .contains("min cardinality: '1', actual cardinality: '0'")),
+        "{errors:#?}"
+    );
+
+    // Neither component matches: both required slices are reported, each
+    // under its own name (the pinned message alone is identical).
+    let mut neither = bp_observation();
+    for c in neither["component"].as_array_mut().unwrap() {
+        c["code"] = json!({"coding": [{"system": "http://loinc.org", "code": "0000-0"}]});
+    }
+    let errors = structural(&r, &neither, &[BP_LIKE]);
+    let mut missing: Vec<_> = errors
+        .iter()
+        .filter(|e| e.kind == ErrorKind::SliceCardinality && e.path == "Observation.component")
+        .filter_map(|e| e.hl7_message.as_deref())
+        .collect();
+    missing.sort();
+    assert_eq!(
+        missing,
+        vec![
+            "Slice 'Observation.component:Dia': a matching slice is required, but not found",
+            "Slice 'Observation.component:Sys': a matching slice is required, but not found",
+        ],
         "{errors:#?}"
     );
 }

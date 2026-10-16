@@ -825,9 +825,10 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         Severity::Warning => IssueSeverity::Warning,
     };
     // The profile behind the rule, as the HL7 validator names it.
+    let text = error.hl7_message.as_deref().unwrap_or(&error.message);
     let message = match &error.source {
-        Some(source) => format!("{} (from {source})", error.message),
-        None => error.message.clone(),
+        Some(source) => format!("{text} (from {source})"),
+        None => text.to_string(),
     };
     Issue::new(severity, code, message).with_expression(dotted_to_fhirpath(&error.path))
 }

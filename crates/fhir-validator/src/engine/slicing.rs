@@ -194,17 +194,27 @@ pub(super) fn validate_slices(
             }
         }
 
+        // The element the slicing sits on, without array indices, for the
+        // HL7 wording (`Observation.component:SystolicBP`).
+        let element = ctx
+            .path
+            .render_dotted()
+            .split('.')
+            .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
+            .collect::<Vec<_>>()
+            .join(".");
         for (name, slice) in &mark.slicing.slices {
             let found = mark.counters[name];
             if let Some(min) = slice.min
                 && min > 0
                 && found < min
             {
-                ctx.error_from(
+                ctx.error_full(
                     ErrorKind::SliceCardinality,
                     errors::msg_slice_min(min, found),
                     Severity::Error,
                     mark.source.clone(),
+                    Some(errors::hl7_slice_min(&element, name, min, found)),
                 );
             }
             // Unlike the reference validator (which skips falsy bounds),
@@ -213,11 +223,12 @@ pub(super) fn validate_slices(
             if let Some(max) = slice.max
                 && found > max
             {
-                ctx.error_from(
+                ctx.error_full(
                     ErrorKind::SliceCardinality,
                     errors::msg_slice_max(max, found),
                     Severity::Error,
                     mark.source.clone(),
+                    Some(errors::hl7_slice_max(&element, name, max, found)),
                 );
             }
         }
