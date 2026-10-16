@@ -178,3 +178,32 @@ fn element_objects_are_true_in_boolean_operators() {
         EvaluationResult::boolean(true)
     );
 }
+
+/// `CapabilityStatement.implementationGuide` is a sibling of
+/// `implementation`, not an `implementation[x]` variant: cpb-16
+/// (`kind != 'requirements' or (implementation.exists().not() and
+/// software.exists().not())`) must hold for a requirements statement that
+/// only lists implementation guides.
+#[test]
+fn implementation_guide_is_not_an_implementation_variant() {
+    let context = context_for(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "status": "active", "date": "2024-01-01", "kind": "requirements",
+        "fhirVersion": "4.0.1", "format": ["json"],
+        "implementationGuide": ["http://example.org/ImplementationGuide/x"],
+        "rest": [{ "mode": "server" }]
+    }));
+    for (expr, want) in [
+        ("CapabilityStatement.implementation.exists()", false),
+        ("implementation.exists()", false),
+        ("%resource.implementation.exists()", false),
+        ("CapabilityStatement.all((kind != 'requirements') or (implementation.exists().not() and software.exists().not()))", true),
+        ("CapabilityStatement.implementationGuide.exists()", true),
+    ] {
+        assert_eq!(
+            run_expression(&context, expr),
+            EvaluationResult::boolean(want),
+            "{expr}"
+        );
+    }
+}

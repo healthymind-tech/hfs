@@ -17,15 +17,26 @@
 //!   (never silent). An **empty** FHIRPath result counts as a pass, per
 //!   FHIR invariant semantics (the reference validator treats empty as a
 //!   failure — a known bug there).
-//! - bindings: only `strength: required` is enforced. The coded shape is
-//!   the element's declared type when known, else inferred from the value
-//!   (`code` string / Coding / CodeableConcept, mirroring the reference).
-//!   Provider errors surface as warning issues by default (fail-open);
-//!   [`TerminologyFailMode`] escalates them — all of them (`Closed`), or
-//!   only "ValueSet not known" (`ClosedRequired`) — to errors.
+//! - bindings: `strength: required` is enforced; `extensible` draws a
+//!   warning when [`EffectHandlers::check_extensible`] is on. The coded
+//!   shape is the element's declared type when known, else inferred from
+//!   the value (`code` string / Coding / CodeableConcept, mirroring the
+//!   reference). Provider errors on required bindings surface as warning
+//!   issues by default (fail-open); [`TerminologyFailMode`] escalates them
+//!   — all of them (`Closed`), or only "ValueSet not known"
+//!   (`ClosedRequired`) — to errors. Failures on extensible bindings are
+//!   silent.
+//! - codings: every Coding with a `display` (or an HL7-namespace `system`)
+//!   is checked against its code system ([`TxCheck::Coding`]): a wrong
+//!   display is a [`ErrorKind::DisplayMismatch`] issue of
+//!   [`EffectHandlers::display_issues`] severity — never a binding failure —
+//!   and an unknown code system in the HL7 namespaces is an error.
+//!   Bindings and codings of one resource are asked of the provider in a
+//!   single [`TerminologyProvider::check`] call.
 //!
-//! Issue order: all constraint issues (deferred order), then all binding
-//! issues (deferred order) — always after the structural errors.
+//! Issue order: all constraint issues (deferred order), then binding and
+//! coding issues (deferred order, then document order) — always after the
+//! structural errors.
 
 use crate::engine::{ErrorKind, Severity, ValidationError};
 use crate::schema::Binding;
@@ -101,6 +112,77 @@ pub trait TerminologyProvider: Send + Sync {
             out.push(self.validate_code(value_set, coded).await);
         }
         out
+    }
+
+    /// Every terminology question of one resource at once — value-set
+    /// membership and code-system checks of individual codings — answers
+    /// aligned with `checks`. One call per resource, so a remote provider
+    /// can answer them all in a single round trip.
+    ///
+    /// The default answers [`TxCheck::InValueSet`] through
+    /// [`validate_codes`](Self::validate_codes) and leaves every
+    /// [`TxCheck::Coding`] unjudged ([`TxVerdict::valid`]).
+    async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        let membership: Vec<(usize, (&str, &CodedValue))> = checks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match c {
+                TxCheck::InValueSet(vs, coded) => Some((i, (*vs, *coded))),
+                TxCheck::Coding(_) => None,
+            })
+            .collect();
+        let mut out: Vec<Result<TxVerdict, TerminologyError>> =
+            vec![Ok(TxVerdict::valid()); checks.len()];
+        if !membership.is_empty() {
+            let requests: Vec<(&str, &CodedValue)> = membership.iter().map(|(_, c)| *c).collect();
+            let verdicts = self.validate_codes(&requests).await;
+            for ((i, _), verdict) in membership.iter().zip(verdicts) {
+                out[*i] = verdict.map(TxVerdict::member);
+            }
+        }
+        out
+    }
+}
+
+/// One terminology question asked during a validation run.
+#[derive(Debug, Clone, Copy)]
+pub enum TxCheck<'a> {
+    /// Is the coded value in the value set (`ValueSet/$validate-code`)?
+    InValueSet(&'a str, &'a CodedValue),
+    /// Is this Coding right for its code system (`CodeSystem/$validate-code`):
+    /// is the system known, and is the `display` one the code system
+    /// defines for the code? Asked for every Coding with a `system` and
+    /// `code`, bound or not, as the HL7 validator does.
+    Coding(&'a Value),
+}
+
+/// The answer to one [`TxCheck`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxVerdict {
+    /// [`TxCheck::InValueSet`]: the coded value is in the value set. A
+    /// wrong display never makes a code invalid; it only shows up in
+    /// [`TxCheck::Coding`] answers. Always `true` for coding checks.
+    pub valid: bool,
+    /// [`TxCheck::Coding`]: the display is wrong; the message says which
+    /// displays are valid (HL7 validator wording).
+    pub wrong_display: Option<String>,
+    /// [`TxCheck::Coding`]: the service knows no code system with this URL.
+    pub unknown_system: bool,
+}
+
+impl TxVerdict {
+    /// In the value set / nothing wrong (or nothing judged).
+    pub fn valid() -> Self {
+        Self::member(true)
+    }
+
+    /// A membership answer.
+    pub fn member(valid: bool) -> Self {
+        Self {
+            valid,
+            wrong_display: None,
+            unknown_system: false,
+        }
     }
 }
 
@@ -238,7 +320,6 @@ pub struct DeferredConstraint<'a> {
 }
 
 /// The handlers for one validation run.
-#[derive(Default)]
 pub struct EffectHandlers<'a> {
     pub terminology: Option<&'a dyn TerminologyProvider>,
     pub constraints: Option<&'a dyn ConstraintEvaluator>,
@@ -246,6 +327,35 @@ pub struct EffectHandlers<'a> {
     pub suppress_constraints: &'a [String],
     /// How terminology-service failures on required bindings are reported.
     pub terminology_fail: TerminologyFailMode,
+    /// Severity of a wrong `display` on a Coding (default warning, as HAPI
+    /// and the HL7 validator's `--display-issues-are-warnings`; the HL7
+    /// validator's own default is error).
+    pub display_issues: Severity,
+    /// Check `extensible` bindings too: a coded value from none of the
+    /// value set's codes draws a warning (HL7 validator default). Off by
+    /// default — only `required` bindings are enforced.
+    pub check_extensible: bool,
+    /// Report internal narrative hyperlinks (`<a href="#x">`) that resolve
+    /// to nothing in the resource (error, as the HL7 validator does).
+    pub narrative_links: bool,
+    /// The HL7 validator's best-practice warnings (an Observation without
+    /// a subject or performer).
+    pub best_practice: bool,
+}
+
+impl Default for EffectHandlers<'_> {
+    fn default() -> Self {
+        Self {
+            terminology: None,
+            constraints: None,
+            suppress_constraints: &[],
+            terminology_fail: TerminologyFailMode::default(),
+            display_issues: Severity::Warning,
+            check_extensible: false,
+            narrative_links: false,
+            best_practice: false,
+        }
+    }
 }
 
 /// Execute the deferred obligations, appending issues to `errors`.
@@ -257,12 +367,7 @@ pub async fn execute(
     errors: &mut Vec<ValidationError>,
 ) {
     execute_constraints(resource, version, deferred, handlers, errors);
-    execute_bindings(deferred, handlers, errors).await;
-    // Wrong displays on required-bound codings, judged offline against
-    // the embedded core code systems whenever bindings are checked at all.
-    if handlers.terminology.is_some() {
-        errors.extend(crate::terminology::display_issues(version, deferred));
-    }
+    execute_terminology(resource, deferred, handlers, errors).await;
 }
 
 fn execute_constraints(
@@ -371,7 +476,24 @@ fn execute_constraints(
     }
 }
 
-async fn execute_bindings(
+/// What one terminology question in [`execute_terminology`] was asked for.
+enum Asked<'a> {
+    /// A `required` or (with [`EffectHandlers::check_extensible`])
+    /// `extensible` binding on the node at `path`.
+    Binding {
+        path: &'a String,
+        binding: &'a Binding,
+        value: &'a Value,
+        coded: CodedValue,
+    },
+    /// A Coding at `path` (dotted, numeric indices).
+    Coding { path: String, coding: &'a Value },
+}
+
+/// Bindings and per-coding code-system checks, asked of the provider in
+/// one call (one round trip for a remote provider).
+async fn execute_terminology(
+    resource: &Value,
     deferred: &[Deferred],
     handlers: &EffectHandlers<'_>,
     errors: &mut Vec<ValidationError>,
@@ -380,8 +502,21 @@ async fn execute_bindings(
         return;
     };
 
-    // Collect every required binding first, then ask the provider once.
-    let mut checks: Vec<(&String, &Binding, &Value, CodedValue)> = Vec::new();
+    // Every value set bound at each path, across the cooperative layers.
+    let mut bound: std::collections::HashMap<&str, Vec<(&str, Option<&str>)>> =
+        std::collections::HashMap::new();
+    for d in deferred {
+        if let Deferred::Binding { path, binding, .. } = d {
+            let vs = binding.value_set.split('|').next().unwrap_or_default();
+            let entry = bound.entry(path.as_str()).or_default();
+            if !entry.iter().any(|(v, s)| *v == vs && *s == binding.strength.as_deref()) {
+                entry.push((vs, binding.strength.as_deref()));
+            }
+        }
+    }
+    let mut extensible_seen: HashSet<(&str, &str)> = HashSet::new();
+
+    let mut asked: Vec<Asked<'_>> = Vec::new();
     for d in deferred {
         let Deferred::Binding {
             path,
@@ -392,55 +527,197 @@ async fn execute_bindings(
         else {
             continue;
         };
-        if binding.strength.as_deref() != Some("required") {
-            continue;
+        match binding.strength.as_deref() {
+            Some("required") => {}
+            Some("extensible") if handlers.check_extensible => {}
+            _ => continue,
         }
         let Some(coded) = coded_value(value, type_hint.as_deref()) else {
             continue; // shape not coded (e.g. null gap) — structural checks own it
         };
-        checks.push((path, binding, value, coded));
-    }
-    if checks.is_empty() {
-        return;
-    }
-    let requests: Vec<(&str, &CodedValue)> = checks
-        .iter()
-        .map(|(_, binding, _, coded)| (binding.value_set.as_str(), coded))
-        .collect();
-    let verdicts = provider.validate_codes(&requests).await;
-    debug_assert_eq!(verdicts.len(), checks.len(), "provider must align verdicts");
-
-    for ((path, binding, value, _), verdict) in checks.iter().zip(verdicts) {
-        let path = *path;
-        let binding = *binding;
-        let value = *value;
-        match verdict {
-            Ok(true) => {}
-            Ok(false) => {
-                errors.push(
-                    ValidationError::new(
-                        ErrorKind::TerminologyBinding,
-                        path.clone(),
-                        messages::terminology_binding(value, &binding.value_set),
-                    )
-                    .with_extra(
-                        "binding",
-                        serde_json::to_value(binding).expect("binding serializes"),
-                    ),
-                );
+        if binding.strength.as_deref() == Some("extensible") {
+            let vs = binding.value_set.split('|').next().unwrap_or_default();
+            // A text-only concept satisfies an extensible binding; a bare
+            // `code` (Address.state & co.) is not judged — its system is
+            // implied and often external (USPS), so a negative answer is
+            // mostly the service not knowing the system.
+            if !has_code(&coded) || matches!(coded, CodedValue::Code(_)) {
+                continue;
             }
-            Err(e) => {
-                let severity = handlers.terminology_fail.severity(e.kind());
-                errors.push(
-                    ValidationError::new(
-                        ErrorKind::TerminologyBinding,
-                        path.clone(),
-                        messages::terminology_unavailable(&binding.value_set, e.message()),
-                    )
-                    .with_severity(severity),
-                );
+            if !extensible_seen.insert((path.as_str(), vs)) {
+                continue; // same set from several layers (`|4.0.1` or not)
+            }
+            if overridden(vs, bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[])) {
+                continue;
             }
         }
+        asked.push(Asked::Binding {
+            path,
+            binding,
+            value,
+            coded,
+        });
+    }
+    let root = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for (path, coding) in crate::terminology::codings(resource, root) {
+        // `system|version` is no code-system URL (the version belongs in
+        // Coding.version); in the HL7 namespaces it can never resolve.
+        if let Some(system) = coding.get("system").and_then(Value::as_str)
+            && system.contains('|')
+            && crate::terminology::is_hl7_namespace(system)
+        {
+            errors.push(ValidationError::new(
+                ErrorKind::UnknownCodeSystem,
+                format!("{path}.system"),
+                messages::url_unresolved(system),
+            ));
+            continue;
+        }
+        // Only what can produce an issue is asked: a display to judge, or
+        // an HL7-namespace system that must resolve.
+        let has_display = coding.get("display").is_some_and(Value::is_string);
+        let hl7 = coding
+            .get("system")
+            .and_then(Value::as_str)
+            .is_some_and(crate::terminology::is_hl7_namespace);
+        if !has_display && !hl7 {
+            continue;
+        }
+        asked.push(Asked::Coding { path, coding });
+    }
+    if asked.is_empty() {
+        return;
+    }
+    let requests: Vec<TxCheck<'_>> = asked
+        .iter()
+        .map(|a| match a {
+            Asked::Binding { binding, coded, .. } => {
+                TxCheck::InValueSet(binding.value_set.as_str(), coded)
+            }
+            Asked::Coding { coding, .. } => TxCheck::Coding(coding),
+        })
+        .collect();
+    let verdicts = provider.check(&requests).await;
+    debug_assert_eq!(verdicts.len(), asked.len(), "provider must align verdicts");
+
+    for (asked, verdict) in asked.iter().zip(verdicts) {
+        match asked {
+            Asked::Binding {
+                path,
+                binding,
+                value,
+                coded,
+            } => {
+                let required = binding.strength.as_deref() == Some("required");
+                match verdict {
+                    Ok(v) if v.valid => {}
+                    Ok(_) if required => {
+                        errors.push(
+                            ValidationError::new(
+                                ErrorKind::TerminologyBinding,
+                                (*path).clone(),
+                                messages::terminology_binding(value, &binding.value_set),
+                            )
+                            .with_extra(
+                                "binding",
+                                serde_json::to_value(binding).expect("binding serializes"),
+                            ),
+                        );
+                    }
+                    Ok(_) => {
+                        errors.push(
+                            ValidationError::new(
+                                ErrorKind::TerminologyBinding,
+                                (*path).clone(),
+                                messages::extensible_binding(coded, &binding.value_set),
+                            )
+                            .with_severity(Severity::Warning),
+                        );
+                    }
+                    Err(e) if required => {
+                        let severity = handlers.terminology_fail.severity(e.kind());
+                        errors.push(
+                            ValidationError::new(
+                                ErrorKind::TerminologyBinding,
+                                (*path).clone(),
+                                messages::terminology_unavailable(
+                                    &binding.value_set,
+                                    e.message(),
+                                ),
+                            )
+                            .with_severity(severity),
+                        );
+                    }
+                    // An extensible binding the service cannot judge says
+                    // nothing about the data.
+                    Err(_) => {}
+                }
+            }
+            Asked::Coding { path, coding } => {
+                let Ok(verdict) = verdict else { continue };
+                if let Some(message) = verdict.wrong_display {
+                    errors.push(
+                        ValidationError::new(
+                            ErrorKind::DisplayMismatch,
+                            format!("{path}.display"),
+                            message,
+                        )
+                        .with_severity(handlers.display_issues),
+                    );
+                }
+                if verdict.unknown_system
+                    && let Some(system) = coding.get("system").and_then(Value::as_str)
+                    && crate::terminology::is_hl7_namespace(system)
+                {
+                    // The HL7 validator resolves every uri in the HL7
+                    // namespaces and rejects one nobody defines
+                    // (Type_Specific_Checks_DT_URL_Resolve).
+                    errors.push(ValidationError::new(
+                        ErrorKind::UnknownCodeSystem,
+                        format!("{path}.system"),
+                        messages::url_unresolved(system),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Whether an `extensible` binding to `vs` is superseded by another
+/// binding on the same element: a profile that rebinds an element (TW Core
+/// `identifier.type` to its own value set) replaces the base binding, as
+/// the HL7 validator judges only the most specific one. A required binding
+/// elsewhere on the element, or a non-core (IG) value set next to a core
+/// one, wins; among several IG value sets the last layer's is checked.
+fn overridden(vs: &str, bindings: &[(&str, Option<&str>)]) -> bool {
+    let core = |v: &str| {
+        v.starts_with("http://hl7.org/fhir/ValueSet/")
+            || v.starts_with("http://terminology.hl7.org/ValueSet/")
+    };
+    let others: Vec<&(&str, Option<&str>)> = bindings.iter().filter(|(v, _)| *v != vs).collect();
+    if others.iter().any(|(_, s)| *s == Some("required")) {
+        return true;
+    }
+    if core(vs) {
+        return others.iter().any(|(v, _)| !core(v));
+    }
+    // vs is an IG set: superseded only by a later IG set.
+    let pos = bindings.iter().position(|(v, _)| *v == vs).unwrap_or(0);
+    bindings[pos + 1..].iter().any(|(v, _)| *v != vs && !core(v))
+}
+
+/// Whether the coded value carries any code at all.
+fn has_code(coded: &CodedValue) -> bool {
+    match coded {
+        CodedValue::Code(c) => !c.is_empty(),
+        CodedValue::Coding(c) => c.get("code").and_then(Value::as_str).is_some(),
+        CodedValue::CodeableConcept(cc) => cc
+            .get("coding")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| cs.iter().any(|c| c.get("code").and_then(Value::as_str).is_some())),
     }
 }
 
@@ -473,6 +750,27 @@ pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<Code
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ig_rebinding_supersedes_the_core_extensible_binding() {
+        let core = "http://hl7.org/fhir/ValueSet/identifier-type";
+        let tw = "https://twcore.mohw.gov.tw/ig/twcore/ValueSet/identifier-type-tw";
+        let ext = Some("extensible");
+        // TW Core rebinds Identifier.type: the core set is not checked, TW's is.
+        let both = [(core, ext), (tw, ext)];
+        assert!(overridden(core, &both));
+        assert!(!overridden(tw, &both));
+        // Alone, the core binding is checked.
+        assert!(!overridden(core, &[(core, ext)]));
+        // A required binding on the element supersedes an extensible one.
+        let req = [(tw, Some("required")), (core, ext)];
+        assert!(overridden(core, &req));
+        // Profile on profile: the later IG set wins.
+        let ig2 = "https://example.org/ValueSet/narrower";
+        let chain = [(core, ext), (tw, ext), (ig2, ext)];
+        assert!(overridden(tw, &chain));
+        assert!(!overridden(ig2, &chain));
+    }
 
     #[test]
     fn unknown_code_system_blocks_only_when_fully_closed() {

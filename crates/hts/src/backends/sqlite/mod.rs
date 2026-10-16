@@ -1286,7 +1286,9 @@ fn write_concept_properties(
                  WHERE c.system_id = ?1 AND c.code = ?2
                    AND lower(COALESCE(c.display, '')) <> lower(?4)
                    AND NOT EXISTS (SELECT 1 FROM concept_designations d
-                                   WHERE d.concept_id = c.id AND lower(d.value) = lower(?4))",
+                                   WHERE d.concept_id = c.id
+                                     AND d.language IS ?3
+                                     AND lower(d.value) = lower(?4))",
             )
             .map_err(err)?;
         for (code, language, value) in designations {

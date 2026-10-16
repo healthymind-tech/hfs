@@ -9,6 +9,7 @@
 
 mod bundle;
 mod errors;
+mod narrative;
 mod path;
 mod primitives;
 mod references;
@@ -26,7 +27,9 @@ pub(crate) mod messages {
         msg_constraints_not_evaluable as constraints_not_evaluable,
         msg_fhirpath_constraint as fhirpath_constraint,
         msg_terminology_binding as terminology_binding,
-        msg_terminology_unavailable as terminology_unavailable, msg_wrong_display as wrong_display,
+        msg_extensible_binding as extensible_binding,
+        msg_terminology_unavailable as terminology_unavailable, msg_url_unresolved as url_unresolved,
+        msg_wrong_display as wrong_display,
     };
 }
 
@@ -279,6 +282,12 @@ impl Validator {
             mut errors,
             deferred,
         } = self.validate_sync(resource, opts);
+        if effects.narrative_links {
+            errors.extend(narrative::narrative_link_errors(resource));
+        }
+        if effects.best_practice {
+            errors.extend(narrative::best_practice_warnings(resource));
+        }
         crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
         errors
     }

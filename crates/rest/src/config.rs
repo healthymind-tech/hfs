@@ -683,6 +683,20 @@ pub struct ValidationConfig {
     /// `closed-required` (a ValueSet the server does not know is an error,
     /// an outage is a warning).
     pub terminology_fail: String,
+    /// Severity of a wrong `Coding.display` (`HFS_VALIDATION_DISPLAY_ISSUES`):
+    /// `warning` (default, as HAPI and the HL7 validator's
+    /// `--display-issues-are-warnings`) or `error` (the HL7 validator's
+    /// default). A wrong display never makes the code itself invalid.
+    pub display_issues: String,
+    /// `extensible` bindings (`HFS_VALIDATION_EXTENSIBLE_BINDINGS`):
+    /// `warning` (default, as the HL7 validator: a coded value from none of
+    /// the value set's codes draws a warning) or `off` (only `required`
+    /// bindings are checked).
+    pub extensible_bindings: String,
+    /// The HL7 validator's best-practice recommendations
+    /// (`HFS_VALIDATION_BEST_PRACTICE`): `warning` (default; e.g. "all
+    /// observations should have a performer") or `off`.
+    pub best_practice: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
@@ -722,6 +736,9 @@ impl Default for ValidationConfig {
             terminology: "embedded".to_string(),
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
+            display_issues: "warning".to_string(),
+            extensible_bindings: "warning".to_string(),
+            best_practice: "warning".to_string(),
             stored_profiles: true,
             shadow_core: false,
             rehydrate: true,
@@ -772,6 +789,15 @@ impl ValidationConfig {
             ),
             terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
+            display_issues: std::env::var("HFS_VALIDATION_DISPLAY_ISSUES")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.display_issues),
+            extensible_bindings: std::env::var("HFS_VALIDATION_EXTENSIBLE_BINDINGS")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.extensible_bindings),
+            best_practice: std::env::var("HFS_VALIDATION_BEST_PRACTICE")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.best_practice),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
             shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
             rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
@@ -816,6 +842,24 @@ impl ValidationConfig {
             errors.push(format!(
                 "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed|closed-required)",
                 self.terminology_fail
+            ));
+        }
+        if !matches!(self.display_issues.as_str(), "warning" | "error") {
+            errors.push(format!(
+                "HFS_VALIDATION_DISPLAY_ISSUES '{}' invalid (expected warning|error)",
+                self.display_issues
+            ));
+        }
+        if !matches!(self.extensible_bindings.as_str(), "warning" | "off") {
+            errors.push(format!(
+                "HFS_VALIDATION_EXTENSIBLE_BINDINGS '{}' invalid (expected warning|off)",
+                self.extensible_bindings
+            ));
+        }
+        if !matches!(self.best_practice.as_str(), "warning" | "off") {
+            errors.push(format!(
+                "HFS_VALIDATION_BEST_PRACTICE '{}' invalid (expected warning|off)",
+                self.best_practice
             ));
         }
         if self.terminology_timeout_ms == 0 {

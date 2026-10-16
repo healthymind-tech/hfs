@@ -164,6 +164,9 @@ fn hfs(ts_url: &str, terminology: &str, fail: &str) -> TestServer {
         validation: ValidationConfig {
             terminology: terminology.to_string(),
             terminology_fail: fail.to_string(),
+            // Required bindings only: extensible checks (on by default)
+            // would add their own round trips to the request counts below.
+            extensible_bindings: "off".to_string(),
             ..Default::default()
         },
         ..ServerConfig::for_testing()

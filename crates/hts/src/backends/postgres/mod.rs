@@ -1393,12 +1393,13 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             desigs += tx
                 .execute(
                     "INSERT INTO concept_designations (concept_id, language, value)
-                     SELECT DISTINCT ON (c.id, lower(t.v)) c.id, t.l, t.v
+                     SELECT DISTINCT ON (c.id, t.l, lower(t.v)) c.id, t.l, t.v
                        FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(code, l, v)
                        JOIN concepts c ON c.system_id = $1 AND c.code = t.code
                       WHERE lower(COALESCE(c.display, '')) <> lower(t.v)
                         AND NOT EXISTS (SELECT 1 FROM concept_designations d
                                          WHERE d.concept_id = c.id
+                                           AND d.language IS NOT DISTINCT FROM t.l
                                            AND lower(d.value) = lower(t.v))",
                     &[&system_id, &codes, &langs, &values],
                 )

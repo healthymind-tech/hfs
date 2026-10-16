@@ -56,10 +56,12 @@
 //! case-insensitively against the parts' names; see
 //! [`crate::loinc_filters`]). Each part also gets its `PartName` and
 //! `PartDisplayName` as designations, so `Bld` is a valid display of
-//! `LP7057-5` (display `Blood`). `HTS_LOINC_PROPERTIES=false` skips all of
-//! this. An existing import gets the properties without re-importing its
-//! concepts through `hts import --format loinc-properties <zip>`
-//! ([`backfill_loinc_properties`]).
+//! `LP7057-5` (display `Blood`), and each term its `SHORTNAME`
+//! (`Calcium SerPl-mCnc` for 17861-6); both are `en-US` designations.
+//! `HTS_LOINC_PROPERTIES=false` skips the properties (the designations stay:
+//! they are displays). An existing import gets the properties and the
+//! designations without re-importing its concepts through
+//! `hts import --format loinc-properties <zip>` ([`backfill_loinc_properties`]).
 //!
 //! # ⚠️  LICENSE REQUIRED
 //!
@@ -98,6 +100,22 @@ struct LoincConcept {
     status: String,
     /// Non-empty [`LOINC_STRING_PROPERTIES`] values, in that order.
     props: Vec<(&'static str, String)>,
+    /// The term's SHORTNAME when it differs from `display`. tx.fhir.org
+    /// accepts it as a valid display (DisplayName and CONSUMER_NAME it does
+    /// not: 'Physical findings Narrative' for 29545-1 is wrong), so it
+    /// becomes an `en-US` designation.
+    alternates: Vec<String>,
+}
+
+/// The `en-US` designations for a concept's alternate English names.
+fn english_designations(alternates: &[String]) -> Vec<OwnedDesignation> {
+    alternates
+        .iter()
+        .map(|value| OwnedDesignation {
+            language: "en-US".to_string(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 /// `Loinc.csv` columns stored as `string` properties, under the same codes
@@ -346,6 +364,7 @@ pub async fn import_loinc_csv(
                     definition,
                     parent: parent_of.get(code).cloned(),
                     properties,
+                    designations: english_designations(&concept.alternates),
                     ..Default::default()
                 },
             );
@@ -583,14 +602,16 @@ pub async fn import_loinc_csv(
     Ok(stats)
 }
 
-/// Adds the LOINC properties and part-name designations (see the module
+/// Adds the LOINC properties, part-name and SHORTNAME designations (see the module
 /// docs) to an existing LOINC import, without re-importing its concepts:
 /// `hts import --format loinc-properties <Loinc_x.yz.zip>`.
 ///
 /// Reads `Loinc.csv`, the `LoincPartLink_*.csv` files and `Part.csv` from
 /// the distribution, replaces every stored value of the properties it
-/// writes (so a rerun does not duplicate them) and adds the part names that
-/// are missing. Targets the CodeSystem `http://loinc.org` of the archive's
+/// writes (so a rerun does not duplicate them) and adds the part names and
+/// term short names that are missing (a designation equal, ignoring case, to
+/// the display or to an existing designation is skipped, so reruns and
+/// databases backfilled by an earlier version get no duplicates). Targets the CodeSystem `http://loinc.org` of the archive's
 /// release version, else the only stored version. Concepts and hierarchy
 /// stay as they are; cached expansions over LOINC are dropped. A server
 /// running against the same database keeps in-memory caches until it is
@@ -629,6 +650,16 @@ pub async fn backfill_loinc_properties(
                     });
                 }
             }
+            let mut designations = Vec::new();
+            for code in table.keys() {
+                for alternate in &table[code].alternates {
+                    designations.push((
+                        code.clone(),
+                        PART_NAME_LANGUAGE.to_string(),
+                        alternate.clone(),
+                    ));
+                }
+            }
             let mut seen: HashSet<(String, String, String)> = HashSet::new();
             for name in &paths.part_links {
                 for (loinc, property, part) in
@@ -657,7 +688,6 @@ pub async fn backfill_loinc_properties(
                         .into(),
                 );
             }
-            let mut designations = Vec::new();
             if let Some(name) = &paths.parts {
                 for part in parse_parts(read_entry(&path_owned, name)?.as_slice(), &mut errors)? {
                     let mut values = vec![part.display];
@@ -689,7 +719,7 @@ pub async fn backfill_loinc_properties(
     if dry_run {
         eprintln!(
             "[{FORMAT}] dry-run — would write {} properties ({} property codes) and up to {} \
-             part-name designations",
+             part-name/short-name designations",
             rows.len(),
             clear.len(),
             designations.len()
@@ -697,7 +727,7 @@ pub async fn backfill_loinc_properties(
         return Ok(stats);
     }
     eprintln!(
-        "[{FORMAT}] writing {} properties ({} property codes) and up to {} part-name designations",
+        "[{FORMAT}] writing {} properties ({} property codes) and up to {} part-name/short-name designations",
         rows.len(),
         clear.len(),
         designations.len()
@@ -741,7 +771,7 @@ pub async fn backfill_loinc_properties(
     }
     debug_assert!(rows.peek().is_none());
     eprintln!(
-        "[{FORMAT}] wrote {props_written} properties and {desig_written} part-name designations"
+        "[{FORMAT}] wrote {props_written} properties and {desig_written} part-name/short-name designations"
     );
     stats.code_systems = 1;
     Ok(stats)
@@ -786,7 +816,6 @@ fn load_parts_and_answers(
     };
 
     let mut extra_parts = 0;
-    let part_names = loinc_properties_enabled();
     if let Some(name) = &paths.parts {
         for part in parse_parts(open(name)?.as_slice(), errors)? {
             let concept = match concepts.entry(part.code) {
@@ -800,10 +829,8 @@ fn load_parts_and_answers(
                 }
                 std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
             };
-            if part_names {
-                for value in [part.name, part.display] {
-                    add_part_name(concept, value);
-                }
+            for value in [part.name, part.display] {
+                add_part_name(concept, value);
             }
         }
     }
@@ -844,7 +871,8 @@ fn load_parts_and_answers(
     Ok((extra_parts, lists, answers))
 }
 
-/// Language of the part-name designations (LOINC is published in en-US).
+/// Language of the part-name and short-name designations (LOINC is
+/// published in en-US).
 const PART_NAME_LANGUAGE: &str = "en-US";
 
 /// Adds `value` as an English designation of a part unless it is empty or
@@ -867,7 +895,7 @@ fn add_part_name(concept: &mut MergedConcept, value: String) {
 }
 
 /// `HTS_LOINC_PROPERTIES` (default on): store the `Loinc.csv` string
-/// properties, the part links and the part-name designations.
+/// properties and the part links.
 fn loinc_properties_enabled() -> bool {
     std::env::var("HTS_LOINC_PROPERTIES").map_or(true, |v| {
         !matches!(
@@ -1343,7 +1371,10 @@ fn parse_loinc_table(
 
     let code_idx = find_col(&headers, "LOINC_NUM")?;
     let long_idx = find_col(&headers, "LONG_COMMON_NAME").ok();
-    let short_idx = find_col(&headers, "ShortName").ok();
+    // `LoincTable/Loinc.csv` spells it SHORTNAME; older/core tables ShortName.
+    let short_idx = find_col(&headers, "SHORTNAME")
+        .or_else(|_| find_col(&headers, "ShortName"))
+        .ok();
     let status_idx = find_col(&headers, "STATUS").ok();
     let prop_idxs: Vec<(&'static str, usize)> = LOINC_STRING_PROPERTIES
         .iter()
@@ -1393,12 +1424,21 @@ fn parse_loinc_table(
             })
             .collect();
 
+        let alternates: Vec<String> = short_idx
+            .and_then(|i| record.get(i))
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&display))
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+
         concepts.insert(
             code,
             LoincConcept {
                 display,
                 status,
                 props,
+                alternates,
             },
         );
     }
@@ -1830,6 +1870,22 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         .unwrap_or(0)
     }
 
+    /// Translated designations only (the `en-US` alternate English names —
+    /// SHORTNAME etc. — are counted separately).
+    fn count_translations(backend: &SqliteTerminologyBackend) -> i64 {
+        let conn = backend.pool().get().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM concept_designations WHERE language IS NOT 'en-US'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    fn count_english_alternates(backend: &SqliteTerminologyBackend) -> i64 {
+        count_rows(backend, "concept_designations") - count_translations(backend)
+    }
+
     // ── Parser unit tests ─────────────────────────────────────────────────────
 
     #[test]
@@ -1853,6 +1909,44 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let mut errors = Vec::new();
         let concepts = parse_loinc_table(csv.as_bytes(), &mut errors).unwrap();
         assert_eq!(concepts["1234-5"].display, "Short only");
+    }
+
+    /// SHORTNAME is an alternate English display (tx.fhir.org accepts
+    /// `Calcium SerPl-mCnc` for 17861-6), DisplayName/CONSUMER_NAME are not;
+    /// the real Loinc.csv spells the short name SHORTNAME.
+    #[test]
+    fn parse_loinc_table_keeps_alternate_english_names() {
+        let csv = "\"LOINC_NUM\",\"CONSUMER_NAME\",\"SHORTNAME\",\"LONG_COMMON_NAME\",\"STATUS\",\"DisplayName\"\r\n\
+                   \"17861-6\",\"\",\"Calcium SerPl-mCnc\",\"Calcium [Mass/volume] in Serum or Plasma\",\"ACTIVE\",\"Calcium [Mass/Vol]\"\r\n\
+                   \"1-8\",\"Same\",\"Same\",\"Same\",\"ACTIVE\",\"\"\r\n";
+        let mut errors = Vec::new();
+        let concepts = parse_loinc_table(csv.as_bytes(), &mut errors).unwrap();
+        let calcium = &concepts["17861-6"];
+        assert_eq!(calcium.display, "Calcium [Mass/volume] in Serum or Plasma");
+        assert_eq!(
+            calcium.alternates,
+            vec!["Calcium SerPl-mCnc".to_string()]
+        );
+        assert!(concepts["1-8"].alternates.is_empty(), "a short name equal to the display is dropped");
+        let designations = english_designations(&calcium.alternates);
+        assert!(designations.iter().all(|d| d.language == "en-US"));
+    }
+
+    #[test]
+    fn parse_parts_returns_the_part_name() {
+        let csv = "\"PartNumber\",\"PartTypeName\",\"PartName\",\"PartDisplayName\",\"Status\"\r\n\
+                   \"LP7057-5\",\"SYSTEM\",\"Bld\",\"Blood\",\"ACTIVE\"\r\n";
+        let mut errors = Vec::new();
+        let parts = parse_parts(csv.as_bytes(), &mut errors).unwrap();
+        assert_eq!(
+            parts,
+            vec![PartRow {
+                code: "LP7057-5".to_string(),
+                display: "Blood".to_string(),
+                name: "Bld".to_string(),
+                status: "ACTIVE".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -2334,7 +2428,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         .expect("import with linguistic variants should succeed");
 
         // 2 French + 1 German translation = 3 designation rows.
-        assert_eq!(count_rows(&backend, "concept_designations"), 3);
+        assert_eq!(count_translations(&backend), 3);
 
         let conn = backend.pool().get().unwrap();
         let (lang, value): (String, String) = conn
@@ -2379,7 +2473,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
 
         // Only the 2 French translations survive; the German variant file is
         // skipped without being parsed.
-        assert_eq!(count_rows(&backend, "concept_designations"), 2);
+        assert_eq!(count_translations(&backend), 2);
 
         let conn = backend.pool().get().unwrap();
         let de_count: i64 = conn
@@ -2438,7 +2532,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         assert_eq!(count("es-AR"), 0, "es-AR dropped (es-ES exact outranks)");
         assert_eq!(count("es-MX"), 0, "es-MX dropped (es-ES exact outranks)");
         // 2 German + 2 Spanish designations, nothing else.
-        assert_eq!(count_rows(&backend, "concept_designations"), 4);
+        assert_eq!(count_translations(&backend), 4);
     }
 
     #[tokio::test]
@@ -2458,7 +2552,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         )
         .await
         .unwrap();
-        assert_eq!(count_rows(&backend, "concept_designations"), 3); // fr×2 + de×1
+        assert_eq!(count_translations(&backend), 3); // fr×2 + de×1
 
         // Re-import with a narrower filter. The system now has concepts, so the
         // probe must flip fresh_load OFF and the per-concept replacement must
@@ -2487,7 +2581,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             de, 0,
             "stale German designations must be removed on re-import"
         );
-        assert_eq!(count_rows(&backend, "concept_designations"), 2); // fr×2 only
+        assert_eq!(count_translations(&backend), 2); // fr×2 only
     }
 
     #[tokio::test]
@@ -2508,7 +2602,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         .expect("dry-run should succeed");
 
         // Dry-run writes nothing.
-        assert_eq!(count_rows(&backend, "concept_designations"), 0);
+        assert_eq!(count_translations(&backend), 0);
     }
 
     #[tokio::test]
@@ -2528,7 +2622,56 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         )
         .await
         .unwrap();
-        assert_eq!(count_rows(&backend, "concept_designations"), 0);
+        assert_eq!(count_translations(&backend), 0);
+        // The three short names of the fixture are alternate displays.
+        assert_eq!(count_english_alternates(&backend), 3);
+    }
+
+    /// The backfill's designation dedupe is per language: a translation that
+    /// happens to spell the short name does not stop the `en-US` designation,
+    /// and a second write adds nothing.
+    #[tokio::test]
+    async fn designation_backfill_dedupes_per_language() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip();
+        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false, &LanguageFilter::default())
+            .await
+            .unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute("DELETE FROM concept_designations", []).unwrap();
+            conn.execute(
+                "INSERT INTO concept_designations (concept_id, language, value)
+                 SELECT id, 'fr-FR', 'HGB BLD-MCNC' FROM concepts WHERE code = '718-7'",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = || {
+            vec![
+                ("718-7".to_string(), "en-US".to_string(), "Hgb Bld-mCnc".to_string()),
+                ("718-7".to_string(), "en-US".to_string(), "hgb bld-mcnc".to_string()),
+                // Equal to the display, ignoring case: not a designation.
+                (
+                    "718-7".to_string(),
+                    "en-US".to_string(),
+                    "hemoglobin [mass/volume] in blood".to_string(),
+                ),
+            ]
+        };
+        let (_, first) = backend
+            .write_concept_properties(&ctx, LOINC_URL, None, &[], vec![], rows())
+            .await
+            .unwrap();
+        assert_eq!(first, 1, "one en-US short name beside the fr-FR row");
+        let (_, second) = backend
+            .write_concept_properties(&ctx, LOINC_URL, None, &[], vec![], rows())
+            .await
+            .unwrap();
+        assert_eq!(second, 0, "a rerun adds nothing");
+        assert_eq!(count_english_alternates(&backend), 1);
+        assert_eq!(count_translations(&backend), 1);
     }
 
     #[test]

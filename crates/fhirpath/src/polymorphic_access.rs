@@ -91,26 +91,18 @@ pub fn access_polymorphic_element(
             // Handle special cases for all potential typed fields
             // This covers patterns like value.unit -> valueQuantity.unit
             for (key, value) in obj.iter() {
-                // Check if key starts with the first part and has a type suffix
-                if key.starts_with(first_part) && key.len() > first_part.len() {
-                    // Extract the type suffix (need uppercase letter after base name)
-                    if let Some(c) = key.chars().nth(first_part.len()) {
-                        if c.is_uppercase() {
-                            // This is a potential choice element with type suffix
-                            if let EvaluationResult::Object {
-                                map: inner_obj,
-                                type_info: _,
-                            } = value
-                            {
-                                // Try to resolve the rest of the path
-                                if let Some(result) =
-                                    access_polymorphic_element(inner_obj, rest, version)
-                                {
-                                    return Some(result);
-                                }
-                            }
-                        }
-                    }
+                // Only a data-type suffix makes a choice variant
+                // (valueQuantity, not a sibling such as periodUnit).
+                if key.starts_with(first_part)
+                    && key.len() > first_part.len()
+                    && is_choice_type_suffix(&key[first_part.len()..])
+                    && let EvaluationResult::Object {
+                        map: inner_obj,
+                        type_info: _,
+                    } = value
+                    && let Some(result) = access_polymorphic_element(inner_obj, rest, version)
+                {
+                    return Some(result);
                 }
             }
         } else {
@@ -213,11 +205,11 @@ fn get_polymorphic_fields(
             let Some(suffix) = field.strip_prefix(base_name) else {
                 break;
             };
-            if !suffix
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
-            {
+            // Only a data-type suffix names a variant: the table also holds
+            // siblings that share the prefix (`CapabilityStatement.
+            // implementationGuide` next to `implementation`; cpb-16 saw the
+            // guide list as an implementation).
+            if !is_choice_type_suffix(suffix) {
                 continue;
             }
             if matches.iter().any(|(n, _)| n == field) {

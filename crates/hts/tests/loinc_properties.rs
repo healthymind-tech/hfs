@@ -497,3 +497,121 @@ async fn backfill_of_a_missing_code_system_fails() {
         assert!(err.is_err(), "{name}: {err:?}");
     }
 }
+
+/// `LOINC_CSV` with a SHORTNAME column, as the real `Loinc.csv` has: a short
+/// name for 718-7, one equal to the display (ignoring case) for 29545-1.
+fn loinc_csv_with_short_names() -> String {
+    LOINC_CSV
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let short = match (i, line.split(',').next()) {
+                (0, _) => "SHORTNAME",
+                (_, Some("718-7")) => "Hgb Bld-mCnc",
+                (_, Some("29545-1")) => "physical findings narrative",
+                _ => "",
+            };
+            format!("{line},{short}\r\n")
+        })
+        .collect()
+}
+
+fn zip_with_short_names() -> tempfile::NamedTempFile {
+    let loinc = loinc_csv_with_short_names();
+    let primary = primary_links();
+    let supplementary = supplementary_links();
+    zip(&[
+        ("LoincTable/Loinc.csv", &loinc),
+        ("AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv", HIERARCHY_CSV),
+        ("AccessoryFiles/PartFile/Part.csv", PART_CSV),
+        ("AccessoryFiles/PartFile/LoincPartLink_Primary.csv", &primary),
+        ("AccessoryFiles/PartFile/LoincPartLink_Supplementary.csv", &supplementary),
+    ])
+}
+
+async fn designation_values(b: &Backend, code: &str) -> Vec<String> {
+    let mut values: Vec<String> = b
+        .concept_designations(&ctx(), "http://loinc.org", &[code.to_string()])
+        .await
+        .unwrap()
+        .remove(code)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.value)
+        .collect();
+    values.sort();
+    values
+}
+
+/// A database imported and property-backfilled before SHORTNAME was read
+/// (production: LOINC 2.80 imported, then backfilled once) gets the short
+/// names from a rerun of the backfill, once however often it runs.
+#[tokio::test]
+async fn backfill_adds_short_names_to_an_earlier_import_once() {
+    let _serial = SERIAL.lock().await;
+    let legacy = full_zip(); // no SHORTNAME column
+    let current = zip_with_short_names();
+    for (name, b, app, _dir) in backends().await {
+        import(&b, &legacy).await;
+        backfill_loinc_properties(&*b, &ctx(), legacy.path(), 1000, false)
+            .await
+            .unwrap();
+        assert!(designation_values(&b, "718-7").await.is_empty(), "{name}");
+        let bld_before = designation_values(&b, "LP7057-5").await;
+        // Dry run writes nothing.
+        backfill_loinc_properties(&*b, &ctx(), current.path(), 1000, true)
+            .await
+            .unwrap();
+        assert!(designation_values(&b, "718-7").await.is_empty(), "{name}: dry run");
+        let before = property_count(&b, "718-7").await;
+        for _ in 0..2 {
+            let stats = backfill_loinc_properties(&*b, &ctx(), current.path(), 1, false)
+                .await
+                .unwrap();
+            assert!(stats.errors.is_empty(), "{name}: {:?}", stats.errors);
+            assert_eq!(
+                designation_values(&b, "718-7").await,
+                vec!["Hgb Bld-mCnc".to_string()],
+                "{name}: one short-name designation"
+            );
+        }
+        assert!(
+            designation_values(&b, "29545-1").await.is_empty(),
+            "{name}: a short name equal to the display is not a designation"
+        );
+        assert_eq!(designation_values(&b, "LP7057-5").await, bld_before, "{name}");
+        assert_eq!(bld_before, vec!["Bld".to_string()], "{name}");
+        assert_eq!(property_count(&b, "718-7").await, before, "{name}");
+        let checked = get_json(
+            &app,
+            "/CodeSystem/$validate-code?url=http://loinc.org&code=718-7&display=Hgb%20Bld-mCnc",
+        )
+        .await;
+        assert_eq!(
+            param(&checked, "result").and_then(|p| p["valueBoolean"].as_bool()),
+            Some(true),
+            "{name}: {checked}"
+        );
+    }
+}
+
+/// A fresh import stores the short names (and part names) itself.
+#[tokio::test]
+async fn import_stores_short_names_as_designations() {
+    let _serial = SERIAL.lock().await;
+    let file = zip_with_short_names();
+    for (name, b, _app, _dir) in backends().await {
+        import(&b, &file).await;
+        assert_eq!(
+            designation_values(&b, "718-7").await,
+            vec!["Hgb Bld-mCnc".to_string()],
+            "{name}"
+        );
+        assert!(designation_values(&b, "29545-1").await.is_empty(), "{name}");
+        assert_eq!(designation_values(&b, "LP7057-5").await, vec!["Bld".to_string()], "{name}");
+        // Without properties the displays stay.
+        import_without_properties(&b, &file).await;
+        assert_eq!(designation_values(&b, "718-7").await, vec!["Hgb Bld-mCnc".to_string()], "{name}");
+        assert_eq!(designation_values(&b, "LP7057-5").await, vec!["Bld".to_string()], "{name}");
+    }
+}

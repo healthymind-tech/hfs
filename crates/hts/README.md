@@ -393,7 +393,7 @@ Options:
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 | `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
 | `HTS_LOINC_PARTS_AND_ANSWERS` | true | Import LOINC's `Part.csv`, `AnswerList.csv` and `LoincAnswerListLink.csv` along with the main table: all parts, answer lists and answers as concepts, one ValueSet `http://loinc.org/vs/<LL…>` per answer list, and an `answer-list` property on linked terms. `false` imports only the terms and the parts in the component hierarchy. |
-| `HTS_LOINC_PROPERTIES` | true | Store LOINC's properties: the `Loinc.csv` columns `STATUS`, `CLASSTYPE`, `ORDER_OBS`, `VersionFirstReleased`, `VersionLastChanged`, `CHNG_TYPE`, `UNITSREQUIRED`, `EXAMPLE_UCUM_UNITS`, `EXAMPLE_UNITS`, `PanelType` (strings) and one `Coding` property per `LoincPartLink_*.csv` row (`COMPONENT`, `SCALE_TYP`, `CLASS`, `document-kind`, …, without the `search` links), plus each part's `PartName`/`PartDisplayName` as designations. See *LOINC properties* below. |
+| `HTS_LOINC_PROPERTIES` | true | Store LOINC's properties: the `Loinc.csv` columns `STATUS`, `CLASSTYPE`, `ORDER_OBS`, `VersionFirstReleased`, `VersionLastChanged`, `CHNG_TYPE`, `UNITSREQUIRED`, `EXAMPLE_UCUM_UNITS`, `EXAMPLE_UNITS`, `PanelType` (strings) and one `Coding` property per `LoincPartLink_*.csv` row (`COMPONENT`, `SCALE_TYP`, `CLASS`, `document-kind`, …, without the `search` links). (Part names and term short names are stored as designations either way.) See *LOINC properties* below. |
 | `HTS_SHUTDOWN_TIMEOUT` | 9 | Seconds `hts run` may drain requests after SIGTERM/SIGINT before it exits anyway (a second signal exits at once). A signal during startup exits at once. |
 | `HTS_ADMIN_UI` | false | Enable terminology management — the `/admin` API (chunked upload, import jobs, delete, current-version pin, compaction, registry install) and the matching console pages. See [`docs/hts-terminology-admin.md`](../../docs/hts-terminology-admin.md) for this and the related `HTS_ADMIN_DATA_DIR`, `HTS_IMPORT_DIR`, `HTS_PACKAGE_REGISTRY`, `HTS_UPLOAD_CHUNK_SIZE`, `HTS_MAX_UPLOAD_SIZE` and `HTS_DISK_HEADROOM`. |
 
@@ -959,17 +959,23 @@ case — `SCALE_TYP = LP32888-7`, `SCALE_TYP = DOC` and `SCALE_TYP = Doc`
 select the same document codes, `CLASS = DOC.ONTOLOGY` = `CLASS = LP32519-8`;
 `$lookup` returns the properties (`valueCoding` for the part links). Each
 part has its `PartName` and `PartDisplayName` as `en-US` designations, so
-`Bld` validates as a display of `LP7057-5` (display `Blood`).
+`Bld` validates as a display of `LP7057-5` (display `Blood`), and each term
+its `SHORTNAME` (`Calcium SerPl-mCnc` for 17861-6); `DisplayName` and
+`CONSUMER_NAME` are not displays (tx.fhir.org rejects them). The
+designations are stored also with `HTS_LOINC_PROPERTIES=false`.
 
-An import made before this has no properties. Add them without re-importing
-the concepts:
+An import made before this has no properties and no short-name or part-name
+designations. Add them without re-importing the concepts:
 
 ```bash
 hts import --format loinc-properties ./Loinc_2.80.zip   # or an admin import job, format loinc-properties
 ```
 
 This deletes and rewrites only the property values it writes (a rerun does
-not duplicate them), adds the missing part-name designations and drops the
+not duplicate them), adds the missing part-name and short-name designations
+(skipping any equal, ignoring case, to the display or a stored designation,
+so reruns and databases backfilled by an earlier version get no duplicates)
+and drops the
 cached expansions over LOINC. Run it as an admin import job on a live server,
 or restart the server after the CLI run (in-memory caches).
 
