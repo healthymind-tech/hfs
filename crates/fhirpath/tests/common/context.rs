@@ -31,7 +31,7 @@ pub fn setup_extension_variables(context: &mut EvaluationContext) {
 pub fn setup_patient_extension_context(context: &mut EvaluationContext, test_name: &str) {
     if test_name == "testExtension1" || test_name == "testExtension2" {
         // Clone relevant information before modifying the context
-        let patient_data = if let Some(this) = &context.this {
+        let patient_data = if let Some(this) = context.this.as_deref() {
             if let EvaluationResult::Object { map: obj, .. } = this {
                 if obj.get("resourceType")
                     == Some(&EvaluationResult::String("Patient".to_string(), None, None))
@@ -114,7 +114,7 @@ pub fn setup_resource_context(context: &mut EvaluationContext, json_filename: &s
 }
 
 fn setup_patient_context(context: &mut EvaluationContext) {
-    let patient_data = if let Some(this) = &context.this {
+    let patient_data = if let Some(this) = context.this.as_deref() {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
                 == Some(&EvaluationResult::String("Patient".to_string(), None, None))
@@ -157,7 +157,7 @@ fn setup_patient_context(context: &mut EvaluationContext) {
 }
 
 fn setup_observation_context(context: &mut EvaluationContext) {
-    let observation_data = if let Some(this) = &context.this {
+    let observation_data = if let Some(this) = context.this.as_deref() {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
                 == Some(&EvaluationResult::String(
@@ -198,7 +198,7 @@ fn setup_observation_context(context: &mut EvaluationContext) {
 }
 
 fn setup_valueset_context(context: &mut EvaluationContext) {
-    let valueset_data = if let Some(this) = &context.this {
+    let valueset_data = if let Some(this) = context.this.as_deref() {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
                 == Some(&EvaluationResult::String(
@@ -224,7 +224,7 @@ fn setup_valueset_context(context: &mut EvaluationContext) {
 }
 
 fn setup_questionnaire_context(context: &mut EvaluationContext) {
-    let questionnaire_data = if let Some(this) = &context.this {
+    let questionnaire_data = if let Some(this) = context.this.as_deref() {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
                 == Some(&EvaluationResult::String(

@@ -131,8 +131,14 @@ pub struct EvaluationContext {
     pub variables: HashMap<String, EvaluationResult>,
 
     /// The 'this' context for direct evaluation (primarily used in tests)
-    /// When set, this overrides the current item passed to the evaluate function
-    pub this: Option<EvaluationResult>,
+    /// When set, this overrides the current item passed to the evaluate function.
+    ///
+    /// Shared (`Arc`): it is the whole root resource, and every lambda
+    /// (`where`, `select`, `all`, `exists(criteria)`, ...) clones the context
+    /// — twice, with its parent link. A deep copy there copied every map of
+    /// the resource per lambda call, which dominated invariant evaluation on
+    /// large resources (a StructureDefinition snapshot: seconds per SD).
+    pub this: Option<Arc<EvaluationResult>>,
 
     /// Flag to enable strict mode evaluation
     /// When enabled, operations on non-existent members produce errors instead of Empty
@@ -236,7 +242,9 @@ impl EvaluationContext {
         });
 
         // Set 'this' to the first resource if available
-        let this = resources.first().map(convert_resource_to_result);
+        let this = resources
+            .first()
+            .map(|r| Arc::new(convert_resource_to_result(r)));
 
         Self {
             resources: Arc::new(resources),
@@ -269,7 +277,9 @@ impl EvaluationContext {
     /// A new `EvaluationContext` instance with the provided resources and version
     pub fn new_with_version(resources: Vec<FhirResource>, fhir_version: FhirVersion) -> Self {
         // Set 'this' to the first resource if available
-        let this = resources.first().map(convert_resource_to_result);
+        let this = resources
+            .first()
+            .map(|r| Arc::new(convert_resource_to_result(r)));
 
         Self {
             resources: Arc::new(resources),
@@ -403,7 +413,7 @@ impl EvaluationContext {
     ///
     /// * `value` - The value to set as the 'this' context
     pub fn set_this(&mut self, value: EvaluationResult) {
-        self.this = Some(value);
+        self.this = Some(Arc::new(value));
     }
 
     /// Adds a resource to the context
@@ -772,18 +782,23 @@ pub fn evaluate(
     // starts with a simple member identifier.
     if current_item.is_none() {
         if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
-            let global_context_item = if let Some(this_item) = &context.this {
-                this_item.clone()
+            // Borrowed: the common answer is "no match", and copying the
+            // whole root resource just to read its resourceType cost a deep
+            // clone per root-level member access.
+            let converted;
+            let global_context_item: &EvaluationResult = if let Some(this_item) = &context.this {
+                this_item
             } else if !context.resources.is_empty() {
-                convert_resource_to_result(&context.resources[0])
+                converted = convert_resource_to_result(&context.resources[0]);
+                &converted
             } else {
-                EvaluationResult::Empty
+                &EvaluationResult::Empty
             };
 
             if let EvaluationResult::Object {
                 map: obj_map,
                 type_info: _,
-            } = &global_context_item
+            } = global_context_item
             {
                 if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType")
                 {
@@ -791,7 +806,7 @@ pub fn evaluate(
                     if initial_name.eq_ignore_ascii_case(ctx_type) {
                         // The initial identifier matches the context type.
                         // The expression resolves to the context item itself.
-                        return Ok(global_context_item);
+                        return Ok(global_context_item.clone());
                     }
                 }
             }
@@ -867,8 +882,8 @@ pub fn evaluate(
                             // Find the parent object
                             if let Some(EvaluationResult::Object { map, .. }) = current_item {
                                 parent_obj = Some(map.clone());
-                            } else if let Some(EvaluationResult::Object { ref map, .. }) =
-                                context.this
+                            } else if let Some(EvaluationResult::Object { map, .. }) =
+                                context.this.as_deref()
                             {
                                 parent_obj = Some(map.clone());
                             }
@@ -953,7 +968,7 @@ pub fn evaluate(
             if current_item.is_none()
                 && let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) =
                     left_expr.as_ref()
-                && let Some(this_item) = context.this.as_ref()
+                && let Some(this_item) = context.this.as_deref()
                 && let EvaluationResult::Object { map: this_map, .. } = this_item
                 && let Some(EvaluationResult::String(ctx_type, _, _)) = this_map.get("resourceType")
                 && initial_name.eq_ignore_ascii_case(ctx_type)
@@ -1425,25 +1440,28 @@ fn evaluate_with_context(
     // Check if the expression is a simple type name that matches a resource in context
     if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
         // Try to find a matching resource in context
-        let global_context_item = if let Some(this_item) = &context.this {
-            this_item.clone()
+        let converted;
+        let global_context_item: &EvaluationResult = if let Some(this_item) = &context.this {
+            this_item
         } else if !context.resources.is_empty() {
-            convert_resource_to_result(&context.resources[0])
+            converted = convert_resource_to_result(&context.resources[0]);
+            &converted
         } else if let Some(current) = current_item {
             // Also check current_item if no resources in context
-            current.clone()
+            current
         } else {
-            EvaluationResult::Empty
+            &EvaluationResult::Empty
         };
 
         if let EvaluationResult::Object {
             map: obj_map,
             type_info: _,
-        } = &global_context_item
+        } = global_context_item
         {
             if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType") {
                 if initial_name.eq_ignore_ascii_case(ctx_type) {
-                    return Ok((global_context_item, context));
+                    let item = global_context_item.clone();
+                    return Ok((item, context));
                 }
             }
         }
@@ -1589,7 +1607,7 @@ fn evaluate_term(
                     item // Return the item if Some
                 } else if let Some(this_context) = &context.this {
                     // Use the explicitly set 'this' context if available (for testing)
-                    this_context.clone()
+                    (**this_context).clone()
                 } else {
                     // Return the default context if None
                     if context.resources.is_empty() {
@@ -1679,7 +1697,7 @@ fn evaluate_term(
             let base_context: std::borrow::Cow<'_, EvaluationResult> = match current_item {
                 Some(item) => std::borrow::Cow::Borrowed(item),
                 None => match &context.this {
-                    Some(this_item) => std::borrow::Cow::Borrowed(this_item),
+                    Some(this_item) => std::borrow::Cow::Borrowed(&**this_item),
                     None => std::borrow::Cow::Owned({
                         // Fallback to resources if context.this is also None
                         if context.resources.is_empty() {
