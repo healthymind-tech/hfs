@@ -393,6 +393,12 @@ pub(crate) fn msg_unknown_schema(reference: &str) -> String {
 
 /// [helios] a `meta.profile` claim could not be resolved (the HL7
 /// validator's wording).
+/// A resource profile of another resource type (HL7:
+/// `VALIDATION_VAL_PROFILE_WRONGTYPE`).
+pub(crate) fn msg_profile_wrong_type(expected: &str, actual: &str, profile: &str) -> String {
+    format!("Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'")
+}
+
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {
     format!("Profile reference '{reference}' has not been checked because it could not be found")
 }

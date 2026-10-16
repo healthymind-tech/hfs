@@ -38,19 +38,21 @@ impl PathTracker {
         self.segs.pop();
     }
 
-    /// The index-free element path of the *parent* of the current key —
-    /// `Patient.name` while validating `Patient.name.0.extension` — the form
-    /// extension contexts are declared in (#615).
-    pub(crate) fn parent_element_path(&self) -> String {
-        let keys: Vec<&str> = self
-            .segs
+    /// Number of segments (a resource's depth, for [`Self::keys_from`]).
+    pub(crate) fn depth(&self) -> usize {
+        self.segs.len()
+    }
+
+    /// The `Key` segments from `depth` on (indices dropped).
+    pub(crate) fn keys_from(&self, depth: usize) -> Vec<&str> {
+        self.segs
             .iter()
+            .skip(depth)
             .filter_map(|s| match s {
                 PathSeg::Key(k) => Some(k.as_str()),
                 PathSeg::Index(_) => None,
             })
-            .collect();
-        keys[..keys.len().saturating_sub(1)].join(".")
+            .collect()
     }
 
     /// The last `Key` segment — the element name currently being validated.

@@ -7,6 +7,7 @@
 //! `docs/guide/mental-model.md` in the FHIR Schema repo for the model, and
 //! `walk.rs` for the deterministic error-emission order.
 
+mod bundle;
 mod errors;
 mod path;
 mod primitives;
@@ -259,6 +260,7 @@ impl Validator {
             .errors
             .extend(bundle_entry_type_mismatches(resource));
         outcome.errors.extend(bundle_unresolved_urns(resource));
+        outcome.errors.extend(bundle::bundle_rules(resource));
         outcome
     }
 

@@ -36,13 +36,16 @@
 
 use super::errors::{self, ErrorKind, Severity, ValidationError};
 use super::path::PathTracker;
+use super::bundle::{Entry, Resolution};
 use super::{SyncOutcome, UnknownProfilePolicy, ValidationOptions};
 use crate::effects::Deferred;
 use crate::resolver::SchemaResolver;
 use crate::schema::FhirSchema;
 use indexmap::IndexMap;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// The special element type resolved dynamically from `data.resourceType`.
@@ -106,30 +109,133 @@ pub(super) struct WalkCtx<'a> {
     /// `(id, resourceType)` of the contained resources of each resource
     /// being walked, innermost last (for `#id` reference targets).
     contained: Vec<Vec<(String, String)>>,
-    /// `(fullUrl, resourceType)` of the entries of each Bundle being
-    /// walked, innermost last (for Bundle-internal reference targets).
-    bundle_entries: Vec<Vec<(String, String)>>,
+    /// The entries of each Bundle being walked, innermost last (for
+    /// Bundle-internal reference targets and `resolve()` discriminators).
+    bundles: Vec<Rc<Vec<Entry<'a>>>>,
+    /// The resources being walked, innermost last (the source of a
+    /// reference: its `fullUrl` and `contained`).
+    resources: Vec<&'a Value>,
+    /// `(path depth, resourceType)` of each resource being walked, innermost
+    /// last: element paths of extension parents are taken relative to the
+    /// innermost resource (`Patient.name` inside `Bundle.entry.0.resource`).
+    resource_roots: Vec<(usize, String)>,
+    /// How many slice-membership validations enclose this walk (each
+    /// validates a value against a profile in a fresh context).
+    nesting: usize,
+    /// Slice-membership verdicts by `(value address, profile)`, shared by
+    /// the nested walks of one validation. An entry is written `true` while
+    /// its validation runs, so reference cycles terminate.
+    conformance: Rc<RefCell<HashMap<(usize, String), bool>>>,
 }
+
+/// Nested slice-membership validations deeper than this are assumed to
+/// conform (profile chains through `resolve()` rarely exceed three).
+const MAX_NESTING: usize = 6;
 
 impl<'a> WalkCtx<'a> {
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
         self.resolver
     }
 
-    /// The resolver, detached from the borrow of the context.
-    pub(super) fn resolver_handle(&self) -> &'a dyn SchemaResolver {
-        self.resolver
-    }
 
     /// The type of the contained resource `id` of the innermost resource.
     /// The type of the entry whose `fullUrl` is `url` in the innermost
     /// Bundle being walked.
     pub(super) fn bundle_entry_type(&self, url: &str) -> Option<String> {
-        self.bundle_entries
+        self.bundles
             .last()?
             .iter()
-            .find(|(full_url, _)| full_url == url)
-            .map(|(_, rt)| rt.clone())
+            .find(|e| e.full_url == Some(url))
+            .and_then(|e| e.resource.get("resourceType"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Resolve a literal reference from the node being walked: `#id` to a
+    /// contained resource of an enclosing resource, anything else to an
+    /// entry of the innermost Bundle (by the Bundle rules, from the entry
+    /// the walk is inside). `None` when it names nothing at hand.
+    pub(super) fn resolve_reference(&self, reference: &str) -> Option<&'a Value> {
+        if let Some(id) = reference.strip_prefix('#') {
+            for resource in self.resources.iter().rev() {
+                if id.is_empty() {
+                    return Some(resource);
+                }
+                let found = resource
+                    .get("contained")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+                    });
+                if found.is_some() {
+                    return found;
+                }
+            }
+            return None;
+        }
+        let entries = self.bundles.last()?;
+        // The entry the walk is inside: the innermost resource that is one
+        // of the Bundle's entry resources.
+        let source = self.resources.iter().rev().find_map(|r| {
+            entries
+                .iter()
+                .find(|e| std::ptr::eq(e.resource, *r))
+        });
+        match super::bundle::resolve(entries, reference, source.and_then(|e| e.full_url)) {
+            Resolution::Found(index) => Some(entries[index].resource),
+            Resolution::Cannot(_) | Resolution::NotFound => None,
+        }
+    }
+
+    /// Does `value` (a node of the data being walked) conform to
+    /// `profile`? It is validated against the profile in this walk's
+    /// context (its Bundle and enclosing resources stay resolvable), and
+    /// conforms without error-severity structural issues — how the HL7
+    /// validator decides `profile` slice membership. Verdicts are memoised
+    /// per validation.
+    pub(super) fn conforms_to(&self, value: &'a Value, profile: &str) -> bool {
+        let key = (std::ptr::from_ref(value) as usize, profile.to_string());
+        if let Some(&known) = self.conformance.borrow().get(&key) {
+            return known;
+        }
+        if self.nesting >= MAX_NESTING {
+            return true;
+        }
+        self.conformance.borrow_mut().insert(key.clone(), true);
+        let opts = ValidationOptions {
+            profiles: vec![profile.to_string()],
+            use_meta_profiles: false,
+            unknown_profile: UnknownProfilePolicy::Ignore,
+            check_extension_context: false,
+        };
+        let mut nested = WalkCtx {
+            resolver: self.resolver,
+            errors: Vec::new(),
+            deferred: Vec::new(),
+            path: PathTracker::new(
+                value
+                    .get("resourceType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            check_extension_context: false,
+            use_meta_profiles: false,
+            unknown_profile: UnknownProfilePolicy::Ignore,
+            emitted: HashSet::new(),
+            deferred_bindings: HashSet::new(),
+            contained: Vec::new(),
+            bundles: self.bundles.clone(),
+            resources: self.resources.clone(),
+            resource_roots: Vec::new(),
+            nesting: self.nesting + 1,
+            conformance: Rc::clone(&self.conformance),
+        };
+        let outcome = run(&mut nested, value, &opts);
+        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        self.conformance.borrow_mut().insert(key, conforms);
+        conforms
     }
 
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
@@ -211,31 +317,45 @@ pub(super) fn validate(
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
-        bundle_entries: Vec::new(),
+        bundles: Vec::new(),
+        resources: Vec::new(),
+        resource_roots: Vec::new(),
+        nesting: 0,
+        conformance: Rc::default(),
     };
+    run(&mut ctx, resource, opts)
+}
+
+/// Validate `resource` as the root of `ctx`'s walk.
+fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions) -> SyncOutcome {
+    let resolver = ctx.resolver;
+    let resource_type = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     // Root schema-set: resourceType, then meta.profile claims, then
     // caller-supplied profiles (the draft-algorithm order).
     let mut set = SchemaSet::new();
     if !resource_type.is_empty() {
         match resolver.resolve(resource_type) {
-            Some(schema) => add_schemas_to_set(&mut ctx, &mut set, schema, resource_type),
+            Some(schema) => add_schemas_to_set(ctx, &mut set, schema, resource_type),
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(resource_type),
             ),
         }
     }
-    add_meta_profiles(&mut ctx, &mut set, resource);
+    add_meta_profiles(ctx, &mut set, resource);
     for profile in &opts.profiles {
-        add_profile(&mut ctx, &mut set, profile, opts.unknown_profile, true);
+        add_profile(ctx, &mut set, profile, Some(resource), opts.unknown_profile, true);
     }
 
-    validate_node(&mut ctx, &set, resource);
+    validate_node(ctx, &set, resource);
 
     SyncOutcome {
-        errors: ctx.errors,
-        deferred: ctx.deferred,
+        errors: std::mem::take(&mut ctx.errors),
+        deferred: std::mem::take(&mut ctx.deferred),
     }
 }
 
@@ -251,7 +371,7 @@ fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Valu
         ctx.path.push_key("meta");
         ctx.path.push_key("profile");
         ctx.path.push_index(index);
-        add_profile(ctx, set, profile, policy, false);
+        add_profile(ctx, set, profile, Some(resource), policy, false);
         ctx.path.pop();
         ctx.path.pop();
         ctx.path.pop();
@@ -273,14 +393,34 @@ fn meta_profiles(resource: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Layer `profile` onto the set of `resource`. A resource profile of
+/// another type (a Practitioner profile claimed by a Patient) is not
+/// layered: the HL7 validator rejects the claim, and the cooperative set
+/// would otherwise judge the Patient by Practitioner's elements — every key
+/// the two share passes, so the wrong profile "conformed".
 fn add_profile(
     ctx: &mut WalkCtx<'_>,
     set: &mut SchemaSet,
     profile: &str,
+    resource: Option<&Value>,
     policy: UnknownProfilePolicy,
     requested: bool,
 ) {
     if let Some(schema) = ctx.resolver.resolve(profile) {
+        let actual = resource
+            .and_then(|r| r.get("resourceType"))
+            .and_then(Value::as_str);
+        if let (Some(actual), Some(expected)) = (actual, schema.type_.as_deref())
+            && crate::editor::is_resource(&schema)
+            && actual != expected
+            && !matches!(expected, "Resource" | "DomainResource")
+        {
+            ctx.error(
+                ErrorKind::Type,
+                errors::msg_profile_wrong_type(expected, actual, profile),
+            );
+            return;
+        }
         add_schemas_to_set(ctx, set, schema, profile);
         return;
     }
@@ -401,7 +541,7 @@ fn resolve_element_reference(
 }
 
 /// Validate one data node against a cooperative schema set.
-pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
+pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'a Value) {
     // Dynamic `Resource` resolution: an element typed `Resource` takes its
     // concrete schema from the nested `resourceType` at validation time
     // (Bundle.entry.resource, contained, Parameters.parameter.resource).
@@ -448,8 +588,12 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     let is_bundle = obj.get("resourceType").and_then(Value::as_str) == Some("Bundle");
     if is_resource {
         ctx.contained.push(contained_types(obj));
+        ctx.resources.push(data);
+        let rt = obj.get("resourceType").and_then(Value::as_str).unwrap_or_default();
+        ctx.resource_roots.push((ctx.path.depth(), rt.to_string()));
         if is_bundle {
-            ctx.bundle_entries.push(bundle_entry_types(obj));
+            let entries = super::bundle::entries(data).into_iter().map(|(_, e)| e);
+            ctx.bundles.push(Rc::new(entries.collect()));
         }
         check_resource_id(ctx, set, obj);
     }
@@ -484,8 +628,10 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
 
     if is_resource {
         ctx.contained.pop();
+        ctx.resources.pop();
+        ctx.resource_roots.pop();
         if is_bundle {
-            ctx.bundle_entries.pop();
+            ctx.bundles.pop();
         }
     }
 }
@@ -518,28 +664,6 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
         ctx.error(ErrorKind::PrimitiveValue, errors::msg_resource_id(id));
         ctx.path.pop();
     }
-}
-
-/// `(fullUrl, resourceType)` of a Bundle's entries.
-fn bundle_entry_types(bundle: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
-    bundle
-        .get("entry")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|e| {
-                    Some((
-                        e.get("fullUrl")?.as_str()?.to_string(),
-                        e.get("resource")?
-                            .get("resourceType")?
-                            .as_str()?
-                            .to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
@@ -703,12 +827,12 @@ fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
 
 /// Validate one data key against the element schemas collected from every
 /// layer of the set.
-fn eval_element(
-    ctx: &mut WalkCtx<'_>,
+fn eval_element<'a>(
+    ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
     multi_choice: &mut IndexMap<String, Vec<String>>,
     key: &str,
-    value: &Value,
+    value: &'a Value,
 ) {
     let mut elset = SchemaSet::new();
     collect_schemas_for_element(ctx, set, &mut elset, multi_choice, key);
@@ -733,7 +857,7 @@ fn eval_element(
         // warning (#615). Runs for every item, sliced or not — placement is
         // orthogonal to slicing.
         if ctx.check_extension_context && (key == "extension" || key == "modifierExtension") {
-            check_extension_context(ctx, items);
+            check_extension_context(ctx, set, items);
         }
 
         // Whole-collection keywords, per schema: min then max.
@@ -798,7 +922,12 @@ fn eval_element(
 /// passed. An unknown url stays allowed on `extension`, but a modifier
 /// extension changes the meaning of its element, so one nobody can look up
 /// is an error (FHIR: unknown modifier extensions SHALL NOT be ignored).
-fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Value, modifier: bool) {
+fn validate_extension_item<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    item: &'a Value,
+    modifier: bool,
+) {
     let url = item
         .get("url")
         .and_then(Value::as_str)
@@ -900,22 +1029,48 @@ const CANONICAL_RESOURCES: &[&str] = &[
 /// Observation), except on canonical resources (warning, see
 /// [`CANONICAL_RESOURCES`]).
 ///
-/// Conservative on purpose, twice over. Only extensions at the **resource
-/// root** are judged: an element-level instance path cannot be compared to a
-/// declared context without mapping it back to the StructureDefinition path
-/// (recursive elements — `Questionnaire.item.item` — collapse to
-/// `Questionnaire.item` there, and the spec's own examples falsified the
-/// naive comparison at scale). And only element-type contexts that read as
-/// resource-rooted paths are judged: a context naming a datatype
-/// (`HumanName`), an `Element`/`Resource`/`DomainResource` catch-all, or a
-/// FHIRPath expression makes the extension unjudgeable here and passes
-/// silently. Unknown urls and relative (sub-extension) urls always pass.
-fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
-    let parent = ctx.path.parent_element_path();
-    // Root only: the parent path is bare `ResourceType` with no dots.
-    if parent.is_empty() || parent.contains('.') {
+/// The extension's parent is located by its element path relative to the
+/// innermost resource (`Patient.contact.address`, `Observation.value[x]`
+/// for `valueQuantity`, the `contentReference` target for recursive
+/// elements such as `Questionnaire.item.item`) and by its types (the
+/// element's datatype and the datatypes it derives from). An element-type
+/// context is met when it names that path or one of those types.
+///
+/// Conservative where the placement cannot be named exactly: catch-all
+/// contexts (`Element`, `BackboneElement`, `Resource`, `DomainResource`),
+/// FHIRPath contexts, and datatype-rooted paths (`Timing.repeat`) make an
+/// extension unjudgeable, as does a datatype context on a primitive's
+/// `_foo` sidecar (its type is not at hand). Unknown urls and relative
+/// (sub-extension) urls always pass.
+fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Value]) {
+    let Some((depth, root)) = ctx.resource_roots.last().cloned() else {
         return;
+    };
+    let mut keys: Vec<String> = ctx.path.keys_from(depth).iter().map(|k| k.to_string()).collect();
+    keys.pop(); // the `extension` key itself
+    let sidecar = keys.last().is_some_and(|k| k.starts_with('_'));
+    if let Some(last) = keys.last_mut()
+        && let Some(base) = last.strip_prefix('_')
+    {
+        *last = base.to_string();
     }
+    let mut parent_paths: Vec<String> = Vec::new();
+    let mut here = vec![root.clone()];
+    here.extend(keys.iter().cloned());
+    parent_paths.push(here.join("."));
+    // A recursive element names its definition through contentReference.
+    for schema in set.schemas() {
+        if let Some(segments) = &schema.element_reference {
+            let path: Vec<&str> = segments
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i == 0 || s.as_str() != "elements")
+                .map(|(_, s)| s.as_str())
+                .collect();
+            parent_paths.push(path.join("."));
+        }
+    }
+    let parent_types = element_types(ctx.resolver, set);
 
     for (index, item) in items.iter().enumerate() {
         let Some(url) = item.get("url").and_then(Value::as_str) else {
@@ -931,30 +1086,47 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
             continue;
         };
 
-        let judgeable = |c: &String| {
-            // A resource-rooted element path: dotted segments, the first of
-            // which resolves to a resource schema. Everything else (datatype
-            // names, catch-alls, FHIRPath) is out of this check's reach.
-            !matches!(c.as_str(), "Element" | "Resource" | "DomainResource")
-                && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.')
-                && c.split('.')
-                    .next()
-                    .and_then(|head| ctx.resolver.resolve(head))
-                    .is_some_and(|s| crate::editor::is_resource(&s))
-        };
-        if !contexts.iter().all(judgeable) {
-            continue;
+        let mut met = false;
+        let mut judgeable = true;
+        for c in contexts {
+            if matches!(
+                c.as_str(),
+                "Element" | "BackboneElement" | "Resource" | "DomainResource"
+            ) || !c
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '[' | ']'))
+            {
+                judgeable = false;
+                break;
+            }
+            let head = c.split('.').next().unwrap_or_default();
+            let Some(head_schema) = ctx.resolver.resolve(head) else {
+                judgeable = false;
+                break;
+            };
+            if crate::editor::is_resource(&head_schema) {
+                // A resource-rooted element path names one exact spot:
+                // `Patient` is the root, `Patient.name` that element.
+                if parent_paths.iter().any(|p| path_matches(c, p)) {
+                    met = true;
+                }
+            } else if c.contains('.') || sidecar {
+                // Datatype-rooted paths, and datatypes on a primitive's
+                // sidecar, are out of reach.
+                judgeable = false;
+                break;
+            } else if parent_types.iter().any(|t| t == c) {
+                met = true;
+            }
         }
-        // An element-type context names one exact spot: `Patient` is the
-        // resource root, `Patient.name` that element — not "anywhere in
-        // Patient".
-        if contexts.contains(&parent) {
+        if !judgeable || met {
             continue;
         }
 
+        let parent = &parent_paths[0];
         ctx.path.push_index(index);
-        let message = errors::msg_extension_context(url, &parent, contexts);
-        let severity = if CANONICAL_RESOURCES.contains(&parent.as_str()) {
+        let message = errors::msg_extension_context(url, parent, contexts);
+        let severity = if CANONICAL_RESOURCES.contains(&root.as_str()) {
             Severity::Warning
         } else {
             Severity::Error
@@ -964,18 +1136,59 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
     }
 }
 
+/// Does the context path `context` (`Observation.value[x]`) name the
+/// instance element path `instance` (`Observation.valueQuantity`)?
+fn path_matches(context: &str, instance: &str) -> bool {
+    let c: Vec<&str> = context.split('.').collect();
+    let i: Vec<&str> = instance.split('.').collect();
+    c.len() == i.len()
+        && c.iter().zip(&i).all(|(c, i)| match c.strip_suffix("[x]") {
+            Some(stem) => i
+                .strip_prefix(stem)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())),
+            None => c == i,
+        })
+}
+
+/// The datatypes of an element (from its schema set), with the datatypes
+/// they derive from (`Age` → `Quantity`).
+fn element_types(resolver: &dyn SchemaResolver, set: &SchemaSet) -> Vec<String> {
+    const CORE: &str = "http://hl7.org/fhir/StructureDefinition/";
+    let mut out: Vec<String> = Vec::new();
+    for schema in set.schemas() {
+        let Some(mut ty) = schema.type_.clone() else {
+            continue;
+        };
+        for _ in 0..8 {
+            if out.contains(&ty) {
+                break;
+            }
+            out.push(ty.clone());
+            let Some(base) = resolver
+                .resolve(&ty)
+                .and_then(|s| s.base.clone())
+                .map(|b| b.strip_prefix(CORE).map(str::to_string).unwrap_or(b))
+            else {
+                break;
+            };
+            ty = base;
+        }
+    }
+    out
+}
+
 /// Validate a `_foo` primitive-extension sidecar.
 ///
 /// The sidecar pairs with the base element `foo`: it is only legal when some
 /// layer declares `foo` with a primitive type, it mirrors `foo`'s
 /// array-vs-singular shape, and its content (per item for arrays, with
 /// `null` gaps allowed) validates against the resolver's `Element` schema.
-fn handle_sidecar(
-    ctx: &mut WalkCtx<'_>,
+fn handle_sidecar<'a>(
+    ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
     key: &str,
     base_key: &str,
-    value: &Value,
+    value: &'a Value,
 ) {
     // Collect the base element's sub-set; choice bookkeeping is discarded
     // (a sidecar is not a branch occurrence).
@@ -1294,6 +1507,58 @@ mod tests {
             "extension": [{ "url": "http://example.org/mystery", "valueString": "v" }]
         });
         assert!(warnings(&unknown).is_empty());
+    }
+
+    /// #615 below the resource root: element contexts are matched by the
+    /// parent's element path (relative to the innermost resource, choice
+    /// branches as `[x]`) or its datatype.
+    #[test]
+    fn extension_context_below_the_root() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions {
+            check_extension_context: true,
+            ..Default::default()
+        };
+        let context_errors = |resource: &serde_json::Value| {
+            validator
+                .validate_sync(resource, &opts)
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::ExtensionContext)
+                .map(|e| e.path)
+                .collect::<Vec<_>>()
+        };
+        // geolocation: context `Address`.
+        let geo = json!({"url": "http://hl7.org/fhir/StructureDefinition/geolocation",
+            "extension": [{"url": "latitude", "valueDecimal": 1.0}, {"url": "longitude", "valueDecimal": 2.0}]});
+        let on_address = json!({"resourceType": "Patient",
+            "address": [{"city": "X", "extension": [geo.clone()]}],
+            "contact": [{"address": {"city": "Y", "extension": [geo.clone()]}}]});
+        assert!(context_errors(&on_address).is_empty(), "{:?}", context_errors(&on_address));
+        let on_name = json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
+        assert_eq!(context_errors(&on_name), vec!["Patient.name.0.extension.0"]);
+
+        // birthPlace: context `Patient` (the root only), inside a Bundle too.
+        let birthplace = json!({"url": "http://hl7.org/fhir/StructureDefinition/patient-birthPlace",
+            "valueAddress": {"city": "X"}});
+        let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": "urn:uuid:1", "resource": {"resourceType": "Patient", "extension": [birthplace.clone()],
+                "contact": [{"extension": [birthplace.clone()], "name": {"text": "c"}}]}}]});
+        assert_eq!(
+            context_errors(&bundle),
+            vec!["Bundle.entry.0.resource.contact.0.extension.0"]
+        );
+
+        // A choice-branch path context: `Observation.value[x]`-style
+        // contexts match `valueQuantity`; datatype `Quantity` does too.
+        // (bodyPosition: context `Observation`; at a component: error.)
+        let position = json!({"url": "http://hl7.org/fhir/StructureDefinition/observation-bodyPosition",
+            "valueCodeableConcept": {"text": "sitting"}});
+        let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "c"},
+            "extension": [position.clone()],
+            "component": [{"code": {"text": "x"}, "extension": [position.clone()]}]});
+        assert_eq!(context_errors(&obs), vec!["Observation.component.0.extension.0"]);
     }
 
     /// A keyword the base declares and every profile in the chain restates
