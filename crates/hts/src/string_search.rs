@@ -393,14 +393,27 @@ pub(crate) fn filter_rows(
 /// updated_at`. Columns a table lacks, or that the search does not need,
 /// are `NULL` — `supplements`/`publisher` are derived from `resource_json`,
 /// so reading them for every row costs a JSON read per row.
-pub(crate) fn metadata_select_list(table: &str, search: &ResourceStringSearch) -> String {
+///
+/// `publisher` is a generated column on every SQLite table and on
+/// PostgreSQL's `code_systems`; PostgreSQL's `value_sets`/`concept_maps`
+/// (hundreds of MB of JSON on a production server) read it from the JSON on
+/// demand instead, so adding the column never rewrites those tables.
+pub(crate) fn metadata_select_list(
+    table: &str,
+    search: &ResourceStringSearch,
+    postgres: bool,
+) -> String {
     let content = if table == "code_systems" { "content" } else { "NULL" };
     let supplements = if table == "code_systems" && search.needs_supplements() {
         "supplements"
     } else {
         "NULL"
     };
-    let publisher = if search.needs_publisher() { "publisher" } else { "NULL" };
+    let publisher = match (search.needs_publisher(), postgres && table != "code_systems") {
+        (false, _) => "NULL",
+        (true, false) => "publisher",
+        (true, true) => "resource_json->>'publisher'",
+    };
     let updated = if table == "concept_maps" { "created_at" } else { "updated_at" };
     format!(
         "id, url, version, name, title, status, {content}, {supplements}, {publisher}, {updated}"

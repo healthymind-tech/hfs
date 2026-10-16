@@ -282,8 +282,6 @@ async fn postgres_existing_rows_become_searchable_after_upgrade() {
             .batch_execute(
                 "ALTER TABLE code_systems DROP COLUMN supplements;
                  ALTER TABLE code_systems DROP COLUMN publisher;
-                 ALTER TABLE value_sets DROP COLUMN publisher;
-                 ALTER TABLE concept_maps DROP COLUMN publisher;
                  DELETE FROM hts_schema_meta WHERE key = 'schema_fingerprint';",
             )
             .await

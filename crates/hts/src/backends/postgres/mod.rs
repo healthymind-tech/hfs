@@ -215,7 +215,7 @@ where
         .query(
             &format!(
                 "SELECT {columns} FROM {table} {filter}",
-                columns = crate::string_search::metadata_select_list(table, &search)
+                columns = crate::string_search::metadata_select_list(table, &search, true)
             ),
             &params,
         )
@@ -406,7 +406,7 @@ where
            AND ($2::text IS NULL OR version = $2)
            AND ($3::text IS NULL OR status = $3)
          ORDER BY created_at",
-        columns = crate::string_search::metadata_select_list(table, &search)
+        columns = crate::string_search::metadata_select_list(table, &search, true)
     );
     let rows = client
         .query(&metadata_sql, &[&query.url, &query.version, &query.status])

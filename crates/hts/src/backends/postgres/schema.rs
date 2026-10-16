@@ -340,19 +340,17 @@ ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS current_pin INTEGER;
 ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS version_sort TEXT;
 
 -- ── JSON-derived search columns (supplements / publisher) ─────────────────────
--- Back the `supplements` and `publisher` search parameters. STORED generated
--- columns, so every write path (and `hts migrate`'s COPY) fills them without
--- knowing about them. Adding one to an existing database rewrites the
--- resource rows of that table once (code_systems / value_sets / concept_maps
--- only — never the concept tables); after that it is a no-op.
+-- Back the CodeSystem `supplements` and `publisher` search parameters. STORED
+-- generated columns, so every write path (and `hts migrate`'s COPY) fills them
+-- without knowing about them. Adding them to an existing database rewrites the
+-- code_systems rows once (a few thousand rows, ~25 MB of JSON in production;
+-- never the concept tables); after that it is a no-op. ValueSet/ConceptMap
+-- `publisher` reads the JSON on demand instead (see
+-- `string_search::metadata_select_list`): value_sets holds hundreds of MB.
 ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS supplements TEXT
     GENERATED ALWAYS AS (CASE WHEN content = 'supplement'
                               THEN resource_json->>'supplements' END) STORED;
 ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS publisher TEXT
-    GENERATED ALWAYS AS (resource_json->>'publisher') STORED;
-ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS publisher TEXT
-    GENERATED ALWAYS AS (resource_json->>'publisher') STORED;
-ALTER TABLE concept_maps ADD COLUMN IF NOT EXISTS publisher TEXT
     GENERATED ALWAYS AS (resource_json->>'publisher') STORED;
 
 -- ── ICD-9-CM re-import backfill (issue #802) ────────────────────────────────────

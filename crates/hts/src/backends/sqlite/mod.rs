@@ -102,7 +102,7 @@ fn search_resources_in_transaction(
            AND (?2 IS NULL OR version = ?2)
            AND (?3 IS NULL OR status = ?3)
          ORDER BY created_at",
-        columns = crate::string_search::metadata_select_list(table, &search)
+        columns = crate::string_search::metadata_select_list(table, &search, false)
     );
     let mut statement = conn
         .prepare(&metadata_sql)
@@ -203,7 +203,7 @@ fn count_resources(
     let mut statement = conn
         .prepare_cached(&format!(
             "SELECT {columns} FROM {table} {filter}",
-            columns = crate::string_search::metadata_select_list(table, &search)
+            columns = crate::string_search::metadata_select_list(table, &search, false)
         ))
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
