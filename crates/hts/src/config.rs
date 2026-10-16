@@ -223,6 +223,20 @@ pub struct HtsConfig {
     pub disk_headroom: u64,
 }
 
+/// The storage backend to use for `database_url`.
+///
+/// A `postgres://` or `postgresql://` URL always means the PostgreSQL backend:
+/// with the `sqlite` default such a URL would be opened as a file path, and
+/// the resulting error would carry the URL — password included — into logs.
+pub fn effective_storage_backend(storage_backend: &str, database_url: &str) -> String {
+    let url = database_url.trim_start().to_ascii_lowercase();
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "postgres".to_string()
+    } else {
+        storage_backend.to_string()
+    }
+}
+
 impl HtsConfig {
     /// Returns the socket address string for binding.
     pub fn socket_addr(&self) -> String {
@@ -569,6 +583,28 @@ pub struct ImportArgs {
 
 #[cfg(test)]
 mod tests {
+    use super::effective_storage_backend;
+
+    #[test]
+    fn postgres_urls_select_the_postgres_backend() {
+        assert_eq!(
+            effective_storage_backend("sqlite", "postgresql://u:p@h/db"),
+            "postgres"
+        );
+        assert_eq!(
+            effective_storage_backend("sqlite", "POSTGRES://u:p@h/db"),
+            "postgres"
+        );
+        assert_eq!(
+            effective_storage_backend("sqlite", "./data/hts.db"),
+            "sqlite"
+        );
+        assert_eq!(
+            effective_storage_backend("postgres", "./data/hts.db"),
+            "postgres"
+        );
+    }
+
     use super::*;
 
     #[test]

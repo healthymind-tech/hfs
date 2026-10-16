@@ -3,6 +3,7 @@
 use clap::Parser;
 use helios_hts::config::{
     Cli, Command, HtsConfig, ImportArgs, ImportFormat, MigrateArgs, detect_format,
+    effective_storage_backend,
 };
 use helios_hts::import::dispatch::dispatch_import;
 use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
@@ -49,6 +50,9 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|| Command::Run(HtsConfig::parse_from(["hts"])))
     {
         Command::Run(config) => {
+            let mut config = config;
+            config.storage_backend =
+                effective_storage_backend(&config.storage_backend, &config.database_url);
             // Listen for SIGTERM/SIGINT before the startup work (bootstrap
             // imports, closure and FTS builds): as PID 1 in a container an
             // unhandled SIGTERM is discarded. `HTS_SHUTDOWN_TIMEOUT` bounds
@@ -91,6 +95,9 @@ async fn run() -> anyhow::Result<()> {
             run_migrate(args).await
         }
         Command::Import(args) => {
+            let mut args = args;
+            args.storage_backend =
+                effective_storage_backend(&args.storage_backend, &args.database_url);
             let log_level = if args.verbose {
                 "debug"
             } else {
