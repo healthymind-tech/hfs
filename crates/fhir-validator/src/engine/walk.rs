@@ -71,7 +71,7 @@ impl SchemaSet {
         self.map.contains_key(key)
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&str, &Arc<FhirSchema>)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, &Arc<FhirSchema>)> {
         self.map.iter().map(|(k, v)| (k.as_str(), v))
     }
 
@@ -108,8 +108,13 @@ pub(super) struct WalkCtx<'a> {
     contained: Vec<Vec<(String, String)>>,
 }
 
-impl WalkCtx<'_> {
+impl<'a> WalkCtx<'a> {
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
+        self.resolver
+    }
+
+    /// The resolver, detached from the borrow of the context.
+    pub(super) fn resolver_handle(&self) -> &'a dyn SchemaResolver {
         self.resolver
     }
 
@@ -126,14 +131,34 @@ impl WalkCtx<'_> {
         self.error_with_severity(kind, message, Severity::Error);
     }
 
-    fn error_with_severity(&mut self, kind: ErrorKind, message: String, severity: Severity) {
+    pub(super) fn error_with_severity(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+    ) {
+        self.error_from(kind, message, severity, None);
+    }
+
+    /// Emit an issue attributed to the profile `source` (see
+    /// [`ValidationError::source`]).
+    pub(super) fn error_from(
+        &mut self,
+        kind: ErrorKind,
+        message: String,
+        severity: Severity,
+        source: Option<String>,
+    ) {
         let path = self.path.render_dotted();
         if self
             .emitted
             .insert((kind, severity, path.clone(), message.clone()))
         {
-            self.errors
-                .push(ValidationError::new(kind, path, message).with_severity(severity));
+            self.errors.push(
+                ValidationError::new(kind, path, message)
+                    .with_severity(severity)
+                    .with_source(source),
+            );
         }
     }
 }
@@ -310,6 +335,20 @@ pub(super) fn add_schemas_to_set(
     }
 
     set.map.insert(key.to_string(), schema);
+}
+
+/// The canonical URL a schema-set key descends from. Layer keys are the
+/// canonical (or type name) a schema was added under, element subsets
+/// append `.{element}` per step: `http://x/StructureDefinition/bp.component`
+/// came from `http://x/StructureDefinition/bp`. Type-name keys
+/// (`Observation.component`) name no profile.
+pub(super) fn key_origin(key: &str) -> Option<String> {
+    if !key.contains("://") {
+        return None;
+    }
+    let tail = key.rfind('/').map_or(0, |i| i + 1);
+    let end = key[tail..].find('.').map_or(key.len(), |i| tail + i);
+    Some(key[..end].to_string())
 }
 
 /// Navigate an element reference: `["Questionnaire", "elements", "item"]` —

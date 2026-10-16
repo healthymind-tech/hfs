@@ -820,8 +820,12 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         Severity::Error => IssueSeverity::Error,
         Severity::Warning => IssueSeverity::Warning,
     };
-    Issue::new(severity, code, error.message.clone())
-        .with_expression(dotted_to_fhirpath(&error.path))
+    // The profile behind the rule, as the HL7 validator names it.
+    let message = match &error.source {
+        Some(source) => format!("{} (from {source})", error.message),
+        None => error.message.clone(),
+    };
+    Issue::new(severity, code, message).with_expression(dotted_to_fhirpath(&error.path))
 }
 
 /// Build the `$validate` OperationOutcome: the mapped issues, or the

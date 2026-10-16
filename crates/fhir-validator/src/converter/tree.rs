@@ -7,7 +7,7 @@
 //! here: the `[x]` element becomes a `choices` declarer plus one `choiceOf`
 //! branch element per type.
 
-use super::{Ed, EdConstraint, EdDiscriminator};
+use super::{Ed, EdConstraint, EdDiscriminator, EdType};
 use crate::schema::{Binding, Constraint, FhirSchema};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -66,6 +66,10 @@ pub(super) struct Node {
     /// `max: "0"` — the element is prohibited; recorded on the parent's
     /// `excluded` and the subtree is dropped.
     pub dead: bool,
+    /// The ED's `type[].code`s, for `type` slice discriminators.
+    pub type_codes: Vec<String>,
+    /// The ED's `type[].profile`s, for `profile` slice discriminators.
+    pub type_profiles: Vec<String>,
 }
 
 impl Node {
@@ -89,19 +93,61 @@ pub(super) struct SliceNode {
 
 /// Apply one ElementDefinition at its navigated position.
 pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &mut Vec<String>) {
-    // Navigate to the parent of the final segment.
-    let mut node: &mut Node = root;
-    for seg in &segments[..segments.len() - 1] {
-        if node.dead {
-            return;
-        }
-        node = descend(node, seg);
-    }
+    let Some((last, parents)) = segments.split_last() else {
+        return;
+    };
+    apply_below(root, parents, last, ed, warnings);
+}
+
+/// Navigate `parents` from `node`, then apply the ED at `last`.
+///
+/// A `foo[x]` step does not name an element of the data: the children a
+/// snapshot lists under `value[x]` (`value[x].system`, `value[x].code`)
+/// constrain the concrete branch (`valueQuantity`). A step written as a type
+/// slice (`value[x]:valueQuantity`) names its branch directly; a bare
+/// `foo[x]` step resolves through the choice declarer when it allows a
+/// single type. Before, these children landed under a literal `value[x]`
+/// element no data key ever matches, so the fixed `system`/`code` of the
+/// core blood-pressure components were never checked.
+fn apply_below(
+    node: &mut Node,
+    parents: &[Segment],
+    last: &Segment,
+    ed: &Ed,
+    warnings: &mut Vec<String>,
+) {
     if node.dead {
         return;
     }
-    let last = &segments[segments.len() - 1];
+    let Some((seg, rest)) = parents.split_first() else {
+        apply_last(node, last, ed, warnings);
+        return;
+    };
+    if let Some(base_name) = seg.name.strip_suffix("[x]") {
+        let branch = match &seg.slice {
+            Some(slice) => Some(slice.clone()),
+            None => node
+                .children
+                .get(base_name)
+                .and_then(|declarer| declarer.schema.choices.as_ref())
+                .filter(|choices| choices.len() == 1)
+                .map(|choices| choices[0].clone()),
+        };
+        if let Some(branch) = branch {
+            let child = node
+                .children
+                .entry(branch.clone())
+                .or_insert_with(|| Node::new(branch));
+            apply_below(child, rest, last, ed, warnings);
+            return;
+        }
+    }
+    let child = descend(node, seg);
+    apply_below(child, rest, last, ed, warnings);
+}
 
+/// Apply an ED whose final id segment is `last` under `node`.
+fn apply_last(node: &mut Node, last: &Segment, ed: &Ed, warnings: &mut Vec<String>) {
     // Explicit choice-branch constraint: `value[x]:valueQuantity`.
     if let (true, Some(slice)) = (last.name.ends_with("[x]"), &last.slice) {
         let branch = node
@@ -130,6 +176,7 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
         {
             slice.extension_profile = Some(profile.clone());
         }
+        record_types(&mut slice.node, ed);
         // Value-level keywords on the slice ED itself apply to the slice
         // schema (shape/cardinality were consumed above as slice bounds).
         apply_value_keywords(&mut slice.node.schema, ed, warnings);
@@ -224,8 +271,23 @@ fn apply_shape(element: &mut Node, ed: &Ed) {
     }
 }
 
+/// Remember an ED's type codes and type profiles on its node: `type` and
+/// `profile` slice discriminators read them (they never reach the schema).
+fn record_types(node: &mut Node, ed: &Ed) {
+    if ed.types.is_empty() {
+        return;
+    }
+    node.type_codes = ed.types.iter().map(EdType::effective_code).collect();
+    node.type_profiles = ed
+        .types
+        .iter()
+        .flat_map(|t| t.profile.iter().cloned())
+        .collect();
+}
+
 /// Type reference, contentReference, and the value-level keywords.
 fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>) {
+    record_types(element, ed);
     match ed.types.len() {
         0 => {
             if let Some(reference) = &ed.content_reference {
@@ -352,6 +414,7 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         .children
         .entry(base_name.to_string())
         .or_insert_with(|| Node::new(base_name.to_string()));
+    record_types(declarer, ed);
     match &mut declarer.schema.choices {
         Some(existing) => {
             for name in branch_names {
@@ -375,6 +438,8 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
         slicing_rules,
         slicing_ordered,
         dead,
+        type_codes: _,
+        type_profiles: _,
     } = node;
 
     if dead {

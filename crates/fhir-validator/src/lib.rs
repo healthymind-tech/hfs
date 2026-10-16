@@ -43,10 +43,12 @@
 //!
 //! ## Current limitations (hardening backlog)
 //!
-//! - Slice matchers: only `pattern` matching is evaluated. `type`,
-//!   `profile`, `binding`, and `resolve-ref` matchers are parsed but inert
+//! - Slice matchers: `value`/`pattern` (including constants inside nested
+//!   slices), `type` and `profile` discriminators are evaluated; `exists`,
+//!   `binding`, and paths through `resolve()` or `extension(...)` are not
 //!   (such slices match nothing and never enforce a minimum; the converter
-//!   emits a warning when it cannot build a pattern match).
+//!   emits a warning when it cannot build a match). `profile` matching
+//!   validates the item structurally against the profile.
 //! - `refers` (reference target types) is carried but not enforced.
 //! - `extensible`-strength bindings are never checked (only `required`,
 //!   per the FHIR Schema spec); a warning mode may come later.

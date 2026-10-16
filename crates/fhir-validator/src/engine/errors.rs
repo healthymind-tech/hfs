@@ -102,6 +102,11 @@ pub struct ValidationError {
     /// Internal severity; REST maps it onto OperationOutcome.
     #[serde(skip)]
     pub severity: Severity,
+    /// The canonical URL of the profile (or extension definition) whose
+    /// rule produced the issue, when known — rendered by REST as the HL7
+    /// validator's `(from <url>)`. Not part of the conformance shape.
+    #[serde(skip)]
+    pub source: Option<String>,
 }
 
 impl ValidationError {
@@ -112,7 +117,13 @@ impl ValidationError {
             message,
             extra: serde_json::Map::new(),
             severity: Severity::Error,
+            source: None,
         }
+    }
+
+    pub fn with_source(mut self, source: Option<String>) -> Self {
+        self.source = source;
+        self
     }
 
     pub fn with_severity(mut self, severity: Severity) -> Self {
