@@ -369,6 +369,34 @@ impl TerminologyProvider for CompositeTerminologyProvider {
             None => self.remote.validate_code(value_set, coded).await,
         }
     }
+
+    /// Embedded answers locally; everything else goes to the remote
+    /// provider as one batch.
+    async fn validate_codes(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Vec<Result<bool, TerminologyError>> {
+        let mut out: Vec<Option<Result<bool, TerminologyError>>> = checks
+            .iter()
+            .map(|(value_set, coded)| self.embedded.member(value_set, coded).map(Ok))
+            .collect();
+        let remote: Vec<(usize, (&str, &CodedValue))> = checks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out[*i].is_none())
+            .map(|(i, check)| (i, *check))
+            .collect();
+        if !remote.is_empty() {
+            let requests: Vec<(&str, &CodedValue)> = remote.iter().map(|(_, c)| *c).collect();
+            let verdicts = self.remote.validate_codes(&requests).await;
+            for ((index, _), verdict) in remote.iter().zip(verdicts) {
+                out[*index] = Some(verdict);
+            }
+        }
+        out.into_iter()
+            .map(|v| v.unwrap_or_else(|| Err(TerminologyError::new("no verdict"))))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +453,31 @@ mod tests {
             self.0.lock().unwrap().push(value_set.to_string());
             Ok(false)
         }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn composite_batches_only_the_remote_checks_in_order() {
+        let remote = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let provider = CompositeTerminologyProvider::new(
+            core_terminology(FhirVersion::R4),
+            Arc::clone(&remote) as Arc<dyn TerminologyProvider>,
+        );
+        let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
+        let ig_a = "http://example.org/ValueSet/a";
+        let ig_b = "http://example.org/ValueSet/b";
+        let male = CodedValue::Code("male".into());
+        let bad = CodedValue::Code("masculino".into());
+        let any = CodedValue::Code("x".into());
+        let verdicts = provider
+            .validate_codes(&[(ig_a, &any), (gender, &male), (ig_b, &any), (gender, &bad)])
+            .await;
+        let verdicts: Vec<bool> = verdicts.into_iter().map(|v| v.unwrap()).collect();
+        assert_eq!(verdicts, [false, true, false, false]);
+        assert_eq!(
+            remote.0.lock().unwrap().as_slice(),
+            [ig_a.to_string(), ig_b.to_string()]
+        );
     }
 
     #[cfg(feature = "R4")]

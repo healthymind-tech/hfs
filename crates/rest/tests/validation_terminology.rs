@@ -476,3 +476,125 @@ async fn codes_of_contentless_code_systems_cannot_be_checked() {
         issues[0].2
     );
 }
+
+/// The mock HTS plus `POST /` (FHIR batch of `ValueSet/$validate-code`
+/// entries), recording each batch it receives.
+async fn start_batching_mock_hts(
+    known: &[(&str, &[&str])],
+) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let state = MockHts {
+        requests: Arc::clone(&requests),
+        known: Arc::new(
+            known
+                .iter()
+                .map(|(url, codes)| {
+                    (
+                        url.to_string(),
+                        codes.iter().map(|c| c.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        ),
+        code_systems: Arc::new(HashMap::new()),
+        composes: Arc::new(HashMap::new()),
+        blame_unknown_system: None,
+    };
+    let batch_log = Arc::clone(&batches);
+    let batch = move |State(state): State<MockHts>, Json(bundle): Json<Value>| {
+        let batch_log = Arc::clone(&batch_log);
+        async move {
+            batch_log.lock().unwrap().push(bundle.clone());
+            let mut entries = Vec::new();
+            for entry in bundle["entry"].as_array().cloned().unwrap_or_default() {
+                // Answered like a single request, but not logged as one.
+                let inner = MockHts {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    known: Arc::clone(&state.known),
+                    code_systems: Arc::clone(&state.code_systems),
+                    composes: Arc::clone(&state.composes),
+                    blame_unknown_system: state.blame_unknown_system.clone(),
+                };
+                let (status, Json(resource)) =
+                    validate_code(State(inner), Json(entry["resource"].clone())).await;
+                entries.push(json!({
+                    "resource": resource,
+                    "response": { "status": status.as_u16().to_string() }
+                }));
+            }
+            Json(json!({ "resourceType": "Bundle", "type": "batch-response", "entry": entries }))
+        }
+    };
+    let router = Router::new()
+        .route(
+            "/ValueSet/$validate-code",
+            axum::routing::post(validate_code),
+        )
+        .route("/", axum::routing::post(batch))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (base_url, requests, batches)
+}
+
+/// All bindings of one resource cost one round trip: duplicates are asked
+/// once, the rest share a batch Bundle, and answers come back in order.
+#[tokio::test]
+async fn remote_checks_of_one_resource_share_one_batch() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let other = "http://example.org/ValueSet/other";
+    let (url, singles, batches) =
+        start_batching_mock_hts(&[(IG_VS, &["M", "S"]), (other, &["x"])]).await;
+    let provider =
+        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let m = CodedValue::Code("M".into());
+    let bad = CodedValue::Code("nope".into());
+    let x = CodedValue::Code("x".into());
+    let missing = "http://example.org/ValueSet/missing";
+    let verdicts = provider
+        .validate_codes(&[(IG_VS, &m), (other, &x), (IG_VS, &m), (IG_VS, &bad), (missing, &x)])
+        .await;
+    assert!(singles.lock().unwrap().is_empty(), "no single requests");
+    let sent = batches.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "one round trip");
+    assert_eq!(
+        sent[0]["entry"].as_array().unwrap().len(),
+        4,
+        "the duplicate is asked once"
+    );
+    assert!(matches!(verdicts[0], Ok(true)));
+    assert!(matches!(verdicts[1], Ok(true)));
+    assert!(matches!(verdicts[2], Ok(true)));
+    assert!(matches!(verdicts[3], Ok(false)));
+    let unknown = verdicts[4].as_ref().expect_err("unknown value set");
+    assert_eq!(
+        unknown.kind(),
+        helios_fhir_validator::TerminologyErrorKind::UnknownValueSet
+    );
+
+    // Everything is cached now: no further traffic.
+    let again = provider.validate_codes(&[(IG_VS, &m), (other, &x)]).await;
+    assert!(again.iter().all(|v| matches!(v, Ok(true))));
+    assert_eq!(batches.lock().unwrap().len(), 1);
+    assert!(singles.lock().unwrap().is_empty());
+}
+
+/// A server without the batch endpoint is asked one check at a time.
+#[tokio::test]
+async fn remote_checks_fall_back_to_single_requests() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let other = "http://example.org/ValueSet/other";
+    let (url, requests) = start_mock_hts(&[(IG_VS, &["M"]), (other, &["x"])]).await;
+    let provider =
+        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let m = CodedValue::Code("M".into());
+    let x = CodedValue::Code("y".into());
+    let verdicts = provider.validate_codes(&[(IG_VS, &m), (other, &x)]).await;
+    assert!(matches!(verdicts[0], Ok(true)));
+    assert!(matches!(verdicts[1], Ok(false)));
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}

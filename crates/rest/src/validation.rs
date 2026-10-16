@@ -1338,6 +1338,148 @@ impl RemoteTerminologyProvider {
     }
 }
 
+impl RemoteTerminologyProvider {
+    fn cache_key(value_set: &str, coded: &CodedValue) -> String {
+        format!("{value_set}|{coded:?}")
+    }
+
+    /// A still-fresh cached verdict (or remembered unknown value set).
+    fn cached(&self, value_set: &str, key: &str) -> Option<Result<bool, TerminologyError>> {
+        if let Some(entry) = self.cache.get(key) {
+            let (verdict, at) = *entry;
+            if at.elapsed() < CACHE_TTL {
+                return Some(Ok(verdict));
+            }
+        }
+        if let Some(at) = self.unknown_value_sets.get(value_set)
+            && at.elapsed() < UNKNOWN_VALUE_SET_TTL
+        {
+            return Some(Err(TerminologyError::unknown_value_set(format!(
+                "value set '{value_set}' is not known to the terminology server (cached)"
+            ))));
+        }
+        None
+    }
+
+    /// Interpret one `$validate-code` answer (plain or batch entry) and
+    /// cache what it says.
+    fn settle(
+        &self,
+        value_set: &str,
+        key: String,
+        url: &str,
+        status: reqwest::StatusCode,
+        body: Option<&Value>,
+        raw: &str,
+    ) -> Result<bool, TerminologyError> {
+        if !status.is_success() {
+            let error = Self::classify_failure(url, status, raw);
+            if error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet {
+                self.unknown_value_sets
+                    .insert(value_set.to_string(), Instant::now());
+            }
+            return Err(error);
+        }
+        let verdict = body
+            .and_then(|b| b.get("parameter"))
+            .and_then(Value::as_array)
+            .and_then(|params| {
+                params
+                    .iter()
+                    .find(|p| p.get("name").and_then(Value::as_str) == Some("result"))
+            })
+            .and_then(|p| p.get("valueBoolean"))
+            .and_then(Value::as_bool)
+            .ok_or_else(|| TerminologyError::new("no boolean 'result' parameter in response"))?;
+        self.cache.insert(key, (verdict, Instant::now()));
+        Ok(verdict)
+    }
+
+    /// Several uncached checks in one FHIR `batch` Bundle (`POST [base]`,
+    /// one `POST ValueSet/$validate-code` entry each). `None` when the
+    /// server did not answer the batch as a whole, so the caller can fall
+    /// back to single requests.
+    async fn validate_batch(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Option<Vec<Result<bool, TerminologyError>>> {
+        let entries: Vec<Value> = checks
+            .iter()
+            .map(|(value_set, coded)| {
+                json!({
+                    "request": {"method": "POST", "url": "ValueSet/$validate-code"},
+                    "resource": Self::payload(value_set, coded),
+                })
+            })
+            .collect();
+        let bundle = json!({"resourceType": "Bundle", "type": "batch", "entry": entries});
+        let url = format!("{}/", self.base_url);
+        let response = self.client.post(&url).json(&bundle).send().await.ok()?;
+        if !response.status().is_success() {
+            debug!(status = %response.status(), "terminology server refused a batch; checking one by one");
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        let answers = body.get("entry").and_then(Value::as_array)?;
+        if answers.len() != checks.len() {
+            return None;
+        }
+        let op_url = format!("{}/ValueSet/$validate-code", self.base_url);
+        let settled: Vec<Result<bool, TerminologyError>> = checks
+                .iter()
+                .zip(answers)
+                .map(|((value_set, coded), answer)| {
+                    let status = answer
+                        .pointer("/response/status")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|code| code.parse::<u16>().ok())
+                        .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+                        .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+                    let resource = answer.get("resource");
+                    let raw = resource.map(Value::to_string).unwrap_or_default();
+                    self.settle(
+                        value_set,
+                        Self::cache_key(value_set, coded),
+                        &op_url,
+                        status,
+                        resource,
+                        &raw,
+                    )
+                })
+                .collect();
+        // A `false` may only mean the code system has no content on the
+        // server; that check stays per verdict (rare: only on failures).
+        let mut out = Vec::with_capacity(settled.len());
+        for (((value_set, coded), answer), verdict) in checks.iter().zip(answers).zip(settled) {
+            let body = answer.get("resource").cloned().unwrap_or(Value::Null);
+            out.push(self.check_unverifiable(value_set, coded, &body, verdict).await);
+        }
+        Some(out)
+    }
+
+    /// N's rule: a negative verdict over a code system the server has no
+    /// content for is "cannot check", not "invalid" (and is not cached).
+    async fn check_unverifiable(
+        &self,
+        value_set: &str,
+        coded: &CodedValue,
+        body: &Value,
+        verdict: Result<bool, TerminologyError>,
+    ) -> Result<bool, TerminologyError> {
+        if matches!(verdict, Ok(false))
+            && let Some(system) = self.unverifiable_system(value_set, coded, body).await
+        {
+            self.cache.remove(&Self::cache_key(value_set, coded));
+            return Err(TerminologyError::unknown_code_system(format!(
+                "code system '{system}' has no content on the terminology server \
+                 (unknown, or a content=not-present stub), so the code cannot be checked"
+            )));
+        }
+        verdict
+    }
+}
+
 #[async_trait]
 impl TerminologyProvider for RemoteTerminologyProvider {
     async fn validate_code(
@@ -1345,19 +1487,9 @@ impl TerminologyProvider for RemoteTerminologyProvider {
         value_set: &str,
         coded: &CodedValue,
     ) -> Result<bool, TerminologyError> {
-        let key = format!("{value_set}|{coded:?}");
-        if let Some(entry) = self.cache.get(&key) {
-            let (verdict, at) = *entry;
-            if at.elapsed() < CACHE_TTL {
-                return Ok(verdict);
-            }
-        }
-        if let Some(at) = self.unknown_value_sets.get(value_set)
-            && at.elapsed() < UNKNOWN_VALUE_SET_TTL
-        {
-            return Err(TerminologyError::unknown_value_set(format!(
-                "value set '{value_set}' is not known to the terminology server (cached)"
-            )));
+        let key = Self::cache_key(value_set, coded);
+        if let Some(cached) = self.cached(value_set, &key) {
+            return cached;
         }
 
         let url = format!("{}/ValueSet/$validate-code", self.base_url);
@@ -1371,37 +1503,67 @@ impl TerminologyProvider for RemoteTerminologyProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            let error = Self::classify_failure(&url, status, &body);
-            if error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet {
-                self.unknown_value_sets
-                    .insert(value_set.to_string(), Instant::now());
-            }
-            return Err(error);
+            return self.settle(value_set, key, &url, status, None, &body);
         }
         let body: Value = response
             .json()
             .await
             .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
-        let verdict = body
-            .get("parameter")
-            .and_then(Value::as_array)
-            .and_then(|params| {
-                params
-                    .iter()
-                    .find(|p| p.get("name").and_then(Value::as_str) == Some("result"))
-            })
-            .and_then(|p| p.get("valueBoolean"))
-            .and_then(Value::as_bool)
-            .ok_or_else(|| TerminologyError::new("no boolean 'result' parameter in response"))?;
+        let verdict = self.settle(value_set, key, &url, status, Some(&body), "");
+        self.check_unverifiable(value_set, coded, &body, verdict).await
+    }
 
-        if !verdict && let Some(system) = self.unverifiable_system(value_set, coded, &body).await {
-            return Err(TerminologyError::unknown_code_system(format!(
-                "code system '{system}' has no content on the terminology server \
-                 (unknown, or a content=not-present stub), so the code cannot be checked"
-            )));
+    /// One round trip per resource: cached verdicts answer locally,
+    /// duplicates are asked once, the rest go out as one batch Bundle
+    /// (single requests, concurrently, if the server rejects batches).
+    async fn validate_codes(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Vec<Result<bool, TerminologyError>> {
+        let mut out: Vec<Option<Result<bool, TerminologyError>>> = vec![None; checks.len()];
+        // Distinct uncached checks, each with the positions it answers.
+        let mut pending: Vec<((&str, &CodedValue), Vec<usize>)> = Vec::new();
+        let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, (value_set, coded)) in checks.iter().enumerate() {
+            let key = Self::cache_key(value_set, coded);
+            if let Some(cached) = self.cached(value_set, &key) {
+                out[i] = Some(cached);
+                continue;
+            }
+            match by_key.get(&key) {
+                Some(&slot) => pending[slot].1.push(i),
+                None => {
+                    by_key.insert(key, pending.len());
+                    pending.push(((*value_set, *coded), vec![i]));
+                }
+            }
         }
-        self.cache.insert(key, (verdict, Instant::now()));
-        Ok(verdict)
+        if !pending.is_empty() {
+            let requests: Vec<(&str, &CodedValue)> = pending.iter().map(|(c, _)| *c).collect();
+            let verdicts = match requests.len() {
+                1 => None,
+                _ => self.validate_batch(&requests).await,
+            };
+            let verdicts = match verdicts {
+                Some(v) => v,
+                None => {
+                    futures::future::join_all(
+                        requests
+                            .iter()
+                            .map(|(value_set, coded)| self.validate_code(value_set, coded)),
+                    )
+                    .await
+                }
+            };
+            for ((_, positions), verdict) in pending.iter().zip(verdicts) {
+                for &i in positions {
+                    out[i] = Some(verdict.clone());
+                }
+            }
+        }
+        out.into_iter()
+            .map(|v| v.unwrap_or_else(|| Err(TerminologyError::new("no verdict"))))
+            .collect()
     }
 }
 
