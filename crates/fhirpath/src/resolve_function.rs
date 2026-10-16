@@ -65,6 +65,9 @@ struct Candidate {
     /// Whether this candidate came from a `contained` array (eligible for
     /// fragment / bare-id matching).
     is_contained: bool,
+    /// `Bundle.entry.fullUrl` when the candidate is a Bundle entry's resource
+    /// (`urn:uuid:…` and absolute references match it literally).
+    full_url: Option<String>,
     value: EvaluationResult,
 }
 
@@ -79,13 +82,21 @@ fn build_candidate_pool(context: &EvaluationContext) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for resource in context.resources.iter() {
         let result = resource.to_evaluation_result();
-        collect_candidates(&result, false, &mut candidates);
+        collect_candidates(&result, false, None, &mut candidates);
     }
     candidates
 }
 
-/// Adds `value` (if it is a resource object) and its `contained` children to the pool.
-fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Vec<Candidate>) {
+/// Adds `value` (if it is a resource object), its `contained` children and —
+/// for a Bundle — its entries' resources to the pool. Bundle entries are how
+/// document/message invariants reach their siblings
+/// (`Composition.author.resolve()` in a document Bundle).
+fn collect_candidates(
+    value: &EvaluationResult,
+    is_contained: bool,
+    full_url: Option<String>,
+    out: &mut Vec<Candidate>,
+) {
     if let EvaluationResult::Object { map, .. } = value {
         let resource_type = string_field(map, "resourceType");
         let id = string_field(map, "id");
@@ -95,8 +106,24 @@ fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Ve
                 resource_type: resource_type.clone(),
                 id: id.clone(),
                 is_contained,
+                full_url,
                 value: value.clone(),
             });
+        }
+
+        if resource_type.as_deref() == Some("Bundle") {
+            let entries = match map.get("entry") {
+                Some(EvaluationResult::Collection { items, .. }) => items.iter().collect(),
+                Some(entry @ EvaluationResult::Object { .. }) => vec![entry],
+                _ => Vec::new(),
+            };
+            for entry in entries {
+                if let EvaluationResult::Object { map: entry, .. } = entry
+                    && let Some(resource) = entry.get("resource")
+                {
+                    collect_candidates(resource, false, string_field(entry, "fullUrl"), out);
+                }
+            }
         }
 
         // Recurse into contained resources (one level is all FHIR allows, but
@@ -105,11 +132,11 @@ fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Ve
             match contained {
                 EvaluationResult::Collection { items, .. } => {
                     for item in items {
-                        collect_candidates(item, true, out);
+                        collect_candidates(item, true, None, out);
                     }
                 }
                 obj @ EvaluationResult::Object { .. } => {
-                    collect_candidates(obj, true, out);
+                    collect_candidates(obj, true, None, out);
                 }
                 _ => {}
             }
@@ -122,6 +149,14 @@ fn resolve_one(item: &EvaluationResult, candidates: &[Candidate]) -> EvaluationR
     let Some(reference) = extract_reference_string(item) else {
         return EvaluationResult::Empty;
     };
+
+    // A Bundle entry whose fullUrl is the reference (urn:uuid:, absolute URL).
+    if let Some(found) = candidates
+        .iter()
+        .find(|c| c.full_url.as_deref() == Some(reference.as_str()))
+    {
+        return found.value.clone();
+    }
 
     let parsed = ParsedReference::parse(&reference);
 
@@ -294,7 +329,7 @@ mod tests {
     fn pool(roots: &[EvaluationResult]) -> Vec<Candidate> {
         let mut out = Vec::new();
         for root in roots {
-            collect_candidates(root, false, &mut out);
+            collect_candidates(root, false, None, &mut out);
         }
         out
     }
@@ -329,6 +364,101 @@ mod tests {
             }
             other => panic!("expected Organization object, got {other:?}"),
         }
+    }
+
+    fn collection(items: Vec<EvaluationResult>) -> EvaluationResult {
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order: false,
+            type_info: None,
+        }
+    }
+
+    fn id_of(resolved: &EvaluationResult) -> Option<String> {
+        match resolved {
+            EvaluationResult::Object { map, .. } => string_field(map, "id"),
+            _ => None,
+        }
+    }
+
+    /// Bundle entries are resolvable: by relative `Type/id`, by `fullUrl`
+    /// (`urn:uuid:` and absolute), and an entry's own contained resources stay
+    /// fragment-only. (The NHI EMPD document invariant `empd-medreq-1` reads
+    /// `Composition.author.resolve().ofType(Practitioner).identifier`.)
+    #[test]
+    fn resolves_bundle_entries() {
+        let practitioner = obj(&[
+            ("resourceType", string("Practitioner")),
+            ("id", string("pra-02")),
+            (
+                "identifier",
+                collection(vec![obj(&[("value", string("DC001"))])]),
+            ),
+        ]);
+        let patient = obj(&[
+            ("resourceType", string("Patient")),
+            ("id", string("p1")),
+            (
+                "contained",
+                obj(&[
+                    ("resourceType", string("Organization")),
+                    ("id", string("o1")),
+                ]),
+            ),
+        ]);
+        let bundle = obj(&[
+            ("resourceType", string("Bundle")),
+            (
+                "entry",
+                collection(vec![
+                    obj(&[
+                        (
+                            "fullUrl",
+                            string("https://example.org/fhir/Practitioner/pra-02"),
+                        ),
+                        ("resource", practitioner),
+                    ]),
+                    obj(&[
+                        (
+                            "fullUrl",
+                            string("urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"),
+                        ),
+                        ("resource", patient),
+                    ]),
+                ]),
+            ),
+        ]);
+        let candidates = pool(&[bundle]);
+        let resolved = resolve_one(&reference("Practitioner/pra-02"), &candidates);
+        assert_eq!(id_of(&resolved).as_deref(), Some("pra-02"));
+        match &resolved {
+            EvaluationResult::Object { map, .. } => {
+                assert!(
+                    map.contains_key("identifier"),
+                    "the real entry, not a typed stub"
+                )
+            }
+            other => panic!("expected Practitioner, got {other:?}"),
+        }
+        let resolved = resolve_one(
+            &reference("urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"),
+            &candidates,
+        );
+        assert_eq!(id_of(&resolved).as_deref(), Some("p1"));
+        let resolved = resolve_one(
+            &reference("https://example.org/fhir/Practitioner/pra-02"),
+            &candidates,
+        );
+        assert_eq!(id_of(&resolved).as_deref(), Some("pra-02"));
+        assert_eq!(
+            id_of(&resolve_one(&reference("#o1"), &candidates)).as_deref(),
+            Some("o1")
+        );
+        assert_eq!(
+            id_of(&resolve_one(&reference("p1"), &candidates)),
+            None,
+            "a bare id never matches a Bundle entry (only contained resources)"
+        );
     }
 
     #[test]

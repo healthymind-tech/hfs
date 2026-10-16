@@ -101,6 +101,13 @@ pub enum TerminologyErrorKind {
     /// `required` binding this is a defect of the deployment (the IG's
     /// terminology was never loaded), not a transient outage.
     UnknownValueSet,
+    /// The ValueSet is known, but the code system of the coded value is not
+    /// loaded on the service (absent, or only a `content: not-present`
+    /// stub such as HGNC, HGVS or the CDC race codes in `hl7.terminology`),
+    /// so the code itself cannot be checked. The HL7 validator reports this
+    /// as a warning ("A definition for CodeSystem … could not be found, so
+    /// the code cannot be validated"), not as an invalid code.
+    UnknownCodeSystem,
 }
 
 /// A terminology-service failure (network, unknown ValueSet, ...).
@@ -124,6 +131,14 @@ impl TerminologyError {
         Self {
             message: message.into(),
             kind: TerminologyErrorKind::UnknownValueSet,
+        }
+    }
+
+    /// A failure of kind [`TerminologyErrorKind::UnknownCodeSystem`].
+    pub fn unknown_code_system(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: TerminologyErrorKind::UnknownCodeSystem,
         }
     }
 
@@ -154,7 +169,8 @@ pub enum TerminologyFailMode {
     Closed,
     /// An unknown ValueSet ([`TerminologyErrorKind::UnknownValueSet`]) is an
     /// error — the binding could not have been satisfied by any deployment
-    /// state the client controls — while an outage stays a warning.
+    /// state the client controls — while an outage, or a code system the
+    /// service has no content for, stays a warning.
     ClosedRequired,
 }
 
@@ -167,9 +183,10 @@ impl TerminologyFailMode {
             (TerminologyFailMode::ClosedRequired, TerminologyErrorKind::UnknownValueSet) => {
                 Severity::Error
             }
-            (TerminologyFailMode::ClosedRequired, TerminologyErrorKind::Unavailable) => {
-                Severity::Warning
-            }
+            (
+                TerminologyFailMode::ClosedRequired,
+                TerminologyErrorKind::Unavailable | TerminologyErrorKind::UnknownCodeSystem,
+            ) => Severity::Warning,
         }
     }
 }
@@ -418,5 +435,26 @@ pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<Code
             Value::Object(_) => Some(CodedValue::Coding(value.clone())),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_code_system_blocks_only_when_fully_closed() {
+        let kind = TerminologyError::unknown_code_system("no content").kind();
+        assert_eq!(kind, TerminologyErrorKind::UnknownCodeSystem);
+        assert_eq!(TerminologyFailMode::Open.severity(kind), Severity::Warning);
+        assert_eq!(
+            TerminologyFailMode::ClosedRequired.severity(kind),
+            Severity::Warning
+        );
+        assert_eq!(TerminologyFailMode::Closed.severity(kind), Severity::Error);
+        assert_eq!(
+            TerminologyFailMode::ClosedRequired.severity(TerminologyErrorKind::UnknownValueSet),
+            Severity::Error
+        );
     }
 }

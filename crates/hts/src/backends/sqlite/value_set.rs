@@ -1958,6 +1958,15 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             } else {
                 found
             };
+            // UCUM is a grammar: a value set taking all of UCUM contains every
+            // well-formed unit expression, which no expansion enumerates.
+            let found = found.or_else(|| {
+                crate::ucum_validate::whole_ucum_member(
+                    compose_json_for_version.as_deref(),
+                    effective_system.as_deref(),
+                    &req.code,
+                )
+            });
 
             // When req.version is set (exact, not wildcard), override the found
             // concept's display with the one from that specific CS version.
@@ -10099,6 +10108,39 @@ mod tests {
 
         assert!(resp.result);
         assert_eq!(resp.display, Some("Concept A".into()));
+    }
+
+    // ── $validate-code: a value set taking all of UCUM ────────────────────────
+
+    #[tokio::test]
+    async fn validate_code_whole_ucum_value_set_accepts_well_formed_units() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [
+            { "resource": { "resourceType": "CodeSystem", "id": "ucum", "url": "http://unitsofmeasure.org",
+                            "name": "UCUM", "status": "active", "content": "not-present" } },
+            { "resource": { "resourceType": "ValueSet", "id": "units", "url": "http://example.org/vs-units",
+                            "name": "Units", "status": "active",
+                            "compose": { "include": [
+                              { "system": "http://snomed.info/sct", "concept": [{ "code": "733006000" }] },
+                              { "system": "http://unitsofmeasure.org" } ] } } }
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+        let check = |code: &str| ValidateCodeRequest {
+            url: Some("http://example.org/vs-units".into()),
+            system: Some("http://unitsofmeasure.org".into()),
+            code: code.into(),
+            ..Default::default()
+        };
+        for code in ["mg/m2", "{tbl}", "mm[Hg]"] {
+            let resp = b.validate_code(&ctx(), check(code)).await.unwrap();
+            assert!(resp.result, "{code}: {resp:?}");
+            assert_eq!(resp.system.as_deref(), Some("http://unitsofmeasure.org"));
+        }
+        let resp = b.validate_code(&ctx(), check("not-a-unit")).await.unwrap();
+        assert!(!resp.result, "{resp:?}");
     }
 
     // ── $validate-code: code NOT in set ───────────────────────────────────────

@@ -147,8 +147,20 @@ impl SchemaRegistry {
 }
 
 impl SchemaResolver for SchemaRegistry {
+    /// A versioned canonical (`url|version`, as instance data, `meta.profile`
+    /// and IG profiles write them — e.g. an extension URL
+    /// `…/patient-nationality|5.3.0`) resolves to the schema registered under
+    /// the bare `url`: the registry holds one schema per canonical, so the
+    /// version is advisory here (the HL7 validator likewise falls back to the
+    /// loaded version of a canonical).
     fn resolve(&self, reference: &str) -> Option<Arc<FhirSchema>> {
-        self.map.get(reference).cloned()
+        if let Some(schema) = self.map.get(reference) {
+            return Some(Arc::clone(schema));
+        }
+        match reference.split_once('|') {
+            Some((url, _)) if !url.is_empty() => self.map.get(url).cloned(),
+            _ => None,
+        }
     }
 }
 
@@ -198,6 +210,30 @@ mod tests {
         assert!(Arc::ptr_eq(&by_key, &by_url));
         assert!(Arc::ptr_eq(&by_key, &by_name));
         assert!(reg.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn versioned_canonical_resolves_by_bare_url() {
+        let mut reg = SchemaRegistry::new();
+        reg.insert(named("Patient"));
+        let bare = reg.resolve("http://example.org/Patient").unwrap();
+        let versioned = reg.resolve("http://example.org/Patient|5.3.0").unwrap();
+        assert!(Arc::ptr_eq(&bare, &versioned));
+        assert!(
+            reg.resolve("http://example.org/Patient|").is_some(),
+            "an empty version is the bare canonical"
+        );
+        assert!(reg.resolve("http://example.org/Other|1.0").is_none());
+        assert!(reg.resolve("|1.0").is_none());
+
+        // Through a composite: an overlay layer and the core layer both apply.
+        let composite =
+            CompositeResolver::new(vec![Arc::new(SchemaRegistry::new()), Arc::new(reg)]);
+        assert!(
+            composite
+                .resolve("http://example.org/Patient|4.0.1")
+                .is_some()
+        );
     }
 
     #[test]
