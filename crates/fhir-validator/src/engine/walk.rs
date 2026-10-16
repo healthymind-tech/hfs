@@ -106,6 +106,9 @@ pub(super) struct WalkCtx<'a> {
     /// `(id, resourceType)` of the contained resources of each resource
     /// being walked, innermost last (for `#id` reference targets).
     contained: Vec<Vec<(String, String)>>,
+    /// `(fullUrl, resourceType)` of the entries of each Bundle being
+    /// walked, innermost last (for Bundle-internal reference targets).
+    bundle_entries: Vec<Vec<(String, String)>>,
 }
 
 impl<'a> WalkCtx<'a> {
@@ -119,6 +122,16 @@ impl<'a> WalkCtx<'a> {
     }
 
     /// The type of the contained resource `id` of the innermost resource.
+    /// The type of the entry whose `fullUrl` is `url` in the innermost
+    /// Bundle being walked.
+    pub(super) fn bundle_entry_type(&self, url: &str) -> Option<String> {
+        self.bundle_entries
+            .last()?
+            .iter()
+            .find(|(full_url, _)| full_url == url)
+            .map(|(_, rt)| rt.clone())
+    }
+
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
         self.contained
             .last()?
@@ -184,6 +197,7 @@ pub(super) fn validate(
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
+        bundle_entries: Vec::new(),
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -417,8 +431,12 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
     }
 
     let is_resource = obj.get("resourceType").is_some_and(Value::is_string);
+    let is_bundle = obj.get("resourceType").and_then(Value::as_str) == Some("Bundle");
     if is_resource {
         ctx.contained.push(contained_types(obj));
+        if is_bundle {
+            ctx.bundle_entries.push(bundle_entry_types(obj));
+        }
         check_resource_id(ctx, set, obj);
     }
 
@@ -452,6 +470,9 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
 
     if is_resource {
         ctx.contained.pop();
+        if is_bundle {
+            ctx.bundle_entries.pop();
+        }
     }
 }
 
@@ -483,6 +504,28 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
         ctx.error(ErrorKind::PrimitiveValue, errors::msg_resource_id(id));
         ctx.path.pop();
     }
+}
+
+/// `(fullUrl, resourceType)` of a Bundle's entries.
+fn bundle_entry_types(bundle: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    bundle
+        .get("entry")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some((
+                        e.get("fullUrl")?.as_str()?.to_string(),
+                        e.get("resource")?
+                            .get("resourceType")?
+                            .as_str()?
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
@@ -1497,6 +1540,34 @@ mod tests {
         let errors = reference_errors(&bundle("collection", dangling), &[]);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].severity, Severity::Warning);
+    }
+
+    /// A Bundle-internal URN reference is typed by the entry it names:
+    /// Observation.subject pointing at an Organization entry is invalid.
+    #[test]
+    fn bundle_urn_references_are_type_checked() {
+        let bundle = |target_type: &str| {
+            json!({
+                "resourceType": "Bundle", "type": "transaction",
+                "entry": [
+                    {"fullUrl": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                     "resource": {"resourceType": target_type},
+                     "request": {"method": "POST", "url": target_type}},
+                    {"fullUrl": "urn:uuid:22222222-2222-2222-2222-222222222222",
+                     "resource": observation(json!({"reference": "urn:uuid:11111111-1111-1111-1111-111111111111"})),
+                     "request": {"method": "POST", "url": "Observation"}}
+                ]
+            })
+        };
+        assert!(reference_errors(&bundle("Patient"), &[]).is_empty());
+        let errors = reference_errors(&bundle("Organization"), &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].kind, ErrorKind::ReferenceInvalid);
+        assert_eq!(errors[0].path, "Bundle.entry.1.resource.subject");
+        assert!(
+            errors[0].message.contains("Found Organization"),
+            "{errors:?}"
+        );
     }
 
     #[test]
