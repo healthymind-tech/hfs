@@ -103,7 +103,10 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
                     .collect();
             }
         };
-        let context = EvaluationContext::new(vec![typed]);
+        let mut context = EvaluationContext::new(vec![typed]);
+        // Sound: every AST evaluated here is held by `self.asts` for the
+        // life of the evaluator, which outlives this context.
+        context.enable_root_memo();
         let mut nodes = NodeCache::default();
 
         constraints
@@ -488,23 +491,27 @@ mod tests {
         let started = std::time::Instant::now();
         evaluator.evaluate_all(&resource, FhirVersion::R4, &constraints);
         eprintln!("{} constraints, all at once: {:?}", constraints.len(), started.elapsed());
-        let mut by_id: std::collections::BTreeMap<&str, (usize, std::time::Duration)> =
+        // Per invariant id: all its occurrences in one call (one typed parse
+        // and node navigation each, subtracted below).
+        let mut groups: std::collections::BTreeMap<&str, Vec<DeferredConstraint<'_>>> =
             Default::default();
         for c in &constraints {
+            groups.entry(c.id).or_default().push(*c);
+        }
+        let mut by_id: std::collections::BTreeMap<&str, (usize, std::time::Duration)> =
+            Default::default();
+        for (id, group) in &groups {
             let t = std::time::Instant::now();
-            evaluator.evaluate_all(&resource, FhirVersion::R4, std::slice::from_ref(c));
-            let e = by_id.entry(c.id).or_default();
-            e.0 += 1;
-            e.1 += t.elapsed();
+            evaluator.evaluate_all(&resource, FhirVersion::R4, group);
+            by_id.insert(id, (group.len(), t.elapsed()));
         }
         let typed = std::time::Instant::now();
-        let _ = super::parse_typed(&resource, FhirVersion::R4).map(|t| {
-            helios_fhirpath::EvaluationContext::new(vec![t])
-        });
+        let _ = super::parse_typed(&resource, FhirVersion::R4)
+            .map(|t| helios_fhirpath::EvaluationContext::new(vec![t]));
         let per_call = typed.elapsed();
         let mut rows: Vec<_> = by_id.into_iter().collect();
         rows.sort_by_key(|(_, (_, d))| std::cmp::Reverse(*d));
-        eprintln!("(each single call includes the typed parse + context: {per_call:?})");
+        eprintln!("(each group call includes the typed parse + context: {per_call:?})");
         for (id, (n, d)) in rows.iter().take(25) {
             eprintln!("{id:>10} x{n:<5} {d:?}");
         }

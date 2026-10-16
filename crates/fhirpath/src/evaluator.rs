@@ -174,7 +174,16 @@ pub struct EvaluationContext {
     /// Debug tracer for step-by-step evaluation tracing.
     /// When set (gated by FHIRPATH_DEBUG_TRACE env var), records every evaluate() step.
     pub debug_tracer: Option<Arc<Mutex<crate::debug_trace::DebugTracer>>>,
+
+    /// Opt-in memo of `%resource`-rooted navigation chains (see
+    /// [`EvaluationContext::enable_root_memo`]); shared by clones.
+    pub root_memo: Option<RootMemo>,
 }
+
+/// Results of `%resource`/`%rootResource` navigation chains, keyed by the
+/// address of their AST node. Only sound while those ASTs stay alive and
+/// unchanged for as long as the context is used.
+pub type RootMemo = Arc<Mutex<HashMap<usize, EvaluationResult>>>;
 
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
@@ -193,6 +202,7 @@ impl Clone for EvaluationContext {
             parent_context: self.parent_context.clone(),
             terminology_server_url: self.terminology_server_url.clone(),
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
+            root_memo: self.root_memo.clone(),
         }
     }
 }
@@ -259,6 +269,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -294,6 +305,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -324,6 +336,7 @@ impl EvaluationContext {
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
+            root_memo: None,
         }
     }
 
@@ -412,6 +425,23 @@ impl EvaluationContext {
     /// # Arguments
     ///
     /// * `value` - The value to set as the 'this' context
+    /// Memoize `%resource`/`%rootResource`-rooted navigation chains for the
+    /// lifetime of this context (and its clones).
+    ///
+    /// Such a chain does not depend on the focus, yet an invariant like
+    /// `sdf-8` (`snapshot.element.tail().all(path.startsWith(%resource.snapshot
+    /// .element.first().path & '.'))`) re-evaluates it — converting and
+    /// navigating the whole root resource — for every item. With the memo it
+    /// runs once per context.
+    ///
+    /// The memo is keyed by AST node address, so the caller must keep every
+    /// expression it evaluates against this context alive and unmodified
+    /// while the context is in use (e.g. ASTs held by a long-lived parse
+    /// cache), and must not evaluate after changing `resources`.
+    pub fn enable_root_memo(&mut self) {
+        self.root_memo = Some(Arc::new(Mutex::new(HashMap::new())));
+    }
+
     pub fn set_this(&mut self, value: EvaluationResult) {
         self.this = Some(Arc::new(value));
     }
@@ -565,6 +595,7 @@ impl EvaluationContext {
             parent_context: Some(Box::new(self.clone())), // Clone entire parent context
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
+            root_memo: self.root_memo.clone(),
         }
     }
 
@@ -773,6 +804,21 @@ pub fn evaluate(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
+    if let Some(memo) = &context.root_memo
+        && is_root_chain(expr)
+    {
+        let key = expr as *const Expression as usize;
+        if let Some(hit) = memo.lock().get(&key).cloned() {
+            return Ok(hit);
+        }
+        let Expression::Invocation(left_expr, invocation) = expr else {
+            unreachable!("is_root_chain only accepts invocations");
+        };
+        let left = evaluate(left_expr, context, None)?;
+        let result = evaluate_invocation(&left, invocation, context, None)?;
+        memo.lock().insert(key, result.clone());
+        return Ok(result);
+    }
     // FHIRPath Spec Section 3: Path Selection
     // "When resolving an identifier that is also the root of a FHIRPath expression,
     // it is resolved as a type name first, and if it resolves to a type, it must
@@ -3348,6 +3394,39 @@ fn extract_precision_keyword(expr: &Expression) -> Result<String, EvaluationErro
         _ => Err(EvaluationError::InvalidArgument(
             "Precision argument must be a string literal or keyword identifier".to_string(),
         )),
+    }
+}
+
+/// Whether `expr` is a navigation chain rooted at `%resource` or
+/// `%rootResource` that depends on nothing but the root resource: member
+/// accesses and argument-less, side-effect-free functions only.
+fn is_root_chain(expr: &Expression) -> bool {
+    const PURE: &[&str] = &[
+        "first", "last", "tail", "single", "count", "exists", "empty", "distinct",
+        "isDistinct", "children", "descendants", "hasValue", "not",
+    ];
+    let mut current = expr;
+    let mut steps = 0;
+    loop {
+        match current {
+            Expression::Invocation(left, invocation) => {
+                match invocation {
+                    Invocation::Member(_) => {}
+                    Invocation::Function(name, args)
+                        if args.is_empty() && PURE.contains(&name.as_str()) => {}
+                    _ => return false,
+                }
+                steps += 1;
+                current = left;
+            }
+            Expression::Term(Term::ExternalConstant(name)) => {
+                return steps > 0 && (name == "resource" || name == "rootResource");
+            }
+            Expression::Term(Term::Invocation(Invocation::Member(name))) => {
+                return steps > 0 && (name == "%resource" || name == "%rootResource");
+            }
+            _ => return false,
+        }
     }
 }
 
