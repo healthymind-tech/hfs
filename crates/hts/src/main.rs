@@ -17,14 +17,49 @@ use helios_hts::state::AppState;
 #[cfg(feature = "postgres")]
 use helios_hts::backends::PostgresTerminologyBackend;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The stop-signal guard of `hts run` (see
+/// [`helios_observability::shutdown::StopGuard`]); the servers mark it
+/// serving once they listen.
+static STOP: std::sync::OnceLock<helios_observability::shutdown::StopGuard> =
+    std::sync::OnceLock::new();
+
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Dropping the runtime would wait without limit for blocking tasks still
+    // running (SQLite queries, an import job); a stopped server must not
+    // linger — and keep its port — for them.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+/// Marks the server as listening (a stop signal now drains it).
+fn serving() {
+    if let Some(stop) = STOP.get() {
+        stop.serving();
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli
         .command
         .unwrap_or_else(|| Command::Run(HtsConfig::parse_from(["hts"])))
     {
         Command::Run(config) => {
+            // Listen for SIGTERM/SIGINT before the startup work (bootstrap
+            // imports, closure and FTS builds): as PID 1 in a container an
+            // unhandled SIGTERM is discarded. `HTS_SHUTDOWN_TIMEOUT` bounds
+            // the drain (default 9 s, under `docker stop`'s 10 s).
+            let _ = STOP.set(helios_observability::shutdown::StopGuard::install(
+                "hts",
+                helios_observability::shutdown::parse_grace(
+                    std::env::var("HTS_SHUTDOWN_TIMEOUT").ok().as_deref(),
+                    std::time::Duration::from_secs(9),
+                ),
+            ));
             helios_observability::uptime::init();
             helios_observability::telemetry::init("hts", &config.log_level);
             helios_observability::metrics::init("hts");
@@ -167,6 +202,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serving();
     axum::serve(
         listener,
         // Peer addresses feed the admin audit trail (`admin::audit`).
@@ -239,6 +275,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     info!(address = %addr, "HTS (PostgreSQL) listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serving();
     axum::serve(
         listener,
         // Peer addresses feed the admin audit trail (`admin::audit`).
