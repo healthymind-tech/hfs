@@ -23,8 +23,8 @@ use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
     CodedValue, CompositeResolver, CompositeTerminologyProvider, EffectHandlers, ErrorKind,
     SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyFailMode,
-    TerminologyProvider, UnknownProfilePolicy, ValidationError, ValidationOptions, Validator,
-    dotted_to_fhirpath,
+    TerminologyProvider, TxCheck, TxVerdict, UnknownProfilePolicy, ValidationError,
+    ValidationOptions, Validator, dotted_to_fhirpath,
 };
 use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -95,6 +95,10 @@ pub struct ValidationService {
     suppress_constraints: Vec<String>,
     /// How terminology-service failures on required bindings are reported.
     terminology_fail: TerminologyFailMode,
+    /// Severity of a wrong `Coding.display` (`HFS_VALIDATION_DISPLAY_ISSUES`).
+    display_issues: Severity,
+    /// Check `extensible` bindings (`HFS_VALIDATION_EXTENSIBLE_BINDINGS`).
+    check_extensible: bool,
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
@@ -126,6 +130,8 @@ impl Default for ValidationService {
             terminology: None,
             suppress_constraints: vec!["dom-6".to_string()],
             terminology_fail: TerminologyFailMode::Open,
+            display_issues: Severity::Warning,
+            check_extensible: true,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
@@ -200,6 +206,11 @@ impl ValidationService {
             terminology,
             suppress_constraints: config.suppress_constraints.clone(),
             terminology_fail,
+            display_issues: match config.display_issues.as_str() {
+                "error" => Severity::Error,
+                _ => Severity::Warning,
+            },
+            check_extensible: config.extensible_bindings != "off",
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
@@ -311,6 +322,8 @@ impl ValidationService {
             terminology: self.terminology.as_deref(),
             suppress_constraints: &self.suppress_constraints,
             terminology_fail: self.terminology_fail,
+            display_issues: self.display_issues,
+            check_extensible: self.check_extensible,
         };
         validator
             .validate(resource, version, &opts, &handlers)
@@ -1094,8 +1107,9 @@ fn prepare_stored_profiles(
 pub struct RemoteTerminologyProvider {
     base_url: String,
     client: reqwest::Client,
-    /// `(valueSet, coded-token)` → validity, cached for [`CACHE_TTL`].
-    cache: DashMap<String, (bool, Instant)>,
+    /// Check key (value set + coded value, or code system + coding) →
+    /// verdict, cached for [`CACHE_TTL`].
+    cache: DashMap<String, (TxVerdict, Instant)>,
     /// ValueSets the server answered "not found" for, cached for
     /// [`UNKNOWN_VALUE_SET_TTL`] so one missing IG value set costs one
     /// round-trip per TTL instead of one per coded element.
@@ -1106,6 +1120,10 @@ pub struct RemoteTerminologyProvider {
     /// ValueSet canonical → its `compose` (`Value::Null` when the server
     /// does not return one).
     value_set_composes: DashMap<String, (Value, Instant)>,
+    /// Check key → "cannot be checked" message (a negative answer over a
+    /// code system without content), cached like verdicts so a resource
+    /// using such a system does not cost a round trip on every validation.
+    unverifiable: DashMap<String, (String, Instant)>,
 }
 
 /// How long `$validate-code` verdicts are cached.
@@ -1138,6 +1156,7 @@ impl RemoteTerminologyProvider {
             unknown_value_sets: DashMap::new(),
             contentless_systems: DashMap::new(),
             value_set_composes: DashMap::new(),
+            unverifiable: DashMap::new(),
         }
     }
 
@@ -1342,19 +1361,62 @@ impl RemoteTerminologyProvider {
 }
 
 impl RemoteTerminologyProvider {
-    fn cache_key(value_set: &str, coded: &CodedValue) -> String {
-        format!("{value_set}|{coded:?}")
+    fn cache_key(check: &TxCheck<'_>) -> String {
+        match check {
+            TxCheck::InValueSet(value_set, coded) => format!("{value_set}|{coded:?}"),
+            TxCheck::Coding(coding) => format!(
+                "cs|{}|{}|{}|{}",
+                coding.get("system").and_then(Value::as_str).unwrap_or_default(),
+                coding.get("version").and_then(Value::as_str).unwrap_or_default(),
+                coding.get("code").and_then(Value::as_str).unwrap_or_default(),
+                coding.get("display").and_then(Value::as_str).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The operation and Parameters for one check.
+    fn request(check: &TxCheck<'_>) -> (&'static str, Value) {
+        match check {
+            TxCheck::InValueSet(value_set, coded) => {
+                ("ValueSet/$validate-code", Self::payload(value_set, coded))
+            }
+            TxCheck::Coding(coding) => ("CodeSystem/$validate-code", Self::coding_payload(coding)),
+        }
+    }
+
+    /// `CodeSystem/$validate-code` Parameters for one Coding: the system as
+    /// `url`, the code, and the display and version when the Coding has them.
+    fn coding_payload(coding: &Value) -> Value {
+        let text = |k: &str| coding.get(k).and_then(Value::as_str);
+        let mut parameter = vec![
+            json!({ "name": "url", "valueUri": text("system").unwrap_or_default() }),
+            json!({ "name": "code", "valueCode": text("code").unwrap_or_default() }),
+        ];
+        if let Some(version) = text("version") {
+            parameter.push(json!({ "name": "version", "valueString": version }));
+        }
+        if let Some(display) = text("display") {
+            parameter.push(json!({ "name": "display", "valueString": display }));
+        }
+        json!({ "resourceType": "Parameters", "parameter": parameter })
     }
 
     /// A still-fresh cached verdict (or remembered unknown value set).
-    fn cached(&self, value_set: &str, key: &str) -> Option<Result<bool, TerminologyError>> {
+    fn cached(&self, check: &TxCheck<'_>, key: &str) -> Option<Result<TxVerdict, TerminologyError>> {
         if let Some(entry) = self.cache.get(key) {
-            let (verdict, at) = *entry;
+            let (verdict, at) = &*entry;
             if at.elapsed() < CACHE_TTL {
-                return Some(Ok(verdict));
+                return Some(Ok(verdict.clone()));
             }
         }
-        if let Some(at) = self.unknown_value_sets.get(value_set)
+        if let Some(entry) = self.unverifiable.get(key) {
+            let (message, at) = &*entry;
+            if at.elapsed() < CACHE_TTL {
+                return Some(Err(TerminologyError::unknown_code_system(message.clone())));
+            }
+        }
+        if let TxCheck::InValueSet(value_set, _) = check
+            && let Some(at) = self.unknown_value_sets.get(*value_set)
             && at.elapsed() < UNKNOWN_VALUE_SET_TTL
         {
             return Some(Err(TerminologyError::unknown_value_set(format!(
@@ -1364,27 +1426,46 @@ impl RemoteTerminologyProvider {
         None
     }
 
-    /// Interpret one `$validate-code` answer (plain or batch entry) and
-    /// cache what it says.
-    fn settle(
-        &self,
-        value_set: &str,
-        key: String,
-        url: &str,
-        status: reqwest::StatusCode,
-        body: Option<&Value>,
-        raw: &str,
-    ) -> Result<bool, TerminologyError> {
-        if !status.is_success() {
-            let error = Self::classify_failure(url, status, raw);
-            if error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet {
-                self.unknown_value_sets
-                    .insert(value_set.to_string(), Instant::now());
-            }
-            return Err(error);
-        }
-        let verdict = body
-            .and_then(|b| b.get("parameter"))
+    /// The `issues` OperationOutcome issues of a `$validate-code` answer.
+    fn answer_issues(body: &Value) -> Vec<&Value> {
+        body.get("parameter")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|p| p.get("name").and_then(Value::as_str) == Some("issues"))
+            .filter_map(|p| p.pointer("/resource/issue").and_then(Value::as_array))
+            .flatten()
+            .collect()
+    }
+
+    /// The `tx-issue-type` code of an issue (`invalid-display`, `not-found`, ...).
+    fn tx_issue_type(issue: &Value) -> Option<&str> {
+        issue
+            .pointer("/details/coding")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|c| {
+                c.get("system").and_then(Value::as_str)
+                    == Some("http://hl7.org/fhir/tools/CodeSystem/tx-issue-type")
+            })?
+            .get("code")
+            .and_then(Value::as_str)
+    }
+
+    fn is_display_issue(issue: &Value) -> bool {
+        Self::tx_issue_type(issue) == Some("invalid-display")
+    }
+
+    /// Read the verdict out of a successful `$validate-code` answer.
+    ///
+    /// A wrong display never makes the code itself invalid: a `false` whose
+    /// only error issues are `invalid-display` counts as valid (the HL7
+    /// validator reports the display separately, as a display issue). For a
+    /// Coding check the display issue text and an unknown code system are
+    /// carried in the verdict.
+    fn read_verdict(check: &TxCheck<'_>, body: &Value) -> Result<TxVerdict, TerminologyError> {
+        let result = body
+            .get("parameter")
             .and_then(Value::as_array)
             .and_then(|params| {
                 params
@@ -1394,24 +1475,113 @@ impl RemoteTerminologyProvider {
             .and_then(|p| p.get("valueBoolean"))
             .and_then(Value::as_bool)
             .ok_or_else(|| TerminologyError::new("no boolean 'result' parameter in response"))?;
-        self.cache.insert(key, (verdict, Instant::now()));
+        let issues = Self::answer_issues(body);
+        let display_only = !result
+            && issues.iter().any(|i| Self::is_display_issue(i))
+            && issues
+                .iter()
+                .filter(|i| i.get("severity").and_then(Value::as_str) == Some("error"))
+                .all(|i| Self::is_display_issue(i));
+        match check {
+            TxCheck::InValueSet(..) => Ok(TxVerdict::member(result || display_only)),
+            TxCheck::Coding(_) => {
+                let wrong_display = issues
+                    .iter()
+                    .find(|i| Self::is_display_issue(i))
+                    .and_then(|i| i.pointer("/details/text").and_then(Value::as_str))
+                    .map(str::to_string);
+                let unknown_system = Self::caused_by_unknown_system(body).is_some()
+                    || issues.iter().any(|i| {
+                        i.pointer("/extension/0/valueString").and_then(Value::as_str)
+                            == Some("UNKNOWN_CODESYSTEM")
+                    });
+                Ok(TxVerdict {
+                    valid: true,
+                    wrong_display,
+                    unknown_system,
+                })
+            }
+        }
+    }
+
+    /// Interpret one `$validate-code` answer (plain or batch entry) and
+    /// cache what it says.
+    fn settle(
+        &self,
+        check: &TxCheck<'_>,
+        key: String,
+        url: &str,
+        status: reqwest::StatusCode,
+        body: Option<&Value>,
+        raw: &str,
+    ) -> Result<TxVerdict, TerminologyError> {
+        // A code-system check the server refuses (unknown version such as a
+        // SNOMED US edition URI, malformed system ...) can produce no issue;
+        // remember it as "nothing to report" so it is not asked again on
+        // every validation.
+        if matches!(check, TxCheck::Coding(_)) && status.is_client_error() {
+            let verdict = TxVerdict::valid();
+            self.cache.insert(key, (verdict.clone(), Instant::now()));
+            return Ok(verdict);
+        }
+        if !status.is_success() {
+            let error = Self::classify_failure(url, status, raw);
+            if let TxCheck::InValueSet(value_set, _) = check
+                && error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet
+            {
+                self.unknown_value_sets
+                    .insert(value_set.to_string(), Instant::now());
+            }
+            return Err(error);
+        }
+        let verdict = Self::read_verdict(check, body.unwrap_or(&Value::Null))?;
+        self.cache.insert(key, (verdict.clone(), Instant::now()));
         Ok(verdict)
     }
 
+    /// One check, one request.
+    async fn check_one(&self, check: &TxCheck<'_>) -> Result<TxVerdict, TerminologyError> {
+        let key = Self::cache_key(check);
+        if let Some(cached) = self.cached(check, &key) {
+            return cached;
+        }
+        let (op, payload) = Self::request(check);
+        let url = format!("{}/{op}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| TerminologyError::new(format!("request to {url} failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return self.settle(check, key, &url, status, None, &body);
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
+        let verdict = self.settle(check, key, &url, status, Some(&body), "");
+        self.check_unverifiable(check, &body, verdict).await
+    }
+
     /// Several uncached checks in one FHIR `batch` Bundle (`POST [base]`,
-    /// one `POST ValueSet/$validate-code` entry each). `None` when the
-    /// server did not answer the batch as a whole, so the caller can fall
-    /// back to single requests.
-    async fn validate_batch(
+    /// one `POST ValueSet/$validate-code` or `CodeSystem/$validate-code`
+    /// entry each). `None` when the server did not answer the batch as a
+    /// whole, so the caller can fall back to single requests.
+    async fn check_batch(
         &self,
-        checks: &[(&str, &CodedValue)],
-    ) -> Option<Vec<Result<bool, TerminologyError>>> {
+        checks: &[TxCheck<'_>],
+    ) -> Option<Vec<Result<TxVerdict, TerminologyError>>> {
         let entries: Vec<Value> = checks
             .iter()
-            .map(|(value_set, coded)| {
+            .map(|check| {
+                let (op, payload) = Self::request(check);
                 json!({
-                    "request": {"method": "POST", "url": "ValueSet/$validate-code"},
-                    "resource": Self::payload(value_set, coded),
+                    "request": {"method": "POST", "url": op},
+                    "resource": payload,
                 })
             })
             .collect();
@@ -1427,57 +1597,58 @@ impl RemoteTerminologyProvider {
         if answers.len() != checks.len() {
             return None;
         }
-        let op_url = format!("{}/ValueSet/$validate-code", self.base_url);
-        let settled: Vec<Result<bool, TerminologyError>> = checks
-                .iter()
-                .zip(answers)
-                .map(|((value_set, coded), answer)| {
-                    let status = answer
-                        .pointer("/response/status")
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.split_whitespace().next())
-                        .and_then(|code| code.parse::<u16>().ok())
-                        .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
-                        .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-                    let resource = answer.get("resource");
-                    let raw = resource.map(Value::to_string).unwrap_or_default();
-                    self.settle(
-                        value_set,
-                        Self::cache_key(value_set, coded),
-                        &op_url,
-                        status,
-                        resource,
-                        &raw,
-                    )
-                })
-                .collect();
-        // A `false` may only mean the code system has no content on the
-        // server; that check stays per verdict (rare: only on failures).
-        let mut out = Vec::with_capacity(settled.len());
-        for (((value_set, coded), answer), verdict) in checks.iter().zip(answers).zip(settled) {
-            let body = answer.get("resource").cloned().unwrap_or(Value::Null);
-            out.push(self.check_unverifiable(value_set, coded, &body, verdict).await);
+        let mut out = Vec::with_capacity(checks.len());
+        for (check, answer) in checks.iter().zip(answers) {
+            let status = answer
+                .pointer("/response/status")
+                .and_then(Value::as_str)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|code| code.parse::<u16>().ok())
+                .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+            let resource = answer.get("resource");
+            let raw = resource.map(Value::to_string).unwrap_or_default();
+            let op_url = format!("{}/{}", self.base_url, Self::request(check).0);
+            let verdict = self.settle(
+                check,
+                Self::cache_key(check),
+                &op_url,
+                status,
+                resource,
+                &raw,
+            );
+            // A `false` may only mean the code system has no content on the
+            // server; that check stays per verdict (rare: only on failures).
+            let body = resource.cloned().unwrap_or(Value::Null);
+            out.push(self.check_unverifiable(check, &body, verdict).await);
         }
         Some(out)
     }
 
-    /// N's rule: a negative verdict over a code system the server has no
-    /// content for is "cannot check", not "invalid" (and is not cached).
+    /// N's rule: a negative membership verdict over a code system the
+    /// server has no content for is "cannot check", not "invalid" (and is
+    /// not cached).
     async fn check_unverifiable(
         &self,
-        value_set: &str,
-        coded: &CodedValue,
+        check: &TxCheck<'_>,
         body: &Value,
-        verdict: Result<bool, TerminologyError>,
-    ) -> Result<bool, TerminologyError> {
-        if matches!(verdict, Ok(false))
+        verdict: Result<TxVerdict, TerminologyError>,
+    ) -> Result<TxVerdict, TerminologyError> {
+        let TxCheck::InValueSet(value_set, coded) = check else {
+            return verdict;
+        };
+        if matches!(&verdict, Ok(v) if !v.valid)
             && let Some(system) = self.unverifiable_system(value_set, coded, body).await
         {
-            self.cache.remove(&Self::cache_key(value_set, coded));
-            return Err(TerminologyError::unknown_code_system(format!(
+            let key = Self::cache_key(check);
+            self.cache.remove(&key);
+            let message = format!(
                 "code system '{system}' has no content on the terminology server \
                  (unknown, or a content=not-present stub), so the code cannot be checked"
-            )));
+            );
+            self.unverifiable
+                .insert(key, (message.clone(), Instant::now()));
+            return Err(TerminologyError::unknown_code_system(message));
         }
         verdict
     }
@@ -1490,46 +1661,37 @@ impl TerminologyProvider for RemoteTerminologyProvider {
         value_set: &str,
         coded: &CodedValue,
     ) -> Result<bool, TerminologyError> {
-        let key = Self::cache_key(value_set, coded);
-        if let Some(cached) = self.cached(value_set, &key) {
-            return cached;
-        }
+        self.check_one(&TxCheck::InValueSet(value_set, coded))
+            .await
+            .map(|v| v.valid)
+    }
 
-        let url = format!("{}/ValueSet/$validate-code", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .json(&Self::payload(value_set, coded))
-            .send()
+    async fn validate_codes(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Vec<Result<bool, TerminologyError>> {
+        let checks: Vec<TxCheck<'_>> = checks
+            .iter()
+            .map(|(value_set, coded)| TxCheck::InValueSet(value_set, coded))
+            .collect();
+        self.check(&checks)
             .await
-            .map_err(|e| TerminologyError::new(format!("request to {url} failed: {e}")))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return self.settle(value_set, key, &url, status, None, &body);
-        }
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
-        let verdict = self.settle(value_set, key, &url, status, Some(&body), "");
-        self.check_unverifiable(value_set, coded, &body, verdict).await
+            .into_iter()
+            .map(|v| v.map(|v| v.valid))
+            .collect()
     }
 
     /// One round trip per resource: cached verdicts answer locally,
     /// duplicates are asked once, the rest go out as one batch Bundle
     /// (single requests, concurrently, if the server rejects batches).
-    async fn validate_codes(
-        &self,
-        checks: &[(&str, &CodedValue)],
-    ) -> Vec<Result<bool, TerminologyError>> {
-        let mut out: Vec<Option<Result<bool, TerminologyError>>> = vec![None; checks.len()];
+    async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        let mut out: Vec<Option<Result<TxVerdict, TerminologyError>>> = vec![None; checks.len()];
         // Distinct uncached checks, each with the positions it answers.
-        let mut pending: Vec<((&str, &CodedValue), Vec<usize>)> = Vec::new();
+        let mut pending: Vec<(TxCheck<'_>, Vec<usize>)> = Vec::new();
         let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (i, (value_set, coded)) in checks.iter().enumerate() {
-            let key = Self::cache_key(value_set, coded);
-            if let Some(cached) = self.cached(value_set, &key) {
+        for (i, check) in checks.iter().enumerate() {
+            let key = Self::cache_key(check);
+            if let Some(cached) = self.cached(check, &key) {
                 out[i] = Some(cached);
                 continue;
             }
@@ -1537,25 +1699,20 @@ impl TerminologyProvider for RemoteTerminologyProvider {
                 Some(&slot) => pending[slot].1.push(i),
                 None => {
                     by_key.insert(key, pending.len());
-                    pending.push(((*value_set, *coded), vec![i]));
+                    pending.push((*check, vec![i]));
                 }
             }
         }
         if !pending.is_empty() {
-            let requests: Vec<(&str, &CodedValue)> = pending.iter().map(|(c, _)| *c).collect();
+            let requests: Vec<TxCheck<'_>> = pending.iter().map(|(c, _)| *c).collect();
             let verdicts = match requests.len() {
                 1 => None,
-                _ => self.validate_batch(&requests).await,
+                _ => self.check_batch(&requests).await,
             };
             let verdicts = match verdicts {
                 Some(v) => v,
                 None => {
-                    futures::future::join_all(
-                        requests
-                            .iter()
-                            .map(|(value_set, coded)| self.validate_code(value_set, coded)),
-                    )
-                    .await
+                    futures::future::join_all(requests.iter().map(|c| self.check_one(c))).await
                 }
             };
             for ((_, positions), verdict) in pending.iter().zip(verdicts) {
@@ -1594,6 +1751,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         // A Bundle-internal URN reference no entry provides.
         ErrorKind::ReferenceUnresolved => IssueType::NotFound,
         ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
+        // An HL7-namespace code system nobody defines: invalid content.
+        ErrorKind::UnknownCodeSystem => IssueType::Invalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.
@@ -1714,6 +1873,100 @@ mod remote_provider_tests {
                     "coding".into(),
                     json!({ "system": "http://s", "code": "c" })
                 ),
+            ]
+        );
+    }
+
+    fn answer(result: bool, issues: Vec<Value>, extra: Vec<Value>) -> Value {
+        let mut parameter = vec![json!({"name": "result", "valueBoolean": result})];
+        if !issues.is_empty() {
+            parameter.push(json!({"name": "issues", "resource": {
+                "resourceType": "OperationOutcome", "issue": issues}}));
+        }
+        parameter.extend(extra);
+        json!({"resourceType": "Parameters", "parameter": parameter})
+    }
+
+    fn issue(severity: &str, tx_type: &str, text: &str, message_id: Option<&str>) -> Value {
+        let mut i = json!({"severity": severity, "code": "invalid",
+            "details": {"coding": [{"system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                "code": tx_type}], "text": text}});
+        if let Some(id) = message_id {
+            i["extension"] = json!([{"url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                "valueString": id}]);
+        }
+        i
+    }
+
+    /// A `false` whose only error is a wrong display is a valid code — the
+    /// NGS specimen types (`LP7057-5` "Bld") must not fail their binding.
+    #[test]
+    fn a_wrong_display_never_makes_a_code_invalid() {
+        let coded = CodedValue::Coding(json!({"system": "http://loinc.org", "code": "LP7057-5", "display": "Bld"}));
+        let vs = TxCheck::InValueSet("http://example.org/vs", &coded);
+        let display = issue("error", "invalid-display", "Wrong Display Name 'Bld'", None);
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &vs,
+            &answer(false, vec![display.clone()], vec![]),
+        )
+        .unwrap();
+        assert!(verdict.valid);
+
+        // Another error next to the display one: really not in the set.
+        let not_in = issue("error", "not-in-vs", "not in the value set", None);
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &vs,
+            &answer(false, vec![display.clone(), not_in], vec![]),
+        )
+        .unwrap();
+        assert!(!verdict.valid);
+
+        // A plain `false` without issues stays invalid.
+        let verdict =
+            RemoteTerminologyProvider::read_verdict(&vs, &answer(false, vec![], vec![])).unwrap();
+        assert!(!verdict.valid);
+    }
+
+    #[test]
+    fn coding_checks_carry_display_and_unknown_system() {
+        let coding = json!({"system": "http://loinc.org", "code": "787-2", "display": "MCV"});
+        let check = TxCheck::Coding(&coding);
+        let text = "Wrong Display Name 'MCV' for http://loinc.org#787-2. Valid display is 'MCV [Entitic mean volume] in Red Blood Cells by Automated count'";
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &check,
+            &answer(false, vec![issue("error", "invalid-display", text, Some("Display_Name_for__should_be_one_of__instead_of"))], vec![]),
+        )
+        .unwrap();
+        assert!(verdict.valid);
+        assert_eq!(verdict.wrong_display.as_deref(), Some(text));
+        assert!(!verdict.unknown_system);
+
+        let unknown = issue(
+            "error",
+            "not-found",
+            "A definition for CodeSystem 'http://terminology.hl7.org/CodeSystem/v3-ActEncounterCode' could not be found",
+            Some("UNKNOWN_CODESYSTEM"),
+        );
+        let verdict =
+            RemoteTerminologyProvider::read_verdict(&check, &answer(false, vec![unknown], vec![]))
+                .unwrap();
+        assert!(verdict.unknown_system);
+        assert!(verdict.wrong_display.is_none());
+
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &check,
+            &answer(false, vec![], vec![json!({"name": "x-unknown-system", "valueCanonical": "http://x"})]),
+        )
+        .unwrap();
+        assert!(verdict.unknown_system);
+
+        let payload = RemoteTerminologyProvider::coding_payload(&coding);
+        assert_eq!(
+            names_and_values(&payload),
+            vec![
+                ("url".into(), json!("http://loinc.org")),
+                ("code".into(), json!("787-2")),
+                ("display".into(), json!("MCV")),
             ]
         );
     }

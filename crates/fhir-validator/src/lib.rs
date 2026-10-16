@@ -50,8 +50,9 @@
 //!   emits a warning when it cannot build a match). `profile` matching
 //!   validates the item structurally against the profile.
 //! - `refers` (reference target types) is carried but not enforced.
-//! - `extensible`-strength bindings are never checked (only `required`,
-//!   per the FHIR Schema spec); a warning mode may come later.
+//! - `extensible`-strength bindings are only checked on request
+//!   ([`EffectHandlers::check_extensible`], warning severity); the FHIR
+//!   Schema spec enforces `required` only.
 //! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
 //!   resource and evaluates via `path.all(expr)`, so invariants relying on
 //!   nested-resource `%resource` semantics can misfire (helios-fhirpath
@@ -83,7 +84,7 @@ pub use editor::{
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
     EffectHandlers, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
-    TerminologyProvider,
+    TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
@@ -91,4 +92,6 @@ pub use engine::{
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
-pub use terminology::{CompositeTerminologyProvider, CoreTerminology, core_terminology};
+pub use terminology::{
+    CompositeTerminologyProvider, CoreTerminology, core_terminology, is_hl7_namespace,
+};

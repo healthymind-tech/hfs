@@ -300,7 +300,52 @@ async fn non_required_bindings_are_not_checked() {
             &handlers,
         )
         .await;
-    assert_eq!(errors, vec![], "extensible bindings must not be enforced");
+    assert_eq!(errors, vec![], "a text-only concept satisfies an extensible binding");
+
+    // A coded value outside an extensible binding: silent by default, a
+    // warning (never an error) when extensible checks are on.
+    let resource = json!({
+        "resourceType": "Patient",
+        "maritalStatus": { "coding": [{ "system": "http://example.org/ms", "code": "Q" }] }
+    });
+    // (The mini registry has no `CodeableConcept.coding`: only binding
+    // issues matter here.)
+    let bindings = |errors: Vec<helios_fhir_validator::ValidationError>| {
+        errors
+            .into_iter()
+            .filter(|e| e.kind == helios_fhir_validator::ErrorKind::TerminologyBinding)
+            .collect::<Vec<_>>()
+    };
+    let errors = bindings(
+        validator()
+            .validate(
+                &resource,
+                FhirVersion::R4,
+                &ValidationOptions::default(),
+                &handlers,
+            )
+            .await,
+    );
+    assert_eq!(errors, vec![], "extensible bindings are off by default");
+    let on = EffectHandlers {
+        terminology: Some(&allow),
+        check_extensible: true,
+        ..Default::default()
+    };
+    let errors = bindings(
+        validator()
+            .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &on)
+            .await,
+    );
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(errors[0].severity, Severity::Warning);
+    assert!(
+        errors[0]
+            .message
+            .starts_with("None of the codings provided are in the value set 'http://hl7.org/fhir/ValueSet/marital-status'"),
+        "{}",
+        errors[0].message
+    );
 }
 
 #[tokio::test]

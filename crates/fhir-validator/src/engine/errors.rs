@@ -81,6 +81,10 @@ pub enum ErrorKind {
     ReferenceUnresolved,
     /// A JSON object with no members (FHIR JSON forbids empty elements).
     EmptyObject,
+    /// A `Coding.system` in an HL7 namespace (`hl7.org`, `fhir.org`) that
+    /// names no known code system (HL7 validator:
+    /// Type_Specific_Checks_DT_URL_Resolve, error).
+    UnknownCodeSystem,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -367,6 +371,48 @@ pub(crate) fn msg_wrong_display(
         ),
     };
     format!("Wrong Display Name '{display}' for {system}#{code}. Valid display is {valid}")
+}
+
+/// [helios] no coding of the value is in an `extensible` binding's value
+/// set (HL7 validator wording: Terminology_TX_NoValid_2_CC /
+/// Terminology_TX_NoValid_13 / Terminology_TX_Confirm_5).
+pub(crate) fn msg_extensible_binding(coded: &crate::effects::CodedValue, value_set: &str) -> String {
+    use crate::effects::CodedValue;
+    let token = |c: &Value| {
+        format!(
+            "{}#{}",
+            c.get("system").and_then(Value::as_str).unwrap_or_default(),
+            c.get("code").and_then(Value::as_str).unwrap_or_default()
+        )
+    };
+    match coded {
+        CodedValue::CodeableConcept(cc) => {
+            let codes: Vec<String> = cc
+                .get("coding")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(token)
+                .collect();
+            format!(
+                "None of the codings provided are in the value set '{value_set}', and a coding should come from this value set unless it has no suitable code (note that the validator cannot judge what is suitable) (codes = {})",
+                codes.join(", ")
+            )
+        }
+        CodedValue::Coding(c) => format!(
+            "The Coding provided ({}) was not found in the value set '{value_set}', and a code should come from this value set unless it has no suitable code (note that the validator cannot judge what is suitable)",
+            token(c)
+        ),
+        CodedValue::Code(code) => format!(
+            "The code provided ({code}) is not in the value set '{value_set}', and a code should come from this value set unless it has no suitable code (the validator cannot judge what is suitable)"
+        ),
+    }
+}
+
+/// [helios] a uri in an HL7 namespace that names nothing known (HL7
+/// validator wording).
+pub(crate) fn msg_url_unresolved(url: &str) -> String {
+    format!("No definition could be found for URL value '{url}'")
 }
 
 /// [helios] the terminology service could not be reached / errored.
