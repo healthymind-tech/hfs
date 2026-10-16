@@ -328,16 +328,26 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
 
     let mut schema = tree::finalize(root, &mut warnings).unwrap_or_default();
 
-    // Extension applicability contexts (#363): element expressions only.
+    // Extension applicability contexts (#363). Element contexts are carried
+    // as their expression; `fhirpath` and `extension` contexts as
+    // `fhirpath:<expr>` / `extension:<url>`, which no element path equals —
+    // dropping them made an extension allowed by a FHIRPath context look
+    // misplaced to the context check.
     let contexts: Vec<String> = sd
         .get("context")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter(|c| c.get("type").and_then(Value::as_str).unwrap_or("element") == "element")
-                .filter_map(|c| c.get("expression").and_then(Value::as_str))
-                .map(str::to_string)
+                .filter_map(|c| {
+                    let expression = c.get("expression").and_then(Value::as_str)?;
+                    Some(
+                        match c.get("type").and_then(Value::as_str).unwrap_or("element") {
+                            "element" => expression.to_string(),
+                            other => format!("{other}:{expression}"),
+                        },
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();

@@ -219,7 +219,9 @@ impl ValidationService {
             profiles,
             use_meta_profiles: self.use_meta_profiles,
             unknown_profile: self.unknown_profile,
-            ..Default::default()
+            // An extension outside its declared context is an error, as
+            // the HL7 validator reports it (warning on canonical resources).
+            check_extension_context: true,
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -792,6 +794,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         // A known extension outside its declared context (#615): invalid
         // content by placement, not a structural malformation.
         ErrorKind::ExtensionContext => IssueType::Invalid,
+        // An HL7-namespace extension nobody defines.
+        ErrorKind::UnknownExtension => IssueType::Structure,
         // A batch/transaction entry filed under the wrong resource type.
         ErrorKind::BundleEntryMismatch => IssueType::Invalid,
         // A malformed or wrongly-typed reference.

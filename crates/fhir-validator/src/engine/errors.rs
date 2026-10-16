@@ -60,10 +60,14 @@ pub enum ErrorKind {
     /// A profile named in `meta.profile` or the caller's profile list could
     /// not be resolved.
     UnknownProfile,
-    /// A known extension used outside its declared context (#615). Always
-    /// warning severity: context matching is conservative and ad-hoc
-    /// extensions must stay permissive.
+    /// A known extension used outside its declared context (#615). Error
+    /// severity (warning on canonical resources); context matching is
+    /// conservative — only resource-root placements against resource-rooted
+    /// contexts are judged.
     ExtensionContext,
+    /// An extension url in an HL7 namespace that resolves to no known
+    /// definition (warning severity).
+    UnknownExtension,
     /// A `batch`/`transaction` entry whose `request.url` names a different
     /// resource type than the entry's `resource` (X10).
     BundleEntryMismatch,
@@ -183,14 +187,26 @@ pub(crate) fn msg_expected_object_comma(json_type: &str) -> String {
     format!("expected object, got {json_type}")
 }
 
-/// [reference] `expected {min} > {actual_len}`
+/// [helios] an extension used outside its declared context (HL7
+/// validator wording).
 pub(crate) fn msg_extension_context(url: &str, at: &str, contexts: &[String]) -> String {
     format!(
-        "extension {url} is not declared for use at {at}; its contexts are [{}]",
-        contexts.join(", ")
+        "The extension {url} is not allowed to be used at this point (this element is [{at}]; allowed = {})",
+        contexts
+            .iter()
+            .map(|c| format!("e:{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
+/// [helios] an HL7-namespace extension with no known definition (HL7
+/// validator wording).
+pub(crate) fn msg_unknown_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
+/// [reference] `expected {min} > {actual_len}`
 pub(crate) fn msg_min(min: u64, actual_len: usize) -> String {
     format!("expected {min} > {actual_len}")
 }

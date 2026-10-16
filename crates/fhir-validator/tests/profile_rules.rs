@@ -443,4 +443,33 @@ fn complex_extension_sub_extension_minimum_names_the_extension() {
     }]});
     let errors = structural(&r, &with_text, &[RACE_PATIENT]);
     assert!(errors.is_empty(), "{errors:#?}");
+
+    // The extension's context is Patient: on an Observation it is an error.
+    let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "x"},
+        "extension": [{"url": RACE_LIKE, "extension": [{"url": "text", "valueString": "x"}]}]});
+    let errors = structural(&r, &obs, &[]);
+    assert!(
+        errors.iter().any(|e| e.kind == ErrorKind::ExtensionContext
+            && e.severity == helios_fhir_validator::Severity::Error),
+        "{errors:#?}"
+    );
+}
+
+/// An extension allowed by a FHIRPath context is not misplaced just
+/// because its element contexts do not match.
+#[test]
+fn fhirpath_contexts_keep_the_context_check_quiet() {
+    let mut sds = race_sds();
+    sds[0]["context"] = json!([
+        {"type": "element", "expression": "Patient"},
+        {"type": "fhirpath", "expression": "Observation"}
+    ]);
+    let r = resolver(&sds);
+    let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "x"},
+        "extension": [{"url": RACE_LIKE, "extension": [{"url": "text", "valueString": "x"}]}]});
+    let errors = structural(&r, &obs, &[]);
+    assert!(
+        !errors.iter().any(|e| e.kind == ErrorKind::ExtensionContext),
+        "{errors:#?}"
+    );
 }

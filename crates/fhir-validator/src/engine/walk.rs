@@ -747,13 +747,76 @@ fn validate_extension_item(ctx: &mut WalkCtx<'_>, elset: &SchemaSet, item: &Valu
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
+            } else if is_hl7_namespace(url) {
+                // HL7 publishes every extension it defines; a url in its
+                // namespace that resolves to nothing is a typo or an
+                // uninstalled package (the HL7 validator rejects it). Other
+                // namespaces stay allowed silently: FHIR permits extensions
+                // the receiver does not know.
+                ctx.error_with_severity(
+                    ErrorKind::UnknownExtension,
+                    errors::msg_unknown_extension(url),
+                    Severity::Warning,
+                );
             }
             validate_node(ctx, elset, item);
         }
     }
 }
 
-/// Warn when an extension item is used outside its declared context (#615).
+/// Extension urls in HL7's own namespaces, which HL7 publishes definitions
+/// for.
+fn is_hl7_namespace(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or_default();
+    host == "hl7.org" || host.ends_with(".hl7.org") || host == "fhir.org"
+}
+
+/// Canonical (conformance) resource types. HL7's publisher places
+/// `structuredefinition-*` metadata extensions on their roots outside the
+/// extensions' declared contexts throughout the published spec, so a
+/// context mismatch there stays a warning.
+const CANONICAL_RESOURCES: &[&str] = &[
+    "ActivityDefinition",
+    "CapabilityStatement",
+    "ChargeItemDefinition",
+    "CodeSystem",
+    "CompartmentDefinition",
+    "ConceptMap",
+    "EffectEvidenceSynthesis",
+    "EventDefinition",
+    "Evidence",
+    "EvidenceVariable",
+    "ExampleScenario",
+    "GraphDefinition",
+    "ImplementationGuide",
+    "Library",
+    "Measure",
+    "MessageDefinition",
+    "NamingSystem",
+    "ObservationDefinition",
+    "OperationDefinition",
+    "PlanDefinition",
+    "Questionnaire",
+    "ResearchDefinition",
+    "ResearchElementDefinition",
+    "RiskEvidenceSynthesis",
+    "SearchParameter",
+    "SpecimenDefinition",
+    "StructureDefinition",
+    "StructureMap",
+    "TerminologyCapabilities",
+    "TestScript",
+    "ValueSet",
+];
+
+/// Report an extension item used outside its declared context (#615): an
+/// error, as the HL7 validator reports it (`patient-birthPlace` on an
+/// Observation), except on canonical resources (warning, see
+/// [`CANONICAL_RESOURCES`]).
 ///
 /// Conservative on purpose, twice over. Only extensions at the **resource
 /// root** are judged: an element-level instance path cannot be compared to a
@@ -809,7 +872,12 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
 
         ctx.path.push_index(index);
         let message = errors::msg_extension_context(url, &parent, contexts);
-        ctx.error_with_severity(ErrorKind::ExtensionContext, message, Severity::Warning);
+        let severity = if CANONICAL_RESOURCES.contains(&parent.as_str()) {
+            Severity::Warning
+        } else {
+            Severity::Error
+        };
+        ctx.error_with_severity(ErrorKind::ExtensionContext, message, severity);
         ctx.path.pop();
     }
 }
@@ -1111,15 +1179,32 @@ mod tests {
         });
         assert!(warnings(&ok).is_empty());
 
-        // Out of context (an Observation): one warning, warning-severity.
+        // Out of context (an Observation): one error, as the HL7 validator
+        // reports it, attributed to the extension definition.
         let wrong = json!({
             "resourceType": "Observation", "status": "final", "code": {"text": "t"},
             "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
         });
         let found = warnings(&wrong);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].severity, Severity::Error);
         assert_eq!(found[0].path, "Observation.extension.0");
+        assert!(
+            found[0]
+                .message
+                .contains("is not allowed to be used at this point"),
+            "{found:?}"
+        );
+
+        // On a canonical resource root the publisher's own placements are
+        // tolerated: a warning.
+        let canonical = json!({
+            "resourceType": "ValueSet", "status": "draft",
+            "extension": [{ "url": birthplace, "valueAddress": {"city": "X"} }]
+        });
+        let found = warnings(&canonical);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, Severity::Warning);
 
         // Unknown url: silent, wherever it sits.
         let unknown = json!({
@@ -1522,6 +1607,15 @@ mod tests {
                 "extension": [{"url": "http://example.org/x", "valueString": "v"}]}))
             .is_empty()
         );
+        // ...except in HL7's namespace, where every extension is published:
+        // an unknown one there warns.
+        let hl7 = errors(json!({"resourceType": "Patient",
+            "extension": [{"url": "http://hl7.org/fhir/StructureDefinition/nope-extension",
+                "valueString": "v"}]}));
+        assert_eq!(hl7.len(), 1, "{hl7:?}");
+        assert_eq!(hl7[0].kind, ErrorKind::UnknownExtension);
+        assert_eq!(hl7[0].severity, Severity::Warning);
+        assert_eq!(hl7[0].path, "Patient.extension.0");
         let modifier = errors(json!({"resourceType": "Patient",
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
