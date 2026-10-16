@@ -104,7 +104,10 @@ fn timing_period_unit_is_not_a_period_variant() {
         EvaluationResult::boolean(false)
     );
     assert_eq!(
-        run_expression(&context, &format!("{repeat}.all(period.exists() implies period >= 0)")),
+        run_expression(
+            &context,
+            &format!("{repeat}.all(period.exists() implies period >= 0)")
+        ),
         EvaluationResult::boolean(true)
     );
     assert_eq!(
@@ -130,7 +133,48 @@ fn range_low_high_quantities_compare() {
         }))
     };
     let rng2 = "Observation.value.all(low.empty() or high.empty() or (low <= high))";
-    assert_eq!(run_expression(&range(10, 20, "/[HPF]"), rng2), EvaluationResult::boolean(true));
-    assert_eq!(run_expression(&range(30, 20, "/[HPF]"), rng2), EvaluationResult::boolean(false));
-    assert_eq!(run_expression(&range(10, 20, "mg"), rng2), EvaluationResult::boolean(true));
+    assert_eq!(
+        run_expression(&range(10, 20, "/[HPF]"), rng2),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&range(30, 20, "/[HPF]"), rng2),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        run_expression(&range(10, 20, "mg"), rng2),
+        EvaluationResult::boolean(true)
+    );
+}
+
+/// FHIRPath singleton evaluation: a single element object in a Boolean
+/// operator is true (US Core us-core-13 `practitioner or organization or
+/// healthcareService or location` on PractitionerRole).
+#[test]
+fn element_objects_are_true_in_boolean_operators() {
+    let role = context_for(serde_json::json!({
+        "resourceType": "PractitionerRole",
+        "practitioner": { "reference": "Practitioner/p" }
+    }));
+    let us_core_13 =
+        "PractitionerRole.all(practitioner or organization or healthcareService or location)";
+    assert_eq!(
+        run_expression(&role, us_core_13),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(
+            &role,
+            "PractitionerRole.all(practitioner implies practitioner)"
+        ),
+        EvaluationResult::boolean(true)
+    );
+    let empty = context_for(serde_json::json!({ "resourceType": "PractitionerRole" }));
+    assert_eq!(
+        run_expression(
+            &empty,
+            "PractitionerRole.select(practitioner or organization).empty()"
+        ),
+        EvaluationResult::boolean(true)
+    );
 }

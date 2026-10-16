@@ -1174,11 +1174,11 @@ pub fn evaluate(
         }
         Expression::Or(left, op, right) => {
             // Evaluate left, handle potential error
-            let left_eval = evaluate(left, context, current_item)?;
+            let left_eval = element_singleton_as_boolean(evaluate(left, context, current_item)?);
             let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
 
             // Evaluate right, handle potential error
-            let right_eval = evaluate(right, context, current_item)?;
+            let right_eval = element_singleton_as_boolean(evaluate(right, context, current_item)?);
 
             // Check types *before* logical conversion
             if !matches!(
@@ -1272,7 +1272,7 @@ pub fn evaluate(
         }
         Expression::Implies(left, right) => {
             // Evaluate left, handle potential error
-            let left_eval = evaluate(left, context, current_item)?;
+            let left_eval = element_singleton_as_boolean(evaluate(left, context, current_item)?);
             let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
 
             // Check type *before* logical conversion
@@ -1290,7 +1290,8 @@ pub fn evaluate(
                 EvaluationResult::Boolean(false, _, _) => Ok(EvaluationResult::boolean(true)), // false implies X -> true
                 EvaluationResult::Empty => {
                     // Evaluate right, handle potential error
-                    let right_eval = evaluate(right, context, current_item)?;
+                    let right_eval =
+                        element_singleton_as_boolean(evaluate(right, context, current_item)?);
                     // Check type *before* logical conversion
                     if !matches!(
                         right_eval,
@@ -1311,7 +1312,8 @@ pub fn evaluate(
                 }
                 EvaluationResult::Boolean(true, _, _) => {
                     // Evaluate right, handle potential error
-                    let right_eval = evaluate(right, context, current_item)?;
+                    let right_eval =
+                        element_singleton_as_boolean(evaluate(right, context, current_item)?);
                     // Check type *before* logical conversion
                     if !matches!(
                         right_eval,
@@ -8252,9 +8254,34 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
 }
 
 /// Compares two values for inequality - Returns Result now
+/// FHIRPath singleton evaluation for Boolean operators (spec §4.5): a
+/// single complex node — a FHIR element object or a Quantity — "evaluates
+/// to true". FHIR invariants rely on it for presence checks such as US Core
+/// us-core-13 `practitioner or organization or healthcareService or location`.
+/// Primitive singletons keep their existing conversions.
+fn element_singleton_as_boolean(value: EvaluationResult) -> EvaluationResult {
+    match &value {
+        EvaluationResult::Object { .. } | EvaluationResult::Quantity(..) => {
+            EvaluationResult::boolean(true)
+        }
+        EvaluationResult::Collection { items, .. }
+            if items.len() == 1
+                && matches!(
+                    items[0],
+                    EvaluationResult::Object { .. } | EvaluationResult::Quantity(..)
+                ) =>
+        {
+            EvaluationResult::boolean(true)
+        }
+        _ => value,
+    }
+}
+
 /// `(value, unit)` of a FHIR Quantity object: a numeric `value` and the
 /// `code` (falling back to `unit`). `None` when `map` has no numeric value.
-fn fhir_quantity_parts(map: &HashMap<String, EvaluationResult>) -> Option<(Decimal, Option<String>)> {
+fn fhir_quantity_parts(
+    map: &HashMap<String, EvaluationResult>,
+) -> Option<(Decimal, Option<String>)> {
     let value = match map.get("value")? {
         EvaluationResult::Decimal(d, _, _) => *d,
         EvaluationResult::Integer(i, _, _) => Decimal::from(*i),
@@ -8523,9 +8550,10 @@ fn compare_inequality(
         // Two FHIR Quantity objects (rng-2 `low <= high` on a Range): compare
         // values when the units agree (code, else unit), converting through
         // UCUM when they differ but are comparable.
-        (EvaluationResult::Object { map: obj_l, .. }, EvaluationResult::Object { map: obj_r, .. })
-            if fhir_quantity_parts(obj_l).is_some() && fhir_quantity_parts(obj_r).is_some() =>
-        {
+        (
+            EvaluationResult::Object { map: obj_l, .. },
+            EvaluationResult::Object { map: obj_r, .. },
+        ) if fhir_quantity_parts(obj_l).is_some() && fhir_quantity_parts(obj_r).is_some() => {
             let (val_l, unit_l) = fhir_quantity_parts(obj_l).expect("checked");
             let (val_r, unit_r) = fhir_quantity_parts(obj_r).expect("checked");
             match (unit_l.as_deref(), unit_r.as_deref()) {
