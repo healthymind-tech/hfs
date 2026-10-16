@@ -691,6 +691,40 @@ pub fn migrate_current_pin(conn: &rusqlite::Connection) -> rusqlite::Result<()> 
     }
 }
 
+/// Add the JSON-derived search columns behind the `supplements` and
+/// `publisher` search parameters.
+///
+/// They are `VIRTUAL` generated columns: computed from `resource_json` when
+/// read, so existing rows become searchable immediately — nothing is
+/// backfilled or rewritten, and every write path stays correct without
+/// knowing about them. Searches select them only when filtering on them.
+/// `json_valid` guards keep a malformed stored document from turning a
+/// search into an error. Idempotent; must run after the `drop_url_unique`
+/// rebuilds (fixed column lists).
+pub fn migrate_search_param_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for sql in [
+        "ALTER TABLE code_systems ADD COLUMN supplements TEXT GENERATED ALWAYS AS \
+         (CASE WHEN content = 'supplement' AND json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.supplements') END) VIRTUAL",
+        "ALTER TABLE code_systems ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+        "ALTER TABLE value_sets ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+        "ALTER TABLE concept_maps ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+    ] {
+        match conn.execute_batch(sql) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<()> {
     let pending: Vec<(String, String)> = {
         let mut stmt = conn.prepare(&format!(

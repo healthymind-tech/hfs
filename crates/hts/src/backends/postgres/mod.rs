@@ -213,15 +213,35 @@ where
 
     let rows = client
         .query(
-            &format!("SELECT name, title FROM {table} {filter}"),
+            &format!(
+                "SELECT {columns} FROM {table} {filter}",
+                columns = crate::string_search::metadata_select_list(table, &search)
+            ),
             &params,
         )
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
     Ok(rows
         .iter()
-        .filter(|row| search.matches(row.get::<_, Option<&str>>(0), row.get::<_, Option<&str>>(1)))
+        .map(search_row)
+        .filter(|row| search.matches_row(row))
         .count() as u64)
+}
+
+/// Map a row of [`crate::string_search::metadata_select_list`].
+fn search_row(row: &tokio_postgres::Row) -> ResourceSearchRow {
+    ResourceSearchRow {
+        id: row.get(0),
+        url: row.get(1),
+        version: row.get(2),
+        name: row.get(3),
+        title: row.get(4),
+        status: row.get(5),
+        content: row.get(6),
+        supplements: row.get(7),
+        publisher: row.get(8),
+        updated_at: row.get(9),
+    }
 }
 
 impl PostgresTerminologyBackend {
@@ -380,26 +400,20 @@ where
     C: GenericClient + Sync,
 {
     let metadata_sql = format!(
-        "SELECT id, url, version, name, title, status
+        "SELECT {columns}
          FROM {table}
          WHERE ($1::text IS NULL OR url = $1)
            AND ($2::text IS NULL OR version = $2)
            AND ($3::text IS NULL OR status = $3)
-         ORDER BY created_at"
+         ORDER BY created_at",
+        columns = crate::string_search::metadata_select_list(table, &search)
     );
     let rows = client
         .query(&metadata_sql, &[&query.url, &query.version, &query.status])
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?
-        .into_iter()
-        .map(|row| ResourceSearchRow {
-            id: row.get(0),
-            url: row.get(1),
-            version: row.get(2),
-            name: row.get(3),
-            title: row.get(4),
-            status: row.get(5),
-        })
+        .iter()
+        .map(search_row)
         .collect::<Vec<_>>();
     let selected = filter_rows(rows, &query, &search);
 

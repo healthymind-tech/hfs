@@ -1,9 +1,10 @@
 //! Handlers for resource-type search endpoints.
 //!
 //! Implements `GET /CodeSystem`, `GET /ValueSet`, and `GET /ConceptMap` with
-//! the five mandatory FHIR search parameters: `url`, `version`, `name`,
-//! `title`, and `status`.  Results are returned as a FHIR `Bundle` of type
-//! `searchset`.
+//! the FHIR search parameters `url`, `version`, `name`, `title`, `status`,
+//! `publisher`, `_id` and `_lastUpdated`, plus CodeSystem's `system`,
+//! `supplements` and `content-mode`.  Results are returned as a FHIR `Bundle`
+//! of type `searchset`.
 //!
 //! Pagination is controlled by `_count` (page size, default 20) and `_offset`
 //! (zero-based start position, default 0).  `Bundle.total` is the number of
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::state::AppState;
-use crate::string_search::FhirStringSearchMode;
+use crate::string_search::{DateSearch, FhirStringSearchMode};
 use crate::traits::{
     CodeSystemOperations, ConceptMapOperations, TerminologyBackend, ValueSetOperations,
 };
@@ -35,7 +36,18 @@ fn ctx() -> TenantContext {
     TenantContext::system()
 }
 
-fn parse_search_query(raw: Option<&str>) -> Result<ResourceSearchQuery, HtsError> {
+/// Which resource type a search addresses: a few parameters exist on
+/// CodeSystem only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchKind {
+    CodeSystem,
+    Other,
+}
+
+fn parse_search_query(
+    raw: Option<&str>,
+    kind: SearchKind,
+) -> Result<ResourceSearchQuery, HtsError> {
     let mut query = ResourceSearchQuery::default();
 
     for (key, value) in form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
@@ -80,6 +92,41 @@ fn parse_search_query(raw: Option<&str>) -> Result<ResourceSearchQuery, HtsError
                 reject_modifier("status", modifier)?;
                 set_once(&mut query.status, value, "status")?;
             }
+            "publisher" => {
+                let mode = string_mode("publisher", modifier)?;
+                set_string_filter(
+                    &mut query.publisher,
+                    &mut query.publisher_mode,
+                    value,
+                    mode,
+                    "publisher",
+                )?;
+            }
+            "_id" => {
+                reject_modifier("_id", modifier)?;
+                set_once(&mut query.id, value, "_id")?;
+            }
+            "_lastUpdated" => {
+                reject_modifier("_lastUpdated", modifier)?;
+                let date = DateSearch::parse(&value).map_err(|error| {
+                    HtsError::InvalidRequest(format!(
+                        "Search parameter `_lastUpdated`: {error}"
+                    ))
+                })?;
+                query.last_updated.push(date);
+            }
+            "system" if kind == SearchKind::CodeSystem => {
+                reject_modifier("system", modifier)?;
+                set_once(&mut query.system, value, "system")?;
+            }
+            "supplements" if kind == SearchKind::CodeSystem => {
+                reject_modifier("supplements", modifier)?;
+                set_once(&mut query.supplements, value, "supplements")?;
+            }
+            "content-mode" if kind == SearchKind::CodeSystem => {
+                reject_modifier("content-mode", modifier)?;
+                set_once(&mut query.content_mode, value, "content-mode")?;
+            }
             "_count" if modifier.is_none() => {
                 let count = parse_u32("_count", &value)?;
                 set_once(&mut query.count, count, "_count")?;
@@ -92,8 +139,7 @@ fn parse_search_query(raw: Option<&str>) -> Result<ResourceSearchQuery, HtsError
                 set_once(&mut query.summary, value, "_summary")?;
             }
             // Unknown parameters remain lenient, matching the existing HTS
-            // behavior. Only modifiers on the five announced parameters above
-            // are rejected.
+            // behavior. Only modifiers on the parameters above are rejected.
             _ => {}
         }
     }
@@ -308,7 +354,7 @@ pub async fn search_code_systems<B>(
 where
     B: TerminologyBackend + BundleImportBackend,
 {
-    let query = match parse_search_query(raw.as_deref()) {
+    let query = match parse_search_query(raw.as_deref(), SearchKind::CodeSystem) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
@@ -336,7 +382,7 @@ pub async fn search_value_sets<B>(
 where
     B: TerminologyBackend + BundleImportBackend,
 {
-    let query = match parse_search_query(raw.as_deref()) {
+    let query = match parse_search_query(raw.as_deref(), SearchKind::Other) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
@@ -364,7 +410,7 @@ pub async fn search_concept_maps<B>(
 where
     B: TerminologyBackend + BundleImportBackend,
 {
-    let query = match parse_search_query(raw.as_deref()) {
+    let query = match parse_search_query(raw.as_deref(), SearchKind::Other) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
