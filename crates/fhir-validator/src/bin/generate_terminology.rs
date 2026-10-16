@@ -64,15 +64,40 @@ fn main() {
 struct CodeSystem {
     complete: bool,
     codes: Vec<String>,
+    /// code → its display plus designation values (display checks).
+    displays: BTreeMap<String, Vec<String>>,
 }
 
-fn collect_concepts(concepts: Option<&Vec<Value>>, out: &mut Vec<String>) {
+fn collect_concepts(
+    concepts: Option<&Vec<Value>>,
+    out: &mut Vec<String>,
+    displays: &mut BTreeMap<String, Vec<String>>,
+) {
     let Some(concepts) = concepts else { return };
     for c in concepts {
         if let Some(code) = c.get("code").and_then(Value::as_str) {
             out.push(code.to_string());
+            let mut names: Vec<String> = Vec::new();
+            if let Some(display) = c.get("display").and_then(Value::as_str) {
+                names.push(display.to_string());
+            }
+            for d in c
+                .get("designation")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(v) = d.get("value").and_then(Value::as_str)
+                    && !names.iter().any(|n| n == v)
+                {
+                    names.push(v.to_string());
+                }
+            }
+            if !names.is_empty() {
+                displays.insert(code.to_string(), names);
+            }
         }
-        collect_concepts(c.get("concept").and_then(Value::as_array), out);
+        collect_concepts(c.get("concept").and_then(Value::as_array), out, displays);
     }
 }
 
@@ -101,12 +126,18 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
             continue;
         };
         let mut codes = Vec::new();
-        collect_concepts(r.get("concept").and_then(Value::as_array), &mut codes);
+        let mut displays = BTreeMap::new();
+        collect_concepts(
+            r.get("concept").and_then(Value::as_array),
+            &mut codes,
+            &mut displays,
+        );
         systems.insert(
             url.to_string(),
             CodeSystem {
                 complete: r.get("content").and_then(Value::as_str) == Some("complete"),
                 codes,
+                displays,
             },
         );
     }
@@ -138,12 +169,39 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
     let compressed = encoder.finish().expect("gzip finish");
     fs::write(&out_path, &compressed).map_err(|e| format!("write pack: {e}"))?;
 
+    // Displays of the code systems the embedded value sets draw from, for
+    // the display check on required bindings (wrong display → warning).
+    let used: std::collections::BTreeSet<&str> = table
+        .values()
+        .flatten()
+        .map(|(system, _)| system.as_str())
+        .collect();
+    let display_table: Vec<(&str, Vec<(&String, &Vec<String>)>)> = used
+        .iter()
+        .filter_map(|system| {
+            let cs = systems.get(*system)?;
+            (!cs.displays.is_empty()).then(|| (*system, cs.displays.iter().collect()))
+        })
+        .collect();
+    let display_json = serde_json::to_vec(&display_table).expect("display table serializes");
+    let display_path = packs_dir.join(format!(
+        "terminology_displays_{}.json.gz",
+        version.to_lowercase()
+    ));
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&display_json).expect("gzip write");
+    let display_compressed = encoder.finish().expect("gzip finish");
+    fs::write(&display_path, &display_compressed).map_err(|e| format!("write pack: {e}"))?;
+
     Ok(format!(
-        "{version}: {} value sets expanded ({unresolved} skipped as not offline-resolvable) → {} ({} KB raw, {} KB gz)",
+        "{version}: {} value sets expanded ({unresolved} skipped as not offline-resolvable) → {} ({} KB raw, {} KB gz); displays of {} code systems → {} ({} KB gz)",
         table.len(),
         out_path.display(),
         json.len() / 1024,
-        compressed.len() / 1024
+        compressed.len() / 1024,
+        display_table.len(),
+        display_path.display(),
+        display_compressed.len() / 1024
     ))
 }
 

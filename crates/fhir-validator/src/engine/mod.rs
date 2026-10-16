@@ -24,7 +24,7 @@ pub(crate) mod messages {
         msg_constraint_not_evaluable as constraint_not_evaluable,
         msg_fhirpath_constraint as fhirpath_constraint,
         msg_terminology_binding as terminology_binding,
-        msg_terminology_unavailable as terminology_unavailable,
+        msg_terminology_unavailable as terminology_unavailable, msg_wrong_display as wrong_display,
     };
 }
 

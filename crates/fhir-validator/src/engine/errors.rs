@@ -43,6 +43,8 @@ pub enum ErrorKind {
     FhirpathConstraint,
     /// A coded value failed its required-strength ValueSet binding.
     TerminologyBinding,
+    /// A coding's `display` is not a display of its code (warning).
+    DisplayMismatch,
     // ------------------------------------------------------------------
     // Helios extensions — not pinned by (and never triggered in) the
     // upstream conformance fixtures.
@@ -308,6 +310,28 @@ pub(crate) fn msg_terminology_binding(value: &Value, value_set: &str) -> String 
         "Provided coded value '{}' does not pass validation against the following valueset: '{value_set}'",
         render_value(value)
     )
+}
+
+/// [helios] a coding's display is not one of its code's displays (HL7
+/// validator wording).
+pub(crate) fn msg_wrong_display(
+    display: &str,
+    system: &str,
+    code: &str,
+    valid: &[String],
+) -> String {
+    let valid = match valid {
+        [one] => format!("'{one}'"),
+        many => format!(
+            "one of {} choices: {}",
+            many.len(),
+            many.iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    format!("Wrong Display Name '{display}' for {system}#{code}. Valid display is {valid}")
 }
 
 /// [helios] the terminology service could not be reached / errored.

@@ -802,7 +802,7 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::ReferenceInvalid => IssueType::Invalid,
         // A Bundle-internal URN reference no entry provides.
         ErrorKind::ReferenceUnresolved => IssueType::NotFound,
-        ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
+        ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.

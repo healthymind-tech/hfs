@@ -227,6 +227,11 @@ pub async fn execute(
 ) {
     execute_constraints(resource, version, deferred, handlers, errors);
     execute_bindings(deferred, handlers, errors).await;
+    // Wrong displays on required-bound codings, judged offline against
+    // the embedded core code systems whenever bindings are checked at all.
+    if handlers.terminology.is_some() {
+        errors.extend(crate::terminology::display_issues(version, deferred));
+    }
 }
 
 fn execute_constraints(

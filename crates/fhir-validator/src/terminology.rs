@@ -26,6 +26,14 @@ use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "R4")]
 static R4_TX: &[u8] = include_bytes!("../packs/terminology_r4.json.gz");
+#[cfg(feature = "R4")]
+static R4_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r4.json.gz");
+#[cfg(feature = "R4B")]
+static R4B_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r4b.json.gz");
+#[cfg(feature = "R5")]
+static R5_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r5.json.gz");
+#[cfg(feature = "R6")]
+static R6_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r6.json.gz");
 #[cfg(feature = "R4B")]
 static R4B_TX: &[u8] = include_bytes!("../packs/terminology_r4b.json.gz");
 #[cfg(feature = "R5")]
@@ -70,6 +78,129 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
 
 /// Codes of one value set, indexed by code → the systems that define it here.
 type ValueSetCodes = HashMap<String, Vec<String>>;
+
+/// system → code → the code's display and designation values.
+type Displays = HashMap<String, HashMap<String, Vec<String>>>;
+
+/// The displays of the code systems the embedded value sets draw from.
+/// Parsed on first use (the display check only runs with terminology on).
+fn core_displays(version: FhirVersion) -> Option<&'static Displays> {
+    fn parse(bytes: &[u8]) -> Displays {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut json = Vec::new();
+        decoder
+            .read_to_end(&mut json)
+            .expect("embedded display pack decompresses");
+        /// `(system, [(code, [display, designation...])])`, as generated.
+        type Pack = Vec<(String, Vec<(String, Vec<String>)>)>;
+        let systems: Pack = serde_json::from_slice(&json).expect("embedded display pack parses");
+        systems
+            .into_iter()
+            .map(|(system, codes)| (system, codes.into_iter().collect()))
+            .collect()
+    }
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R4_DISPLAYS)))
+        }
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R4B_DISPLAYS)))
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R5_DISPLAYS)))
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R6_DISPLAYS)))
+        }
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Display comparison the HL7 validator applies: case-insensitive, with
+/// runs of whitespace collapsed.
+fn normalize_display(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Wrong displays on codings bound by `required` bindings to embedded core
+/// value sets: a coding whose code is in the value set but whose `display`
+/// matches neither the code system's display nor any designation draws a
+/// warning, as HAPI and the HL7 validator (with display issues as
+/// warnings) report it. Only codes the embedded packs know are judged;
+/// codings without a display are fine.
+pub fn display_issues(version: FhirVersion, deferred: &[Deferred]) -> Vec<ValidationError> {
+    let Some(displays) = core_displays(version) else {
+        return Vec::new();
+    };
+    let tx = core_terminology(version);
+    let mut issues = Vec::new();
+    for d in deferred {
+        let Deferred::Binding {
+            path,
+            binding,
+            value,
+            type_hint,
+        } = d
+        else {
+            continue;
+        };
+        if binding.strength.as_deref() != Some("required") {
+            continue;
+        }
+        let codings: Vec<(String, &Value)> = match coded_value(value, type_hint.as_deref()) {
+            Some(CodedValue::Coding(_)) => vec![(format!("{path}.display"), value)],
+            Some(CodedValue::CodeableConcept(_)) => value
+                .get("coding")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, c)| (format!("{path}.coding.{i}.display"), c))
+                .collect(),
+            _ => continue,
+        };
+        for (at, coding) in codings {
+            let (Some(system), Some(code), Some(display)) = (
+                coding.get("system").and_then(Value::as_str),
+                coding.get("code").and_then(Value::as_str),
+                coding.get("display").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if tx.contains(&binding.value_set, Some(system), code) != Some(true) {
+                continue; // membership is the binding check's business
+            }
+            let Some(valid) = displays.get(system).and_then(|codes| codes.get(code)) else {
+                continue;
+            };
+            let wanted = normalize_display(display);
+            if valid.iter().any(|v| normalize_display(v) == wanted) {
+                continue;
+            }
+            issues.push(
+                ValidationError::new(
+                    ErrorKind::DisplayMismatch,
+                    at,
+                    crate::engine::messages::wrong_display(display, system, code, valid),
+                )
+                .with_severity(crate::engine::Severity::Warning),
+            );
+        }
+    }
+    issues
+}
 
 /// An offline terminology provider over the embedded core value sets.
 pub struct CoreTerminology {

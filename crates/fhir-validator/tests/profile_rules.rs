@@ -63,6 +63,65 @@ async fn obs7_fires_when_a_component_repeats_the_code_with_a_value() {
     );
 }
 
+/// A wrong display on a required-bound coding warns (HAPI / HL7 validator
+/// with display issues as warnings); the right display, a designation-free
+/// case difference, or no display at all stays silent.
+#[tokio::test]
+async fn wrong_display_on_a_required_binding_warns() {
+    let condition = |display: Option<&str>| {
+        let mut coding = json!({
+            "system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active"
+        });
+        if let Some(d) = display {
+            coding["display"] = json!(d);
+        }
+        json!({"resourceType": "Condition", "subject": {"reference": "Patient/p"},
+               "clinicalStatus": {"coding": [coding]}})
+    };
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let tx = helios_fhir_validator::core_terminology(FhirVersion::R4);
+    let handlers = EffectHandlers {
+        terminology: Some(tx.as_ref()),
+        ..Default::default()
+    };
+    let check = |resource: Value| {
+        let validator = &validator;
+        let handlers = &handlers;
+        async move {
+            validator
+                .validate(
+                    &resource,
+                    FhirVersion::R4,
+                    &ValidationOptions::default(),
+                    handlers,
+                )
+                .await
+        }
+    };
+    let issues = check(condition(Some("Not Active At All"))).await;
+    let wrong: Vec<_> = issues
+        .iter()
+        .filter(|e| e.kind == ErrorKind::DisplayMismatch)
+        .collect();
+    assert_eq!(wrong.len(), 1, "{issues:#?}");
+    assert_eq!(wrong[0].severity, helios_fhir_validator::Severity::Warning);
+    assert_eq!(wrong[0].path, "Condition.clinicalStatus.coding.0.display");
+    assert!(
+        wrong[0].message.contains("Valid display is 'Active'"),
+        "{wrong:?}"
+    );
+    assert!(
+        !issues
+            .iter()
+            .any(|e| e.severity == helios_fhir_validator::Severity::Error),
+        "{issues:#?}"
+    );
+    for fine in [Some("Active"), Some("active"), None] {
+        let issues = check(condition(fine)).await;
+        assert!(issues.is_empty(), "{fine:?}: {issues:#?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Converted profiles layered on the core pack
 // ---------------------------------------------------------------------------
