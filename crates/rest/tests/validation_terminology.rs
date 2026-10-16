@@ -20,11 +20,59 @@ use helios_rest::{ServerConfig, create_app_with_config};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct MockHts {
     requests: Arc<Mutex<Vec<Value>>>,
     /// value set url → codes it contains.
     known: Arc<HashMap<String, Vec<String>>>,
+    /// code system url → its `content` (`GET /CodeSystem?url=`).
+    code_systems: Arc<HashMap<String, String>>,
+    /// value set url → its `compose` (`GET /ValueSet?url=`).
+    composes: Arc<HashMap<String, Value>>,
+    /// Code systems a negative answer blames via `x-caused-by-unknown-system`.
+    blame_unknown_system: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct UrlQuery {
+    url: String,
+}
+
+fn searchset(resources: Vec<Value>) -> Json<Value> {
+    Json(json!({
+        "resourceType": "Bundle", "type": "searchset", "total": resources.len(),
+        "entry": resources.into_iter().map(|r| json!({ "resource": r })).collect::<Vec<_>>()
+    }))
+}
+
+async fn search_code_systems(
+    State(state): State<MockHts>,
+    axum::extract::Query(q): axum::extract::Query<UrlQuery>,
+) -> Json<Value> {
+    searchset(
+        state
+            .code_systems
+            .get(&q.url)
+            .map(
+                |content| json!({ "resourceType": "CodeSystem", "url": q.url, "content": content }),
+            )
+            .into_iter()
+            .collect(),
+    )
+}
+
+async fn search_value_sets(
+    State(state): State<MockHts>,
+    axum::extract::Query(q): axum::extract::Query<UrlQuery>,
+) -> Json<Value> {
+    searchset(
+        state
+            .composes
+            .get(&q.url)
+            .map(|compose| json!({ "resourceType": "ValueSet", "url": q.url, "version": "1.0.0", "compose": compose }))
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
@@ -61,19 +109,18 @@ async fn validate_code(
         })
         .unwrap_or_default();
     let result = codes.iter().any(|c| c == code);
+    let mut parameter = vec![json!({ "name": "result", "valueBoolean": result })];
+    if let (false, Some(system)) = (result, &state.blame_unknown_system) {
+        parameter.push(json!({ "name": "x-caused-by-unknown-system", "valueCanonical": system }));
+    }
     (
         StatusCode::OK,
-        Json(json!({
-            "resourceType": "Parameters",
-            "parameter": [{ "name": "result", "valueBoolean": result }]
-        })),
+        Json(json!({ "resourceType": "Parameters", "parameter": parameter })),
     )
 }
 
 async fn start_mock_hts(known: &[(&str, &[&str])]) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let state = MockHts {
-        requests: Arc::clone(&requests),
+    start_mock(MockHts {
         known: Arc::new(
             known
                 .iter()
@@ -85,12 +132,21 @@ async fn start_mock_hts(known: &[(&str, &[&str])]) -> (String, Arc<Mutex<Vec<Val
                 })
                 .collect(),
         ),
-    };
+        ..MockHts::default()
+    })
+    .await
+}
+
+async fn start_mock(mut state: MockHts) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    state.requests = Arc::clone(&requests);
     let router = Router::new()
         .route(
             "/ValueSet/$validate-code",
             axum::routing::post(validate_code),
         )
+        .route("/CodeSystem", axum::routing::get(search_code_systems))
+        .route("/ValueSet", axum::routing::get(search_value_sets))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -316,5 +372,107 @@ async fn unknown_value_set_policy_is_explicit() {
         requests.lock().unwrap().len(),
         before + 1,
         "a 404 is remembered for the value set, not retried per code"
+    );
+}
+
+const GENES: &str = "http://www.genenames.org";
+
+fn gene_patient(code: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "maritalStatus": { "coding": [{ "system": GENES, "code": code }] }
+    })
+}
+
+/// A negative `$validate-code` that only reflects a code system the server
+/// has no content for (a `content: not-present` stub such as HGNC in
+/// `hl7.terminology`) cannot be checked: a warning, like the HL7 validator's
+/// "A definition for CodeSystem … could not be found, so the code cannot be
+/// validated" — not an invalid code. An enumerated `include.concept` list is
+/// still a real membership answer, and the server can say so itself with
+/// `x-caused-by-unknown-system`.
+#[tokio::test]
+async fn codes_of_contentless_code_systems_cannot_be_checked() {
+    let stub = |compose: Value| MockHts {
+        known: Arc::new(HashMap::from([(
+            IG_VS.to_string(),
+            vec!["HGNC:1".to_string()],
+        )])),
+        code_systems: Arc::new(HashMap::from([(
+            GENES.to_string(),
+            "not-present".to_string(),
+        )])),
+        composes: Arc::new(HashMap::from([(IG_VS.to_string(), compose)])),
+        ..MockHts::default()
+    };
+
+    // The value set takes the whole stub system: unverifiable -> warning.
+    let (ts_url, _) = start_mock(stub(json!({ "include": [{ "system": GENES }] }))).await;
+    for (fail, severity) in [
+        ("open", "warning"),
+        ("closed-required", "warning"),
+        ("closed", "error"),
+    ] {
+        let server = hfs(&ts_url, "remote", fail);
+        upload_profile(&server).await;
+        let outcome = validate(&server, &gene_patient("HGNC:1100"), true).await;
+        let issues = binding_issues(&outcome);
+        assert_eq!(issues.len(), 1, "{fail}: {outcome:#}");
+        assert_eq!(issues[0].0, severity, "{fail}: {outcome:#}");
+        assert!(
+            issues[0].2.contains("could not be performed"),
+            "{}",
+            issues[0].2
+        );
+        assert!(issues[0].2.contains(GENES), "{}", issues[0].2);
+    }
+
+    // An enumerated list for the same stub system is a real answer: error.
+    let (ts_url, _) = start_mock(stub(json!({
+        "include": [{ "system": GENES, "concept": [{ "code": "HGNC:1" }] }]
+    })))
+    .await;
+    let server = hfs(&ts_url, "remote", "open");
+    upload_profile(&server).await;
+    let outcome = validate(&server, &gene_patient("HGNC:1100"), true).await;
+    let issues = binding_issues(&outcome);
+    assert_eq!(issues.len(), 1, "{outcome:#}");
+    assert_eq!(issues[0].0, "error", "{outcome:#}");
+    assert!(
+        issues[0].2.contains("does not pass validation"),
+        "{}",
+        issues[0].2
+    );
+
+    // A code system with real content: the negative answer stands.
+    let (ts_url, _) = start_mock(MockHts {
+        code_systems: Arc::new(HashMap::from([(GENES.to_string(), "complete".to_string())])),
+        ..stub(json!({ "include": [{ "system": GENES }] }))
+    })
+    .await;
+    let server = hfs(&ts_url, "remote", "open");
+    upload_profile(&server).await;
+    let outcome = validate(&server, &gene_patient("HGNC:1100"), true).await;
+    assert_eq!(binding_issues(&outcome)[0].0, "error", "{outcome:#}");
+
+    // The server blames an unknown code system itself.
+    let (ts_url, _) = start_mock(MockHts {
+        blame_unknown_system: Some("http://example.org/cs".to_string()),
+        ..MockHts {
+            known: Arc::new(HashMap::from([(IG_VS.to_string(), vec!["M".to_string()])])),
+            ..MockHts::default()
+        }
+    })
+    .await;
+    let server = hfs(&ts_url, "remote", "open");
+    upload_profile(&server).await;
+    let outcome = validate(&server, &patient("male", "X"), true).await;
+    let issues = binding_issues(&outcome);
+    assert_eq!(issues.len(), 1, "{outcome:#}");
+    assert_eq!(issues[0].0, "warning", "{outcome:#}");
+    assert!(
+        issues[0].2.contains("http://example.org/cs"),
+        "{}",
+        issues[0].2
     );
 }

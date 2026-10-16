@@ -635,6 +635,12 @@ pub struct RemoteTerminologyProvider {
     /// [`UNKNOWN_VALUE_SET_TTL`] so one missing IG value set costs one
     /// round-trip per TTL instead of one per coded element.
     unknown_value_sets: DashMap<String, Instant>,
+    /// Code system url → whether the server has no content to check codes
+    /// against (absent, or only `content: not-present` stubs).
+    contentless_systems: DashMap<String, (bool, Instant)>,
+    /// ValueSet canonical → its `compose` (`Value::Null` when the server
+    /// does not return one).
+    value_set_composes: DashMap<String, (Value, Instant)>,
 }
 
 /// How long `$validate-code` verdicts are cached.
@@ -665,7 +671,159 @@ impl RemoteTerminologyProvider {
                 .expect("reqwest client builds"),
             cache: DashMap::new(),
             unknown_value_sets: DashMap::new(),
+            contentless_systems: DashMap::new(),
+            value_set_composes: DashMap::new(),
         }
+    }
+
+    /// The code systems a coded value names (none for a bare `code`).
+    fn coded_systems(coded: &CodedValue) -> Vec<String> {
+        let system = |c: &Value| c.get("system").and_then(Value::as_str).map(str::to_string);
+        match coded {
+            CodedValue::Code(_) => Vec::new(),
+            CodedValue::Coding(coding) => system(coding).into_iter().collect(),
+            CodedValue::CodeableConcept(concept) => concept
+                .get("coding")
+                .and_then(Value::as_array)
+                .map(|codings| codings.iter().filter_map(system).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The canonical a `$validate-code` answer blames on an unknown code
+    /// system (`x-caused-by-unknown-system` / `x-unknown-system`).
+    fn caused_by_unknown_system(body: &Value) -> Option<String> {
+        body.get("parameter")?.as_array()?.iter().find_map(|p| {
+            let name = p.get("name")?.as_str()?;
+            if name != "x-caused-by-unknown-system" && name != "x-unknown-system" {
+                return None;
+            }
+            p.get("valueCanonical")
+                .or_else(|| p.get("valueUri"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+
+    /// Whether every CodeSystem the server holds for `system` is a
+    /// `content: not-present` stub (or there is none). `None` when the server
+    /// could not be asked — the caller then keeps the server's verdict.
+    async fn system_has_no_content(&self, system: &str) -> Option<bool> {
+        if let Some(entry) = self.contentless_systems.get(system)
+            && entry.1.elapsed() < CACHE_TTL
+        {
+            return Some(entry.0);
+        }
+        let url = format!("{}/CodeSystem", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .query(&[
+                ("url", system),
+                ("_elements", "url,version,content"),
+                ("_count", "50"),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bundle: Value = response.json().await.ok()?;
+        if bundle.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
+            return None;
+        }
+        // A searchset may omit `entry` when nothing matched: no CodeSystem.
+        let entries = bundle
+            .get("entry")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let contentless = entries
+            .iter()
+            .all(|e| e.pointer("/resource/content").and_then(Value::as_str) == Some("not-present"));
+        self.contentless_systems
+            .insert(system.to_string(), (contentless, Instant::now()));
+        Some(contentless)
+    }
+
+    /// The `compose` of `value_set` (`url|version` honoured when the server
+    /// returns several versions). `None` when the server could not be asked.
+    async fn value_set_compose(&self, value_set: &str) -> Option<Value> {
+        if let Some(entry) = self.value_set_composes.get(value_set)
+            && entry.1.elapsed() < CACHE_TTL
+        {
+            return Some(entry.0.clone());
+        }
+        let (canonical, version) = split_canonical(value_set);
+        let url = format!("{}/ValueSet", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("url", canonical), ("_count", "50")])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bundle: Value = response.json().await.ok()?;
+        let entries = bundle.get("entry").and_then(Value::as_array)?;
+        let pick = entries
+            .iter()
+            .find(|e| {
+                version.is_some()
+                    && e.pointer("/resource/version").and_then(Value::as_str) == version
+            })
+            .or_else(|| entries.first());
+        let compose = pick
+            .and_then(|e| e.pointer("/resource/compose"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.value_set_composes
+            .insert(value_set.to_string(), (compose.clone(), Instant::now()));
+        Some(compose)
+    }
+
+    /// After a negative `$validate-code`: the code system to blame when the
+    /// "not in the value set" answer only reflects that the server cannot
+    /// check the code at all — the server said so (`x-caused-by-unknown-system`),
+    /// or every code system of the coded value has no content on the server
+    /// while the value set takes that system wholesale or by filter (an
+    /// enumerated `include.concept` list is still a real membership answer).
+    async fn unverifiable_system(
+        &self,
+        value_set: &str,
+        coded: &CodedValue,
+        body: &Value,
+    ) -> Option<String> {
+        if let Some(system) = Self::caused_by_unknown_system(body) {
+            return Some(system);
+        }
+        let systems = Self::coded_systems(coded);
+        if systems.is_empty() {
+            return None;
+        }
+        for system in &systems {
+            if !self.system_has_no_content(system).await? {
+                return None;
+            }
+        }
+        let compose = self.value_set_compose(value_set).await?;
+        let includes = compose.get("include").and_then(Value::as_array)?;
+        let unenumerated = |system: &str| {
+            includes.iter().any(|inc| {
+                inc.get("system").and_then(Value::as_str) == Some(system)
+                    && inc
+                        .get("concept")
+                        .and_then(Value::as_array)
+                        .is_none_or(|c| c.is_empty())
+            })
+        };
+        systems
+            .iter()
+            .all(|s| unenumerated(s))
+            .then(|| systems[0].clone())
     }
 
     /// The `$validate-code` Parameters for one check: `url` (version
@@ -774,6 +932,12 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             .and_then(Value::as_bool)
             .ok_or_else(|| TerminologyError::new("no boolean 'result' parameter in response"))?;
 
+        if !verdict && let Some(system) = self.unverifiable_system(value_set, coded, &body).await {
+            return Err(TerminologyError::unknown_code_system(format!(
+                "code system '{system}' has no content on the terminology server \
+                 (unknown, or a content=not-present stub), so the code cannot be checked"
+            )));
+        }
         self.cache.insert(key, (verdict, Instant::now()));
         Ok(verdict)
     }
