@@ -115,6 +115,10 @@ pub(super) struct WalkCtx<'a> {
     /// The resources being walked, innermost last (the source of a
     /// reference: its `fullUrl` and `contained`).
     resources: Vec<&'a Value>,
+    /// `(path depth, resourceType)` of each resource being walked, innermost
+    /// last: element paths of extension parents are taken relative to the
+    /// innermost resource (`Patient.name` inside `Bundle.entry.0.resource`).
+    resource_roots: Vec<(usize, String)>,
     /// How many slice-membership validations enclose this walk (each
     /// validates a value against a profile in a fresh context).
     nesting: usize,
@@ -224,6 +228,7 @@ impl<'a> WalkCtx<'a> {
             contained: Vec::new(),
             bundles: self.bundles.clone(),
             resources: self.resources.clone(),
+            resource_roots: Vec::new(),
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
         };
@@ -314,6 +319,7 @@ pub(super) fn validate(
         contained: Vec::new(),
         bundles: Vec::new(),
         resources: Vec::new(),
+        resource_roots: Vec::new(),
         nesting: 0,
         conformance: Rc::default(),
     };
@@ -583,6 +589,8 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
     if is_resource {
         ctx.contained.push(contained_types(obj));
         ctx.resources.push(data);
+        let rt = obj.get("resourceType").and_then(Value::as_str).unwrap_or_default();
+        ctx.resource_roots.push((ctx.path.depth(), rt.to_string()));
         if is_bundle {
             let entries = super::bundle::entries(data).into_iter().map(|(_, e)| e);
             ctx.bundles.push(Rc::new(entries.collect()));
@@ -621,6 +629,7 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
     if is_resource {
         ctx.contained.pop();
         ctx.resources.pop();
+        ctx.resource_roots.pop();
         if is_bundle {
             ctx.bundles.pop();
         }
@@ -848,7 +857,7 @@ fn eval_element<'a>(
         // warning (#615). Runs for every item, sliced or not — placement is
         // orthogonal to slicing.
         if ctx.check_extension_context && (key == "extension" || key == "modifierExtension") {
-            check_extension_context(ctx, items);
+            check_extension_context(ctx, set, items);
         }
 
         // Whole-collection keywords, per schema: min then max.
@@ -1020,22 +1029,48 @@ const CANONICAL_RESOURCES: &[&str] = &[
 /// Observation), except on canonical resources (warning, see
 /// [`CANONICAL_RESOURCES`]).
 ///
-/// Conservative on purpose, twice over. Only extensions at the **resource
-/// root** are judged: an element-level instance path cannot be compared to a
-/// declared context without mapping it back to the StructureDefinition path
-/// (recursive elements — `Questionnaire.item.item` — collapse to
-/// `Questionnaire.item` there, and the spec's own examples falsified the
-/// naive comparison at scale). And only element-type contexts that read as
-/// resource-rooted paths are judged: a context naming a datatype
-/// (`HumanName`), an `Element`/`Resource`/`DomainResource` catch-all, or a
-/// FHIRPath expression makes the extension unjudgeable here and passes
-/// silently. Unknown urls and relative (sub-extension) urls always pass.
-fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
-    let parent = ctx.path.parent_element_path();
-    // Root only: the parent path is bare `ResourceType` with no dots.
-    if parent.is_empty() || parent.contains('.') {
+/// The extension's parent is located by its element path relative to the
+/// innermost resource (`Patient.contact.address`, `Observation.value[x]`
+/// for `valueQuantity`, the `contentReference` target for recursive
+/// elements such as `Questionnaire.item.item`) and by its types (the
+/// element's datatype and the datatypes it derives from). An element-type
+/// context is met when it names that path or one of those types.
+///
+/// Conservative where the placement cannot be named exactly: catch-all
+/// contexts (`Element`, `BackboneElement`, `Resource`, `DomainResource`),
+/// FHIRPath contexts, and datatype-rooted paths (`Timing.repeat`) make an
+/// extension unjudgeable, as does a datatype context on a primitive's
+/// `_foo` sidecar (its type is not at hand). Unknown urls and relative
+/// (sub-extension) urls always pass.
+fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Value]) {
+    let Some((depth, root)) = ctx.resource_roots.last().cloned() else {
         return;
+    };
+    let mut keys: Vec<String> = ctx.path.keys_from(depth).iter().map(|k| k.to_string()).collect();
+    keys.pop(); // the `extension` key itself
+    let sidecar = keys.last().is_some_and(|k| k.starts_with('_'));
+    if let Some(last) = keys.last_mut()
+        && let Some(base) = last.strip_prefix('_')
+    {
+        *last = base.to_string();
     }
+    let mut parent_paths: Vec<String> = Vec::new();
+    let mut here = vec![root.clone()];
+    here.extend(keys.iter().cloned());
+    parent_paths.push(here.join("."));
+    // A recursive element names its definition through contentReference.
+    for schema in set.schemas() {
+        if let Some(segments) = &schema.element_reference {
+            let path: Vec<&str> = segments
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i == 0 || s.as_str() != "elements")
+                .map(|(_, s)| s.as_str())
+                .collect();
+            parent_paths.push(path.join("."));
+        }
+    }
+    let parent_types = element_types(ctx.resolver, set);
 
     for (index, item) in items.iter().enumerate() {
         let Some(url) = item.get("url").and_then(Value::as_str) else {
@@ -1051,30 +1086,47 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
             continue;
         };
 
-        let judgeable = |c: &String| {
-            // A resource-rooted element path: dotted segments, the first of
-            // which resolves to a resource schema. Everything else (datatype
-            // names, catch-alls, FHIRPath) is out of this check's reach.
-            !matches!(c.as_str(), "Element" | "Resource" | "DomainResource")
-                && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.')
-                && c.split('.')
-                    .next()
-                    .and_then(|head| ctx.resolver.resolve(head))
-                    .is_some_and(|s| crate::editor::is_resource(&s))
-        };
-        if !contexts.iter().all(judgeable) {
-            continue;
+        let mut met = false;
+        let mut judgeable = true;
+        for c in contexts {
+            if matches!(
+                c.as_str(),
+                "Element" | "BackboneElement" | "Resource" | "DomainResource"
+            ) || !c
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '[' | ']'))
+            {
+                judgeable = false;
+                break;
+            }
+            let head = c.split('.').next().unwrap_or_default();
+            let Some(head_schema) = ctx.resolver.resolve(head) else {
+                judgeable = false;
+                break;
+            };
+            if crate::editor::is_resource(&head_schema) {
+                // A resource-rooted element path names one exact spot:
+                // `Patient` is the root, `Patient.name` that element.
+                if parent_paths.iter().any(|p| path_matches(c, p)) {
+                    met = true;
+                }
+            } else if c.contains('.') || sidecar {
+                // Datatype-rooted paths, and datatypes on a primitive's
+                // sidecar, are out of reach.
+                judgeable = false;
+                break;
+            } else if parent_types.iter().any(|t| t == c) {
+                met = true;
+            }
         }
-        // An element-type context names one exact spot: `Patient` is the
-        // resource root, `Patient.name` that element — not "anywhere in
-        // Patient".
-        if contexts.contains(&parent) {
+        if !judgeable || met {
             continue;
         }
 
+        let parent = &parent_paths[0];
         ctx.path.push_index(index);
-        let message = errors::msg_extension_context(url, &parent, contexts);
-        let severity = if CANONICAL_RESOURCES.contains(&parent.as_str()) {
+        let message = errors::msg_extension_context(url, parent, contexts);
+        let severity = if CANONICAL_RESOURCES.contains(&root.as_str()) {
             Severity::Warning
         } else {
             Severity::Error
@@ -1082,6 +1134,47 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, items: &[Value]) {
         ctx.error_with_severity(ErrorKind::ExtensionContext, message, severity);
         ctx.path.pop();
     }
+}
+
+/// Does the context path `context` (`Observation.value[x]`) name the
+/// instance element path `instance` (`Observation.valueQuantity`)?
+fn path_matches(context: &str, instance: &str) -> bool {
+    let c: Vec<&str> = context.split('.').collect();
+    let i: Vec<&str> = instance.split('.').collect();
+    c.len() == i.len()
+        && c.iter().zip(&i).all(|(c, i)| match c.strip_suffix("[x]") {
+            Some(stem) => i
+                .strip_prefix(stem)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())),
+            None => c == i,
+        })
+}
+
+/// The datatypes of an element (from its schema set), with the datatypes
+/// they derive from (`Age` → `Quantity`).
+fn element_types(resolver: &dyn SchemaResolver, set: &SchemaSet) -> Vec<String> {
+    const CORE: &str = "http://hl7.org/fhir/StructureDefinition/";
+    let mut out: Vec<String> = Vec::new();
+    for schema in set.schemas() {
+        let Some(mut ty) = schema.type_.clone() else {
+            continue;
+        };
+        for _ in 0..8 {
+            if out.contains(&ty) {
+                break;
+            }
+            out.push(ty.clone());
+            let Some(base) = resolver
+                .resolve(&ty)
+                .and_then(|s| s.base.clone())
+                .map(|b| b.strip_prefix(CORE).map(str::to_string).unwrap_or(b))
+            else {
+                break;
+            };
+            ty = base;
+        }
+    }
+    out
 }
 
 /// Validate a `_foo` primitive-extension sidecar.
@@ -1414,6 +1507,58 @@ mod tests {
             "extension": [{ "url": "http://example.org/mystery", "valueString": "v" }]
         });
         assert!(warnings(&unknown).is_empty());
+    }
+
+    /// #615 below the resource root: element contexts are matched by the
+    /// parent's element path (relative to the innermost resource, choice
+    /// branches as `[x]`) or its datatype.
+    #[test]
+    fn extension_context_below_the_root() {
+        use crate::engine::Validator;
+        let validator = Validator::new(crate::packs::core_registry(helios_fhir::FhirVersion::R4));
+        let opts = crate::ValidationOptions {
+            check_extension_context: true,
+            ..Default::default()
+        };
+        let context_errors = |resource: &serde_json::Value| {
+            validator
+                .validate_sync(resource, &opts)
+                .errors
+                .into_iter()
+                .filter(|e| e.kind == ErrorKind::ExtensionContext)
+                .map(|e| e.path)
+                .collect::<Vec<_>>()
+        };
+        // geolocation: context `Address`.
+        let geo = json!({"url": "http://hl7.org/fhir/StructureDefinition/geolocation",
+            "extension": [{"url": "latitude", "valueDecimal": 1.0}, {"url": "longitude", "valueDecimal": 2.0}]});
+        let on_address = json!({"resourceType": "Patient",
+            "address": [{"city": "X", "extension": [geo.clone()]}],
+            "contact": [{"address": {"city": "Y", "extension": [geo.clone()]}}]});
+        assert!(context_errors(&on_address).is_empty(), "{:?}", context_errors(&on_address));
+        let on_name = json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
+        assert_eq!(context_errors(&on_name), vec!["Patient.name.0.extension.0"]);
+
+        // birthPlace: context `Patient` (the root only), inside a Bundle too.
+        let birthplace = json!({"url": "http://hl7.org/fhir/StructureDefinition/patient-birthPlace",
+            "valueAddress": {"city": "X"}});
+        let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": "urn:uuid:1", "resource": {"resourceType": "Patient", "extension": [birthplace.clone()],
+                "contact": [{"extension": [birthplace.clone()], "name": {"text": "c"}}]}}]});
+        assert_eq!(
+            context_errors(&bundle),
+            vec!["Bundle.entry.0.resource.contact.0.extension.0"]
+        );
+
+        // A choice-branch path context: `Observation.value[x]`-style
+        // contexts match `valueQuantity`; datatype `Quantity` does too.
+        // (bodyPosition: context `Observation`; at a component: error.)
+        let position = json!({"url": "http://hl7.org/fhir/StructureDefinition/observation-bodyPosition",
+            "valueCodeableConcept": {"text": "sitting"}});
+        let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "c"},
+            "extension": [position.clone()],
+            "component": [{"code": {"text": "x"}, "extension": [position.clone()]}]});
+        assert_eq!(context_errors(&obs), vec!["Observation.component.0.extension.0"]);
     }
 
     /// A keyword the base declares and every profile in the chain restates
