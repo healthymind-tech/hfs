@@ -519,6 +519,13 @@ pub struct PackageConfig {
     /// server lacks `units-of-time`, `ucum-units`, `observation-codes`, ….
     /// Only applies with `HFS_TERMINOLOGY_SERVER`.
     pub core_terminology: bool,
+    /// Credential sent as `Authorization: Bearer` on the package manager's
+    /// calls to the terminology server (IG and core terminology imports,
+    /// uninstall deletes) — `HFS_TERMINOLOGY_SERVER_TOKEN`, or the contents
+    /// of `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` (which wins). For HTS this is
+    /// its administrator password, which `HTS_REQUIRE_AUTH_FOR_WRITES`
+    /// requires for terminology writes.
+    pub terminology_token: Option<helios_admin_auth::Secret>,
 }
 
 /// Where the package manager looks for packages online.
@@ -598,6 +605,7 @@ impl Default for PackageConfig {
             max_unpacked: 1024 * 1024 * 1024,
             max_entry: 64 * 1024 * 1024,
             core_terminology: true,
+            terminology_token: None,
         }
     }
 }
@@ -646,8 +654,38 @@ impl PackageConfig {
                     )
                 })
                 .unwrap_or(d.core_terminology),
+            terminology_token: terminology_token_from_env(),
         }
     }
+}
+
+/// `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` (wins; trailing newline dropped), else
+/// `HFS_TERMINOLOGY_SERVER_TOKEN`. An unreadable file is logged — never with
+/// its contents — and leaves no token, so terminology writes fail visibly.
+fn terminology_token_from_env() -> Option<helios_admin_auth::Secret> {
+    if let Some(path) = std::env::var("HFS_TERMINOLOGY_SERVER_TOKEN_FILE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return match std::fs::read_to_string(path.trim()) {
+            Ok(contents) => {
+                let token = contents.trim_end_matches(['\r', '\n']);
+                (!token.trim().is_empty()).then(|| helios_admin_auth::Secret::new(token))
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %path.trim(),
+                    error = %err.kind(),
+                    "cannot read HFS_TERMINOLOGY_SERVER_TOKEN_FILE; terminology writes will be sent without a credential"
+                );
+                None
+            }
+        };
+    }
+    std::env::var("HFS_TERMINOLOGY_SERVER_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(helios_admin_auth::Secret::new)
 }
 
 /// Resource validation configuration, loaded from `HFS_VALIDATION_*`

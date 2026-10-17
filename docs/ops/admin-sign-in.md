@@ -21,6 +21,8 @@ Every variable exists for both servers, with the `HFS_` or `HTS_` prefix.
 | `*_ADMIN_TRUSTED_PROXIES` | loopback and private ranges | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` / `X-Real-IP` are believed for the sign-in rate limit. `none` trusts no proxy. |
 | `*_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins (`https://host[:port]`) accepted on cookie-authenticated writes, for proxies that rewrite `Host`. HFS always accepts the origin of `HFS_BASE_URL`. |
 | `*_ADMIN_COOKIE_SECURE` | `auto` | `auto`: the session cookie is `Secure` when the sign-in came over HTTPS (`X-Forwarded-Proto: https`, or the browser's `https://` `Origin`). `true` / `false` force it. |
+| `HTS_REQUIRE_AUTH_FOR_WRITES` | `true` when an HTS password is set, else `false` | Require the administrator credential for state-changing terminology requests (see the HTS table below). `false` with a password configured opens them again (warning at startup); `true` without one makes them answer `503`. With neither a password nor the switch, writes stay open as before and HTS logs a startup warning. |
+| `HFS_TERMINOLOGY_SERVER_TOKEN` / `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` | (none) | Sent by HFS as `Authorization: Bearer` on its package manager's calls to `HFS_TERMINOLOGY_SERVER` (IG and core terminology imports, uninstall deletes). Set it to HTS's administrator password when HTS requires auth for writes. The file wins; a trailing newline is ignored. |
 
 **Fail closed.** With `*_ADMIN_UI=true` and no password (or a broken
 password file) every administrative endpoint answers `503` and the sign-in
@@ -54,7 +56,9 @@ the password is ignored (with a warning).
 | `/ui/hts/terminology/**`, `/ui/hts/jobs/**`, `/ui/hts/import/**` | admin (pages and their forms) |
 | Any other state-changing request under `/ui/hts` except the workbenches | admin |
 | Browsing CodeSystems / ValueSets / ConceptMaps / concepts, the `$lookup` `$validate-code` `$subsumes` `$expand` `$translate` workbenches, capability statement, home | public |
-| The terminology API (`/CodeSystem`, `/ValueSet`, `/ConceptMap`, operations, `/import`, `/metadata`, `/health`) | public (unchanged) |
+| Terminology writes, when `HTS_REQUIRE_AUTH_FOR_WRITES` is on: `POST/PUT/PATCH/DELETE` on `/CodeSystem`, `/ValueSet`, `/ConceptMap` (and their ids), `POST /import`, a `POST /` batch/transaction with any write entry, and any posted `$operation` not listed in the next row | admin (Basic/Bearer; `401` OperationOutcome without) |
+| Terminology reads: every `GET`, and `$lookup`, `$validate-code`, `$subsumes`, `$expand`, `$batch-validate-code`, `$translate`, `$closure` (stateless) in `GET` or `POST` form, and a `POST /` batch whose entries are only such reads (HFS's validator sends its checks this way) | public |
+| `/metadata`, `/health`, `/metrics` | public |
 
 ## Signing in
 
@@ -103,6 +107,16 @@ sits in front of nginx on a public address, add it to
 `*_ADMIN_TRUSTED_PROXIES`, or every client shares its address — and one
 attacker's failures lock everyone out. The address logged with each failure
 shows what the server resolved.
+
+**Callers that write terminology.** HFS's package manager (`/import` of IG
+and core terminology, deletes on uninstall) sends
+`HFS_TERMINOLOGY_SERVER_TOKEN` as a Bearer token; HFS's validator, search
+expansion and FHIRPath terminology functions only read. The HTS console's
+Import page and management pages call HTS over loopback with the
+administrator credential. Startup bootstrap (`HTS_BOOTSTRAP_DIR`), admin
+jobs and the `hts import` / `hts migrate` CLIs write to the database
+directly and are unaffected. Scripts posting to `/import` must add
+`-u admin:…`.
 
 **Audit.** HTS records the signed-in administrator (`X-Remote-User` is set
 to the admin user on admitted requests; a client-supplied

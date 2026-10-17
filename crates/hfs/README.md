@@ -112,6 +112,7 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `HFS_ADMIN_PASSWORD` | (none) | Administrator password guarding `/admin/*`, the cross-tenant console metrics and the console's admin pages (IG Packages, Tenants, Bulk Import/Export, SQL Export, other state-changing forms). Browsers sign in at `/ui/admin/login`; scripts use Basic (`-u admin:…`) or `Bearer <password>`. Required with `HFS_ADMIN_UI=true` (else those endpoints answer `503`); ignored when `HFS_AUTH_ENABLED=true`. See [Administrator sign-in](../../docs/ops/admin-sign-in.md) |
 | `HFS_ADMIN_PASSWORD_FILE` | (none) | File holding the administrator password (Docker secrets); wins over `HFS_ADMIN_PASSWORD` |
 | `HFS_ADMIN_USER` | admin | Administrator user name |
+| `HFS_TERMINOLOGY_SERVER_TOKEN` | (none) | Bearer token for the package manager's writes to `HFS_TERMINOLOGY_SERVER` (IG/core terminology `/import`, uninstall deletes) — HTS's administrator password when it requires auth for writes. `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` reads it from a file (wins) |
 | `HFS_ADMIN_SESSION_IDLE_MINUTES` | 480 | Idle lifetime of an admin browser session |
 | `HFS_ADMIN_TRUSTED_PROXIES` | loopback + private ranges | Proxies whose `X-Forwarded-For`/`X-Real-IP` are believed for the sign-in rate limit (CIDR list, or `none`) |
 | `HFS_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins accepted on cookie-authenticated admin writes (the `HFS_BASE_URL` origin always is) |

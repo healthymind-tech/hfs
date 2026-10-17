@@ -21,6 +21,7 @@ without internet access.
 | `HFS_PACKAGE_MAX_UNPACKED` | 1 GiB | Largest unpacked package. |
 | `HFS_PACKAGE_MAX_ENTRY` | 64 MiB | Largest single file inside a package. |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Where CodeSystem/ValueSet/ConceptMap go (`POST /import`). Without it terminology is stored in HFS. |
+| `HFS_TERMINOLOGY_SERVER_TOKEN` / `_FILE` | (none) | Bearer token for those terminology writes; HTS's administrator password when HTS requires auth for writes (`HTS_REQUIRE_AUTH_FOR_WRITES`). |
 
 Installing and removing packages are administrative actions. They sit
 behind `HFS_ADMIN_UI` and the administrator sign-in (`HFS_ADMIN_PASSWORD`;

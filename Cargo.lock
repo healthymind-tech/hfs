@@ -3741,6 +3741,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "helios-admin-auth",
  "helios-audit",
  "helios-auth",
  "helios-fhir",
