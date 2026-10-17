@@ -17,6 +17,7 @@ default-members = [
 	"crates/hfs",
 	"crates/ui",
 	"crates/ui-chrome",
+	"crates/admin-auth",
 	"crates/persistence",
 	"crates/rest",
 	"crates/sof",

@@ -3351,6 +3351,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helios-admin-auth"
+version = "0.2.4"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "http-body-util",
+ "rand 0.8.6",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "helios-audit"
 version = "0.2.4"
 dependencies = [
@@ -3538,6 +3553,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "sqlparser",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",
@@ -3746,8 +3762,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha1",
  "sha2 0.10.9",
  "sqlparser",
+ "tar",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
