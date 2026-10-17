@@ -109,6 +109,10 @@ askama = "0.16"
 # they did before — see crates/ui-chrome/README.md.
 helios-ui-chrome = { path = "../ui-chrome", version = "0.2.4" }
 
+# Administrator sign-in for the console's admin pages (`/ui/admin/login`, the
+# guard on IG Packages, Tenants, Bulk and SQL export), shared with HTS.
+helios-admin-auth = { path = "../admin-auth", version = "0.2.4" }
+
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
 # (`Vary: HX-Request`) so an htmx fragment is never served for a hard navigation.

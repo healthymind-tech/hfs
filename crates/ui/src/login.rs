@@ -471,6 +471,7 @@ mod selfcall_tests {
             write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             login: sessions.map(|sessions| Arc::new(LoginRuntime { sessions })),
+            admin_gate: helios_admin_auth::AdminGate::Open,
         }
     }
 
