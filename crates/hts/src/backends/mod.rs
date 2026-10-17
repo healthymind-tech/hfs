@@ -106,6 +106,35 @@ static CS_ORDER_BY_CODE_SYSTEMS: LazyLock<String> =
     LazyLock::new(|| build_cs_precedence_order_by("code_systems"));
 static CS_ORDER_BY_S: LazyLock<String> = LazyLock::new(|| build_cs_precedence_order_by("s"));
 
+/// `ORDER BY` for a resource search (`GET /CodeSystem?url=…`, and every
+/// operation that resolves "the" CodeSystem, ValueSet or ConceptMap for a URL
+/// with `search(url, count: 1)`).
+///
+/// A search restricted to one canonical URL without a version — `url`, or
+/// CodeSystem `system` (its alias), whatever other parameters (`name`,
+/// `title`, `status`, `_id`, …) narrow it further — lists the rows in
+/// [`cs_precedence_order_by`] / [`vs_precedence_order_by`] /
+/// [`cm_precedence_order_by`] order, so its first hit is the row every other
+/// versionless resolver picks. Before, it listed them by `created_at`: with
+/// the THO `v3-loinc` stub (`content=not-present`, version `3.1.0`) imported
+/// before the real LOINC 2.83, `$expand` expanded 2.83 but reported
+/// `used-codesystem = http://loinc.org|3.1.0` from the stub. Other searches
+/// span several canonicals and keep insertion order. Both orders are total
+/// (they end in a unique column), so paging stays stable.
+pub(crate) fn search_order_by(
+    table: &str,
+    query: &crate::types::ResourceSearchQuery,
+) -> Cow<'static, str> {
+    let single_canonical =
+        (query.url.is_some() || query.system.is_some()) && query.version.is_none();
+    match (table, single_canonical) {
+        ("code_systems", true) => cs_precedence_order_by("code_systems"),
+        ("value_sets", true) => vs_precedence_order_by("value_sets"),
+        ("concept_maps", true) => cm_precedence_order_by("concept_maps"),
+        _ => Cow::Borrowed("created_at, id"),
+    }
+}
+
 /// Precedence among `value_sets` rows sharing one canonical URL.
 ///
 /// The ValueSet analogue of [`cs_precedence_order_by`]. `value_sets` has no
@@ -134,6 +163,28 @@ fn build_vs_precedence_order_by(alias: &str) -> String {
 
 static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
     LazyLock::new(|| build_vs_precedence_order_by("value_sets"));
+
+/// Precedence among `concept_maps` rows sharing one canonical URL: the
+/// highest version (semantic order, [`crate::version_order`]), then a stable
+/// `id`. The ConceptMap analogue of [`vs_precedence_order_by`]; ConceptMaps
+/// carry no provenance rank.
+///
+/// Every place that picks "the" ConceptMap for a URL without a version — a
+/// versionless `GET /ConceptMap?url=…`, `$translate` with `url` (or without,
+/// per map) — orders by this.
+pub(crate) fn cm_precedence_order_by(alias: &str) -> Cow<'static, str> {
+    match alias {
+        "concept_maps" => Cow::Borrowed(CM_ORDER_BY_CONCEPT_MAPS.as_str()),
+        other => Cow::Owned(build_cm_precedence_order_by(other)),
+    }
+}
+
+fn build_cm_precedence_order_by(alias: &str) -> String {
+    format!("COALESCE({alias}.version_sort, {alias}.version, '') DESC, {alias}.id")
+}
+
+static CM_ORDER_BY_CONCEPT_MAPS: LazyLock<String> =
+    LazyLock::new(|| build_cm_precedence_order_by("concept_maps"));
 
 /// `expansion.contains` entries built straight from `compose.include.concept[]`
 /// (code + embedded display), skipping codes already in `skip`.

@@ -120,6 +120,11 @@ impl ResourceStringSearch {
         self.publisher.is_some()
     }
 
+    /// Whether the metadata rows must carry the reported id (`_id`).
+    pub(crate) fn needs_fhir_id(&self) -> bool {
+        self.id.is_some()
+    }
+
     /// Whether the metadata rows must carry `supplements`.
     pub(crate) fn needs_supplements(&self) -> bool {
         self.supplements.is_some()
@@ -136,15 +141,29 @@ impl ResourceStringSearch {
     pub(crate) fn matches_row(&self, row: &ResourceSearchRow) -> bool {
         self.matches(row.name.as_deref(), row.title.as_deref())
             && satisfies(&self.publisher, row.publisher.as_deref())
-            && self.id.as_deref().is_none_or(|id| {
-                row.id == id
-                    || row
-                        .id
-                        .strip_prefix(id)
-                        .is_some_and(|rest| rest.starts_with('|'))
-            })
-            && self.system.as_deref().is_none_or(|system| row.url == system)
-            && self.content_mode.as_deref().is_none_or(|mode| row.content.as_deref() == Some(mode))
+            && self
+                .id
+                .as_deref()
+                .is_none_or(|id| match row.fhir_id.as_deref() {
+                    // Reported ids are unique per stored version: `_id` names one row.
+                    Some(reported) => reported == id || row.id == id,
+                    // A row without one: its storage id, or every `<id>|<version>`.
+                    None => {
+                        row.id == id
+                            || row
+                                .id
+                                .strip_prefix(id)
+                                .is_some_and(|rest| rest.starts_with('|'))
+                    }
+                })
+            && self
+                .system
+                .as_deref()
+                .is_none_or(|system| row.url == system)
+            && self
+                .content_mode
+                .as_deref()
+                .is_none_or(|mode| row.content.as_deref() == Some(mode))
             && self.supplements.as_deref().is_none_or(|wanted| {
                 row.supplements
                     .as_deref()
@@ -290,7 +309,9 @@ fn date_range(
             };
             let (naive, step) = match fraction {
                 None => (naive, step),
-                Some(f) if !f.is_empty() && f.len() <= 9 && f.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(f)
+                    if !f.is_empty() && f.len() <= 9 && f.bytes().all(|b| b.is_ascii_digit()) =>
+                {
                     if clock.len() != 19 {
                         return None;
                     }
@@ -370,6 +391,9 @@ pub(crate) struct ResourceSearchRow {
     pub publisher: Option<String>,
     /// Last-modified timestamp (`updated_at`; `created_at` for ConceptMap).
     pub updated_at: Option<String>,
+    /// Reported id (`fhir_id`, see `crate::resource_ids`). PostgreSQL always
+    /// selects it; SQLite fills it in when `_id` is filtered on.
+    pub fhir_id: Option<String>,
 }
 
 /// Apply the Rust-side filters and then `_offset`/`_count`.
@@ -390,7 +414,7 @@ pub(crate) fn filter_rows(
 
 /// The metadata select list for `table` (see [`ResourceSearchRow`]): `id, url,
 /// version, name, title, status, content, supplements, publisher,
-/// updated_at`. Columns a table lacks, or that the search does not need,
+/// updated_at, fhir_id`. Columns a table lacks, or that the search does not need,
 /// are `NULL` — `supplements`/`publisher` are derived from `resource_json`,
 /// so reading them for every row costs a JSON read per row.
 ///
@@ -403,20 +427,35 @@ pub(crate) fn metadata_select_list(
     search: &ResourceStringSearch,
     postgres: bool,
 ) -> String {
-    let content = if table == "code_systems" { "content" } else { "NULL" };
+    let content = if table == "code_systems" {
+        "content"
+    } else {
+        "NULL"
+    };
     let supplements = if table == "code_systems" && search.needs_supplements() {
         "supplements"
     } else {
         "NULL"
     };
-    let publisher = match (search.needs_publisher(), postgres && table != "code_systems") {
+    let publisher = match (
+        search.needs_publisher(),
+        postgres && table != "code_systems",
+    ) {
         (false, _) => "NULL",
         (true, false) => "publisher",
         (true, true) => "resource_json->>'publisher'",
     };
-    let updated = if table == "concept_maps" { "created_at" } else { "updated_at" };
+    let updated = if table == "concept_maps" {
+        "created_at"
+    } else {
+        "updated_at"
+    };
+    // SQLite reads `fhir_id` from an index separately (it sits behind
+    // `resource_json` in the row).
+    let fhir_id = if postgres { "fhir_id" } else { "NULL" };
     format!(
-        "id, url, version, name, title, status, {content}, {supplements}, {publisher}, {updated}"
+        "id, url, version, name, title, status, {content}, {supplements}, {publisher}, {updated}, \
+         {fhir_id}"
     )
 }
 
@@ -528,7 +567,15 @@ mod tests {
 
     #[test]
     fn date_search_rejects_malformed_values() {
-        for bad in ["", "yesterday", "xx2026", "2026-13", "2026-10-15T25:00", "2026-1", "20261015"] {
+        for bad in [
+            "",
+            "yesterday",
+            "xx2026",
+            "2026-13",
+            "2026-10-15T25:00",
+            "2026-1",
+            "20261015",
+        ] {
             assert!(DateSearch::parse(bad).is_err(), "{bad}");
         }
     }
@@ -548,9 +595,21 @@ mod tests {
     #[test]
     fn supplements_canonical_matching() {
         assert!(canonical_matches("http://loinc.org", "http://loinc.org"));
-        assert!(canonical_matches("http://loinc.org", "http://loinc.org|2.80"));
-        assert!(!canonical_matches("http://loinc.org", "http://loinc.org/extra"));
-        assert!(canonical_matches("http://loinc.org|2.80", "http://loinc.org|2.80"));
-        assert!(!canonical_matches("http://loinc.org|2.80", "http://loinc.org"));
+        assert!(canonical_matches(
+            "http://loinc.org",
+            "http://loinc.org|2.80"
+        ));
+        assert!(!canonical_matches(
+            "http://loinc.org",
+            "http://loinc.org/extra"
+        ));
+        assert!(canonical_matches(
+            "http://loinc.org|2.80",
+            "http://loinc.org|2.80"
+        ));
+        assert!(!canonical_matches(
+            "http://loinc.org|2.80",
+            "http://loinc.org"
+        ));
     }
 }

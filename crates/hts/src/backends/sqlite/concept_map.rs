@@ -106,18 +106,20 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
 
+            // A versionless URL search lists the default version first.
+            let order_by = crate::backends::search_order_by("concept_maps", &query);
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                .prepare_cached(&format!(
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM concept_maps
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
                        AND (?3 IS NULL OR name = ?3)
                        AND (?4 IS NULL OR title = ?4)
                        AND (?5 IS NULL OR status = ?5)
-                     ORDER BY created_at
+                     ORDER BY {order_by}
                      LIMIT ?6 OFFSET ?7",
-                )
+                ))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt
@@ -140,6 +142,7 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -147,10 +150,10 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -163,6 +166,10 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)
@@ -221,6 +228,9 @@ fn translate_sync(
     } else {
         (req.system.as_deref(), req.target_system.as_deref())
     };
+    // Each map URL contributes one version: `conceptMapVersion` for the
+    // named `url`, else its default version.
+    let map_version = req.url.as_ref().and(req.map_version.as_deref());
 
     let mut rows = query_translate_elements(
         conn,
@@ -228,6 +238,7 @@ fn translate_sync(
         search_sys,
         other_side_sys,
         req.url.as_deref(),
+        map_version,
         reverse,
         req.date.as_deref(),
     )?;
@@ -249,6 +260,7 @@ fn translate_sync(
                 search_sys,
                 other_side_sys,
                 req.url.as_deref(),
+                map_version,
                 reverse,
                 req.date.as_deref(),
             )?;
@@ -335,6 +347,7 @@ fn query_translate_elements(
     system: Option<&str>,
     other_side_sys: Option<&str>,
     map_url: Option<&str>,
+    map_version: Option<&str>,
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
@@ -362,7 +375,11 @@ fn query_translate_elements(
            AND (?2 IS NULL OR {lookup_sys_col} = ?2)
            AND (?3 IS NULL OR {other_sys_col} = ?3)
            AND (?4 IS NULL OR cm.url = ?4)
-           AND (?5 IS NULL OR json_extract(cm.resource_json, '$.date') <= ?5)"
+           AND (?5 IS NULL OR json_extract(cm.resource_json, '$.date') <= ?5)
+           AND cm.id = (SELECT c2.id FROM concept_maps c2
+                         WHERE c2.url = cm.url AND (?6 IS NULL OR c2.version = ?6)
+                         ORDER BY {default_first} LIMIT 1)",
+        default_first = crate::backends::cm_precedence_order_by("c2")
     );
 
     let mut stmt = conn
@@ -371,7 +388,7 @@ fn query_translate_elements(
 
     let rows = stmt
         .query_map(
-            rusqlite::params![code, system, other_side_sys, map_url, date],
+            rusqlite::params![code, system, other_side_sys, map_url, date, map_version],
             |row| {
                 Ok(TranslateRow {
                     concept_system: row.get(0)?,

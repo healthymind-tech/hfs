@@ -62,6 +62,13 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
     // `system=X|V` → `system=X` + `version=V` (see `normalize_canonical_params`).
     let mut params = params;
     normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // SNOMED CT edition URIs (`version`, coding versions) → the stored release.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
     // ── Resolve (system, codeA, codeB) from one of two input forms ───────────
     //
     // Form 1: bare `codeA` + `codeB` + shared `system` parameter.

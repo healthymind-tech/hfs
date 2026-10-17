@@ -300,6 +300,11 @@ fn write_code_system(
         )
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // The declared id the row had before this write: a re-import under a
+    // different id moves the row to another declared-id group.
+    let previous_declared = existing_for_url_version
+        .as_deref()
+        .and_then(|sid| crate::backends::sqlite::fhir_ids::declared_of(conn, "code_systems", sid));
     let storage_id = if let Some(id) = existing_for_url_version {
         id
     } else {
@@ -537,6 +542,11 @@ fn write_code_system(
     crate::backends::sqlite::invalidate_cs_id_cache();
     crate::backends::sqlite::invalidate_cs_language_cache();
 
+    // Unique reported ids across the versions sharing this id.
+    let mut groups = vec![cs.id.clone()];
+    groups.extend(previous_declared);
+    crate::backends::sqlite::fhir_ids::reassign(conn, "code_systems", &groups)?;
+
     stats.code_systems += 1;
     Ok(())
 }
@@ -599,6 +609,9 @@ fn write_value_set(
         )
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let previous_declared = existing_for_url_version
+        .as_deref()
+        .and_then(|sid| crate::backends::sqlite::fhir_ids::declared_of(conn, "value_sets", sid));
     let storage_id = if let Some(id) = existing_for_url_version {
         id
     } else {
@@ -690,6 +703,11 @@ fn write_value_set(
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    // Unique reported ids across the versions sharing this id.
+    let mut groups = vec![vs.id.clone()];
+    groups.extend(previous_declared);
+    crate::backends::sqlite::fhir_ids::reassign(conn, "value_sets", &groups)?;
+
     stats.value_sets += 1;
     Ok(())
 }
@@ -720,26 +738,95 @@ fn write_concept_map(
     let resource_json = serde_json::to_string(&cm.resource_json).ok();
     let now = utc_now();
 
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO concept_maps
-         (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-    )
-    .and_then(|mut s| {
-        s.execute(rusqlite::params![
-            cm.id,
-            cm.url,
-            cm.version,
-            cm.name,
-            cm.title,
-            cm.source_uri,
-            cm.target_uri,
-            cm.status,
-            resource_json,
-            now
-        ])
-    })
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // One row per (url, version), like CodeSystems and ValueSets: a new
+    // version is stored next to the old ones (before, `INSERT OR REPLACE`
+    // keyed on the unique url replaced whatever version was there, so the
+    // last import won); a re-import of the same version replaces its row.
+    // Storage id: the FHIR id when free, else `<id>|<version>`, else a UUID.
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM concept_maps \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cm.url, cm.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let previous_declared = existing
+        .as_deref()
+        .and_then(|sid| crate::backends::sqlite::fhir_ids::declared_of(conn, "concept_maps", sid));
+    // The same (url, version) re-imported under another id moves to that id:
+    // the old row (and its elements) goes, so the old id stops resolving.
+    let existing = match existing {
+        Some(sid) if previous_declared.as_deref() != Some(cm.id.as_str()) => {
+            conn.execute("DELETE FROM concept_maps WHERE id = ?1", [&sid])
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            None
+        }
+        other => other,
+    };
+    let taken = |id: &str| -> Result<bool, HtsError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE id = ?1)",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))
+    };
+    let storage_id = match existing {
+        Some(id) => {
+            conn.execute("DELETE FROM concept_map_elements WHERE map_id = ?1", [&id])
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            conn.execute(
+                "UPDATE concept_maps SET name = ?2, title = ?3, source_uri = ?4, \
+                 target_uri = ?5, status = ?6, resource_json = ?7, version_sort = ?8 \
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    cm.name,
+                    cm.title,
+                    cm.source_uri,
+                    cm.target_uri,
+                    cm.status,
+                    resource_json,
+                    version_sort_key(cm.version.as_deref()),
+                ],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            id
+        }
+        None => {
+            let versioned = storage_id_for(&cm.id, cm.version.as_deref());
+            let id = if !taken(&cm.id)? {
+                cm.id.clone()
+            } else if !taken(&versioned)? {
+                versioned
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            conn.execute(
+                "INSERT INTO concept_maps
+                 (id, url, version, name, title, source_uri, target_uri, status, resource_json,
+                  created_at, version_sort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    id,
+                    cm.url,
+                    cm.version,
+                    cm.name,
+                    cm.title,
+                    cm.source_uri,
+                    cm.target_uri,
+                    cm.status,
+                    resource_json,
+                    now,
+                    version_sort_key(cm.version.as_deref()),
+                ],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            id
+        }
+    };
 
     const INSERT_ELEMENT_SQL: &str = "INSERT OR IGNORE INTO concept_map_elements
          (map_id, source_system, source_code, target_system, target_code, equivalence)
@@ -748,7 +835,7 @@ fn write_concept_map(
         conn.prepare_cached(INSERT_ELEMENT_SQL)
             .and_then(|mut s| {
                 s.execute(rusqlite::params![
-                    cm.id,
+                    storage_id,
                     el.source_system,
                     el.source_code,
                     el.target_system,
@@ -758,6 +845,10 @@ fn write_concept_map(
             })
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
+
+    let mut groups = vec![cm.id.clone()];
+    groups.extend(previous_declared);
+    crate::backends::sqlite::fhir_ids::reassign(conn, "concept_maps", &groups)?;
 
     stats.concept_maps += 1;
     Ok(())
@@ -779,7 +870,8 @@ pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<
     use rusqlite::OptionalExtension;
     if let Some(url) = conn
         .query_row(
-            "SELECT url FROM code_systems WHERE id = ?1",
+            "SELECT url FROM code_systems WHERE fhir_id = ?1 OR id = ?1 \
+             ORDER BY (fhir_id = ?1) DESC LIMIT 1",
             rusqlite::params![id],
             |row| row.get::<_, String>(0),
         )
@@ -831,16 +923,24 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
     // deleting a CodeSystem would otherwise orphan its FTS rows and its
     // concepts_fts_built marker. Mirrors the per-system invalidation in
     // write_code_system.
-    let system_ids: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM code_systems \
-             WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
-        )
-        .and_then(|mut s| {
-            s.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    //
+    // An id some row reports (`fhir_id`, unique per stored version — see
+    // `crate::resource_ids`) names exactly that row; anything else keeps the
+    // legacy matching on storage id or declared id.
+    let exact = reported_row(conn, "code_systems", id)?;
+    let system_ids: Vec<String> = match &exact {
+        Some((sid, _)) => vec![sid.clone()],
+        None => conn
+            .prepare(
+                "SELECT id FROM code_systems \
+                 WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
+            )
+            .and_then(|mut s| {
+                s.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default(),
+    };
 
     // FTS rows first, while the concepts (whose ids are the rowids) still
     // exist — see `invalidate_concept_fts`.
@@ -848,12 +948,21 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
         invalidate_concept_fts(conn, sid)?;
     }
 
-    conn.execute(
-        "DELETE FROM code_systems \
-         WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
-        rusqlite::params![id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if let Some((sid, declared)) = exact {
+        conn.execute("DELETE FROM code_systems WHERE id = ?1", [&sid])
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        // Hand the plain id to the next default version.
+        if let Some(declared) = declared {
+            crate::backends::sqlite::fhir_ids::reassign(conn, "code_systems", &[declared])?;
+        }
+    } else {
+        conn.execute(
+            "DELETE FROM code_systems \
+             WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    }
 
     crate::backends::sqlite::invalidate_cs_id_cache();
     crate::backends::sqlite::invalidate_cs_language_cache();
@@ -886,6 +995,17 @@ pub(crate) fn delete_value_set(conn: &Connection, id: &str) -> Result<(), HtsErr
     // on the embedded id would delete unrelated ValueSets. The remaining gap —
     // a ValueSet stored under such a minted UUID is still not reachable by id —
     // needs URL-based resolution and is out of scope here.
+    //
+    // An id some row reports (`fhir_id`) names exactly that row, as for
+    // CodeSystems.
+    if let Some((sid, declared)) = reported_row(conn, "value_sets", id)? {
+        conn.execute("DELETE FROM value_sets WHERE id = ?1", [&sid])
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        if let Some(declared) = declared {
+            crate::backends::sqlite::fhir_ids::reassign(conn, "value_sets", &[declared])?;
+        }
+        return Ok(());
+    }
     conn.execute(
         "DELETE FROM value_sets \
          WHERE id = ?1 \
@@ -896,9 +1016,35 @@ pub(crate) fn delete_value_set(conn: &Connection, id: &str) -> Result<(), HtsErr
     Ok(())
 }
 
+/// `(storage id, declared id)` of the row reporting `id`.
+#[cfg(feature = "sqlite")]
+fn reported_row(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+) -> Result<Option<(String, Option<String>)>, HtsError> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        &format!("SELECT id, declared_id FROM {table} WHERE fhir_id = ?1 LIMIT 1"),
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
 /// Delete a ConceptMap and all its element rows by FHIR resource `id`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsError> {
+    // The row reporting `id` (one version), as for CodeSystems.
+    if let Some((sid, declared)) = reported_row(conn, "concept_maps", id)? {
+        conn.execute("DELETE FROM concept_maps WHERE id = ?1", [&sid])
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        if let Some(declared) = declared {
+            crate::backends::sqlite::fhir_ids::reassign(conn, "concept_maps", &[declared])?;
+        }
+        return Ok(());
+    }
     conn.execute(
         "DELETE FROM concept_maps WHERE id = ?1",
         rusqlite::params![id],

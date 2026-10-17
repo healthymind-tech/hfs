@@ -8,6 +8,7 @@ pub mod schema;
 
 mod code_system;
 mod concept_map;
+pub(crate) mod fhir_ids;
 mod value_set;
 
 use async_trait::async_trait;
@@ -241,6 +242,7 @@ fn search_row(row: &tokio_postgres::Row) -> ResourceSearchRow {
         supplements: row.get(7),
         publisher: row.get(8),
         updated_at: row.get(9),
+        fhir_id: row.get(10),
     }
 }
 
@@ -297,17 +299,20 @@ async fn search_table(
                 && query.name.is_none()
                 && query.title.is_none()
                 && query.status.is_none());
+    let order_by = crate::backends::search_order_by(table, &query);
+    let has_fhir_id = fhir_ids::TABLES.contains(&table);
     let sql = format!(
-        "SELECT id, url, version, name, title, status{json}
+        "SELECT id, url, version, name, title, status, {fhir_id}{json}
          FROM {table}
          WHERE ($1::text IS NULL OR url = $1)
            AND ($2::text IS NULL OR version = $2)
            AND ($3::text IS NULL OR name = $3)
            AND ($4::text IS NULL OR title = $4)
            AND ($5::text IS NULL OR status = $5)
-         ORDER BY created_at
+         ORDER BY {order_by}
          LIMIT $6 OFFSET $7",
-        json = if metadata_only { "" } else { ", resource_json" }
+        json = if metadata_only { "" } else { ", resource_json" },
+        fhir_id = if has_fhir_id { "fhir_id" } else { "NULL::text" }
     );
     let rows = (**client)
         .cq(
@@ -326,8 +331,8 @@ async fn search_table(
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
-        let stored: Option<serde_json::Value> = if metadata_only { None } else { row.get(6) };
-        results.push(stored.unwrap_or_else(|| {
+        let stored: Option<serde_json::Value> = if metadata_only { None } else { row.get(7) };
+        let mut resource = stored.unwrap_or_else(|| {
             code_system::build_synthetic_resource(
                 resource_type,
                 &row.get::<_, String>(0),
@@ -337,7 +342,15 @@ async fn search_table(
                 row.get::<_, Option<String>>(4).as_deref(),
                 &row.get::<_, String>(5),
             )
-        }));
+        });
+        if has_fhir_id {
+            let fhir_id: Option<String> = row.get(6);
+            crate::resource_ids::apply_id(
+                &mut resource,
+                &crate::resource_ids::reported_id(&row.get::<_, String>(0), fhir_id.as_deref()),
+            );
+        }
+        results.push(resource);
     }
     Ok(results)
 }
@@ -405,8 +418,9 @@ where
          WHERE ($1::text IS NULL OR url = $1)
            AND ($2::text IS NULL OR version = $2)
            AND ($3::text IS NULL OR status = $3)
-         ORDER BY created_at",
-        columns = crate::string_search::metadata_select_list(table, &search, true)
+         ORDER BY {order_by}",
+        columns = crate::string_search::metadata_select_list(table, &search, true),
+        order_by = crate::backends::search_order_by(table, &query)
     );
     let rows = client
         .query(&metadata_sql, &[&query.url, &query.version, &query.status])
@@ -440,9 +454,10 @@ where
             .collect::<HashMap<_, _>>()
     };
 
+    let has_fhir_id = fhir_ids::TABLES.contains(&table);
     let mut results = Vec::with_capacity(selected.len());
     for row in selected {
-        let resource = stored_resources
+        let mut resource = stored_resources
             .get(&row.id)
             .cloned()
             .flatten()
@@ -457,6 +472,12 @@ where
                     &row.status,
                 )
             });
+        if has_fhir_id {
+            crate::resource_ids::apply_id(
+                &mut resource,
+                &crate::resource_ids::reported_id(&row.id, row.fhir_id.as_deref()),
+            );
+        }
         results.push(resource);
     }
     Ok(results)
@@ -535,6 +556,10 @@ impl PostgresTerminologyBackend {
                         error_chain(&e)
                     ))
                 })?;
+
+            // Unique reported ids across versions; repairs databases where
+            // versions still share one id (see `crate::resource_ids`).
+            fhir_ids::repair(&mut client).await?;
 
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
@@ -915,73 +940,47 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
     }
 
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
-        // Exact storage id first; then — multi-version rows carry synthetic
-        // `<id>|<version>` storage ids — the FHIR id captured in
-        // `resource_json`, best row by precedence. Mirrors the SQLite twin.
-        let fallback = match resource_type {
-            "CodeSystem" => Some(format!(
-                "SELECT url FROM code_systems WHERE (resource_json->>'id') = $1 \
-                 ORDER BY {} LIMIT 1",
-                crate::backends::cs_precedence_order_by("code_systems")
-            )),
-            "ValueSet" => Some(format!(
-                "SELECT url FROM value_sets WHERE (resource_json->>'id') = $1 \
-                 ORDER BY {} LIMIT 1",
-                crate::backends::vs_precedence_order_by("value_sets")
-            )),
-            "ConceptMap" => None,
-            _ => return None,
-        };
         let table = match resource_type {
             "CodeSystem" => "code_systems",
             "ValueSet" => "value_sets",
-            _ => "concept_maps",
+            "ConceptMap" => "concept_maps",
+            _ => return None,
         };
-        let direct = format!("SELECT url FROM {table} WHERE id = $1");
         let id = id.to_owned();
         self.sync_query(move |client| {
             Box::pin(async move {
-                if let Some(row) = client.query_opt(&direct, &[&id]).await.ok()? {
-                    return Some(row.get::<_, String>(0));
-                }
-                let sql = fallback?;
-                let row = client.query_opt(&sql, &[&id]).await.ok()??;
-                Some(row.get::<_, String>(0))
+                // The row reporting `id`, a storage id or `<id>-<version>`
+                // (see `fhir_ids::resolve`).
+                let (sid, _) = fhir_ids::resolve(client, table, &id).await.ok()??;
+                fhir_ids::instance_canonical(client, table, &sid)
+                    .await
+                    .ok()?
             })
         })
     }
 
     fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
-        let (table, order_by) = match resource_type {
-            "CodeSystem" => (
-                "code_systems",
-                crate::backends::cs_precedence_order_by("code_systems"),
-            ),
-            "ValueSet" => (
-                "value_sets",
-                crate::backends::vs_precedence_order_by("value_sets"),
-            ),
-            "ConceptMap" => (
-                "concept_maps",
-                std::borrow::Cow::Borrowed("created_at DESC"),
-            ),
+        let table = match resource_type {
+            "CodeSystem" => "code_systems",
+            "ValueSet" => "value_sets",
+            "ConceptMap" => "concept_maps",
             _ => return None,
         };
-        // Same matching rules as the SQLite twin: exact storage id, then the
-        // synthetic `<id>|<version>` storage ids. Matched on the segment before
-        // the first `|` (expression-indexed) rather than an `id >= x||'|'`
-        // range, which does not hold under a linguistic collation.
-        let sql = format!(
-            "SELECT resource_json::text FROM {table} \
-             WHERE id = $1 OR (split_part(id, '|', 1) = $1 AND strpos(id, '|') > 0) \
-             ORDER BY (id = $1) DESC, {order_by} LIMIT 1"
-        );
         let id = id.to_owned();
         self.sync_query(move |client| {
             Box::pin(async move {
-                let row = client.query_opt(&sql, &[&id]).await.ok()??;
+                let (sid, reported) = fhir_ids::resolve(client, table, &id).await.ok()??;
+                let row = client
+                    .query_opt(
+                        &format!("SELECT resource_json::text FROM {table} WHERE id = $1"),
+                        &[&sid],
+                    )
+                    .await
+                    .ok()??;
                 let raw: Option<String> = row.get(0);
-                raw.and_then(|s| serde_json::from_str(&s).ok())
+                let mut resource: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+                crate::resource_ids::apply_id(&mut resource, &reported);
+                Some(resource)
             })
         })
     }
@@ -1166,6 +1165,14 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             Some(stats) => stats,
             None => self.import_guarded(&mut client, &parsed).await?,
         };
+
+        // Unique reported ids across the versions sharing each written id.
+        let cs_ids: Vec<String> = parsed.code_systems.iter().map(|cs| cs.id.clone()).collect();
+        let vs_ids: Vec<String> = parsed.value_sets.iter().map(|vs| vs.id.clone()).collect();
+        fhir_ids::reassign(&**client, "code_systems", &cs_ids).await?;
+        fhir_ids::reassign(&**client, "value_sets", &vs_ids).await?;
+        let cm_ids: Vec<String> = parsed.concept_maps.iter().map(|cm| cm.id.clone()).collect();
+        fhir_ids::reassign(&**client, "concept_maps", &cm_ids).await?;
 
         // Closure maintenance, as SQLite does it (`import_parsed_sync`):
         // `write_code_system` dropped the closure of every row it wrote.
@@ -1429,6 +1436,37 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+        // An id some row reports (unique per stored version) names exactly
+        // that row; the plain id then moves to the next default version.
+        let table = match resource_type {
+            "CodeSystem" => Some("code_systems"),
+            "ValueSet" => Some("value_sets"),
+            "ConceptMap" => Some("concept_maps"),
+            _ => None,
+        };
+        if let Some(table) = table
+            && let Some((sid, declared)) = fhir_ids::reported_row(&**client, table, id).await?
+        {
+            if table == "code_systems" {
+                client
+                    .execute(
+                        "DELETE FROM value_set_expansions WHERE system_url IN \
+                         (SELECT url COLLATE \"C\" FROM code_systems WHERE id = $1)",
+                        &[&sid],
+                    )
+                    .await
+                    .map_err(db)?;
+            }
+            client
+                .execute(&format!("DELETE FROM {table} WHERE id = $1"), &[&sid])
+                .await
+                .map_err(db)?;
+            if let Some(declared) = declared {
+                fhir_ids::reassign(&**client, table, &[declared]).await?;
+            }
+            self.invalidate_caches();
+            return Ok(());
+        }
         match resource_type {
             "CodeSystem" => {
                 // Expansions cached over this system are DB state too.
@@ -1958,39 +1996,106 @@ async fn write_concept_map(
 ) -> Result<(), HtsError> {
     let resource_json = Some(cm.resource_json.clone());
     let now = utc_now();
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
 
-    // SQLite's `INSERT OR REPLACE`: whatever row holds this id or this url is
-    // replaced (its elements go with it through the FK cascade), so the map
-    // ends up under the new id even when only the url matched, and an id that
-    // moved to a new url does not fail the import.
-    client
-        .cexec(
-            "DELETE FROM concept_maps WHERE id = $1 OR url = $2",
-            &[&cm.id, &cm.url],
+    // One row per (url, version), as SQLite stores it (see its
+    // `write_concept_map`): a new version is stored next to the old ones, a
+    // re-import of the same version replaces its row and elements. Storage
+    // id: the FHIR id when free, else `<id>|<version>`, else a UUID.
+    let version_sort = crate::version_order::version_sort_key(cm.version.as_deref());
+    let existing: Option<(String, Option<String>)> = client
+        .query_opt(
+            "SELECT id, resource_json->>'id' FROM concept_maps \
+             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+            &[&cm.url, &cm.version],
         )
         .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    client
-        .cexec(
-            "INSERT INTO concept_maps
-             (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            &[
-                &cm.id,
-                &cm.url,
-                &cm.version,
-                &cm.name,
-                &cm.title,
-                &cm.source_uri,
-                &cm.target_uri,
-                &cm.status,
-                &resource_json,
-                &now,
-            ],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-    let map_id: &str = &cm.id;
+        .map_err(db)?
+        .map(|r| (r.get(0), r.get(1)));
+    // The same (url, version) re-imported under another id moves to that id:
+    // the old row (and its elements) goes, so the old id stops resolving.
+    let existing = match existing {
+        Some((sid, declared)) if declared.as_deref() != Some(cm.id.as_str()) => {
+            client
+                .execute("DELETE FROM concept_maps WHERE id = $1", &[&sid])
+                .await
+                .map_err(db)?;
+            None
+        }
+        other => other.map(|(sid, _)| sid),
+    };
+    let storage_id = match existing {
+        Some(id) => {
+            client
+                .execute("DELETE FROM concept_map_elements WHERE map_id = $1", &[&id])
+                .await
+                .map_err(db)?;
+            client
+                .execute(
+                    "UPDATE concept_maps SET name = $2, title = $3, source_uri = $4, \
+                     target_uri = $5, status = $6, resource_json = $7, version_sort = $8 \
+                     WHERE id = $1",
+                    &[
+                        &id,
+                        &cm.name,
+                        &cm.title,
+                        &cm.source_uri,
+                        &cm.target_uri,
+                        &cm.status,
+                        &resource_json,
+                        &version_sort,
+                    ],
+                )
+                .await
+                .map_err(db)?;
+            id
+        }
+        None => {
+            let versioned =
+                crate::import::fhir_bundle::storage_id_for(&cm.id, cm.version.as_deref());
+            let taken: Vec<String> = client
+                .query(
+                    "SELECT id FROM concept_maps WHERE id = $1 OR id = $2",
+                    &[&cm.id, &versioned],
+                )
+                .await
+                .map_err(db)?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect();
+            let id = if !taken.contains(&cm.id) {
+                cm.id.clone()
+            } else if !taken.contains(&versioned) {
+                versioned
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            client
+                .execute(
+                    "INSERT INTO concept_maps
+                     (id, url, version, name, title, source_uri, target_uri, status,
+                      resource_json, created_at, version_sort)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    &[
+                        &id,
+                        &cm.url,
+                        &cm.version,
+                        &cm.name,
+                        &cm.title,
+                        &cm.source_uri,
+                        &cm.target_uri,
+                        &cm.status,
+                        &resource_json,
+                        &now,
+                        &version_sort,
+                    ],
+                )
+                .await
+                .map_err(db)?;
+            id
+        }
+    };
+    let map_id: &str = &storage_id;
 
     for chunk in cm.elements.chunks(10_000) {
         let src_sys: Vec<&str> = chunk.iter().map(|e| e.source_system.as_str()).collect();

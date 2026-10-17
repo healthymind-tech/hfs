@@ -502,6 +502,26 @@ Every normalized table (CodeSystems, ValueSets, ConceptMaps, concepts, propertie
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 
+**Logical ids of multi-version resources.** Packages and importers reuse one
+id for every version of a resource (LOINC 2.80 and 2.83 are both `loinc`;
+LOINC answer-list ValueSets keep their `LL…` id across releases). HTS stores
+every version and gives each one its own logical id: the **default version**
+(the one a versionless request resolves to) reports the declared id, every
+other version reports `<id>-<version>`:
+
+| Stored | Reported id |
+|--------|-------------|
+| `http://loinc.org` 2.83 (default) | `loinc` |
+| `http://loinc.org` 2.80 | `loinc-2.80` |
+
+`GET /CodeSystem/loinc` therefore reads the default version, and every version
+is addressable by a unique id (`<id>-<version>` also reads the default
+version, so the versioned form is a stable address). When a newer version
+becomes the default, the plain id moves to it. `DELETE` and `_id` name exactly
+one version. A resource with a single stored version keeps its id unchanged.
+Databases written by older releases, where versions still share one id, are
+repaired at startup (only the reported ids change; concepts are untouched).
+
 ### Utility
 
 | Operation | Method | URL |
@@ -734,6 +754,12 @@ curl -X POST http://localhost:8090/ConceptMap/\$translate \
   }'
 ```
 
+Several versions of a ConceptMap can be stored. Without `conceptMapVersion`
+(or a `url|version` canonical), `$translate` uses each map's default version —
+the semantically newest, the same rule a versionless `GET /ConceptMap?url=…`
+lists first — also when no `url` is given and every loaded map is consulted.
+`ConceptMap/{id}/$translate` uses the version that id names.
+
 ### Create a CodeSystem
 
 ```bash
@@ -906,16 +932,24 @@ SNOMED CT's implicit ValueSet URLs are recognised by `$expand` and
 | `http://snomed.info/sct?fhir_vs=ecl/<expr>` | the URL-encoded ECL expression, e.g. `ecl/%3C%3C%2073211009` |
 | `http://snomed.info/sct?fhir_vs=refset/<id>` | the members of reference set `<id>` |
 
-**Version URIs.** The importer stores a release as its date (`20250601`).
-`$validate-code` and `$lookup` also accept the FHIR SNOMED CT version URIs
-for what is loaded — `http://snomed.info/sct/900000000000207008` (the
-International edition, latest release) and
-`http://snomed.info/sct/900000000000207008/version/20250601` — as `version`
-/ `systemVersion` parameters and as the `version` of SNOMED codings. An
-edition that is not loaded (the US edition `731000124108` when only
-International is) stays an unknown version: the code cannot be validated
-and the message lists the valid versions, which is also what tx.fhir.org
-answers for an edition it lacks. (The HL7 validator additionally reports
+**Version URIs.** The importer stores a release as its date (`20250601`),
+and HTS reports it in the FHIR form tx.fhir.org uses,
+`http://snomed.info/sct/900000000000207008/version/20250601` — in `version`
+(`$lookup`, `$validate-code`, CodeSystem resources), `used-codesystem` /
+`system-version` (`$expand`), coding and `expansion.contains` versions and
+messages. Every place a version can be given accepts the date, the release
+URI, or the edition URI `http://snomed.info/sct/900000000000207008` (the
+International edition, latest release): `version` / `systemVersion`, the
+`version` of SNOMED codings, `compose.include[].version` of stored and inline
+ValueSets, `$expand`'s `system-version` / `force-system-version` /
+`check-system-version`, `$subsumes`, and `GET /CodeSystem?url=…&version=…`.
+The translation happens at the API boundary; the stored version stays the
+date, so existing databases need no migration. An edition that is not loaded
+(the US edition `731000124108` when only International is) stays an unknown
+version: the code cannot be validated and the message lists the valid
+versions, which is also what tx.fhir.org answers for an edition it lacks.
+(The RF2 importer does not record the edition it loaded, so a date-versioned
+release is reported as International. The HL7 validator additionally reports
 `VALUESET_VALUE_MISMATCH_CHANGED` when a coding's edition differs from the
 one an unversioned ValueSet include resolves to — e.g. US Core examples
 coded with the US edition against International; that is a validator rule,

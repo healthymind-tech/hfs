@@ -1543,6 +1543,14 @@ pub(crate) async fn process_expand<B: TerminologyBackend>(
     // the cache key, the negative cache and every resolver below see one shape.
     let mut params = params;
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    // SNOMED CT edition URIs in `*-system-version` pins and an inline
+    // ValueSet's includes → the stored release they name.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
@@ -3228,6 +3236,14 @@ async fn process_expand_inner<B: TerminologyBackend>(
                         if ver.as_deref().is_some_and(|v| v.contains(".x") || v == "x") {
                             continue;
                         }
+                        // Likewise a SNOMED CT edition URI pin: it names a
+                        // stored release, which contains[] already carries.
+                        if ver.as_deref().is_some_and(|v| {
+                            crate::operations::snomed_version::parse_version_uri(v).is_some()
+                        }) && used_pairs.iter().any(|(s, _)| s == sys)
+                        {
+                            continue;
+                        }
                         // Skip versionless pins when contains[] already
                         // covers this system — they resolve to the same
                         // concrete (system, version) pair.
@@ -4112,6 +4128,20 @@ async fn process_expand_inner<B: TerminologyBackend>(
         && !cfg!(feature = "R6")
     {
         downconvert_property_to_r4_extension(&mut response);
+    }
+
+    // Stored SNOMED CT releases are reported as edition URIs. A release named
+    // both by date and by URI along the way now reads the same; report it once.
+    crate::operations::snomed_version::report_edition_versions(&mut response);
+    if let Some(ps) = response
+        .pointer_mut("/expansion/parameter")
+        .and_then(Value::as_array_mut)
+    {
+        let mut seen = std::collections::HashSet::new();
+        ps.retain(|p| {
+            p.get("name").and_then(Value::as_str) != Some("used-codesystem")
+                || seen.insert(p.get("valueUri").cloned())
+        });
     }
 
     // ── Serialize once, cache, return ─────────────────────────────────────────

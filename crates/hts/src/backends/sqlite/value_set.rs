@@ -2192,6 +2192,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
+            let order_by = crate::backends::search_order_by("value_sets", &query);
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_value_sets_meta serves this query without touching the main table.
@@ -2203,7 +2204,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     && query.status.is_none()
             {
                 let mut stmt = conn
-                    .prepare_cached(
+                    .prepare_cached(&format!(
                         "SELECT id, url, version, name, title, status
                          FROM value_sets
                          WHERE (?1 IS NULL OR url = ?1)
@@ -2211,9 +2212,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                            AND (?3 IS NULL OR name = ?3)
                            AND (?4 IS NULL OR title = ?4)
                            AND (?5 IS NULL OR status = ?5)
-                         ORDER BY created_at
+                         ORDER BY {order_by}
                          LIMIT ?6 OFFSET ?7",
-                    )
+                    ))
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
                     .query_map(
@@ -2238,35 +2239,39 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         },
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+                let reported = super::fhir_ids::reported_ids(&conn, "value_sets", &ids)?;
                 let mut results = Vec::new();
-                for row in rows {
-                    let (id, url, version, name, title, status) =
-                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for (id, url, version, name, title, status) in &rows {
+                    let id = reported.get(id).unwrap_or(id);
                     results.push(super::code_system::build_synthetic_resource(
                         "ValueSet",
-                        &id,
-                        &url,
+                        id,
+                        url,
                         version.as_deref(),
                         name.as_deref(),
                         title.as_deref(),
-                        &status,
+                        status,
                     ));
                 }
                 return Ok(results);
             }
 
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                .prepare_cached(&format!(
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
                        AND (?3 IS NULL OR name = ?3)
                        AND (?4 IS NULL OR title = ?4)
                        AND (?5 IS NULL OR status = ?5)
-                     ORDER BY created_at
+                     ORDER BY {order_by}
                      LIMIT ?6 OFFSET ?7",
-                )
+                ))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt
@@ -2289,6 +2294,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -2296,10 +2302,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -2312,6 +2318,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)
@@ -6719,6 +6729,14 @@ fn resolve_compose_system_id(
     if rows.is_empty() {
         return Ok(None);
     }
+    // A SNOMED CT edition URI names a stored release (a URI also contains
+    // dots, which would otherwise send it down the pattern branch).
+    let mapped = crate::operations::snomed_version::map_compose_version(
+        url,
+        version,
+        rows.iter().filter_map(|(_, v)| v.as_deref()),
+    );
+    let version = mapped.as_deref().or(version);
 
     // Match exactly the same rules as `resolve_ver_against_candidates`
     // (single-integer "1"/"2" => EXACT, dotted "1.0"/"1.0.0" => prefix/wildcard,
@@ -7395,6 +7413,13 @@ fn resolve_ver_against_candidates(
     candidates: &[(String, Option<String>)],
     ver: &str,
 ) -> Option<String> {
+    // A SNOMED CT edition URI names a stored release (see `snomed_version`).
+    if crate::operations::snomed_version::parse_version_uri(ver).is_some() {
+        let stored: Vec<String> = candidates.iter().filter_map(|(_, v)| v.clone()).collect();
+        if let Some(mapped) = crate::operations::snomed_version::map_version(ver, &stored) {
+            return Some(mapped);
+        }
+    }
     if ver.contains(".x") || ver == "x" || ver.contains('.') {
         // Pattern/prefix matching: "1.0" → highest "1.0.x", "1.x" → highest "1.y.z"
         super::code_system_select_version_match(candidates, ver).and_then(|(_, v)| v)

@@ -148,13 +148,14 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
         target_code,
         reverse: reverse_flag,
         date: find_str_param(&params, "date"),
+        map_version: find_str_param(&params, "conceptMapVersion"),
     };
 
     let ctx = TenantContext::system();
 
-    // `conceptMapVersion` (explicit or promoted from `url=X|V`): the store keeps
-    // one row per ConceptMap URL, so a version that does not match the stored
-    // row is a 404 rather than a silent answer from a different version.
+    // `conceptMapVersion` (explicit or promoted from `url=X|V`): a version
+    // that is not stored is a 404 rather than a silent answer from a
+    // different version; a stored one is the map the backend translates with.
     if let (Some(url), Some(want)) = (
         req.url.as_deref(),
         find_str_param(&params, "conceptMapVersion"),

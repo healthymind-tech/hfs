@@ -477,6 +477,11 @@ pub struct TranslateRequest {
     /// Point-in-time date for evaluation (ISO-8601).
     #[serde(default)]
     pub date: Option<String>,
+    /// `conceptMapVersion`: the version of the `url` ConceptMap to use.
+    /// Without it (or without `url`) each map URL contributes its default
+    /// version only (see `cm_precedence_order_by`).
+    #[serde(default)]
+    pub map_version: Option<String>,
 }
 
 /// Response from `ConceptMap/$translate`.

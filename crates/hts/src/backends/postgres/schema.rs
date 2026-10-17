@@ -51,6 +51,11 @@ CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
 -- (`resource_json->>'id'`), since multi-version rows carry synthetic ids.
 CREATE INDEX IF NOT EXISTS idx_code_systems_json_id ON code_systems ((resource_json->>'id'));
 CREATE INDEX IF NOT EXISTS idx_code_systems_id_base ON code_systems (split_part(id, '|', 1));
+-- Reported FHIR id, unique per stored version (see `crate::resource_ids`):
+-- versions sharing a declared id report `<id>` (the default version) and
+-- `<id>-<version>`. Maintained on write, repaired at startup.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_code_systems_fhir_id ON code_systems (fhir_id);
 -- A ValueSet URL that names no stored ValueSet is tried as a CodeSystem's
 -- `valueSet` (its implicit all-codes ValueSet): an index probe instead of
 -- reading every CodeSystem's JSON.
@@ -157,6 +162,9 @@ CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
 -- FHIR-id resolution of versioned rows (`<id>|<version>` storage ids).
 CREATE INDEX IF NOT EXISTS idx_value_sets_json_id ON value_sets ((resource_json->>'id'));
 CREATE INDEX IF NOT EXISTS idx_value_sets_id_base ON value_sets (split_part(id, '|', 1));
+-- See code_systems.fhir_id.
+ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_value_sets_fhir_id ON value_sets (fhir_id);
 
 -- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
 -- code_systems above had it removed: tx-ecosystem ships per-version VS
@@ -205,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_value_set_expansions_system ON value_set_expansio
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id            TEXT PRIMARY KEY,
-    url           TEXT NOT NULL UNIQUE,
+    url           TEXT NOT NULL,
     version       TEXT,
     name          TEXT,
     title         TEXT,
@@ -215,6 +223,31 @@ CREATE TABLE IF NOT EXISTS concept_maps (
     resource_json JSONB,
     created_at    TEXT NOT NULL
 );
+-- Multi-version like code_systems: one row per (url, version). Databases
+-- created with `url TEXT NOT NULL UNIQUE` drop that constraint here (before,
+-- importing version 2 of a map replaced version 1).
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'concept_maps'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE concept_maps DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+    ON concept_maps(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);
+-- See code_systems.version_sort / fhir_id.
+ALTER TABLE concept_maps ADD COLUMN IF NOT EXISTS version_sort TEXT;
+ALTER TABLE concept_maps ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_concept_maps_fhir_id ON concept_maps (fhir_id);
+CREATE INDEX IF NOT EXISTS idx_concept_maps_json_id ON concept_maps ((resource_json->>'id'));
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_map_elements (
@@ -446,7 +479,9 @@ BEGIN
                 ('code_systems', 'version'),
                 ('code_systems', 'version_sort'),
                 ('value_sets', 'version'),
-                ('value_sets', 'version_sort')
+                ('value_sets', 'version_sort'),
+                ('concept_maps', 'version'),
+                ('concept_maps', 'version_sort')
              ) AS want(tbl, col)
           ON a.attrelid = to_regclass(want.tbl) AND a.attname = want.col
         WHERE NOT a.attisdropped AND a.attcollation <> c_coll
@@ -563,7 +598,7 @@ async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_p
 pub async fn migrate_version_sort_pg(
     client: &tokio_postgres::Client,
 ) -> Result<(), tokio_postgres::Error> {
-    for table in ["code_systems", "value_sets"] {
+    for table in ["code_systems", "value_sets", "concept_maps"] {
         let rows = client
             .query(
                 &format!(
