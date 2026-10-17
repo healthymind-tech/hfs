@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
+The project is a Rust workspace with 23 crates (22 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -30,6 +30,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
 | **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS — Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
 | **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs — the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
+| **`helios-admin-auth`** (`crates/admin-auth`) | Administrator password sign-in shared by HFS and HTS (`HFS_ADMIN_PASSWORD`, `HTS_ADMIN_PASSWORD`): fail-closed gate, session cookie, CSRF origin check, failed-attempt lockout, axum guard middleware. |
 | **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 

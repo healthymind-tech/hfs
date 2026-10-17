@@ -109,6 +109,13 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; `0` disables |
 | `HFS_TERMINOLOGY_PUBLIC_URL` | (none) | Browser-reachable URL for the web UI's Terminology link; defaults to `/ui/hts` when `HFS_TERMINOLOGY_SERVER` is an internal host |
 | `HFS_ADMIN_UI` | false | Enables FHIR package (IG) administration: the `/admin/packages` API and the console's IG Packages page (`/ui/packages`). Off by default; see [IG packages](../../docs/ops/ig-packages.md) |
+| `HFS_ADMIN_PASSWORD` | (none) | Administrator password guarding `/admin/*`, the cross-tenant console metrics and the console's admin pages (IG Packages, Tenants, Bulk Import/Export, SQL Export, other state-changing forms). Browsers sign in at `/ui/admin/login`; scripts use Basic (`-u admin:…`) or `Bearer <password>`. Required with `HFS_ADMIN_UI=true` (else those endpoints answer `503`); ignored when `HFS_AUTH_ENABLED=true`. See [Administrator sign-in](../../docs/ops/admin-sign-in.md) |
+| `HFS_ADMIN_PASSWORD_FILE` | (none) | File holding the administrator password (Docker secrets); wins over `HFS_ADMIN_PASSWORD` |
+| `HFS_ADMIN_USER` | admin | Administrator user name |
+| `HFS_ADMIN_SESSION_IDLE_MINUTES` | 480 | Idle lifetime of an admin browser session |
+| `HFS_ADMIN_TRUSTED_PROXIES` | loopback + private ranges | Proxies whose `X-Forwarded-For`/`X-Real-IP` are believed for the sign-in rate limit (CIDR list, or `none`) |
+| `HFS_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins accepted on cookie-authenticated admin writes (the `HFS_BASE_URL` origin always is) |
+| `HFS_ADMIN_COOKIE_SECURE` | auto | `Secure` on the admin session cookie: `auto` (when the sign-in came over HTTPS), `true`, `false` |
 | `HFS_PACKAGE_REGISTRY` | on | Package sources: `on` (packages.fhir.org, then packages2.fhir.org), `off` (no network: upload and cache only), or comma-separated npm-compatible mirror URLs |
 | `HFS_PACKAGES` | (none) | Packages installed at startup when missing, e.g. `tw.gov.mohw.twcore#1.0.0,hl7.fhir.uv.ips#1.1.0` (runs regardless of `HFS_ADMIN_UI`) |
 | `HFS_PACKAGE_CACHE_DIR` | next to the SQLite file, else `<HFS_DATA_DIR>/packages` | Package cache (`<name>#<version>.tgz`); also where offline sites can drop packages |
