@@ -51,6 +51,7 @@ mod concepts;
 mod home;
 mod i18n;
 mod import;
+mod login;
 mod metrics_parse;
 mod metrics_ring;
 mod raw_fold;
@@ -71,6 +72,9 @@ use std::sync::Arc;
 // account menu from the real Fluent catalogs and asserts the page contains it
 // (#799). `crates/ui` exports it for the same reason.
 pub use i18n::{I18n, RequestLocale, negotiate_locale};
+/// The administrator session cookie (`hts_admin`, `Path=/ui/hts`) the `hts`
+/// binary configures its [`helios_admin_auth::AdminGate`] with.
+pub use login::COOKIE as ADMIN_COOKIE;
 // Home request-rate chart (§7.1): the sample ring lives on `HtsUiState`, so
 // its type must be nameable by the `hts` binary and by the test rings.
 // `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
@@ -163,9 +167,10 @@ pub struct HtsUiState {
 /// Build the HTS UI router.
 ///
 /// Mount this at `/ui` in the HTS binary so the routes below become
-/// `/ui/hts`, `/ui/hts/assets/*`, etc.
+/// `/ui/hts`, `/ui/hts/assets/*`, etc. Without an admin API there is nothing
+/// to sign in to, so this mounts no administrator guard.
 pub fn router(state: Arc<HtsUiState>) -> Router {
-    router_with_admin(state, None)
+    router_with_admin(state, None, helios_admin_auth::AdminGate::Open)
 }
 
 /// [`router`] plus the HTS admin API nested at `/hts/api/admin`, so the
@@ -173,7 +178,17 @@ pub fn router(state: Arc<HtsUiState>) -> Router {
 /// the console's own origin and path prefix — `/ui/hts/api/admin/...` — which
 /// any reverse proxy forwarding `/ui/hts` already routes to this binary.
 /// `admin` is `None` when `HTS_ADMIN_UI` is off.
-pub fn router_with_admin(state: Arc<HtsUiState>, admin: Option<Router>) -> Router {
+///
+/// `gate` is the administrator sign-in (`HTS_ADMIN_PASSWORD`): it guards the
+/// management pages (`/hts/terminology`, `/hts/jobs`, `/hts/import`) and
+/// backs `/hts/login`. `admin` must already be wrapped in the API guard for
+/// the same gate — this function does not guard it — so `/hts/api/admin`
+/// and `/admin` refuse alike.
+pub fn router_with_admin(
+    state: Arc<HtsUiState>,
+    admin: Option<Router>,
+    gate: helios_admin_auth::AdminGate,
+) -> Router {
     let base = match admin {
         Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
         None => Router::new(),
@@ -185,6 +200,7 @@ pub fn router_with_admin(state: Arc<HtsUiState>, admin: Option<Router>) -> Route
         .merge(concepts::routes())
         .merge(import::routes())
         .merge(admin::routes())
+        .merge(login::routes())
         .merge(capability::routes())
         .merge(raw_json_fragment::concept_fragment_routes())
         .merge(raw_json_fragment::workbench_fragment_routes())
@@ -194,6 +210,20 @@ pub fn router_with_admin(state: Arc<HtsUiState>, admin: Option<Router>) -> Route
         // which a browser shows as a blank tab with no title or language.
         .fallback(not_found_page)
         .with_state(state)
+        // Inner to the guard: exposes the signed-in administrator it stamped
+        // to page rendering (the account menu's Sign out).
+        .layer(axum::middleware::from_fn(login::scope_signed_in))
+        .layer(axum::middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: gate.clone(),
+                protects: login::protects,
+                style: helios_admin_auth::Style::Browser {
+                    login_path: login::LOGIN_PATH,
+                },
+            },
+            helios_admin_auth::guard,
+        ))
+        .layer(axum::Extension(gate))
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
         .layer(AutoVaryLayer)
 }
@@ -242,21 +272,29 @@ pub(crate) struct Chrome<'a> {
 impl Chrome<'_> {
     /// Render the topbar account menu from the shared chrome (#799).
     ///
-    /// Deliberately a method rather than a `Chrome` field: HTS has no
-    /// authenticated principal to put in one. `/ui/hts` sits outside any auth
-    /// layer (cf. #320), so no request carries a signed-in user, and
+    /// Deliberately a method rather than a `Chrome` field, which leaves all
+    /// the HTS page structs untouched: the only identity HTS has is the
+    /// administrator sign-in (`HTS_ADMIN_PASSWORD`, [`login`]), and the
+    /// request's signed-in administrator reaches rendering through a
+    /// task-local the sign-in middleware scopes. Signed out, this is
     /// [`helios_ui_chrome::UserIdentity::default`] — every field `None`,
-    /// `can_logout: false` — *is* the signed-out shape. That is byte-identical
-    /// to what HFS renders today, because `crates/ui/src/lib.rs:400-420`
-    /// hard-codes the very same values behind its `user_*` accessors.
-    ///
-    /// Keeping it a method also leaves all ten HTS page structs untouched: the
-    /// menu costs the pages nothing until there is something to show. When the
-    /// browser login flow and the claim inventory (#724) land, the default here
-    /// gives way to real claims and both products light up from one change,
-    /// because the markup is shared rather than copied.
+    /// `can_logout: false` — the same shape HFS renders without a session.
     pub(crate) fn user_menu(&self) -> Result<String, askama::Error> {
-        helios_ui_chrome::user_menu(&self.i18n, helios_ui_chrome::UserIdentity::default())
+        // Signed in as the administrator (`HTS_ADMIN_PASSWORD`): name the
+        // account and offer Sign out. Otherwise the signed-out shape.
+        let user = login::signed_in();
+        let hint = self.i18n.t("admin-user-hint");
+        let identity = match user.as_deref() {
+            Some(name) => helios_ui_chrome::UserIdentity {
+                display: Some(name),
+                secondary: Some(hint.as_str()),
+                can_logout: true,
+                logout_href: login::LOGOUT_PATH,
+                ..Default::default()
+            },
+            None => helios_ui_chrome::UserIdentity::default(),
+        };
+        helios_ui_chrome::user_menu(&self.i18n, identity)
     }
 
     /// The topbar theme switcher, shared with HFS (`helios-ui-chrome`).

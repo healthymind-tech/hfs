@@ -46,6 +46,10 @@ use std::time::Duration;
 pub struct UpstreamClient {
     client: reqwest::Client,
     base_url: String,
+    /// `Authorization` for the admin API (`/admin`, guarded by the
+    /// administrator sign-in): the console's own credential, so its
+    /// management pages work for whoever signed in to the console.
+    admin_authorization: Option<reqwest::header::HeaderValue>,
 }
 
 impl UpstreamClient {
@@ -86,7 +90,18 @@ impl UpstreamClient {
             .map_err(|source| UpstreamError::ClientBuild {
                 message: source.to_string(),
             })?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            admin_authorization: None,
+        })
+    }
+
+    /// The same client, sending `value` as `Authorization` on admin API
+    /// calls ([`helios_admin_auth::AdminAuth::service_authorization`]).
+    pub fn with_admin_authorization(mut self, value: reqwest::header::HeaderValue) -> Self {
+        self.admin_authorization = Some(value);
+        self
     }
 
     /// The base URL the client is pointed at, without a trailing slash.
@@ -4528,6 +4543,9 @@ impl UpstreamClient {
         // trail (the upstream otherwise sees only this loopback client).
         for (name, value) in forward {
             req = req.header(*name, value.as_str());
+        }
+        if let Some(auth) = &self.admin_authorization {
+            req = req.header(reqwest::header::AUTHORIZATION, auth.clone());
         }
         if let Some(b) = body {
             req = req.json(b);

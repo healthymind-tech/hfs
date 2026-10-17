@@ -2311,3 +2311,16 @@ hts-dir-modified = Geändert
 hts-dir-detect-on-import = wird beim Import erkannt
 hts-term-showing = { $shown } von { $total } Codesystemen angezeigt
 hts-term-show-all-rows = Alle anzeigen
+
+## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
+## both consoles: /ui/admin/login and /ui/hts/login.
+admin-login-title = Administrator-Anmeldung
+admin-login-lede = Pakete installieren, Mandanten verwalten, Terminologie importieren und die übrigen Verwaltungsseiten erfordern das Administratorpasswort.
+admin-login-user = Benutzername
+admin-login-password = Passwort
+admin-login-submit = Anmelden
+admin-login-invalid = Benutzername oder Passwort falsch.
+admin-login-throttled = Zu viele fehlgeschlagene Versuche von Ihrer Adresse. Versuchen Sie es in { $minutes } Minuten erneut.
+admin-login-cross-site = Das Anmeldeformular muss von dieser Website gesendet werden. Laden Sie die Seite neu und versuchen Sie es erneut.
+admin-login-locked = Die Verwaltung ist gesperrt: Für diesen Server ist kein Administratorpasswort festgelegt. Setzen Sie { $var } (oder { $var }_FILE) und starten Sie ihn neu.
+admin-user-hint = Administrator

@@ -181,9 +181,9 @@ pub struct HtsConfig {
 
     /// Enable terminology management: the `/admin` API (upload, import,
     /// delete, set current version, compact) and the console pages that use
-    /// it. **Off by default.** Until SMART/OIDC admin scopes exist this flag
-    /// is the access control, so only enable it where `/admin` and `/ui/hts`
-    /// are reachable by administrators alone.
+    /// it. **Off by default.** Requires `HTS_ADMIN_PASSWORD` (or
+    /// `HTS_ADMIN_PASSWORD_FILE`): without one every admin endpoint answers
+    /// `503` rather than run unauthenticated.
     #[arg(long, env = "HTS_ADMIN_UI", default_value = "false", action = clap::ArgAction::Set)]
     pub admin_ui: bool,
 
@@ -221,6 +221,14 @@ pub struct HtsConfig {
     /// 1 GiB) — covers WAL growth and temporary files during the import.
     #[arg(long, env = "HTS_DISK_HEADROOM", default_value = "1073741824")]
     pub disk_headroom: u64,
+
+    /// Administrator sign-in for `/admin` and the console's management
+    /// pages. Not a flag: `None` (the default) reads `HTS_ADMIN_USER`,
+    /// `HTS_ADMIN_PASSWORD` / `HTS_ADMIN_PASSWORD_FILE` and the other
+    /// `HTS_ADMIN_*` sign-in variables when the app is built (see
+    /// `docs/hts-terminology-admin.md`); tests and embedders set it directly.
+    #[arg(skip)]
+    pub admin_auth: Option<helios_admin_auth::AdminSettings>,
 }
 
 /// The storage backend to use for `database_url`.
@@ -269,6 +277,7 @@ impl Default for HtsConfig {
             upload_chunk_size: 8 * 1024 * 1024,
             max_upload_size: 16 * 1024 * 1024 * 1024,
             disk_headroom: 1024 * 1024 * 1024,
+            admin_auth: None,
         }
     }
 }

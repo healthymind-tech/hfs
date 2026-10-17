@@ -103,6 +103,30 @@ where
         None
     };
 
+    // Administrator sign-in (`HTS_ADMIN_PASSWORD`). Fails closed: with the
+    // admin API on and no password, every admin endpoint answers 503. The
+    // same gate guards `/admin`, the console's `/ui/hts/api/admin` mount of
+    // it, and the console's management pages.
+    let gate = helios_admin_auth::AdminGate::configure(
+        "HTS",
+        config
+            .admin_auth
+            .clone()
+            .unwrap_or_else(|| helios_admin_auth::AdminSettings::from_env("HTS")),
+        config.admin_ui,
+        helios_hts_ui::ADMIN_COOKIE,
+    );
+    let admin = admin.map(|router| {
+        router.layer(axum::middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: gate.clone(),
+                protects: |_, _| true,
+                style: helios_admin_auth::Style::Api { fhir: false },
+            },
+            helios_admin_auth::guard,
+        ))
+    });
+
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
     // the `/hts` prefix internally so this mount point stays `/ui`, the same
@@ -122,7 +146,16 @@ where
     let hts_ui = if config.ui_enabled {
         let upstream_url = std::env::var("HTS_UI_UPSTREAM_URL")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
-        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).unwrap_or_else(|err| {
+        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).map(|client| {
+            // The console's management pages call `/admin` over loopback with
+            // the administrator's credential; the page guard has already
+            // required the browser to sign in.
+            match gate.auth() {
+                Some(auth) => client.with_admin_authorization(auth.service_authorization()),
+                None => client,
+            }
+        });
+        let upstream = upstream.unwrap_or_else(|err| {
             // reqwest's builder fails only under very degenerate conditions
             // (e.g. no TLS backend, which cannot happen here — we use
             // default_features = false with no TLS feature). Log loudly if
@@ -160,7 +193,11 @@ where
             // Starts empty; the Home page's own 15 s poll fills it.
             metrics_ring: Default::default(),
         });
-        Some(helios_hts_ui::router_with_admin(ui_state, admin.clone()))
+        Some(helios_hts_ui::router_with_admin(
+            ui_state,
+            admin.clone(),
+            gate.clone(),
+        ))
     } else {
         None
     };

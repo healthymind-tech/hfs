@@ -2426,3 +2426,16 @@ hts-dir-modified = Modified
 hts-dir-detect-on-import = detected on import
 hts-term-showing = Showing { $shown } of { $total } code systems
 hts-term-show-all-rows = Show all
+
+## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
+## both consoles: /ui/admin/login and /ui/hts/login.
+admin-login-title = Administrator sign-in
+admin-login-lede = Installing packages, managing tenants, importing terminology and the other administrative pages need the administrator password.
+admin-login-user = User name
+admin-login-password = Password
+admin-login-submit = Sign in
+admin-login-invalid = Wrong user name or password.
+admin-login-throttled = Too many failed attempts from your address. Try again in { $minutes } minutes.
+admin-login-cross-site = The sign-in form must be sent from this site. Reload the page and try again.
+admin-login-locked = Administration is locked: this server has no administrator password. Set { $var } (or { $var }_FILE) and restart it.
+admin-user-hint = Administrator
