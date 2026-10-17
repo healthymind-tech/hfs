@@ -109,9 +109,7 @@ fn parse_search_query(
             "_lastUpdated" => {
                 reject_modifier("_lastUpdated", modifier)?;
                 let date = DateSearch::parse(&value).map_err(|error| {
-                    HtsError::InvalidRequest(format!(
-                        "Search parameter `_lastUpdated`: {error}"
-                    ))
+                    HtsError::InvalidRequest(format!("Search parameter `_lastUpdated`: {error}"))
                 })?;
                 query.last_updated.push(date);
             }
@@ -339,6 +337,8 @@ where
         }
     };
     let bundle = build_searchset_bundle(&query, &links, total, resources);
+    let mut bundle = bundle;
+    crate::operations::snomed_version::report_edition_versions(&mut bundle);
     (StatusCode::OK, Json(bundle)).into_response()
 }
 
@@ -354,13 +354,15 @@ pub async fn search_code_systems<B>(
 where
     B: TerminologyBackend + BundleImportBackend,
 {
-    let query = match parse_search_query(raw.as_deref(), SearchKind::CodeSystem) {
+    let mut query = match parse_search_query(raw.as_deref(), SearchKind::CodeSystem) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
     let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
     let backend = state.backend();
     let ctx = ctx();
+    // `version=` as a SNOMED CT edition URI → the stored release.
+    crate::operations::snomed_version::normalize_search_version(backend, &ctx, &mut query).await;
     searchset_response(
         query,
         links,

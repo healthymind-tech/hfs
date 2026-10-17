@@ -3560,6 +3560,14 @@ async fn resolve_compose_system_id(
     if candidates.is_empty() {
         return Ok(None);
     }
+    // A SNOMED CT edition URI names a stored release (a URI also contains
+    // dots, which would otherwise send it down the pattern branch).
+    let mapped = crate::operations::snomed_version::map_compose_version(
+        url,
+        version,
+        candidates.iter().filter_map(|(_, v)| v.as_deref()),
+    );
+    let version = mapped.as_deref().or(version);
 
     let chosen = match version {
         // Pattern matching ONLY for `.x` wildcards / bare "x" / dot-containing
@@ -4498,6 +4506,13 @@ fn resolve_ver_against_candidates(
     candidates: &[(String, Option<String>)],
     ver: &str,
 ) -> Option<String> {
+    // A SNOMED CT edition URI names a stored release (see `snomed_version`).
+    if crate::operations::snomed_version::parse_version_uri(ver).is_some() {
+        let stored: Vec<String> = candidates.iter().filter_map(|(_, v)| v.clone()).collect();
+        if let Some(mapped) = crate::operations::snomed_version::map_version(ver, &stored) {
+            return Some(mapped);
+        }
+    }
     if ver.contains(".x") || ver == "x" || ver.contains('.') {
         // Pattern/prefix matching: "1.0" → highest "1.0.x", "1.x" → highest "1.y.z".
         // Reuses the same matcher the compose-resolution helper above uses.
