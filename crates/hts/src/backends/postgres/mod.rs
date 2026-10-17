@@ -297,6 +297,8 @@ async fn search_table(
                 && query.name.is_none()
                 && query.title.is_none()
                 && query.status.is_none());
+    let order_by =
+        crate::backends::search_order_by(table, query.url.is_some() && query.version.is_none());
     let sql = format!(
         "SELECT id, url, version, name, title, status{json}
          FROM {table}
@@ -305,7 +307,7 @@ async fn search_table(
            AND ($3::text IS NULL OR name = $3)
            AND ($4::text IS NULL OR title = $4)
            AND ($5::text IS NULL OR status = $5)
-         ORDER BY created_at
+         ORDER BY {order_by}
          LIMIT $6 OFFSET $7",
         json = if metadata_only { "" } else { ", resource_json" }
     );

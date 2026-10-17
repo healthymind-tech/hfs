@@ -1174,6 +1174,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
+            let order_by = crate::backends::search_order_by(
+                "code_systems",
+                query.url.is_some() && query.version.is_none(),
+            );
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_code_systems_meta serves this query without touching the main table.
@@ -1185,7 +1189,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     && query.status.is_none()
             {
                 let mut stmt = conn
-                    .prepare_cached(
+                    .prepare_cached(&format!(
                         "SELECT id, url, version, name, title, status
                          FROM code_systems
                          WHERE (?1 IS NULL OR url = ?1)
@@ -1193,9 +1197,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                            AND (?3 IS NULL OR name = ?3)
                            AND (?4 IS NULL OR title = ?4)
                            AND (?5 IS NULL OR status = ?5)
-                         ORDER BY created_at
+                         ORDER BY {order_by}
                          LIMIT ?6 OFFSET ?7",
-                    )
+                    ))
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
                     .query_map(
@@ -1238,7 +1242,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             }
 
             let mut stmt = conn
-                .prepare_cached(
+                .prepare_cached(&format!(
                     "SELECT id, url, version, name, title, status, resource_json
                      FROM code_systems
                      WHERE (?1 IS NULL OR url = ?1)
@@ -1246,9 +1250,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                        AND (?3 IS NULL OR name = ?3)
                        AND (?4 IS NULL OR title = ?4)
                        AND (?5 IS NULL OR status = ?5)
-                     ORDER BY created_at
+                     ORDER BY {order_by}
                      LIMIT ?6 OFFSET ?7",
-                )
+                ))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt

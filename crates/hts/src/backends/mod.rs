@@ -106,6 +106,24 @@ static CS_ORDER_BY_CODE_SYSTEMS: LazyLock<String> =
     LazyLock::new(|| build_cs_precedence_order_by("code_systems"));
 static CS_ORDER_BY_S: LazyLock<String> = LazyLock::new(|| build_cs_precedence_order_by("s"));
 
+/// `ORDER BY` for a resource search (`GET /CodeSystem?url=…`, and every
+/// operation that resolves "the" CodeSystem for a URL with
+/// `search(url, count: 1)`).
+///
+/// A search narrowed to one canonical URL without a version lists the rows in
+/// [`cs_precedence_order_by`] order, so its first hit is the row every other
+/// versionless resolver picks. Before, it listed them by `created_at`: with
+/// the THO `v3-loinc` stub (`content=not-present`, version `3.1.0`) imported
+/// before the real LOINC 2.83, `$expand` expanded 2.83 but reported
+/// `used-codesystem = http://loinc.org|3.1.0` from the stub. Other searches
+/// keep insertion order.
+pub(crate) fn search_order_by(table: &str, url_without_version: bool) -> Cow<'static, str> {
+    match (table, url_without_version) {
+        ("code_systems", true) => cs_precedence_order_by("code_systems"),
+        _ => Cow::Borrowed("created_at"),
+    }
+}
+
 /// Precedence among `value_sets` rows sharing one canonical URL.
 ///
 /// The ValueSet analogue of [`cs_precedence_order_by`]. `value_sets` has no
