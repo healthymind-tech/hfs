@@ -46,9 +46,10 @@ use std::time::Duration;
 pub struct UpstreamClient {
     client: reqwest::Client,
     base_url: String,
-    /// `Authorization` for the admin API (`/admin`, guarded by the
-    /// administrator sign-in): the console's own credential, so its
-    /// management pages work for whoever signed in to the console.
+    /// `Authorization` for the admin API (`/admin`) and the terminology
+    /// writes (`/import`), both guarded by the administrator sign-in: the
+    /// console's own credential, so its management pages work for whoever
+    /// signed in to the console.
     admin_authorization: Option<reqwest::header::HeaderValue>,
 }
 
@@ -4047,12 +4048,19 @@ impl UpstreamClient {
     /// banner picks it up.
     pub async fn import_bundle(&self, bundle_json: &str) -> Result<ImportResult, UpstreamError> {
         let url = format!("{}/import", self.base_url);
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .header("Accept", "application/fhir+json")
             .header("Content-Type", "application/fhir+json")
-            .body(bundle_json.to_owned())
+            .body(bundle_json.to_owned());
+        // `/import` writes, so with HTS_REQUIRE_AUTH_FOR_WRITES on it needs
+        // the administrator credential; the Import page itself is behind the
+        // console sign-in.
+        if let Some(auth) = &self.admin_authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, auth.clone());
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| UpstreamError::from_reqwest("import", &url, e))?;

@@ -20,7 +20,11 @@ use tower::ServiceExt;
 
 const PASSWORD: &str = "hts-ui-test-password";
 
-/// A mock admin API that answers only callers presenting `expected`.
+/// Authorized `POST /import` calls the mock has seen.
+static AUTHORIZED_IMPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A mock admin API (and `/import`, which HTS guards the same way when it
+/// requires auth for writes) that answers only callers presenting `expected`.
 async fn start_mock(expected: String) -> String {
     let check = move |headers: HeaderMap| {
         let ok = headers
@@ -31,6 +35,7 @@ async fn start_mock(expected: String) -> String {
     };
     let c1 = check.clone();
     let c2 = check.clone();
+    let c3 = check.clone();
     let router = Router::new()
         .route(
             "/admin",
@@ -61,6 +66,23 @@ async fn start_mock(expected: String) -> String {
                         axum::Json(
                             json!({"error": "login", "message": "administrator sign-in required"}),
                         ),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/import",
+            axum::routing::post(move |h: HeaderMap| async move {
+                if c3(h).await {
+                    AUTHORIZED_IMPORTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({"code_systems": 1, "value_sets": 0, "concept_maps": 0})),
+                    )
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(json!({"resourceType": "OperationOutcome"})),
                     )
                 }
             }),
@@ -204,6 +226,31 @@ async fn signed_in_pages_reach_the_admin_api_and_offer_sign_out() {
     assert!(!html.contains("administrator sign-in required"), "{html}");
     assert!(html.contains(r#"action="/ui/hts/logout""#), "{html}");
     assert!(html.contains("Administrator"), "{html}");
+
+    // The Import page's bundle import goes to the guarded `/import` with
+    // the console's credential.
+    let before = AUTHORIZED_IMPORTS.load(std::sync::atomic::Ordering::SeqCst);
+    let bundle = r#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{"resourceType":"CodeSystem","url":"http://x/cs","status":"active","content":"complete"}}]}"#;
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    form.append_pair("bundle", bundle);
+    let (status, _, _) = send(
+        &app,
+        "POST",
+        "/ui/hts/import",
+        &[
+            ("cookie", &cookie),
+            ("host", "tx.example"),
+            ("origin", "https://tx.example"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ],
+        &form.finish(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        AUTHORIZED_IMPORTS.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1
+    );
 
     // Signed in, the sign-in page just forwards.
     let (status, headers, _) = send(

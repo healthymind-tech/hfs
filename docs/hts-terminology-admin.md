@@ -11,7 +11,10 @@ the JSON API under `/admin`.
 > `curl -u admin:…` or `Authorization: Bearer <password>`. Without a password
 > every admin endpoint answers `503`. See
 > [Administrator sign-in](ops/admin-sign-in.md). Every action is audited
-> (see below) under the signed-in administrator.
+> (see below) under the signed-in administrator. With a password set, the
+> terminology API's own writes (`/import`, CodeSystem/ValueSet/ConceptMap
+> create/update/delete, write batches) need the same credential
+> (`HTS_REQUIRE_AUTH_FOR_WRITES`).
 
 ## Configuration
 

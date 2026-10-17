@@ -399,6 +399,7 @@ Options:
 | `HTS_ADMIN_PASSWORD` | (none) | Administrator password guarding `/admin`, `/ui/hts/api/admin` and the console's management pages (`/ui/hts/terminology`, `/jobs`, `/import`). Browsers sign in at `/ui/hts/login`; scripts use Basic (`-u admin:…`) or `Bearer <password>`. Required with `HTS_ADMIN_UI=true` (else those endpoints answer `503`). See [Administrator sign-in](../../docs/ops/admin-sign-in.md) |
 | `HTS_ADMIN_PASSWORD_FILE` | (none) | File holding the administrator password (Docker secrets); wins over `HTS_ADMIN_PASSWORD` |
 | `HTS_ADMIN_USER` | admin | Administrator user name |
+| `HTS_REQUIRE_AUTH_FOR_WRITES` | true with a password, else false | Require the administrator credential (Basic/Bearer) for CodeSystem/ValueSet/ConceptMap create/update/delete, `POST /import` and write batches; reads and `$lookup`/`$validate-code`/`$subsumes`/`$expand`/`$batch-validate-code`/`$translate`/`$closure` stay public. Without a password writes stay open, with a startup warning |
 | `HTS_ADMIN_SESSION_IDLE_MINUTES` | 480 | Idle lifetime of an admin browser session |
 | `HTS_ADMIN_TRUSTED_PROXIES` | loopback + private ranges | Proxies whose `X-Forwarded-For`/`X-Real-IP` are believed for the sign-in rate limit (CIDR list, or `none`) |
 | `HTS_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins accepted on cookie-authenticated admin writes |

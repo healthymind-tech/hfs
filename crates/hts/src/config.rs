@@ -229,6 +229,17 @@ pub struct HtsConfig {
     /// `docs/hts-terminology-admin.md`); tests and embedders set it directly.
     #[arg(skip)]
     pub admin_auth: Option<helios_admin_auth::AdminSettings>,
+
+    /// Require the administrator credential for state-changing terminology
+    /// requests: CodeSystem/ValueSet/ConceptMap create, update and delete,
+    /// `POST /import`, and batch/transaction Bundles with write entries.
+    /// Reads and the non-persisting operations (`$lookup`, `$validate-code`,
+    /// `$subsumes`, `$expand`, `$batch-validate-code`, `$translate`,
+    /// `$closure`) stay public. Default: `true` when `HTS_ADMIN_PASSWORD`
+    /// (or `_FILE`) is set, else `false` (open, with a startup warning).
+    /// `true` without a password answers those writes with `503`.
+    #[arg(long, env = "HTS_REQUIRE_AUTH_FOR_WRITES", action = clap::ArgAction::Set)]
+    pub require_auth_for_writes: Option<bool>,
 }
 
 /// The storage backend to use for `database_url`.
@@ -278,6 +289,7 @@ impl Default for HtsConfig {
             max_upload_size: 16 * 1024 * 1024 * 1024,
             disk_headroom: 1024 * 1024 * 1024,
             admin_auth: None,
+            require_auth_for_writes: None,
         }
     }
 }

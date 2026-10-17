@@ -116,6 +116,7 @@ where
         config.admin_ui,
         helios_hts_ui::ADMIN_COOKIE,
     );
+    let writes_gate = writes_gate(&gate, config.require_auth_for_writes);
     let admin = admin.map(|router| {
         router.layer(axum::middleware::from_fn_with_state(
             helios_admin_auth::Guard {
@@ -297,7 +298,17 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state);
+        .with_state(state)
+        // Terminology writes need the administrator (`HTS_REQUIRE_AUTH_FOR_WRITES`).
+        // A route layer, so only matched routes are guarded, and inside the
+        // decompression layer below, so a batch body is classified decompressed.
+        .route_layer(axum::middleware::from_fn_with_state(
+            crate::write_guard::WriteGuard {
+                gate: writes_gate,
+                max_body_size: config.max_body_size,
+            },
+            crate::write_guard::guard,
+        ));
 
     // Merge the optional UI router before wrapping the whole app in the
     // observability / cors / timeout / trace layers so the UI benefits from
@@ -346,6 +357,48 @@ where
             Duration::from_secs(config.request_timeout.max(1)),
         ))
         .layer(TraceLayer::new_for_http())
+}
+
+/// The gate for state-changing terminology requests: the admin gate when
+/// `HTS_REQUIRE_AUTH_FOR_WRITES` is on (default: on when a password is set),
+/// else open — logged, since anyone can then rewrite the terminology.
+fn writes_gate(
+    admin: &helios_admin_auth::AdminGate,
+    require: Option<bool>,
+) -> helios_admin_auth::AdminGate {
+    use helios_admin_auth::AdminGate;
+    let has_password = matches!(admin, AdminGate::Password(_));
+    if !require.unwrap_or(has_password) {
+        if has_password {
+            tracing::warn!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=false: CodeSystem/ValueSet/ConceptMap create, \
+                 update and delete, /import and write batches are open to anyone"
+            );
+        } else {
+            tracing::warn!(
+                "terminology writes (CodeSystem/ValueSet/ConceptMap create, update and delete, \
+                 /import, write batches) are unauthenticated: set HTS_ADMIN_PASSWORD to require \
+                 the administrator for them"
+            );
+        }
+        return AdminGate::Open;
+    }
+    match admin {
+        AdminGate::Open => {
+            tracing::error!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=true but no HTS_ADMIN_PASSWORD is set: terminology \
+                 writes answer 503 until one is"
+            );
+            AdminGate::Locked(std::sync::Arc::from(
+                "terminology writes are locked: HTS_REQUIRE_AUTH_FOR_WRITES=true needs \
+                 HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+            ))
+        }
+        gate => {
+            tracing::info!("terminology writes require the administrator credential");
+            gate.clone()
+        }
+    }
 }
 
 /// Wire the admin core to this app's backend and caches and start its worker.
