@@ -3351,6 +3351,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helios-admin-auth"
+version = "0.2.4"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "http-body-util",
+ "rand 0.8.6",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "helios-audit"
 version = "0.2.4"
 dependencies = [
@@ -3523,6 +3538,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "helios-admin-auth",
  "helios-audit",
  "helios-auth",
  "helios-fhir",
@@ -3538,6 +3554,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "sqlparser",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",
@@ -3551,6 +3568,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
@@ -3560,6 +3578,7 @@ dependencies = [
  "flate2",
  "form_urlencoded",
  "futures",
+ "helios-admin-auth",
  "helios-fhir",
  "helios-hts-ui",
  "helios-observability",
@@ -3605,6 +3624,7 @@ dependencies = [
  "fluent-syntax 0.11.1",
  "fluent-templates",
  "form_urlencoded",
+ "helios-admin-auth",
  "helios-fhir",
  "helios-ui-chrome",
  "http-body-util",
@@ -3721,6 +3741,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "helios-admin-auth",
  "helios-audit",
  "helios-auth",
  "helios-fhir",
@@ -3746,8 +3767,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha1",
  "sha2 0.10.9",
  "sqlparser",
+ "tar",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -3875,6 +3898,7 @@ dependencies = [
  "fluent-templates",
  "form_urlencoded",
  "futures-lite",
+ "helios-admin-auth",
  "helios-auth",
  "helios-fhir",
  "helios-fhir-validator",

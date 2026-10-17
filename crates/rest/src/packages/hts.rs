@@ -27,6 +27,9 @@ pub struct ImportOutcome {
 pub struct HtsClient {
     base: String,
     http: reqwest::Client,
+    /// `Authorization: Bearer` for the terminology server
+    /// (`HFS_TERMINOLOGY_SERVER_TOKEN`), marked sensitive.
+    authorization: Option<reqwest::header::HeaderValue>,
 }
 
 impl HtsClient {
@@ -40,6 +43,27 @@ impl HtsClient {
                 .timeout(Duration::from_secs(900))
                 .build()
                 .unwrap_or_default(),
+            authorization: None,
+        }
+    }
+
+    /// The same client, sending `token` as `Authorization: Bearer` on every
+    /// call — HTS requires its administrator credential for `/import` and
+    /// deletes (`HTS_REQUIRE_AUTH_FOR_WRITES`).
+    pub fn with_token(mut self, token: Option<&helios_admin_auth::Secret>) -> Self {
+        self.authorization = token.and_then(|t| {
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", t.expose())).ok()?;
+            value.set_sensitive(true);
+            Some(value)
+        });
+        self
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.authorization {
+            Some(value) => request.header(reqwest::header::AUTHORIZATION, value.clone()),
+            None => request,
         }
     }
 
@@ -57,8 +81,7 @@ impl HtsClient {
         });
         let body = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
         let response = self
-            .http
-            .post(format!("{}/import", self.base))
+            .authorized(self.http.post(format!("{}/import", self.base)))
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/json")
             .body(body)
@@ -102,8 +125,7 @@ impl HtsClient {
         version: Option<&str>,
     ) -> Result<Vec<String>, String> {
         let mut request = self
-            .http
-            .get(format!("{}/{resource_type}", self.base))
+            .authorized(self.http.get(format!("{}/{resource_type}", self.base)))
             .header("Accept", "application/fhir+json")
             .timeout(Duration::from_secs(60))
             // The summary carries id, url and version without the concept
@@ -202,8 +224,10 @@ impl HtsClient {
     /// Deletes one resource by id. A `404`/`410` counts as already gone.
     pub async fn delete(&self, resource_type: &str, id: &str) -> Result<(), String> {
         let response = self
-            .http
-            .delete(format!("{}/{resource_type}/{id}", self.base))
+            .authorized(
+                self.http
+                    .delete(format!("{}/{resource_type}/{id}", self.base)),
+            )
             .timeout(Duration::from_secs(120))
             .send()
             .await
@@ -212,5 +236,68 @@ impl HtsClient {
             200..=299 | 404 | 410 => Ok(()),
             status => Err(format!("terminology delete HTTP {status}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{delete, post};
+    use axum::{Json, Router};
+
+    /// A terminology server that, like HTS with `HTS_REQUIRE_AUTH_FOR_WRITES`,
+    /// refuses writes without its administrator credential.
+    async fn guarded_server() -> String {
+        fn authorized(headers: &HeaderMap) -> bool {
+            headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some("Bearer hts-admin-test-token")
+        }
+        let app = Router::new()
+            .route(
+                "/import",
+                post(|headers: HeaderMap| async move {
+                    if authorized(&headers) {
+                        (StatusCode::OK, Json(json!({"code_systems": 1})))
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"resourceType": "OperationOutcome", "issue": [
+                                {"severity": "error", "code": "login",
+                                 "diagnostics": "administrator sign-in required"}]})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/CodeSystem/{id}",
+                delete(|headers: HeaderMap| async move {
+                    if authorized(&headers) {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    #[tokio::test]
+    async fn writes_carry_the_terminology_server_token() {
+        let base = guarded_server().await;
+        let cs = vec![json!({"resourceType": "CodeSystem", "url": "http://x/cs"})];
+
+        let anonymous = HtsClient::new(&base);
+        let err = anonymous.import(&cs).await.unwrap_err();
+        assert!(err.contains("401"), "{err}");
+        assert!(anonymous.delete("CodeSystem", "x").await.is_err());
+
+        let token = helios_admin_auth::Secret::new("hts-admin-test-token");
+        let client = HtsClient::new(&base).with_token(Some(&token));
+        assert_eq!(client.import(&cs).await.unwrap().imported, 1);
+        client.delete("CodeSystem", "x").await.unwrap();
     }
 }

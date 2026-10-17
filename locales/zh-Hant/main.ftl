@@ -2423,3 +2423,16 @@ hts-dir-modified = 修改時間
 hts-dir-detect-on-import = 匯入時偵測
 hts-term-showing = 顯示 { $shown } / { $total } 個代碼系統
 hts-term-show-all-rows = 顯示全部
+
+## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
+## both consoles: /ui/admin/login and /ui/hts/login.
+admin-login-title = 管理員登入
+admin-login-lede = 安裝套件、管理租戶、匯入術語等管理頁面需要管理員密碼。
+admin-login-user = 使用者名稱
+admin-login-password = 密碼
+admin-login-submit = 登入
+admin-login-invalid = 使用者名稱或密碼錯誤。
+admin-login-throttled = 您的位址登入失敗次數過多，請於 { $minutes } 分鐘後再試。
+admin-login-cross-site = 登入表單必須從本站送出。請重新整理頁面後再試一次。
+admin-login-locked = 管理功能已鎖定：此伺服器未設定管理員密碼。請設定 { $var }（或 { $var }_FILE）後重新啟動。
+admin-user-hint = 管理員

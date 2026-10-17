@@ -307,7 +307,9 @@ impl PackageManager {
                 cache_dir(config),
                 limits,
             ),
-            hts: config.terminology_server.as_deref().map(HtsClient::new),
+            hts: config.terminology_server.as_deref().map(|base| {
+                HtsClient::new(base).with_token(config.packages.terminology_token.as_ref())
+            }),
             fhir_version: config.default_fhir_version,
             default_tenant: config.default_tenant.clone(),
             config: config.packages.clone(),

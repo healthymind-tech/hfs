@@ -396,6 +396,14 @@ Options:
 | `HTS_LOINC_PROPERTIES` | true | Store LOINC's properties: the `Loinc.csv` columns `STATUS`, `CLASSTYPE`, `ORDER_OBS`, `VersionFirstReleased`, `VersionLastChanged`, `CHNG_TYPE`, `UNITSREQUIRED`, `EXAMPLE_UCUM_UNITS`, `EXAMPLE_UNITS`, `PanelType` (strings) and one `Coding` property per `LoincPartLink_*.csv` row (`COMPONENT`, `SCALE_TYP`, `CLASS`, `document-kind`, …, without the `search` links). (Part names and term short names are stored as designations either way.) See *LOINC properties* below. |
 | `HTS_SHUTDOWN_TIMEOUT` | 9 | Seconds `hts run` may drain requests after SIGTERM/SIGINT before it exits anyway (a second signal exits at once). A signal during startup exits at once. |
 | `HTS_ADMIN_UI` | false | Enable terminology management — the `/admin` API (chunked upload, import jobs, delete, current-version pin, compaction, registry install) and the matching console pages. See [`docs/hts-terminology-admin.md`](../../docs/hts-terminology-admin.md) for this and the related `HTS_ADMIN_DATA_DIR`, `HTS_IMPORT_DIR`, `HTS_PACKAGE_REGISTRY`, `HTS_UPLOAD_CHUNK_SIZE`, `HTS_MAX_UPLOAD_SIZE` and `HTS_DISK_HEADROOM`. |
+| `HTS_ADMIN_PASSWORD` | (none) | Administrator password guarding `/admin`, `/ui/hts/api/admin` and the console's management pages (`/ui/hts/terminology`, `/jobs`, `/import`). Browsers sign in at `/ui/hts/login`; scripts use Basic (`-u admin:…`) or `Bearer <password>`. Required with `HTS_ADMIN_UI=true` (else those endpoints answer `503`). See [Administrator sign-in](../../docs/ops/admin-sign-in.md) |
+| `HTS_ADMIN_PASSWORD_FILE` | (none) | File holding the administrator password (Docker secrets); wins over `HTS_ADMIN_PASSWORD` |
+| `HTS_ADMIN_USER` | admin | Administrator user name |
+| `HTS_REQUIRE_AUTH_FOR_WRITES` | true with a password, else false | Require the administrator credential (Basic/Bearer) for CodeSystem/ValueSet/ConceptMap create/update/delete, `POST /import` and write batches; reads and `$lookup`/`$validate-code`/`$subsumes`/`$expand`/`$batch-validate-code`/`$translate`/`$closure` stay public. Without a password writes stay open, with a startup warning |
+| `HTS_ADMIN_SESSION_IDLE_MINUTES` | 480 | Idle lifetime of an admin browser session |
+| `HTS_ADMIN_TRUSTED_PROXIES` | loopback + private ranges | Proxies whose `X-Forwarded-For`/`X-Real-IP` are believed for the sign-in rate limit (CIDR list, or `none`) |
+| `HTS_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins accepted on cookie-authenticated admin writes |
+| `HTS_ADMIN_COOKIE_SECURE` | auto | `Secure` on the admin session cookie: `auto`, `true`, `false` |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected

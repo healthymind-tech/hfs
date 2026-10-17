@@ -45,6 +45,9 @@ helios-observability = { path = "../observability", version = "0.2.4" }
 # The UI ships no HTML at boot when disabled and adds negligible binary size
 # relative to the terminology payload.
 helios-hts-ui = { path = "../hts-ui", version = "0.2.4", default-features = false }
+# Password sign-in for `/admin` and the console's management pages
+# (`HTS_ADMIN_PASSWORD`), shared with HFS.
+helios-admin-auth = { path = "../admin-auth", version = "0.2.4" }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }
@@ -92,6 +95,8 @@ tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 ctor = "0.2"
+# `Authorization: Basic` for the admin sign-in tests (tests/admin_api.rs).
+base64 = "0.22"
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
 # Windows test runs don't need SIGTERM cleanup, so drop the feature there.

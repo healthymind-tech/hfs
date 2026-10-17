@@ -12,6 +12,7 @@ without internet access.
 | Variable | Default | |
 |---|---|---|
 | `HFS_ADMIN_UI` | `false` | `true` enables the `/admin/packages` API and the console page **IG Packages** (`/ui/packages`, in the navigation and the phone drawer). |
+| `HFS_ADMIN_PASSWORD` / `HFS_ADMIN_PASSWORD_FILE` | (none) | Administrator password (or a file holding it). Required with `HFS_ADMIN_UI=true` unless SMART/OIDC auth is on; see [Administrator sign-in](admin-sign-in.md). |
 | `HFS_PACKAGE_REGISTRY` | `on` | `on`: packages.fhir.org, then packages2.fhir.org. `off`: no network access at all. A comma-separated list of URLs: npm-compatible mirrors used instead of the public registries. |
 | `HFS_PACKAGES` | (none) | `name#version,...` installed at startup when missing (works with `HFS_ADMIN_UI=false`). |
 | `HFS_PACKAGE_CACHE_DIR` | next to the SQLite database (`/data/packages` for `HFS_DATABASE_URL=/data/fhir.db`), else `<HFS_DATA_DIR or ./data>/packages` | The package cache. |
@@ -20,12 +21,16 @@ without internet access.
 | `HFS_PACKAGE_MAX_UNPACKED` | 1 GiB | Largest unpacked package. |
 | `HFS_PACKAGE_MAX_ENTRY` | 64 MiB | Largest single file inside a package. |
 | `HFS_TERMINOLOGY_SERVER` | (none) | Where CodeSystem/ValueSet/ConceptMap go (`POST /import`). Without it terminology is stored in HFS. |
+| `HFS_TERMINOLOGY_SERVER_TOKEN` / `_FILE` | (none) | Bearer token for those terminology writes; HTS's administrator password when HTS requires auth for writes (`HTS_REQUIRE_AUTH_FOR_WRITES`). |
 
-Installing and removing packages are administrative actions. Until
-SMART/OIDC admin scopes are in place they sit behind `HFS_ADMIN_UI`; when
-authentication is on, the API also requires a system-scope token (the same
-tier as `/admin/tenants`). Leave `HFS_ADMIN_UI` off on servers where nobody
-should change the installed IGs, and use `HFS_PACKAGES` instead.
+Installing and removing packages are administrative actions. They sit
+behind `HFS_ADMIN_UI` and the administrator sign-in (`HFS_ADMIN_PASSWORD`;
+browsers sign in at `/ui/admin/login`, scripts send `curl -u admin:…` — see
+[Administrator sign-in](admin-sign-in.md)); with `HFS_ADMIN_UI=true` and no
+password the API answers `503`. When SMART/OIDC authentication is on, the
+API instead requires a system-scope token (the same tier as
+`/admin/tenants`). Leave `HFS_ADMIN_UI` off on servers where nobody should
+change the installed IGs, and use `HFS_PACKAGES` instead.
 
 ## What an install does
 

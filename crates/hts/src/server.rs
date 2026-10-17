@@ -103,6 +103,31 @@ where
         None
     };
 
+    // Administrator sign-in (`HTS_ADMIN_PASSWORD`). Fails closed: with the
+    // admin API on and no password, every admin endpoint answers 503. The
+    // same gate guards `/admin`, the console's `/ui/hts/api/admin` mount of
+    // it, and the console's management pages.
+    let gate = helios_admin_auth::AdminGate::configure(
+        "HTS",
+        config
+            .admin_auth
+            .clone()
+            .unwrap_or_else(|| helios_admin_auth::AdminSettings::from_env("HTS")),
+        config.admin_ui,
+        helios_hts_ui::ADMIN_COOKIE,
+    );
+    let writes_gate = writes_gate(&gate, config.require_auth_for_writes);
+    let admin = admin.map(|router| {
+        router.layer(axum::middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: gate.clone(),
+                protects: |_, _| true,
+                style: helios_admin_auth::Style::Api { fhir: false },
+            },
+            helios_admin_auth::guard,
+        ))
+    });
+
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
     // the `/hts` prefix internally so this mount point stays `/ui`, the same
@@ -122,7 +147,16 @@ where
     let hts_ui = if config.ui_enabled {
         let upstream_url = std::env::var("HTS_UI_UPSTREAM_URL")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
-        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).unwrap_or_else(|err| {
+        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).map(|client| {
+            // The console's management pages call `/admin` over loopback with
+            // the administrator's credential; the page guard has already
+            // required the browser to sign in.
+            match gate.auth() {
+                Some(auth) => client.with_admin_authorization(auth.service_authorization()),
+                None => client,
+            }
+        });
+        let upstream = upstream.unwrap_or_else(|err| {
             // reqwest's builder fails only under very degenerate conditions
             // (e.g. no TLS backend, which cannot happen here — we use
             // default_features = false with no TLS feature). Log loudly if
@@ -160,7 +194,11 @@ where
             // Starts empty; the Home page's own 15 s poll fills it.
             metrics_ring: Default::default(),
         });
-        Some(helios_hts_ui::router_with_admin(ui_state, admin.clone()))
+        Some(helios_hts_ui::router_with_admin(
+            ui_state,
+            admin.clone(),
+            gate.clone(),
+        ))
     } else {
         None
     };
@@ -260,7 +298,17 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state);
+        .with_state(state)
+        // Terminology writes need the administrator (`HTS_REQUIRE_AUTH_FOR_WRITES`).
+        // A route layer, so only matched routes are guarded, and inside the
+        // decompression layer below, so a batch body is classified decompressed.
+        .route_layer(axum::middleware::from_fn_with_state(
+            crate::write_guard::WriteGuard {
+                gate: writes_gate,
+                max_body_size: config.max_body_size,
+            },
+            crate::write_guard::guard,
+        ));
 
     // Merge the optional UI router before wrapping the whole app in the
     // observability / cors / timeout / trace layers so the UI benefits from
@@ -309,6 +357,48 @@ where
             Duration::from_secs(config.request_timeout.max(1)),
         ))
         .layer(TraceLayer::new_for_http())
+}
+
+/// The gate for state-changing terminology requests: the admin gate when
+/// `HTS_REQUIRE_AUTH_FOR_WRITES` is on (default: on when a password is set),
+/// else open — logged, since anyone can then rewrite the terminology.
+fn writes_gate(
+    admin: &helios_admin_auth::AdminGate,
+    require: Option<bool>,
+) -> helios_admin_auth::AdminGate {
+    use helios_admin_auth::AdminGate;
+    let has_password = matches!(admin, AdminGate::Password(_));
+    if !require.unwrap_or(has_password) {
+        if has_password {
+            tracing::warn!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=false: CodeSystem/ValueSet/ConceptMap create, \
+                 update and delete, /import and write batches are open to anyone"
+            );
+        } else {
+            tracing::warn!(
+                "terminology writes (CodeSystem/ValueSet/ConceptMap create, update and delete, \
+                 /import, write batches) are unauthenticated: set HTS_ADMIN_PASSWORD to require \
+                 the administrator for them"
+            );
+        }
+        return AdminGate::Open;
+    }
+    match admin {
+        AdminGate::Open => {
+            tracing::error!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=true but no HTS_ADMIN_PASSWORD is set: terminology \
+                 writes answer 503 until one is"
+            );
+            AdminGate::Locked(std::sync::Arc::from(
+                "terminology writes are locked: HTS_REQUIRE_AUTH_FOR_WRITES=true needs \
+                 HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+            ))
+        }
+        gate => {
+            tracing::info!("terminology writes require the administrator credential");
+            gate.clone()
+        }
+    }
 }
 
 /// Wire the admin core to this app's backend and caches and start its worker.

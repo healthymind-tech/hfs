@@ -38,6 +38,7 @@
 //! picker's option list widens from the tenant's stored types to every
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
+mod admin_login;
 mod bulk_export;
 mod bulk_import;
 mod capability;
@@ -66,6 +67,7 @@ mod subscriptions;
 mod tenants;
 mod vd_complete;
 
+pub use admin_login::ADMIN_COOKIE;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 
 #[doc(hidden)]
@@ -215,6 +217,9 @@ struct WebState {
     /// with [`set_interactive_login`]. `None` means no login and no session
     /// gate — the pre-#1449 behaviour.
     login: Option<Arc<login::LoginRuntime>>,
+    /// The administrator sign-in (`HFS_ADMIN_PASSWORD`) guarding the admin
+    /// pages, as installed with [`set_admin_gate`]; `Open` when none was.
+    admin_gate: helios_admin_auth::AdminGate,
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -285,6 +290,9 @@ pub(crate) struct RequestTenant {
     /// tenant, because it is the same per-request rendering context the
     /// topbar draws from.
     pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
+    /// The administrator signed in with `HFS_ADMIN_PASSWORD`, when this
+    /// request carries a live admin session (stamped by the admin guard).
+    pub(crate) admin_user: Option<String>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -306,6 +314,7 @@ where
                 display: None,
                 multi: false,
                 signed_in: None,
+                admin_user: None,
             }))
     }
 }
@@ -334,12 +343,17 @@ async fn resolve_prefs(
         .extensions()
         .get::<login::SignedIn>()
         .map(|s| s.0.clone());
+    let admin_user = request
+        .extensions()
+        .get::<helios_admin_auth::AdminUser>()
+        .map(|u| u.0.clone());
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
         signed_in: signed_in.clone(),
+        admin_user: admin_user.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -367,6 +381,7 @@ async fn resolve_prefs(
                 display: record.display_name,
                 multi: false,
                 signed_in: signed_in.clone(),
+                admin_user: admin_user.clone(),
             };
         }
     }
@@ -467,6 +482,10 @@ pub(crate) struct UserSummary {
     initials: String,
     /// Avatar image URL, when the IdP sent a `picture` claim.
     photo: Option<String>,
+    /// The administrator signed in with `HFS_ADMIN_PASSWORD` rather than an
+    /// IdP user: the secondary line then says "Administrator", and Sign out
+    /// ends the admin session.
+    admin: bool,
 }
 
 impl UserSummary {
@@ -482,6 +501,19 @@ impl UserSummary {
             display,
             secondary,
             photo: principal.picture.clone(),
+            admin: false,
+        })
+    }
+
+    /// The administrator of an `HFS_ADMIN_PASSWORD` session.
+    fn admin(user: Option<&str>) -> Option<Self> {
+        let user = user?;
+        Some(Self {
+            initials: initials_of(user),
+            display: user.to_string(),
+            secondary: String::new(),
+            photo: None,
+            admin: true,
         })
     }
 }
@@ -615,8 +647,9 @@ impl Status {
         self.user.as_ref().and_then(|u| u.photo.as_deref())
     }
 
-    /// Whether the menu offers Sign out — only for an interactive session,
-    /// which `/ui/logout` ends (#1449).
+    /// Whether the menu offers Sign out — for an interactive session, which
+    /// `/ui/logout` ends (#1449), or an admin session, which
+    /// `/ui/admin/logout` ends.
     pub(crate) fn user_can_logout(&self) -> bool {
         self.user.is_some()
     }
@@ -629,15 +662,25 @@ impl Status {
     /// passes template fields to a method call by reference, so the generated
     /// code hands us `&self.i18n`.
     pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        let admin = self.user.as_ref().is_some_and(|u| u.admin);
+        let admin_hint = i18n.t("admin-user-hint");
         helios_ui_chrome::user_menu(
             i18n,
             helios_ui_chrome::UserIdentity {
                 display: self.user_display(),
-                secondary: self.user_secondary(),
+                secondary: if admin {
+                    Some(admin_hint.as_str())
+                } else {
+                    self.user_secondary()
+                },
                 initials: self.user_initials(),
                 photo: self.user_photo(),
                 can_logout: self.user_can_logout(),
-                logout_href: "/ui/logout",
+                logout_href: if admin {
+                    admin_login::LOGOUT_PATH
+                } else {
+                    "/ui/logout"
+                },
             },
         )
     }
@@ -2032,7 +2075,17 @@ pub fn mount_with_conformance_source_and_runtime(
         // Answer 404 until a login is installed (see `login::installed`).
         .route("/ui/login", get(login::login))
         .route("/ui/callback", get(login::callback))
-        .route("/ui/logout", axum::routing::post(login::logout));
+        .route("/ui/logout", axum::routing::post(login::logout))
+        // Administrator sign-in (`HFS_ADMIN_PASSWORD`): the form, and the
+        // sign-out its session's account menu offers.
+        .route(
+            admin_login::LOGIN_PATH,
+            get(admin_login::login_page).post(admin_login::login_submit),
+        )
+        .route(
+            admin_login::LOGOUT_PATH,
+            axum::routing::post(admin_login::logout),
+        );
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
@@ -2071,6 +2124,7 @@ pub fn mount_with_conformance_source_and_runtime(
         ))),
         tenant_path_routing,
         login: login::installed(),
+        admin_gate: installed_admin_gate(),
     };
 
     router
@@ -2090,6 +2144,21 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // The administrator sign-in: refuses the admin pages without a
+        // session (to `/ui/admin/login`) and stamps the signed-in
+        // administrator for the account menu. Outside `resolve_prefs`, which
+        // reads that stamp; inside the OIDC session gate, so a server with
+        // both asks for the IdP login first.
+        .layer(middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: state.admin_gate.clone(),
+                protects: admin_login::protects,
+                style: helios_admin_auth::Style::Browser {
+                    login_path: admin_login::LOGIN_PATH,
+                },
+            },
+            helios_admin_auth::guard,
+        ))
         // Outermost of the UI layers so it runs first: with a login installed
         // it stamps the signed-in Principal that `resolve_prefs` keys the
         // per-user settings on, or turns the request away to `/ui/login`
@@ -8535,6 +8604,34 @@ fn dashboard_refresh() -> DashboardRefresh {
 
 static PACKAGE_ADMIN: RwLock<bool> = RwLock::new(false);
 
+static ADMIN_GATE: RwLock<Option<helios_admin_auth::AdminGate>> = RwLock::new(None);
+
+/// Install the administrator sign-in (`HFS_ADMIN_PASSWORD`) that guards the
+/// console's admin pages — IG Packages, Tenants, Bulk Import/Export, SQL
+/// Export and every state-changing form outside the read-only previews —
+/// and backs `/ui/admin/login`. Called once from the server's startup before
+/// the UI is mounted (the mount captures it); the most recent call wins. The
+/// server must guard its `/admin` API with the same gate, since the IG
+/// Packages page's script calls that API with the session cookie.
+///
+/// Without a call the UI mounts with [`helios_admin_auth::AdminGate::Open`]
+/// — no sign-in, the pre-existing behaviour — so an embedder that enables
+/// administration must install a gate (the `hfs` binary always does, and
+/// builds it to fail closed).
+pub fn set_admin_gate(gate: helios_admin_auth::AdminGate) {
+    *ADMIN_GATE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+}
+
+fn installed_admin_gate() -> helios_admin_auth::AdminGate {
+    ADMIN_GATE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or(helios_admin_auth::AdminGate::Open)
+}
+
 /// Record whether FHIR package administration is enabled
 /// (`HFS_ADMIN_UI=true`): the nav then links `/ui/packages` and the page
 /// offers install and remove. Called once from the server's startup; the
@@ -9438,7 +9535,10 @@ pub(crate) fn current_status(
             state.terminology.as_deref(),
             state.terminology_public_url.as_deref(),
         ),
-        user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        // An IdP session names the user; failing that, an administrator
+        // signed in with the admin password.
+        user: UserSummary::from_session(tenant.signed_in.as_ref())
+            .or_else(|| UserSummary::admin(tenant.admin_user.as_deref())),
         bearer_only_auth: bearer_only_auth(),
         fhir_base: fhir_base_path(&state.public_base_url),
     }

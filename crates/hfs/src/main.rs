@@ -923,6 +923,13 @@ async fn serve(
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     write_observer: Option<Arc<dyn WriteObserver>>,
 ) -> anyhow::Result<()> {
+    // Administrator sign-in (`HFS_ADMIN_PASSWORD`): one gate for the console's
+    // admin pages (installed into the UI before it is mounted) and the admin
+    // API, which the IG Packages page calls with the same session cookie.
+    let admin_gate = admin_gate(config);
+    #[cfg(feature = "ui")]
+    helios_ui::set_admin_gate(admin_gate.clone());
+
     let app = attach_ui(
         app,
         config,
@@ -931,6 +938,16 @@ async fn serve(
         ui_bulk_provider,
         write_observer,
     );
+    // Outermost of the application layers, so it sees `/admin/...` whether
+    // the UI router or the FHIR router answers it.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        helios_admin_auth::Guard {
+            gate: admin_gate,
+            protects: is_admin_api_path,
+            style: helios_admin_auth::Style::Api { fhir: true },
+        },
+        helios_admin_auth::guard,
+    ));
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -996,6 +1013,47 @@ async fn serve(
     helios_observability::telemetry::shutdown();
     served?;
     Ok(())
+}
+
+/// The administrator sign-in for this server (`HFS_ADMIN_*`).
+///
+/// With SMART/OIDC authentication on (`HFS_AUTH_ENABLED`), the admin tier
+/// already requires a system-scope bearer token and the console its own
+/// session, so the password gate stays out of the way (and a configured
+/// password is ignored, with a warning). Otherwise a password enables the
+/// sign-in, and `HFS_ADMIN_UI=true` without one locks every admin endpoint
+/// (`503`) instead of leaving it open.
+fn admin_gate(config: &ServerConfig) -> helios_admin_auth::AdminGate {
+    // The public base URL's origin is accepted on cookie-authenticated writes
+    // even when a proxy rewrote `Host`.
+    let settings =
+        helios_admin_auth::AdminSettings::from_env("HFS").allow_origin_of(&config.base_url);
+    if AuthConfig::from_env().enabled {
+        if settings.password.is_some() || settings.error.is_some() {
+            warn!(
+                "HFS_ADMIN_PASSWORD is ignored: authentication is enabled, so the admin API \
+                 requires a system-scope token and the console its own sign-in"
+            );
+        }
+        return helios_admin_auth::AdminGate::Open;
+    }
+    #[cfg(feature = "ui")]
+    let cookie = helios_ui::ADMIN_COOKIE;
+    #[cfg(not(feature = "ui"))]
+    let cookie = helios_admin_auth::CookieSpec {
+        name: "hfs_admin",
+        path: "/",
+    };
+    helios_admin_auth::AdminGate::configure("HFS", settings, config.packages.admin_ui, cookie)
+}
+
+/// The administrative API: package and tenant administration, and the
+/// cross-tenant console metrics (the tier `build_app` reserves for
+/// system-scope tokens when authentication is on).
+fn is_admin_api_path(_method: &axum::http::Method, path: &str) -> bool {
+    helios_admin_auth::under(path, "/admin")
+        || path == "/console/metrics/tenants"
+        || path == "/console/metrics/traffic"
 }
 
 /// Attaches the web UI surface to the FHIR router.

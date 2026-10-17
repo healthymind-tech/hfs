@@ -1,0 +1,30 @@
+[package]
+name = "helios-admin-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/admin-auth"
+description = "Password sign-in for the administrative surfaces of the Helios FHIR and terminology servers"
+keywords = ["helios-software", "fhir", "admin", "authentication"]
+
+# One implementation of the admin sign-in for both products: HFS (`/admin`,
+# the IG Packages / Tenants / Bulk pages of `/ui`) and HTS (`/admin`, the
+# terminology management pages of `/ui/hts`). Every dependency below is
+# already in the workspace lock; the crate adds no new third-party code.
+[dependencies]
+axum = "0.8"
+# Session tokens: 256 bits from the operating system's CSPRNG.
+rand = "0.8"
+# Fixed-length digests for constant-time credential comparison and for the
+# session table's keys (the token itself is never stored).
+sha2 = "0.10"
+base64 = "0.22"
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

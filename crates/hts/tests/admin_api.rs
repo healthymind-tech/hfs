@@ -1,6 +1,8 @@
 //! End-to-end tests of the terminology admin API (`HTS_ADMIN_UI=true`):
 //! chunked upload → detection → queued import job → inventory / pin /
-//! dependents → delete job, plus the single-writer queue and the switches.
+//! dependents → delete job, plus the single-writer queue and the switches,
+//! and the administrator sign-in that guards all of it
+//! (`HTS_ADMIN_PASSWORD`).
 #![cfg(feature = "sqlite")]
 
 use std::time::Duration;
@@ -16,6 +18,17 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const CS_URL: &str = "http://example.org/admin-test/cs";
+
+/// Throwaway administrator password of the test servers.
+const ADMIN_PASSWORD: &str = "admin-api-test-password";
+
+fn basic(user: &str, password: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -33,6 +46,14 @@ fn backend_label() -> &'static str {
 }
 
 async fn env(admin: bool) -> Env {
+    env_with(
+        admin,
+        helios_admin_auth::AdminSettings::default().with_password(ADMIN_PASSWORD),
+    )
+    .await
+}
+
+async fn env_with(admin: bool, auth: helios_admin_auth::AdminSettings) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let import_dir = dir.path().join("import");
     std::fs::create_dir_all(&import_dir).unwrap();
@@ -46,7 +67,7 @@ async fn env(admin: bool) -> Env {
         let config = HtsConfig {
             storage_backend: "postgres".into(),
             database_url: url,
-            ..env_config(&dir, &import_dir, admin)
+            ..env_config(&dir, &import_dir, admin, auth)
         };
         let app = helios_hts::server::create_app(&config, state);
         return Env {
@@ -64,7 +85,7 @@ async fn env(admin: bool) -> Env {
         let state = AppState::new(backend).with_hts_pool(pool);
         let config = HtsConfig {
             database_url: db.to_string_lossy().into_owned(),
-            ..env_config(&dir, &import_dir, admin)
+            ..env_config(&dir, &import_dir, admin, auth)
         };
         let app = helios_hts::server::create_app(&config, state);
         Env {
@@ -77,9 +98,15 @@ async fn env(admin: bool) -> Env {
     panic!("no backend")
 }
 
-fn env_config(dir: &tempfile::TempDir, import_dir: &std::path::Path, admin: bool) -> HtsConfig {
+fn env_config(
+    dir: &tempfile::TempDir,
+    import_dir: &std::path::Path,
+    admin: bool,
+    auth: helios_admin_auth::AdminSettings,
+) -> HtsConfig {
     HtsConfig {
         admin_ui: admin,
+        admin_auth: Some(auth),
         admin_data_dir: dir.path().join("admin").to_string_lossy().into_owned(),
         import_dir: import_dir.to_string_lossy().into_owned(),
         package_registry: "off".into(),
@@ -127,7 +154,9 @@ async fn send(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (St
         }
         None => Body::empty(),
     };
-    req = req.header("x-forwarded-for", "10.1.2.3");
+    req = req
+        .header("x-forwarded-for", "10.1.2.3")
+        .header("authorization", basic("admin", ADMIN_PASSWORD));
     let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 64 << 20)
@@ -142,6 +171,7 @@ async fn put_bytes(app: &Router, uri: &str, data: Vec<u8>) -> StatusCode {
         .method("PUT")
         .uri(uri)
         .header("content-type", "application/octet-stream")
+        .header("authorization", basic("admin", ADMIN_PASSWORD))
         .body(Body::from(data))
         .unwrap();
     app.clone().oneshot(req).await.unwrap().status()
@@ -462,7 +492,10 @@ async fn upload_import_pin_delete_round_trip() {
         events
             .iter()
             .any(|e| e["subtype"][0]["code"] == "delete-code-system"
-                && e["agent"][0]["who"]["display"] == "10.1.2.3")
+                // The signed-in administrator, not whatever the client
+                // claimed, plus the address it came from.
+                && e["agent"][0]["who"]["display"] == "admin"
+                && e["agent"][0]["network"]["address"] == "10.1.2.3")
     );
     assert!(
         events
@@ -572,4 +605,257 @@ async fn import_dir_directory_resolves_to_the_release_inside() {
     let job = wait_job(app, job["id"].as_str().unwrap()).await;
     assert_eq!(job["status"], "failed", "{job}");
     assert!(job.to_string().contains("directory"), "{job}");
+}
+
+// ── Administrator sign-in ────────────────────────────────────────────────────
+
+/// A raw request; `headers` are sent as given (no credentials added).
+async fn raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> axum::response::Response {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    app.clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_requires_the_administrator() {
+    let e = env(true).await;
+    let app = &e.app;
+
+    for uri in ["/admin", "/admin/jobs", "/ui/hts/api/admin/formats"] {
+        let r = raw(app, "GET", uri, &[], "").await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert!(r.headers().contains_key("www-authenticate"), "{uri}");
+    }
+    let r = raw(
+        app,
+        "POST",
+        "/admin/imports",
+        &[("content-type", "application/json")],
+        r#"{"source":{"type":"import-dir","path":"x"}}"#,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // Bearer <password> works as well as Basic.
+    let bearer = format!("Bearer {ADMIN_PASSWORD}");
+    let r = raw(app, "GET", "/admin/jobs", &[("authorization", &bearer)], "").await;
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // The terminology API stays public.
+    for uri in [
+        "/health",
+        "/metadata",
+        "/CodeSystem",
+        "/ui/hts",
+        "/ui/hts/code-systems",
+    ] {
+        let r = raw(app, "GET", uri, &[], "").await;
+        assert_eq!(r.status(), StatusCode::OK, "{uri}");
+    }
+
+    // Wrong passwords: 401, then the client is locked out — even for the
+    // right one.
+    let wrong = basic("admin", "not-the-password");
+    for _ in 0..4 {
+        let r = raw(app, "GET", "/admin/jobs", &[("authorization", &wrong)], "").await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+    let r = raw(app, "GET", "/admin/jobs", &[("authorization", &wrong)], "").await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.headers().contains_key("retry-after"));
+    let right = basic("admin", ADMIN_PASSWORD);
+    let r = raw(app, "GET", "/admin/jobs", &[("authorization", &right)], "").await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_fails_closed_without_a_password() {
+    let e = env_with(true, helios_admin_auth::AdminSettings::default()).await;
+    let app = &e.app;
+    let right = basic("admin", "anything");
+    for uri in ["/admin", "/admin/jobs", "/ui/hts/api/admin/formats"] {
+        let r = raw(app, "GET", uri, &[("authorization", &right)], "").await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("HTS_ADMIN_PASSWORD"), "{uri}: {text}");
+    }
+    // The management pages send the browser to the sign-in page, which says
+    // why nobody can sign in.
+    let r = raw(app, "GET", "/ui/hts/terminology", &[], "").await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let r = raw(app, "GET", "/ui/hts/login", &[], "").await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("HTS_ADMIN_PASSWORD"));
+    // Public endpoints are unaffected.
+    let r = raw(app, "GET", "/health", &[], "").await;
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_sign_in_session_and_sign_out() {
+    let e = env(true).await;
+    let app = &e.app;
+    let site = [("host", "tx.example"), ("origin", "https://tx.example")];
+
+    // A management page without a session goes to the sign-in page.
+    let r = raw(app, "GET", "/ui/hts/terminology?x=1", &[], "").await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        r.headers()["location"],
+        "/ui/hts/login?next=/ui/hts/terminology%3Fx%3D1"
+    );
+    let r = raw(app, "GET", "/ui/hts/login?next=/ui/hts/jobs", &[], "").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains(r#"action="/ui/hts/login""#), "{html}");
+    assert!(
+        html.contains(r#"name="next" value="/ui/hts/jobs""#),
+        "{html}"
+    );
+
+    let form_headers = [
+        site[0],
+        site[1],
+        ("content-type", "application/x-www-form-urlencoded"),
+    ];
+    // Wrong password: the form again, 401, no cookie.
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/login",
+        &form_headers,
+        "username=admin&password=wrong&next=%2Fui%2Fhts%2Fjobs",
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert!(!r.headers().contains_key("set-cookie"));
+
+    // A form posted from another site is refused.
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/login",
+        &[
+            ("host", "tx.example"),
+            ("origin", "https://evil.example"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ],
+        &format!("username=admin&password={ADMIN_PASSWORD}"),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // Right password: redirect to `next` with the session cookie.
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/login",
+        &form_headers,
+        &format!("username=admin&password={ADMIN_PASSWORD}&next=%2Fui%2Fhts%2Fjobs"),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/ui/hts/jobs");
+    let set_cookie = r.headers()["set-cookie"].to_str().unwrap().to_string();
+    assert!(set_cookie.starts_with("hts_admin="), "{set_cookie}");
+    for attr in ["Path=/ui/hts", "HttpOnly", "SameSite=Strict", "Secure"] {
+        assert!(set_cookie.contains(attr), "{attr}: {set_cookie}");
+    }
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // An open redirect is not followed.
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/login",
+        &form_headers,
+        &format!("username=admin&password={ADMIN_PASSWORD}&next=https%3A%2F%2Fevil.example"),
+    )
+    .await;
+    assert_eq!(r.headers()["location"], "/ui/hts");
+
+    // The session opens the API mount the console's script uses, and the
+    // management pages, which show Sign out.
+    let r = raw(
+        app,
+        "GET",
+        "/ui/hts/api/admin/formats",
+        &[("cookie", &cookie)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = raw(app, "GET", "/ui/hts/jobs", &[("cookie", &cookie)], "").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(r.into_body(), 4 << 20).await.unwrap();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains(r#"action="/ui/hts/logout""#), "{html}");
+
+    // A cookie-authenticated write needs a same-site Origin (CSRF).
+    let upload = r#"{"filename":"x.json","size":10,"client_key":"k"}"#;
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/api/admin/uploads",
+        &[("cookie", &cookie), ("content-type", "application/json")],
+        upload,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/api/admin/uploads",
+        &[
+            ("cookie", &cookie),
+            ("content-type", "application/json"),
+            site[0],
+            site[1],
+        ],
+        upload,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+
+    // Sign out ends the session.
+    let r = raw(
+        app,
+        "POST",
+        "/ui/hts/logout",
+        &[("cookie", &cookie), site[0], site[1]],
+        "",
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(
+        r.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let r = raw(
+        app,
+        "GET",
+        "/ui/hts/api/admin/formats",
+        &[("cookie", &cookie)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = raw(app, "GET", "/ui/hts/jobs", &[("cookie", &cookie)], "").await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
 }

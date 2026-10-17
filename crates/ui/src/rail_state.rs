@@ -1237,6 +1237,7 @@ mod tests {
             write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             login: None,
+            admin_gate: helios_admin_auth::AdminGate::Open,
         }
     }
 

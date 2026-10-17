@@ -19,7 +19,10 @@ Outputs one FHIR *collection* Bundle per supplement into ``--out-dir``::
 Each concept carries ``designation[language=zh-Hant, use=display]``.  Load with::
 
   hts import --format fhir-bundle <file>            # CLI, any size
-  curl -X POST $HTS/import --data-binary @<file>    # REST (mind the body-size limit)
+  curl -u admin:$HTS_ADMIN_PASSWORD -X POST $HTS/import --data-binary @<file>
+                                                    # REST (mind the body-size limit; the
+                                                    # credential is needed once HTS has an
+                                                    # admin password)
 
 Query with ``$lookup?...&useSupplement=<supplement url>`` (and, once supplement
 designations are merged generically, plain ``displayLanguage=zh-Hant``).

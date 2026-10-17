@@ -5,17 +5,23 @@ importers as `hts import`, run as background jobs — from the console at
 `/ui/hts/terminology`, `/ui/hts/import` and `/ui/hts/jobs`, or from scripts via
 the JSON API under `/admin`.
 
-> **Access control.** The whole surface is off unless `HTS_ADMIN_UI=true`.
-> Until SMART/OIDC admin scopes land, that flag *is* the access control:
-> enable it only where `/admin` and `/ui/hts` are reachable by administrators
-> alone (internal network, VPN, or an authenticating reverse proxy that sets
-> `X-Forwarded-User`). Every action is audited (see below).
+> **Access control.** The whole surface is off unless `HTS_ADMIN_UI=true`,
+> and then requires the administrator password (`HTS_ADMIN_PASSWORD` or
+> `HTS_ADMIN_PASSWORD_FILE`): browsers sign in at `/ui/hts/login`, scripts send
+> `curl -u admin:…` or `Authorization: Bearer <password>`. Without a password
+> every admin endpoint answers `503`. See
+> [Administrator sign-in](ops/admin-sign-in.md). Every action is audited
+> (see below) under the signed-in administrator. With a password set, the
+> terminology API's own writes (`/import`, CodeSystem/ValueSet/ConceptMap
+> create/update/delete, write batches) need the same credential
+> (`HTS_REQUIRE_AUTH_FOR_WRITES`).
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HTS_ADMIN_UI` | `false` | Mount `/admin`, `/ui/hts/api/admin` and enable the console pages. |
+| `HTS_ADMIN_PASSWORD` / `HTS_ADMIN_PASSWORD_FILE` | *(none)* | Administrator password (or a file holding it). Required with `HTS_ADMIN_UI=true`; see [Administrator sign-in](ops/admin-sign-in.md) for `HTS_ADMIN_USER`, `HTS_ADMIN_SESSION_IDLE_MINUTES`, `HTS_ADMIN_TRUSTED_PROXIES`, `HTS_ADMIN_ALLOWED_ORIGINS`, `HTS_ADMIN_COOKIE_SECURE`. |
 | `HTS_ADMIN_DATA_DIR` | `<database dir>/hts-admin` | Uploads (`uploads/`), job records and logs (`jobs/`), downloaded packages (`packages/`), `audit.ndjson`, `provenance.json`. Put it on the same volume as the database or one at least as large as the biggest source file. |
 | `HTS_IMPORT_DIR` | *(off)* | Directory operators copy files into (e.g. a read-only mount of a share). Listed by the console; imported without an upload. |
 | `HTS_PACKAGE_REGISTRY` | `https://packages.fhir.org` | FHIR package registry (or an internal mirror). `off` disables it for hospitals without outbound internet; uploads and the import directory keep working. |

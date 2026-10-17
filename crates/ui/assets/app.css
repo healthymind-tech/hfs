@@ -9273,3 +9273,18 @@ body.app-shell .pane {
     padding: 12px;
   }
 }
+
+/* Administrator sign-in form: HFS /ui/admin/login and HTS /ui/hts/login. */
+.admin-login {
+  max-width: 28rem;
+  padding: 24px;
+}
+
+.admin-login form {
+  display: grid;
+  gap: 16px;
+}
+
+.admin-login .alert {
+  margin-bottom: 16px;
+}
