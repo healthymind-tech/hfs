@@ -22,8 +22,9 @@ use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend, error_c
 /// field that affects the output rows.
 fn translate_cache_key(req: &TranslateRequest) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         req.url.as_deref().unwrap_or(""),
+        req.map_version.as_deref().unwrap_or(""),
         req.system.as_deref().unwrap_or(""),
         req.code,
         req.source.as_deref().unwrap_or(""),
@@ -70,6 +71,9 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         } else {
             (req.system.as_deref(), req.target_system.as_deref())
         };
+        // Each map URL contributes one version: `conceptMapVersion` for the
+        // named `url`, else its default version.
+        let map_version = req.url.as_ref().and(req.map_version.as_deref());
 
         // A named ConceptMap that is not loaded is a 404, distinct from "no
         // match found" (mirrors SQLite `translate_sync`).
@@ -94,6 +98,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 search_sys,
                 other_side_sys,
                 req.url.as_deref(),
+                map_version,
                 reverse,
                 req.date.as_deref(),
             )
@@ -121,6 +126,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                     search_sys,
                     other_side_sys,
                     req.url.as_deref(),
+                    map_version,
                     reverse,
                     req.date.as_deref(),
                 )
@@ -317,6 +323,7 @@ async fn query_translate_elements(
     system: Option<&str>,
     other_side_sys: Option<&str>,
     map_url: Option<&str>,
+    map_version: Option<&str>,
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
@@ -346,13 +353,24 @@ async fn query_translate_elements(
            AND ($2::text IS NULL OR {lookup_sys_col} = $2)
            AND ($3::text IS NULL OR {other_sys_col} = $3)
            AND ($4::text IS NULL OR cm.url = $4)
-           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
+           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)
+           AND cm.id = (SELECT c2.id FROM concept_maps c2
+                         WHERE c2.url = cm.url AND ($6::text IS NULL OR c2.version = $6)
+                         ORDER BY {default_first} LIMIT 1)",
+        default_first = crate::backends::cm_precedence_order_by("c2")
     );
 
     let rows = super::query_text(
         client,
         &sql,
-        &[&code, &system, &other_side_sys, &map_url, &date],
+        &[
+            &code,
+            &system,
+            &other_side_sys,
+            &map_url,
+            &date,
+            &map_version,
+        ],
     )
     .await
     .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;

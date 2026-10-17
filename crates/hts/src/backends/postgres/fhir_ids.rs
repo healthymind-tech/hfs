@@ -12,7 +12,7 @@ use crate::error::HtsError;
 use crate::resource_ids::{self, GroupRow};
 
 /// Resource tables that carry a reported `fhir_id`.
-pub(crate) const TABLES: [&str; 2] = ["code_systems", "value_sets"];
+pub(crate) const TABLES: [&str; 3] = ["code_systems", "value_sets", "concept_maps"];
 
 fn db(e: tokio_postgres::Error) -> HtsError {
     HtsError::StorageError(error_chain(&e))
@@ -26,6 +26,7 @@ fn group_order_by(table: &str) -> std::borrow::Cow<'static, str> {
 fn precedence(table: &str, alias: &str) -> std::borrow::Cow<'static, str> {
     match table {
         "code_systems" => crate::backends::cs_precedence_order_by(alias),
+        "concept_maps" => crate::backends::cm_precedence_order_by(alias),
         _ => crate::backends::vs_precedence_order_by(alias),
     }
 }

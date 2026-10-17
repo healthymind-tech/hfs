@@ -452,11 +452,7 @@ pub(crate) fn metadata_select_list(
     };
     // SQLite reads `fhir_id` from an index separately (it sits behind
     // `resource_json` in the row).
-    let fhir_id = if postgres && table != "concept_maps" {
-        "fhir_id"
-    } else {
-        "NULL"
-    };
+    let fhir_id = if postgres { "fhir_id" } else { "NULL" };
     format!(
         "id, url, version, name, title, status, {content}, {supplements}, {publisher}, {updated}, \
          {fhir_id}"

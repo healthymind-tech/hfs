@@ -192,15 +192,21 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_system
     ON implicit_expansion_cache(system_url);
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
+-- Multi-version like code_systems / value_sets: one row per (url, version).
+-- Databases created with the old `url TEXT NOT NULL UNIQUE` are rebuilt by
+-- `migrate_concept_maps_drop_url_unique`.
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
+    url         TEXT NOT NULL,
     version     TEXT,
     source_uri  TEXT,
     target_uri  TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
     created_at  TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+    ON concept_maps(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_map_elements (
@@ -668,7 +674,7 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
 /// written by an older binary (which leaves the column `NULL`) converges on
 /// the next start.
 pub fn migrate_version_sort(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    for table in ["code_systems", "value_sets"] {
+    for table in ["code_systems", "value_sets", "concept_maps"] {
         match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN version_sort TEXT")) {
             Ok(_) => {}
             Err(e) if e.to_string().contains("duplicate column name") => {}
@@ -957,6 +963,68 @@ pub fn migrate_code_systems_drop_url_unique(
          CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);",
     )?;
     tx.commit()
+}
+
+/// Drop the legacy `UNIQUE` constraint on `concept_maps.url`, so several
+/// versions of a ConceptMap can be stored (before, importing version 2
+/// replaced version 1, whichever was imported last). Mirror of
+/// [`migrate_code_systems_drop_url_unique`].
+///
+/// Foreign keys are switched off for the rebuild: with them on, dropping the
+/// old table would cascade-delete every `concept_map_elements` row.
+/// Idempotent: a no-op once the rebuild has run. Must run after
+/// [`migrate_search_columns`] (which adds `name`, `title`, `resource_json`)
+/// and before the migrations that add columns to `concept_maps`.
+pub fn migrate_concept_maps_drop_url_unique(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let needs_rebuild: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='concept_maps' \
+               AND sql LIKE '%url%TEXT%NOT NULL%UNIQUE%'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !needs_rebuild {
+        return Ok(());
+    }
+    let fk_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let result = (|| {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE concept_maps_new (
+                 id            TEXT PRIMARY KEY,
+                 url           TEXT NOT NULL,
+                 version       TEXT,
+                 source_uri    TEXT,
+                 target_uri    TEXT,
+                 status        TEXT NOT NULL DEFAULT 'active',
+                 created_at    TEXT NOT NULL,
+                 name          TEXT,
+                 title         TEXT,
+                 resource_json TEXT
+             );
+             INSERT INTO concept_maps_new
+                 (id, url, version, source_uri, target_uri, status, created_at, name, title,
+                  resource_json)
+             SELECT id, url, version, source_uri, target_uri, status, created_at, name, title,
+                    resource_json
+               FROM concept_maps;
+             DROP TABLE concept_maps;
+             ALTER TABLE concept_maps_new RENAME TO concept_maps;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+                 ON concept_maps(url, COALESCE(version, ''));
+             CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);",
+        )?;
+        tx.commit()
+    })();
+    if fk_on {
+        conn.execute_batch("PRAGMA foreign_keys=ON")?;
+    }
+    result
 }
 
 /// Drop the legacy `UNIQUE` constraint on `value_sets.url`. Mirror of

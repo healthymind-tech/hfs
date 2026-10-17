@@ -121,6 +121,7 @@ pub(crate) fn search_order_by(table: &str, url_without_version: bool) -> Cow<'st
     match (table, url_without_version) {
         ("code_systems", true) => cs_precedence_order_by("code_systems"),
         ("value_sets", true) => vs_precedence_order_by("value_sets"),
+        ("concept_maps", true) => cm_precedence_order_by("concept_maps"),
         _ => Cow::Borrowed("created_at"),
     }
 }
@@ -153,6 +154,28 @@ fn build_vs_precedence_order_by(alias: &str) -> String {
 
 static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
     LazyLock::new(|| build_vs_precedence_order_by("value_sets"));
+
+/// Precedence among `concept_maps` rows sharing one canonical URL: the
+/// highest version (semantic order, [`crate::version_order`]), then a stable
+/// `id`. The ConceptMap analogue of [`vs_precedence_order_by`]; ConceptMaps
+/// carry no provenance rank.
+///
+/// Every place that picks "the" ConceptMap for a URL without a version — a
+/// versionless `GET /ConceptMap?url=…`, `$translate` with `url` (or without,
+/// per map) — orders by this.
+pub(crate) fn cm_precedence_order_by(alias: &str) -> Cow<'static, str> {
+    match alias {
+        "concept_maps" => Cow::Borrowed(CM_ORDER_BY_CONCEPT_MAPS.as_str()),
+        other => Cow::Owned(build_cm_precedence_order_by(other)),
+    }
+}
+
+fn build_cm_precedence_order_by(alias: &str) -> String {
+    format!("COALESCE({alias}.version_sort, {alias}.version, '') DESC, {alias}.id")
+}
+
+static CM_ORDER_BY_CONCEPT_MAPS: LazyLock<String> =
+    LazyLock::new(|| build_cm_precedence_order_by("concept_maps"));
 
 /// `expansion.contains` entries built straight from `compose.include.concept[]`
 /// (code + embedded display), skipping codes already in `skip`.

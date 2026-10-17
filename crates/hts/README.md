@@ -754,6 +754,12 @@ curl -X POST http://localhost:8090/ConceptMap/\$translate \
   }'
 ```
 
+Several versions of a ConceptMap can be stored. Without `conceptMapVersion`
+(or a `url|version` canonical), `$translate` uses each map's default version —
+the semantically newest, the same rule a versionless `GET /ConceptMap?url=…`
+lists first — also when no `url` is given and every loaded map is consulted.
+`ConceptMap/{id}/$translate` uses the version that id names.
+
 ### Create a CodeSystem
 
 ```bash

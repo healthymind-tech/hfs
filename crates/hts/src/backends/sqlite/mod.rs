@@ -555,6 +555,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_concept_maps_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy concept_maps.url UNIQUE: {e}"
+                ))
+            })?;
             schema::migrate_bootstrap_imports_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!(
                     "Failed to apply bootstrap_imports column migration: {e}"
@@ -777,6 +782,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_concept_maps_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy concept_maps.url UNIQUE: {e}"
+                ))
+            })?;
             // See the on-disk path: must follow the drop_url_unique rebuilds.
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
@@ -888,6 +898,7 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
         let table = match resource_type {
             "CodeSystem" => Some("code_systems"),
             "ValueSet" => Some("value_sets"),
+            "ConceptMap" => Some("concept_maps"),
             _ => None,
         };
         if let Some(table) = table
@@ -950,17 +961,7 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
         let table = match resource_type {
             "CodeSystem" => "code_systems",
             "ValueSet" => "value_sets",
-            "ConceptMap" => {
-                let raw: Option<String> = conn
-                    .query_row(
-                        "SELECT resource_json FROM concept_maps WHERE id = ?1",
-                        [id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .ok()
-                    .flatten();
-                return raw.and_then(|s| serde_json::from_str(&s).ok());
-            }
+            "ConceptMap" => "concept_maps",
             _ => return None,
         };
         // The row reporting `id`, a storage id (best version by precedence),

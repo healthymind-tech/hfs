@@ -738,26 +738,95 @@ fn write_concept_map(
     let resource_json = serde_json::to_string(&cm.resource_json).ok();
     let now = utc_now();
 
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO concept_maps
-         (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-    )
-    .and_then(|mut s| {
-        s.execute(rusqlite::params![
-            cm.id,
-            cm.url,
-            cm.version,
-            cm.name,
-            cm.title,
-            cm.source_uri,
-            cm.target_uri,
-            cm.status,
-            resource_json,
-            now
-        ])
-    })
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // One row per (url, version), like CodeSystems and ValueSets: a new
+    // version is stored next to the old ones (before, `INSERT OR REPLACE`
+    // keyed on the unique url replaced whatever version was there, so the
+    // last import won); a re-import of the same version replaces its row.
+    // Storage id: the FHIR id when free, else `<id>|<version>`, else a UUID.
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM concept_maps \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cm.url, cm.version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let previous_declared = existing
+        .as_deref()
+        .and_then(|sid| crate::backends::sqlite::fhir_ids::declared_of(conn, "concept_maps", sid));
+    // The same (url, version) re-imported under another id moves to that id:
+    // the old row (and its elements) goes, so the old id stops resolving.
+    let existing = match existing {
+        Some(sid) if previous_declared.as_deref() != Some(cm.id.as_str()) => {
+            conn.execute("DELETE FROM concept_maps WHERE id = ?1", [&sid])
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            None
+        }
+        other => other,
+    };
+    let taken = |id: &str| -> Result<bool, HtsError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE id = ?1)",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))
+    };
+    let storage_id = match existing {
+        Some(id) => {
+            conn.execute("DELETE FROM concept_map_elements WHERE map_id = ?1", [&id])
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            conn.execute(
+                "UPDATE concept_maps SET name = ?2, title = ?3, source_uri = ?4, \
+                 target_uri = ?5, status = ?6, resource_json = ?7, version_sort = ?8 \
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    cm.name,
+                    cm.title,
+                    cm.source_uri,
+                    cm.target_uri,
+                    cm.status,
+                    resource_json,
+                    version_sort_key(cm.version.as_deref()),
+                ],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            id
+        }
+        None => {
+            let versioned = storage_id_for(&cm.id, cm.version.as_deref());
+            let id = if !taken(&cm.id)? {
+                cm.id.clone()
+            } else if !taken(&versioned)? {
+                versioned
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            conn.execute(
+                "INSERT INTO concept_maps
+                 (id, url, version, name, title, source_uri, target_uri, status, resource_json,
+                  created_at, version_sort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    id,
+                    cm.url,
+                    cm.version,
+                    cm.name,
+                    cm.title,
+                    cm.source_uri,
+                    cm.target_uri,
+                    cm.status,
+                    resource_json,
+                    now,
+                    version_sort_key(cm.version.as_deref()),
+                ],
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            id
+        }
+    };
 
     const INSERT_ELEMENT_SQL: &str = "INSERT OR IGNORE INTO concept_map_elements
          (map_id, source_system, source_code, target_system, target_code, equivalence)
@@ -766,7 +835,7 @@ fn write_concept_map(
         conn.prepare_cached(INSERT_ELEMENT_SQL)
             .and_then(|mut s| {
                 s.execute(rusqlite::params![
-                    cm.id,
+                    storage_id,
                     el.source_system,
                     el.source_code,
                     el.target_system,
@@ -776,6 +845,10 @@ fn write_concept_map(
             })
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
     }
+
+    let mut groups = vec![cm.id.clone()];
+    groups.extend(previous_declared);
+    crate::backends::sqlite::fhir_ids::reassign(conn, "concept_maps", &groups)?;
 
     stats.concept_maps += 1;
     Ok(())
@@ -963,6 +1036,15 @@ fn reported_row(
 /// Delete a ConceptMap and all its element rows by FHIR resource `id`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsError> {
+    // The row reporting `id` (one version), as for CodeSystems.
+    if let Some((sid, declared)) = reported_row(conn, "concept_maps", id)? {
+        conn.execute("DELETE FROM concept_maps WHERE id = ?1", [&sid])
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        if let Some(declared) = declared {
+            crate::backends::sqlite::fhir_ids::reassign(conn, "concept_maps", &[declared])?;
+        }
+        return Ok(());
+    }
     conn.execute(
         "DELETE FROM concept_maps WHERE id = ?1",
         rusqlite::params![id],
