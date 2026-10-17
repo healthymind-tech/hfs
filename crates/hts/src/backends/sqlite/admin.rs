@@ -637,6 +637,18 @@ impl TerminologyAdmin for SqliteTerminologyBackend {
                 )
                 .map_err(storage)?;
             }
+            // The pin decides the default version, which reports the plain id.
+            let declared: Vec<String> = tx
+                .prepare(
+                    "SELECT DISTINCT declared_id FROM code_systems \
+                     WHERE url = ?1 AND declared_id IS NOT NULL",
+                )
+                .and_then(|mut s| {
+                    s.query_map([&url], |r| r.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(storage)?;
+            super::fhir_ids::reassign(&tx, "code_systems", &declared)?;
             tx.commit().map_err(storage)
         })
         .await?;

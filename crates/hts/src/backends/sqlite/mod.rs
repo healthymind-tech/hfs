@@ -16,6 +16,7 @@ pub mod schema;
 
 mod code_system;
 mod concept_map;
+pub(crate) mod fhir_ids;
 mod value_set;
 
 pub(crate) use code_system::invalidate_cs_language_cache;
@@ -119,7 +120,15 @@ fn search_resources_in_transaction(
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let rows = with_fhir_ids(conn, table, rows, &search)?;
     let selected = filter_rows(rows, &query, &search);
+    let has_fhir_id = fhir_ids::TABLES.contains(&table);
+    let reported = if has_fhir_id {
+        let ids: Vec<&str> = selected.iter().map(|row| row.id.as_str()).collect();
+        fhir_ids::reported_ids(conn, table, &ids)?
+    } else {
+        HashMap::new()
+    };
 
     let use_synthetic = synthetic_summary && query.summary.as_deref() == Some("true");
     let mut stored_resources = HashMap::<String, Option<String>>::new();
@@ -151,7 +160,7 @@ fn search_resources_in_transaction(
 
     let mut results = Vec::with_capacity(selected.len());
     for row in selected {
-        let resource = stored_resources
+        let mut resource = stored_resources
             .remove(&row.id)
             .flatten()
             .and_then(|json| serde_json::from_str(&json).ok())
@@ -166,9 +175,28 @@ fn search_resources_in_transaction(
                     &row.status,
                 )
             });
+        if let Some(id) = reported.get(&row.id) {
+            crate::resource_ids::apply_id(&mut resource, id);
+        }
         results.push(resource);
     }
     Ok(results)
+}
+
+/// Fill [`ResourceSearchRow::fhir_id`] when the search filters on `_id`.
+fn with_fhir_ids(
+    conn: &rusqlite::Connection,
+    table: &str,
+    mut rows: Vec<ResourceSearchRow>,
+    search: &ResourceStringSearch,
+) -> Result<Vec<ResourceSearchRow>, HtsError> {
+    if search.needs_fhir_id() && fhir_ids::TABLES.contains(&table) {
+        let mut all = fhir_ids::all_fhir_ids(conn, table)?;
+        for row in &mut rows {
+            row.fhir_id = all.remove(&row.id).flatten();
+        }
+    }
+    Ok(rows)
 }
 
 /// Count the resources in `table` matching `query`, ignoring `_count` and
@@ -208,15 +236,11 @@ fn count_resources(
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
         .query_map(params, search_row)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
-    let mut count = 0;
-    for row in rows {
-        let row = row.map_err(|error| HtsError::StorageError(error.to_string()))?;
-        if search.matches_row(&row) {
-            count += 1;
-        }
-    }
-    Ok(count)
+    let rows = with_fhir_ids(conn, table, rows, &search)?;
+    Ok(rows.iter().filter(|row| search.matches_row(row)).count() as u64)
 }
 
 /// Map a row of [`crate::string_search::metadata_select_list`].
@@ -232,6 +256,7 @@ fn search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceSearchRow> {
         supplements: row.get(7)?,
         publisher: row.get(8)?,
         updated_at: row.get(9)?,
+        fhir_id: row.get(10)?,
     })
 }
 
@@ -551,6 +576,13 @@ impl SqliteTerminologyBackend {
             schema::migrate_search_param_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
             })?;
+            // Unique reported ids across versions (see `crate::resource_ids`):
+            // add the columns, then repair rows written without them —
+            // including databases where versions still share one id.
+            fhir_ids::migrate_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply fhir_id migration: {e}"))
+            })?;
+            fhir_ids::repair(&conn)?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
@@ -759,6 +791,13 @@ impl SqliteTerminologyBackend {
             schema::migrate_search_param_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
             })?;
+            // Unique reported ids across versions (see `crate::resource_ids`):
+            // add the columns, then repair rows written without them —
+            // including databases where versions still share one id.
+            fhir_ids::migrate_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply fhir_id migration: {e}"))
+            })?;
+            fhir_ids::repair(&conn)?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
@@ -844,6 +883,18 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
     /// Returns `None` when the ID is unknown.
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
         let conn = self.pool.get().ok()?;
+        // The row reporting `id` (unique per stored version), else the
+        // legacy storage-id / declared-id matching below.
+        let table = match resource_type {
+            "CodeSystem" => Some("code_systems"),
+            "ValueSet" => Some("value_sets"),
+            _ => None,
+        };
+        if let Some(table) = table
+            && let Some((sid, _)) = fhir_ids::resolve(&conn, table, id)
+        {
+            return fhir_ids::instance_canonical(&conn, table, &sid);
+        }
         match resource_type {
             "CodeSystem" => {
                 if let Ok(url) = conn.query_row(
@@ -896,39 +947,39 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
 
     fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
         let conn = self.pool.get().ok()?;
-        let (table, order_by) = match resource_type {
-            "CodeSystem" => (
-                "code_systems",
-                crate::backends::cs_precedence_order_by("code_systems"),
-            ),
-            "ValueSet" => (
-                "value_sets",
-                crate::backends::vs_precedence_order_by("value_sets"),
-            ),
-            "ConceptMap" => (
-                "concept_maps",
-                std::borrow::Cow::Borrowed("created_at DESC"),
-            ),
+        let table = match resource_type {
+            "CodeSystem" => "code_systems",
+            "ValueSet" => "value_sets",
+            "ConceptMap" => {
+                let raw: Option<String> = conn
+                    .query_row(
+                        "SELECT resource_json FROM concept_maps WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                return raw.and_then(|s| serde_json::from_str(&s).ok());
+            }
             _ => return None,
         };
-        // Exact storage id first, then the synthetic `<id>|<version>` storage
-        // ids. Both are served by the primary key (the `|` prefix is expressed
-        // as a range so SQLite can use the index; `}` is the next ASCII
-        // character after `|`). Deliberately no `json_extract(resource_json,
-        // '$.id')` fallback: that is a full scan of every stored resource
-        // (~2.3 s over 21k ValueSets) on every miss, i.e. on every 404.
-        let sql = format!(
-            "SELECT resource_json FROM {table} \
-             WHERE id = ?1 OR (id >= ?1 || '|' AND id < ?1 || '}}') \
-             ORDER BY (id = ?1) DESC, {order_by} LIMIT 1"
-        );
+        // The row reporting `id`, a storage id (best version by precedence),
+        // or `<declared>-<version>` — all index lookups. Deliberately no
+        // unindexed `json_extract(resource_json, '$.id')` scan: that is a full
+        // scan of every stored resource (~2.3 s over 21k ValueSets) on every
+        // miss, i.e. on every 404.
+        let (sid, reported) = fhir_ids::resolve(&conn, table, id)?;
         let raw: Option<String> = conn
-            .query_row(&sql, rusqlite::params![id], |row| {
-                row.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                &format!("SELECT resource_json FROM {table} WHERE id = ?1"),
+                [&sid],
+                |row| row.get::<_, Option<String>>(0),
+            )
             .ok()
             .flatten();
-        raw.and_then(|s| serde_json::from_str(&s).ok())
+        let mut resource: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+        crate::resource_ids::apply_id(&mut resource, &reported);
+        Some(resource)
     }
 }
 

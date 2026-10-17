@@ -1224,18 +1224,22 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         },
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+                let reported = super::fhir_ids::reported_ids(&conn, "code_systems", &ids)?;
                 let mut results = Vec::new();
-                for row in rows {
-                    let (id, url, version, name, title, status) =
-                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for (id, url, version, name, title, status) in &rows {
+                    let id = reported.get(id).unwrap_or(id);
                     results.push(build_synthetic_resource(
                         "CodeSystem",
-                        &id,
-                        &url,
+                        id,
+                        url,
                         version.as_deref(),
                         name.as_deref(),
                         title.as_deref(),
-                        &status,
+                        status,
                     ));
                 }
                 return Ok(results);
@@ -1243,7 +1247,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             let mut stmt = conn
                 .prepare_cached(&format!(
-                    "SELECT id, url, version, name, title, status, resource_json
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM code_systems
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
@@ -1275,6 +1279,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -1282,10 +1287,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         build_synthetic_resource(
@@ -1298,6 +1303,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)

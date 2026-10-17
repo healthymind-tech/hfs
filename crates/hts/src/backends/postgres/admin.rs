@@ -449,6 +449,19 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .await
             .map_err(pg)?;
         }
+        // The pin decides the default version, which reports the plain id.
+        let declared: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT resource_json->>'id' FROM code_systems \
+                 WHERE url = $1 AND resource_json->>'id' IS NOT NULL",
+                &[&url],
+            )
+            .await
+            .map_err(pg)?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        super::fhir_ids::reassign(&*tx, "code_systems", &declared).await?;
         tx.commit().await.map_err(pg)?;
         self.invalidate_caches();
         Ok(())

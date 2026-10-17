@@ -51,6 +51,11 @@ CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
 -- (`resource_json->>'id'`), since multi-version rows carry synthetic ids.
 CREATE INDEX IF NOT EXISTS idx_code_systems_json_id ON code_systems ((resource_json->>'id'));
 CREATE INDEX IF NOT EXISTS idx_code_systems_id_base ON code_systems (split_part(id, '|', 1));
+-- Reported FHIR id, unique per stored version (see `crate::resource_ids`):
+-- versions sharing a declared id report `<id>` (the default version) and
+-- `<id>-<version>`. Maintained on write, repaired at startup.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_code_systems_fhir_id ON code_systems (fhir_id);
 -- A ValueSet URL that names no stored ValueSet is tried as a CodeSystem's
 -- `valueSet` (its implicit all-codes ValueSet): an index probe instead of
 -- reading every CodeSystem's JSON.
@@ -157,6 +162,9 @@ CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
 -- FHIR-id resolution of versioned rows (`<id>|<version>` storage ids).
 CREATE INDEX IF NOT EXISTS idx_value_sets_json_id ON value_sets ((resource_json->>'id'));
 CREATE INDEX IF NOT EXISTS idx_value_sets_id_base ON value_sets (split_part(id, '|', 1));
+-- See code_systems.fhir_id.
+ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_value_sets_fhir_id ON value_sets (fhir_id);
 
 -- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
 -- code_systems above had it removed: tx-ecosystem ships per-version VS

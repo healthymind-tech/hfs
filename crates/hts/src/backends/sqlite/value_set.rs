@@ -2242,18 +2242,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         },
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+                let reported = super::fhir_ids::reported_ids(&conn, "value_sets", &ids)?;
                 let mut results = Vec::new();
-                for row in rows {
-                    let (id, url, version, name, title, status) =
-                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for (id, url, version, name, title, status) in &rows {
+                    let id = reported.get(id).unwrap_or(id);
                     results.push(super::code_system::build_synthetic_resource(
                         "ValueSet",
-                        &id,
-                        &url,
+                        id,
+                        url,
                         version.as_deref(),
                         name.as_deref(),
                         title.as_deref(),
-                        &status,
+                        status,
                     ));
                 }
                 return Ok(results);
@@ -2261,7 +2265,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut stmt = conn
                 .prepare_cached(&format!(
-                    "SELECT id, url, version, name, title, status, resource_json
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
@@ -2293,6 +2297,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -2300,10 +2305,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -2316,6 +2321,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)

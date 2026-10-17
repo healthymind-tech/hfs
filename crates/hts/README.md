@@ -502,6 +502,26 @@ Every normalized table (CodeSystems, ValueSets, ConceptMaps, concepts, propertie
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 
+**Logical ids of multi-version resources.** Packages and importers reuse one
+id for every version of a resource (LOINC 2.80 and 2.83 are both `loinc`;
+LOINC answer-list ValueSets keep their `LL…` id across releases). HTS stores
+every version and gives each one its own logical id: the **default version**
+(the one a versionless request resolves to) reports the declared id, every
+other version reports `<id>-<version>`:
+
+| Stored | Reported id |
+|--------|-------------|
+| `http://loinc.org` 2.83 (default) | `loinc` |
+| `http://loinc.org` 2.80 | `loinc-2.80` |
+
+`GET /CodeSystem/loinc` therefore reads the default version, and every version
+is addressable by a unique id (`<id>-<version>` also reads the default
+version, so the versioned form is a stable address). When a newer version
+becomes the default, the plain id moves to it. `DELETE` and `_id` name exactly
+one version. A resource with a single stored version keeps its id unchanged.
+Databases written by older releases, where versions still share one id, are
+repaired at startup (only the reported ids change; concepts are untouched).
+
 ### Utility
 
 | Operation | Method | URL |
