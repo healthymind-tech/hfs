@@ -107,10 +107,7 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
             let offset = i64::from(query.offset.unwrap_or(0));
 
             // A versionless URL search lists the default version first.
-            let order_by = crate::backends::search_order_by(
-                "concept_maps",
-                query.url.is_some() && query.version.is_none(),
-            );
+            let order_by = crate::backends::search_order_by("concept_maps", &query);
             let mut stmt = conn
                 .prepare_cached(&format!(
                     "SELECT id, url, version, name, title, status, resource_json, fhir_id

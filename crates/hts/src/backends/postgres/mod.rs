@@ -299,8 +299,7 @@ async fn search_table(
                 && query.name.is_none()
                 && query.title.is_none()
                 && query.status.is_none());
-    let order_by =
-        crate::backends::search_order_by(table, query.url.is_some() && query.version.is_none());
+    let order_by = crate::backends::search_order_by(table, &query);
     let has_fhir_id = fhir_ids::TABLES.contains(&table);
     let sql = format!(
         "SELECT id, url, version, name, title, status, {fhir_id}{json}
@@ -419,8 +418,9 @@ where
          WHERE ($1::text IS NULL OR url = $1)
            AND ($2::text IS NULL OR version = $2)
            AND ($3::text IS NULL OR status = $3)
-         ORDER BY created_at",
-        columns = crate::string_search::metadata_select_list(table, &search, true)
+         ORDER BY {order_by}",
+        columns = crate::string_search::metadata_select_list(table, &search, true),
+        order_by = crate::backends::search_order_by(table, &query)
     );
     let rows = client
         .query(&metadata_sql, &[&query.url, &query.version, &query.status])

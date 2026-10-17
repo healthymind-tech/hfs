@@ -102,8 +102,9 @@ fn search_resources_in_transaction(
          WHERE (?1 IS NULL OR url = ?1)
            AND (?2 IS NULL OR version = ?2)
            AND (?3 IS NULL OR status = ?3)
-         ORDER BY created_at",
-        columns = crate::string_search::metadata_select_list(table, &search, false)
+         ORDER BY {order_by}",
+        columns = crate::string_search::metadata_select_list(table, &search, false),
+        order_by = crate::backends::search_order_by(table, &query)
     );
     let mut statement = conn
         .prepare(&metadata_sql)

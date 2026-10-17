@@ -2192,10 +2192,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
-            let order_by = crate::backends::search_order_by(
-                "value_sets",
-                query.url.is_some() && query.version.is_none(),
-            );
+            let order_by = crate::backends::search_order_by("value_sets", &query);
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_value_sets_meta serves this query without touching the main table.

@@ -107,22 +107,31 @@ static CS_ORDER_BY_CODE_SYSTEMS: LazyLock<String> =
 static CS_ORDER_BY_S: LazyLock<String> = LazyLock::new(|| build_cs_precedence_order_by("s"));
 
 /// `ORDER BY` for a resource search (`GET /CodeSystem?url=…`, and every
-/// operation that resolves "the" CodeSystem or ValueSet for a URL with
-/// `search(url, count: 1)`).
+/// operation that resolves "the" CodeSystem, ValueSet or ConceptMap for a URL
+/// with `search(url, count: 1)`).
 ///
-/// A search narrowed to one canonical URL without a version lists the rows in
-/// [`cs_precedence_order_by`] / [`vs_precedence_order_by`] order, so its first
-/// hit is the row every other versionless resolver picks. Before, it listed them by `created_at`: with
+/// A search restricted to one canonical URL without a version — `url`, or
+/// CodeSystem `system` (its alias), whatever other parameters (`name`,
+/// `title`, `status`, `_id`, …) narrow it further — lists the rows in
+/// [`cs_precedence_order_by`] / [`vs_precedence_order_by`] /
+/// [`cm_precedence_order_by`] order, so its first hit is the row every other
+/// versionless resolver picks. Before, it listed them by `created_at`: with
 /// the THO `v3-loinc` stub (`content=not-present`, version `3.1.0`) imported
 /// before the real LOINC 2.83, `$expand` expanded 2.83 but reported
 /// `used-codesystem = http://loinc.org|3.1.0` from the stub. Other searches
-/// keep insertion order.
-pub(crate) fn search_order_by(table: &str, url_without_version: bool) -> Cow<'static, str> {
-    match (table, url_without_version) {
+/// span several canonicals and keep insertion order. Both orders are total
+/// (they end in a unique column), so paging stays stable.
+pub(crate) fn search_order_by(
+    table: &str,
+    query: &crate::types::ResourceSearchQuery,
+) -> Cow<'static, str> {
+    let single_canonical =
+        (query.url.is_some() || query.system.is_some()) && query.version.is_none();
+    match (table, single_canonical) {
         ("code_systems", true) => cs_precedence_order_by("code_systems"),
         ("value_sets", true) => vs_precedence_order_by("value_sets"),
         ("concept_maps", true) => cm_precedence_order_by("concept_maps"),
-        _ => Cow::Borrowed("created_at"),
+        _ => Cow::Borrowed("created_at, id"),
     }
 }
 
