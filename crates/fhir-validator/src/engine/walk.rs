@@ -1386,7 +1386,7 @@ fn validate_known_extension<'a>(
         }
         Some(_) => validate_node(ctx, elset, item),
         None => {
-            if modifier && !(url.contains("example.org") || url.contains("acme.com")) {
+            if modifier {
                 ctx.error(
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
@@ -2640,7 +2640,7 @@ mod tests {
         assert_eq!(hl7[0].severity, Severity::Warning);
         assert_eq!(hl7[0].path, "Patient.extension.0");
         let modifier = errors(json!({"resourceType": "Patient",
-            "modifierExtension": [{"url": "http://unknown.test/x", "valueBoolean": true}]}));
+            "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
     }
