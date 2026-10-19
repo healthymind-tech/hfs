@@ -344,7 +344,8 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
         }
     }
 
-    // fullUrl vs type/id.
+    // fullUrl vs type/id: an http(s) fullUrl ending in `/{Type}/{id}`
+    // is a RESTful URL and must name the entry's own type and id.
     for (index, entry) in &indexed {
         let (Some(full_url), Some(ty), Some(id)) =
             (entry.full_url, entry.resource_type(), entry.id())
@@ -355,8 +356,15 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
             continue;
         }
         let url = strip_history(full_url.split(['?', '#']).next().unwrap_or(full_url));
-        let marker = format!("/{ty}/");
-        if url.contains(&marker) && !url.ends_with(&format!("/{ty}/{id}")) {
+        let mut tail = url.rsplit('/');
+        let (url_id, url_type) = (
+            tail.next().unwrap_or_default(),
+            tail.next().unwrap_or_default(),
+        );
+        let restful = url_type.starts_with(|c: char| c.is_ascii_uppercase())
+            && url_type.chars().all(|c| c.is_ascii_alphabetic())
+            && !url_id.is_empty();
+        if restful && (url_type != ty || url_id != id) {
             out.push(error(
                 ErrorKind::BundleEntryMismatch,
                 format!("Bundle.entry.{index}"),
@@ -656,6 +664,18 @@ mod tests {
                 "This is not a matching resource type for the specified search (OperationOutcome expecting [Observation, DocumentReference])",
             ]
         );
+    }
+
+    #[test]
+    fn restful_fullurls_must_name_the_entry() {
+        let b = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": "http://acme.com/Patient/pat1",
+             "resource": {"resourceType": "DocumentManifest", "id": "pat1"}},
+            {"fullUrl": "http://acme.com/fhir/DocumentManifest/m",
+             "resource": {"resourceType": "DocumentManifest", "id": "m"}}]});
+        let got: Vec<String> = bundle_rules(&b).into_iter().map(|e| e.message).collect();
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert!(got[0].contains("must end with the correct type and id (/DocumentManifest/pat1)"));
     }
 
     #[test]
