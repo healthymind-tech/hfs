@@ -1438,3 +1438,24 @@ async fn extension_value_of_a_disallowed_type() {
         "{issues:#?}"
     );
 }
+
+/// `inv-checks#profile`: a profile labelled `specialization` of its own
+/// base type is still a profile.
+#[tokio::test]
+async fn specialization_of_the_same_type_is_a_profile() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/named",
+        "name": "Named", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Patient", "derivation": "specialization",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient.name", "path": "Patient.name", "min": 1}]}
+    });
+    let issues = validate_with(
+        &json!({"resourceType": "Patient"}),
+        &[sd],
+        &["http://example.org/StructureDefinition/named"],
+    )
+    .await;
+    assert_eq!(errors(&issues).len(), 1, "{issues:#?}");
+}

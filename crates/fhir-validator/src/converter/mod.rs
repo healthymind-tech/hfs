@@ -259,8 +259,24 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     let name = get_str("name");
     let sd_type = get_str("type").ok_or(ConvertError::Missing("type"))?;
     let kind_raw = get_str("kind").ok_or(ConvertError::Missing("kind"))?;
-    let derivation = get_str("derivation");
     let base = get_str("baseDefinition");
+    // A "specialization" of a type on that same type's own definition
+    // defines no new type: it is a profile mislabelled (as the HL7
+    // validator treats it).
+    let derivation = match get_str("derivation") {
+        Some(d)
+            if d == "specialization"
+                && base.as_deref().is_some_and(|b| {
+                    b.split('|').next()
+                        == Some(
+                            format!("http://hl7.org/fhir/StructureDefinition/{sd_type}").as_str(),
+                        )
+                }) =>
+        {
+            Some("constraint".to_string())
+        }
+        other => other,
+    };
 
     let element_values = sd
         .get("snapshot")
