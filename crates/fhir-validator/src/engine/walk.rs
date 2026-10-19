@@ -1586,8 +1586,9 @@ fn with_type_profiles<'a>(
             ),
         );
         // and, as the HL7 validator lists them, why each candidate failed
-        // The same failure from several candidates is listed once.
-        let mut listed: HashSet<(String, String)> = HashSet::new();
+        // The same invariant failure from several candidates is listed once
+        // (other failures name their own profile, so stay per candidate).
+        let mut listed: HashSet<(String, String, Option<String>)> = HashSet::new();
         for (url, _) in &resolved {
             let mut failures: Vec<ValidationError> = ctx
                 .nested_outcome(value, url)
@@ -1600,8 +1601,10 @@ fn with_type_profiles<'a>(
                 .collect();
             failures.extend(invariant_failures(ctx, url));
             for e in failures {
+                let origin = (e.kind != ErrorKind::FhirpathConstraint)
+                    .then(|| e.source.clone().unwrap_or_else(|| url.clone()));
                 if e.severity != Severity::Error
-                    || !listed.insert((e.path.clone(), e.message.clone()))
+                    || !listed.insert((e.path.clone(), e.message.clone(), origin))
                 {
                     continue;
                 }

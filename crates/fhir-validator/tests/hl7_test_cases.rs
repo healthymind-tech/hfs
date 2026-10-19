@@ -1910,3 +1910,37 @@ async fn candidate_invariants_decide_type_profiles() {
         "{issues:#?}"
     );
 }
+
+/// `no/Person-test-bad#profile`: the same cardinality failure under two
+/// candidate type profiles is listed for each.
+#[tokio::test]
+async fn candidate_failures_are_listed_per_profile() {
+    let address_profile = |n: &str| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{n}"),
+            "name": n, "status": "active", "kind": "complex-type", "abstract": false,
+            "type": "Address", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Address",
+            "differential": {"element": [{"id": "Address.city", "path": "Address.city", "max": "0"}]}
+        })
+    };
+    let person_profile = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/person",
+        "name": "P", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Person", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Person",
+        "differential": {"element": [{"id": "Person.address", "path": "Person.address",
+            "type": [{"code": "Address", "profile": ["http://example.org/StructureDefinition/a1",
+                                                      "http://example.org/StructureDefinition/a2"]}]}]}
+    });
+    let person = json!({"resourceType": "Person", "address": [{"city": "Oslo"}]});
+    let issues = validate_with(
+        &person,
+        &[address_profile("a1"), address_profile("a2"), person_profile],
+        &["http://example.org/StructureDefinition/person"],
+    )
+    .await;
+    assert_eq!(errors(&issues).len(), 3, "{issues:#?}");
+}
