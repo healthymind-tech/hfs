@@ -371,7 +371,8 @@ fn structural_errors(resource: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `patient-hs-1`, `empty-array`: JSON-representation rules.
+/// `patient-hs-1`, `patient-id-extensions`, `empty-array`,
+/// `contained-resource-duplicate`: JSON-representation rules.
 #[test]
 fn json_representation_rules() {
     // A primitive array position with neither value nor sidecar.
@@ -384,8 +385,24 @@ fn json_representation_rules() {
         "name": [{"given": ["a", null], "_given": [null, {"id": "b"}]}]}));
     assert!(errs.is_empty(), "{errs:#?}");
 
+    // Resource.id carries no extensions.
+    let errs = structural_errors(&json!({"resourceType": "Patient", "id": "p",
+        "_id": {"extension": [{"url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+                               "valueCode": "masked"}]}}));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert_eq!(errs[0].0, "Patient.id");
+
     // Empty arrays.
     let errs = structural_errors(&json!({"resourceType": "Patient", "name": []}));
     assert_eq!(errs.len(), 1, "{errs:#?}");
     assert!(errs[0].1.starts_with("Array cannot be empty"), "{errs:#?}");
+
+    // Contained ids are unique within the resource.
+    let errs = structural_errors(&json!({"resourceType": "Condition",
+        "subject": {"reference": "Patient/p"},
+        "recorder": {"reference": "#23"}, "asserter": {"reference": "#23"},
+        "contained": [{"resourceType": "Practitioner", "id": "23"},
+                      {"resourceType": "Practitioner", "id": "23"}]}));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert_eq!(errs[0].0, "Condition.contained.1");
 }

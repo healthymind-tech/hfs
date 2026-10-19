@@ -1791,9 +1791,10 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
         // An HL7-namespace code system nobody defines, a narrative link to
         // nothing, a best-practice recommendation: invalid content.
-        ErrorKind::UnknownCodeSystem | ErrorKind::Narrative | ErrorKind::BestPractice => {
-            IssueType::Invalid
-        }
+        ErrorKind::UnknownCodeSystem
+        | ErrorKind::Narrative
+        | ErrorKind::BestPractice
+        | ErrorKind::DuplicateId => IssueType::Invalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.

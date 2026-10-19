@@ -92,6 +92,8 @@ pub enum ErrorKind {
     /// Best-practice recommendations the HL7 validator warns about by
     /// default (e.g. an Observation without a performer).
     BestPractice,
+    /// Two contained resources of one resource share an id.
+    DuplicateId,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the

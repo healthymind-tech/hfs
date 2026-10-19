@@ -615,6 +615,7 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
             ctx.bundles.push(Rc::new(entries.collect()));
         }
         check_resource_id(ctx, set, obj);
+        check_resource_level_rules(ctx, obj);
     }
 
     // Choice branches seen on this node, keyed by choice group, in first-
@@ -687,6 +688,48 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
+/// Rules on a resource object the element schemas cannot express (HL7
+/// validator): `Resource.id` carries no extensions, and contained
+/// resources have distinct ids.
+fn check_resource_level_rules(ctx: &mut WalkCtx<'_>, obj: &serde_json::Map<String, Value>) {
+    if let Some(urls) = obj
+        .get("_id")
+        .and_then(|s| s.get("extension"))
+        .and_then(Value::as_array)
+    {
+        let urls: Vec<&str> = urls
+            .iter()
+            .filter_map(|e| e.get("url").and_then(Value::as_str))
+            .collect();
+        ctx.path.push_key("id");
+        ctx.error(
+            ErrorKind::Excluded,
+            format!(
+                "Extensions are not allowed on Resource.id ('{}')",
+                urls.join("', '")
+            ),
+        );
+        ctx.path.pop();
+    }
+    if let Some(contained) = obj.get("contained").and_then(Value::as_array) {
+        let mut seen = HashSet::new();
+        for (index, item) in contained.iter().enumerate() {
+            if let Some(id) = item.get("id").and_then(Value::as_str)
+                && !seen.insert(id)
+            {
+                ctx.path.push_key("contained");
+                ctx.path.push_index(index);
+                ctx.error(
+                    ErrorKind::DuplicateId,
+                    format!("Duplicate ID for contained resource: {id}"),
+                );
+                ctx.path.pop();
+                ctx.path.pop();
+            }
+        }
+    }
+}
+
 fn contained_types(resource: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     resource
         .get("contained")
