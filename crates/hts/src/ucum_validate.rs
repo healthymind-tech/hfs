@@ -30,9 +30,78 @@ pub fn is_valid_ucum_code(code: &str) -> bool {
         return true;
     }
     match strip_annotations(code) {
-        Some(stripped) if stripped != code => validate_ucum_expression(&stripped).is_ok(),
+        Some(stripped) => {
+            (stripped != code && validate_ucum_expression(&stripped).is_ok())
+                || validate_ucum_expression(&positive_exponents(&stripped)).is_ok()
+        }
         _ => false,
     }
+}
+
+/// `expr` (without annotations) with every negative exponent written as a
+/// division instead: `s-1` → `/s`, `kg.m-2` → `kg/m2`, `kg/m-2` → `kg.m2`.
+/// UCUM allows negative exponents (§7.4), the expression parser does not;
+/// UCUM's `/` applies to the next term only, so the rewrite keeps the value.
+pub fn positive_exponents(expr: &str) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::with_capacity(expr.len() + 4);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if matches!(c, '.' | '/' | '(' | ')') {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // One term: up to the next operator, keeping `[...]` atoms whole.
+        let start = i;
+        let mut depth = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                '.' | '/' | '(' | ')' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        let term: String = chars[start..i].iter().collect();
+        let negative = term
+            .rfind('-')
+            .filter(|&k| {
+                k > 0
+                    && k + 1 < term.len()
+                    && term[k + 1..].bytes().all(|b| b.is_ascii_digit())
+                    && !term[..k].ends_with('*')
+                    && !term[..k].ends_with('^')
+            })
+            .map(|k| {
+                let exponent = &term[k + 1..];
+                if exponent == "1" {
+                    term[..k].to_string()
+                } else {
+                    format!("{}{exponent}", &term[..k])
+                }
+            });
+        match negative {
+            Some(positive) => {
+                match out.chars().last() {
+                    Some('.') => {
+                        out.pop();
+                        out.push('/');
+                    }
+                    Some('/') => {
+                        out.pop();
+                        out.push('.');
+                    }
+                    _ => out.push('/'),
+                }
+                out.push_str(&positive);
+            }
+            None => out.push_str(&term),
+        }
+    }
+    out
 }
 
 /// `code` with every `{annotation}` replaced by `1` (stand-alone / after an
@@ -191,6 +260,18 @@ mod tests {
             );
         }
         assert!(whole_ucum_member(None, Some(UCUM_URL), "mg").is_none());
+    }
+
+    #[test]
+    fn negative_exponents_are_divisions() {
+        assert_eq!(positive_exponents("s-1"), "/s");
+        assert_eq!(positive_exponents("kg.m-2"), "kg/m2");
+        assert_eq!(positive_exponents("kg/m-2"), "kg.m2");
+        assert_eq!(positive_exponents("10*-3"), "10*-3");
+        assert_eq!(positive_exponents("mL/min/{1.73_m2}"), "mL/min/{1.73_m2}");
+        for code in ["s-1", "min-1", "m-2", "mmol-1", "kg.m-2"] {
+            assert!(is_valid_ucum_code(code), "{code}");
+        }
     }
 
     #[test]
