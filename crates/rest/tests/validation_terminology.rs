@@ -75,6 +75,36 @@ async fn search_value_sets(
     )
 }
 
+/// `CodeSystem/$validate-code`: `known` doubles as code system url → codes;
+/// an absent code is HTS's `invalid-code` answer.
+async fn validate_code_in_system(
+    State(state): State<MockHts>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // Not recorded: the request counts above are about value set checks.
+    let url = param(&body, "url")
+        .and_then(|p| p["valueUri"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let code = param(&body, "code")
+        .and_then(|p| p["valueCode"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let found = state
+        .known
+        .get(&url)
+        .is_some_and(|codes| codes.iter().any(|c| *c == code));
+    let mut parameter = vec![json!({ "name": "result", "valueBoolean": found })];
+    if !found {
+        parameter.push(json!({"name": "issues", "resource": {"resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "code-invalid",
+                "details": {"coding": [{"system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                                        "code": "invalid-code"}],
+                            "text": format!("Unknown code '{code}' in the CodeSystem '{url}'")}}]}}));
+    }
+    Json(json!({ "resourceType": "Parameters", "parameter": parameter }))
+}
+
 fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
     body["parameter"]
         .as_array()?
@@ -146,6 +176,10 @@ async fn start_mock(mut state: MockHts) -> (String, Arc<Mutex<Vec<Value>>>) {
             axum::routing::post(validate_code),
         )
         .route("/CodeSystem", axum::routing::get(search_code_systems))
+        .route(
+            "/CodeSystem/$validate-code",
+            axum::routing::post(validate_code_in_system),
+        )
         .route("/ValueSet", axum::routing::get(search_value_sets))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -615,4 +649,49 @@ async fn remote_checks_fall_back_to_single_requests() {
     assert!(matches!(verdicts[0], Ok(true)));
     assert!(matches!(verdicts[1], Ok(false)));
     assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+/// An unknown code is an error only when the server holds the code system
+/// completely: a fragment (or stub) proves nothing about a code it lacks.
+#[tokio::test]
+async fn unknown_codes_count_only_in_complete_code_systems() {
+    let complete = "http://example.org/CodeSystem/complete";
+    let fragment = "http://example.org/CodeSystem/fragment";
+    let (ts_url, _requests) = start_mock(MockHts {
+        known: Arc::new(HashMap::from([
+            (complete.to_string(), vec!["a".to_string()]),
+            (fragment.to_string(), vec!["a".to_string()]),
+        ])),
+        code_systems: Arc::new(HashMap::from([
+            (complete.to_string(), "complete".to_string()),
+            (fragment.to_string(), "fragment".to_string()),
+        ])),
+        ..MockHts::default()
+    })
+    .await;
+    let server = hfs(&ts_url, "remote", "open");
+    let unknown = |outcome: &Value| {
+        outcome["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| {
+                i["details"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("Unknown code"))
+            })
+            .count()
+    };
+    let obs = |system: &str, code: &str| {
+        json!({"resourceType": "Observation", "status": "final",
+               "code": {"coding": [{"system": system, "code": code}]}})
+    };
+    for (system, code, expected) in [(complete, "zz", 1), (complete, "a", 0), (fragment, "zz", 0)] {
+        let outcome: Value = server
+            .post("/Observation/$validate")
+            .json(&obs(system, code))
+            .await
+            .json();
+        assert_eq!(unknown(&outcome), expected, "{system}#{code}: {outcome:#}");
+    }
 }

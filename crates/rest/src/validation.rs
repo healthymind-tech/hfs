@@ -1137,9 +1137,10 @@ pub struct RemoteTerminologyProvider {
     /// [`UNKNOWN_VALUE_SET_TTL`] so one missing IG value set costs one
     /// round-trip per TTL instead of one per coded element.
     unknown_value_sets: DashMap<String, Instant>,
-    /// Code system url → whether the server has no content to check codes
-    /// against (absent, or only `content: not-present` stubs).
-    contentless_systems: DashMap<String, (bool, Instant)>,
+    /// Code system url → what the server holds for it: (no content to
+    /// check codes against — absent, or only `content: not-present` stubs;
+    /// a `complete` version).
+    contentless_systems: DashMap<String, ((bool, bool), Instant)>,
     /// ValueSet canonical → its `compose` (`Value::Null` when the server
     /// does not return one).
     value_set_composes: DashMap<String, (Value, Instant)>,
@@ -1216,6 +1217,21 @@ impl RemoteTerminologyProvider {
     /// `content: not-present` stub (or there is none). `None` when the server
     /// could not be asked — the caller then keeps the server's verdict.
     async fn system_has_no_content(&self, system: &str) -> Option<bool> {
+        self.system_content(system)
+            .await
+            .map(|(contentless, _)| contentless)
+    }
+
+    /// Whether the server holds a `content: complete` version of `system`:
+    /// only then does "unknown code" mean the code does not exist.
+    async fn system_is_complete(&self, system: &str) -> Option<bool> {
+        self.system_content(system)
+            .await
+            .map(|(_, complete)| complete)
+    }
+
+    /// `(contentless, complete)` for `system` (see `contentless_systems`).
+    async fn system_content(&self, system: &str) -> Option<(bool, bool)> {
         if let Some(entry) = self.contentless_systems.get(system)
             && entry.1.elapsed() < CACHE_TTL
         {
@@ -1246,12 +1262,22 @@ impl RemoteTerminologyProvider {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let content = |e: &Value| {
+            e.pointer("/resource/content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         let contentless = entries
             .iter()
-            .all(|e| e.pointer("/resource/content").and_then(Value::as_str) == Some("not-present"));
-        self.contentless_systems
-            .insert(system.to_string(), (contentless, Instant::now()));
-        Some(contentless)
+            .all(|e| content(e).as_deref() == Some("not-present"));
+        let complete = entries
+            .iter()
+            .any(|e| content(e).as_deref() == Some("complete"));
+        self.contentless_systems.insert(
+            system.to_string(),
+            ((contentless, complete), Instant::now()),
+        );
+        Some((contentless, complete))
     }
 
     /// The `compose` of `value_set` (`url|version` honoured when the server
@@ -1686,6 +1712,24 @@ impl RemoteTerminologyProvider {
         body: &Value,
         verdict: Result<TxVerdict, TerminologyError>,
     ) -> Result<TxVerdict, TerminologyError> {
+        if let (TxCheck::Coding(coding), Ok(v)) = (check, &verdict)
+            && v.unknown_code.is_some()
+        {
+            // "Unknown code" from a fragment, example or stub code system
+            // proves nothing about the code.
+            let system = coding
+                .get("system")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if self.system_is_complete(system).await != Some(true) {
+                let mut v = v.clone();
+                v.unknown_code = None;
+                self.cache
+                    .insert(Self::cache_key(check), (v.clone(), Instant::now()));
+                return Ok(v);
+            }
+            return verdict;
+        }
         let TxCheck::InValueSet(value_set, coded) = check else {
             return verdict;
         };
