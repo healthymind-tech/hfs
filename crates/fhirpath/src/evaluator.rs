@@ -6532,8 +6532,28 @@ fn call_function(
                         }
                     }
                 }
-                // Primitive types have no children
-                _ => EvaluationResult::Empty,
+                // A FHIR primitive's children are its `id` and `extension`
+                // (carried from the JSON `_field` sibling); a bare value has
+                // none. dom-3 finds `#id` canonicals inside such extensions
+                // through `descendants()`.
+                primitive => {
+                    let mut children = Vec::new();
+                    if let Some(element) = primitive.primitive_element() {
+                        if let Some(id) = &element.id {
+                            children.push(EvaluationResult::fhir_string(id.clone(), "id"));
+                        }
+                        children.extend(element.extension.iter().cloned());
+                    }
+                    if children.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        EvaluationResult::Collection {
+                            items: children,
+                            has_undefined_order: true,
+                            type_info: None,
+                        }
+                    }
+                }
             })
         }
         "descendants" => {
