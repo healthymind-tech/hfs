@@ -426,6 +426,13 @@ pub(crate) fn msg_no_code_required(value_set: &str) -> String {
     format!("No code provided, and a code is required from the value set '{value_set}'")
 }
 
+/// A Coding's code system is known, its stated version is not.
+pub(crate) fn msg_unknown_code_system_version(system: &str, version: &str) -> String {
+    format!(
+        "A definition for CodeSystem '{system}' version '{version}' could not be found, so the code cannot be validated"
+    )
+}
+
 pub(crate) fn msg_url_unresolved(url: &str) -> String {
     format!("No definition could be found for URL value '{url}'")
 }

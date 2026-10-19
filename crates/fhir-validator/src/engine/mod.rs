@@ -29,6 +29,7 @@ pub(crate) mod messages {
         msg_fhirpath_constraint as fhirpath_constraint,
         msg_terminology_binding as terminology_binding,
         msg_terminology_unavailable as terminology_unavailable,
+        msg_unknown_code_system_version as unknown_code_system_version,
         msg_url_unresolved as url_unresolved, msg_wrong_display as wrong_display,
     };
 }

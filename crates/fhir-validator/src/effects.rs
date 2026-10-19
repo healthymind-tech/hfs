@@ -628,7 +628,40 @@ async fn execute_terminology(
     let verdicts = provider.check(&requests).await;
     debug_assert_eq!(verdicts.len(), asked.len(), "provider must align verdicts");
 
-    for (asked, verdict) in asked.iter().zip(verdicts) {
+    // A versioned Coding whose system|version the service does not know:
+    // ask again without the version to tell an unknown version of a known
+    // code system (a warning, as the HL7 validator reports it) from a
+    // system nobody defines.
+    let versioned_unknown: Vec<(usize, Value)> = asked
+        .iter()
+        .zip(&verdicts)
+        .enumerate()
+        .filter_map(|(i, (a, v))| match (a, v) {
+            (Asked::Coding { coding, .. }, Ok(v))
+                if v.unknown_system && coding.get("version").is_some() =>
+            {
+                let mut bare = (*coding).clone();
+                bare.as_object_mut()?.remove("version");
+                bare.as_object_mut()?.remove("display");
+                Some((i, bare))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut unknown_version: HashSet<usize> = HashSet::new();
+    if !versioned_unknown.is_empty() {
+        let again: Vec<TxCheck<'_>> = versioned_unknown
+            .iter()
+            .map(|(_, c)| TxCheck::Coding(c))
+            .collect();
+        for ((i, _), verdict) in versioned_unknown.iter().zip(provider.check(&again).await) {
+            if verdict.is_ok_and(|v| !v.unknown_system) {
+                unknown_version.insert(*i);
+            }
+        }
+    }
+
+    for (index, (asked, verdict)) in asked.iter().zip(verdicts).enumerate() {
         match asked {
             Asked::Binding {
                 path,
@@ -690,7 +723,22 @@ async fn execute_terminology(
                         .with_severity(handlers.display_issues),
                     );
                 }
-                if verdict.unknown_system
+                if unknown_version.contains(&index)
+                    && let Some(system) = coding.get("system").and_then(Value::as_str)
+                {
+                    let version = coding
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    errors.push(
+                        ValidationError::new(
+                            ErrorKind::UnknownCodeSystem,
+                            format!("{path}.version"),
+                            messages::unknown_code_system_version(system, version),
+                        )
+                        .with_severity(Severity::Warning),
+                    );
+                } else if verdict.unknown_system
                     && let Some(system) = coding.get("system").and_then(Value::as_str)
                     && crate::terminology::is_hl7_namespace(system)
                 {

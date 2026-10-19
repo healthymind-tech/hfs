@@ -121,11 +121,17 @@ impl TerminologyProvider for Scripted {
                     TxCheck::Coding(coding) => {
                         let system = coding["system"].as_str().unwrap_or_default();
                         self.asked.lock().unwrap().push(format!("cs {system}"));
+                        // `system|version` entries: only that version is unknown.
+                        let versioned = coding["version"]
+                            .as_str()
+                            .map(|v| format!("{system}|{v}"))
+                            .unwrap_or_default();
                         TxVerdict {
                             valid: true,
                             wrong_display: (self.wrong_display && coding.get("display").is_some())
                                 .then(|| "Wrong Display Name 'x'".to_string()),
-                            unknown_system: self.unknown_systems.contains(&system),
+                            unknown_system: self.unknown_systems.contains(&system)
+                                || self.unknown_systems.contains(&versioned.as_str()),
                         }
                     }
                 })
@@ -351,4 +357,43 @@ async fn cpb16_does_not_confuse_implementation_with_implementation_guide() {
     cs["implementation"] = json!({"description": "x"});
     let issues = run(&cs, &handlers).await;
     assert!(cpb16(&issues), "{issues:#?}");
+}
+
+/// `pat-ms-3.0.0` (HL7 validator test cases): an unknown version of a known
+/// HL7 code system is a warning about the version, not an unresolvable
+/// system URL; a versioned Coding of an unknown HL7 system is still an
+/// error.
+#[tokio::test]
+async fn unknown_version_of_a_known_code_system_warns() {
+    let patient = |system: &str| {
+        json!({"resourceType": "Patient", "maritalStatus": {"coding": [{
+            "system": system, "version": "3.0.0", "code": "M"}]}})
+    };
+    let mut tx = Scripted::new();
+    tx.unknown_systems = &[
+        "http://terminology.hl7.org/CodeSystem/v3-MaritalStatus|3.0.0",
+        "http://terminology.hl7.org/CodeSystem/nothing-here",
+    ];
+    let handlers = EffectHandlers {
+        terminology: Some(&tx),
+        ..Default::default()
+    };
+    let issues = run(
+        &patient("http://terminology.hl7.org/CodeSystem/v3-MaritalStatus"),
+        &handlers,
+    )
+    .await;
+    let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
+    assert_eq!(unknown.len(), 1, "{issues:#?}");
+    assert_eq!(unknown[0].severity, Severity::Warning);
+    assert_eq!(unknown[0].path, "Patient.maritalStatus.coding.0.version");
+
+    let issues = run(
+        &patient("http://terminology.hl7.org/CodeSystem/nothing-here"),
+        &handlers,
+    )
+    .await;
+    let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
+    assert_eq!(unknown.len(), 1, "{issues:#?}");
+    assert_eq!(unknown[0].severity, Severity::Error);
 }
