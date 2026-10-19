@@ -638,6 +638,62 @@ pub(super) fn key_origin(key: &str) -> Option<String> {
     Some(key[..end].to_string())
 }
 
+/// Slices with a minimum on an element the data does not have at all: the
+/// slicing pass only runs over present arrays, so a profile requiring a
+/// `section:code-A` slice (or an extension) said nothing about a
+/// Composition without sections.
+fn absent_slice_minimums(
+    ctx: &mut WalkCtx<'_>,
+    set: &SchemaSet,
+    obj: &serde_json::Map<String, Value>,
+) {
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    let layers: Vec<(Option<String>, Arc<FhirSchema>)> = set
+        .iter()
+        .map(|(name, schema)| (key_origin(name), Arc::clone(schema)))
+        .collect();
+    for (source, schema) in &layers {
+        let mut required: Vec<(String, String, u64)> = Vec::new();
+        for (key, element) in schema.elements.iter().flatten() {
+            if has_key(obj, key) {
+                continue;
+            }
+            if let Some(slicing) = &element.slicing {
+                for (name, slice) in &slicing.slices {
+                    if let Some(min) = slice.min.filter(|m| *m > 0) {
+                        required.push((key.clone(), name.clone(), min));
+                    }
+                }
+            }
+        }
+        if !has_key(obj, "extension") {
+            for (name, entry) in schema.extensions.iter().flatten() {
+                if let Some(min) = entry.min.filter(|m| *m > 0) {
+                    required.push(("extension".to_string(), name.clone(), min));
+                }
+            }
+        }
+        for (key, name, min) in required {
+            if !reported.insert((key.clone(), name.clone())) {
+                continue;
+            }
+            ctx.path.push_key(&key);
+            let element = ctx.path.render_unindexed();
+            // The HL7 wording names the slice (two required slices of one
+            // absent element are two issues).
+            let message = errors::hl7_slice_min(&element, &name, min, 0);
+            ctx.error_full(
+                ErrorKind::SliceCardinality,
+                message.clone(),
+                Severity::Error,
+                source.clone(),
+                Some(message),
+            );
+            ctx.path.pop();
+        }
+    }
+}
+
 /// Navigate an element reference: `["Questionnaire", "elements", "item"]` —
 /// a root schema name followed by alternating `"elements"` / element-name
 /// segments.
@@ -747,6 +803,8 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         }
         ctx.path.pop();
     }
+
+    absent_slice_minimums(ctx, set, obj);
 
     // postValidate: more than one branch of the same choice group present.
     for (group, branches) in &multi_choice {

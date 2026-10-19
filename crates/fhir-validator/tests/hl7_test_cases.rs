@@ -890,3 +890,46 @@ async fn contained_resources_referenced_from_narrative() {
         "{issues:#?}"
     );
 }
+
+/// `document-bad-no-sections`: slices with a minimum (and required
+/// extensions) are missing when their element is absent altogether.
+#[tokio::test]
+async fn slice_minimums_on_absent_elements() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/sections",
+        "name": "Sections", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Composition", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Composition",
+        "differential": {"element": [
+            {"id": "Composition.section", "path": "Composition.section",
+             "slicing": {"discriminator": [{"type": "pattern", "path": "code"}], "rules": "open"}},
+            {"id": "Composition.section:code-A", "path": "Composition.section", "sliceName": "code-A", "min": 1},
+            {"id": "Composition.section:code-A.code", "path": "Composition.section.code",
+             "patternCodeableConcept": {"coding": [{"system": "http://example.org/cs", "code": "A"}]}},
+            {"id": "Composition.extension", "path": "Composition.extension", "slicing": {
+                "discriminator": [{"type": "value", "path": "url"}], "rules": "open"}},
+            {"id": "Composition.extension:version", "path": "Composition.extension", "sliceName": "version",
+             "min": 1, "type": [{"code": "Extension",
+                "profile": ["http://hl7.org/fhir/StructureDefinition/composition-clinicaldocument-versionNumber"]}]}
+        ]}
+    });
+    let composition = json!({"resourceType": "Composition", "status": "final", "type": {"text": "x"},
+        "date": "2021-02-01", "author": [{"display": "y"}], "title": "z"});
+    let issues = validate_with(
+        &composition,
+        &[sd],
+        &["http://example.org/StructureDefinition/sections"],
+    )
+    .await;
+    let slices: Vec<&str> = issues
+        .iter()
+        .filter(|e| e.kind == helios_fhir_validator::ErrorKind::SliceCardinality)
+        .map(|e| e.path.as_str())
+        .collect();
+    assert_eq!(
+        slices,
+        vec!["Composition.section", "Composition.extension"],
+        "{issues:#?}"
+    );
+}
