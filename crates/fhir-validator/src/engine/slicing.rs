@@ -107,7 +107,14 @@ pub(super) fn validate_slices<'a>(
                 .iter()
                 .filter(|name| mark.slicing.slices[*name].reslice.is_none() && !name.contains('/'))
                 .collect();
-            if top.len() > 1 {
+            // Profile-matched slices are matched structurally here (no
+            // invariants or terminology), more loosely than the HL7
+            // validator's full profile check: overlap among them is no
+            // evidence of a real ambiguity.
+            let by_profile = top
+                .iter()
+                .any(|name| matches_by_profile(&mark.slicing.slices[*name]));
+            if top.len() > 1 && !by_profile {
                 ctx.path.push_index(index);
                 let names: Vec<&str> = top.iter().map(|n| n.as_str()).collect();
                 let message = match &mark.source {
@@ -261,6 +268,25 @@ pub(super) fn validate_slices<'a>(
     }
 
     consumed
+}
+
+/// Whether a slice's membership is decided by profile conformance (a
+/// `profile` part, or a `type`/`profile` part through `resolve()`).
+fn matches_by_profile(slice: &Slice) -> bool {
+    slice
+        .match_
+        .as_ref()
+        .filter(|m| m.type_.as_deref() == Some("all"))
+        .and_then(|m| m.value.as_ref())
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("profile" | "profile-element")
+                ) || p.get("resolve").and_then(Value::as_bool) == Some(true)
+            })
+        })
 }
 
 /// The schema-set key a matched slice's schema joins under: the extension

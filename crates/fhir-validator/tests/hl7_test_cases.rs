@@ -1634,3 +1634,54 @@ fn required_additional_binding() {
     assert_eq!(binding.value_set, "http://example.org/ValueSet/vs1");
     assert_eq!(binding.strength.as_deref(), Some("required"));
 }
+
+/// IPS Bundle entries: slices matched by profile conformance may overlap
+/// (structural matching is looser than the HL7 validator's full check), so
+/// overlap among them is not reported.
+#[tokio::test]
+async fn profile_matched_slices_may_overlap() {
+    let obs_profile = |name: &str| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{name}"),
+            "name": name, "status": "active", "kind": "resource", "abstract": false,
+            "type": "Observation", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+            "differential": {"element": [{"id": "Observation.status", "path": "Observation.status", "mustSupport": true}]}
+        })
+    };
+    let slice = |name: &str| {
+        vec![
+            json!({"id": format!("Bundle.entry:{name}"), "path": "Bundle.entry", "sliceName": name}),
+            json!({"id": format!("Bundle.entry:{name}.resource"), "path": "Bundle.entry.resource",
+            "type": [{"code": "Observation", "profile": [format!("http://example.org/StructureDefinition/{name}")]}]}),
+        ]
+    };
+    let mut elements = vec![json!({"id": "Bundle.entry", "path": "Bundle.entry",
+        "slicing": {"discriminator": [{"type": "type", "path": "resource"}, {"type": "profile", "path": "resource"}], "rules": "open"}})];
+    elements.extend(slice("a"));
+    elements.extend(slice("b"));
+    let bundle_sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/bundle",
+        "name": "B", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Bundle", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Bundle",
+        "differential": {"element": elements}
+    });
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"fullUrl": "urn:uuid:7f1c0b9e-1d7b-4c3a-9a51-2f3b8e6d4c10",
+         "resource": {"resourceType": "Observation", "status": "final", "code": {"text": "x"}}}]});
+    let issues = validate_with(
+        &bundle,
+        &[obs_profile("a"), obs_profile("b"), bundle_sd],
+        &["http://example.org/StructureDefinition/bundle"],
+    )
+    .await;
+    assert!(
+        !issues
+            .iter()
+            .any(|e| e.message.contains("more than one slice")),
+        "{issues:#?}"
+    );
+}
