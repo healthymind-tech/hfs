@@ -718,6 +718,90 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
     assert_eq!(issue_code, "too-costly");
 }
 
+/// An inline ValueSet that includes a whole code system too large to expand
+/// (all of SNOMED CT in practice; here max_expansion_size = 1 against the
+/// 5-code anatomy system) is still answered: membership in a compose of
+/// whole systems and enumerated concepts is decided code by code instead of
+/// failing as too costly. A compose with a filter still needs an expansion.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_whole_system_value_set_too_large_to_expand_still_validates() {
+    use axum::{body::Body, http::Request};
+    use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+    use tower::ServiceExt;
+
+    let backend = SqliteTerminologyBackend::in_memory().unwrap();
+    let state = AppState::new(backend).with_max_expansion_size(1);
+    let app = helios_hts::server::create_app(&HtsConfig::default(), state);
+    let post = |uri: &'static str, body: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/fhir+json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    let (status, _) = post("/import", bundles::r4_bundle().to_string()).await;
+    assert!(status.is_success());
+
+    let validate = |compose: serde_json::Value, code: &str| {
+        serde_json::json!({"resourceType": "Parameters", "parameter": [
+            {"name": "valueSet", "resource": {"resourceType": "ValueSet", "status": "active", "compose": compose}},
+            {"name": "coding", "valueCoding": {"system": bundles::ANATOMY_CS_URL, "code": code}}
+        ]})
+        .to_string()
+    };
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+    let whole = serde_json::json!({"include": [{"system": bundles::ANATOMY_CS_URL}]});
+
+    let (status, body) = post("/ValueSet/$validate-code", validate(whole.clone(), "arm")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(true), "{body}");
+
+    let (status, body) = post("/ValueSet/$validate-code", validate(whole, "tail")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(false), "{body}");
+
+    // Excluded by an enumerated exclude.
+    let minus_arm = serde_json::json!({
+        "include": [{"system": bundles::ANATOMY_CS_URL}],
+        "exclude": [{"system": bundles::ANATOMY_CS_URL, "concept": [{"code": "arm"}]}]
+    });
+    let (_, body) = post("/ValueSet/$validate-code", validate(minus_arm, "arm")).await;
+    assert_eq!(result(&body), Some(false), "{body}");
+
+    // A filtered include cannot be judged without an expansion.
+    let filtered = serde_json::json!({"include": [{"system": bundles::ANATOMY_CS_URL,
+        "filter": [{"property": "concept", "op": "is-a", "value": "body"}]}]});
+    let (status, body) = post("/ValueSet/$validate-code", validate(filtered, "arm")).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]

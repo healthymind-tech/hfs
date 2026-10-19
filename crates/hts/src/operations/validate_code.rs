@@ -3619,6 +3619,128 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
     Ok(out)
 }
 
+/// Membership of `attempts` (`(system, code)`) in an inline ValueSet whose
+/// compose is simple enough to judge without expanding it: every include
+/// names a `system` and either nothing else (the whole code system) or an
+/// enumerated `concept` list, and excludes, if any, are enumerated too. A
+/// whole-system include is answered by `CodeSystem/$validate-code` on that
+/// system (and version, when the include pins one). Returns a pseudo
+/// expansion holding the attempts found in the value set, or `None` when
+/// the compose has filters or value-set imports (an expansion is then the
+/// only way to decide).
+async fn inline_membership_without_expansion<B: TerminologyBackend>(
+    state: &AppState<B>,
+    ctx: &TenantContext,
+    vs_resource: &Value,
+    attempts: &[(Option<String>, String)],
+) -> Option<crate::types::ExpandResponse> {
+    let compose = vs_resource.get("compose")?;
+    let includes = compose.get("include")?.as_array()?;
+    let enumerated_only = |inc: &Value| {
+        inc.get("system").and_then(Value::as_str).is_some()
+            && inc
+                .get("filter")
+                .is_none_or(|f| f.as_array().is_some_and(Vec::is_empty))
+            && inc
+                .get("valueSet")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+    };
+    let excludes: Vec<&Value> = compose
+        .get("exclude")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if includes.is_empty()
+        || !includes.iter().all(enumerated_only)
+        || !excludes
+            .iter()
+            .all(|e| enumerated_only(e) && e.get("concept").and_then(Value::as_array).is_some())
+    {
+        return None;
+    }
+    // `Some(display)` when `code` is in the include's enumerated concepts.
+    let listed = |inc: &Value, code: &str| -> Option<Option<String>> {
+        inc.get("concept")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|c| c.get("code").and_then(Value::as_str) == Some(code))
+            .map(|c| c.get("display").and_then(Value::as_str).map(str::to_string))
+    };
+    let mut contains = Vec::new();
+    for (system, code) in attempts {
+        let excluded = excludes.iter().any(|e| {
+            system
+                .as_deref()
+                .is_none_or(|s| e.get("system").and_then(Value::as_str) == Some(s))
+                && listed(e, code).is_some()
+        });
+        if excluded {
+            continue;
+        }
+        for inc in includes {
+            let inc_system = inc
+                .get("system")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if system.as_deref().is_some_and(|s| s != inc_system) {
+                continue;
+            }
+            let version = inc
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let hit = if inc
+                .get("concept")
+                .and_then(Value::as_array)
+                .is_some_and(|c| !c.is_empty())
+            {
+                listed(inc, code).map(|display| (display, version.clone()))
+            } else {
+                let req = ValidateCodeRequest {
+                    url: None,
+                    value_set_version: None,
+                    system: Some(inc_system.to_string()),
+                    code: code.clone(),
+                    version: version.clone(),
+                    display: None,
+                    date: None,
+                    include_abstract: None,
+                    input_form: None,
+                    lenient_display_validation: None,
+                    default_value_set_versions: std::collections::HashMap::new(),
+                };
+                match CodeSystemOperations::validate_code(state.backend(), ctx, req).await {
+                    Ok(resp) if resp.result => {
+                        Some((resp.display, resp.cs_version.or(version.clone())))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((display, version)) = hit {
+                contains.push(crate::types::ExpansionContains {
+                    system: inc_system.to_string(),
+                    version,
+                    code: code.clone(),
+                    display,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: Vec::new(),
+                    properties: Vec::new(),
+                    extensions: Vec::new(),
+                    contains: Vec::new(),
+                });
+                break;
+            }
+        }
+    }
+    Some(crate::types::ExpandResponse {
+        total: Some(contains.len() as u32),
+        offset: None,
+        contains,
+        warnings: Vec::new(),
+    })
+}
+
 /// `ValueSet/$validate-code` against an inline `valueSet` body.
 ///
 /// Drives the IG `validation/validate-contained-{good,bad}` fixtures: the
@@ -3821,7 +3943,23 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         system_version_defaults: std::collections::HashMap::new(),
         default_value_set_versions: std::collections::HashMap::new(),
     };
-    let expansion = ValueSetOperations::expand(state.backend(), &ctx, expand_req).await?;
+    let expansion = match ValueSetOperations::expand(state.backend(), &ctx, expand_req).await {
+        Ok(expansion) => expansion,
+        // Too large to expand (an include of all of SNOMED CT or LOINC):
+        // membership in a compose made only of whole code systems and
+        // enumerated concepts can be decided code by code instead.
+        Err(HtsError::TooCostly(message)) => {
+            let attempts: Vec<(Option<String>, String)> = coding_attempts
+                .iter()
+                .map(|(s, c, _, _)| (s.clone(), c.clone()))
+                .collect();
+            match inline_membership_without_expansion(state, &ctx, &vs_resource, &attempts).await {
+                Some(expansion) => expansion,
+                None => return Err(HtsError::TooCostly(message)),
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     // Try each coding attempt (first-to-last for CodeableConcept) until one
     // is found in the inline VS expansion.
