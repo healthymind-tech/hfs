@@ -1513,3 +1513,24 @@ async fn slices_from_a_library_profile() {
     let good = validate_with(&composition("a"), &sds, &[url]).await;
     assert!(errors(&good).is_empty(), "{good:#?}");
 }
+
+/// `patient-extension-bad2`: an empty primitive (`url=""`) has neither a
+/// value nor children, so ele-1 fails as well.
+#[test]
+fn empty_primitives_break_ele1() {
+    let errs = structural_errors(&json!({"resourceType": "Patient", "extension": [
+        {"url": "", "valueString": "x"}]}));
+    let at_url: Vec<&str> = errs
+        .iter()
+        .filter(|e| e.0 == "Patient.extension.0.url")
+        .map(|e| e.1.as_str())
+        .collect();
+    assert_eq!(
+        at_url,
+        vec![
+            "value cannot be empty",
+            "Constraint failed: ele-1: 'All FHIR elements must have a @value or children'"
+        ],
+        "{errs:#?}"
+    );
+}

@@ -88,6 +88,15 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
             ErrorKind::PrimitiveValue,
             "value cannot be empty".to_string(),
         );
+        if ctx.empty_primitive_breaks_ele1() {
+            // Neither a value nor children (`url=""` in XML): ele-1 too,
+            // as the HL7 validator reports it.
+            ctx.error(
+                ErrorKind::FhirpathConstraint,
+                "Constraint failed: ele-1: 'All FHIR elements must have a @value or children'"
+                    .to_string(),
+            );
+        }
         return;
     }
 

@@ -141,6 +141,16 @@ pub(super) struct WalkCtx<'a> {
 const MAX_NESTING: usize = 6;
 
 impl<'a> WalkCtx<'a> {
+    /// An empty primitive with no sidecar children has neither a value nor
+    /// children (ele-1), with the HL7 FHIR packs loaded.
+    pub(super) fn empty_primitive_breaks_ele1(&self) -> bool {
+        knows_hl7_extensions(self.resolver)
+            && self
+                .primitive_sidecar
+                .and_then(Value::as_object)
+                .is_none_or(|o| o.keys().all(|k| k == "id"))
+    }
+
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
         self.resolver
     }
