@@ -509,7 +509,10 @@ async fn execute_terminology(
         if let Deferred::Binding { path, binding, .. } = d {
             let vs = binding.value_set.split('|').next().unwrap_or_default();
             let entry = bound.entry(path.as_str()).or_default();
-            if !entry.iter().any(|(v, s)| *v == vs && *s == binding.strength.as_deref()) {
+            if !entry
+                .iter()
+                .any(|(v, s)| *v == vs && *s == binding.strength.as_deref())
+            {
                 entry.push((vs, binding.strength.as_deref()));
             }
         }
@@ -547,7 +550,10 @@ async fn execute_terminology(
             if !extensible_seen.insert((path.as_str(), vs)) {
                 continue; // same set from several layers (`|4.0.1` or not)
             }
-            if overridden(vs, bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[])) {
+            if overridden(
+                vs,
+                bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[]),
+            ) {
                 continue;
             }
         }
@@ -643,10 +649,7 @@ async fn execute_terminology(
                             ValidationError::new(
                                 ErrorKind::TerminologyBinding,
                                 (*path).clone(),
-                                messages::terminology_unavailable(
-                                    &binding.value_set,
-                                    e.message(),
-                                ),
+                                messages::terminology_unavailable(&binding.value_set, e.message()),
                             )
                             .with_severity(severity),
                         );
@@ -706,7 +709,9 @@ fn overridden(vs: &str, bindings: &[(&str, Option<&str>)]) -> bool {
     }
     // vs is an IG set: superseded only by a later IG set.
     let pos = bindings.iter().position(|(v, _)| *v == vs).unwrap_or(0);
-    bindings[pos + 1..].iter().any(|(v, _)| *v != vs && !core(v))
+    bindings[pos + 1..]
+        .iter()
+        .any(|(v, _)| *v != vs && !core(v))
 }
 
 /// Whether the coded value carries any code at all.
@@ -714,10 +719,14 @@ fn has_code(coded: &CodedValue) -> bool {
     match coded {
         CodedValue::Code(c) => !c.is_empty(),
         CodedValue::Coding(c) => c.get("code").and_then(Value::as_str).is_some(),
-        CodedValue::CodeableConcept(cc) => cc
-            .get("coding")
-            .and_then(Value::as_array)
-            .is_some_and(|cs| cs.iter().any(|c| c.get("code").and_then(Value::as_str).is_some())),
+        CodedValue::CodeableConcept(cc) => {
+            cc.get("coding")
+                .and_then(Value::as_array)
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.get("code").and_then(Value::as_str).is_some())
+                })
+        }
     }
 }
 

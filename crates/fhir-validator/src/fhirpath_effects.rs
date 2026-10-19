@@ -393,7 +393,8 @@ mod tests {
     /// invariant the core pack attaches, at every node path).
     #[test]
     fn node_cached_evaluation_matches_combined_expressions() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/tests/data/json/R4");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/tests/data/json/R4");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             eprintln!("spec corpus not present at {}; skipping", dir.display());
             return;
@@ -413,8 +414,12 @@ mod tests {
             if !full && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 12_000 {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else { continue };
-            let Ok(resource) = serde_json::from_str::<Value>(&text) else { continue };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(resource) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if resource.get("resourceType").is_none() {
                 continue;
             }
@@ -423,7 +428,12 @@ mod tests {
                 .deferred
                 .iter()
                 .filter_map(|d| match d {
-                    Deferred::Constraint { path, id, expression, .. } => Some(DeferredConstraint {
+                    Deferred::Constraint {
+                        path,
+                        id,
+                        expression,
+                        ..
+                    } => Some(DeferredConstraint {
                         path,
                         id,
                         expression,
@@ -454,11 +464,22 @@ mod tests {
             diffs.is_empty(),
             "{} of {checked} outcomes differ ({failed} failures):\n{}",
             diffs.len(),
-            diffs.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+            diffs
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         // The cache is keyed by expression, not by node path.
-        assert!(evaluator.cached_expressions() < 2_000, "{}", evaluator.cached_expressions());
-        eprintln!("{resources} resources, {checked} constraint outcomes identical ({failed} failures)");
+        assert!(
+            evaluator.cached_expressions() < 2_000,
+            "{}",
+            evaluator.cached_expressions()
+        );
+        eprintln!(
+            "{resources} resources, {checked} constraint outcomes identical ({failed} failures)"
+        );
     }
 
     /// Per-invariant cost breakdown for one resource (diagnostics, not a
@@ -479,7 +500,12 @@ mod tests {
             .deferred
             .iter()
             .filter_map(|d| match d {
-                Deferred::Constraint { path, id, expression, .. } => Some(DeferredConstraint {
+                Deferred::Constraint {
+                    path,
+                    id,
+                    expression,
+                    ..
+                } => Some(DeferredConstraint {
                     path,
                     id,
                     expression,
@@ -490,7 +516,11 @@ mod tests {
         let evaluator = super::FhirPathConstraintEvaluator::new();
         let started = std::time::Instant::now();
         evaluator.evaluate_all(&resource, FhirVersion::R4, &constraints);
-        eprintln!("{} constraints, all at once: {:?}", constraints.len(), started.elapsed());
+        eprintln!(
+            "{} constraints, all at once: {:?}",
+            constraints.len(),
+            started.elapsed()
+        );
         // Per invariant id: all its occurrences in one call (one typed parse
         // and node navigation each, subtracted below).
         let mut groups: std::collections::BTreeMap<&str, Vec<DeferredConstraint<'_>>> =
