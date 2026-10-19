@@ -1517,8 +1517,14 @@ impl RemoteTerminologyProvider {
             .and_then(Value::as_str)
     }
 
+    /// A wrong display: `invalid-display`, or a display that is no longer
+    /// correct (`display-comment`, INACTIVE_DISPLAY_FOUND — a deprecated or
+    /// withdrawn designation, an error unless validation is lenient).
     fn is_display_issue(issue: &Value) -> bool {
-        Self::tx_issue_type(issue) == Some("invalid-display")
+        matches!(
+            Self::tx_issue_type(issue),
+            Some("invalid-display" | "display-comment")
+        )
     }
 
     /// Read the verdict out of a successful `$validate-code` answer.
@@ -2020,6 +2026,20 @@ mod remote_provider_tests {
         )
         .unwrap();
         assert!(!verdict.valid);
+
+        // So is a display that is no longer correct (a withdrawn designation).
+        let inactive_display = issue(
+            "error",
+            "display-comment",
+            "'2nd Code' is no longer considered a correct display for code 'code2' (status = withdrawn). The correct display is 'Display 2'",
+            Some("INACTIVE_DISPLAY_FOUND"),
+        );
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &vs,
+            &answer(false, vec![inactive_display], vec![]),
+        )
+        .unwrap();
+        assert!(verdict.valid);
 
         // A plain `false` without issues stays invalid.
         let verdict =

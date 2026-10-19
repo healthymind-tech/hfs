@@ -74,6 +74,7 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
     // Form 1: bare `codeA` + `codeB` + shared `system` parameter.
     // Form 2: `codingA` (valueCoding) + `codingB` (valueCoding) — system is
     //         embedded in each Coding and they MUST be the same code system.
+    let coding_form = find_str_param(&params, "codeA").is_none();
     let (system, code_a, code_b) = match (
         find_str_param(&params, "codeA"),
         find_str_param(&params, "codeB"),
@@ -92,6 +93,13 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
                 extract_coding(&params, "codingB"),
             ) {
                 (Some((sys_a, code_a, _)), Some((sys_b, code_b, _))) => {
+                    // A Coding without a system is a malformed request, not
+                    // a code system that cannot be found.
+                    if sys_a.is_empty() || sys_b.is_empty() {
+                        return Err(HtsError::InvalidRequest(
+                            "codingA and codingB must both have a system for $subsumes".into(),
+                        ));
+                    }
                     // FHIR spec: both codings MUST belong to the same code system.
                     if sys_a != sys_b {
                         return Err(HtsError::InvalidRequest(format!(
@@ -112,6 +120,85 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
         }
     };
 
+    // UCUM: a grammar, judged by canonical form and magnitude.
+    if system == crate::ucum_validate::UCUM_URL {
+        let side = if coding_form { "coding" } else { "code" };
+        let outcome = crate::ucum::subsumes(&code_a, &code_b).map_err(|bad| {
+            let which = if bad == code_a { "A" } else { "B" };
+            HtsError::coded(
+                "code-invalid",
+                "invalid-code",
+                format!(
+                    "Unknown code '{bad}' in the CodeSystem '{}': {}",
+                    crate::ucum_validate::UCUM_URL,
+                    crate::ucum::error_message(bad)
+                ),
+                Some(&format!("{side}{which}")),
+            )
+        })?;
+        return Ok(json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "outcome", "valueCode": outcome.as_str()}]
+        }));
+    }
+
+    // SNOMED CT expressions: compared by their normal forms.
+    let expression = |c: &str| {
+        c.contains(|ch: char| matches!(ch, ':' | '+' | '|' | '{' | '(' | '=') || ch.is_whitespace())
+    };
+    if system == crate::snomed::SNOMED_URL && (expression(&code_a) || expression(&code_b)) {
+        let version = find_str_param(&params, "version");
+        if let Some(model) = state
+            .backend()
+            .snomed_model(
+                &helios_persistence::tenant::TenantContext::system(),
+                &system,
+                version.as_deref(),
+            )
+            .await?
+        {
+            let outcome = crate::snomed::ops::subsumes(&model, &code_a, &code_b)?;
+            return Ok(json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "outcome", "valueCode": outcome}]
+            }));
+        }
+    }
+
+    // Media types: a grammar, judged without stored content.
+    if system == crate::mimetypes::SYSTEM {
+        let side = if coding_form { "coding" } else { "code" };
+        let parse = |code: &str, which: &str| {
+            crate::mimetypes::parse(code).ok_or_else(|| {
+                HtsError::coded(
+                    "code-invalid",
+                    "invalid-code",
+                    format!(
+                        "Unknown code '{code}' in the CodeSystem '{}': not a well formed media type",
+                        crate::mimetypes::SYSTEM
+                    ),
+                    Some(&format!("{side}{which}")),
+                )
+            })
+        };
+        let (a, b) = (parse(&code_a, "A")?, parse(&code_b, "B")?);
+        let outcome = crate::mimetypes::subsumes(&a, &b).map_err(|param| {
+            HtsError::coded(
+                "not-supported",
+                "cannot-determine",
+                format!(
+                    "Cannot determine how '{code_a}' and '{code_b}' relate: whether the \
+                     parameter '{param}' narrows the media type is not known"
+                ),
+                None,
+            )
+        })?;
+        return Ok(json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "outcome", "valueCode": outcome.as_str()}]
+        }));
+    }
+
     let req = SubsumesRequest {
         system,
         version: find_str_param(&params, "version"),
@@ -119,8 +206,41 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
         code_b,
     };
 
+    let (system, version) = (req.system.clone(), req.version.clone());
+    let code_a = req.code_a.clone();
     let ctx = TenantContext::system();
-    let resp = CodeSystemOperations::subsumes(state.backend(), &ctx, req).await?;
+    let resp = match CodeSystemOperations::subsumes(state.backend(), &ctx, req).await {
+        Ok(resp) => resp,
+        Err(HtsError::NotFound(msg)) => {
+            let cs = match version.as_deref() {
+                Some(v) => format!("'{system}' version '{v}'"),
+                None => format!("'{system}'"),
+            };
+            // The backends report an unknown code as `Concept not found: <code>`
+            // and an unknown CodeSystem as `CodeSystem not found: ...`.
+            return Err(match msg.strip_prefix("Concept not found: ") {
+                Some(code) => {
+                    // Both backends check codeA first.
+                    let side = if code == code_a { "A" } else { "B" };
+                    let param = if coding_form {
+                        format!("coding{side}")
+                    } else {
+                        format!("code{side}")
+                    };
+                    HtsError::coded(
+                        "code-invalid",
+                        "invalid-code",
+                        format!("Unknown code '{code}' in the CodeSystem {cs}"),
+                        Some(&param),
+                    )
+                }
+                None => HtsError::NotFound(format!(
+                    "A definition for CodeSystem {cs} could not be found, so the codes cannot be compared"
+                )),
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     let outcome_str = match resp.outcome {
         SubsumptionOutcome::Equivalent => "equivalent",
@@ -148,7 +268,7 @@ pub async fn subsumes_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
     Ok(fhir_respond(
-        process_subsumes(&state, params).await?,
+        dispatch_tx!(state, params, process_subsumes)?,
         format,
     ))
 }
@@ -445,5 +565,62 @@ mod tests {
         });
         let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    // ── tx-ecosystem simple-subsumes-* error shapes ───────────────────────────
+
+    async fn subsumes_outcome(body: Value) -> (u16, Value) {
+        let resp = post_json(make_app(), "/CodeSystem/$subsumes", body).await;
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unknown_code_is_code_invalid_at_the_parameter() {
+        let (status, oo) = subsumes_outcome(json!({"resourceType": "Parameters", "parameter": [
+            {"name": "system", "valueUri": "http://example.org/hier"},
+            {"name": "codeA", "valueCode": "A"},
+            {"name": "codeB", "valueCode": "ZZZ"}
+        ]}))
+        .await;
+        assert_eq!(status, 400);
+        let issue = &oo["issue"][0];
+        assert_eq!(issue["code"], "code-invalid");
+        assert_eq!(issue["details"]["coding"][0]["code"], "invalid-code");
+        assert_eq!(issue["expression"], json!(["codeB"]));
+        let text = issue["details"]["text"].as_str().unwrap();
+        assert!(text.contains("ZZZ") && text.contains("http://example.org/hier"));
+
+        let (_, oo) = subsumes_outcome(json!({"resourceType": "Parameters", "parameter": [
+            {"name": "codingA", "valueCoding": {"system": "http://example.org/hier", "code": "ZZZ"}},
+            {"name": "codingB", "valueCoding": {"system": "http://example.org/hier", "code": "A"}}
+        ]}))
+        .await;
+        assert_eq!(oo["issue"][0]["expression"], json!(["codingA"]));
+    }
+
+    #[tokio::test]
+    async fn missing_system_is_invalid_data() {
+        for body in [
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "codeA", "valueCode": "A"},
+                {"name": "codeB", "valueCode": "B"}
+            ]}),
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "codingA", "valueCoding": {"code": "A"}},
+                {"name": "codingB", "valueCoding": {"code": "B"}}
+            ]}),
+        ] {
+            let (status, oo) = subsumes_outcome(body).await;
+            assert_eq!(status, 400);
+            assert_eq!(oo["issue"][0]["code"], "invalid");
+            assert_eq!(
+                oo["issue"][0]["details"]["coding"][0]["code"],
+                "invalid-data"
+            );
+        }
     }
 }

@@ -60,9 +60,7 @@ async fn env_with(admin: bool, auth: helios_admin_auth::AdminSettings) -> Env {
     #[cfg(feature = "postgres")]
     if common::pg_mode() {
         let url = common::fresh_pg_database().await;
-        let backend = helios_hts::backends::PostgresTerminologyBackend::new(&url)
-            .await
-            .unwrap();
+        let backend = common::pg_hts_backend(&url).await.unwrap();
         let state = AppState::new(backend);
         let config = HtsConfig {
             storage_backend: "postgres".into(),

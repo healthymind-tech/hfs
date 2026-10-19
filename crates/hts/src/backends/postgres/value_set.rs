@@ -1211,12 +1211,9 @@ impl PostgresTerminologyBackend {
                             Some(s) => cs_version_for_msg(&client, &self.meta, s).await,
                             None => None,
                         };
-                        let cs_is_fragment = match req.system.as_deref() {
-                            Some(s) => {
-                                cs_content_for_url(&client, &self.meta, s).await.as_deref()
-                                    == Some("fragment")
-                            }
-                            None => false,
+                        let cs_content: Option<String> = match req.system.as_deref() {
+                            Some(s) => cs_content_for_url(&client, &self.meta, s).await,
+                            None => None,
                         };
                         let vs_version_owned =
                             lookup_value_set_version(&client, &self.meta, &url).await;
@@ -1230,12 +1227,13 @@ impl PostgresTerminologyBackend {
                             inactive_for_msg,
                             vs_version_owned.as_deref(),
                             inactive_in_cs,
+                            false, // an implicit ValueSet keeps inactive codes
                             code_unknown_in_cs,
                             false,
                             cs_version.as_deref(),
                             req.version.as_deref(),
                             req.lenient_display_validation.unwrap_or(false),
-                            cs_is_fragment,
+                            cs_content.as_deref(),
                             None,
                             None,
                         );
@@ -1295,12 +1293,9 @@ impl PostgresTerminologyBackend {
                                 Some(s) => cs_version_for_msg(&client, &self.meta, s).await,
                                 None => None,
                             };
-                            let cs_is_fragment = match req.system.as_deref() {
-                                Some(s) => {
-                                    cs_content_for_url(&client, &self.meta, s).await.as_deref()
-                                        == Some("fragment")
-                                }
-                                None => false,
+                            let cs_content: Option<String> = match req.system.as_deref() {
+                                Some(s) => cs_content_for_url(&client, &self.meta, s).await,
+                                None => None,
                             };
                             let vs_version_owned =
                                 lookup_value_set_version(&client, &self.meta, &url).await;
@@ -1314,12 +1309,13 @@ impl PostgresTerminologyBackend {
                                 inactive_for_msg,
                                 vs_version_owned.as_deref(),
                                 inactive_in_cs,
+                                false, // an implicit ValueSet keeps inactive codes
                                 code_unknown_in_cs,
                                 false,
                                 cs_version.as_deref(),
                                 req.version.as_deref(),
                                 req.lenient_display_validation.unwrap_or(false),
-                                cs_is_fragment,
+                                cs_content.as_deref(),
                                 None,
                                 None,
                             );
@@ -1724,19 +1720,18 @@ impl PostgresTerminologyBackend {
             None => None,
         };
         let vs_version_owned = lookup_value_set_version(&client, &self.meta, &url).await;
-        let cs_is_fragment = match system_for_msg.as_deref() {
-            Some(s) => {
-                cs_content_for_url(&client, &self.meta, s).await.as_deref() == Some("fragment")
-            }
-            None => false,
+        let cs_content: Option<String> = match system_for_msg.as_deref() {
+            Some(s) => cs_content_for_url(&client, &self.meta, s).await,
+            None => None,
         };
         // Display echoed for a code that is in the CodeSystem but not in the
         // ValueSet, when the caller sent none: the CodeSystem's display at the
         // resolved version (never put into the not-in-vs message text).
         let cs_display_lookup: Option<String> = if req.display.is_some() || code_unknown_in_cs {
             None
-        } else if let (Some(sys), Some(ver)) = (system_for_msg.as_deref(), cs_version.as_deref()) {
-            pg_lookup_cs_display(&client, sys, Some(ver), &req.code).await
+        } else if let Some(sys) = system_for_msg.as_deref() {
+            // A versionless CodeSystem has no cs_version: take the winning row.
+            pg_lookup_cs_display(&client, sys, cs_version.as_deref(), &req.code).await
         } else {
             None
         };
@@ -1752,12 +1747,13 @@ impl PostgresTerminologyBackend {
             inactive_for_msg,
             vs_version_owned.as_deref(),
             inactive_in_cs,
+            compose_inactive_false,
             code_unknown_in_cs,
             code_unknown_at_version_only,
             cs_version.as_deref(),
             req.version.as_deref(),
             req.lenient_display_validation.unwrap_or(false),
-            cs_is_fragment,
+            cs_content.as_deref(),
             cs_display_lookup.as_deref(),
             normalized_code.as_deref(),
         )?;
@@ -2789,10 +2785,11 @@ async fn pg_expand_vs_reference(
                 full_chain.join(", ")
             )));
         }
-        warnings.push(format!(
-            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
-        ));
-        return Ok(vec![]);
+        // A value set that includes itself, directly or through others, has
+        // no defined expansion (IG `simple/simple-expand-contained-circular`).
+        return Err(HtsError::VsInvalid(format!(
+            "Cyclic reference detected when including {ref_url}: the value set includes itself"
+        )));
     }
     let mut child = ctx.clone();
     child.visited.insert(ref_url.to_owned());
@@ -2956,8 +2953,10 @@ async fn apply_compose_filters_pg(
         // The hierarchy operators apply to the concept itself: SQLite only
         // accepts `property` = `concept` / `code` for them and treats any
         // other property as an unsupported filter, i.e. an empty set.
-        if matches!(op, "is-a" | "descendent-of" | "generalizes" | "child-of")
-            && property != "concept"
+        if matches!(
+            op,
+            "is-a" | "descendent-of" | "generalizes" | "child-of" | "is-not-a"
+        ) && property != "concept"
             && property != "code"
         {
             tracing::warn!(
@@ -3068,6 +3067,19 @@ async fn apply_compose_filters_pg(
                 v
             }
             "child-of" => pg_filter_child_of(client, system_url, system_id, value).await?,
+            // `is-not-a`: the complement of `is-a` — every concept except the
+            // value and its descendants.
+            "is-not-a" => {
+                let subtree: HashSet<String> = pg_filter_is_a(client, system_url, system_id, value)
+                    .await?
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect();
+                let mut all =
+                    pg_filter_property_ne(client, meta, system_url, system_id, "", "").await?;
+                all.retain(|(c, _)| !subtree.contains(c));
+                all
+            }
             "regex" => pg_filter_regex(client, system_id, property, value).await?,
             // Single-value `not-in` reduces to `!=`; both return concepts
             // whose property is NOT this value (concepts without the
@@ -4929,12 +4941,13 @@ fn finish_validate_code_response(
     is_inactive: bool,
     vs_version: Option<&str>,
     is_inactive_in_underlying_cs: bool,
+    inactive_excluded_by_vs: bool,
     code_unknown_in_cs: bool,
     code_unknown_at_version_only: bool,
     cs_version_for_msg: Option<&str>,
     req_version_hint: Option<&str>,
     lenient_display: bool,
-    cs_is_fragment: bool,
+    cs_content: Option<&str>,
     cs_display_lookup: Option<&str>,
     normalized_code: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
@@ -4962,7 +4975,7 @@ fn finish_validate_code_response(
         None => {
             // Fragment short-circuit: unknown code in a fragment CS becomes a
             // single warning (result=true) per IG `fragment/validation-*-bad-code`.
-            if cs_is_fragment && code_unknown_in_cs {
+            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg) && code_unknown_in_cs {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(
@@ -4999,7 +5012,7 @@ fn finish_validate_code_response(
             );
             // Code is valid in underlying CS but inactive, and the VS filtered
             // it out — emit the business-rule "valid but not active" error.
-            if is_inactive_in_underlying_cs {
+            if is_inactive_in_underlying_cs && inactive_excluded_by_vs {
                 issues.push(crate::types::ValidationIssue {
                     severity: "error".into(),
                     fhir_code: "business-rule".into(),
@@ -5021,7 +5034,10 @@ fn finish_validate_code_response(
             });
             // Companion issue when the code is not in the underlying CS at all
             // but the CS itself is loaded.
-            if code_unknown_in_cs && cs_version_for_msg.is_some() {
+            // A versionless CodeSystem is still a loaded one: report the code
+            // as unknown unless the CodeSystem is only a `not-present` stub.
+            let cs_known = cs_content.is_some_and(|c| c != "not-present");
+            if code_unknown_in_cs && (cs_version_for_msg.is_some() || cs_known) {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => {

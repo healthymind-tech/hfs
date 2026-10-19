@@ -322,6 +322,50 @@ CREATE TABLE IF NOT EXISTS refset_members (
     PRIMARY KEY (system_id, refset_id, referenced_code)
 ) WITHOUT ROWID;
 
+-- ── SNOMED CT concept model ───────────────────────────────────────────────────
+-- What the in-memory SNOMED CT model (`crate::snomed::model`) is built from:
+-- per-concept status, definition status, effective time, module and active /
+-- inactive description terms (in description id order, newline-separated);
+-- every active inferred relationship with its group (is-a included, concrete
+-- values marked); and the MRCM attribute domain and range rules. Written by
+-- the RF2 importer, replaced per system on re-import. `snomed_model_stamps`
+-- names the import, so a cached model is rebuilt after a re-import.
+CREATE TABLE IF NOT EXISTS snomed_concepts (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    code           TEXT NOT NULL,
+    active         INTEGER NOT NULL,
+    primitive      INTEGER NOT NULL,
+    effective_time TEXT,
+    module_id      TEXT,
+    terms          TEXT NOT NULL DEFAULT '',
+    inactive_terms TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (system_id, code)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS snomed_relationships (
+    system_id   TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    source_code TEXT NOT NULL,
+    rel_group   INTEGER NOT NULL,
+    type_code   TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    concrete    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_relationships_system
+    ON snomed_relationships(system_id);
+CREATE TABLE IF NOT EXISTS snomed_mrcm (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    kind           TEXT NOT NULL,
+    attribute_code TEXT NOT NULL,
+    c1             TEXT NOT NULL,
+    c2             TEXT NOT NULL,
+    c3             TEXT NOT NULL,
+    c4             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_mrcm_system ON snomed_mrcm(system_id);
+CREATE TABLE IF NOT EXISTS snomed_model_stamps (
+    system_id TEXT PRIMARY KEY REFERENCES code_systems(id) ON DELETE CASCADE,
+    stamp     TEXT NOT NULL
+);
+
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the

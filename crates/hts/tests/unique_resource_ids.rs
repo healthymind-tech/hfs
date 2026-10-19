@@ -303,7 +303,6 @@ async fn startup_repairs_duplicate_ids_sqlite() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn startup_repairs_duplicate_ids_postgres() {
-    use helios_hts::backends::PostgresTerminologyBackend;
     use helios_hts::import::BundleImportBackend;
     use helios_persistence::tenant::TenantContext;
 
@@ -316,7 +315,7 @@ async fn startup_repairs_duplicate_ids_postgres() {
         .unwrap();
     tokio::spawn(conn);
     let concepts: i64 = {
-        let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+        let backend = common::pg_hts_backend(&url).await.unwrap();
         backend
             .import_bundle(
                 &TenantContext::system(),
@@ -333,7 +332,7 @@ async fn startup_repairs_duplicate_ids_postgres() {
             .get(0)
     };
 
-    let _backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+    let _backend = common::pg_hts_backend(&url).await.unwrap();
     for (table, want) in [
         (
             "code_systems",

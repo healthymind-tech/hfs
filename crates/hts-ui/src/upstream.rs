@@ -467,11 +467,7 @@ impl OutcomeView {
             .and_then(|s| s.as_str())
             .unwrap_or("unknown")
             .to_owned();
-        let diagnostics = issue
-            .and_then(|i| i.get("diagnostics"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let diagnostics = issue.map(issue_text).unwrap_or_default();
         let location = issue
             .and_then(|i| i.get("location"))
             .and_then(|v| v.as_array())
@@ -4190,6 +4186,18 @@ fn parse_import_counts(body: &Value) -> Option<ImportCounts> {
     })
 }
 
+/// Human-readable text of an OperationOutcome issue: `diagnostics`, or
+/// `details.text` (HTS puts its messages in `details.text` only).
+fn issue_text(issue: &Value) -> String {
+    issue
+        .get("diagnostics")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .or_else(|| issue.pointer("/details/text").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_owned()
+}
+
 /// Best-effort projection of `OperationOutcome.issue[].diagnostics`
 /// into a flat list of strings. Used for the 400-rejection issue list
 /// under the shared outcome banner. Missing / empty diagnostics fall
@@ -4201,9 +4209,9 @@ fn collect_outcome_diagnostics(body: &Value) -> Vec<String> {
             issues
                 .iter()
                 .map(|i| {
-                    let d = i.get("diagnostics").and_then(|v| v.as_str()).unwrap_or("");
+                    let d = issue_text(i);
                     if !d.is_empty() {
-                        d.to_owned()
+                        d
                     } else {
                         i.get("code")
                             .and_then(|v| v.as_str())

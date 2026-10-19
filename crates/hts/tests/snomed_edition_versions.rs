@@ -242,3 +242,58 @@ async fn subsumes_accepts_the_edition_uri() {
         );
     }
 }
+
+/// An extension edition loaded from RF2 is stored under its edition URI
+/// (`…/731000124108/version/20250301`, see the importer): next to the
+/// International release it is found by that edition, reported under it,
+/// and does not answer for the International edition.
+#[tokio::test]
+async fn an_extension_edition_stored_under_its_uri_is_its_own_release() {
+    const US_RELEASE: &str = "http://snomed.info/sct/731000124108/version/20250301";
+    let app = app().await;
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "sct-us", "url": SCT, "version": US_RELEASE,
+            "status": "active", "content": "complete", "hierarchyMeaning": "is-a",
+            "concept": [{"code": "763875007", "display": "Sulfonamide-containing product"},
+                        {"code": "450321000124108", "display": "US-only concept"}]}}
+    ]});
+    app.import_bundle_ok(&bundle.to_string()).await;
+
+    for version in [US, US_RELEASE] {
+        let (status, out) = app
+            .get_fhir(&format!(
+                "/CodeSystem/$lookup?system={}&code=450321000124108&version={}",
+                enc(SCT),
+                enc(version)
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{version}: {out}");
+        assert_eq!(
+            param_str(&out, "version"),
+            Some(US_RELEASE),
+            "{version}: {out}"
+        );
+    }
+    // The International edition does not have the US concept.
+    let (_, out) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$validate-code?url={}&code=450321000124108&version={}",
+            enc(SCT),
+            enc(INT)
+        ))
+        .await;
+    assert_eq!(
+        param(&out, "result").unwrap()["valueBoolean"],
+        false,
+        "{out}"
+    );
+    // ... and the International release is still reported as such.
+    let (_, out) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$lookup?system={}&code=763875007&version={}",
+            enc(SCT),
+            enc(INT)
+        ))
+        .await;
+    assert_eq!(param_str(&out, "version"), Some(URI), "{out}");
+}

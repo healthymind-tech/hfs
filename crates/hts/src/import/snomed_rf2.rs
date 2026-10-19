@@ -132,8 +132,12 @@ struct ConceptTerms {
 
 #[derive(Debug)]
 struct SnomedParseResult {
+    /// What the in-memory concept model is built from.
+    model: crate::snomed::ModelImport,
     /// concept id → display term + designations.
     concept_terms: HashMap<String, ConceptTerms>,
+    /// Ids of the inactive concepts among `concept_terms`.
+    inactive_concepts: HashSet<String>,
     /// (child, parent) is-a edges.
     is_a_edges: Vec<(String, String)>,
     /// source_concept_id → Vec<(type_id, destination_concept_id)> for non-IS_A relationships.
@@ -173,6 +177,10 @@ pub async fn import_snomed_rf2(
             association_refsets: assoc_refset_paths,
             language_refsets: lang_refset_paths,
             simple_refsets: simple_refset_paths,
+            module_dependency,
+            concrete_values,
+            mrcm_domain,
+            mrcm_range,
         } = find_rf2_paths(&path_owned, &languages)?;
 
         tracing::info!(
@@ -186,14 +194,20 @@ pub async fn import_snomed_rf2(
         );
 
         let mut parse_errors: Vec<String> = Vec::new();
+        let mut modules: HashMap<String, u64> = HashMap::new();
 
-        let active_concepts = {
+        let (active_concepts, inactive_concepts) = {
             let mut zip = open_zip(&path_owned)?;
             let entry = zip
                 .by_name(&concept_path)
                 .map_err(|e| HtsError::InvalidRequest(format!("Cannot open concept file: {e}")))?;
-            parse_active_concepts(BufReader::new(entry), &mut parse_errors)
+            parse_concepts(BufReader::new(entry), &mut parse_errors, &mut modules)
         };
+        // Inactive concepts are imported too (marked inactive) so a retired
+        // code is reported as inactive rather than unknown; they take part in
+        // no relationship.
+        let known_concepts: HashSet<String> =
+            active_concepts.union(&inactive_concepts).cloned().collect();
 
         let concept_terms = {
             let mut by_desc_id: HashMap<String, (usize, ParsedDescription)> = HashMap::new();
@@ -205,7 +219,7 @@ pub async fn import_snomed_rf2(
                 })?;
                 parse_descriptions(
                     BufReader::new(entry),
-                    &active_concepts,
+                    &known_concepts,
                     &languages,
                     &mut next_order,
                     &mut by_desc_id,
@@ -222,7 +236,7 @@ pub async fn import_snomed_rf2(
                 parse_language_refsets(BufReader::new(entry), &mut preferred_in, &mut parse_errors);
             }
 
-            build_concept_terms(by_desc_id, &preferred_in, &active_concepts)
+            build_concept_terms(by_desc_id, &preferred_in, &known_concepts)
         };
 
         let (is_a_edges, role_relationships) = {
@@ -260,10 +274,70 @@ pub async fn import_snomed_rf2(
             active_members(latest)
         };
 
-        let release_version = extract_release_date(&concept_path);
+        let edition_module = match module_dependency.as_deref() {
+            Some(md_path) => {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(md_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open module dependency file: {e}"))
+                })?;
+                edition_module_from_dependencies(BufReader::new(entry))
+            }
+            None => None,
+        };
+        let model = {
+            let open = |_: &str| open_zip(&path_owned);
+            let mut zip = open(&concept_path)?;
+            let entry = zip
+                .by_name(&concept_path)
+                .map_err(|e| HtsError::InvalidRequest(format!("Cannot open concept file: {e}")))?;
+            let metas = parse_concept_meta(BufReader::new(entry));
+            let mut terms: HashMap<String, (String, bool, String, String)> = HashMap::new();
+            for desc_path in &desc_paths {
+                let mut zip = open(desc_path)?;
+                let entry = zip.by_name(desc_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open description file: {e}"))
+                })?;
+                parse_description_terms(BufReader::new(entry), &mut terms);
+            }
+            let mut zip = open(&rel_path)?;
+            let entry = zip.by_name(&rel_path).map_err(|e| {
+                HtsError::InvalidRequest(format!("Cannot open relationship file: {e}"))
+            })?;
+            let mut relationships =
+                parse_model_relationships(BufReader::new(entry), &active_concepts, false);
+            if let Some(cv) = concrete_values.as_deref() {
+                let mut zip = open(cv)?;
+                let entry = zip.by_name(cv).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open concrete values file: {e}"))
+                })?;
+                relationships.extend(parse_model_relationships(
+                    BufReader::new(entry),
+                    &active_concepts,
+                    true,
+                ));
+            }
+            let mut mrcm = Vec::new();
+            for (kind, paths) in [("domain", &mrcm_domain), ("range", &mrcm_range)] {
+                for p in paths {
+                    let mut zip = open(p)?;
+                    let entry = zip.by_name(p).map_err(|e| {
+                        HtsError::InvalidRequest(format!("Cannot open MRCM file: {e}"))
+                    })?;
+                    mrcm.extend(parse_mrcm(BufReader::new(entry), kind));
+                }
+            }
+            build_model_import(metas, terms, relationships, mrcm)
+        };
+        let release_version =
+            extract_release_date(&concept_path).map(|date| match &edition_module {
+                Some(module) => edition_uri(module, &date),
+                None => edition_version(&concept_path, &modules, date),
+            });
 
         Ok(SnomedParseResult {
+            model,
             concept_terms,
+            inactive_concepts,
             is_a_edges,
             role_relationships,
             association_refsets,
@@ -276,7 +350,9 @@ pub async fn import_snomed_rf2(
     .map_err(|e| HtsError::Internal(format!("SNOMED parser panicked: {e}")))??;
 
     let SnomedParseResult {
+        model,
         concept_terms,
+        inactive_concepts,
         is_a_edges,
         role_relationships,
         association_refsets,
@@ -383,7 +459,18 @@ pub async fn import_snomed_rf2(
                     })
                     .unwrap_or_default();
 
-                [parent_extras, role_extras].concat()
+                let inactive_extra = inactive_concepts.contains(code).then_some(BuilderProperty {
+                    code: "inactive",
+                    value_key: "valueBoolean",
+                    value: "true",
+                });
+
+                [
+                    parent_extras,
+                    role_extras,
+                    inactive_extra.into_iter().collect(),
+                ]
+                .concat()
             })
             .collect();
 
@@ -434,8 +521,18 @@ pub async fn import_snomed_rf2(
         );
     }
 
-    // Simple reference set membership (ECL `^`, `?fhir_vs=refset/<id>`).
+    // Simple reference set membership (ECL `^`, `?fhir_vs=refset/<id>`), and
+    // the referenced components of the association reference sets (members
+    // too: `^ 900000000000526001 |REPLACED BY|`).
     // Written even when empty so a re-import that drops a refset clears it.
+    let mut refset_members = refset_members;
+    for (refset_id, mappings) in &association_refsets {
+        refset_members.extend(
+            mappings
+                .iter()
+                .map(|(src, _)| (refset_id.clone(), src.clone())),
+        );
+    }
     let member_count = refset_members.len();
     let written = backend
         .import_refset_members(ctx, SNOMED_URL, Some(&meta_version), refset_members)
@@ -443,6 +540,13 @@ pub async fn import_snomed_rf2(
     if written > 0 || member_count > 0 {
         eprintln!("[{FORMAT}] imported {written} simple refset members");
     }
+
+    // The concept model tables (relationship groups, concrete values, MRCM,
+    // definition status, description terms).
+    let model_rows = backend
+        .import_snomed_model(ctx, SNOMED_URL, Some(&meta_version), model)
+        .await?;
+    eprintln!("[{FORMAT}] stored {model_rows} concept model rows");
 
     // Import association refsets as ConceptMap resources.
     if !association_refsets.is_empty() {
@@ -474,6 +578,174 @@ pub async fn import_snomed_rf2(
     }
 
     Ok(stats)
+}
+
+// ── Concept model rows ────────────────────────────────────────────────────────
+
+/// One concept file row: `(id, effective time, active, module, primitive)`,
+/// the latest per id.
+fn parse_concept_meta(reader: impl BufRead) -> HashMap<String, (String, bool, String, bool)> {
+    let mut out: HashMap<String, (String, bool, String, bool)> = HashMap::new();
+    for line in reader.lines().skip(1).map_while(Result::ok) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let row = (
+            f[1].trim().to_string(),
+            f[2].trim() == "1",
+            f[3].trim().to_string(),
+            f[4].trim() == crate::snomed::model::PRIMITIVE,
+        );
+        match out.get(f[0].trim()) {
+            Some(prev) if prev.0 > row.0 => {}
+            _ => {
+                out.insert(f[0].trim().to_string(), row);
+            }
+        }
+    }
+    out
+}
+
+/// Description rows by id (latest wins): `(effective time, active, concept,
+/// term)`.
+fn parse_description_terms(
+    reader: impl BufRead,
+    out: &mut HashMap<String, (String, bool, String, String)>,
+) {
+    for line in reader.lines().skip(1).map_while(Result::ok) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let row = (
+            f[1].trim().to_string(),
+            f[2].trim() == "1",
+            f[4].trim().to_string(),
+            f[7].to_string(),
+        );
+        match out.get(f[0].trim()) {
+            Some(prev) if prev.0 > row.0 => {}
+            _ => {
+                out.insert(f[0].trim().to_string(), row);
+            }
+        }
+    }
+}
+
+/// Active relationships between active concepts as `(source, group, type,
+/// value, concrete)`; a concrete values file when `concrete`.
+fn parse_model_relationships(
+    reader: impl BufRead,
+    active: &HashSet<String>,
+    concrete: bool,
+) -> Vec<(String, i32, String, String, bool)> {
+    let mut out = Vec::new();
+    for line in reader.lines().skip(1).map_while(Result::ok) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 8 || f[2].trim() != "1" {
+            continue;
+        }
+        let (src, value, group, ty) = (f[4].trim(), f[5].trim(), f[6].trim(), f[7].trim());
+        if !active.contains(src) || (!concrete && !active.contains(value)) {
+            continue;
+        }
+        out.push((
+            src.to_string(),
+            group.parse().unwrap_or(0),
+            ty.to_string(),
+            value.to_string(),
+            concrete,
+        ));
+    }
+    out
+}
+
+/// MRCM rule content types that apply to post-coordinated expressions:
+/// all SNOMED CT content and post-coordinated content.
+const MRCM_CONTENT_TYPES: [&str; 2] = ["723596005", "723595009"];
+
+/// Active MRCM attribute domain / range rows for expressions.
+fn parse_mrcm(
+    reader: impl BufRead,
+    kind: &str,
+) -> Vec<(String, String, String, String, String, String)> {
+    let mut out = Vec::new();
+    for line in reader.lines().skip(1).map_while(Result::ok) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 6 || f[2].trim() != "1" {
+            continue;
+        }
+        let content_type = f.last().map(|s| s.trim()).unwrap_or_default();
+        if !MRCM_CONTENT_TYPES.contains(&content_type) {
+            continue;
+        }
+        let attr = f[5].trim().to_string();
+        let row = match kind {
+            // domainId, grouped, attributeCardinality, attributeInGroupCardinality
+            "domain" if f.len() >= 10 => (f[6], f[7], f[8], f[9]),
+            // rangeConstraint, attributeRule
+            "range" if f.len() >= 8 => (f[6], f[7], "", ""),
+            _ => continue,
+        };
+        out.push((
+            kind.to_string(),
+            attr,
+            row.0.trim().to_string(),
+            row.1.trim().to_string(),
+            row.2.trim().to_string(),
+            row.3.trim().to_string(),
+        ));
+    }
+    out
+}
+
+fn build_model_import(
+    metas: HashMap<String, (String, bool, String, bool)>,
+    terms: HashMap<String, (String, bool, String, String)>,
+    relationships: Vec<(String, i32, String, String, bool)>,
+    mrcm: Vec<(String, String, String, String, String, String)>,
+) -> crate::snomed::ModelImport {
+    // Terms per concept in description id order (numeric).
+    let mut by_concept: HashMap<String, Vec<(u64, bool, String)>> = HashMap::new();
+    for (id, (_, active, concept, term)) in terms {
+        by_concept
+            .entry(concept)
+            .or_default()
+            .push((id.parse().unwrap_or(u64::MAX), active, term));
+    }
+    let mut concepts: Vec<crate::snomed::ConceptRow> = metas
+        .into_iter()
+        .map(|(code, (effective, active, module, primitive))| {
+            let mut list = by_concept.remove(&code).unwrap_or_default();
+            list.sort_by_key(|(id, _, _)| *id);
+            let mut terms = Vec::new();
+            let mut inactive_terms = Vec::new();
+            for (_, a, t) in list {
+                if a {
+                    terms.push(t);
+                } else {
+                    inactive_terms.push(t);
+                }
+            }
+            inactive_terms.retain(|t| !terms.contains(t));
+            crate::snomed::ConceptRow {
+                code,
+                active,
+                primitive,
+                effective_time: Some(effective).filter(|s| !s.is_empty()),
+                module: Some(module).filter(|s| !s.is_empty()),
+                terms,
+                inactive_terms,
+            }
+        })
+        .collect();
+    concepts.sort_by(|a, b| a.code.cmp(&b.code));
+    crate::snomed::ModelImport {
+        concepts,
+        relationships,
+        mrcm,
+    }
 }
 
 // ── ZIP helpers ───────────────────────────────────────────────────────────────
@@ -570,6 +842,13 @@ struct Rf2Paths {
     language_refsets: Vec<String>,
     /// `der2_Refset_Simple*` files: Simple reference set membership.
     simple_refsets: Vec<String>,
+    /// The Module Dependency reference set (names the edition's module).
+    module_dependency: Option<String>,
+    /// Concrete-valued relationships (`sct2_RelationshipConcreteValues_…`).
+    concrete_values: Option<String>,
+    /// MRCM attribute domain and range reference sets.
+    mrcm_domain: Vec<String>,
+    mrcm_range: Vec<String>,
 }
 
 fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, HtsError> {
@@ -581,6 +860,10 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
     let mut assoc_refset_paths: Vec<String> = Vec::new();
     let mut lang_refset_paths: Vec<String> = Vec::new();
     let mut simple_refset_paths: Vec<String> = Vec::new();
+    let mut module_dependency_paths: Vec<String> = Vec::new();
+    let mut concrete_paths: Vec<String> = Vec::new();
+    let mut mrcm_domain_paths: Vec<String> = Vec::new();
+    let mut mrcm_range_paths: Vec<String> = Vec::new();
 
     for i in 0..zip.len() {
         let entry = zip
@@ -593,7 +876,13 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
         }
         let lower = name.to_lowercase();
         if lower.contains("refset") {
-            if lower.contains("association") {
+            if lower.contains("moduledependency") {
+                module_dependency_paths.push(name);
+            } else if lower.contains("mrcmattributedomain") {
+                mrcm_domain_paths.push(name);
+            } else if lower.contains("mrcmattributerange") {
+                mrcm_range_paths.push(name);
+            } else if lower.contains("association") {
                 assoc_refset_paths.push(name);
             } else if lower.contains("language") {
                 lang_refset_paths.push(name);
@@ -605,7 +894,9 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
             continue;
         }
 
-        if lower.contains("concept_") {
+        if lower.contains("relationshipconcretevalues") {
+            concrete_paths.push(name);
+        } else if lower.contains("concept_") {
             concept_paths.push(name);
         } else if lower.contains("description_") {
             desc_paths.push(name);
@@ -650,6 +941,10 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
         association_refsets: assoc_refset_paths,
         language_refsets: lang_refset_paths,
         simple_refsets: simple_refset_paths,
+        module_dependency: pick_single(prefer_snapshot(module_dependency_paths)),
+        concrete_values: pick_single(prefer_snapshot(concrete_paths)),
+        mrcm_domain: prefer_snapshot(mrcm_domain_paths),
+        mrcm_range: prefer_snapshot(mrcm_range_paths),
     })
 }
 
@@ -660,8 +955,17 @@ fn file_name_of(path: &str) -> &str {
 
 // ── RF2 parsers ───────────────────────────────────────────────────────────────
 
-fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> HashSet<String> {
+/// The `(active, inactive)` concept ids of a Concept file (last row of an id
+/// wins), counting the active concepts per `moduleId` (column 4) into
+/// `modules`, from which [`edition_version`] tells an extension edition from
+/// the International one.
+fn parse_concepts(
+    reader: impl BufRead,
+    errors: &mut Vec<String>,
+    modules: &mut HashMap<String, u64>,
+) -> (HashSet<String>, HashSet<String>) {
     let mut active = HashSet::new();
+    let mut inactive = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = match line_result {
@@ -686,12 +990,17 @@ fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> Hash
         let is_active = parts[2].trim() == "1";
 
         if is_active {
+            if let Some(module) = parts.get(3) {
+                *modules.entry(module.trim().to_string()).or_default() += 1;
+            }
+            inactive.remove(&id);
             active.insert(id);
         } else {
             active.remove(&id);
+            inactive.insert(id);
         }
     }
-    active
+    (active, inactive)
 }
 
 /// Parse one RF2 Description file into `by_desc_id`, keyed on description id
@@ -928,7 +1237,7 @@ fn build_concept_terms(
         );
     }
 
-    // Active concepts without any description keep an (empty-display) entry.
+    // Concepts without any description keep an (empty-display) entry.
     for concept_id in active_concepts {
         terms.entry(concept_id.clone()).or_default();
     }
@@ -1151,6 +1460,83 @@ fn build_assoc_refset_concept_map_bundle(
     serde_json::to_vec(&bundle).expect("serialise ConceptMap bundle")
 }
 
+/// The International edition's own modules (SNOMED CT core, model
+/// component): every edition carries concepts in them.
+const INTERNATIONAL_MODULES: [&str; 2] = ["900000000000207008", "900000000000012004"];
+
+/// The CodeSystem version a release is stored under. The International
+/// edition (`sct2_Concept_Snapshot_INT_<date>.txt`) keeps the plain release
+/// date, which the API reports as
+/// `http://snomed.info/sct/900000000000207008/version/<date>`. Any other
+/// edition (`…_US1000124_<date>.txt`, a national extension) is stored as its
+/// edition URI `http://snomed.info/sct/<module>/version/<date>`, the module
+/// being the one holding most of its active concepts outside the
+/// International modules — otherwise it would be reported, and pinned, as
+/// an International release.
+fn edition_version(concept_path: &str, modules: &HashMap<String, u64>, date: String) -> String {
+    let stem = concept_path.rsplit('/').next().unwrap_or(concept_path);
+    let tag = stem.rsplit('_').nth(1).unwrap_or_default();
+    if tag.eq_ignore_ascii_case("INT") {
+        return date;
+    }
+    let edition = modules
+        .iter()
+        .filter(|(m, _)| !INTERNATIONAL_MODULES.contains(&m.as_str()))
+        .max_by(|(ma, a), (mb, b)| a.cmp(b).then_with(|| mb.cmp(ma)))
+        .map(|(m, _)| m.clone());
+    match edition {
+        Some(module) => format!("{SNOMED_URL}/{module}/version/{date}"),
+        None => date,
+    }
+}
+
+/// The edition module a Module Dependency reference set describes: the
+/// module that depends on others and nothing depends on, the International
+/// modules aside (the International release's own top modules, 449080006
+/// etc., are not editions). `None` for the International
+/// edition, or when the refset does not single one out.
+fn edition_module_from_dependencies(reader: impl BufRead) -> Option<String> {
+    let mut sources: HashSet<String> = HashSet::new();
+    let mut targets: HashSet<String> = HashSet::new();
+    for (n, line) in reader.lines().enumerate() {
+        let Ok(line) = line else { continue };
+        if n == 0 {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        // id effectiveTime active moduleId refsetId referencedComponentId …
+        if parts.len() < 6 || parts[2].trim() != "1" {
+            continue;
+        }
+        let (source, target) = (parts[3].trim(), parts[5].trim());
+        sources.insert(source.to_string());
+        // A module may list itself; that is not a dependency on it.
+        if source != target {
+            targets.insert(target.to_string());
+        }
+    }
+    let mut tops: Vec<String> = sources
+        .into_iter()
+        // An extension module is a long-form SCTID (partition 10): the
+        // International modules (900000000000207008, 449080006, …) are not.
+        .filter(|m| !targets.contains(m) && m.len() > 10 && m.as_bytes()[m.len() - 3] == b'1')
+        .collect();
+    (tops.len() == 1).then(|| tops.remove(0))
+}
+
+/// The edition URI of a release of `module`. Editions in the SNOMED test
+/// namespace (1000003) are experimental: `http://snomed.info/xsct/…`.
+fn edition_uri(module: &str, date: &str) -> String {
+    // A long-form SCTID: item, 7-digit namespace, 2-digit partition, check digit.
+    let namespace = (module.len() > 10).then(|| &module[module.len() - 10..module.len() - 3]);
+    let scheme = if namespace == Some("1000003") {
+        "http://snomed.info/xsct"
+    } else {
+        SNOMED_URL
+    };
+    format!("{scheme}/{module}/version/{date}")
+}
+
 fn extract_release_date(path: &str) -> Option<String> {
     let stem = path.rsplit('/').next().unwrap_or(path);
     let without_ext = stem.strip_suffix(".txt")?;
@@ -1166,6 +1552,14 @@ fn extract_release_date(path: &str) -> Option<String> {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    fn parse_concepts_active(
+        reader: impl std::io::BufRead,
+        errors: &mut Vec<String>,
+        modules: &mut std::collections::HashMap<String, u64>,
+    ) -> std::collections::HashSet<String> {
+        super::parse_concepts(reader, errors, modules).0
+    }
+
     use super::*;
     use crate::backends::SqliteTerminologyBackend;
     use std::io::Write;
@@ -1297,7 +1691,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     /// Run the description/refset parsing pipeline over the test fixtures.
     fn parse_fixture_terms() -> HashMap<String, ConceptTerms> {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
@@ -1342,11 +1737,43 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn parse_active_concepts_returns_only_active_ids() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         assert!(active.contains("123456001"));
         assert!(active.contains("789012001"));
         assert!(!active.contains("999999001"));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn edition_module_comes_from_the_module_dependency_refset() {
+        let md = "id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\n\
+a\t20250801\t1\t449080006\t900000000000534007\t900000000000012004\n\
+b\t20250801\t1\t900000000000207008\t900000000000534007\t900000000000012004\n\
+c\t20250909\t1\t31000003106\t900000000000534007\t449080006\n\
+d\t20250909\t1\t31000003106\t900000000000534007\t31000003106\n";
+        let module = edition_module_from_dependencies(md.as_bytes());
+        assert_eq!(module.as_deref(), Some("31000003106"));
+        assert_eq!(
+            edition_uri("31000003106", "20250909"),
+            "http://snomed.info/xsct/31000003106/version/20250909"
+        );
+        assert_eq!(
+            edition_uri("731000124108", "20250301"),
+            "http://snomed.info/sct/731000124108/version/20250301"
+        );
+        // The International release alone names no edition.
+        let int: String = md.lines().take(3).map(|l| format!("{l}\n")).collect();
+        assert_eq!(edition_module_from_dependencies(int.as_bytes()), None);
+    }
+
+    #[test]
+    fn inactive_concepts_are_kept_apart() {
+        let mut errors = Vec::new();
+        let (active, inactive) =
+            super::parse_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+        assert!(inactive.contains("999999001"));
+        assert!(!active.contains("999999001"));
     }
 
     #[test]
@@ -1367,7 +1794,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn display_without_language_refsets_keeps_first_synonym() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
         parse_descriptions(
@@ -1448,7 +1876,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn inactive_description_row_revokes_earlier_state() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         // Full-file style: the synonym is later inactivated.
         let full_tsv = "\
@@ -1472,7 +1901,8 @@ id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcase
     #[test]
     fn parse_relationships_returns_correct_is_a_pairs() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let (edges, roles) = parse_relationships(RELATIONSHIP_TSV.as_bytes(), &active, &mut errors);
 
         assert_eq!(edges.len(), 1);
@@ -1490,7 +1920,8 @@ id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\r\n\
 123456001\t20240101\t1\t900000000000207008\t900000000000074008\r\n\
 BADLINE\r\n";
         let mut errors = Vec::new();
-        let active = parse_active_concepts(concept_data.as_bytes(), &mut errors);
+        let active =
+            parse_concepts_active(concept_data.as_bytes(), &mut errors, &mut HashMap::new());
         assert_eq!(active.len(), 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("line 3"));
@@ -1502,6 +1933,58 @@ BADLINE\r\n";
             extract_release_date("Snapshot/Terminology/sct2_Concept_Snapshot_INT_20240101.txt"),
             Some("20240101".to_string())
         );
+    }
+
+    #[test]
+    fn extension_editions_are_stored_under_their_edition_uri() {
+        let modules: HashMap<String, u64> = [
+            ("900000000000207008".to_string(), 350_000),
+            ("900000000000012004".to_string(), 500),
+            ("731000124108".to_string(), 12_000),
+            ("5991000124107".to_string(), 30),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            edition_version(
+                "Snapshot/Terminology/sct2_Concept_Snapshot_US1000124_20250301.txt",
+                &modules,
+                "20250301".into()
+            ),
+            "http://snomed.info/sct/731000124108/version/20250301"
+        );
+        // The International edition keeps the plain date, whatever modules.
+        assert_eq!(
+            edition_version(
+                "Snapshot/Terminology/sct2_Concept_Snapshot_INT_20250601.txt",
+                &modules,
+                "20250601".into()
+            ),
+            "20250601"
+        );
+        // An extension file with only International modules: plain date.
+        let core: HashMap<String, u64> = [("900000000000207008".to_string(), 10)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            edition_version(
+                "sct2_Concept_Snapshot_XX_20250101.txt",
+                &core,
+                "20250101".into()
+            ),
+            "20250101"
+        );
+        // Module counting reads column 4 of active rows only.
+        let mut counts = HashMap::new();
+        let mut errors = Vec::new();
+        let rf2 = "id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\n\
+                   1\t20250301\t1\t731000124108\t900000000000074008\n\
+                   2\t20250301\t0\t731000124108\t900000000000074008\n\
+                   3\t20250301\t1\t900000000000207008\t900000000000074008\n";
+        let active = parse_concepts_active(rf2.as_bytes(), &mut errors, &mut counts);
+        assert_eq!(active.len(), 2);
+        assert_eq!(counts.get("731000124108"), Some(&1));
+        assert_eq!(counts.get("900000000000207008"), Some(&1));
     }
 
     #[test]
@@ -1529,7 +2012,7 @@ BADLINE\r\n";
         .expect("dry-run should succeed");
 
         assert_eq!(stats.code_systems, 1);
-        assert_eq!(stats.concepts, 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
 
         assert_eq!(count_rows(&backend, "code_systems"), 0);
         assert_eq!(count_rows(&backend, "concepts"), 0);
@@ -1554,10 +2037,10 @@ BADLINE\r\n";
         .expect("live import should succeed");
 
         assert_eq!(stats.code_systems, 1);
-        assert_eq!(stats.concepts, 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 3);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
     }
 
@@ -1581,10 +2064,10 @@ BADLINE\r\n";
         // Identical to the snapshot-only archive: the Full files' poison rows
         // (extra concept 555555001, stale description, duplicate edge) must
         // not be parsed.
-        assert_eq!(stats.concepts, 2);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
+        assert_eq!(count_rows(&backend, "concepts"), 3);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // the inactive concept's term too
     }
 
     #[tokio::test]
@@ -1611,7 +2094,7 @@ BADLINE\r\n";
         // synonym a bare-`en` and a dialect preferredForLanguage row
         // (111005 → en + en-US, 111001 → en + en-GB) = 8;
         // 789012001: en FSN + de FSN = 2.
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // includes the inactive concept 999999001
 
         // displayLanguage=de resolves the German synonym as the display.
         let resp = backend
@@ -1701,7 +2184,7 @@ BADLINE\r\n";
         // Full import yields 10 designation rows (see
         // import_snomed_rf2_writes_multilingual_designations); the 2 German
         // synonyms/FSNs from the per-language Description file are dropped.
-        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+        assert_eq!(count_rows(&backend, "concept_designations"), 9); // includes the inactive concept 999999001
 
         // English lookups behave exactly as without a filter.
         let resp = backend
@@ -1744,7 +2227,7 @@ BADLINE\r\n";
 
         // en is force-retained alongside the requested de, so the result is
         // identical to an unfiltered import.
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // includes the inactive concept 999999001
     }
 
     #[test]
@@ -1984,6 +2467,58 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         );
     }
 
+    /// The concept model tables: concept metadata and description terms in
+    /// id order, every relationship with its group (concrete values
+    /// marked), and the MRCM rules that apply to expressions; the model is
+    /// built from them.
+    #[tokio::test]
+    async fn import_snomed_rf2_writes_the_concept_model() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_rf2_zip_with_simple_refset(&[
+            (
+                "Snapshot/Terminology/sct2_RelationshipConcreteValues_Snapshot_INT_20240101.txt",
+                "id\teffectiveTime\tactive\tmoduleId\tsourceId\tvalue\trelationshipGroup\ttypeId\tcharacteristicTypeId\tmodifierId\r\n\
+                 c1\t20240101\t1\t900000000000207008\t789012001\t#5\t1\t123456001\t900000000000011006\t900000000000451002\r\n",
+            ),
+            (
+                "Snapshot/Refset/Metadata/der2_cissccRefset_MRCMAttributeDomainSnapshot_INT_20240101.txt",
+                "id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\tdomainId\tgrouped\tattributeCardinality\tattributeInGroupCardinality\truleStrengthId\tcontentTypeId\r\n\
+                 d1\t20240101\t1\t900000000000012004\t723561005\t123456001\t789012001\t1\t0..*\t0..1\t723597001\t723596005\r\n\
+                 d2\t20240101\t1\t900000000000012004\t723561005\t123456001\t789012001\t1\t0..*\t0..1\t723597001\t723594008\r\n",
+            ),
+        ]);
+        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false, &LanguageFilter::default())
+            .await
+            .expect("import should succeed");
+        assert_eq!(count_rows(&backend, "snomed_concepts"), 3);
+        assert_eq!(count_rows(&backend, "snomed_relationships"), 2);
+        // The precoordinated-only rule (723594008) is left out.
+        assert_eq!(count_rows(&backend, "snomed_mrcm"), 1);
+        let conn = backend.pool().get().unwrap();
+        let rows = crate::snomed::store::concepts_sqlite(
+            &conn,
+            "snomed-ct|20240101",
+            &["123456001".to_string()],
+        )
+        .unwrap();
+        let row = &rows["123456001"].row;
+        assert_eq!(
+            row.terms,
+            ["Foo disorder", "Foo disorder (disorder)", "Foo malady", "Foo Erkrankung"]
+        );
+        assert_eq!(row.effective_time.as_deref(), Some("20240101"));
+        assert!(row.active && row.primitive);
+        let model = crate::snomed::store::load_sqlite(&conn, "snomed-ct|20240101")
+            .unwrap()
+            .expect("a model");
+        let bar = model.idx("789012001").unwrap();
+        assert_eq!(model.parents[bar as usize], [model.idx("123456001").unwrap()]);
+        assert_eq!(model.rels[bar as usize].len(), 1);
+        assert_eq!(model.rels[bar as usize][0].group, 1);
+        assert_eq!(model.domains.len(), 1);
+    }
+
     #[tokio::test]
     async fn import_snomed_rf2_idempotent_reimport() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
@@ -2012,7 +2547,7 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         .unwrap();
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 3); // includes the inactive concept 999999001
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
     }
 
@@ -2033,8 +2568,8 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         .await
         .unwrap();
 
-        assert_eq!(stats.concepts, 2);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
+        assert_eq!(count_rows(&backend, "concepts"), 3);
     }
 
     #[tokio::test]
