@@ -34,9 +34,9 @@
 //!   the key `{layer}.{group}` (the reference validator uses `{layer}.{key}`,
 //!   which silently overwrites the branch schema and loses its constraints).
 
+use super::bundle::{Entry, Resolution};
 use super::errors::{self, ErrorKind, Severity, ValidationError};
 use super::path::PathTracker;
-use super::bundle::{Entry, Resolution};
 use super::{SyncOutcome, UnknownProfilePolicy, ValidationOptions};
 use crate::effects::Deferred;
 use crate::resolver::SchemaResolver;
@@ -137,7 +137,6 @@ impl<'a> WalkCtx<'a> {
         self.resolver
     }
 
-
     /// The type of the contained resource `id` of the innermost resource.
     /// The type of the entry whose `fullUrl` is `url` in the innermost
     /// Bundle being walked.
@@ -178,11 +177,11 @@ impl<'a> WalkCtx<'a> {
         let entries = self.bundles.last()?;
         // The entry the walk is inside: the innermost resource that is one
         // of the Bundle's entry resources.
-        let source = self.resources.iter().rev().find_map(|r| {
-            entries
-                .iter()
-                .find(|e| std::ptr::eq(e.resource, *r))
-        });
+        let source = self
+            .resources
+            .iter()
+            .rev()
+            .find_map(|r| entries.iter().find(|e| std::ptr::eq(e.resource, *r)));
         match super::bundle::resolve(entries, reference, source.and_then(|e| e.full_url)) {
             Resolution::Found(index) => Some(entries[index].resource),
             Resolution::Cannot(_) | Resolution::NotFound => None,
@@ -348,7 +347,14 @@ fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions)
     }
     add_meta_profiles(ctx, &mut set, resource);
     for profile in &opts.profiles {
-        add_profile(ctx, &mut set, profile, Some(resource), opts.unknown_profile, true);
+        add_profile(
+            ctx,
+            &mut set,
+            profile,
+            Some(resource),
+            opts.unknown_profile,
+            true,
+        );
     }
 
     validate_node(ctx, &set, resource);
@@ -589,7 +595,10 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
     if is_resource {
         ctx.contained.push(contained_types(obj));
         ctx.resources.push(data);
-        let rt = obj.get("resourceType").and_then(Value::as_str).unwrap_or_default();
+        let rt = obj
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         ctx.resource_roots.push((ctx.path.depth(), rt.to_string()));
         if is_bundle {
             let entries = super::bundle::entries(data).into_iter().map(|(_, e)| e);
@@ -1046,7 +1055,12 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
     let Some((depth, root)) = ctx.resource_roots.last().cloned() else {
         return;
     };
-    let mut keys: Vec<String> = ctx.path.keys_from(depth).iter().map(|k| k.to_string()).collect();
+    let mut keys: Vec<String> = ctx
+        .path
+        .keys_from(depth)
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
     keys.pop(); // the `extension` key itself
     let sidecar = keys.last().is_some_and(|k| k.starts_with('_'));
     if let Some(last) = keys.last_mut()
@@ -1143,9 +1157,9 @@ fn path_matches(context: &str, instance: &str) -> bool {
     let i: Vec<&str> = instance.split('.').collect();
     c.len() == i.len()
         && c.iter().zip(&i).all(|(c, i)| match c.strip_suffix("[x]") {
-            Some(stem) => i
-                .strip_prefix(stem)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())),
+            Some(stem) => i.strip_prefix(stem).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())
+            }),
             None => c == i,
         })
 }
@@ -1535,8 +1549,13 @@ mod tests {
         let on_address = json!({"resourceType": "Patient",
             "address": [{"city": "X", "extension": [geo.clone()]}],
             "contact": [{"address": {"city": "Y", "extension": [geo.clone()]}}]});
-        assert!(context_errors(&on_address).is_empty(), "{:?}", context_errors(&on_address));
-        let on_name = json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
+        assert!(
+            context_errors(&on_address).is_empty(),
+            "{:?}",
+            context_errors(&on_address)
+        );
+        let on_name =
+            json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
         assert_eq!(context_errors(&on_name), vec!["Patient.name.0.extension.0"]);
 
         // birthPlace: context `Patient` (the root only), inside a Bundle too.
@@ -1558,7 +1577,10 @@ mod tests {
         let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "c"},
             "extension": [position.clone()],
             "component": [{"code": {"text": "x"}, "extension": [position.clone()]}]});
-        assert_eq!(context_errors(&obs), vec!["Observation.component.0.extension.0"]);
+        assert_eq!(
+            context_errors(&obs),
+            vec!["Observation.component.0.extension.0"]
+        );
     }
 
     /// A keyword the base declares and every profile in the chain restates
