@@ -567,3 +567,93 @@ fn strings_are_capped_at_one_megabyte() {
         errs.iter().map(|e| &e.0).collect::<Vec<_>>()
     );
 }
+
+/// `ext-ctxt-*`: an extension whose contexts are element paths, another
+/// extension's url, and a FHIRPath expression is judged against each kind.
+#[tokio::test]
+async fn extension_contexts_of_every_kind() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://hl7.org/fhir/test/StructureDefinition/ext-ctxt-defn",
+        "name": "ExtCtxt", "status": "active", "kind": "complex-type", "abstract": false,
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "context": [
+            {"type": "element", "expression": "Patient"},
+            {"type": "element", "expression": "Patient.name"},
+            {"type": "extension", "expression": "http://hl7.org/fhir/StructureDefinition/patient-interpreterRequired"},
+            {"type": "fhirpath", "expression": "Patient.address.where(use = 'home')"}
+        ],
+        "differential": {"element": [
+            {"id": "Extension.extension", "path": "Extension.extension", "max": "0"},
+            {"id": "Extension.url", "path": "Extension.url",
+             "fixedUri": "http://hl7.org/fhir/test/StructureDefinition/ext-ctxt-defn"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "boolean"}]}
+        ]}
+    });
+    let ext = json!({"url": "http://hl7.org/fhir/test/StructureDefinition/ext-ctxt-defn",
+                     "valueBoolean": true});
+    let count = |issues: Vec<ValidationError>| {
+        issues
+            .iter()
+            .filter(|e| e.kind == helios_fhir_validator::ErrorKind::ExtensionContext)
+            .count()
+    };
+    let run = |resource: Value| {
+        let sd = sd.clone();
+        async move {
+            let core = core_registry(FhirVersion::R4);
+            let mut overlay = SchemaRegistry::new();
+            overlay.insert(convert(&sd).unwrap().schema);
+            let resolver: Arc<dyn SchemaResolver> =
+                Arc::new(CompositeResolver::new(vec![Arc::new(overlay), core]));
+            let opts = ValidationOptions {
+                check_extension_context: true,
+                ..Default::default()
+            };
+            Validator::new(resolver)
+                .validate_sync(&resource, &opts)
+                .errors
+        }
+    };
+    let patient = |extra: Value| {
+        let mut p = json!({"resourceType": "Patient"});
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        p
+    };
+    // allowed: root, name, inside interpreterRequired
+    assert_eq!(
+        count(run(patient(json!({"extension": [ext.clone()]}))).await),
+        0
+    );
+    assert_eq!(
+        count(
+            run(patient(
+                json!({"name": [{"extension": [ext.clone()], "family": "x"}]})
+            ))
+            .await
+        ),
+        0
+    );
+    let nested = json!({"url": "http://hl7.org/fhir/StructureDefinition/patient-interpreterRequired",
+                        "extension": [ext.clone()]});
+    let issues = run(patient(json!({"extension": [nested]}))).await;
+    let shown = format!("{issues:#?}");
+    assert_eq!(count(issues), 0, "{shown}");
+    // not allowed: on a primitive, on another resource type
+    assert_eq!(
+        count(
+            run(patient(
+                json!({"active": true, "_active": {"extension": [ext.clone()]}})
+            ))
+            .await
+        ),
+        1
+    );
+    assert_eq!(
+        count(run(json!({"resourceType": "Organization", "extension": [ext.clone()]})).await),
+        1
+    );
+}

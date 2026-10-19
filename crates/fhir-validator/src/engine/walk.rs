@@ -120,6 +120,9 @@ pub(super) struct WalkCtx<'a> {
     /// last: element paths of extension parents are taken relative to the
     /// innermost resource (`Patient.name` inside `Bundle.entry.0.resource`).
     resource_roots: Vec<(usize, String)>,
+    /// The urls of the extensions being walked, innermost last (for
+    /// `extension`-type contexts of nested extensions).
+    extension_urls: Vec<String>,
     /// The `_foo` sidecar (id/extension) of the primitive being validated,
     /// if any: element keywords on a primitive (`required: ["extension"]`
     /// from a profile constraining `display.extension`) describe it.
@@ -236,6 +239,7 @@ impl<'a> WalkCtx<'a> {
             resources: self.resources.clone(),
             resource_roots: Vec::new(),
             primitive_sidecar: None,
+            extension_urls: Vec::new(),
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
         };
@@ -339,6 +343,7 @@ pub(super) fn validate(
         resources: Vec::new(),
         resource_roots: Vec::new(),
         primitive_sidecar: None,
+        extension_urls: Vec::new(),
         nesting: 0,
         conformance: Rc::default(),
     };
@@ -1081,6 +1086,19 @@ fn validate_extension_item<'a>(
         validate_node(ctx, elset, item);
         return;
     };
+    ctx.extension_urls.push(url.to_string());
+    validate_known_extension(ctx, elset, item, url, modifier);
+    ctx.extension_urls.pop();
+}
+
+/// [`validate_extension_item`] for an item with an absolute url.
+fn validate_known_extension<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    item: &'a Value,
+    url: &str,
+    modifier: bool,
+) {
     match ctx.resolver.resolve(url) {
         Some(definition) if definition.kind.as_deref() == Some(crate::schema::kind::EXTENSION) => {
             let mut extended = elset.clone();
@@ -1277,7 +1295,42 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
 
         let mut met = false;
         let mut judgeable = true;
+        // The extension sits directly in another extension.
+        let in_extension = keys
+            .last()
+            .is_some_and(|k| k == "extension" || k == "modifierExtension");
         for c in contexts {
+            // `extension` context (`extension:<url>`): the url of the
+            // extension it may sit in.
+            if let Some(url) = c.strip_prefix("extension:") {
+                if in_extension && ctx.extension_urls.last().is_some_and(|u| u == url) {
+                    met = true;
+                }
+                continue;
+            }
+            // `fhirpath` context (`fhirpath:<expression>`): only its leading
+            // element path can be judged here — elsewhere it is not met; on
+            // that element the expression decides, which the walk cannot
+            // evaluate.
+            if let Some(expression) = c.strip_prefix("fhirpath:") {
+                let prefix = expression
+                    .split(".where(")
+                    .next()
+                    .unwrap_or(expression)
+                    .split('(')
+                    .next()
+                    .unwrap_or(expression);
+                let simple = !prefix.is_empty()
+                    && prefix.starts_with(|ch: char| ch.is_ascii_uppercase())
+                    && prefix
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.');
+                if !simple || parent_paths.iter().any(|p| path_matches(prefix, p)) {
+                    judgeable = false;
+                    break;
+                }
+                continue;
+            }
             if matches!(
                 c.as_str(),
                 "Element" | "BackboneElement" | "Resource" | "DomainResource"
