@@ -125,34 +125,7 @@ fn has_validatable_input(v_params: &[Value]) -> bool {
 
 /// Build the IG-pinned OperationOutcome for the "no validatable input" path.
 fn no_code_to_validate_outcome() -> Value {
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": "error",
-            "code": "invalid",
-            "details": { "text": NO_CODE_TO_VALIDATE_TEXT }
-        }]
-    })
-}
-
-/// Convert an `HtsError` into an OperationOutcome resource for embedding in a
-/// per-validation slot. Keeps the diagnostic text in the `details.text` field
-/// (where the IG fixtures compare it).
-fn err_to_outcome(err: &HtsError) -> Value {
-    let (severity, code, text) = match err {
-        HtsError::InvalidRequest(m) => ("error", "invalid", m.clone()),
-        HtsError::NotFound(m) => ("error", "not-found", m.clone()),
-        HtsError::VsInvalid(m) => ("error", "invalid", m.clone()),
-        other => ("error", "exception", other.to_string()),
-    };
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": severity,
-            "code": code,
-            "details": { "text": text }
-        }]
-    })
+    HtsError::InvalidRequest(NO_CODE_TO_VALIDATE_TEXT.into()).to_operation_outcome()
 }
 
 /// Forward batch-level inheritable parameters into a per-validation params
@@ -232,7 +205,7 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
 
         let result_resource = match process_vs_validate_code(state, delegated_params).await {
             Ok(value) => value,
-            Err(err) => err_to_outcome(&err),
+            Err(err) => err.to_operation_outcome(),
         };
 
         output_validations.push(json!({

@@ -46,42 +46,6 @@ use super::subsumes::process_subsumes;
 use super::translate::process_translate;
 use super::validate_code::{process_validate_code, process_vs_validate_code};
 
-// ── Error helpers ──────────────────────────────────────────────────────────────
-
-/// HTTP status code (as a numeric string) for a given `HtsError`.
-fn error_status(e: &HtsError) -> &'static str {
-    match e {
-        HtsError::NotFound(_) => "404",
-        HtsError::NotSupported(_) => "501",
-        HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) => "400",
-        HtsError::Internal(_) | HtsError::StorageError(_) => "500",
-        HtsError::PreconditionFailed(_) => "412",
-        HtsError::TooCostly(_) => "422",
-    }
-}
-
-/// Build a FHIR OperationOutcome JSON value from an `HtsError`.
-fn error_to_outcome(e: &HtsError) -> Value {
-    let (code, diagnostics) = match e {
-        HtsError::NotFound(msg) => ("not-found", msg.as_str()),
-        HtsError::NotSupported(msg) => ("not-supported", msg.as_str()),
-        // VsInvalid maps to FHIR issue code `invalid` (same as InvalidRequest)
-        // but carries a distinct `tx-issue-type=vs-invalid` coding in the
-        // top-level error response (see `HtsError::into_response`). Inside a
-        // batch entry the fine-grained tx-issue-type is not surfaced; the
-        // entry-level `invalid` code is sufficient for batch reporting.
-        HtsError::InvalidRequest(msg) | HtsError::VsInvalid(msg) => ("invalid", msg.as_str()),
-        HtsError::Internal(msg) => ("exception", msg.as_str()),
-        HtsError::StorageError(msg) => ("exception", msg.as_str()),
-        HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
-        HtsError::TooCostly(msg) => ("too-costly", msg.as_str()),
-    };
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{"severity": "error", "code": code, "diagnostics": diagnostics}]
-    })
-}
-
 // ── Entry dispatch ─────────────────────────────────────────────────────────────
 
 /// Outcome of one batch entry: HTTP status (as FHIR wants it, a string) and
@@ -322,8 +286,8 @@ pub async fn batch_handler<B: TerminologyBackend + Clone>(
                 e
             }
             Err(e) => json!({
-                "resource": error_to_outcome(&e),
-                "response": { "status": error_status(&e) }
+                "resource": e.to_operation_outcome(),
+                "response": { "status": e.status().as_u16().to_string() }
             }),
         };
         response_entries.push(response_entry);
