@@ -1975,6 +1975,50 @@ fn handle_sidecar<'a>(
         _ => {}
     }
 
+    // ele-1 on a primitive carried only by its sidecar: an id alone is no
+    // content (a value or an extension is needed). The FHIRPath ele-1 never
+    // sees a sidecar-only primitive.
+    let id_only = |side: &Value| {
+        side.as_object()
+            .is_some_and(|o| !o.is_empty() && o.keys().all(|k| k == "id"))
+    };
+    // (FHIR packs only: FHIR Schema fixtures treat a bare sidecar as legal.)
+    let fhir = knows_hl7_extensions(ctx.resolver);
+    let lonely: Vec<Option<usize>> = match value {
+        _ if !fhir => Vec::new(),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter(|(i, side)| {
+                id_only(side)
+                    && base_value
+                        .and_then(Value::as_array)
+                        .and_then(|b| b.get(*i))
+                        .is_none_or(Value::is_null)
+            })
+            .map(|(i, _)| Some(i))
+            .collect(),
+        side if id_only(side) && base_value.is_none_or(Value::is_null) => vec![None],
+        _ => Vec::new(),
+    };
+    for index in lonely {
+        ctx.path.pop();
+        ctx.path.push_key(base_key);
+        if let Some(i) = index {
+            ctx.path.push_index(i);
+        }
+        ctx.error(
+            ErrorKind::FhirpathConstraint,
+            "Constraint failed: ele-1: 'All FHIR elements must have a @value or children'"
+                .to_string(),
+        );
+        if index.is_some() {
+            ctx.path.pop();
+        }
+        ctx.path.pop();
+        ctx.path.push_key(key);
+    }
+
     // Every position of a primitive array needs a value, an id/extension
     // sidecar, or both.
     if let Value::Array(sidecars) = value {

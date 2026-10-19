@@ -409,7 +409,8 @@ fn json_representation_rules() {
     assert_eq!(errs[0].0, "Patient.name.0.given");
     assert!(errs[0].1.contains("invalid at index 1"), "{errs:#?}");
     let errs = structural_errors(&json!({"resourceType": "Patient",
-        "name": [{"given": ["a", null], "_given": [null, {"id": "b"}]}]}));
+        "name": [{"given": ["a", null], "_given": [null, {"extension": [{
+            "url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason", "valueCode": "unknown"}]}]}]}));
     assert!(errs.is_empty(), "{errs:#?}");
 
     // Resource.id carries no extensions.
@@ -1217,5 +1218,22 @@ async fn string_length_bounds() {
     assert_eq!(
         count(validate_with(&p("abc", "Smithers"), &[sd], &[url]).await),
         1
+    );
+}
+
+/// `patient-id-only`: a primitive with only an id (no value, no
+/// extension) breaks ele-1.
+#[test]
+fn primitive_with_only_an_id() {
+    let errs =
+        structural_errors(&json!({"resourceType": "Patient", "_implicitRules": {"id": "i1"}}));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert_eq!(errs[0].0, "Patient.implicitRules");
+    assert!(
+        structural_errors(
+            &json!({"resourceType": "Patient", "implicitRules": "http://x.org",
+        "_implicitRules": {"id": "i1"}})
+        )
+        .is_empty()
     );
 }
