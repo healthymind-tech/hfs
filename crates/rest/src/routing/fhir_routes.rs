@@ -6,7 +6,7 @@
 use axum::{
     Router,
     body::Body,
-    extract::Request,
+    extract::{Path, Request, State},
     routing::{delete, get, head, patch, post, put},
 };
 use helios_fhir::FhirVersion;
@@ -524,9 +524,45 @@ where
         // operations-capability.html#partial-operation-support requires such a
         // server to publish its own definition — with `base` naming the
         // guide's — and to cite that from its CapabilityStatement.
+        //
+        // Only those ids are routed here: a `/OperationDefinition/{id}` route
+        // would shadow every other OperationDefinition interaction (reading
+        // the ones IG packages install, PUT, DELETE, `$validate`).
         .route(
-            "/OperationDefinition/{id}",
-            get(handlers::sof::sof_operation_definition_handler::<S>),
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::SQL_RUN_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::SQL_RUN_DEFINITION_ID.to_string()),
+                )
+            }),
+        )
+        .route(
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::SQL_EXPORT_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::SQL_EXPORT_DEFINITION_ID.to_string()),
+                )
+            }),
+        )
+        .route(
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::REINDEX_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::REINDEX_DEFINITION_ID.to_string()),
+                )
+            }),
         )
         // `$sql-run` — system level only (`system=true, type=false,
         // instance=false`). The subject is named by `subjectCanonical`,

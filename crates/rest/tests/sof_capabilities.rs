@@ -263,4 +263,46 @@ mod sof_capability_tests {
             "3.0.0-ballot defines no $sql-on-fhir-capabilities endpoint: {body}"
         );
     }
+
+    /// Only this server's own definitions are routed specially: every other
+    /// OperationDefinition — the ones IG packages install — is an ordinary
+    /// resource that can be written, read, validated and deleted.
+    #[tokio::test]
+    async fn test_other_operation_definitions_are_ordinary_resources() {
+        let server = create_test_server().await;
+        let tenant = || HeaderValue::from_static("test-tenant");
+        let od = serde_json::json!({"resourceType": "OperationDefinition", "id": "questionnaire-package",
+            "url": "http://example.org/OperationDefinition/questionnaire-package", "name": "QuestionnairePackage",
+            "status": "active", "kind": "operation", "code": "questionnaire-package",
+            "system": false, "type": true, "instance": false, "resource": ["Questionnaire"]});
+        server
+            .put("/OperationDefinition/questionnaire-package")
+            .add_header(X_TENANT_ID, tenant())
+            .json(&od)
+            .await
+            .assert_status(StatusCode::CREATED);
+        let read = server
+            .get("/OperationDefinition/questionnaire-package")
+            .add_header(X_TENANT_ID, tenant())
+            .await;
+        read.assert_status(StatusCode::OK);
+        assert_eq!(read.json::<Value>()["code"], "questionnaire-package");
+        server
+            .post("/OperationDefinition/$validate")
+            .add_header(X_TENANT_ID, tenant())
+            .json(&od)
+            .await
+            .assert_status(StatusCode::OK);
+        server
+            .delete("/OperationDefinition/questionnaire-package")
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status_success();
+        // Our own definitions are still served.
+        server
+            .get("/OperationDefinition/hfs-sql-run")
+            .add_header(X_TENANT_ID, tenant())
+            .await
+            .assert_status(StatusCode::OK);
+    }
 }
