@@ -73,6 +73,9 @@ pub(super) struct Node {
     /// The ED's `type[].targetProfile`s, for `type`/`profile` slice
     /// discriminators through `resolve()`.
     pub type_target_profiles: Vec<String>,
+    /// `(profile, element id)` of type profiles that name an element of
+    /// the profile (`elementdefinition-profile-element`).
+    pub profile_elements: Vec<(String, String)>,
 }
 
 impl Node {
@@ -291,6 +294,7 @@ fn record_types(node: &mut Node, ed: &Ed) {
         .iter()
         .flat_map(|t| t.target_profile.iter().cloned())
         .collect();
+    node.profile_elements = ed.types.iter().flat_map(EdType::profile_elements).collect();
 }
 
 /// Type reference, contentReference, and the value-level keywords.
@@ -320,6 +324,9 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
+            if !t.profile.is_empty() && t.effective_code() != "Extension" {
+                element.schema.type_profiles = Some(t.profile.clone());
+            }
         }
         _ => {
             // Multiple types without `[x]` should not occur; take the first.
@@ -348,6 +355,17 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             strength: binding.strength.clone(),
         });
     }
+    // A required additional binding on a binding that is not itself
+    // enforced (example/preferred) is the one to check.
+    if let Some(binding) = &ed.binding
+        && !matches!(binding.strength.as_deref(), Some("required" | "extensible"))
+        && let Some(value_set) = binding.required_additional()
+    {
+        schema.binding = Some(Binding {
+            value_set,
+            strength: Some("required".to_string()),
+        });
+    }
     apply_constraints(schema, &ed.constraint, false);
     for (key, value) in &ed.rest {
         if let Some(rest) = key.strip_prefix("fixed")
@@ -360,6 +378,33 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             && !key.starts_with('_')
         {
             schema.pattern = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("minValue")
+            && !rest.is_empty()
+        {
+            schema.min_value = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("maxValue")
+            && !rest.is_empty()
+        {
+            schema.max_value = Some(value.clone());
+        } else if key == "maxLength" {
+            schema.max_length = value.as_u64().filter(|n| *n > 0);
+        } else if key == "extension" {
+            for ext in value.as_array().into_iter().flatten() {
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/minLength")
+                {
+                    schema.min_length = ext.get("valueInteger").and_then(serde_json::Value::as_u64);
+                }
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/maxSize")
+                {
+                    schema.max_size = ext
+                        .get("valueDecimal")
+                        .or_else(|| ext.get("valueInteger"))
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|n| n as u64);
+                }
+            }
         }
     }
 }
@@ -415,6 +460,9 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         if !t.target_profile.is_empty() {
             branch.schema.refers = Some(t.target_profile.clone());
         }
+        if !t.profile.is_empty() && t.effective_code() != "Extension" {
+            branch.schema.type_profiles = Some(t.profile.clone());
+        }
         apply_value_keywords(&mut branch.schema, ed, warnings);
     }
 
@@ -423,6 +471,13 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         .entry(base_name.to_string())
         .or_insert_with(|| Node::new(base_name.to_string()));
     record_types(declarer, ed);
+    // A differential `foo[x]` without `type` (a binding or constraint added
+    // to `Observation.value[x]`) keeps the base's types: it declares no
+    // branches (an empty `choices` list restricts nothing) and its keywords
+    // ride on the declarer, which joins whichever branch the data uses.
+    if ed.types.is_empty() {
+        apply_value_keywords(&mut declarer.schema, ed, warnings);
+    }
     match &mut declarer.schema.choices {
         Some(existing) => {
             for name in branch_names {
@@ -449,6 +504,7 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
         type_codes: _,
         type_profiles: _,
         type_target_profiles: _,
+        profile_elements: _,
     } = node;
 
     if dead {
@@ -531,11 +587,12 @@ fn parse_numeric_max(max: Option<&str>) -> Option<u64> {
 }
 
 fn parse_content_reference(reference: &str) -> Option<Vec<String>> {
-    // `#Questionnaire.item`, or with the defining StructureDefinition's
-    // canonical in front (`http://hl7.org/fhir/StructureDefinition/Composition#Composition.section`),
-    // as newer IG Publisher snapshots write it. The path names the element
-    // either way.
-    let (_, path) = reference.split_once('#')?;
+    // `#Bundle.link`, or the canonical form R4 IG snapshots carry,
+    // `http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link`.
+    let path = match reference.strip_prefix('#') {
+        Some(path) => path,
+        None => reference.split_once('#')?.1,
+    };
     let mut parts = path.split('.');
     let root = parts.next()?;
     if root.is_empty() {
@@ -567,5 +624,24 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod content_reference_tests {
+    #[test]
+    fn canonical_content_references_parse() {
+        let local = super::parse_content_reference("#Bundle.link");
+        assert_eq!(
+            local,
+            Some(vec!["Bundle".into(), "elements".into(), "link".into()])
+        );
+        assert_eq!(
+            super::parse_content_reference(
+                "http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link"
+            ),
+            local
+        );
+        assert_eq!(super::parse_content_reference("Bundle.link"), None);
     }
 }

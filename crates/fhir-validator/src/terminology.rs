@@ -50,22 +50,30 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4_TX, FhirVersion::R4))))
+            Arc::clone(
+                TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4_TX, FhirVersion::R4))),
+            )
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4B_TX, FhirVersion::R4B))))
+            Arc::clone(
+                TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4B_TX, FhirVersion::R4B))),
+            )
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R5_TX, FhirVersion::R5))))
+            Arc::clone(
+                TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R5_TX, FhirVersion::R5))),
+            )
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX, FhirVersion::R6))))
+            Arc::clone(
+                TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX, FhirVersion::R6))),
+            )
         }
         // Feature unification can add FhirVersion variants beyond the packs
         // this crate was built with: `helios-audit`'s R5/R6 features enable
@@ -234,6 +242,16 @@ impl CoreTerminology {
         let (system, code) = coding_parts(coding);
         let codes = displays.get(system?)?;
         let mut verdict = TxVerdict::valid();
+        if let Some(code) = code
+            && !codes.contains_key(code)
+        {
+            // The pack holds every code of these (complete) code systems.
+            verdict.unknown_code = Some(format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                system.unwrap_or_default()
+            ));
+            return Some(verdict);
+        }
         let (Some(code), Some(display)) = (code, coding.get("display").and_then(Value::as_str))
         else {
             return Some(verdict);
@@ -368,9 +386,9 @@ impl TerminologyProvider for CoreTerminology {
                     TxCheck::InValueSet(vs, coded) => {
                         TxVerdict::member(self.member(vs, coded).unwrap_or(true))
                     }
-                    TxCheck::Coding(coding) => self
-                        .coding_verdict(coding)
-                        .unwrap_or_else(TxVerdict::valid),
+                    TxCheck::Coding(coding) => {
+                        self.coding_verdict(coding).unwrap_or_else(TxVerdict::valid)
+                    }
                 })
             })
             .collect()
@@ -454,9 +472,10 @@ impl TerminologyProvider for CompositeTerminologyProvider {
         let mut out: Vec<Option<Result<TxVerdict, TerminologyError>>> = checks
             .iter()
             .map(|c| match c {
-                TxCheck::InValueSet(vs, coded) => {
-                    self.embedded.member(vs, coded).map(|v| Ok(TxVerdict::member(v)))
-                }
+                TxCheck::InValueSet(vs, coded) => self
+                    .embedded
+                    .member(vs, coded)
+                    .map(|v| Ok(TxVerdict::member(v))),
                 TxCheck::Coding(coding) => self.embedded.coding_verdict(coding).map(Ok),
             })
             .collect();

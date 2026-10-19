@@ -66,6 +66,49 @@ pub fn parse_expr(ecl: &str) -> Result<EclExpr, crate::error::HtsError> {
         .map_err(|e| crate::error::HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))
 }
 
+/// How a constraint on a SNOMED CT edition with a stored concept model is
+/// answered: by the SQL evaluators when it is in their subset, else by the
+/// in-memory model ([`crate::snomed::ecl`]). SNOMED CT constraints are
+/// parsed by the full ECL grammar; a syntax error or an unknown concept makes
+/// the value set invalid.
+enum SnomedPlan {
+    Sql(EclExpr),
+    Model(crate::snomed::ecl::Ecl),
+}
+
+fn snomed_parse(ecl: &str) -> Result<crate::snomed::ecl::Ecl, crate::error::HtsError> {
+    crate::snomed::ecl::parse(ecl).map_err(|e| {
+        crate::error::HtsError::VsInvalid(format!(
+            "The SNOMED CT expression constraint '{ecl}' is not valid: {e}"
+        ))
+    })
+}
+
+fn unknown_concept(ecl: &str, code: &str) -> crate::error::HtsError {
+    crate::error::HtsError::VsInvalid(format!(
+        "The SNOMED CT expression constraint '{ecl}' refers to the concept {code}, which is not in the code system"
+    ))
+}
+
+fn model_results(
+    model: &crate::snomed::SnomedModel,
+    ecl: &str,
+    expr: &crate::snomed::ecl::Ecl,
+) -> Result<Vec<ResolvedConcept>, crate::error::HtsError> {
+    let set = crate::snomed::ecl::Evaluator::new(model)
+        .eval(expr)
+        .map_err(|u| unknown_concept(ecl, &u.0))?;
+    let mut out: Vec<ResolvedConcept> = set
+        .iter()
+        .map(|&i| ResolvedConcept {
+            code: model.code(i),
+            display: model.display_of(i).map(str::to_string),
+        })
+        .collect();
+    out.sort_by(|a, b| a.code.cmp(&b.code));
+    Ok(out)
+}
+
 /// PostgreSQL twin of [`parse_and_evaluate`].
 #[cfg(feature = "postgres")]
 pub async fn parse_and_evaluate_pg(
@@ -73,8 +116,44 @@ pub async fn parse_and_evaluate_pg(
     system_id: &str,
     ecl: &str,
 ) -> Result<Vec<ResolvedConcept>, crate::error::HtsError> {
-    let expr = parse_expr(ecl)?;
-    pg_evaluator::evaluate(client, system_id, &expr).await
+    match snomed_plan_pg(client, system_id, ecl).await? {
+        Some(SnomedPlan::Model(e)) => {
+            let model = crate::snomed::store::load_pg(client, system_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::HtsError::Internal("SNOMED CT model vanished".into())
+                })?;
+            model_results(&model, ecl, &e)
+        }
+        Some(SnomedPlan::Sql(expr)) => pg_evaluator::evaluate(client, system_id, &expr).await,
+        None => {
+            let expr = parse_expr(ecl)?;
+            pg_evaluator::evaluate(client, system_id, &expr).await
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn snomed_plan_pg(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    ecl: &str,
+) -> Result<Option<SnomedPlan>, crate::error::HtsError> {
+    if crate::snomed::store::stamp_pg(client, system_id)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let e = snomed_parse(ecl)?;
+    let missing = crate::snomed::store::missing_pg(client, system_id, &e.concept_ids()).await?;
+    if let Some(c) = missing.first() {
+        return Err(unknown_concept(ecl, c));
+    }
+    Ok(Some(match e.to_simple() {
+        Some(s) => SnomedPlan::Sql(s),
+        None => SnomedPlan::Model(e),
+    }))
 }
 
 /// PostgreSQL twin of [`filter_candidates`].
@@ -88,8 +167,29 @@ pub async fn filter_candidates_pg(
     if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let expr = parse_expr(ecl)?;
-    pg_evaluator::filter_codes(client, system_id, &expr, candidates).await
+    match snomed_plan_pg(client, system_id, ecl).await? {
+        Some(SnomedPlan::Model(e)) => {
+            let model = crate::snomed::store::load_pg(client, system_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::HtsError::Internal("SNOMED CT model vanished".into())
+                })?;
+            let all = model_results(&model, ecl, &e)?;
+            let want: std::collections::HashSet<&String> = candidates.iter().collect();
+            Ok(all
+                .into_iter()
+                .map(|r| r.code)
+                .filter(|c| want.contains(c))
+                .collect())
+        }
+        Some(SnomedPlan::Sql(expr)) => {
+            pg_evaluator::filter_codes(client, system_id, &expr, candidates).await
+        }
+        None => {
+            let expr = parse_expr(ecl)?;
+            pg_evaluator::filter_codes(client, system_id, &expr, candidates).await
+        }
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -115,8 +215,38 @@ pub fn parse_and_evaluate(
     system_id: &str,
     ecl: &str,
 ) -> Result<Vec<ResolvedConcept>, HtsError> {
-    let expr = parse_expr(ecl)?;
-    evaluator::evaluate(conn, system_id, &expr)
+    match snomed_plan_sqlite(conn, system_id, ecl)? {
+        Some(SnomedPlan::Model(e)) => {
+            let model = crate::snomed::store::load_sqlite(conn, system_id)?
+                .ok_or_else(|| HtsError::Internal("SNOMED CT model vanished".into()))?;
+            model_results(&model, ecl, &e)
+        }
+        Some(SnomedPlan::Sql(expr)) => evaluator::evaluate(conn, system_id, &expr),
+        None => {
+            let expr = parse_expr(ecl)?;
+            evaluator::evaluate(conn, system_id, &expr)
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn snomed_plan_sqlite(
+    conn: &Connection,
+    system_id: &str,
+    ecl: &str,
+) -> Result<Option<SnomedPlan>, HtsError> {
+    if crate::snomed::store::stamp_sqlite(conn, system_id)?.is_none() {
+        return Ok(None);
+    }
+    let e = snomed_parse(ecl)?;
+    let missing = crate::snomed::store::missing_sqlite(conn, system_id, &e.concept_ids())?;
+    if let Some(c) = missing.first() {
+        return Err(unknown_concept(ecl, c));
+    }
+    Ok(Some(match e.to_simple() {
+        Some(s) => SnomedPlan::Sql(s),
+        None => SnomedPlan::Model(e),
+    }))
 }
 
 /// Return the subset of `candidates` that are members of the ECL constraint.
@@ -141,6 +271,22 @@ pub fn filter_candidates(
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
-    let expr = parse_expr(ecl)?;
-    evaluator::filter_codes(conn, system_id, &expr, candidates)
+    match snomed_plan_sqlite(conn, system_id, ecl)? {
+        Some(SnomedPlan::Model(e)) => {
+            let model = crate::snomed::store::load_sqlite(conn, system_id)?
+                .ok_or_else(|| HtsError::Internal("SNOMED CT model vanished".into()))?;
+            let all = model_results(&model, ecl, &e)?;
+            let want: HashSet<&String> = candidates.iter().collect();
+            Ok(all
+                .into_iter()
+                .map(|r| r.code)
+                .filter(|c| want.contains(c))
+                .collect())
+        }
+        Some(SnomedPlan::Sql(expr)) => evaluator::filter_codes(conn, system_id, &expr, candidates),
+        None => {
+            let expr = parse_expr(ecl)?;
+            evaluator::filter_codes(conn, system_id, &expr, candidates)
+        }
+    }
 }

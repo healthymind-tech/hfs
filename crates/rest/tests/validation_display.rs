@@ -34,7 +34,8 @@ fn display_issue(text: &str) -> Value {
 /// unknown.
 fn answer(op: &str, body: &Value) -> Value {
     let coding = param(body, "coding").map(|p| p["valueCoding"].clone());
-    let concept = param(body, "codeableConcept").map(|p| p["valueCodeableConcept"]["coding"][0].clone());
+    let concept =
+        param(body, "codeableConcept").map(|p| p["valueCodeableConcept"]["coding"][0].clone());
     let (system, code, display) = match coding.or(concept) {
         Some(c) => (
             c["system"].as_str().unwrap_or_default().to_string(),
@@ -42,9 +43,17 @@ fn answer(op: &str, body: &Value) -> Value {
             c["display"].as_str().map(str::to_string),
         ),
         None => (
-            param(body, "url").and_then(|p| p["valueUri"].as_str()).unwrap_or_default().to_string(),
-            param(body, "code").and_then(|p| p["valueCode"].as_str()).unwrap_or_default().to_string(),
-            param(body, "display").and_then(|p| p["valueString"].as_str()).map(str::to_string),
+            param(body, "url")
+                .and_then(|p| p["valueUri"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+            param(body, "code")
+                .and_then(|p| p["valueCode"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+            param(body, "display")
+                .and_then(|p| p["valueString"].as_str())
+                .map(str::to_string),
         ),
     };
     let mut parameter = Vec::new();
@@ -137,6 +146,9 @@ async fn upload_profile(server: &TestServer) {
 fn observation(display: &str) -> Value {
     json!({
         "resourceType": "Observation", "status": "final",
+        // 8867-4 makes it a heart rate, held to the core heartrate profile
+        "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                                  "code": "vital-signs"}]}],
         "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4", "display": display}]},
         "interpretation": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/nope", "code": "N"}]}],
         "subject": {"reference": "Patient/p"},
@@ -157,7 +169,10 @@ fn issues(outcome: &Value) -> Vec<(String, String, String)> {
             (
                 i["severity"].as_str().unwrap().to_string(),
                 i["expression"][0].as_str().unwrap_or_default().to_string(),
-                i["details"]["text"].as_str().unwrap_or_default().to_string(),
+                i["details"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
             )
         })
         .collect()
@@ -185,7 +200,9 @@ async fn wrong_display_follows_the_setting_and_never_fails_the_binding() {
         assert_eq!(display[0].0, severity, "{setting}");
         assert_eq!(display[0].1, "Observation.code.coding[0].display");
         assert!(
-            !found.iter().any(|(_, _, t)| t.contains("does not pass validation")),
+            !found
+                .iter()
+                .any(|(_, _, t)| t.contains("does not pass validation")),
             "a wrong display is not a binding failure: {outcome:#}"
         );
         // The unknown HL7 code system is an error on Coding.system.

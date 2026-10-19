@@ -34,10 +34,10 @@
 //!   the key `{layer}.{group}` (the reference validator uses `{layer}.{key}`,
 //!   which silently overwrites the branch schema and loses its constraints).
 
+use super::bundle::{Entry, Resolution};
 use super::errors::{self, ErrorKind, Severity, ValidationError};
 use super::path::PathTracker;
-use super::bundle::{Entry, Resolution};
-use super::{SyncOutcome, UnknownProfilePolicy, ValidationOptions};
+use super::{SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy, ValidationOptions};
 use crate::effects::Deferred;
 use crate::resolver::SchemaResolver;
 use crate::schema::FhirSchema;
@@ -94,6 +94,7 @@ pub(super) struct WalkCtx<'a> {
     use_meta_profiles: bool,
     /// What an unresolvable `meta.profile` claim reports.
     unknown_profile: UnknownProfilePolicy,
+    unknown_extensions: UnknownExtensionPolicy,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -119,6 +120,13 @@ pub(super) struct WalkCtx<'a> {
     /// last: element paths of extension parents are taken relative to the
     /// innermost resource (`Patient.name` inside `Bundle.entry.0.resource`).
     resource_roots: Vec<(usize, String)>,
+    /// The urls of the extensions being walked, innermost last (for
+    /// `extension`-type contexts of nested extensions).
+    extension_urls: Vec<String>,
+    /// The `_foo` sidecar (id/extension) of the primitive being validated,
+    /// if any: element keywords on a primitive (`required: ["extension"]`
+    /// from a profile constraining `display.extension`) describe it.
+    primitive_sidecar: Option<&'a Value>,
     /// How many slice-membership validations enclose this walk (each
     /// validates a value against a profile in a fresh context).
     nesting: usize,
@@ -126,6 +134,10 @@ pub(super) struct WalkCtx<'a> {
     /// the nested walks of one validation. An entry is written `true` while
     /// its validation runs, so reference cycles terminate.
     conformance: Rc<RefCell<HashMap<(usize, String), bool>>>,
+    /// Evaluates one invariant (`root resource, dotted path, id,
+    /// expression` → passes) while choosing among type profiles; `None`
+    /// when the caller has no FHIRPath engine.
+    invariants: Option<&'a InvariantCheck<'a>>,
 }
 
 /// Nested slice-membership validations deeper than this are assumed to
@@ -133,10 +145,19 @@ pub(super) struct WalkCtx<'a> {
 const MAX_NESTING: usize = 6;
 
 impl<'a> WalkCtx<'a> {
+    /// An empty primitive with no sidecar children has neither a value nor
+    /// children (ele-1), with the HL7 FHIR packs loaded.
+    pub(super) fn empty_primitive_breaks_ele1(&self) -> bool {
+        knows_hl7_extensions(self.resolver)
+            && self
+                .primitive_sidecar
+                .and_then(Value::as_object)
+                .is_none_or(|o| o.keys().all(|k| k == "id"))
+    }
+
     pub(super) fn resolver(&self) -> &dyn SchemaResolver {
         self.resolver
     }
-
 
     /// The type of the contained resource `id` of the innermost resource.
     /// The type of the entry whose `fullUrl` is `url` in the innermost
@@ -178,11 +199,11 @@ impl<'a> WalkCtx<'a> {
         let entries = self.bundles.last()?;
         // The entry the walk is inside: the innermost resource that is one
         // of the Bundle's entry resources.
-        let source = self.resources.iter().rev().find_map(|r| {
-            entries
-                .iter()
-                .find(|e| std::ptr::eq(e.resource, *r))
-        });
+        let source = self
+            .resources
+            .iter()
+            .rev()
+            .find_map(|r| entries.iter().find(|e| std::ptr::eq(e.resource, *r)));
         match super::bundle::resolve(entries, reference, source.and_then(|e| e.full_url)) {
             Resolution::Found(index) => Some(entries[index].resource),
             Resolution::Cannot(_) | Resolution::NotFound => None,
@@ -204,11 +225,21 @@ impl<'a> WalkCtx<'a> {
             return true;
         }
         self.conformance.borrow_mut().insert(key.clone(), true);
+        let outcome = self.nested_outcome(value, profile);
+        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        self.conformance.borrow_mut().insert(key, conforms);
+        conforms
+    }
+
+    /// Validate `value` against `profile` alone, in a fresh walk (paths
+    /// rooted at the value).
+    pub(super) fn nested_outcome(&self, value: &'a Value, profile: &str) -> SyncOutcome {
         let opts = ValidationOptions {
             profiles: vec![profile.to_string()],
             use_meta_profiles: false,
             unknown_profile: UnknownProfilePolicy::Ignore,
             check_extension_context: false,
+            unknown_extensions: self.unknown_extensions,
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
@@ -223,19 +254,30 @@ impl<'a> WalkCtx<'a> {
             check_extension_context: false,
             use_meta_profiles: false,
             unknown_profile: UnknownProfilePolicy::Ignore,
+            unknown_extensions: self.unknown_extensions,
             emitted: HashSet::new(),
             deferred_bindings: HashSet::new(),
             contained: Vec::new(),
             bundles: self.bundles.clone(),
             resources: self.resources.clone(),
             resource_roots: Vec::new(),
+            primitive_sidecar: None,
+            extension_urls: Vec::new(),
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
+            invariants: self.invariants,
         };
-        let outcome = run(&mut nested, value, &opts);
-        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
-        self.conformance.borrow_mut().insert(key, conforms);
-        conforms
+        run(&mut nested, value, &opts)
+    }
+
+    /// Whether `#id` names a contained resource of the innermost resource,
+    /// or — from inside a contained resource — of its container.
+    pub(super) fn contained_resolves(&self, id: &str) -> bool {
+        self.contained
+            .iter()
+            .rev()
+            .take(2)
+            .any(|level| level.iter().any(|(cid, _)| cid == id))
     }
 
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
@@ -301,10 +343,14 @@ impl<'a> WalkCtx<'a> {
     }
 }
 
-pub(super) fn validate(
-    resolver: &dyn SchemaResolver,
-    resource: &Value,
+/// See [`WalkCtx::invariants`].
+pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + 'a;
+
+pub(super) fn validate<'a>(
+    resolver: &'a dyn SchemaResolver,
+    resource: &'a Value,
     opts: &ValidationOptions,
+    invariants: Option<&'a InvariantCheck<'a>>,
 ) -> SyncOutcome {
     let resource_type = resource
         .get("resourceType")
@@ -319,14 +365,18 @@ pub(super) fn validate(
         check_extension_context: opts.check_extension_context,
         use_meta_profiles: opts.use_meta_profiles,
         unknown_profile: opts.unknown_profile,
+        unknown_extensions: opts.unknown_extensions,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
         bundles: Vec::new(),
         resources: Vec::new(),
         resource_roots: Vec::new(),
+        primitive_sidecar: None,
+        extension_urls: Vec::new(),
         nesting: 0,
         conformance: Rc::default(),
+        invariants,
     };
     run(&mut ctx, resource, opts)
 }
@@ -353,7 +403,14 @@ fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions)
     }
     add_meta_profiles(ctx, &mut set, resource);
     for profile in &opts.profiles {
-        add_profile(ctx, &mut set, profile, Some(resource), opts.unknown_profile, true);
+        add_profile(
+            ctx,
+            &mut set,
+            profile,
+            Some(resource),
+            opts.unknown_profile,
+            true,
+        );
     }
 
     validate_node(ctx, &set, resource);
@@ -381,6 +438,94 @@ fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Valu
         ctx.path.pop();
         ctx.path.pop();
     }
+    if let Some(profile) = vital_signs_profile(resource) {
+        add_profile(
+            ctx,
+            set,
+            profile,
+            Some(resource),
+            UnknownProfilePolicy::Ignore,
+            false,
+        );
+    }
+}
+
+/// FHIR R4 requires a vital-signs Observation to conform to the vital signs
+/// profile for its kind ("If an observation is a vital sign, it SHALL
+/// conform"). As the HL7 validator does, an Observation whose code is one
+/// of the vital signs' LOINC or SNOMED CT codes is held to that core
+/// profile (`bp` for a systolic pressure, `bodytemp` for 276885007, …),
+/// whatever its category or claimed profiles — the code makes it a vital
+/// sign. The table is the HL7 validator's (probed against validator_cli:
+/// codes it does not map, such as 8462-4, are left alone).
+fn vital_signs_profile(resource: &Value) -> Option<&'static str> {
+    const VITALS: &[(&str, &str, &str)] = &[
+        ("http://loinc.org", "85353-1", "vitalspanel"),
+        ("http://loinc.org", "9279-1", "resprate"),
+        ("http://snomed.info/sct", "86290005", "resprate"),
+        ("http://loinc.org", "8867-4", "heartrate"),
+        ("http://loinc.org", "2708-6", "oxygensat"),
+        ("http://loinc.org", "59408-5", "oxygensat"),
+        ("http://loinc.org", "59417-6", "oxygensat"),
+        ("http://snomed.info/sct", "431314004", "oxygensat"),
+        ("http://loinc.org", "8310-5", "bodytemp"),
+        ("http://loinc.org", "8331-1", "bodytemp"),
+        ("http://snomed.info/sct", "276885007", "bodytemp"),
+        ("http://snomed.info/sct", "386725007", "bodytemp"),
+        ("http://loinc.org", "8302-2", "bodyheight"),
+        ("http://loinc.org", "8306-3", "bodyheight"),
+        ("http://loinc.org", "8308-9", "bodyheight"),
+        ("http://snomed.info/sct", "50373000", "bodyheight"),
+        ("http://loinc.org", "9843-4", "headcircum"),
+        ("http://loinc.org", "8287-5", "headcircum"),
+        ("http://snomed.info/sct", "363812007", "headcircum"),
+        ("http://loinc.org", "29463-7", "bodyweight"),
+        ("http://loinc.org", "3141-9", "bodyweight"),
+        ("http://loinc.org", "39156-5", "bmi"),
+        ("http://snomed.info/sct", "60621009", "bmi"),
+        ("http://loinc.org", "85354-9", "bp"),
+        ("http://loinc.org", "8480-6", "bp"),
+        ("http://loinc.org", "76534-7", "bp"),
+        ("http://loinc.org", "8459-0", "bp"),
+        ("http://snomed.info/sct", "271649006", "bp"),
+        ("http://snomed.info/sct", "271650006", "bp"),
+    ];
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Observation") {
+        return None;
+    }
+    let codings = |key: &str| -> Vec<&Value> {
+        match resource.get(key) {
+            Some(Value::Array(concepts)) => concepts
+                .iter()
+                .filter_map(|c| c.get("coding").and_then(Value::as_array))
+                .flatten()
+                .collect(),
+            Some(concept) => concept
+                .get("coding")
+                .and_then(Value::as_array)
+                .map(|c| c.iter().collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    codings("code").iter().find_map(|c| {
+        let (system, code) = (c.get("system")?.as_str()?, c.get("code")?.as_str()?);
+        VITALS
+            .iter()
+            .find(|(s, k, _)| *s == system && *k == code)
+            .map(|(_, _, name)| match *name {
+                "vitalspanel" => "http://hl7.org/fhir/StructureDefinition/vitalspanel",
+                "resprate" => "http://hl7.org/fhir/StructureDefinition/resprate",
+                "heartrate" => "http://hl7.org/fhir/StructureDefinition/heartrate",
+                "oxygensat" => "http://hl7.org/fhir/StructureDefinition/oxygensat",
+                "bodytemp" => "http://hl7.org/fhir/StructureDefinition/bodytemp",
+                "bodyheight" => "http://hl7.org/fhir/StructureDefinition/bodyheight",
+                "headcircum" => "http://hl7.org/fhir/StructureDefinition/headcircum",
+                "bodyweight" => "http://hl7.org/fhir/StructureDefinition/bodyweight",
+                "bmi" => "http://hl7.org/fhir/StructureDefinition/bmi",
+                _ => "http://hl7.org/fhir/StructureDefinition/bp",
+            })
+    })
 }
 
 /// `meta.profile` entries, in document order.
@@ -524,6 +669,62 @@ pub(super) fn key_origin(key: &str) -> Option<String> {
     Some(key[..end].to_string())
 }
 
+/// Slices with a minimum on an element the data does not have at all: the
+/// slicing pass only runs over present arrays, so a profile requiring a
+/// `section:code-A` slice (or an extension) said nothing about a
+/// Composition without sections.
+fn absent_slice_minimums(
+    ctx: &mut WalkCtx<'_>,
+    set: &SchemaSet,
+    obj: &serde_json::Map<String, Value>,
+) {
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    let layers: Vec<(Option<String>, Arc<FhirSchema>)> = set
+        .iter()
+        .map(|(name, schema)| (key_origin(name), Arc::clone(schema)))
+        .collect();
+    for (source, schema) in &layers {
+        let mut required: Vec<(String, String, u64)> = Vec::new();
+        for (key, element) in schema.elements.iter().flatten() {
+            if has_key(obj, key) {
+                continue;
+            }
+            if let Some(slicing) = &element.slicing {
+                for (name, slice) in &slicing.slices {
+                    if let Some(min) = slice.min.filter(|m| *m > 0) {
+                        required.push((key.clone(), name.clone(), min));
+                    }
+                }
+            }
+        }
+        if !has_key(obj, "extension") {
+            for (name, entry) in schema.extensions.iter().flatten() {
+                if let Some(min) = entry.min.filter(|m| *m > 0) {
+                    required.push(("extension".to_string(), name.clone(), min));
+                }
+            }
+        }
+        for (key, name, min) in required {
+            if !reported.insert((key.clone(), name.clone())) {
+                continue;
+            }
+            ctx.path.push_key(&key);
+            let element = ctx.path.render_unindexed();
+            // The HL7 wording names the slice (two required slices of one
+            // absent element are two issues).
+            let message = errors::hl7_slice_min(&element, &name, min, 0);
+            ctx.error_full(
+                ErrorKind::SliceCardinality,
+                message.clone(),
+                Severity::Error,
+                source.clone(),
+                Some(message),
+            );
+            ctx.path.pop();
+        }
+    }
+}
+
 /// Navigate an element reference: `["Questionnaire", "elements", "item"]` —
 /// a root schema name followed by alternating `"elements"` / element-name
 /// segments.
@@ -581,6 +782,14 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         return;
     };
 
+    if set
+        .schemas()
+        .any(|s| s.url.as_deref() == Some("http://hl7.org/fhir/StructureDefinition/Attachment"))
+    {
+        let max_size = set.schemas().filter_map(|s| s.max_size).min();
+        super::attachment::check_attachment(ctx, obj, max_size);
+    }
+
     // FHIR JSON has no empty objects: an element is present only with a
     // value or children (ele-1). The typed FHIRPath model drops `{}` before
     // ele-1 can see it, so the walk reports it.
@@ -594,13 +803,17 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
     if is_resource {
         ctx.contained.push(contained_types(obj));
         ctx.resources.push(data);
-        let rt = obj.get("resourceType").and_then(Value::as_str).unwrap_or_default();
+        let rt = obj
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         ctx.resource_roots.push((ctx.path.depth(), rt.to_string()));
         if is_bundle {
             let entries = super::bundle::entries(data).into_iter().map(|(_, e)| e);
             ctx.bundles.push(Rc::new(entries.collect()));
         }
         check_resource_id(ctx, set, obj);
+        check_resource_level_rules(ctx, obj);
     }
 
     // Choice branches seen on this node, keyed by choice group, in first-
@@ -615,12 +828,15 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         if let Some(base_key) = key.strip_prefix('_')
             && !base_key.is_empty()
         {
-            handle_sidecar(ctx, set, key, base_key, value);
+            handle_sidecar(ctx, set, key, base_key, value, obj.get(base_key));
         } else {
-            eval_element(ctx, set, &mut multi_choice, key, value);
+            let sidecar = obj.get(&format!("_{key}"));
+            eval_element(ctx, set, &mut multi_choice, key, value, sidecar);
         }
         ctx.path.pop();
     }
+
+    absent_slice_minimums(ctx, set, obj);
 
     // postValidate: more than one branch of the same choice group present.
     for (group, branches) in &multi_choice {
@@ -672,6 +888,48 @@ fn check_resource_id(ctx: &mut WalkCtx<'_>, set: &SchemaSet, obj: &serde_json::M
 }
 
 /// `(id, resourceType)` of a resource's `contained` entries.
+/// Rules on a resource object the element schemas cannot express (HL7
+/// validator): `Resource.id` carries no extensions, and contained
+/// resources have distinct ids.
+fn check_resource_level_rules(ctx: &mut WalkCtx<'_>, obj: &serde_json::Map<String, Value>) {
+    if let Some(urls) = obj
+        .get("_id")
+        .and_then(|s| s.get("extension"))
+        .and_then(Value::as_array)
+    {
+        let urls: Vec<&str> = urls
+            .iter()
+            .filter_map(|e| e.get("url").and_then(Value::as_str))
+            .collect();
+        ctx.path.push_key("id");
+        ctx.error(
+            ErrorKind::Excluded,
+            format!(
+                "Extensions are not allowed on Resource.id ('{}')",
+                urls.join("', '")
+            ),
+        );
+        ctx.path.pop();
+    }
+    if let Some(contained) = obj.get("contained").and_then(Value::as_array) {
+        let mut seen = HashSet::new();
+        for (index, item) in contained.iter().enumerate() {
+            if let Some(id) = item.get("id").and_then(Value::as_str)
+                && !seen.insert(id)
+            {
+                ctx.path.push_key("contained");
+                ctx.path.push_index(index);
+                ctx.error(
+                    ErrorKind::DuplicateId,
+                    format!("Duplicate ID for contained resource: {id}"),
+                );
+                ctx.path.pop();
+                ctx.path.pop();
+            }
+        }
+    }
+}
+
 fn contained_types(resource: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     resource
         .get("contained")
@@ -694,16 +952,26 @@ fn contained_types(resource: &serde_json::Map<String, Value>) -> Vec<(String, St
 fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
     // Clone the Arcs up front: keyword validators need `&mut ctx` while the
     // set is borrowed, and Arc clones are cheap.
-    let schemas: Vec<Arc<FhirSchema>> = set.schemas().cloned().collect();
+    let keyed: Vec<(String, Arc<FhirSchema>)> = set
+        .iter()
+        .map(|(k, s)| (k.to_string(), Arc::clone(s)))
+        .collect();
+    let schemas: Vec<Arc<FhirSchema>> = keyed.iter().map(|(_, s)| Arc::clone(s)).collect();
     let primitive_set = schemas.iter().any(|s| s.is_primitive());
-    for schema in &schemas {
+    for (schema_key, schema) in &keyed {
         if schema.is_primitive() {
             super::primitives::validate_primitive(ctx, schema, data);
         }
         if let Some(fixed) = &schema.fixed
             && data != fixed
         {
-            ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
+            if fixed.is_object() && data.is_object() && knows_hl7_extensions(ctx.resolver) {
+                // As the HL7 validator reports a fixed complex value: per
+                // child that differs, is missing, or is extra.
+                fixed_value_diffs(ctx, fixed, data);
+            } else {
+                ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
+            }
         }
         if let Some(pattern) = &schema.pattern
             && !is_partial_match(data, pattern)
@@ -713,8 +981,52 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 errors::msg_pattern_value(pattern, data),
             );
         }
+        if let Some(text) = data.as_str() {
+            let length = text.chars().count() as u64;
+            if let Some(max) = schema.max_length
+                && length > max
+            {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    format!("value is longer than permitted maximum length of {max}"),
+                );
+            }
+            if let Some(min) = schema.min_length
+                && length < min
+            {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    format!("Value '{text}' is shorter than permitted minimum length of {min}"),
+                );
+            }
+        }
+        for (bound, below) in [(&schema.min_value, true), (&schema.max_value, false)] {
+            let Some(bound) = bound else { continue };
+            if data.is_string() && bound.is_object() {
+                // A Duration bound on a date/time: relative to now.
+                if let Some(message) = super::bounds::duration_violation(data, bound, below) {
+                    ctx.error(ErrorKind::PrimitiveValue, message);
+                }
+                continue;
+            }
+            let ordering = super::bounds::compare(data, bound);
+            let violated = match ordering {
+                Some(std::cmp::Ordering::Less) => below,
+                Some(std::cmp::Ordering::Greater) => !below,
+                _ => false,
+            };
+            if violated {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    super::bounds::message(data, bound, below),
+                );
+            }
+        }
         if let Some(constraints) = &schema.constraints {
             let path = ctx.path.render_dotted();
+            // A resource definition's own root invariants (vs a profile's
+            // invariant on an element that holds a resource).
+            let own_resource = schema.kind.as_deref() == Some("resource");
             for (id, c) in constraints {
                 ctx.deferred.push(Deferred::Constraint {
                     path: path.clone(),
@@ -722,16 +1034,43 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                     expression: c.expression.clone(),
                     human: c.human.clone(),
                     severity: c.severity.clone(),
+                    own_resource,
                 });
             }
         }
-        if let Some(required) = &schema.required {
-            validate_required(ctx, set, required, data);
+        if !data.is_object() && primitive_set {
+            // Keywords on a primitive's children describe its sidecar.
+            validate_primitive_children(ctx, schema);
+        } else {
+            if let Some(required) = &schema.required {
+                validate_required(ctx, set, required, data);
+            }
+            if let Some(excluded) = &schema.excluded {
+                validate_excluded(ctx, set, excluded, data);
+            }
         }
-        if let Some(excluded) = &schema.excluded {
-            validate_excluded(ctx, excluded, data);
-        }
-        if let Some(binding) = &schema.binding {
+        // A binding on a multi-type `value[x]` (the vital signs profiles bind
+        // Quantity|CodeableConcept|... to their unit value set) is judged on
+        // the coded branches only, as the HL7 validator does; a
+        // Quantity-only element still binds its units.
+        // Judged on the element definition that states the binding: its
+        // own layer's declarer (`<layer>.value` beside `<layer>.valueQuantity`)
+        // tells whether it allows several types; a profile narrowing value[x]
+        // to Quantity binds its units.
+        let own_declarer = schema.choice_of.as_ref().and_then(|group| {
+            let (layer, _) = schema_key.rsplit_once('.')?;
+            let wanted = format!("{layer}.{group}");
+            keyed.iter().find(|(k, _)| *k == wanted).map(|(_, d)| d)
+        });
+        let multi_type_quantity = schema.type_.as_deref() == Some("Quantity")
+            && schema.choice_of.is_some()
+            && match own_declarer {
+                Some(d) => d.choices.as_ref().is_some_and(|c| c.len() > 1),
+                None => schemas
+                    .iter()
+                    .any(|s| s.choices.as_ref().is_some_and(|c| c.len() > 1)),
+            };
+        if let Some(binding) = schema.binding.as_ref().filter(|_| !multi_type_quantity) {
             let path = ctx.path.render_dotted();
             if ctx.deferred_bindings.insert((
                 path.clone(),
@@ -759,12 +1098,61 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         if let Some(choices) = &schema.choices {
             // Runs when a choice-group declarer joins a branch element's
             // set; the branch key is the last named path segment.
-            if let Some(branch) = ctx.path.last_key()
-                && !choices.iter().any(|c| c == branch)
+            // An empty list comes from a `foo[x]` element that constrains
+            // without narrowing the types: no restriction.
+            if let Some(branch) = ctx.path.last_key().map(str::to_string)
+                && !choices.is_empty()
+                && !choices.iter().any(|c| *c == branch)
             {
-                let message = errors::msg_choice_excluded(branch);
-                ctx.error(ErrorKind::ChoiceExcluded, message);
+                let branch = branch.as_str();
+                let rendered = ctx.path.render_dotted();
+                let mut parts = rendered.rsplit('.');
+                let (_, index, holder) = (parts.next(), parts.next(), parts.next());
+                let on_extension = branch.starts_with("value")
+                    && index.is_some_and(|i| i.parse::<usize>().is_ok())
+                    && matches!(holder, Some("extension" | "modifierExtension"));
+                if on_extension
+                    && knows_hl7_extensions(ctx.resolver)
+                    && let Some(url) = ctx.extension_urls.last().cloned()
+                {
+                    // In the HL7 validator's wording, on the extension.
+                    let allowed: Vec<String> =
+                        choices.iter().map(|c| extension_value_type(c)).collect();
+                    let message = format!(
+                        "The Extension '{url}' definition allows for the types [{}] but found type {}",
+                        allowed.join(", "),
+                        extension_value_type(branch)
+                    );
+                    let key = branch.to_string();
+                    ctx.path.pop();
+                    ctx.error(ErrorKind::ChoiceExcluded, message);
+                    ctx.path.push_key(&key);
+                } else {
+                    let message = errors::msg_choice_excluded(branch);
+                    ctx.error(ErrorKind::ChoiceExcluded, message);
+                }
             }
+        }
+    }
+}
+
+/// `required` / `excluded` on a primitive element (`display.extension`
+/// min 1 in a profile) judged against its `_foo` sidecar: the primitive's
+/// id and extensions live there in JSON.
+fn validate_primitive_children(ctx: &mut WalkCtx<'_>, schema: &FhirSchema) {
+    let sidecar = ctx.primitive_sidecar.and_then(Value::as_object);
+    for key in schema.required.iter().flatten() {
+        if !sidecar.is_some_and(|s| s.contains_key(key)) {
+            ctx.path.push_key(key);
+            ctx.error(ErrorKind::Required, errors::msg_required(key));
+            ctx.path.pop();
+        }
+    }
+    for key in schema.excluded.iter().flatten() {
+        if sidecar.is_some_and(|s| s.contains_key(key)) {
+            ctx.path.push_key(key);
+            ctx.error(ErrorKind::Excluded, errors::msg_excluded(key));
+            ctx.path.pop();
         }
     }
 }
@@ -813,7 +1201,7 @@ fn has_key(obj: &serde_json::Map<String, Value>, key: &str) -> bool {
     obj.contains_key(key) || obj.contains_key(&format!("_{key}"))
 }
 
-fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
+fn validate_excluded(ctx: &mut WalkCtx<'_>, set: &SchemaSet, excluded: &[String], data: &Value) {
     let Some(obj) = data.as_object() else {
         ctx.error(
             ErrorKind::Type,
@@ -821,12 +1209,89 @@ fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
         );
         return;
     };
+    if let Some(url) = obj.get("url").and_then(Value::as_str)
+        && knows_hl7_extensions(ctx.resolver)
+        && let Some(found) = excluded
+            .iter()
+            .find(|k| k.len() > 5 && k.starts_with("value") && obj.contains_key(k.as_str()))
+    {
+        // An extension's value of a type its definition does not allow,
+        // in the HL7 validator's wording.
+        let all_excluded: HashSet<&str> = set
+            .schemas()
+            .filter_map(|s| s.excluded.as_ref())
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut allowed: Vec<String> = Vec::new();
+        for schema in set.schemas() {
+            let choices = schema
+                .elements
+                .as_ref()
+                .and_then(|e| e.get("value"))
+                .and_then(|v| v.choices.as_ref());
+            for c in choices.into_iter().flatten() {
+                let name = extension_value_type(c);
+                if !all_excluded.contains(c.as_str()) && !allowed.contains(&name) {
+                    allowed.push(name);
+                }
+            }
+        }
+        if !allowed.is_empty() {
+            ctx.error(
+                ErrorKind::Excluded,
+                format!(
+                    "The Extension '{url}' definition allows for the types [{}] but found type {}",
+                    allowed.join(", "),
+                    extension_value_type(found)
+                ),
+            );
+            return;
+        }
+    }
     for key in excluded {
         ctx.path.push_key(key);
         if obj.contains_key(key) {
             ctx.error(ErrorKind::Excluded, errors::msg_excluded(key));
         }
         ctx.path.pop();
+    }
+}
+
+/// The FHIR type of a `value[x]` branch key (`valueUri` → `uri`,
+/// `valueCodeableConcept` → `CodeableConcept`).
+fn extension_value_type(key: &str) -> String {
+    const PRIMITIVES: &[&str] = &[
+        "base64Binary",
+        "boolean",
+        "canonical",
+        "code",
+        "date",
+        "dateTime",
+        "decimal",
+        "id",
+        "instant",
+        "integer",
+        "integer64",
+        "markdown",
+        "oid",
+        "positiveInt",
+        "string",
+        "time",
+        "unsignedInt",
+        "uri",
+        "url",
+        "uuid",
+    ];
+    let rest = key.strip_prefix("value").unwrap_or(key);
+    let mut lower = rest.to_string();
+    if let Some(first) = lower.get(..1) {
+        lower.replace_range(..1, &first.to_ascii_lowercase());
+    }
+    if PRIMITIVES.contains(&lower.as_str()) {
+        lower
+    } else {
+        rest.to_string()
     }
 }
 
@@ -838,6 +1303,7 @@ fn eval_element<'a>(
     multi_choice: &mut IndexMap<String, Vec<String>>,
     key: &str,
     value: &'a Value,
+    sidecar: Option<&'a Value>,
 ) {
     let mut elset = SchemaSet::new();
     collect_schemas_for_element(ctx, set, &mut elset, multi_choice, key);
@@ -858,6 +1324,13 @@ fn eval_element<'a>(
     // validator (the mismatched value still validates against the set).
 
     if let Some(items) = value.as_array() {
+        if items.is_empty() {
+            ctx.error(
+                ErrorKind::EmptyObject,
+                "Array cannot be empty - the property should not be present if it has no values"
+                    .to_string(),
+            );
+        }
         // A known extension used outside its declared context draws a
         // warning (#615). Runs for every item, sliced or not — placement is
         // orthogonal to slicing.
@@ -902,6 +1375,7 @@ fn eval_element<'a>(
         let consumed = super::slicing::validate_slices(ctx, &elset, items);
         let is_extension_array = key == "extension" || key == "modifierExtension";
 
+        let profiles = type_profiles(&elset);
         for (index, item) in items.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
@@ -910,13 +1384,247 @@ fn eval_element<'a>(
             if is_extension_array {
                 validate_extension_item(ctx, &elset, item, key == "modifierExtension");
             } else {
-                validate_node(ctx, &elset, item);
+                let outer = ctx.primitive_sidecar.take();
+                ctx.primitive_sidecar = sidecar
+                    .and_then(Value::as_array)
+                    .and_then(|s| s.get(index))
+                    .filter(|s| !s.is_null());
+                let item_set = with_type_profiles(ctx, &elset, &profiles, item);
+                validate_node(ctx, &item_set, item);
+                ctx.primitive_sidecar = outer;
             }
             ctx.path.pop();
         }
     } else {
-        validate_node(ctx, &elset, value);
+        let outer = ctx.primitive_sidecar.take();
+        ctx.primitive_sidecar = sidecar.filter(|s| s.is_object());
+        let profiles = type_profiles(&elset);
+        let value_set = with_type_profiles(ctx, &elset, &profiles, value);
+        validate_node(ctx, &value_set, value);
+        ctx.primitive_sidecar = outer;
     }
+}
+
+/// Differences of a complex value from its fixed value, one issue per
+/// child (HL7 validator wording).
+fn fixed_value_diffs(ctx: &mut WalkCtx<'_>, fixed: &Value, data: &Value) {
+    let (Some(f), Some(d)) = (fixed.as_object(), data.as_object()) else {
+        if fixed != data {
+            ctx.error(
+                ErrorKind::FixedValue,
+                format!(
+                    "Value is '{}' but is fixed to '{}' in the profile",
+                    show(data),
+                    show(fixed)
+                ),
+            );
+        }
+        return;
+    };
+    fn show(v: &Value) -> String {
+        v.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())
+    }
+    for (key, fv) in f {
+        ctx.path.push_key(key);
+        match d.get(key) {
+            None => ctx.error(
+                ErrorKind::FixedValue,
+                format!("Missing element '{key}' - required by fixed value assigned in profile"),
+            ),
+            Some(dv) => match (fv, dv) {
+                (Value::Array(fa), Value::Array(da)) if fa.len() == da.len() => {
+                    for (i, (fi, di)) in fa.iter().zip(da).enumerate() {
+                        ctx.path.push_index(i);
+                        fixed_value_diffs(ctx, fi, di);
+                        ctx.path.pop();
+                    }
+                }
+                _ if fv.is_object() && dv.is_object() => fixed_value_diffs(ctx, fv, dv),
+                _ if fv != dv => ctx.error(
+                    ErrorKind::FixedValue,
+                    format!(
+                        "Value is '{}' but is fixed to '{}' in the profile",
+                        show(dv),
+                        show(fv)
+                    ),
+                ),
+                _ => {}
+            },
+        }
+        ctx.path.pop();
+    }
+    for key in d
+        .keys()
+        .filter(|k| !f.contains_key(*k) && !k.starts_with('_'))
+    {
+        ctx.path.push_key(key);
+        ctx.error(
+            ErrorKind::FixedValue,
+            format!(
+                "The element {key} is present in the instance but not allowed in the applicable fixed value specified in profile"
+            ),
+        );
+        ctx.path.pop();
+    }
+}
+
+/// The `type.profile` canonicals the element's layers declare.
+fn type_profiles(elset: &SchemaSet) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for schema in elset.schemas() {
+        for p in schema.type_profiles.iter().flatten() {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// `elset` for one value of an element with `type.profile`s. One profile
+/// joins the value's set (its rules report as usual); with several, the
+/// value must conform to at least one ("Unable to find a match for the
+/// specified profile among choices"). A resource profile only applies to a
+/// resource of its type ("The type 'Patient' is not valid - must be
+/// DocumentManifest"). Unresolvable profiles are not judged.
+fn with_type_profiles<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    profiles: &[String],
+    value: &'a Value,
+) -> SchemaSet {
+    if profiles.is_empty() || !value.is_object() {
+        return elset.clone();
+    }
+    let resolved: Vec<(String, Arc<FhirSchema>)> = profiles
+        .iter()
+        .filter_map(|p| ctx.resolver.resolve(p).map(|s| (p.clone(), s)))
+        .collect();
+    if resolved.is_empty() {
+        return elset.clone();
+    }
+    if let Some(rt) = value.get("resourceType").and_then(Value::as_str) {
+        let types: Vec<String> = resolved
+            .iter()
+            .filter_map(|(_, s)| s.type_.clone())
+            .collect();
+        if !types.is_empty() && !types.iter().any(|t| t == rt) {
+            ctx.error(
+                ErrorKind::ReferenceInvalid,
+                format!(
+                    "The type '{rt}' is not valid - must be {}",
+                    types.join(" or ")
+                ),
+            );
+            return elset.clone();
+        }
+    }
+    if let [(url, schema)] = resolved.as_slice() {
+        let mut set = elset.clone();
+        add_schemas_to_set(ctx, &mut set, Arc::clone(schema), url);
+        return set;
+    }
+    // With a FHIRPath engine at hand the candidates' invariants count too
+    // (the HL7 validator evaluates them when choosing).
+    let here = ctx.path.render_dotted();
+    let root_type = value
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let rebase = |p: &str| {
+        let rest = p.strip_prefix(root_type.as_str()).unwrap_or(p);
+        let rest = rest.trim_start_matches('.');
+        if rest.is_empty() {
+            here.clone()
+        } else {
+            format!("{here}.{rest}")
+        }
+    };
+    let invariant_failures = |ctx: &WalkCtx<'a>, url: &str| -> Vec<ValidationError> {
+        let (Some(check), Some(root)) = (ctx.invariants, ctx.resources.first()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for d in ctx.nested_outcome(value, url).deferred {
+            if let Deferred::Constraint {
+                path,
+                id,
+                expression,
+                human,
+                severity,
+                ..
+            } = d
+                && matches!(severity.as_deref(), None | Some("error"))
+            {
+                let at = rebase(&path);
+                if !check(root, &at, &id, &expression) {
+                    out.push(ValidationError::new(
+                        ErrorKind::FhirpathConstraint,
+                        at,
+                        super::messages::fhirpath_constraint(&id, human.as_deref()),
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let passing: Vec<&(String, Arc<FhirSchema>)> = resolved
+        .iter()
+        .filter(|(url, _)| ctx.conforms_to(value, url) && invariant_failures(ctx, url).is_empty())
+        .collect();
+    if passing.len() == 1 && ctx.invariants.is_some() {
+        let (url, schema) = passing[0];
+        let mut set = elset.clone();
+        add_schemas_to_set(ctx, &mut set, Arc::clone(schema), url);
+        return set;
+    }
+    if passing.is_empty() {
+        let names: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
+        ctx.error(
+            ErrorKind::SliceUnmatched,
+            format!(
+                "Unable to find a match for the specified profile among choices: {}",
+                names.join(", ")
+            ),
+        );
+        // and, as the HL7 validator lists them, why each candidate failed
+        // The same invariant failure from several candidates is listed once
+        // (other failures name their own profile, so stay per candidate).
+        let mut listed: HashSet<(String, String, Option<String>)> = HashSet::new();
+        for (url, _) in &resolved {
+            let mut failures: Vec<ValidationError> = ctx
+                .nested_outcome(value, url)
+                .errors
+                .into_iter()
+                .map(|mut e| {
+                    e.path = rebase(&e.path);
+                    e
+                })
+                .collect();
+            failures.extend(invariant_failures(ctx, url));
+            for e in failures {
+                let origin = (e.kind != ErrorKind::FhirpathConstraint)
+                    .then(|| e.source.clone().unwrap_or_else(|| url.clone()));
+                if e.severity != Severity::Error
+                    || !listed.insert((e.path.clone(), e.message.clone(), origin))
+                {
+                    continue;
+                }
+                let path = e.path.clone();
+                let mut issue = e;
+                issue.message = format!("{} (validating against {url})", issue.message);
+                issue.hl7_message = issue
+                    .hl7_message
+                    .map(|m| format!("{m} (validating against {url})"));
+                issue.path = path;
+                ctx.errors.push(issue);
+            }
+        }
+    }
+    elset.clone()
 }
 
 /// Validate an extension no profile slice claimed. An extension whose `url`
@@ -933,6 +1641,40 @@ fn validate_extension_item<'a>(
     item: &'a Value,
     modifier: bool,
 ) {
+    // A sub-extension of a complex extension names itself with a relative
+    // url (`species`); anything else needs an absolute one.
+    let keys = ctx.path.keys_from(0);
+    let nested =
+        keys.len() >= 2 && matches!(keys[keys.len() - 2], "extension" | "modifierExtension");
+    match item.get("url").and_then(Value::as_str) {
+        None | Some("") if item.is_object() => ctx.error(
+            ErrorKind::Required,
+            "Extension.url is required in order to identify, use and validate the extension"
+                .to_string(),
+        ),
+        // (Judged with the FHIR packs only: FHIR Schema fixtures name
+        // extensions by bare keys.)
+        Some(u)
+            if !nested
+                && !u.is_empty()
+                && !u.contains(':')
+                && knows_hl7_extensions(ctx.resolver) =>
+        {
+            ctx.error(
+                ErrorKind::PrimitiveValue,
+                "Extension.url must be an absolute URL".to_string(),
+            )
+        }
+        // A canonical version in the url (`…/patient-congregation|4.0.0`):
+        // the definition is found without it, but the url is wrong.
+        Some(u) if u.contains('|') && u.contains("://") && knows_hl7_extensions(ctx.resolver) => {
+            ctx.error(
+                ErrorKind::PrimitiveValue,
+                "The extension URL must not contain a version".to_string(),
+            )
+        }
+        _ => {}
+    }
     let url = item
         .get("url")
         .and_then(Value::as_str)
@@ -941,8 +1683,46 @@ fn validate_extension_item<'a>(
         validate_node(ctx, elset, item);
         return;
     };
+    ctx.extension_urls.push(url.to_string());
+    validate_known_extension(ctx, elset, item, url, modifier);
+    ctx.extension_urls.pop();
+}
+
+/// [`validate_extension_item`] for an item with an absolute url.
+fn validate_known_extension<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    item: &'a Value,
+    url: &str,
+    modifier: bool,
+) {
     match ctx.resolver.resolve(url) {
         Some(definition) if definition.kind.as_deref() == Some(crate::schema::kind::EXTENSION) => {
+            // A complex extension defines its sub-extensions; a relative
+            // sub-extension url it does not define is an error.
+            let defined = sub_extension_urls(&definition);
+            if !defined.is_empty()
+                && let Some(subs) = item.get("extension").and_then(Value::as_array)
+            {
+                for (index, sub) in subs.iter().enumerate() {
+                    let Some(sub_url) = sub.get("url").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if sub_url.is_empty() || sub_url.contains(':') || defined.contains(sub_url) {
+                        continue;
+                    }
+                    ctx.path.push_key("extension");
+                    ctx.path.push_index(index);
+                    ctx.error(
+                        ErrorKind::UnknownExtension,
+                        format!(
+                            "Sub-extension url '{sub_url}' is not defined by the Extension {url}"
+                        ),
+                    );
+                    ctx.path.pop();
+                    ctx.path.pop();
+                }
+            }
             let mut extended = elset.clone();
             add_schemas_to_set(ctx, &mut extended, definition, url);
             validate_node(ctx, &extended, item);
@@ -954,7 +1734,17 @@ fn validate_extension_item<'a>(
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
-            } else if is_hl7_namespace(url) && knows_hl7_extensions(ctx.resolver) {
+            } else if ctx.unknown_extensions == UnknownExtensionPolicy::Error {
+                if !may_be_unknown(url) {
+                    ctx.error(
+                        ErrorKind::UnknownExtension,
+                        errors::msg_unknown_extension(url),
+                    );
+                }
+            } else if is_hl7_namespace(url)
+                && !is_cross_version_extension(url)
+                && knows_hl7_extensions(ctx.resolver)
+            {
                 // HL7 publishes every extension it defines; a url in its
                 // namespace that resolves to nothing is a typo or an
                 // uninstalled package (the HL7 validator rejects it). Other
@@ -973,6 +1763,64 @@ fn validate_extension_item<'a>(
 
 /// Extension urls in HL7's own namespaces, which HL7 publishes definitions
 /// for.
+/// The relative urls of the sub-extensions a complex extension definition
+/// declares: `extensions` sugar entries, and slices of `extension` matched
+/// by a `{url: ...}` pattern.
+fn sub_extension_urls(definition: &FhirSchema) -> HashSet<&str> {
+    let mut urls: HashSet<&str> = definition
+        .extensions
+        .iter()
+        .flatten()
+        .filter_map(|(_, e)| e.url.as_deref())
+        .collect();
+    let slices = definition
+        .elements
+        .as_ref()
+        .and_then(|els| els.get("extension"))
+        .and_then(|el| el.slicing.as_ref());
+    for slice in slices.iter().flat_map(|s| s.slices.values()) {
+        if let Some(url) = slice
+            .match_
+            .as_ref()
+            .and_then(|m| m.value.as_ref())
+            .and_then(|v| v.get("url"))
+            .and_then(Value::as_str)
+        {
+            urls.insert(url);
+        }
+    }
+    urls
+}
+
+/// Extension urls the HL7 validator accepts without a definition
+/// (`isKnownExtension`): example domains, DICOM (`nema.org`), HL7 tooling
+/// extensions, and cross-version extensions.
+fn may_be_unknown(url: &str) -> bool {
+    url.contains("example.org")
+        || url.contains("acme.com")
+        || url.contains("nema.org")
+        || url.starts_with("http://hl7.org/fhir/tools/StructureDefinition/")
+        || is_cross_version_extension(url)
+}
+
+/// A cross-version extension (`http://hl7.org/fhir/5.0/StructureDefinition/
+/// extension-Questionnaire.item.answerConstraint`): HL7 defines one for every
+/// element of every FHIR version, implicitly — the HL7 validator generates
+/// them on demand rather than loading definitions — so no definition being
+/// installed says nothing about the url.
+fn is_cross_version_extension(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://hl7.org/fhir/") else {
+        return false;
+    };
+    let Some((version, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && version.contains('.')
+        && tail.starts_with("StructureDefinition/extension-")
+}
+
 fn is_hl7_namespace(url: &str) -> bool {
     let rest = url
         .strip_prefix("http://")
@@ -985,7 +1833,7 @@ fn is_hl7_namespace(url: &str) -> bool {
 /// Whether HL7's extension definitions are loaded at all. R4/R4B ship them
 /// in the core packs; from R5 on they live in `hl7.fhir.uv.extensions`,
 /// and without that package every HL7 extension would look unknown.
-fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
+pub(super) fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
     resolver
         .resolve("http://hl7.org/fhir/StructureDefinition/data-absent-reason")
         .is_some()
@@ -1051,7 +1899,12 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
     let Some((depth, root)) = ctx.resource_roots.last().cloned() else {
         return;
     };
-    let mut keys: Vec<String> = ctx.path.keys_from(depth).iter().map(|k| k.to_string()).collect();
+    let mut keys: Vec<String> = ctx
+        .path
+        .keys_from(depth)
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
     keys.pop(); // the `extension` key itself
     let sidecar = keys.last().is_some_and(|k| k.starts_with('_'));
     if let Some(last) = keys.last_mut()
@@ -1087,13 +1940,130 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
         let Some(schema) = ctx.resolver.resolve(url) else {
             continue;
         };
-        let Some(contexts) = schema.context.as_ref().filter(|c| !c.is_empty()) else {
+        let Some(all_contexts) = schema.context.as_ref().filter(|c| !c.is_empty()) else {
             continue;
         };
+        let invariants: Vec<&str> = all_contexts
+            .iter()
+            .filter_map(|c| c.strip_prefix("invariant:"))
+            .collect();
+        let contexts: Vec<String> = all_contexts
+            .iter()
+            .filter(|c| !c.starts_with("invariant:"))
+            .cloned()
+            .collect();
+        let contexts = &contexts;
+        // contextInvariants: checked on the extension's parent, wherever it
+        // is allowed.
+        if !invariants.is_empty() {
+            let at = ctx.path.render_dotted();
+            let parent_path = at
+                .rsplit_once('.')
+                .map_or(at.as_str(), |(p, _)| p)
+                .to_string();
+            for expr in &invariants {
+                ctx.deferred.push(Deferred::Constraint {
+                    path: parent_path.clone(),
+                    id: format!("ext-context-invariant:{url}"),
+                    expression: (*expr).to_string(),
+                    human: Some(format!(
+                        "The extension {url} is not allowed to be used at this point (based on context invariant '{expr}')"
+                    )),
+                    severity: Some("error".to_string()),
+                    own_resource: false,
+                });
+            }
+        }
+        if contexts.is_empty() {
+            continue;
+        }
 
         let mut met = false;
         let mut judgeable = true;
+        let mut conditions: Vec<String> = Vec::new();
+        // The extension sits directly in another extension.
+        // (directly, or on the parent extension's primitive value:
+        // `extension[0]._valueBoolean.extension[0]`)
+        let is_ext = |k: &String| k == "extension" || k == "modifierExtension";
+        let in_extension = keys.last().is_some_and(is_ext)
+            || (sidecar
+                && keys.last().is_some_and(|k| k.starts_with("value"))
+                && keys.len() >= 2
+                && is_ext(&keys[keys.len() - 2]));
         for c in contexts {
+            // `extension` context (`extension:<url>`): the url of the
+            // extension it may sit in.
+            if let Some(url) = c.strip_prefix("extension:") {
+                if in_extension && ctx.extension_urls.last().is_some_and(|u| u == url) {
+                    met = true;
+                }
+                continue;
+            }
+            // `fhirpath` context (`fhirpath:<expression>`): only its leading
+            // element path can be judged here — elsewhere it is not met; on
+            // that element the expression decides, which the walk cannot
+            // evaluate.
+            if let Some(expression) = c.strip_prefix("fhirpath:") {
+                let prefix = expression
+                    .split(".where(")
+                    .next()
+                    .unwrap_or(expression)
+                    .split('(')
+                    .next()
+                    .unwrap_or(expression);
+                let simple = !prefix.is_empty()
+                    && prefix.starts_with(|ch: char| ch.is_ascii_uppercase())
+                    && prefix
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.');
+                if !simple {
+                    judgeable = false;
+                    break;
+                }
+                if parent_paths.iter().any(|p| path_matches(prefix, p)) {
+                    // On that element the rest of the expression decides:
+                    // checked as an invariant of the parent below.
+                    let rest = &expression[prefix.len()..];
+                    if rest.trim().is_empty() {
+                        met = true;
+                    } else {
+                        conditions.push(format!("($this{rest}).exists()"));
+                    }
+                }
+                continue;
+            }
+            // Abstract contexts: any element; a resource root (or an
+            // element of every resource, `DomainResource.text`); a
+            // backbone element.
+            match c.as_str() {
+                "Element" => {
+                    met = true;
+                    continue;
+                }
+                "Resource" | "DomainResource" => {
+                    if keys.is_empty() {
+                        met = true;
+                    }
+                    continue;
+                }
+                "BackboneElement" => {
+                    if parent_types.iter().any(|t| t == "BackboneElement") {
+                        met = true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(tail) = c
+                .strip_prefix("DomainResource.")
+                .or_else(|| c.strip_prefix("Resource."))
+            {
+                let wanted: Vec<&str> = tail.split('.').collect();
+                if !sidecar && keys.iter().map(String::as_str).eq(wanted.iter().copied()) {
+                    met = true;
+                }
+                continue;
+            }
             if matches!(
                 c.as_str(),
                 "Element" | "BackboneElement" | "Resource" | "DomainResource"
@@ -1115,9 +2085,16 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
                 if parent_paths.iter().any(|p| path_matches(c, p)) {
                     met = true;
                 }
-            } else if c.contains('.') || sidecar {
-                // Datatype-rooted paths, and datatypes on a primitive's
-                // sidecar, are out of reach.
+            } else if let Some((_, last)) = c.rsplit_once('.') {
+                // A datatype-rooted path (`HumanName.family`) names an
+                // element of that type: the extension must sit on an
+                // element of that name (whose owner's type the walk does
+                // not track — accepted).
+                if keys.last().is_some_and(|k| path_matches(last, k)) {
+                    met = true;
+                }
+            } else if sidecar {
+                // A datatype on a primitive's sidecar is out of reach.
                 judgeable = false;
                 break;
             } else if parent_types.iter().any(|t| t == c) {
@@ -1129,13 +2106,38 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
         }
 
         let parent = &parent_paths[0];
-        ctx.path.push_index(index);
         let message = errors::msg_extension_context(url, parent, contexts);
         let severity = if CANONICAL_RESOURCES.contains(&root.as_str()) {
             Severity::Warning
         } else {
             Severity::Error
         };
+        if !conditions.is_empty() {
+            // Only a FHIRPath context can still allow it: evaluated on the
+            // extension's parent with the other invariants.
+            let at = ctx.path.render_dotted();
+            let parent_path = at
+                .rsplit_once('.')
+                .map_or(at.as_str(), |(p, _)| p)
+                .to_string();
+            ctx.deferred.push(Deferred::Constraint {
+                path: parent_path,
+                id: "ext-context".to_string(),
+                expression: conditions.join(" or "),
+                human: Some(message),
+                severity: Some(
+                    if severity == Severity::Warning {
+                        "warning"
+                    } else {
+                        "error"
+                    }
+                    .to_string(),
+                ),
+                own_resource: false,
+            });
+            continue;
+        }
+        ctx.path.push_index(index);
         ctx.error_with_severity(ErrorKind::ExtensionContext, message, severity);
         ctx.path.pop();
     }
@@ -1148,9 +2150,9 @@ fn path_matches(context: &str, instance: &str) -> bool {
     let i: Vec<&str> = instance.split('.').collect();
     c.len() == i.len()
         && c.iter().zip(&i).all(|(c, i)| match c.strip_suffix("[x]") {
-            Some(stem) => i
-                .strip_prefix(stem)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())),
+            Some(stem) => i.strip_prefix(stem).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())
+            }),
             None => c == i,
         })
 }
@@ -1194,6 +2196,7 @@ fn handle_sidecar<'a>(
     key: &str,
     base_key: &str,
     value: &'a Value,
+    base_value: Option<&'a Value>,
 ) {
     // Collect the base element's sub-set; choice bookkeeping is discarded
     // (a sidecar is not a branch occurrence).
@@ -1209,10 +2212,128 @@ fn handle_sidecar<'a>(
 
     // The sidecar mirrors the base element's shape.
     let expect_array = base_elset.schemas().any(|s| s.array == Some(true));
+
+    // A primitive with a required binding that is present only through its
+    // sidecar (`"_status": {"extension": [data-absent-reason]}`) carries no
+    // code at all: the HL7 validator rejects it (Terminology_TX_NoValid_1).
+    let required_vs = base_elset.schemas().find_map(|s| {
+        s.binding
+            .as_ref()
+            .filter(|b| b.strength.as_deref() == Some("required"))
+            .map(|b| b.value_set.clone())
+    });
+    if let Some(vs) = required_vs {
+        let missing: Vec<Option<usize>> = match value {
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .filter(|(i, item)| {
+                    !item.is_null()
+                        && base_value
+                            .and_then(Value::as_array)
+                            .and_then(|b| b.get(*i))
+                            .is_none_or(Value::is_null)
+                })
+                .map(|(i, _)| Some(i))
+                .collect(),
+            Value::Null => Vec::new(),
+            _ if base_value.is_none_or(Value::is_null) => vec![None],
+            _ => Vec::new(),
+        };
+        if !missing.is_empty() {
+            ctx.path.pop();
+            ctx.path.push_key(base_key);
+            for index in missing {
+                if let Some(i) = index {
+                    ctx.path.push_index(i);
+                }
+                ctx.error(
+                    ErrorKind::TerminologyBinding,
+                    errors::msg_no_code_required(&vs),
+                );
+                if index.is_some() {
+                    ctx.path.pop();
+                }
+            }
+            ctx.path.pop();
+            ctx.path.push_key(key);
+        }
+    }
     match (expect_array, value.is_array()) {
         (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
         (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),
         _ => {}
+    }
+
+    // ele-1 on a primitive carried only by its sidecar: an id alone is no
+    // content (a value or an extension is needed). The FHIRPath ele-1 never
+    // sees a sidecar-only primitive.
+    let id_only = |side: &Value| {
+        side.as_object()
+            .is_some_and(|o| !o.is_empty() && o.keys().all(|k| k == "id"))
+    };
+    // (FHIR packs only: FHIR Schema fixtures treat a bare sidecar as legal.)
+    let fhir = knows_hl7_extensions(ctx.resolver);
+    let lonely: Vec<Option<usize>> = match value {
+        _ if !fhir => Vec::new(),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter(|(i, side)| {
+                id_only(side)
+                    && base_value
+                        .and_then(Value::as_array)
+                        .and_then(|b| b.get(*i))
+                        .is_none_or(Value::is_null)
+            })
+            .map(|(i, _)| Some(i))
+            .collect(),
+        side if id_only(side) && base_value.is_none_or(Value::is_null) => vec![None],
+        _ => Vec::new(),
+    };
+    for index in lonely {
+        ctx.path.pop();
+        ctx.path.push_key(base_key);
+        if let Some(i) = index {
+            ctx.path.push_index(i);
+        }
+        ctx.error(
+            ErrorKind::FhirpathConstraint,
+            "Constraint failed: ele-1: 'All FHIR elements must have a @value or children'"
+                .to_string(),
+        );
+        if index.is_some() {
+            ctx.path.pop();
+        }
+        ctx.path.pop();
+        ctx.path.push_key(key);
+    }
+
+    // Every position of a primitive array needs a value, an id/extension
+    // sidecar, or both.
+    if let Value::Array(sidecars) = value {
+        let values = base_value.and_then(Value::as_array);
+        let len = sidecars.len().max(values.map_or(0, Vec::len));
+        let empty: Vec<usize> = (0..len)
+            .filter(|&i| {
+                values.and_then(|v| v.get(i)).is_none_or(Value::is_null)
+                    && sidecars.get(i).is_none_or(Value::is_null)
+            })
+            .collect();
+        if !empty.is_empty() {
+            ctx.path.pop();
+            ctx.path.push_key(base_key);
+            for i in empty {
+                ctx.error(
+                    ErrorKind::Type,
+                    format!(
+                        "The JSON array for '{base_key}' is invalid at index {i} - must have at least one valid value"
+                    ),
+                );
+            }
+            ctx.path.pop();
+            ctx.path.push_key(key);
+        }
     }
 
     // Validate the Element part(s). Without a resolvable `Element` schema
@@ -1320,7 +2441,7 @@ fn compile_extensions(
                 continue;
             };
             let resolved = ctx.resolver.resolve(&url);
-            if resolved.is_none() {
+            if resolved.is_none() && !is_cross_version_extension(&url) {
                 ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&url));
             }
             let merged = merge_extension_schema(entry, resolved.as_deref());
@@ -1396,9 +2517,15 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         choice_of,
         fixed,
         pattern,
+        min_value,
+        max_value,
+        max_length,
+        min_length,
+        max_size,
         binding,
         constraints,
         refers,
+        type_profiles,
         slicing,
         extensions,
         modifier,
@@ -1540,8 +2667,13 @@ mod tests {
         let on_address = json!({"resourceType": "Patient",
             "address": [{"city": "X", "extension": [geo.clone()]}],
             "contact": [{"address": {"city": "Y", "extension": [geo.clone()]}}]});
-        assert!(context_errors(&on_address).is_empty(), "{:?}", context_errors(&on_address));
-        let on_name = json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
+        assert!(
+            context_errors(&on_address).is_empty(),
+            "{:?}",
+            context_errors(&on_address)
+        );
+        let on_name =
+            json!({"resourceType": "Patient", "name": [{"text": "A", "extension": [geo.clone()]}]});
         assert_eq!(context_errors(&on_name), vec!["Patient.name.0.extension.0"]);
 
         // birthPlace: context `Patient` (the root only), inside a Bundle too.
@@ -1563,7 +2695,10 @@ mod tests {
         let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "c"},
             "extension": [position.clone()],
             "component": [{"code": {"text": "x"}, "extension": [position.clone()]}]});
-        assert_eq!(context_errors(&obs), vec!["Observation.component.0.extension.0"]);
+        assert_eq!(
+            context_errors(&obs),
+            vec!["Observation.component.0.extension.0"]
+        );
     }
 
     /// A keyword the base declares and every profile in the chain restates
@@ -2000,6 +3135,22 @@ mod tests {
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
+    }
+
+    #[test]
+    fn cross_version_extension_urls() {
+        assert!(super::is_cross_version_extension(
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-Questionnaire.item.answerConstraint"
+        ));
+        assert!(super::is_cross_version_extension(
+            "http://hl7.org/fhir/3.0/StructureDefinition/extension-Patient.animal"
+        ));
+        assert!(!super::is_cross_version_extension(
+            "http://hl7.org/fhir/StructureDefinition/patient-birthTime"
+        ));
+        assert!(!super::is_cross_version_extension(
+            "http://hl7.org/fhir/us/core/StructureDefinition/extension-x"
+        ));
     }
 
     /// Without HL7's extension definitions loaded (R5 core without the

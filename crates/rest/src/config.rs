@@ -735,6 +735,12 @@ pub struct ValidationConfig {
     /// (`HFS_VALIDATION_BEST_PRACTICE`): `warning` (default; e.g. "all
     /// observations should have a performer") or `off`.
     pub best_practice: String,
+    /// Extensions whose url resolves to no definition
+    /// (`HFS_VALIDATION_UNKNOWN_EXTENSIONS`): `lenient` (default — FHIR lets
+    /// a receiver accept extensions it does not know; only an HL7-namespace
+    /// url warns) or `error` (the HL7 validator's default: "could not be
+    /// found so is not allowed here").
+    pub unknown_extensions: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
@@ -777,6 +783,7 @@ impl Default for ValidationConfig {
             display_issues: "warning".to_string(),
             extensible_bindings: "warning".to_string(),
             best_practice: "warning".to_string(),
+            unknown_extensions: "lenient".to_string(),
             stored_profiles: true,
             shadow_core: false,
             rehydrate: true,
@@ -836,6 +843,9 @@ impl ValidationConfig {
             best_practice: std::env::var("HFS_VALIDATION_BEST_PRACTICE")
                 .map(|s| s.to_lowercase())
                 .unwrap_or(d.best_practice),
+            unknown_extensions: std::env::var("HFS_VALIDATION_UNKNOWN_EXTENSIONS")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.unknown_extensions),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
             shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
             rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
@@ -898,6 +908,12 @@ impl ValidationConfig {
             errors.push(format!(
                 "HFS_VALIDATION_BEST_PRACTICE '{}' invalid (expected warning|off)",
                 self.best_practice
+            ));
+        }
+        if !matches!(self.unknown_extensions.as_str(), "lenient" | "error") {
+            errors.push(format!(
+                "HFS_VALIDATION_UNKNOWN_EXTENSIONS '{}' invalid (expected lenient|error)",
+                self.unknown_extensions
             ));
         }
         if self.terminology_timeout_ms == 0 {

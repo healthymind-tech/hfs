@@ -163,6 +163,33 @@ pub(crate) struct EdType {
     pub target_profile: Vec<String>,
     #[serde(default)]
     pub extension: Vec<EdTypeExtension>,
+    /// Extensions on each `profile` (`_profile`), aligned with it.
+    #[serde(rename = "_profile", default)]
+    pub profile_meta: Vec<Option<Value>>,
+}
+
+impl EdType {
+    /// `(profile, element id)` for each profile naming one of its elements
+    /// (`elementdefinition-profile-element`).
+    pub(crate) fn profile_elements(&self) -> Vec<(String, String)> {
+        const EXT: &str =
+            "http://hl7.org/fhir/StructureDefinition/elementdefinition-profile-element";
+        self.profile
+            .iter()
+            .zip(&self.profile_meta)
+            .filter_map(|(url, meta)| {
+                let element = meta
+                    .as_ref()?
+                    .get("extension")?
+                    .as_array()?
+                    .iter()
+                    .find(|e| e.get("url").and_then(Value::as_str) == Some(EXT))?
+                    .get("valueString")?
+                    .as_str()?;
+                Some((url.clone(), element.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +223,46 @@ pub(crate) struct EdBinding {
     pub strength: Option<String>,
     #[serde(rename = "valueSet")]
     pub value_set: Option<String>,
+    #[serde(default)]
+    pub extension: Vec<Value>,
+}
+
+impl EdBinding {
+    /// The value set of an unconditional `required` additional binding
+    /// (R5 `binding.additional`, carried in R4 as the cross-version
+    /// extension or the tools extension).
+    pub(crate) fn required_additional(&self) -> Option<String> {
+        const URLS: &[&str] = &[
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.binding.additional",
+            "http://hl7.org/fhir/tools/StructureDefinition/additional-binding",
+        ];
+        let mut found = self.extension.iter().filter_map(|ext| {
+            let url = ext.get("url")?.as_str()?;
+            if !URLS.contains(&url) {
+                return None;
+            }
+            let parts = ext.get("extension")?.as_array()?;
+            let part = |name: &str| {
+                parts
+                    .iter()
+                    .find(|p| p.get("url").and_then(Value::as_str) == Some(name))
+            };
+            if part("usage").is_some() {
+                return None; // conditional on a usage context
+            }
+            let purpose = part("purpose")?.get("valueCode")?.as_str()?;
+            if purpose != "required" {
+                return None;
+            }
+            let vs = part("valueSet")?;
+            vs.get("valueCanonical")
+                .or_else(|| vs.get("valueUri"))?
+                .as_str()
+                .map(str::to_string)
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,8 +326,24 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     let name = get_str("name");
     let sd_type = get_str("type").ok_or(ConvertError::Missing("type"))?;
     let kind_raw = get_str("kind").ok_or(ConvertError::Missing("kind"))?;
-    let derivation = get_str("derivation");
     let base = get_str("baseDefinition");
+    // A "specialization" of a type on that same type's own definition
+    // defines no new type: it is a profile mislabelled (as the HL7
+    // validator treats it).
+    let derivation = match get_str("derivation") {
+        Some(d)
+            if d == "specialization"
+                && base.as_deref().is_some_and(|b| {
+                    b.split('|').next()
+                        == Some(
+                            format!("http://hl7.org/fhir/StructureDefinition/{sd_type}").as_str(),
+                        )
+                }) =>
+        {
+            Some("constraint".to_string())
+        }
+        other => other,
+    };
 
     let element_values = sd
         .get("snapshot")
@@ -303,17 +386,45 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
 
     // Build the nested element tree by navigating each ED's id segments.
     let mut root = tree::Node::new(sd_type.clone());
+    // Hand-authored differentials may omit ids: the slice an element
+    // belongs to is then the one opened by the closest preceding
+    // `sliceName` element on an ancestor path (document order, as the
+    // HL7 snapshot generator reads them). `(path, id of the slice)`.
+    let mut open_slices: Vec<(String, String)> = Vec::new();
     for ed in &elements {
-        // Navigation is id-based; hand-authored differentials may omit ids,
-        // in which case the slice position is reconstructed from sliceName.
+        // Navigation is id-based; ids are synthesized where missing.
         let synthesized;
         let id = match (&ed.id, &ed.slice_name) {
             (Some(id), _) => id.as_str(),
-            (None, Some(slice)) => {
-                synthesized = format!("{}:{slice}", ed.path);
+            (None, slice) => {
+                let path = ed.path.as_str();
+                let within = |p: &str| {
+                    path.len() > p.len() && path.starts_with(p) && path.as_bytes()[p.len()] == b'.'
+                };
+                let base = open_slices
+                    .iter()
+                    .filter(|(p, _)| within(p))
+                    .max_by_key(|(p, _)| p.len())
+                    .map(|(p, slice_id)| format!("{slice_id}{}", &path[p.len()..]))
+                    .unwrap_or_else(|| path.to_string());
+                // A sliceName opens a slice; the bare element closes the
+                // slices opened at (or below) its path.
+                open_slices.retain(|(p, _)| {
+                    p != path
+                        && !(p.len() > path.len()
+                            && p.starts_with(path)
+                            && p.as_bytes()[path.len()] == b'.')
+                });
+                synthesized = match slice {
+                    Some(slice) => {
+                        let id = format!("{base}:{slice}");
+                        open_slices.push((path.to_string(), id.clone()));
+                        id
+                    }
+                    None => base,
+                };
                 &synthesized
             }
-            (None, None) => &ed.path,
         };
         let segments = tree::parse_segments(id)
             .map_err(|e| ConvertError::Malformed(format!("element id '{id}': {e}")))?;
@@ -333,7 +444,9 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     // `fhirpath:<expr>` / `extension:<url>`, which no element path equals —
     // dropping them made an extension allowed by a FHIRPath context look
     // misplaced to the context check.
-    let contexts: Vec<String> = sd
+    // `contextInvariant`s ride along as `invariant:<expr>` (they restrict
+    // where the extension may be used, on top of the contexts).
+    let mut contexts: Vec<String> = sd
         .get("context")
         .and_then(Value::as_array)
         .map(|items| {
@@ -351,6 +464,14 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
                 .collect()
         })
         .unwrap_or_default();
+    contexts.extend(
+        sd.get("contextInvariant")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|expr| format!("invariant:{expr}")),
+    );
     if !contexts.is_empty() {
         schema.context = Some(contexts);
     }

@@ -184,7 +184,10 @@ pub fn report_edition_versions(value: &mut Value) {
 
 /// `(module, release date)` of a SNOMED version URI.
 pub fn parse_version_uri(version: &str) -> Option<(&str, Option<&str>)> {
-    let rest = version.strip_prefix("http://snomed.info/sct/")?;
+    // `xsct` names an experimental (test) edition the same way.
+    let rest = version
+        .strip_prefix("http://snomed.info/sct/")
+        .or_else(|| version.strip_prefix("http://snomed.info/xsct/"))?;
     let (module, date) = match rest.split_once("/version/") {
         Some((m, d)) => (m, Some(d)),
         None => (rest.trim_end_matches('/'), None),
@@ -202,11 +205,16 @@ pub fn map_version(requested: &str, stored: &[String]) -> Option<String> {
     }
     let (module, date) = parse_version_uri(requested)?;
     let latest = |candidates: Vec<&String>| candidates.into_iter().max().cloned();
+    let same_edition =
+        |s: &String| parse_version_uri(s).is_some_and(|(m, d)| m == module && d.is_some());
     match date {
-        Some(date) => stored.iter().find(|s| *s == date).cloned(),
+        Some(date) => stored
+            .iter()
+            .find(|s| parse_version_uri(s) == Some((module, Some(date))))
+            .or_else(|| stored.iter().find(|s| *s == date))
+            .cloned(),
         None => {
-            let prefix = format!("http://snomed.info/sct/{module}/version/");
-            let as_uri: Vec<&String> = stored.iter().filter(|s| s.starts_with(&prefix)).collect();
+            let as_uri: Vec<&String> = stored.iter().filter(|s| same_edition(s)).collect();
             if !as_uri.is_empty() {
                 return latest(as_uri);
             }

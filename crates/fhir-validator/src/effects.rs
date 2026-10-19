@@ -44,7 +44,8 @@ use crate::schema::Binding;
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 // Message templates live with the rest of the contract in engine::errors;
 // re-exported crate-internally via these thin wrappers.
@@ -65,6 +66,8 @@ pub enum Deferred {
         human: Option<String>,
         /// `error` | `warning` | `guideline`.
         severity: Option<String>,
+        /// See [`DeferredConstraint::own_resource`].
+        own_resource: bool,
     },
     /// A terminology binding to check (filtered to `required` strength at
     /// execution time).
@@ -220,6 +223,9 @@ pub struct TxVerdict {
     pub wrong_display: Option<String>,
     /// [`TxCheck::Coding`]: the service knows no code system with this URL.
     pub unknown_system: bool,
+    /// [`TxCheck::Coding`]: the code system is known and does not define the
+    /// code; the message says so (HL7 validator wording).
+    pub unknown_code: Option<String>,
 }
 
 impl TxVerdict {
@@ -234,6 +240,7 @@ impl TxVerdict {
             valid,
             wrong_display: None,
             unknown_system: false,
+            unknown_code: None,
         }
     }
 }
@@ -359,6 +366,71 @@ pub trait ConstraintEvaluator: Send + Sync {
         version: FhirVersion,
         constraints: &[DeferredConstraint<'_>],
     ) -> Vec<ConstraintOutcome>;
+
+    /// As [`evaluate_all`](Self::evaluate_all), with `memberOf()` answered
+    /// from `members`. An evaluator that cannot use them ignores them.
+    fn evaluate_all_with_members(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: &Arc<MemberOfAnswers>,
+    ) -> Vec<ConstraintOutcome> {
+        let _ = members;
+        self.evaluate_all(resource, version, constraints)
+    }
+}
+
+/// `memberOf()` answers for one resource's invariants, filled from the
+/// [`TerminologyProvider`]. Questions not yet answered are recorded, so the
+/// effects layer can ask them and evaluate again.
+#[derive(Default)]
+pub struct MemberOfAnswers {
+    known: HashMap<(String, String), bool>,
+    missed: Mutex<Vec<(String, CodedValue)>>,
+    /// Answers `conformsTo()`: does this JSON conform to that profile.
+    conformance: Option<Conformance>,
+}
+
+/// Whether a JSON value conforms to a profile (structural validation).
+pub type Conformance = Arc<dyn Fn(&Value, &str) -> bool + Send + Sync>;
+
+impl std::fmt::Debug for MemberOfAnswers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemberOfAnswers")
+            .field("known", &self.known)
+            .field("conformance", &self.conformance.is_some())
+            .finish()
+    }
+}
+
+impl MemberOfAnswers {
+    /// `conformsTo()`: whether `value` conforms to `profile`, when the
+    /// validator supplied a conformance check.
+    pub fn conforms(&self, value: &Value, profile: &str) -> Option<bool> {
+        self.conformance.as_ref().map(|c| c(value, profile))
+    }
+
+    /// The answer for `coded` in `value_set`, or `None` (recorded as asked).
+    pub fn lookup(&self, value_set: &str, coded: CodedValue) -> Option<bool> {
+        let key = (value_set.to_string(), coded_key(&coded));
+        if let Some(b) = self.known.get(&key) {
+            return Some(*b);
+        }
+        self.missed
+            .lock()
+            .expect("memberOf lock")
+            .push((value_set.to_string(), coded));
+        None
+    }
+}
+
+fn coded_key(coded: &CodedValue) -> String {
+    match coded {
+        CodedValue::Code(c) => format!("code:{c}"),
+        CodedValue::Coding(v) => format!("coding:{v}"),
+        CodedValue::CodeableConcept(v) => format!("cc:{v}"),
+    }
 }
 
 /// A borrowed view of one deferred constraint, handed to evaluators.
@@ -369,6 +441,12 @@ pub struct DeferredConstraint<'a> {
     pub path: &'a str,
     pub id: &'a str,
     pub expression: &'a str,
+    /// The constraint belongs to the definition of the resource at `path`
+    /// (a `dom-*` / `pat-1` invariant on a contained or entry resource), so
+    /// `%resource` is that resource; otherwise it is the innermost resource
+    /// *containing* the node (a profile's invariant on `Bundle.entry.resource`
+    /// sees the Bundle as `%resource`).
+    pub own_resource: bool,
 }
 
 /// The handlers for one validation run.
@@ -418,15 +496,28 @@ pub async fn execute(
     handlers: &EffectHandlers<'_>,
     errors: &mut Vec<ValidationError>,
 ) {
-    execute_constraints(resource, version, deferred, handlers, errors);
-    execute_terminology(resource, deferred, handlers, errors).await;
+    execute_with(resource, version, deferred, handlers, None, errors).await;
 }
 
-fn execute_constraints(
+/// [`execute`], with `conformsTo()` answered by `conformance`.
+pub async fn execute_with(
     resource: &Value,
     version: FhirVersion,
     deferred: &[Deferred],
     handlers: &EffectHandlers<'_>,
+    conformance: Option<Conformance>,
+    errors: &mut Vec<ValidationError>,
+) {
+    execute_constraints(resource, version, deferred, handlers, conformance, errors).await;
+    execute_terminology(resource, deferred, handlers, errors).await;
+}
+
+async fn execute_constraints(
+    resource: &Value,
+    version: FhirVersion,
+    deferred: &[Deferred],
+    handlers: &EffectHandlers<'_>,
+    conformance: Option<Conformance>,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(evaluator) = handlers.constraints else {
@@ -435,7 +526,7 @@ fn execute_constraints(
 
     // Select, filter, and dedup — preserving deferred order.
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity)> = Vec::new();
+    let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity, bool)> = Vec::new();
     for d in deferred {
         let Deferred::Constraint {
             path,
@@ -443,6 +534,7 @@ fn execute_constraints(
             expression,
             human,
             severity,
+            own_resource,
         } = d
         else {
             continue;
@@ -458,7 +550,14 @@ fn execute_constraints(
         if !seen.insert((path.clone(), id.clone())) {
             continue; // same constraint from several cooperative layers
         }
-        selected.push((path, id, expression, human.as_deref(), issue_severity));
+        selected.push((
+            path,
+            id,
+            expression,
+            human.as_deref(),
+            issue_severity,
+            *own_resource,
+        ));
     }
     if selected.is_empty() {
         return;
@@ -466,13 +565,56 @@ fn execute_constraints(
 
     let refs: Vec<DeferredConstraint<'_>> = selected
         .iter()
-        .map(|(path, id, expression, _, _)| DeferredConstraint {
-            path,
-            id,
-            expression,
-        })
+        .map(
+            |(path, id, expression, _, _, own_resource)| DeferredConstraint {
+                path,
+                id,
+                expression,
+                own_resource: *own_resource,
+            },
+        )
         .collect();
-    let outcomes = evaluator.evaluate_all(resource, version, &refs);
+    let wants_conformance =
+        conformance.is_some() && refs.iter().any(|c| c.expression.contains("conformsTo("));
+    let outcomes = if let Some(tx) = handlers.terminology
+        && refs.iter().any(|c| c.expression.contains("memberOf("))
+    {
+        // Two passes: the first records the memberOf() questions, the
+        // provider answers them, the second evaluates with the answers.
+        let first = Arc::new(MemberOfAnswers {
+            conformance: conformance.clone(),
+            ..Default::default()
+        });
+        let outcomes = evaluator.evaluate_all_with_members(resource, version, &refs, &first);
+        let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
+        if asked.is_empty() {
+            outcomes
+        } else {
+            let checks: Vec<(&str, &CodedValue)> =
+                asked.iter().map(|(vs, c)| (vs.as_str(), c)).collect();
+            let answers = tx.validate_codes(&checks).await;
+            let mut known = HashMap::new();
+            for ((vs, coded), answer) in asked.iter().zip(answers) {
+                if let Ok(b) = answer {
+                    known.insert((vs.clone(), coded_key(coded)), b);
+                }
+            }
+            let second = Arc::new(MemberOfAnswers {
+                known,
+                missed: Mutex::default(),
+                conformance,
+            });
+            evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+        }
+    } else if wants_conformance {
+        let answers = Arc::new(MemberOfAnswers {
+            conformance,
+            ..Default::default()
+        });
+        evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
+    } else {
+        evaluator.evaluate_all(resource, version, &refs)
+    };
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
 
     // When nothing could be evaluated for the same reason (the resource does
@@ -499,9 +641,11 @@ fn execute_constraints(
         return;
     }
 
-    for ((path, id, _, human, severity), outcome) in selected.iter().zip(outcomes) {
+    for ((path, id, _, human, severity, _), outcome) in selected.iter().zip(outcomes) {
         match outcome {
             ConstraintOutcome::Passed => {}
+            ConstraintOutcome::Failed
+                if *id == "dom-3" && contained_all_referenced(resource, path) => {}
             ConstraintOutcome::Failed => {
                 errors.push(
                     ValidationError::new(
@@ -569,7 +713,10 @@ async fn execute_terminology(
         if let Deferred::Binding { path, binding, .. } = d {
             let vs = binding.value_set.split('|').next().unwrap_or_default();
             let entry = bound.entry(path.as_str()).or_default();
-            if !entry.iter().any(|(v, s)| *v == vs && *s == binding.strength.as_deref()) {
+            if !entry
+                .iter()
+                .any(|(v, s)| *v == vs && *s == binding.strength.as_deref())
+            {
                 entry.push((vs, binding.strength.as_deref()));
             }
         }
@@ -601,6 +748,11 @@ async fn execute_terminology(
         ) {
             continue;
         }
+        // CapabilityStatement.format is "xml | json | ttl | mime type": the
+        // short forms are no BCP-13 codes but the spec allows them.
+        if is_capability_format_shorthand(path, &coded) {
+            continue;
+        }
         if binding.strength.as_deref() == Some("extensible") {
             let vs = binding.value_set.split('|').next().unwrap_or_default();
             // A text-only concept satisfies an extensible binding; a bare
@@ -613,7 +765,10 @@ async fn execute_terminology(
             if !extensible_seen.insert((path.as_str(), vs)) {
                 continue; // same set from several layers (`|4.0.1` or not)
             }
-            if overridden(vs, bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[])) {
+            if overridden(
+                vs,
+                bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[]),
+            ) {
                 continue;
             }
         }
@@ -677,13 +832,14 @@ async fn execute_terminology(
             ));
             continue;
         }
-        // Every Coding with a system and a code is asked, as the HL7
-        // validator does: its display is judged, an HL7-namespace system
-        // must resolve, and any other unknown system draws a warning.
-        let has_system = coding.get("system").is_some_and(Value::is_string);
-        let has_code = coding.get("code").is_some_and(Value::is_string);
+        // Only what can produce an issue is asked: a display to judge, an
+        // HL7-namespace system that must resolve, or a code its code system
+        // must define.
         let has_display = coding.get("display").is_some_and(Value::is_string);
-        if !(has_system && (has_code || has_display)) {
+        let system = coding.get("system").and_then(Value::as_str);
+        let hl7 = system.is_some_and(crate::terminology::is_hl7_namespace);
+        let has_code = system.is_some() && coding.get("code").is_some_and(Value::is_string);
+        if !has_display && !hl7 && !has_code {
             continue;
         }
         asked.push(Asked::Coding { path, coding });
@@ -749,7 +905,40 @@ async fn execute_terminology(
         slice_membership_issues(d, &membership[index], undecided[index], errors);
     }
 
-    for (asked, verdict) in asked.iter().zip(verdicts) {
+    // A versioned Coding whose system|version the service does not know:
+    // ask again without the version to tell an unknown version of a known
+    // code system (a warning, as the HL7 validator reports it) from a
+    // system nobody defines.
+    let versioned_unknown: Vec<(usize, Value)> = asked
+        .iter()
+        .zip(&verdicts)
+        .enumerate()
+        .filter_map(|(i, (a, v))| match (a, v) {
+            (Asked::Coding { coding, .. }, Ok(v))
+                if v.unknown_system && coding.get("version").is_some() =>
+            {
+                let mut bare = (*coding).clone();
+                bare.as_object_mut()?.remove("version");
+                bare.as_object_mut()?.remove("display");
+                Some((i, bare))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut unknown_version: HashSet<usize> = HashSet::new();
+    if !versioned_unknown.is_empty() {
+        let again: Vec<TxCheck<'_>> = versioned_unknown
+            .iter()
+            .map(|(_, c)| TxCheck::Coding(c))
+            .collect();
+        for ((i, _), verdict) in versioned_unknown.iter().zip(provider.check(&again).await) {
+            if verdict.is_ok_and(|v| !v.unknown_system) {
+                unknown_version.insert(*i);
+            }
+        }
+    }
+
+    for (index, (asked, verdict)) in asked.iter().zip(verdicts).enumerate() {
         match asked {
             Asked::Binding {
                 path,
@@ -761,6 +950,19 @@ async fn execute_terminology(
                 match verdict {
                     Ok(v) if v.valid => {}
                     Ok(_) if required => {
+                        // A bare `code` from none of the value set's systems:
+                        // the HL7 validator first reports that no system can
+                        // be determined for it, then the binding failure.
+                        if let CodedValue::Code(code) = coded {
+                            errors.push(ValidationError::new(
+                                ErrorKind::TerminologyBinding,
+                                (*path).clone(),
+                                format!(
+                                    "The System URI could not be determined for the code '{code}' in the ValueSet '{}'",
+                                    binding.value_set
+                                ),
+                            ));
+                        }
                         errors.push(
                             ValidationError::new(
                                 ErrorKind::TerminologyBinding,
@@ -789,10 +991,7 @@ async fn execute_terminology(
                             ValidationError::new(
                                 ErrorKind::TerminologyBinding,
                                 (*path).clone(),
-                                messages::terminology_unavailable(
-                                    &binding.value_set,
-                                    e.message(),
-                                ),
+                                messages::terminology_unavailable(&binding.value_set, e.message()),
                             )
                             .with_severity(severity),
                         );
@@ -804,7 +1003,6 @@ async fn execute_terminology(
             }
             Asked::SliceMember { .. } => {} // judged above
             Asked::Coding { path, coding } => {
-                let system = coding.get("system").and_then(Value::as_str);
                 let verdict = match verdict {
                     Ok(v) => v,
                     // A system the service holds no content for (absent, or
@@ -813,6 +1011,7 @@ async fn execute_terminology(
                         valid: true,
                         wrong_display: None,
                         unknown_system: true,
+                        ..TxVerdict::valid()
                     },
                     Err(_) => continue,
                 };
@@ -826,8 +1025,33 @@ async fn execute_terminology(
                         .with_severity(handlers.display_issues),
                     );
                 }
-                if verdict.unknown_system
-                    && let Some(system) = system
+                if let Some(message) = &verdict.unknown_code
+                    && !unknown_version.contains(&index)
+                    && reportable_unknown_code(coding)
+                {
+                    errors.push(ValidationError::new(
+                        ErrorKind::TerminologyBinding,
+                        format!("{path}.code"),
+                        message.clone(),
+                    ));
+                }
+                if unknown_version.contains(&index)
+                    && let Some(system) = coding.get("system").and_then(Value::as_str)
+                {
+                    let version = coding
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    errors.push(
+                        ValidationError::new(
+                            ErrorKind::UnknownCodeSystem,
+                            format!("{path}.version"),
+                            messages::unknown_code_system_version(system, version),
+                        )
+                        .with_severity(Severity::Warning),
+                    );
+                } else if verdict.unknown_system
+                    && let Some(system) = coding.get("system").and_then(Value::as_str)
                 {
                     if crate::terminology::is_hl7_namespace(system) {
                         // The HL7 validator resolves every uri in the HL7
@@ -962,6 +1186,112 @@ fn restated_later(binding: &Binding, bindings: &[(&str, Option<&str>)]) -> bool 
         })
 }
 
+/// `CapabilityStatement.format` (and `patchFormat`'s base) values `xml`,
+/// `json`, `ttl`, which the element definition allows besides mime types.
+fn is_capability_format_shorthand(path: &str, coded: &CodedValue) -> bool {
+    let element = path.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    element.ends_with("CapabilityStatement.format")
+        && matches!(coded, CodedValue::Code(c) if matches!(c.as_str(), "xml" | "json" | "ttl"))
+}
+
+/// dom-3 as the HL7 validator judges it: a contained resource is
+/// referenced when `#id` appears anywhere in its container — in an element
+/// (reference, canonical, uri) or in a narrative (`<img src="#id">`,
+/// `<a href="#id">`), which the FHIRPath expression cannot see. Used to
+/// overrule a FHIRPath dom-3 failure when every contained id is so
+/// referenced.
+fn contained_all_referenced(resource: &Value, path: &str) -> bool {
+    let mut node = resource;
+    for segment in path.split('.').skip(1) {
+        node = match node {
+            Value::Array(items) => match segment.parse::<usize>().ok().and_then(|i| items.get(i)) {
+                Some(v) => v,
+                None => return false,
+            },
+            Value::Object(map) => match map.get(segment) {
+                Some(v) => v,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    let Some(contained) = node.get("contained").and_then(Value::as_array) else {
+        return false;
+    };
+    // `#id` as a whole value, or as a narrative attribute value.
+    fn mentions(value: &Value, target: &str) -> bool {
+        match value {
+            Value::String(s) => {
+                s == target
+                    || s.contains(&format!("=\"{target}\""))
+                    || s.contains(&format!("='{target}'"))
+            }
+            Value::Array(items) => items.iter().any(|v| mentions(v, target)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(k, v)| k != "contained" && mentions(v, target)),
+            _ => false,
+        }
+    }
+    contained.iter().all(|c| {
+        c.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| mentions(node, &format!("#{id}")))
+            // or the contained resource refers back to its container (`#`)
+            || mentions(c, "#")
+    })
+}
+
+/// Whether a code the terminology service does not find in its code system
+/// is wrong for every reader. SNOMED CT is the exception: a service holds
+/// one or a few editions (and may omit inactive concepts), so a well-formed
+/// concept id it does not know may well exist in another edition or
+/// release — only malformed ids (not digits, bad length, bad Verhoeff check
+/// digit) are reported. Post-coordinated expressions are not judged.
+fn reportable_unknown_code(coding: &Value) -> bool {
+    if coding.get("system").and_then(Value::as_str) != Some("http://snomed.info/sct") {
+        return true;
+    }
+    let Some(code) = coding.get("code").and_then(Value::as_str) else {
+        return false;
+    };
+    if !code.chars().all(|c| c.is_ascii_digit()) {
+        return !code.contains([':', '=', '+', '{', '|']);
+    }
+    !(6..=18).contains(&code.len()) || !verhoeff_valid(code)
+}
+
+/// The Verhoeff check SNOMED CT identifiers carry in their last digit.
+fn verhoeff_valid(digits: &str) -> bool {
+    const D: [[u8; 10]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    ];
+    const P: [[u8; 10]; 8] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+    ];
+    let mut c = 0u8;
+    for (i, ch) in digits.bytes().rev().enumerate() {
+        c = D[c as usize][P[i % 8][(ch - b'0') as usize] as usize];
+    }
+    c == 0
+}
+
 /// Whether an `extensible` binding to `vs` is superseded by another
 /// binding on the same element: a profile that rebinds an element (TW Core
 /// `identifier.type` to its own value set) replaces the base binding, as
@@ -982,7 +1312,9 @@ fn overridden(vs: &str, bindings: &[(&str, Option<&str>)]) -> bool {
     }
     // vs is an IG set: superseded only by a later IG set.
     let pos = bindings.iter().position(|(v, _)| *v == vs).unwrap_or(0);
-    bindings[pos + 1..].iter().any(|(v, _)| *v != vs && !core(v))
+    bindings[pos + 1..]
+        .iter()
+        .any(|(v, _)| *v != vs && !core(v))
 }
 
 /// Whether the coded value carries any code at all.
@@ -990,10 +1322,14 @@ fn has_code(coded: &CodedValue) -> bool {
     match coded {
         CodedValue::Code(c) => !c.is_empty(),
         CodedValue::Coding(c) => c.get("code").and_then(Value::as_str).is_some(),
-        CodedValue::CodeableConcept(cc) => cc
-            .get("coding")
-            .and_then(Value::as_array)
-            .is_some_and(|cs| cs.iter().any(|c| c.get("code").and_then(Value::as_str).is_some())),
+        CodedValue::CodeableConcept(cc) => {
+            cc.get("coding")
+                .and_then(Value::as_array)
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.get("code").and_then(Value::as_str).is_some())
+                })
+        }
     }
 }
 
@@ -1025,6 +1361,38 @@ pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<Code
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn snomed_unknown_codes_worth_reporting() {
+        for valid in [
+            "276885007",
+            "38266002",
+            "22298006",
+            "731000124108",
+            "56248011000036107",
+        ] {
+            assert!(super::verhoeff_valid(valid), "{valid}");
+        }
+        assert!(!super::verhoeff_valid("276885008"));
+        let sct =
+            |code: &str| serde_json::json!({"system": "http://snomed.info/sct", "code": code});
+        // bad check digit, junk: reported
+        assert!(super::reportable_unknown_code(&sct("276885008")));
+        assert!(super::reportable_unknown_code(&sct("276885007x")));
+        // well-formed ids (any namespace) and expressions: an edition or
+        // release question
+        assert!(!super::reportable_unknown_code(&sct("276885007")));
+        assert!(!super::reportable_unknown_code(&sct("56248011000036107")));
+        assert!(!super::reportable_unknown_code(&sct("731000124108")));
+        assert!(!super::reportable_unknown_code(&sct(
+            "249943000:363698007=72098002"
+        )));
+        // other systems: always
+        assert!(super::reportable_unknown_code(
+            &serde_json::json!({"system": "http://loinc.org", "code": "99999-9"})
+        ));
+    }
+
     use super::*;
 
     #[test]

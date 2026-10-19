@@ -38,7 +38,7 @@
 use super::errors::{self, ErrorKind, Severity};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
 use crate::effects::{Deferred, SliceBinding};
-use crate::schema::{Slice, Slicing};
+use crate::schema::{FhirSchema, Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -119,6 +119,36 @@ pub(super) fn validate_slices<'a>(
             counters,
             item_matches,
         });
+    }
+
+    // An item may belong to one slice of a slicing (re-slices aside).
+    for mark in &marks {
+        for (index, matches) in mark.item_matches.iter().enumerate() {
+            let top: Vec<&String> = matches
+                .iter()
+                .filter(|name| mark.slicing.slices[*name].reslice.is_none() && !name.contains('/'))
+                .collect();
+            // Profile-matched slices are matched structurally here (no
+            // invariants or terminology), more loosely than the HL7
+            // validator's full profile check: overlap among them is no
+            // evidence of a real ambiguity.
+            let by_profile = top
+                .iter()
+                .any(|name| matches_by_profile(&mark.slicing.slices[*name]));
+            if top.len() > 1 && !by_profile {
+                ctx.path.push_index(index);
+                let names: Vec<&str> = top.iter().map(|n| n.as_str()).collect();
+                let message = match &mark.source {
+                    Some(profile) => format!(
+                        "Profile {profile}, Element matches more than one slice - {}",
+                        names.join(", ")
+                    ),
+                    None => format!("Element matches more than one slice - {}", names.join(", ")),
+                };
+                ctx.error(ErrorKind::SliceUnmatched, message);
+                ctx.path.pop();
+            }
+        }
     }
 
     // ---- validate matched items (item order), consuming them ----
@@ -316,6 +346,25 @@ pub(super) fn validate_slices<'a>(
     consumed
 }
 
+/// Whether a slice's membership is decided by profile conformance (a
+/// `profile` part, or a `type`/`profile` part through `resolve()`).
+fn matches_by_profile(slice: &Slice) -> bool {
+    slice
+        .match_
+        .as_ref()
+        .filter(|m| m.type_.as_deref() == Some("all"))
+        .and_then(|m| m.value.as_ref())
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("profile" | "profile-element")
+                ) || p.get("resolve").and_then(Value::as_bool) == Some(true)
+            })
+        })
+}
+
 /// The schema-set key a matched slice's schema joins under: the extension
 /// URL for an extension slice (so issues inside it name the extension
 /// definition as their source), else the slice name.
@@ -357,11 +406,7 @@ fn is_decidable(slice: &Slice) -> bool {
 /// missing `match` (constraining slice) matches nothing, and a `match` with
 /// no `value` matches everything (lodash `_.isMatch` semantics for an empty
 /// source).
-fn slice_matches_in<'a>(
-    ctx: Option<&WalkCtx<'a>>,
-    slice: &Slice,
-    item: &'a Value,
-) -> bool {
+fn slice_matches_in<'a>(ctx: Option<&WalkCtx<'a>>, slice: &Slice, item: &'a Value) -> bool {
     if let Some(match_) = &slice.match_ {
         if match_.type_.as_deref() == Some(BINDING_MATCH) {
             // Value-set membership: decided in the effects pass.
@@ -413,6 +458,22 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
             .filter_map(|r| ctx.resolve_reference(r))
             .collect();
         let profiles = strings("profiles");
+        if part.get("type").and_then(Value::as_str) == Some("profile-value") {
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = profiles
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return !targets.is_empty();
+            }
+            return targets.iter().any(|t| {
+                values_at(t, rest)
+                    .into_iter()
+                    .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+            });
+        }
         return match part.get("type").and_then(Value::as_str) {
             Some("profile") => targets
                 .iter()
@@ -427,6 +488,34 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         };
     }
     match part.get("type").and_then(Value::as_str) {
+        Some("profile-value") => {
+            let Some(ctx) = ctx else {
+                return false;
+            };
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = strings("profiles")
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return true; // no profile fixes a value there
+            }
+            values_at(item, path)
+                .into_iter()
+                .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+        }
+        Some("profile-element") => {
+            let (Some(ctx), Some(url), Some(element)) = (
+                ctx,
+                part.get("url").and_then(Value::as_str),
+                part.get("element").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            library_slice(ctx, url, element)
+                .is_some_and(|slice| slice_matches_in(Some(ctx), &slice, item))
+        }
         Some("pattern") => part
             .get("value")
             .is_none_or(|pattern| is_partial_match(item, pattern)),
@@ -440,6 +529,42 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         }
         _ => false,
     }
+}
+
+/// The fixed or pattern value a schema states at a dotted element path.
+fn schema_constant(schema: &FhirSchema, path: &str) -> Option<Value> {
+    let mut current = schema;
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        current = current.elements.as_ref()?.get(segment)?;
+    }
+    current.fixed.clone().or_else(|| current.pattern.clone())
+}
+
+/// The slice `element` (`Composition.section:codeA`) of the profile at
+/// `url`.
+fn library_slice(ctx: &WalkCtx<'_>, url: &str, element: &str) -> Option<Slice> {
+    let root = ctx
+        .resolver()
+        .resolve(url.split('|').next().unwrap_or(url))?;
+    let mut schema: Arc<FhirSchema> = root;
+    let mut found: Option<Slice> = None;
+    for segment in element.split('.').skip(1) {
+        let (name, slice) = match segment.split_once(':') {
+            Some((n, s)) => (n, Some(s)),
+            None => (segment, None),
+        };
+        let child = Arc::clone(schema.elements.as_ref()?.get(name)?);
+        found = None;
+        schema = child;
+        if let Some(slice) = slice {
+            let s = schema.slicing.as_ref()?.slices.get(slice)?.clone();
+            if let Some(inner) = &s.schema {
+                schema = Arc::clone(inner);
+            }
+            found = Some(s);
+        }
+    }
+    found
 }
 
 /// The resource type a (target) profile constrains: the name itself for a
@@ -467,6 +592,18 @@ fn parents_at<'v>(item: &'v Value, path: &str) -> (Vec<&'v Value>, Option<String
     let mut current = vec![item];
     for segment in parents {
         let mut next = Vec::new();
+        // `ofType(Observation)`: the resources of that type.
+        if let Some(ty) = segment
+            .strip_prefix("ofType(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            current.retain(|v| {
+                v.get("resourceType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|rt| rt == ty)
+            });
+            continue;
+        }
         for value in current {
             match value.get(*segment) {
                 Some(Value::Array(items)) => next.extend(items.iter()),

@@ -72,6 +72,8 @@ pub mod packs;
 pub mod resolver;
 pub mod schema;
 pub mod terminology;
+#[cfg(feature = "xml")]
+pub mod xml;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
@@ -83,12 +85,13 @@ pub use editor::{
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, SliceBinding, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
+    EffectHandlers, MemberOfAnswers, SliceBinding, TerminologyError, TerminologyErrorKind,
+    TerminologyFailMode,
     TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{
-    ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
-    Validator, dotted_to_fhirpath,
+    ErrorKind, Severity, SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy,
+    ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};

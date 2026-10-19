@@ -77,6 +77,41 @@ fn lookup_cache_key(req: &LookupRequest) -> Option<String> {
 
 #[async_trait]
 impl CodeSystemOperations for PostgresTerminologyBackend {
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        match crate::snomed::store::system_id_pg(&client, url, version).await? {
+            Some(id) => crate::snomed::store::load_pg(&client, &id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        match crate::snomed::store::system_id_pg(&client, url, version).await? {
+            Some(id) => crate::snomed::store::concepts_pg(&client, &id, codes).await,
+            None => Ok(std::collections::HashMap::new()),
+        }
+    }
+
     async fn lookup(
         &self,
         _ctx: &TenantContext,
@@ -310,7 +345,9 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 let cs_version_str = resolved_cs_version.clone();
                 let cs_content: Option<String> =
                     cs_content_for_system_id(&client, &system_id).await;
-                if cs_content.as_deref() == Some("fragment") {
+                // A fragment — or, as tx.fhir.org treats it, a code system whose
+                // content is not present — may hold the code elsewhere.
+                if crate::types::may_hold_unlisted_codes(cs_content.as_deref(), Some(&*system)) {
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
                             "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",

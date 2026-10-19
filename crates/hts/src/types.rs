@@ -707,3 +707,18 @@ mod tests {
         assert_eq!(decoded.contains[0].code, "CHILD");
     }
 }
+
+/// Whether a code system with `content` may hold a code it does not list: a
+/// fragment, or (as tx.fhir.org treats it) one whose content is not present
+/// — but not a code system defined by a grammar (UCUM, media types, language
+/// tags), whose codes are judged by their form.
+pub fn may_hold_unlisted_codes(content: Option<&str>, system: Option<&str>) -> bool {
+    match content {
+        Some("fragment") => true,
+        Some("not-present") => !matches!(
+            system,
+            Some("http://unitsofmeasure.org" | "urn:ietf:bcp:13" | "urn:ietf:bcp:47")
+        ),
+        _ => false,
+    }
+}

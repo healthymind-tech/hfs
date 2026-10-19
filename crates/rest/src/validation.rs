@@ -23,8 +23,8 @@ use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
     CodedValue, CompositeResolver, CompositeTerminologyProvider, EffectHandlers, ErrorKind,
     SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyFailMode,
-    TerminologyProvider, TxCheck, TxVerdict, UnknownProfilePolicy, ValidationError,
-    ValidationOptions, Validator, dotted_to_fhirpath,
+    TerminologyProvider, TxCheck, TxVerdict, UnknownExtensionPolicy, UnknownProfilePolicy,
+    ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -101,6 +101,8 @@ pub struct ValidationService {
     check_extensible: bool,
     /// HL7 best-practice warnings (`HFS_VALIDATION_BEST_PRACTICE`).
     best_practice: bool,
+    /// Unresolvable extension urls (`HFS_VALIDATION_UNKNOWN_EXTENSIONS`).
+    unknown_extensions: UnknownExtensionPolicy,
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
@@ -135,6 +137,7 @@ impl Default for ValidationService {
             display_issues: Severity::Warning,
             check_extensible: true,
             best_practice: true,
+            unknown_extensions: UnknownExtensionPolicy::Lenient,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
@@ -215,6 +218,10 @@ impl ValidationService {
             },
             check_extensible: config.extensible_bindings != "off",
             best_practice: config.best_practice != "off",
+            unknown_extensions: match config.unknown_extensions.as_str() {
+                "error" => UnknownExtensionPolicy::Error,
+                _ => UnknownExtensionPolicy::Lenient,
+            },
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
@@ -317,6 +324,7 @@ impl ValidationService {
             // An extension outside its declared context is an error, as
             // the HL7 validator reports it (warning on canonical resources).
             check_extension_context: true,
+            unknown_extensions: self.unknown_extensions,
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -779,7 +787,10 @@ impl ValidationService {
             }
         }
         if report.removed > 0 {
-            debug!(removed = report.removed, "dropped cached profiles no longer in storage");
+            debug!(
+                removed = report.removed,
+                "dropped cached profiles no longer in storage"
+            );
         }
     }
 
@@ -1061,7 +1072,11 @@ fn prepare_stored_profiles(
     shadow_core: bool,
     tenant: &str,
     items: Vec<(FhirVersion, Value)>,
-) -> Vec<(FhirVersion, Value, Option<helios_fhir_validator::FhirSchema>)> {
+) -> Vec<(
+    FhirVersion,
+    Value,
+    Option<helios_fhir_validator::FhirSchema>,
+)> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1115,6 +1130,9 @@ fn prepare_stored_profiles(
 pub struct RemoteTerminologyProvider {
     base_url: String,
     client: reqwest::Client,
+    /// The per-check timeout; a batch of n checks gets n times it (capped
+    /// at [`MAX_BATCH_TIMEOUT`]).
+    timeout: Duration,
     /// Check key (value set + coded value, or code system + coding) →
     /// verdict, cached for [`CACHE_TTL`].
     cache: DashMap<String, (TxVerdict, Instant)>,
@@ -1122,9 +1140,10 @@ pub struct RemoteTerminologyProvider {
     /// [`UNKNOWN_VALUE_SET_TTL`] so one missing IG value set costs one
     /// round-trip per TTL instead of one per coded element.
     unknown_value_sets: DashMap<String, Instant>,
-    /// Code system url → whether the server has no content to check codes
-    /// against (absent, or only `content: not-present` stubs).
-    contentless_systems: DashMap<String, (bool, Instant)>,
+    /// Code system url → what the server holds for it: (no content to
+    /// check codes against — absent, or only `content: not-present` stubs;
+    /// a `complete` version).
+    contentless_systems: DashMap<String, ((bool, bool), Instant)>,
     /// ValueSet canonical → its `compose` (`Value::Null` when the server
     /// does not return one).
     value_set_composes: DashMap<String, (Value, Instant)>,
@@ -1151,11 +1170,52 @@ pub fn split_canonical(reference: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Checks per terminology batch request. A large Bundle's checks go out
+/// in several batches, a few at a time, rather than one request the
+/// server may not finish within the timeout.
+const BATCH_CHUNK: usize = 25;
+/// Batch requests in flight at once for one resource.
+const BATCH_CONCURRENCY: usize = 2;
+/// Single requests in flight at once when the server refuses batches.
+const SINGLE_CONCURRENCY: usize = 8;
+/// Upper bound of a batch request's timeout.
+const MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A reqwest error with its source chain (`error sending request` alone
+/// does not say whether the connection was refused, reset or closed).
+fn error_chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Send a request, retrying once when it never reached the server or the
+/// pooled connection broke before an answer (`error sending request`: a
+/// keep-alive connection the server had already closed). Not retried on a
+/// timeout — the server may still be working on it.
+async fn send_retrying(
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    match build().send().await {
+        Err(e) if !e.is_timeout() && (e.is_connect() || e.is_request()) => {
+            debug!(error = %error_chain(&e), "terminology request failed before an answer; retrying once");
+            build().send().await
+        }
+        other => other,
+    }
+}
+
 impl RemoteTerminologyProvider {
     /// `base_url` is the terminology server root (e.g. `http://hts:8090`).
     pub fn new(base_url: String, timeout: Duration) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            timeout,
             client: reqwest::Client::builder()
                 .timeout(timeout)
                 .build()
@@ -1201,23 +1261,36 @@ impl RemoteTerminologyProvider {
     /// `content: not-present` stub (or there is none). `None` when the server
     /// could not be asked — the caller then keeps the server's verdict.
     async fn system_has_no_content(&self, system: &str) -> Option<bool> {
+        self.system_content(system)
+            .await
+            .map(|(contentless, _)| contentless)
+    }
+
+    /// Whether the server holds a `content: complete` version of `system`:
+    /// only then does "unknown code" mean the code does not exist.
+    async fn system_is_complete(&self, system: &str) -> Option<bool> {
+        self.system_content(system)
+            .await
+            .map(|(_, complete)| complete)
+    }
+
+    /// `(contentless, complete)` for `system` (see `contentless_systems`).
+    async fn system_content(&self, system: &str) -> Option<(bool, bool)> {
         if let Some(entry) = self.contentless_systems.get(system)
             && entry.1.elapsed() < CACHE_TTL
         {
             return Some(entry.0);
         }
         let url = format!("{}/CodeSystem", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&[
+        let response = send_retrying(|| {
+            self.client.get(&url).query(&[
                 ("url", system),
                 ("_elements", "url,version,content"),
                 ("_count", "50"),
             ])
-            .send()
-            .await
-            .ok()?;
+        })
+        .await
+        .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -1231,12 +1304,22 @@ impl RemoteTerminologyProvider {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let content = |e: &Value| {
+            e.pointer("/resource/content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         let contentless = entries
             .iter()
-            .all(|e| e.pointer("/resource/content").and_then(Value::as_str) == Some("not-present"));
-        self.contentless_systems
-            .insert(system.to_string(), (contentless, Instant::now()));
-        Some(contentless)
+            .all(|e| content(e).as_deref() == Some("not-present"));
+        let complete = entries
+            .iter()
+            .any(|e| content(e).as_deref() == Some("complete"));
+        self.contentless_systems.insert(
+            system.to_string(),
+            ((contentless, complete), Instant::now()),
+        );
+        Some((contentless, complete))
     }
 
     /// The `compose` of `value_set` (`url|version` honoured when the server
@@ -1249,13 +1332,13 @@ impl RemoteTerminologyProvider {
         }
         let (canonical, version) = split_canonical(value_set);
         let url = format!("{}/ValueSet", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&[("url", canonical), ("_count", "50")])
-            .send()
-            .await
-            .ok()?;
+        let response = send_retrying(|| {
+            self.client
+                .get(&url)
+                .query(&[("url", canonical), ("_count", "50")])
+        })
+        .await
+        .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -1290,6 +1373,27 @@ impl RemoteTerminologyProvider {
         body: &Value,
     ) -> Option<String> {
         if let Some(system) = Self::caused_by_unknown_system(body) {
+            // An unknown code system the value set does not draw on makes
+            // the code plainly not a member (as the HL7 validator says);
+            // only one the value set includes leaves membership open.
+            let named_only = body
+                .get("parameter")
+                .and_then(Value::as_array)
+                .is_some_and(|ps| {
+                    !ps.iter().any(|p| {
+                        p.get("name").and_then(Value::as_str) == Some("x-caused-by-unknown-system")
+                    })
+                });
+            if named_only
+                && let Some(compose) = self.value_set_compose(value_set).await
+                && let Some(includes) = compose.get("include").and_then(Value::as_array)
+                && !includes.iter().any(|inc| {
+                    inc.get("system").and_then(Value::as_str) == Some(system.as_str())
+                        || inc.get("valueSet").is_some()
+                })
+            {
+                return None;
+            }
             return Some(system);
         }
         let systems = Self::coded_systems(coded);
@@ -1431,7 +1535,11 @@ impl RemoteTerminologyProvider {
     }
 
     /// A still-fresh cached verdict (or remembered unknown value set).
-    fn cached(&self, check: &TxCheck<'_>, key: &str) -> Option<Result<TxVerdict, TerminologyError>> {
+    fn cached(
+        &self,
+        check: &TxCheck<'_>,
+        key: &str,
+    ) -> Option<Result<TxVerdict, TerminologyError>> {
         if let Some(entry) = self.cache.get(key) {
             let (verdict, at) = &*entry;
             if at.elapsed() < CACHE_TTL {
@@ -1481,8 +1589,14 @@ impl RemoteTerminologyProvider {
             .and_then(Value::as_str)
     }
 
+    /// A wrong display: `invalid-display`, or a display that is no longer
+    /// correct (`display-comment`, INACTIVE_DISPLAY_FOUND — a deprecated or
+    /// withdrawn designation, an error unless validation is lenient).
     fn is_display_issue(issue: &Value) -> bool {
-        Self::tx_issue_type(issue) == Some("invalid-display")
+        matches!(
+            Self::tx_issue_type(issue),
+            Some("invalid-display" | "display-comment")
+        )
     }
 
     /// Read the verdict out of a successful `$validate-code` answer.
@@ -1521,13 +1635,26 @@ impl RemoteTerminologyProvider {
                     .map(str::to_string);
                 let unknown_system = Self::caused_by_unknown_system(body).is_some()
                     || issues.iter().any(|i| {
-                        i.pointer("/extension/0/valueString").and_then(Value::as_str)
+                        i.pointer("/extension/0/valueString")
+                            .and_then(Value::as_str)
                             == Some("UNKNOWN_CODESYSTEM")
                     });
+                // A known system that does not define the code.
+                let unknown_code = (!result && !unknown_system)
+                    .then(|| {
+                        issues.iter().find(|i| {
+                            i.get("severity").and_then(Value::as_str) == Some("error")
+                                && Self::tx_issue_type(i) == Some("invalid-code")
+                        })
+                    })
+                    .flatten()
+                    .and_then(|i| i.pointer("/details/text").and_then(Value::as_str))
+                    .map(str::to_string);
                 Ok(TxVerdict {
                     valid: true,
                     wrong_display,
                     unknown_system,
+                    unknown_code,
                 })
             }
         }
@@ -1580,13 +1707,15 @@ impl RemoteTerminologyProvider {
         }
         let (op, payload) = Self::request(check, language);
         let url = format!("{}/{op}", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
+        let started = Instant::now();
+        let response = send_retrying(|| self.client.post(&url).json(&payload))
             .await
-            .map_err(|e| TerminologyError::new(format!("request to {url} failed: {e}")))?;
+            .map_err(|e| {
+                let detail = error_chain(&e);
+                warn!(url = %url, elapsed_ms = started.elapsed().as_millis() as u64, error = %detail,
+                      "terminology request failed");
+                TerminologyError::new(format!("request to {url} failed: {detail}"))
+            })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1597,7 +1726,7 @@ impl RemoteTerminologyProvider {
             .await
             .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
         let verdict = self.settle(check, key, &url, status, Some(&body), "");
-        self.check_unverifiable(check, &body, verdict).await
+        self.check_unverifiable(check, &body, verdict, language).await
     }
 
     /// Several uncached checks in one FHIR `batch` Bundle (`POST [base]`,
@@ -1621,14 +1750,65 @@ impl RemoteTerminologyProvider {
             .collect();
         let bundle = json!({"resourceType": "Bundle", "type": "batch", "entry": entries});
         let url = format!("{}/", self.base_url);
-        let response = self.client.post(&url).json(&bundle).send().await.ok()?;
+        let started = Instant::now();
+        let timeout = self
+            .timeout
+            .saturating_mul(checks.len().max(1) as u32)
+            .min(MAX_BATCH_TIMEOUT)
+            .max(self.timeout);
+        let response = match send_retrying(|| self.client.post(&url).json(&bundle).timeout(timeout))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() => {
+                // The server is overloaded or slow on these checks: asking
+                // them again one by one would only add to its load. Each
+                // check is reported as not performed.
+                let detail = error_chain(&e);
+                warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                      error = %detail, "terminology batch timed out");
+                return Some(
+                    checks
+                        .iter()
+                        .map(|_| {
+                            Err(TerminologyError::new(format!(
+                                "request to {url} timed out after {} ms ({} checks in the batch): {detail}",
+                                timeout.as_millis(),
+                                checks.len()
+                            )))
+                        })
+                        .collect(),
+                );
+            }
+            Err(e) => {
+                warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                      error = %error_chain(&e), "terminology batch failed; checking one by one");
+                return None;
+            }
+        };
         if !response.status().is_success() {
             debug!(status = %response.status(), "terminology server refused a batch; checking one by one");
             return None;
         }
-        let body: Value = response.json().await.ok()?;
+        let body: Value = match response.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(entries = checks.len(), error = %error_chain(&e), "unreadable terminology batch answer; checking one by one");
+                return None;
+            }
+        };
+        debug!(
+            entries = checks.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "terminology batch answered"
+        );
         let answers = body.get("entry").and_then(Value::as_array)?;
         if answers.len() != checks.len() {
+            warn!(
+                asked = checks.len(),
+                answered = answers.len(),
+                "terminology batch answer count differs; checking one by one"
+            );
             return None;
         }
         let mut out = Vec::with_capacity(checks.len());
@@ -1654,9 +1834,28 @@ impl RemoteTerminologyProvider {
             // A `false` may only mean the code system has no content on the
             // server; that check stays per verdict (rare: only on failures).
             let body = resource.cloned().unwrap_or(Value::Null);
-            out.push(self.check_unverifiable(check, &body, verdict).await);
+            out.push(self.check_unverifiable(check, &body, verdict, language).await);
         }
         Some(out)
+    }
+
+    /// One chunk as a batch; when the server will not take it as one, its
+    /// checks one by one, SINGLE_CONCURRENCY at a time.
+    async fn check_chunk(
+        &self,
+        chunk: &[TxCheck<'_>],
+        language: Option<&str>,
+    ) -> Vec<Result<TxVerdict, TerminologyError>> {
+        if let Some(verdicts) = self.check_batch(chunk, language).await {
+            return verdicts;
+        }
+        let mut out = Vec::with_capacity(chunk.len());
+        for part in chunk.chunks(SINGLE_CONCURRENCY) {
+            out.extend(
+                futures::future::join_all(part.iter().map(|c| self.check_one(c, language))).await,
+            );
+        }
+        out
     }
 
     /// N's rule: a negative membership verdict over a code system the
@@ -1667,7 +1866,26 @@ impl RemoteTerminologyProvider {
         check: &TxCheck<'_>,
         body: &Value,
         verdict: Result<TxVerdict, TerminologyError>,
+        language: Option<&str>,
     ) -> Result<TxVerdict, TerminologyError> {
+        if let (TxCheck::Coding(coding), Ok(v)) = (check, &verdict)
+            && v.unknown_code.is_some()
+        {
+            // "Unknown code" from a fragment, example or stub code system
+            // proves nothing about the code.
+            let system = coding
+                .get("system")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if self.system_is_complete(system).await != Some(true) {
+                let mut v = v.clone();
+                v.unknown_code = None;
+                self.cache
+                    .insert(Self::cache_key(check, language), (v.clone(), Instant::now()));
+                return Ok(v);
+            }
+            return verdict;
+        }
         let TxCheck::InValueSet(value_set, coded) = check else {
             return verdict;
         };
@@ -1748,16 +1966,21 @@ impl TerminologyProvider for RemoteTerminologyProvider {
         }
         if !pending.is_empty() {
             let requests: Vec<TxCheck<'_>> = pending.iter().map(|(c, _)| *c).collect();
-            let verdicts = match requests.len() {
-                1 => None,
-                _ => self.check_batch(&requests, language).await,
-            };
-            let verdicts = match verdicts {
-                Some(v) => v,
-                None => {
-                    futures::future::join_all(requests.iter().map(|c| self.check_one(c, language)))
-                        .await
+            let verdicts: Vec<Result<TxVerdict, TerminologyError>> = if requests.len() == 1 {
+                vec![self.check_one(&requests[0], language).await]
+            } else {
+                // Batches of BATCH_CHUNK, BATCH_CONCURRENCY in flight.
+                let mut all = Vec::with_capacity(requests.len());
+                for group in requests.chunks(BATCH_CHUNK * BATCH_CONCURRENCY) {
+                    let parts = futures::future::join_all(
+                        group
+                            .chunks(BATCH_CHUNK)
+                            .map(|chunk| self.check_chunk(chunk, language)),
+                    )
+                    .await;
+                    all.extend(parts.into_iter().flatten());
                 }
+                all
             };
             for ((_, positions), verdict) in pending.iter().zip(verdicts) {
                 for &i in positions {
@@ -1797,9 +2020,10 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::TerminologyBinding | ErrorKind::DisplayMismatch => IssueType::CodeInvalid,
         // An HL7-namespace code system nobody defines, a narrative link to
         // nothing, a best-practice recommendation: invalid content.
-        ErrorKind::UnknownCodeSystem | ErrorKind::Narrative | ErrorKind::BestPractice => {
-            IssueType::Invalid
-        }
+        ErrorKind::UnknownCodeSystem
+        | ErrorKind::Narrative
+        | ErrorKind::BestPractice
+        | ErrorKind::DuplicateId => IssueType::Invalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.
@@ -1949,7 +2173,9 @@ mod remote_provider_tests {
     /// NGS specimen types (`LP7057-5` "Bld") must not fail their binding.
     #[test]
     fn a_wrong_display_never_makes_a_code_invalid() {
-        let coded = CodedValue::Coding(json!({"system": "http://loinc.org", "code": "LP7057-5", "display": "Bld"}));
+        let coded = CodedValue::Coding(
+            json!({"system": "http://loinc.org", "code": "LP7057-5", "display": "Bld"}),
+        );
         let vs = TxCheck::InValueSet("http://example.org/vs", &coded);
         let display = issue("error", "invalid-display", "Wrong Display Name 'Bld'", None);
         let verdict = RemoteTerminologyProvider::read_verdict(
@@ -1968,6 +2194,20 @@ mod remote_provider_tests {
         .unwrap();
         assert!(!verdict.valid);
 
+        // So is a display that is no longer correct (a withdrawn designation).
+        let inactive_display = issue(
+            "error",
+            "display-comment",
+            "'2nd Code' is no longer considered a correct display for code 'code2' (status = withdrawn). The correct display is 'Display 2'",
+            Some("INACTIVE_DISPLAY_FOUND"),
+        );
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &vs,
+            &answer(false, vec![inactive_display], vec![]),
+        )
+        .unwrap();
+        assert!(verdict.valid);
+
         // A plain `false` without issues stays invalid.
         let verdict =
             RemoteTerminologyProvider::read_verdict(&vs, &answer(false, vec![], vec![])).unwrap();
@@ -1981,7 +2221,16 @@ mod remote_provider_tests {
         let text = "Wrong Display Name 'MCV' for http://loinc.org#787-2. Valid display is 'MCV [Entitic mean volume] in Red Blood Cells by Automated count'";
         let verdict = RemoteTerminologyProvider::read_verdict(
             &check,
-            &answer(false, vec![issue("error", "invalid-display", text, Some("Display_Name_for__should_be_one_of__instead_of"))], vec![]),
+            &answer(
+                false,
+                vec![issue(
+                    "error",
+                    "invalid-display",
+                    text,
+                    Some("Display_Name_for__should_be_one_of__instead_of"),
+                )],
+                vec![],
+            ),
         )
         .unwrap();
         assert!(verdict.valid);
@@ -2002,7 +2251,11 @@ mod remote_provider_tests {
 
         let verdict = RemoteTerminologyProvider::read_verdict(
             &check,
-            &answer(false, vec![], vec![json!({"name": "x-unknown-system", "valueCanonical": "http://x"})]),
+            &answer(
+                false,
+                vec![],
+                vec![json!({"name": "x-unknown-system", "valueCanonical": "http://x"})],
+            ),
         )
         .unwrap();
         assert!(verdict.unknown_system);

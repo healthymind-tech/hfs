@@ -117,6 +117,25 @@ pub struct FhirSchema {
     /// equal; extra data keys permitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<Value>,
+    /// `minValue[x]` of the element definition: the value (a number, a
+    /// date/time string, or a Quantity) the data must not be below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<Value>,
+    /// `maxValue[x]`: the value the data must not exceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<Value>,
+    /// `ElementDefinition.maxLength`: most characters a string value may
+    /// have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// The `minLength` extension on the element definition: fewest
+    /// characters a string value may have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// The `maxSize` extension on the element definition: most bytes an
+    /// Attachment's data may hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,
@@ -126,6 +145,10 @@ pub struct FhirSchema {
     /// Allowed reference target types (for Reference/canonical elements).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refers: Option<Vec<String>>,
+    /// `type.profile` of the element (datatype or resource profiles): the
+    /// value must conform to one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_profiles: Option<Vec<String>>,
 
     // ------------------------------------------------------------------
     // Slicing

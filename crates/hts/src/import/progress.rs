@@ -245,6 +245,19 @@ impl BundleImportBackend for ProgressBackend {
             .await
     }
 
+    async fn import_snomed_model(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        self.check_cancel()?;
+        self.inner
+            .import_snomed_model(ctx, url, version, data)
+            .await
+    }
+
     async fn write_concept_properties(
         &self,
         ctx: &TenantContext,

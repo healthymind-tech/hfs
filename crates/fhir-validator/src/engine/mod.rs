@@ -7,6 +7,8 @@
 //! `docs/guide/mental-model.md` in the FHIR Schema repo for the model, and
 //! `walk.rs` for the deterministic error-emission order.
 
+mod attachment;
+mod bounds;
 mod bundle;
 mod errors;
 mod narrative;
@@ -31,6 +33,7 @@ pub(crate) mod messages {
         msg_slice_closed_unmatched as slice_closed_unmatched, msg_slice_max as slice_max,
         msg_slice_min as slice_min, msg_terminology_binding as terminology_binding,
         msg_terminology_unavailable as terminology_unavailable,
+        msg_unknown_code_system_version as unknown_code_system_version,
         msg_url_unresolved as url_unresolved, msg_wrong_display as wrong_display,
     };
 }
@@ -72,6 +75,23 @@ pub struct ValidationOptions {
     /// hundreds of canonical resources — useful to a profile author,
     /// noise to everyone else.
     pub check_extension_context: bool,
+    /// How an extension whose url resolves to no definition is reported.
+    pub unknown_extensions: UnknownExtensionPolicy,
+}
+
+/// Policy for extensions whose url resolves to no StructureDefinition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownExtensionPolicy {
+    /// FHIR lets receivers accept extensions they do not know: only a url
+    /// in HL7's own namespaces (where every extension is published) draws a
+    /// warning, when HL7's extension definitions are loaded (default).
+    #[default]
+    Lenient,
+    /// The HL7 validator's default: any unresolvable extension is an error
+    /// ("could not be found so is not allowed here"), except example urls
+    /// (`example.org`, `acme.com`), `nema.org` (DICOM), HL7 tooling
+    /// extensions and cross-version extensions.
+    Error,
 }
 
 impl Default for ValidationOptions {
@@ -81,6 +101,7 @@ impl Default for ValidationOptions {
             use_meta_profiles: true,
             check_extension_context: false,
             unknown_profile: UnknownProfilePolicy::default(),
+            unknown_extensions: UnknownExtensionPolicy::default(),
         }
     }
 }
@@ -260,12 +281,31 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts);
+        self.validate_sync_with(resource, opts, None)
+    }
+
+    /// [`Self::validate_sync`], with invariants evaluated where the walk
+    /// must choose among type profiles.
+    fn validate_sync_with<'a>(
+        &'a self,
+        resource: &'a Value,
+        opts: &ValidationOptions,
+        invariants: Option<&'a walk::InvariantCheck<'a>>,
+    ) -> SyncOutcome {
+        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts, invariants);
         outcome
             .errors
             .extend(bundle_entry_type_mismatches(resource));
         outcome.errors.extend(bundle_unresolved_urns(resource));
-        outcome.errors.extend(bundle::bundle_rules(resource));
+        let resolver = self.resolver.as_ref();
+        let is_resource_type = |name: &str| {
+            resolver
+                .resolve(name)
+                .is_some_and(|s| crate::editor::is_resource(&s))
+        };
+        outcome
+            .errors
+            .extend(bundle::bundle_rules_with(resource, &is_resource_type));
         outcome
     }
 
@@ -280,17 +320,62 @@ impl Validator {
         opts: &ValidationOptions,
         effects: &EffectHandlers<'_>,
     ) -> Vec<ValidationError> {
+        let check = |root: &Value, path: &str, id: &str, expression: &str| -> bool {
+            let Some(evaluator) = effects.constraints else {
+                return true;
+            };
+            let c = [crate::effects::DeferredConstraint {
+                path,
+                id,
+                expression,
+                own_resource: false,
+            }];
+            !matches!(
+                evaluator.evaluate_all(root, version, &c).first(),
+                Some(crate::effects::ConstraintOutcome::Failed)
+            )
+        };
+        let invariants: Option<&walk::InvariantCheck<'_>> = effects
+            .constraints
+            .is_some()
+            .then_some(&check as &walk::InvariantCheck<'_>);
         let SyncOutcome {
             mut errors,
             deferred,
-        } = self.validate_sync(resource, opts);
+        } = self.validate_sync_with(resource, opts, invariants);
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
         }
         if effects.best_practice {
             errors.extend(narrative::best_practice_warnings(resource));
         }
-        crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
+        let resolver = Arc::clone(&self.resolver);
+        let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {
+            let opts = ValidationOptions {
+                profiles: vec![profile.to_string()],
+                use_meta_profiles: false,
+                ..Default::default()
+            };
+            // Structure, plus the core value sets' required bindings
+            // (embedded, so answerable synchronously).
+            let outcome = Validator::new(Arc::clone(&resolver)).validate_sync(value, &opts);
+            let tx = crate::terminology::core_terminology(version)
+                .required_binding_errors(&outcome.deferred);
+            outcome
+                .errors
+                .iter()
+                .chain(&tx)
+                .all(|e| e.severity != Severity::Error)
+        });
+        crate::effects::execute_with(
+            resource,
+            version,
+            &deferred,
+            effects,
+            Some(conformance),
+            &mut errors,
+        )
+        .await;
         errors
     }
 }

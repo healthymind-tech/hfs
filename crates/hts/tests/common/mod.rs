@@ -145,6 +145,71 @@ async fn pg_admin_exec(base: &str, sql: &str) -> Result<(), tokio_postgres::Erro
     res
 }
 
+/// Connections each test app may open per pool (HTS backend, resource store).
+#[cfg(feature = "postgres")]
+const PG_TEST_POOL_SIZE: usize = 4;
+
+/// How many PostgreSQL-backed test apps may be alive at once in a test
+/// binary (`HTS_TEST_PG_SLOTS`, default 8). Every app has its own database
+/// and connection pools, and the test harness runs as many tests in parallel
+/// as there are cores: unbounded, a 48-core runner opened more connections
+/// than a PostgreSQL server's `max_connections` and tests failed with
+/// "sorry, too many clients already".
+#[cfg(feature = "postgres")]
+fn pg_test_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let n = std::env::var("HTS_TEST_PG_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(8);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(n))
+    })
+}
+
+/// A slot for one PostgreSQL-backed test app; held for the app's lifetime.
+#[cfg(feature = "postgres")]
+pub async fn pg_test_slot() -> tokio::sync::OwnedSemaphorePermit {
+    pg_test_slots()
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("PostgreSQL test slots closed")
+}
+
+/// An HTS backend on `url` with a small connection pool.
+#[cfg(feature = "postgres")]
+pub async fn pg_hts_backend(
+    url: &str,
+) -> Result<helios_hts::backends::PostgresTerminologyBackend, helios_hts::error::HtsError> {
+    helios_hts::backends::PostgresTerminologyBackend::with_pool_size(url, PG_TEST_POOL_SIZE).await
+}
+
+/// The HTS backend and resource store of a test app on `url`, with small
+/// connection pools.
+#[cfg(feature = "postgres")]
+pub async fn pg_test_backends(
+    url: &str,
+) -> (
+    helios_hts::backends::PostgresTerminologyBackend,
+    helios_persistence::backends::postgres::PostgresBackend,
+) {
+    use helios_hts::backends::PostgresTerminologyBackend;
+    use helios_persistence::backends::postgres::PostgresBackend;
+    let backend = PostgresTerminologyBackend::with_pool_size(url, PG_TEST_POOL_SIZE)
+        .await
+        .expect("Failed to create PostgresTerminologyBackend");
+    let mut config = PostgresBackend::config_from_connection_string(url)
+        .expect("PostgreSQL resource store config");
+    config.max_connections = PG_TEST_POOL_SIZE;
+    let store = PostgresBackend::new(config)
+        .await
+        .expect("Failed to open PostgreSQL resource store");
+    (backend, store)
+}
+
 /// A fresh database holding the HTS and resource-store schemas, cloned from a
 /// per-process template so each test starts empty and isolated.
 #[cfg(feature = "postgres")]
@@ -180,12 +245,13 @@ pub async fn fresh_pg_database() -> String {
     // The template must have no open sessions; the ones used to build it may
     // take a moment to go away.
     let mut last = None;
-    for _ in 0..100 {
+    for attempt in 0..200u64 {
         match pg_admin_exec(&base, &format!("CREATE DATABASE {db} TEMPLATE {template}")).await {
             Ok(()) => return format!("{base}/{db}"),
             Err(e) => {
                 last = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50 + 10 * attempt.min(20)))
+                    .await;
             }
         }
     }
@@ -197,6 +263,8 @@ pub async fn fresh_pg_database() -> String {
 /// `HTS_TEST_BACKEND=postgres` — a fresh PostgreSQL database per instance.
 pub struct TestApp {
     router: Router,
+    #[cfg(feature = "postgres")]
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl TestApp {
@@ -213,7 +281,11 @@ impl TestApp {
             let state = AppState::new(backend);
             let config = HtsConfig::default();
             let router = helios_hts::server::create_app(&config, state);
-            TestApp { router }
+            TestApp {
+                router,
+                #[cfg(feature = "postgres")]
+                _slot: None,
+            }
         }
         #[cfg(not(feature = "sqlite"))]
         panic!("no backend: build with `sqlite`, or set HTS_TEST_BACKEND=postgres")
@@ -242,7 +314,11 @@ impl TestApp {
                 .with_hts_pool(hts_pool);
             let config = HtsConfig::default();
             let router = helios_hts::server::create_app(&config, state);
-            TestApp { router }
+            TestApp {
+                router,
+                #[cfg(feature = "postgres")]
+                _slot: None,
+            }
         }
         #[cfg(not(feature = "sqlite"))]
         panic!("no backend: build with `sqlite`, or set HTS_TEST_BACKEND=postgres")
@@ -252,17 +328,11 @@ impl TestApp {
     /// `run_server_postgres` (resource store + importer) when `crud` is set.
     #[cfg(feature = "postgres")]
     async fn new_pg(crud: bool) -> Self {
-        use helios_hts::backends::PostgresTerminologyBackend;
-        use helios_persistence::backends::postgres::PostgresBackend;
+        let slot = pg_test_slot().await;
         let url = fresh_pg_database().await;
-        let backend = PostgresTerminologyBackend::new(&url)
-            .await
-            .expect("Failed to create PostgresTerminologyBackend");
+        let (backend, resource_store) = pg_test_backends(&url).await;
         let mut state = PgAppState::new(backend.clone());
         if crud {
-            let resource_store = PostgresBackend::from_connection_string(&url)
-                .await
-                .expect("Failed to open PostgreSQL resource store");
             state = state
                 .with_resource_store_pg(resource_store)
                 .with_terminology_importer(std::sync::Arc::new(backend));
@@ -273,7 +343,10 @@ impl TestApp {
             ..PgHtsConfig::default()
         };
         let router = helios_hts::server::create_app(&config, state);
-        TestApp { router }
+        TestApp {
+            router,
+            _slot: Some(slot),
+        }
     }
 
     /// PUT a FHIR JSON body to `path`, returning `(status, response_body)`.
@@ -477,26 +550,18 @@ pub fn build_params(entries: &[(&str, &str, &str)]) -> String {
 pub struct TestAppPg {
     router: Router,
     url: String,
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[cfg(feature = "postgres")]
 impl TestAppPg {
     /// Create a new `TestAppPg` on a fresh database in the shared container.
     pub async fn new() -> Self {
-        use helios_hts::backends::PostgresTerminologyBackend;
-        use helios_persistence::backends::postgres::PostgresBackend;
         use std::sync::Arc;
 
+        let slot = pg_test_slot().await;
         let db_url = fresh_pg_database().await;
-        let url = db_url.as_str();
-
-        let backend = PostgresTerminologyBackend::new(url)
-            .await
-            .expect("Failed to create PostgresTerminologyBackend");
-
-        let resource_store = PostgresBackend::from_connection_string(url)
-            .await
-            .expect("Failed to open PostgreSQL resource store");
+        let (backend, resource_store) = pg_test_backends(&db_url).await;
 
         let state = PgAppState::new(backend.clone())
             .with_resource_store_pg(resource_store)
@@ -507,6 +572,7 @@ impl TestAppPg {
         TestAppPg {
             router,
             url: db_url,
+            _slot: slot,
         }
     }
 

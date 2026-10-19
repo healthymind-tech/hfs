@@ -6,9 +6,7 @@
 //! in the instance (the root, Bundle entries, contained and other nested
 //! resources), each resource judged on its own as the HL7 validator does.
 
-use super::errors::{
-    msg_narrative_link, msg_observation_performer, msg_observation_subject,
-};
+use super::errors::{msg_narrative_link, msg_observation_performer, msg_observation_subject};
 use super::{ErrorKind, Severity, ValidationError};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -87,7 +85,11 @@ fn tags(xhtml: &str) -> Vec<Tag<'_>> {
             j += 1;
         }
         let name_start = j;
-        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' && bytes[j] != b'/' {
+        while j < bytes.len()
+            && !bytes[j].is_ascii_whitespace()
+            && bytes[j] != b'>'
+            && bytes[j] != b'/'
+        {
             j += 1;
         }
         let name = &xhtml[name_start..j];
@@ -142,7 +144,8 @@ fn tags(xhtml: &str) -> Vec<Tag<'_>> {
                     }
                     _ => {
                         let v_start = j;
-                        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>'
+                        {
                             j += 1;
                         }
                         value = &xhtml[v_start..j];
@@ -239,10 +242,18 @@ fn text_between(xhtml: &str, from: usize, to: usize) -> String {
 }
 
 /// Void HTML elements (never closed).
-const VOID: &[&str] = &["br", "hr", "img", "col", "area", "input", "meta", "link", "wbr"];
+const VOID: &[&str] = &[
+    "br", "hr", "img", "col", "area", "input", "meta", "link", "wbr",
+];
 
 /// Unresolved internal links (`<a href="#x">`) in one narrative `div`.
-fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String, String)> {
+/// Each entry: href, element path in the div, link text, and the scheme
+/// when the link is bad because of it (else an unresolved `#fragment`).
+#[allow(clippy::type_complexity)]
+fn unresolved_links(
+    xhtml: &str,
+    known: &HashSet<String>,
+) -> Vec<(String, String, String, Option<String>)> {
     let all = tags(xhtml);
     let mut out = Vec::new();
     let mut stack: Vec<&str> = Vec::new();
@@ -263,11 +274,12 @@ fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String
         let Some(href) = attr(tag, "href") else {
             continue;
         };
-        let Some(fragment) = href.strip_prefix('#') else {
-            continue;
-        };
-        if fragment.is_empty() || known.contains(fragment) {
-            continue;
+        let scheme = bad_scheme(href);
+        match href.strip_prefix('#') {
+            Some(fragment) if fragment.is_empty() || known.contains(fragment) => continue,
+            Some(_) => {}
+            None if scheme.is_none() => continue,
+            None => {}
         }
         let at = if void {
             let mut p = stack.join("/");
@@ -286,9 +298,26 @@ fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String
         } else {
             text_between(xhtml, tag.end, close)
         };
-        out.push((href.to_string(), at, text));
+        out.push((href.to_string(), at, text, scheme));
     }
     out
+}
+
+/// Schemes a narrative hyperlink may use (HL7 validator).
+const LINK_SCHEMES: &[&str] = &[
+    "http", "https", "ftp", "ftps", "sftp", "mailto", "tel", "fax", "sms", "data", "file", "news",
+];
+
+/// The scheme of an absolute `href` that is not a hyperlinkable one
+/// (`urn:uuid:…`), if any.
+fn bad_scheme(href: &str) -> Option<String> {
+    let (scheme, _) = href.split_once(':')?;
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (is_scheme && !LINK_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()))
+        .then(|| scheme.to_string())
 }
 
 /// `<a href="#fragment">` links in a resource's narrative that point at
@@ -297,24 +326,99 @@ fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String
 /// narrative does not count.
 pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
     let mut errors = Vec::new();
+    // The same bad link twice in one narrative is one issue.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     for (path, res) in all_resources(resource) {
         let Some(div) = res.pointer("/text/div").and_then(Value::as_str) else {
             continue;
         };
+        text_link_errors(res, &path, div, &mut errors);
         if !div.contains("href") {
             continue;
         }
         let mut known = HashSet::new();
         targets(res, &mut known);
-        for (href, at, text) in unresolved_links(div, &known) {
-            errors.push(ValidationError::new(
-                ErrorKind::Narrative,
-                format!("{path}.text.div"),
-                msg_narrative_link(&href, &at, &text),
-            ));
+        for (href, at, text, scheme) in unresolved_links(div, &known) {
+            let message = match scheme {
+                Some(scheme) => format!(
+                    "Hyperlink scheme '{scheme}' in '{href}' at '{at}' for '{text}' is not a valid hyperlinkable scheme"
+                ),
+                None => msg_narrative_link(&href, &at, &text),
+            };
+            let at = format!("{path}.text.div");
+            if !seen.insert((at.clone(), message.clone())) {
+                continue;
+            }
+            errors.push(ValidationError::new(ErrorKind::Narrative, at, message));
         }
     }
     errors
+}
+
+const TEXT_LINK: &str = "http://hl7.org/fhir/StructureDefinition/textLink";
+
+/// `textLink` extensions on a resource's narrative: the `htmlid` must be an
+/// id in the narrative and the `data` reference (`#id`) a target in the
+/// resource (HL7 validator, IPS narrative links).
+fn text_link_errors(res: &Value, path: &str, div: &str, errors: &mut Vec<ValidationError>) {
+    let Some(links) = res.pointer("/text/extension").and_then(Value::as_array) else {
+        return;
+    };
+    let mut in_div = HashSet::new();
+    xhtml_targets(div, &mut in_div);
+    let mut known = HashSet::new();
+    targets(res, &mut known);
+    let at = format!("{path}.text");
+    for (i, link) in links.iter().enumerate() {
+        if link.get("url").and_then(Value::as_str) != Some(TEXT_LINK) {
+            continue;
+        }
+        let parts = link.get("extension").and_then(Value::as_array);
+        for (j, part) in parts.into_iter().flatten().enumerate() {
+            match part.get("url").and_then(Value::as_str) {
+                Some("htmlid") => {
+                    if let Some(id) = part.get("valueString").and_then(Value::as_str)
+                        && !in_div.contains(id)
+                    {
+                        errors.push(ValidationError::new(
+                            ErrorKind::Narrative,
+                            at.clone(),
+                            format!("The html id '{id}' was not found in the xhtml"),
+                        ));
+                    }
+                }
+                Some("data") => {
+                    let Some((key, uri)) = ["valueUri", "valueUrl", "valueCanonical"]
+                        .iter()
+                        .find_map(|k| part.get(*k).and_then(Value::as_str).map(|v| (*k, v)))
+                    else {
+                        continue;
+                    };
+                    let Some(fragment) = uri.strip_prefix('#') else {
+                        continue;
+                    };
+                    if known.contains(fragment) {
+                        continue;
+                    }
+                    errors.push(ValidationError::new(
+                        ErrorKind::Narrative,
+                        at.clone(),
+                        format!(
+                            "The target of the textLink data reference '{uri}' was not found in the resource"
+                        ),
+                    ));
+                    errors.push(ValidationError::new(
+                        ErrorKind::Narrative,
+                        format!("{at}.extension.{i}.extension.{j}.{key}"),
+                        format!(
+                            "The URL value '{uri}' is invalid because there is no matching target"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -337,8 +441,12 @@ pub(crate) fn best_practice_warnings(resource: &Value) -> Vec<ValidationError> {
         };
         if !present("subject") {
             warnings.push(
-                ValidationError::new(ErrorKind::BestPractice, path.clone(), msg_observation_subject())
-                    .with_severity(Severity::Warning),
+                ValidationError::new(
+                    ErrorKind::BestPractice,
+                    path.clone(),
+                    msg_observation_subject(),
+                )
+                .with_severity(Severity::Warning),
             );
         }
         if !present("performer") {
@@ -359,6 +467,42 @@ pub(crate) fn best_practice_warnings(resource: &Value) -> Vec<ValidationError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `ips-link`: textLink htmlid and data must point into the resource.
+    #[test]
+    fn text_links_must_resolve() {
+        let link = |id: &str| {
+            json!({"url": TEXT_LINK, "extension": [
+            {"url": "htmlid", "valueString": id}, {"url": "data", "valueUri": format!("#{id}")}]})
+        };
+        let composition = json!({
+            "resourceType": "Composition",
+            "text": {"status": "generated", "extension": [link("a1"), link("zz")],
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p id=\"a1\">x</p></div>"}
+        });
+        let errors = narrative_link_errors(&composition);
+        let got: Vec<(&str, &str)> = errors
+            .iter()
+            .map(|e| (e.path.as_str(), e.message.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "Composition.text",
+                    "The html id 'zz' was not found in the xhtml"
+                ),
+                (
+                    "Composition.text",
+                    "The target of the textLink data reference '#zz' was not found in the resource"
+                ),
+                (
+                    "Composition.text.extension.1.extension.1.valueUri",
+                    "The URL value '#zz' is invalid because there is no matching target"
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn links_resolve_to_anchors_ids_and_element_ids() {
@@ -388,6 +532,18 @@ mod tests {
     }
 
     #[test]
+    fn hyperlinks_need_a_hyperlinkable_scheme() {
+        let patient = json!({"resourceType": "Patient", "text": {"status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><a href=\"urn:uuid:7221aa91\">Saint Luke</a> <a href=\"https://x.org/a\">ok</a> <a href=\"mailto:a@b.c\">ok</a> <a href=\"Patient/1\">relative</a></p></div>"}});
+        let errors = narrative_link_errors(&patient);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(
+            errors[0].message,
+            "Hyperlink scheme 'urn' in 'urn:uuid:7221aa91' at 'div/p/a' for 'Saint Luke' is not a valid hyperlinkable scheme"
+        );
+    }
+
+    #[test]
     fn a_bundle_entry_is_judged_on_its_own() {
         let div = |body: &str| format!("<div xmlns=\"http://www.w3.org/1999/xhtml\">{body}</div>");
         let bundle = json!({
@@ -402,7 +558,11 @@ mod tests {
         let errors = narrative_link_errors(&bundle);
         assert_eq!(errors.len(), 1, "{errors:#?}");
         assert_eq!(errors[0].path, "Bundle.entry.1.resource.text.div");
-        assert!(errors[0].message.contains("at 'div/p/a'"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("at 'div/p/a'"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]

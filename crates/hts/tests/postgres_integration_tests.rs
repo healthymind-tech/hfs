@@ -112,7 +112,7 @@ async fn db_url() -> &'static str {
 /// transient "connection closed" errors. Concurrent schema application is
 /// made safe inside `schema::apply` via a PG advisory lock.
 async fn fresh_backend() -> PostgresTerminologyBackend {
-    PostgresTerminologyBackend::new(db_url().await)
+    PostgresTerminologyBackend::with_pool_size(db_url().await, 4)
         .await
         .expect("Backend should initialize")
 }
@@ -146,10 +146,10 @@ macro_rules! base_url {
 #[tokio::test]
 async fn schema_applies_idempotently() {
     let url = db_url().await;
-    PostgresTerminologyBackend::new(url)
+    PostgresTerminologyBackend::with_pool_size(url, 4)
         .await
         .expect("First schema application should succeed");
-    PostgresTerminologyBackend::new(url)
+    PostgresTerminologyBackend::with_pool_size(url, 4)
         .await
         .expect("Second schema application (idempotent) should also succeed");
 }
@@ -168,7 +168,9 @@ async fn supported_systems_empty_initially() {
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+    let backend = PostgresTerminologyBackend::with_pool_size(&url, 4)
+        .await
+        .unwrap();
     assert!(
         backend.supported_systems().is_empty(),
         "fresh DB should have no systems"
