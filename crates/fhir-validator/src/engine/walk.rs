@@ -1242,9 +1242,8 @@ fn validate_extension_item<'a>(
     // A sub-extension of a complex extension names itself with a relative
     // url (`species`); anything else needs an absolute one.
     let keys = ctx.path.keys_from(0);
-    let nested = keys.len() >= 2
-        && matches!(keys[keys.len() - 2], "extension" | "modifierExtension")
-        && !ctx.extension_urls.is_empty();
+    let nested =
+        keys.len() >= 2 && matches!(keys[keys.len() - 2], "extension" | "modifierExtension");
     match item.get("url").and_then(Value::as_str) {
         None | Some("") if item.is_object() => ctx.error(
             ErrorKind::Required,
