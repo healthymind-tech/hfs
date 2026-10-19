@@ -66,7 +66,13 @@ pub(super) fn entries(bundle: &Value) -> Vec<(usize, Entry<'_>)> {
                     Some((
                         index,
                         Entry {
-                            full_url: e.get("fullUrl").and_then(Value::as_str),
+                            // A relative fullUrl identifies nothing (and is
+                            // reported by [`bundle_rules`]): the entry
+                            // resolves by type and id, like one without.
+                            full_url: e
+                                .get("fullUrl")
+                                .and_then(Value::as_str)
+                                .filter(|u| is_absolute(u)),
                             resource,
                         },
                     ))
@@ -74,6 +80,16 @@ pub(super) fn entries(bundle: &Value) -> Vec<(usize, Entry<'_>)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether `url` is absolute: it starts with a scheme (`http:`, `urn:`).
+fn is_absolute(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
 }
 
 /// The outcome of resolving a reference inside a Bundle.
@@ -133,7 +149,11 @@ fn strip_history(url: &str) -> &str {
 /// Resolve `reference` among `entries`, from an entry whose `fullUrl` is
 /// `source_full_url`. Contained (`#id`) and conditional references are not
 /// Bundle references: [`Resolution::NotFound`].
-pub(super) fn resolve(entries: &[Entry<'_>], reference: &str, source_full_url: Option<&str>) -> Resolution {
+pub(super) fn resolve(
+    entries: &[Entry<'_>],
+    reference: &str,
+    source_full_url: Option<&str>,
+) -> Resolution {
     if reference.starts_with('#') || reference.contains('?') {
         return Resolution::NotFound;
     }
@@ -225,7 +245,10 @@ const COMPOSITION_REFERENCES: &[&str] = &["subject", "encounter", "author", "cus
 fn composition_references(composition: &Value, prefix: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut push = |path: String, reference: Option<&Value>| {
-        if let Some(r) = reference.and_then(|r| r.get("reference")).and_then(Value::as_str) {
+        if let Some(r) = reference
+            .and_then(|r| r.get("reference"))
+            .and_then(Value::as_str)
+        {
             out.push((path, r.to_string()));
         }
     };
@@ -259,11 +282,7 @@ fn composition_references(composition: &Value, prefix: &str) -> Vec<(String, Str
             push(at(&base, "detail", j), Some(&detail));
         }
     }
-    fn sections(
-        value: Option<&Value>,
-        base: &str,
-        out: &mut Vec<(String, String)>,
-    ) {
+    fn sections(value: Option<&Value>, base: &str, out: &mut Vec<(String, String)>) {
         let Some(Value::Array(items)) = value else {
             return;
         };
@@ -306,9 +325,29 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
     let indexed = entries(bundle);
     let list: Vec<Entry<'_>> = indexed.iter().map(|(_, e)| *e).collect();
 
+    // fullUrl must be absolute (BUNDLE_BUNDLE_ENTRY_FULLURL_NOT_ABSOLUTE).
+    for (index, entry) in bundle
+        .get("entry")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(full_url) = entry.get("fullUrl").and_then(Value::as_str)
+            && !is_absolute(full_url)
+        {
+            out.push(error(
+                ErrorKind::BundleEntryMismatch,
+                format!("Bundle.entry.{index}.fullUrl"),
+                format!("The fullUrl must be an absolute URL (not '{full_url}')"),
+            ));
+        }
+    }
+
     // fullUrl vs type/id.
     for (index, entry) in &indexed {
-        let (Some(full_url), Some(ty), Some(id)) = (entry.full_url, entry.resource_type(), entry.id())
+        let (Some(full_url), Some(ty), Some(id)) =
+            (entry.full_url, entry.resource_type(), entry.id())
         else {
             continue;
         };
@@ -440,31 +479,81 @@ mod tests {
             entry(Some("urn:uuid:aaaa"), &patient),
             entry(Some("urn:uuid:bbbb"), &obs),
         ];
-        assert_eq!(resolve(&urn, "urn:uuid:aaaa", Some("urn:uuid:bbbb")), Resolution::Found(0));
-        assert_eq!(resolve(&urn, "urn:uuid:cccc", Some("urn:uuid:bbbb")), Resolution::NotFound);
+        assert_eq!(
+            resolve(&urn, "urn:uuid:aaaa", Some("urn:uuid:bbbb")),
+            Resolution::Found(0)
+        );
+        assert_eq!(
+            resolve(&urn, "urn:uuid:cccc", Some("urn:uuid:bbbb")),
+            Resolution::NotFound
+        );
         // A relative reference from a URN entry cannot resolve.
-        assert_eq!(resolve(&urn, "Patient/p1", Some("urn:uuid:bbbb")), Resolution::Cannot(0));
-        assert_eq!(resolve(&urn, "Patient/p2", Some("urn:uuid:bbbb")), Resolution::NotFound);
+        assert_eq!(
+            resolve(&urn, "Patient/p1", Some("urn:uuid:bbbb")),
+            Resolution::Cannot(0)
+        );
+        assert_eq!(
+            resolve(&urn, "Patient/p2", Some("urn:uuid:bbbb")),
+            Resolution::NotFound
+        );
 
         let rest = [
             entry(Some("http://x/fhir/Patient/p1"), &patient),
             entry(Some("http://x/fhir/Observation/o1"), &obs),
         ];
-        assert_eq!(resolve(&rest, "Patient/p1", Some("http://x/fhir/Observation/o1")), Resolution::Found(0));
         assert_eq!(
-            resolve(&rest, "Patient/p1/_history/2", Some("http://x/fhir/Observation/o1")),
+            resolve(&rest, "Patient/p1", Some("http://x/fhir/Observation/o1")),
             Resolution::Found(0)
         );
         assert_eq!(
-            resolve(&rest, "http://x/fhir/Patient/p1", Some("http://y/Observation/o1")),
+            resolve(
+                &rest,
+                "Patient/p1/_history/2",
+                Some("http://x/fhir/Observation/o1")
+            ),
+            Resolution::Found(0)
+        );
+        assert_eq!(
+            resolve(
+                &rest,
+                "http://x/fhir/Patient/p1",
+                Some("http://y/Observation/o1")
+            ),
             Resolution::Found(0)
         );
         // Different base: same type/id but no match.
-        assert_eq!(resolve(&rest, "Patient/p1", Some("http://y/fhir/Observation/o1")), Resolution::Cannot(0));
+        assert_eq!(
+            resolve(&rest, "Patient/p1", Some("http://y/fhir/Observation/o1")),
+            Resolution::Cannot(0)
+        );
 
         let bare = [entry(None, &patient), entry(None, &obs)];
         assert_eq!(resolve(&bare, "Patient/p1", None), Resolution::Found(0));
         assert_eq!(resolve(&bare, "#x", None), Resolution::NotFound);
+    }
+
+    #[test]
+    fn relative_fullurls_are_errors_and_resolve_by_type_and_id() {
+        let bundle = json!({"resourceType": "Bundle", "type": "document", "entry": [
+            {"fullUrl": "Composition/1", "resource": {"resourceType": "Composition", "id": "1",
+                "subject": {"reference": "Patient/1"}}},
+            {"fullUrl": "Patient/1", "resource": {"resourceType": "Patient", "id": "1"}},
+            {"fullUrl": "urn:uuid:3", "resource": {"resourceType": "Patient", "id": "3",
+                "link": [{"other": {"reference": "Patient/1"}}]}}
+        ]});
+        let messages: Vec<String> = bundle_rules(&bundle)
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "The fullUrl must be an absolute URL (not 'Composition/1')".to_string(),
+                "The fullUrl must be an absolute URL (not 'Patient/1')".to_string(),
+            ],
+        );
+        assert!(is_absolute("urn:uuid:1") && is_absolute("http://x/Patient/1"));
+        assert!(!is_absolute("Patient/1") && !is_absolute("1a19a371-91b8") && !is_absolute(":x"));
     }
 
     #[test]
@@ -494,16 +583,31 @@ mod tests {
             {"fullUrl": "urn:uuid:z", "resource": {"resourceType": "Organization", "id": "z"}}
         ]});
         let issues = bundle_rules(&bundle);
-        let texts: Vec<String> = issues.iter().map(|e| format!("{} {}", e.path, e.message)).collect();
+        let texts: Vec<String> = issues
+            .iter()
+            .map(|e| format!("{} {}", e.path, e.message))
+            .collect();
         // subject: reported once, at the Composition's reference.
         assert!(
-            texts.iter().any(|t| t.starts_with("Bundle.entry.0.resource.subject Can't find 'Patient/p'")),
+            texts
+                .iter()
+                .any(|t| t.starts_with("Bundle.entry.0.resource.subject Can't find 'Patient/p'")),
             "{texts:#?}"
         );
         // Patient unreachable (its only link failed) and z orphaned; x is
         // reached through the Observation.
-        assert!(texts.iter().any(|t| t.starts_with("Bundle.entry.1 Entry 'urn:uuid:p'")), "{texts:#?}");
-        assert!(texts.iter().any(|t| t.starts_with("Bundle.entry.5 Entry 'urn:uuid:z'")), "{texts:#?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("Bundle.entry.1 Entry 'urn:uuid:p'")),
+            "{texts:#?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("Bundle.entry.5 Entry 'urn:uuid:z'")),
+            "{texts:#?}"
+        );
         assert_eq!(issues.len(), 3, "{texts:#?}");
     }
 }
