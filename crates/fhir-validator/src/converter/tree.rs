@@ -552,7 +552,12 @@ fn parse_numeric_max(max: Option<&str>) -> Option<u64> {
 }
 
 fn parse_content_reference(reference: &str) -> Option<Vec<String>> {
-    let path = reference.strip_prefix('#')?;
+    // `#Bundle.link`, or the canonical form R4 IG snapshots carry,
+    // `http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link`.
+    let path = match reference.strip_prefix('#') {
+        Some(path) => path,
+        None => reference.split_once('#')?.1,
+    };
     let mut parts = path.split('.');
     let root = parts.next()?;
     if root.is_empty() {
@@ -584,5 +589,24 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod content_reference_tests {
+    #[test]
+    fn canonical_content_references_parse() {
+        let local = super::parse_content_reference("#Bundle.link");
+        assert_eq!(
+            local,
+            Some(vec!["Bundle".into(), "elements".into(), "link".into()])
+        );
+        assert_eq!(
+            super::parse_content_reference(
+                "http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link"
+            ),
+            local
+        );
+        assert_eq!(super::parse_content_reference("Bundle.link"), None);
     }
 }
