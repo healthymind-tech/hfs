@@ -997,6 +997,16 @@ async fn complex_extensions_and_datatype_element_contexts() {
     let ok = json!({"resourceType": "Patient", "extension": [{
         "url": "http://example.org/StructureDefinition/animal", "extension": [species.clone()]}]});
     assert!(run(ok).await.is_empty());
+    let bad = json!({"resourceType": "Patient", "extension": [{
+        "url": "http://example.org/StructureDefinition/animal",
+        "extension": [species, {"url": "species-x", "valueString": "x"}]}]});
+    let errs = run(bad).await;
+    assert!(
+        errs.iter()
+            .any(|m| m.starts_with("Sub-extension url 'species-x'")),
+        "{errs:#?}"
+    );
+
     let mf =
         json!({"url": "http://example.org/StructureDefinition/mothers-family", "valueString": "x"});
     let on_family = json!({"resourceType": "Patient", "name": [{"family": "Doe",

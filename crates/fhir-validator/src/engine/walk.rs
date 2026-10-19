@@ -1346,6 +1346,31 @@ fn validate_known_extension<'a>(
 ) {
     match ctx.resolver.resolve(url) {
         Some(definition) if definition.kind.as_deref() == Some(crate::schema::kind::EXTENSION) => {
+            // A complex extension defines its sub-extensions; a relative
+            // sub-extension url it does not define is an error.
+            let defined = sub_extension_urls(&definition);
+            if !defined.is_empty()
+                && let Some(subs) = item.get("extension").and_then(Value::as_array)
+            {
+                for (index, sub) in subs.iter().enumerate() {
+                    let Some(sub_url) = sub.get("url").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if sub_url.is_empty() || sub_url.contains(':') || defined.contains(sub_url) {
+                        continue;
+                    }
+                    ctx.path.push_key("extension");
+                    ctx.path.push_index(index);
+                    ctx.error(
+                        ErrorKind::UnknownExtension,
+                        format!(
+                            "Sub-extension url '{sub_url}' is not defined by the Extension {url}"
+                        ),
+                    );
+                    ctx.path.pop();
+                    ctx.path.pop();
+                }
+            }
             let mut extended = elset.clone();
             add_schemas_to_set(ctx, &mut extended, definition, url);
             validate_node(ctx, &extended, item);
@@ -1386,6 +1411,35 @@ fn validate_known_extension<'a>(
 
 /// Extension urls in HL7's own namespaces, which HL7 publishes definitions
 /// for.
+/// The relative urls of the sub-extensions a complex extension definition
+/// declares: `extensions` sugar entries, and slices of `extension` matched
+/// by a `{url: ...}` pattern.
+fn sub_extension_urls(definition: &FhirSchema) -> HashSet<&str> {
+    let mut urls: HashSet<&str> = definition
+        .extensions
+        .iter()
+        .flatten()
+        .filter_map(|(_, e)| e.url.as_deref())
+        .collect();
+    let slices = definition
+        .elements
+        .as_ref()
+        .and_then(|els| els.get("extension"))
+        .and_then(|el| el.slicing.as_ref());
+    for slice in slices.iter().flat_map(|s| s.slices.values()) {
+        if let Some(url) = slice
+            .match_
+            .as_ref()
+            .and_then(|m| m.value.as_ref())
+            .and_then(|v| v.get("url"))
+            .and_then(Value::as_str)
+        {
+            urls.insert(url);
+        }
+    }
+    urls
+}
+
 /// Extension urls the HL7 validator accepts without a definition
 /// (`isKnownExtension`): example domains, DICOM (`nema.org`), HL7 tooling
 /// extensions, and cross-version extensions.
