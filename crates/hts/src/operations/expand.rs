@@ -4540,7 +4540,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
-    match process_expand(&state, params).await {
+    match dispatch_tx!(state, params, process_expand) {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
             if let Some(resp) = version_check_response(&e) {
@@ -4573,7 +4573,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
-    match process_expand(&state, params).await {
+    match dispatch_tx!(state, params, process_expand) {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
             if let Some(resp) = version_check_response(&e) {
@@ -4807,7 +4807,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        dispatch_tx!(state, params, process_expand)?,
         format,
     ))
 }
@@ -4838,7 +4838,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        dispatch_tx!(state, params, process_expand)?,
         format,
     ))
 }

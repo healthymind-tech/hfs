@@ -919,3 +919,88 @@ async fn translate_follows_the_concept_map_definition() {
         "http://hts.test/cm/main|0.1"
     );
 }
+
+/// The tx-ecosystem runner sends every suite's setup resources as
+/// `tx-resource` parameters instead of loading them into the server: an
+/// operation must be answerable from request-supplied CodeSystems and
+/// ValueSets (with stored ones they depend on), without storing them.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn operations_on_request_supplied_resources() {
+    let app = TestApp::new().await;
+    // Stored: a code system the supplied value set also draws on.
+    app.import_bundle_ok(&simple_bundle()).await;
+    let cs = json!({"resourceType": "CodeSystem", "url": "http://hts.test/req-cs", "version": "1",
+        "status": "active", "content": "complete",
+        "concept": [{"code": "r1", "display": "Req one"}, {"code": "r2", "display": "Req two"}]});
+    let vs = json!({"resourceType": "ValueSet", "url": "http://hts.test/vs/req", "version": "1",
+        "status": "active", "compose": {"include": [
+            {"system": "http://hts.test/req-cs"},
+            {"system": "http://hts.test/simple", "concept": [{"code": "code1"}]}]}});
+    let with_tx = |mut p: Vec<Value>| {
+        p.push(json!({"name": "tx-resource", "resource": cs.clone()}));
+        p.push(json!({"name": "tx-resource", "resource": vs.clone()}));
+        json!({"resourceType": "Parameters", "parameter": p}).to_string()
+    };
+
+    let (st, body) = app
+        .post_fhir(
+            "/ValueSet/$expand",
+            with_tx(vec![
+                json!({"name": "url", "valueUri": "http://hts.test/vs/req"}),
+            ]),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let mut codes: Vec<&str> = body["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    codes.sort();
+    assert_eq!(codes, ["code1", "r1", "r2"]);
+
+    let (st, body) = app
+        .post_fhir(
+            "/ValueSet/$validate-code",
+            with_tx(vec![
+                json!({"name": "url", "valueUri": "http://hts.test/vs/req"}),
+                json!({"name": "coding", "valueCoding": {"system": "http://hts.test/req-cs", "code": "r2"}}),
+            ]),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Req two");
+
+    let (st, body) = app
+        .post_fhir(
+            "/CodeSystem/$lookup",
+            with_tx(vec![
+                json!({"name": "system", "valueUri": "http://hts.test/req-cs"}),
+                json!({"name": "code", "valueCode": "r1"}),
+            ]),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Req one");
+
+    // Nothing the request supplied was stored.
+    let (_, bundle) = app.get_fhir("/CodeSystem?url=http://hts.test/req-cs").await;
+    assert_eq!(bundle["total"], 0, "{bundle}");
+    let (st, _) = app
+        .post_fhir(
+            "/CodeSystem/$lookup",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "system", "valueUri": "http://hts.test/req-cs"},
+                {"name": "code", "valueCode": "r1"}]})
+            .to_string(),
+        )
+        .await;
+    assert!(st.is_client_error(), "{st}");
+}

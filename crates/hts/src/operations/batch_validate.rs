@@ -231,7 +231,7 @@ pub async fn vs_batch_validate_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
     Ok(fhir_respond(
-        process_vs_batch_validate(&state, params).await?,
+        dispatch_tx!(state, params, process_vs_batch_validate)?,
         format,
     ))
 }

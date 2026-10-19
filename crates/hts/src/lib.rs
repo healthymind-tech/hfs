@@ -36,6 +36,25 @@
 //! [`AppState`]: state::AppState
 //! [`create_app`]: server::create_app
 
+/// Run the operation `$f(&state, params)` against the request-scoped
+/// `tx-resource` overlay when the request needs one (see [`tx_overlay`]),
+/// else against `$state`.
+macro_rules! dispatch_tx {
+    ($state:expr, $params:expr, $f:path) => {{
+        #[cfg(feature = "sqlite")]
+        {
+            match $crate::tx_overlay::overlay_for(&$state, &$params).await {
+                Some(overlay) => $f(&*overlay, $params).await,
+                None => $f(&$state, $params).await,
+            }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            $f(&$state, $params).await
+        }
+    }};
+}
+
 pub mod admin;
 pub mod backends;
 pub(crate) mod bcp13;
@@ -54,6 +73,8 @@ pub mod server;
 pub mod state;
 pub mod string_search;
 pub mod traits;
+#[cfg(feature = "sqlite")]
+pub mod tx_overlay;
 pub mod types;
 pub(crate) mod ucum_validate;
 pub mod version_order;

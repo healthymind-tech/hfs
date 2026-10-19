@@ -560,7 +560,10 @@ pub async fn lookup_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/$lookup?system=<url>&code=<code>`
@@ -628,7 +631,10 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
         .unwrap_or_default();
     let mut params = inject_system(raw_params, system);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/{id}/$lookup?code=<code>`

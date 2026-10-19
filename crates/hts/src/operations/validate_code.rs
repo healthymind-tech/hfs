@@ -2674,7 +2674,7 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    match process_validate_code(&state, params).await {
+    match dispatch_tx!(state, params, process_validate_code) {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => match invalid_display_language_response(&e) {
             Some(resp) => Ok(resp),
@@ -6338,7 +6338,7 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    match process_vs_validate_code(&state, params).await {
+    match dispatch_tx!(state, params, process_vs_validate_code) {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => {
             if let Some(resp) = invalid_display_language_response(&e) {
@@ -6411,7 +6411,7 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     let mut params = inject_url(raw_params, url);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        dispatch_tx!(state, params, process_vs_validate_code)?,
         format,
     ))
 }

@@ -249,6 +249,14 @@ pub struct AppState<B: TerminologyBackend> {
     /// [`AppState::clear_expand_cache`] — a newly-imported supplement
     /// might define a previously-unknown code.
     pub lookup_not_found_cache: NotFoundCache,
+
+    /// Request-scoped stores for `tx-resource` parameters the store does
+    /// not hold (see [`crate::tx_overlay`]). Dropped with the other caches.
+    #[cfg(feature = "sqlite")]
+    pub tx_overlays: Arc<crate::tx_overlay::TxOverlayCache>,
+
+    /// This state is a `tx-resource` overlay (never overlaid again).
+    pub is_tx_overlay: bool,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -273,6 +281,9 @@ impl<B: TerminologyBackend> AppState<B> {
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
+            #[cfg(feature = "sqlite")]
+            tx_overlays: Arc::new(crate::tx_overlay::TxOverlayCache::default()),
+            is_tx_overlay: false,
         }
     }
 
@@ -314,6 +325,8 @@ impl<B: TerminologyBackend> AppState<B> {
         if let Ok(mut neg) = self.lookup_not_found_cache.write() {
             neg.clear();
         }
+        #[cfg(feature = "sqlite")]
+        self.tx_overlays.clear();
     }
 
     /// Override the maximum expansion size (default: 10 000).
