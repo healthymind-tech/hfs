@@ -536,6 +536,18 @@ fn populate_properties<'a, B: TerminologyBackend>(
                     })
                     .collect();
             }
+            // A concept made inactive by its `inactive` property (rather than
+            // a status) has the status `inactive` (IG `inactive/inactive-expand`).
+            if c.inactive == Some(true)
+                && properties.iter().any(|p| p == "status")
+                && !c.properties.iter().any(|p| p.code == "status")
+            {
+                c.properties.push(ExpansionContainsProperty {
+                    code: "status".into(),
+                    value_type: "Code".into(),
+                    value: "inactive".into(),
+                });
+            }
             if !c.contains.is_empty() {
                 populate_properties(backend, ctx, &mut c.contains, properties).await;
             }

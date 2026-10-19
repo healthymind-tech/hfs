@@ -405,3 +405,90 @@ async fn codeable_concept_notes_for_the_other_codings() {
         [json!("CodeableConcept.coding[0].system")]
     );
 }
+
+fn props_bundle() -> String {
+    json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "props", "url": "http://hts.test/props",
+          "version": "0.1.0", "status": "active", "content": "complete",
+          "property": [
+            {"code": "colour", "uri": "http://hts.test/props#colour", "type": "string"},
+            {"code": "link", "type": "Coding"},
+            {"code": "inactive", "uri": "http://hl7.org/fhir/concept-properties#inactive", "type": "boolean"}
+          ],
+          "concept": [
+            {"code": "a", "display": "A", "property": [{"code": "colour", "valueString": "red"}]},
+            {"code": "b", "display": "B", "property": [
+              {"code": "link", "valueCoding": {"system": "http://elsewhere.test", "code": "x", "display": "X"}}]},
+            {"code": "c", "display": "C", "property": [{"code": "inactive", "valueBoolean": true}]}
+          ]}},
+        {"resource": {"resourceType": "ValueSet", "id": "props-all", "url": "http://hts.test/vs/props-all",
+          "version": "1.0", "status": "active",
+          "compose": {"include": [{"system": "http://hts.test/props"}], "property": ["*"]}}}
+    ]})
+    .to_string()
+}
+
+/// `property` entries of an R5 `expansion.contains`, or the R5 cross-version
+/// extensions an R4 build renders them as, flattened to `{code, value[x]}`.
+fn r5_props(holder: &Value, ext_url: &str) -> Vec<Value> {
+    if let Some(props) = holder["property"].as_array() {
+        return props.clone();
+    }
+    holder["extension"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["url"] == ext_url)
+        .map(|e| {
+            let mut out = serde_json::Map::new();
+            for part in e["extension"].as_array().into_iter().flatten() {
+                let name = part["url"].as_str().unwrap_or_default();
+                if let Some((k, v)) = part
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| k.starts_with("value"))
+                {
+                    let key = if name == "value" {
+                        k.clone()
+                    } else {
+                        name.to_string()
+                    };
+                    out.insert(key, v.clone());
+                }
+            }
+            Value::Object(out)
+        })
+        .collect()
+}
+
+fn contains_props(body: &Value, code: &str) -> Vec<Value> {
+    let c = body["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code"] == code)
+        .cloned()
+        .unwrap_or_default();
+    r5_props(
+        &c,
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.contains.property",
+    )
+}
+
+/// inactive/inactive-expand: a concept made inactive by its `inactive`
+/// property carries the status `inactive` in an expansion.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn expansion_status_of_an_inactive_concept() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&props_bundle()).await;
+    let (st, body) = app
+        .get_fhir("/ValueSet/$expand?url=http://hts.test/vs/props-all&property=status")
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        contains_props(&body, "c").contains(&json!({"code": "status", "valueCode": "inactive"})),
+        "{body}"
+    );
+}
