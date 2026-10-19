@@ -332,6 +332,7 @@ pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
         let Some(div) = res.pointer("/text/div").and_then(Value::as_str) else {
             continue;
         };
+        text_link_errors(res, &path, div, &mut errors);
         if !div.contains("href") {
             continue;
         }
@@ -352,6 +353,72 @@ pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
         }
     }
     errors
+}
+
+const TEXT_LINK: &str = "http://hl7.org/fhir/StructureDefinition/textLink";
+
+/// `textLink` extensions on a resource's narrative: the `htmlid` must be an
+/// id in the narrative and the `data` reference (`#id`) a target in the
+/// resource (HL7 validator, IPS narrative links).
+fn text_link_errors(res: &Value, path: &str, div: &str, errors: &mut Vec<ValidationError>) {
+    let Some(links) = res.pointer("/text/extension").and_then(Value::as_array) else {
+        return;
+    };
+    let mut in_div = HashSet::new();
+    xhtml_targets(div, &mut in_div);
+    let mut known = HashSet::new();
+    targets(res, &mut known);
+    let at = format!("{path}.text");
+    for (i, link) in links.iter().enumerate() {
+        if link.get("url").and_then(Value::as_str) != Some(TEXT_LINK) {
+            continue;
+        }
+        let parts = link.get("extension").and_then(Value::as_array);
+        for (j, part) in parts.into_iter().flatten().enumerate() {
+            match part.get("url").and_then(Value::as_str) {
+                Some("htmlid") => {
+                    if let Some(id) = part.get("valueString").and_then(Value::as_str)
+                        && !in_div.contains(id)
+                    {
+                        errors.push(ValidationError::new(
+                            ErrorKind::Narrative,
+                            at.clone(),
+                            format!("The html id '{id}' was not found in the xhtml"),
+                        ));
+                    }
+                }
+                Some("data") => {
+                    let Some((key, uri)) = ["valueUri", "valueUrl", "valueCanonical"]
+                        .iter()
+                        .find_map(|k| part.get(*k).and_then(Value::as_str).map(|v| (*k, v)))
+                    else {
+                        continue;
+                    };
+                    let Some(fragment) = uri.strip_prefix('#') else {
+                        continue;
+                    };
+                    if known.contains(fragment) {
+                        continue;
+                    }
+                    errors.push(ValidationError::new(
+                        ErrorKind::Narrative,
+                        at.clone(),
+                        format!(
+                            "The target of the textLink data reference '{uri}' was not found in the resource"
+                        ),
+                    ));
+                    errors.push(ValidationError::new(
+                        ErrorKind::Narrative,
+                        format!("{at}.extension.{i}.extension.{j}.{key}"),
+                        format!(
+                            "The URL value '{uri}' is invalid because there is no matching target"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -400,6 +467,42 @@ pub(crate) fn best_practice_warnings(resource: &Value) -> Vec<ValidationError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `ips-link`: textLink htmlid and data must point into the resource.
+    #[test]
+    fn text_links_must_resolve() {
+        let link = |id: &str| {
+            json!({"url": TEXT_LINK, "extension": [
+            {"url": "htmlid", "valueString": id}, {"url": "data", "valueUri": format!("#{id}")}]})
+        };
+        let composition = json!({
+            "resourceType": "Composition",
+            "text": {"status": "generated", "extension": [link("a1"), link("zz")],
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p id=\"a1\">x</p></div>"}
+        });
+        let errors = narrative_link_errors(&composition);
+        let got: Vec<(&str, &str)> = errors
+            .iter()
+            .map(|e| (e.path.as_str(), e.message.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "Composition.text",
+                    "The html id 'zz' was not found in the xhtml"
+                ),
+                (
+                    "Composition.text",
+                    "The target of the textLink data reference '#zz' was not found in the resource"
+                ),
+                (
+                    "Composition.text.extension.1.extension.1.valueUri",
+                    "The URL value '#zz' is invalid because there is no matching target"
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn links_resolve_to_anchors_ids_and_element_ids() {
