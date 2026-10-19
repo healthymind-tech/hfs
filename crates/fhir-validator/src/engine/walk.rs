@@ -407,6 +407,94 @@ fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Valu
         ctx.path.pop();
         ctx.path.pop();
     }
+    if let Some(profile) = vital_signs_profile(resource) {
+        add_profile(
+            ctx,
+            set,
+            profile,
+            Some(resource),
+            UnknownProfilePolicy::Ignore,
+            false,
+        );
+    }
+}
+
+/// FHIR R4 requires a vital-signs Observation to conform to the vital signs
+/// profile for its kind ("If an observation is a vital sign, it SHALL
+/// conform"). As the HL7 validator does, an Observation whose code is one
+/// of the vital signs' LOINC or SNOMED CT codes is held to that core
+/// profile (`bp` for a systolic pressure, `bodytemp` for 276885007, …),
+/// whatever its category or claimed profiles — the code makes it a vital
+/// sign. The table is the HL7 validator's (probed against validator_cli:
+/// codes it does not map, such as 8462-4, are left alone).
+fn vital_signs_profile(resource: &Value) -> Option<&'static str> {
+    const VITALS: &[(&str, &str, &str)] = &[
+        ("http://loinc.org", "85353-1", "vitalspanel"),
+        ("http://loinc.org", "9279-1", "resprate"),
+        ("http://snomed.info/sct", "86290005", "resprate"),
+        ("http://loinc.org", "8867-4", "heartrate"),
+        ("http://loinc.org", "2708-6", "oxygensat"),
+        ("http://loinc.org", "59408-5", "oxygensat"),
+        ("http://loinc.org", "59417-6", "oxygensat"),
+        ("http://snomed.info/sct", "431314004", "oxygensat"),
+        ("http://loinc.org", "8310-5", "bodytemp"),
+        ("http://loinc.org", "8331-1", "bodytemp"),
+        ("http://snomed.info/sct", "276885007", "bodytemp"),
+        ("http://snomed.info/sct", "386725007", "bodytemp"),
+        ("http://loinc.org", "8302-2", "bodyheight"),
+        ("http://loinc.org", "8306-3", "bodyheight"),
+        ("http://loinc.org", "8308-9", "bodyheight"),
+        ("http://snomed.info/sct", "50373000", "bodyheight"),
+        ("http://loinc.org", "9843-4", "headcircum"),
+        ("http://loinc.org", "8287-5", "headcircum"),
+        ("http://snomed.info/sct", "363812007", "headcircum"),
+        ("http://loinc.org", "29463-7", "bodyweight"),
+        ("http://loinc.org", "3141-9", "bodyweight"),
+        ("http://loinc.org", "39156-5", "bmi"),
+        ("http://snomed.info/sct", "60621009", "bmi"),
+        ("http://loinc.org", "85354-9", "bp"),
+        ("http://loinc.org", "8480-6", "bp"),
+        ("http://loinc.org", "76534-7", "bp"),
+        ("http://loinc.org", "8459-0", "bp"),
+        ("http://snomed.info/sct", "271649006", "bp"),
+        ("http://snomed.info/sct", "271650006", "bp"),
+    ];
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Observation") {
+        return None;
+    }
+    let codings = |key: &str| -> Vec<&Value> {
+        match resource.get(key) {
+            Some(Value::Array(concepts)) => concepts
+                .iter()
+                .filter_map(|c| c.get("coding").and_then(Value::as_array))
+                .flatten()
+                .collect(),
+            Some(concept) => concept
+                .get("coding")
+                .and_then(Value::as_array)
+                .map(|c| c.iter().collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    codings("code").iter().find_map(|c| {
+        let (system, code) = (c.get("system")?.as_str()?, c.get("code")?.as_str()?);
+        VITALS
+            .iter()
+            .find(|(s, k, _)| *s == system && *k == code)
+            .map(|(_, _, name)| match *name {
+                "vitalspanel" => "http://hl7.org/fhir/StructureDefinition/vitalspanel",
+                "resprate" => "http://hl7.org/fhir/StructureDefinition/resprate",
+                "heartrate" => "http://hl7.org/fhir/StructureDefinition/heartrate",
+                "oxygensat" => "http://hl7.org/fhir/StructureDefinition/oxygensat",
+                "bodytemp" => "http://hl7.org/fhir/StructureDefinition/bodytemp",
+                "bodyheight" => "http://hl7.org/fhir/StructureDefinition/bodyheight",
+                "headcircum" => "http://hl7.org/fhir/StructureDefinition/headcircum",
+                "bodyweight" => "http://hl7.org/fhir/StructureDefinition/bodyweight",
+                "bmi" => "http://hl7.org/fhir/StructureDefinition/bmi",
+                _ => "http://hl7.org/fhir/StructureDefinition/bp",
+            })
+    })
 }
 
 /// `meta.profile` entries, in document order.

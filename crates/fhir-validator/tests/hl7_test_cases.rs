@@ -792,3 +792,33 @@ async fn type_profiles_bind_element_values() {
     let errs: Vec<String> = errors(&issues).iter().map(|e| e.path.clone()).collect();
     assert_eq!(errs, vec!["Patient.address.0.use".to_string()]);
 }
+
+/// `obs-temp-bad`, `obs-vs-1`, `obs-quantity-us`: a vital-signs
+/// Observation is held to the core vital signs profile its code maps to.
+#[test]
+fn vital_signs_observations_meet_their_core_profile() {
+    let obs = |system: &str, code: &str, unit: &str| {
+        json!({"resourceType": "Observation", "status": "final",
+               "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                                         "code": "vital-signs"}]}],
+               "code": {"coding": [{"system": system, "code": code}]},
+               "subject": {"reference": "Patient/p"}, "effectiveDateTime": "2020-06-30",
+               "valueQuantity": {"value": 36.0, "system": "http://unitsofmeasure.org", "code": unit, "unit": unit}})
+    };
+    // SNOMED body temperature: the bodytemp profile's LOINC code slice fails
+    let errs = structural_errors(&obs("http://snomed.info/sct", "276885007", "Cel"));
+    assert!(!errs.is_empty(), "bodytemp applies");
+    // with the LOINC code and a body temperature unit it conforms
+    let errs = structural_errors(&obs("http://loinc.org", "8310-5", "Cel"));
+    assert!(errs.is_empty(), "{errs:#?}");
+    // a systolic pressure is a blood pressure (components required)
+    let errs = structural_errors(&obs("http://loinc.org", "8480-6", "mm[Hg]"));
+    assert!(errs.len() >= 2, "{errs:#?}");
+    // not a vital-signs code: untouched
+    assert!(structural_errors(&obs("http://loinc.org", "1234-5", "zzz")).is_empty());
+    // the code decides, not the category (the bp profile then also wants
+    // the vital-signs category)
+    let mut lab = obs("http://loinc.org", "8480-6", "mm[Hg]");
+    lab["category"][0]["coding"][0]["code"] = json!("laboratory");
+    assert!(structural_errors(&lab).len() > errs.len(), "{errs:#?}");
+}

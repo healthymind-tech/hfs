@@ -180,10 +180,10 @@ async fn one_terminology_call_per_resource() {
     };
     let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
         {"fullUrl": "urn:uuid:1", "resource": {"resourceType": "Observation", "status": "final",
-            "code": {"coding": [loinc("8867-4", Some("Heart rate"))]},
+            "code": {"coding": [loinc("2339-0", Some("Glucose"))]},
             "subject": {"reference": "Patient/p"}, "performer": [{"reference": "Practitioner/x"}]}},
         {"fullUrl": "urn:uuid:2", "resource": {"resourceType": "Observation", "status": "final",
-            "code": {"coding": [loinc("8310-5", None)]},
+            "code": {"coding": [loinc("718-7", None)]},
             "interpretation": [{"coding": [{
                 "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
                 "code": "N"}]}],
