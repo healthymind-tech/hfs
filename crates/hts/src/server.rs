@@ -244,6 +244,8 @@ where
             get(get_translate_handler::<B>).post(translate_handler::<B>),
         )
         .route("/ConceptMap/$closure", post(closure_handler::<B>))
+        // `$closure` is a system-level operation (`[base]/$closure`).
+        .route("/$closure", post(closure_handler::<B>))
         // ── Resource CRUD + Search ────────────────────────────────────────────────
         // GET /CodeSystem searches; POST /CodeSystem creates.
         .route(

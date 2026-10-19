@@ -262,6 +262,9 @@ pub struct AppState<B: TerminologyBackend> {
     /// request supplied (a client sending a supplement asks for it with
     /// `useSupplement`; automatic use is for the operator's own).
     pub auto_supplements_skip: Arc<HashSet<String>>,
+
+    /// `$closure` tables by name (see [`crate::operations::closure`]).
+    pub closure_tables: crate::operations::closure::ClosureTables,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -290,6 +293,7 @@ impl<B: TerminologyBackend> AppState<B> {
             tx_overlays: Arc::new(crate::tx_overlay::TxOverlayCache::default()),
             is_tx_overlay: false,
             auto_supplements_skip: Arc::new(HashSet::new()),
+            closure_tables: Default::default(),
         }
     }
 
