@@ -972,6 +972,13 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         }
         for (bound, below) in [(&schema.min_value, true), (&schema.max_value, false)] {
             let Some(bound) = bound else { continue };
+            if data.is_string() && bound.is_object() {
+                // A Duration bound on a date/time: relative to now.
+                if let Some(message) = super::bounds::duration_violation(data, bound, below) {
+                    ctx.error(ErrorKind::PrimitiveValue, message);
+                }
+                continue;
+            }
             let ordering = super::bounds::compare(data, bound);
             let violated = match ordering {
                 Some(std::cmp::Ordering::Less) => below,

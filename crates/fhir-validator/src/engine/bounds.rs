@@ -20,6 +20,105 @@ pub(super) fn compare(data: &Value, bound: &Value) -> Option<Ordering> {
     }
 }
 
+/// A `minValue`/`maxValue` given as a Duration on a date/time element: the
+/// bound is now minus (min) or plus (max) the duration. Returns the bound
+/// rendered as a dateTime and the duration as written (`100a`).
+pub(super) fn duration_bound(
+    bound: &Value,
+    below: bool,
+    now_secs: i64,
+) -> Option<(String, String)> {
+    let q = bound.as_object()?;
+    let value = q.get("value")?.as_f64()?;
+    let code = q.get("code").or_else(|| q.get("unit"))?.as_str()?;
+    let sign: i64 = if below { -1 } else { 1 };
+    let (days, secs) = (now_secs.div_euclid(86_400), now_secs.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    let whole = value.trunc() as i64;
+    let shifted_secs = |delta: f64| now_secs + sign * delta.round() as i64;
+    let at = match code {
+        "a" | "mo" => {
+            let months = if code == "a" { whole * 12 } else { whole };
+            let total = y * 12 + (m - 1) + sign * months;
+            let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+            let nd = d.min(days_in_month(ny, nm));
+            days_from_civil(ny, nm, nd) * 86_400 + secs
+        }
+        "wk" => shifted_secs(value * 7.0 * 86_400.0),
+        "d" => shifted_secs(value * 86_400.0),
+        "h" => shifted_secs(value * 3_600.0),
+        "min" => shifted_secs(value * 60.0),
+        "s" => shifted_secs(value),
+        _ => return None,
+    };
+    let (dy, dm, dd) = civil_from_days(at.div_euclid(86_400));
+    let t = at.rem_euclid(86_400);
+    let rendered = format!(
+        "{dy:04}-{dm:02}-{dd:02}T{:02}:{:02}:{:02}Z",
+        t / 3600,
+        t / 60 % 60,
+        t % 60
+    );
+    let shown = q.get("value").map(Value::to_string).unwrap_or_default();
+    Some((rendered, format!("{shown}{code}")))
+}
+
+/// How a date/time string compares with a Duration bound (see
+/// [`duration_bound`]), and the HL7 validator's message when violated.
+pub(super) fn duration_violation(data: &Value, bound: &Value, below: bool) -> Option<String> {
+    let text = data.as_str()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let (at, written) = duration_bound(bound, below, now)?;
+    let ordering = compare_temporal(text, &at)?;
+    let violated = if below {
+        ordering == Ordering::Less
+    } else {
+        ordering == Ordering::Greater
+    };
+    violated.then(|| {
+        format!(
+            "The date/time value '{text}' is not legal: {} is {written} {} now (which is {at})",
+            if below { "minValue" } else { "maxValue" },
+            if below { "before" } else { "after" },
+        )
+    })
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
 /// The HL7 validator's wording, close enough to match on.
 pub(super) fn message(data: &Value, bound: &Value, below: bool) -> String {
     let show = |v: &Value| match v {
@@ -138,6 +237,28 @@ fn compare_quantity(data: &Value, bound: &Value) -> Option<Ordering> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn duration_bounds_relative_to_now() {
+        // 2026-10-20T00:00:00Z
+        let now = days_from_civil(2026, 10, 20) * 86_400;
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
+        let years = json!({"value": 100, "code": "a"});
+        assert_eq!(
+            duration_bound(&years, true, now),
+            Some(("1926-10-20T00:00:00Z".into(), "100a".into()))
+        );
+        let days = json!({"value": 10, "unit": "d"});
+        assert_eq!(
+            duration_bound(&days, false, now).unwrap().0,
+            "2026-10-30T00:00:00Z"
+        );
+        assert!(duration_violation(&json!("1850-01-01"), &years, true).is_some());
+        assert!(duration_violation(&json!("1950-01-01"), &years, true).is_none());
+        let ten = json!({"value": 10, "code": "a"});
+        assert!(duration_violation(&json!("2100-01-01"), &ten, false).is_some());
+        assert!(duration_violation(&json!("2020-01-01"), &ten, false).is_none());
+    }
 
     #[test]
     fn numbers_dates_times_and_quantities() {

@@ -1382,3 +1382,32 @@ async fn member_of_in_invariants() {
         "{good:#?}"
     );
 }
+
+/// `toplevel-minvalueduration-*`, `toplevel-maxvalueduration-*`: a Duration
+/// minValue/maxValue on a date bounds it relative to now.
+#[tokio::test]
+async fn duration_relative_bounds() {
+    let sd = |key: &str, years: u32| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{key}"),
+            "name": "Bound", "status": "active", "kind": "resource", "abstract": false,
+            "type": "Patient", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "differential": {"element": [{"id": "Patient.birthDate", "path": "Patient.birthDate",
+                key: {"value": years, "unit": "a", "system": "http://unitsofmeasure.org", "code": "a"}}]}
+        })
+    };
+    let p = |d: &str| json!({"resourceType": "Patient", "birthDate": d});
+    for (key, years, bad, good) in [
+        ("minValueDuration", 100, "1850-01-01", "1950-01-01"),
+        ("maxValueDuration", 10, "2100-01-01", "2020-01-01"),
+    ] {
+        let url = format!("http://example.org/StructureDefinition/{key}");
+        let issues = validate_with(&p(bad), &[sd(key, years)], &[&url]).await;
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 1, "{issues:#?}");
+        assert!(errs[0].message.contains("is not legal"), "{issues:#?}");
+        assert!(errors(&validate_with(&p(good), &[sd(key, years)], &[&url]).await).is_empty());
+    }
+}
