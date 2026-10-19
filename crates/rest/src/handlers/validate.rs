@@ -74,16 +74,45 @@ impl ValidateMode {
     }
 }
 
+/// Whether a `Parameters` body is the operation's input wrapper rather than
+/// the resource to validate. Outside `Parameters/$validate` it always is.
+/// On `Parameters/$validate` the body is only a wrapper when it carries a
+/// `resource` part holding a `Parameters` resource; anything else — a
+/// Parameters resource with ordinary parts, or one whose `resource` part
+/// holds e.g. a Patient — is itself what the client wants validated.
+fn is_operation_wrapper(body: &Value, resource_type: Option<&str>) -> bool {
+    if body.get("resourceType").and_then(Value::as_str) != Some("Parameters") {
+        return false;
+    }
+    if resource_type != Some("Parameters") {
+        return true;
+    }
+    body.get("parameter")
+        .and_then(Value::as_array)
+        .is_some_and(|params| {
+            params.iter().any(|p| {
+                p.get("name").and_then(Value::as_str) == Some("resource")
+                    && p.pointer("/resource/resourceType").and_then(Value::as_str)
+                        == Some("Parameters")
+            })
+        })
+}
+
 /// Unwrap the request body: either a raw resource, or a `Parameters`
 /// carrying `resource` / `mode` / `profile` parts. Query parameters fill in
-/// whatever the body did not provide.
-fn unwrap_inputs(body: Option<Value>, query: &ValidateQuery) -> Result<ValidateInputs, RestError> {
+/// whatever the body did not provide. `resource_type` is the type the
+/// request addresses (see [`is_operation_wrapper`]).
+fn unwrap_inputs(
+    body: Option<Value>,
+    query: &ValidateQuery,
+    resource_type: Option<&str>,
+) -> Result<ValidateInputs, RestError> {
     let mut resource = None;
     let mut mode_raw: Option<String> = None;
     let mut profiles: Vec<String> = Vec::new();
 
     if let Some(body) = body {
-        if body.get("resourceType").and_then(Value::as_str) == Some("Parameters") {
+        if is_operation_wrapper(&body, resource_type) {
             for param in body
                 .get("parameter")
                 .and_then(Value::as_array)
@@ -223,7 +252,7 @@ pub async fn validate_type_handler<S>(
 where
     S: ResourceStorage + Send + Sync,
 {
-    let inputs = unwrap_inputs(Some(body), &query)?;
+    let inputs = unwrap_inputs(Some(body), &query, Some(&resource_type))?;
     respond(
         &state,
         version.storage_version_or(state.config().default_fhir_version),
@@ -256,7 +285,7 @@ where
             id: id.clone(),
         })?;
 
-    let mut inputs = unwrap_inputs(None, &query)?;
+    let mut inputs = unwrap_inputs(None, &query, Some(&resource_type))?;
     inputs.resource = Some(stored.content().clone());
     respond(
         &state,
@@ -283,7 +312,7 @@ pub async fn validate_instance_post_handler<S>(
 where
     S: ResourceStorage + Send + Sync,
 {
-    let inputs = unwrap_inputs(Some(body), &query)?;
+    let inputs = unwrap_inputs(Some(body), &query, Some(&resource_type))?;
     respond(
         &state,
         version.storage_version_or(state.config().default_fhir_version),
@@ -293,4 +322,53 @@ where
         &req_headers,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn inputs(body: Value, resource_type: &str) -> ValidateInputs {
+        unwrap_inputs(Some(body), &ValidateQuery::default(), Some(resource_type)).unwrap()
+    }
+
+    #[test]
+    fn parameters_wrapper_is_unwrapped_for_other_types() {
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": {"resourceType": "Patient"}},
+            {"name": "profile", "valueUri": "http://example.org/p"}]});
+        let got = inputs(body, "Patient");
+        assert_eq!(got.resource.unwrap()["resourceType"], "Patient");
+        assert_eq!(got.profiles, vec!["http://example.org/p".to_string()]);
+    }
+
+    #[test]
+    fn a_parameters_resource_is_validated_as_itself() {
+        // Parameters/$validate with ordinary parts: the body is the resource.
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "attachment", "valueAttachment": {"contentType": "text/plain"}}]});
+        let got = inputs(body.clone(), "Parameters");
+        assert_eq!(got.resource.unwrap(), body);
+        // ... also when a part named `resource` holds some other resource.
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": {"resourceType": "Patient"}}]});
+        let got = inputs(body.clone(), "Parameters");
+        assert_eq!(got.resource.unwrap(), body);
+        // An empty Parameters is a resource too.
+        let body = json!({"resourceType": "Parameters"});
+        assert_eq!(inputs(body.clone(), "Parameters").resource.unwrap(), body);
+    }
+
+    #[test]
+    fn parameters_wrapping_a_parameters_resource_is_unwrapped() {
+        let inner =
+            json!({"resourceType": "Parameters", "parameter": [{"name": "x", "valueString": "y"}]});
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": inner.clone()},
+            {"name": "mode", "valueCode": "create"}]});
+        let got = inputs(body, "Parameters");
+        assert_eq!(got.resource.unwrap(), inner);
+        assert_eq!(got.mode, ValidateMode::Create);
+    }
 }
