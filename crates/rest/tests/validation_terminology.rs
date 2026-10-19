@@ -31,6 +31,8 @@ struct MockHts {
     composes: Arc<HashMap<String, Value>>,
     /// Code systems a negative answer blames via `x-caused-by-unknown-system`.
     blame_unknown_system: Option<String>,
+    /// Code system a negative answer names via `x-unknown-system`.
+    name_unknown_system: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -142,6 +144,9 @@ async fn validate_code(
     let mut parameter = vec![json!({ "name": "result", "valueBoolean": result })];
     if let (false, Some(system)) = (result, &state.blame_unknown_system) {
         parameter.push(json!({ "name": "x-caused-by-unknown-system", "valueCanonical": system }));
+    }
+    if let (false, Some(system)) = (result, &state.name_unknown_system) {
+        parameter.push(json!({ "name": "x-unknown-system", "valueCanonical": system }));
     }
     (
         StatusCode::OK,
@@ -542,6 +547,7 @@ async fn start_batching_mock_hts(
         code_systems: Arc::new(HashMap::new()),
         composes: Arc::new(HashMap::new()),
         blame_unknown_system: None,
+        name_unknown_system: None,
     };
     let batch_log = Arc::clone(&batches);
     let batch = move |State(state): State<MockHts>, Json(bundle): Json<Value>| {
@@ -557,6 +563,7 @@ async fn start_batching_mock_hts(
                     code_systems: Arc::clone(&state.code_systems),
                     composes: Arc::clone(&state.composes),
                     blame_unknown_system: state.blame_unknown_system.clone(),
+                    name_unknown_system: state.name_unknown_system.clone(),
                 };
                 let (status, Json(resource)) =
                     validate_code(State(inner), Json(entry["resource"].clone())).await;
@@ -693,5 +700,38 @@ async fn unknown_codes_count_only_in_complete_code_systems() {
             .await
             .json();
         assert_eq!(unknown(&outcome), expected, "{system}#{code}: {outcome:#}");
+    }
+}
+
+/// `mimic`: a code from an unknown code system the value set does not draw
+/// on is simply not in the value set (an error, as the HL7 validator says);
+/// only when the value set includes that system is membership unknowable.
+#[tokio::test]
+async fn unknown_systems_outside_the_value_set_are_not_members() {
+    const OTHER: &str = "http://example.org/other-cs";
+    let mock = |compose: Value| MockHts {
+        known: Arc::new(HashMap::from([(
+            IG_VS.to_string(),
+            vec!["HGNC:1".to_string()],
+        )])),
+        composes: Arc::new(HashMap::from([(IG_VS.to_string(), compose)])),
+        name_unknown_system: Some(OTHER.to_string()),
+        ..MockHts::default()
+    };
+    let patient = json!({
+        "resourceType": "Patient",
+        "maritalStatus": { "coding": [{ "system": OTHER, "code": "X" }] }
+    });
+    for (compose, severity) in [
+        (json!({ "include": [{ "system": GENES }] }), "error"),
+        (json!({ "include": [{ "system": OTHER }] }), "warning"),
+    ] {
+        let (ts_url, _) = start_mock(mock(compose)).await;
+        let server = hfs(&ts_url, "remote", "open");
+        upload_profile(&server).await;
+        let outcome = validate(&server, &patient, true).await;
+        let issues = binding_issues(&outcome);
+        assert_eq!(issues.len(), 1, "{outcome:#}");
+        assert_eq!(issues[0].0, severity, "{outcome:#}");
     }
 }

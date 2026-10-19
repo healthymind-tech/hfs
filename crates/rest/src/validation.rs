@@ -1331,6 +1331,27 @@ impl RemoteTerminologyProvider {
         body: &Value,
     ) -> Option<String> {
         if let Some(system) = Self::caused_by_unknown_system(body) {
+            // An unknown code system the value set does not draw on makes
+            // the code plainly not a member (as the HL7 validator says);
+            // only one the value set includes leaves membership open.
+            let named_only = body
+                .get("parameter")
+                .and_then(Value::as_array)
+                .is_some_and(|ps| {
+                    !ps.iter().any(|p| {
+                        p.get("name").and_then(Value::as_str) == Some("x-caused-by-unknown-system")
+                    })
+                });
+            if named_only
+                && let Some(compose) = self.value_set_compose(value_set).await
+                && let Some(includes) = compose.get("include").and_then(Value::as_array)
+                && !includes.iter().any(|inc| {
+                    inc.get("system").and_then(Value::as_str) == Some(system.as_str())
+                        || inc.get("valueSet").is_some()
+                })
+            {
+                return None;
+            }
             return Some(system);
         }
         let systems = Self::coded_systems(coded);
