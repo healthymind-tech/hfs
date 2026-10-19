@@ -1038,6 +1038,7 @@ fn eval_element<'a>(
         let consumed = super::slicing::validate_slices(ctx, &elset, items);
         let is_extension_array = key == "extension" || key == "modifierExtension";
 
+        let profiles = type_profiles(&elset);
         for (index, item) in items.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
@@ -1051,7 +1052,8 @@ fn eval_element<'a>(
                     .and_then(Value::as_array)
                     .and_then(|s| s.get(index))
                     .filter(|s| !s.is_null());
-                validate_node(ctx, &elset, item);
+                let item_set = with_type_profiles(ctx, &elset, &profiles, item);
+                validate_node(ctx, &item_set, item);
                 ctx.primitive_sidecar = outer;
             }
             ctx.path.pop();
@@ -1059,9 +1061,80 @@ fn eval_element<'a>(
     } else {
         let outer = ctx.primitive_sidecar.take();
         ctx.primitive_sidecar = sidecar.filter(|s| s.is_object());
-        validate_node(ctx, &elset, value);
+        let profiles = type_profiles(&elset);
+        let value_set = with_type_profiles(ctx, &elset, &profiles, value);
+        validate_node(ctx, &value_set, value);
         ctx.primitive_sidecar = outer;
     }
+}
+
+/// The `type.profile` canonicals the element's layers declare.
+fn type_profiles(elset: &SchemaSet) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for schema in elset.schemas() {
+        for p in schema.type_profiles.iter().flatten() {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// `elset` for one value of an element with `type.profile`s. One profile
+/// joins the value's set (its rules report as usual); with several, the
+/// value must conform to at least one ("Unable to find a match for the
+/// specified profile among choices"). A resource profile only applies to a
+/// resource of its type ("The type 'Patient' is not valid - must be
+/// DocumentManifest"). Unresolvable profiles are not judged.
+fn with_type_profiles<'a>(
+    ctx: &mut WalkCtx<'a>,
+    elset: &SchemaSet,
+    profiles: &[String],
+    value: &'a Value,
+) -> SchemaSet {
+    if profiles.is_empty() || !value.is_object() {
+        return elset.clone();
+    }
+    let resolved: Vec<(String, Arc<FhirSchema>)> = profiles
+        .iter()
+        .filter_map(|p| ctx.resolver.resolve(p).map(|s| (p.clone(), s)))
+        .collect();
+    if resolved.is_empty() {
+        return elset.clone();
+    }
+    if let Some(rt) = value.get("resourceType").and_then(Value::as_str) {
+        let types: Vec<String> = resolved
+            .iter()
+            .filter_map(|(_, s)| s.type_.clone())
+            .collect();
+        if !types.is_empty() && !types.iter().any(|t| t == rt) {
+            ctx.error(
+                ErrorKind::ReferenceInvalid,
+                format!(
+                    "The type '{rt}' is not valid - must be {}",
+                    types.join(" or ")
+                ),
+            );
+            return elset.clone();
+        }
+    }
+    if let [(url, schema)] = resolved.as_slice() {
+        let mut set = elset.clone();
+        add_schemas_to_set(ctx, &mut set, Arc::clone(schema), url);
+        return set;
+    }
+    if !resolved.iter().any(|(url, _)| ctx.conforms_to(value, url)) {
+        let names: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
+        ctx.error(
+            ErrorKind::SliceUnmatched,
+            format!(
+                "Unable to find a match for the specified profile among choices: {}",
+                names.join(", ")
+            ),
+        );
+    }
+    elset.clone()
 }
 
 /// Validate an extension no profile slice claimed. An extension whose `url`
@@ -1740,6 +1813,7 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         binding,
         constraints,
         refers,
+        type_profiles,
         slicing,
         extensions,
         modifier,

@@ -320,6 +320,9 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
+            if !t.profile.is_empty() && t.effective_code() != "Extension" {
+                element.schema.type_profiles = Some(t.profile.clone());
+            }
         }
         _ => {
             // Multiple types without `[x]` should not occur; take the first.
@@ -422,6 +425,9 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         branch.schema.choice_of = Some(base_name.to_string());
         if !t.target_profile.is_empty() {
             branch.schema.refers = Some(t.target_profile.clone());
+        }
+        if !t.profile.is_empty() && t.effective_code() != "Extension" {
+            branch.schema.type_profiles = Some(t.profile.clone());
         }
         apply_value_keywords(&mut branch.schema, ed, warnings);
     }

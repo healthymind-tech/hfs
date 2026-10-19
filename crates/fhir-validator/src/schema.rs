@@ -133,6 +133,10 @@ pub struct FhirSchema {
     /// Allowed reference target types (for Reference/canonical elements).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refers: Option<Vec<String>>,
+    /// `type.profile` of the element (datatype or resource profiles): the
+    /// value must conform to one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_profiles: Option<Vec<String>>,
 
     // ------------------------------------------------------------------
     // Slicing

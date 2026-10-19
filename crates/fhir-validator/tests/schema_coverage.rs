@@ -109,6 +109,7 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             }),
             constraints: Some(Default::default()),
             refers: Some(Vec::new()),
+            type_profiles: Some(Vec::new()),
             slicing: Some(Slicing {
                 slices: Default::default(),
                 rules: None,
@@ -172,7 +173,9 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // `minValue` / `maxValue`: the packs predate the keywords (stored and
         // IG profiles carry them); regenerating the packs would emit the few
         // core ones.
-        Ctx::Schema => &["scalar", "minValue", "maxValue"],
+        //
+        // `typeProfiles`: core datatype elements carry no type profiles.
+        Ctx::Schema => &["scalar", "minValue", "maxValue", "typeProfiles"],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.
         // (`order` used to live here — the converter now emits it under

@@ -738,3 +738,57 @@ async fn idless_differentials_constrain_the_open_slice() {
     .await;
     assert!(errors(&issues).is_empty(), "{issues:#?}");
 }
+
+/// `profile-choice-1`, `no/Person-test-bad`, `bundle-ihe-bad`: an element's
+/// `type.profile` binds its values — one profile layers on, several must
+/// match at least one, and a resource profile requires its resource type.
+#[tokio::test]
+async fn type_profiles_bind_element_values() {
+    let address = |url: &str, required: &str| {
+        json!({
+            "resourceType": "StructureDefinition", "url": url, "name": "A", "status": "active",
+            "kind": "complex-type", "abstract": false, "type": "Address", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Address",
+            "differential": {"element": [{"id": format!("Address.{required}"),
+                                          "path": format!("Address.{required}"), "min": 1}]}
+        })
+    };
+    let a1 = "http://example.org/StructureDefinition/address-use";
+    let a2 = "http://example.org/StructureDefinition/address-type";
+    let patient_profile = |profiles: &[&str]| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/patient-address",
+            "name": "P", "status": "active", "kind": "resource", "abstract": false,
+            "type": "Patient", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "differential": {"element": [{"id": "Patient.address", "path": "Patient.address",
+                "type": [{"code": "Address", "profile": profiles}]}]}
+        })
+    };
+    let p = "http://example.org/StructureDefinition/patient-address";
+    let patient = |addr: Value| json!({"resourceType": "Patient", "address": [addr]});
+    let sds = |profiles: &[&str]| {
+        vec![
+            address(a1, "use"),
+            address(a2, "type"),
+            patient_profile(profiles),
+        ]
+    };
+    let count = |issues: Vec<ValidationError>| errors(&issues).len();
+    // two profiles: matching either one is enough
+    assert_eq!(
+        count(validate_with(&patient(json!({"use": "home"})), &sds(&[a1, a2]), &[p]).await),
+        0
+    );
+    assert_eq!(
+        count(validate_with(&patient(json!({"type": "postal"})), &sds(&[a1, a2]), &[p]).await),
+        0
+    );
+    let issues = validate_with(&patient(json!({"city": "x"})), &sds(&[a1, a2]), &[p]).await;
+    assert_eq!(count(issues), 1);
+    // one profile: its rules apply directly
+    let issues = validate_with(&patient(json!({"city": "x"})), &sds(&[a1]), &[p]).await;
+    let errs: Vec<String> = errors(&issues).iter().map(|e| e.path.clone()).collect();
+    assert_eq!(errs, vec!["Patient.address.0.use".to_string()]);
+}
