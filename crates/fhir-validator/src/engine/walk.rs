@@ -1602,9 +1602,16 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
                 if parent_paths.iter().any(|p| path_matches(c, p)) {
                     met = true;
                 }
-            } else if c.contains('.') || sidecar {
-                // Datatype-rooted paths, and datatypes on a primitive's
-                // sidecar, are out of reach.
+            } else if let Some((_, last)) = c.rsplit_once('.') {
+                // A datatype-rooted path (`HumanName.family`) names an
+                // element of that type: the extension must sit on an
+                // element of that name (whose owner's type the walk does
+                // not track — accepted).
+                if keys.last().is_some_and(|k| path_matches(last, k)) {
+                    met = true;
+                }
+            } else if sidecar {
+                // A datatype on a primitive's sidecar is out of reach.
                 judgeable = false;
                 break;
             } else if parent_types.iter().any(|t| t == c) {

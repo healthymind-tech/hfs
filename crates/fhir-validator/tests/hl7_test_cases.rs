@@ -933,3 +933,81 @@ async fn slice_minimums_on_absent_elements() {
         "{issues:#?}"
     );
 }
+
+/// `patient-extension-complex-bad2`, `maiden-name-extension`: a complex
+/// extension's undefined sub-extension, and an extension whose context is
+/// a datatype element (`HumanName.family`) placed elsewhere.
+#[tokio::test]
+async fn complex_extensions_and_datatype_element_contexts() {
+    let animal = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/animal",
+        "name": "Animal", "status": "active", "kind": "complex-type", "abstract": false,
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "context": [{"type": "element", "expression": "Patient"}],
+        "differential": {"element": [
+            {"id": "Extension.extension", "path": "Extension.extension",
+             "slicing": {"discriminator": [{"type": "value", "path": "url"}], "rules": "open"}},
+            {"id": "Extension.extension:species", "path": "Extension.extension", "sliceName": "species", "min": 1},
+            {"id": "Extension.extension:species.url", "path": "Extension.extension.url", "fixedUri": "species"},
+            {"id": "Extension.extension:species.value[x]", "path": "Extension.extension.value[x]",
+             "type": [{"code": "CodeableConcept"}]},
+            {"id": "Extension.url", "path": "Extension.url", "fixedUri": "http://example.org/StructureDefinition/animal"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "max": "0"}
+        ]}
+    });
+    let family = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/mothers-family",
+        "name": "MothersFamily", "status": "active", "kind": "complex-type", "abstract": false,
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "context": [{"type": "element", "expression": "HumanName.family"}],
+        "differential": {"element": [
+            {"id": "Extension.url", "path": "Extension.url",
+             "fixedUri": "http://example.org/StructureDefinition/mothers-family"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "string"}]}
+        ]}
+    });
+    let run = |resource: Value| {
+        let sds = [animal.clone(), family.clone()];
+        async move {
+            let core = core_registry(FhirVersion::R4);
+            let mut overlay = SchemaRegistry::new();
+            for sd in &sds {
+                overlay.insert(convert(sd).unwrap().schema);
+            }
+            let resolver: Arc<dyn SchemaResolver> =
+                Arc::new(CompositeResolver::new(vec![Arc::new(overlay), core]));
+            let opts = ValidationOptions {
+                check_extension_context: true,
+                ..Default::default()
+            };
+            Validator::new(resolver)
+                .validate_sync(&resource, &opts)
+                .errors
+                .into_iter()
+                .filter(|e| e.severity == Severity::Error)
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+        }
+    };
+    let species = json!({"url": "species", "valueCodeableConcept": {"text": "dog"}});
+    let ok = json!({"resourceType": "Patient", "extension": [{
+        "url": "http://example.org/StructureDefinition/animal", "extension": [species.clone()]}]});
+    assert!(run(ok).await.is_empty());
+    let mf =
+        json!({"url": "http://example.org/StructureDefinition/mothers-family", "valueString": "x"});
+    let on_family = json!({"resourceType": "Patient", "name": [{"family": "Doe",
+        "_family": {"extension": [mf.clone()]}}]});
+    assert!(run(on_family).await.is_empty());
+    let on_name =
+        json!({"resourceType": "Patient", "name": [{"family": "Doe", "extension": [mf]}]});
+    let errs = run(on_name).await;
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("is not allowed to be used at this point")),
+        "{errs:#?}"
+    );
+}
