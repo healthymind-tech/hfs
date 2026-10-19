@@ -735,3 +735,114 @@ async fn unknown_systems_outside_the_value_set_are_not_members() {
         assert_eq!(issues[0].0, severity, "{outcome:#}");
     }
 }
+
+/// `Bundle-example-PMR`: a large resource's checks go out in chunked
+/// batches whose timeout scales with their size, so a server that needs
+/// longer than one check's timeout for a whole batch still answers every
+/// check — instead of the batch timing out and every check then being
+/// fired at the busy server at once.
+#[tokio::test]
+async fn large_resources_batch_in_chunks_with_scaled_timeouts() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let codes: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
+    let state = MockHts {
+        known: Arc::new(HashMap::from([(IG_VS.to_string(), codes.clone())])),
+        ..MockHts::default()
+    };
+    let singles = Arc::new(Mutex::new(0usize));
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let sizes = Arc::clone(&batch_sizes);
+    let batch = move |State(state): State<MockHts>, Json(bundle): Json<Value>| {
+        let sizes = Arc::clone(&sizes);
+        async move {
+            let entries_in = bundle["entry"].as_array().cloned().unwrap_or_default();
+            sizes.lock().unwrap().push(entries_in.len());
+            // 15 ms per check: a 60-check batch would take 900 ms.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                15 * entries_in.len() as u64,
+            ))
+            .await;
+            let mut entries = Vec::new();
+            for entry in entries_in {
+                let (status, Json(resource)) =
+                    validate_code(State(state.clone()), Json(entry["resource"].clone())).await;
+                entries.push(json!({"resource": resource, "response": {"status": status.as_u16().to_string()}}));
+            }
+            Json(json!({"resourceType": "Bundle", "type": "batch-response", "entry": entries}))
+        }
+    };
+    let counter = Arc::clone(&singles);
+    let single = move |State(state): State<MockHts>, Json(body): Json<Value>| {
+        let counter = Arc::clone(&counter);
+        async move {
+            *counter.lock().unwrap() += 1;
+            validate_code(State(state), Json(body)).await
+        }
+    };
+    let router = Router::new()
+        .route("/", axum::routing::post(batch))
+        .route("/ValueSet/$validate-code", axum::routing::post(single))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    // Per-check timeout 200 ms: below one 60-check batch, above one check.
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_millis(200),
+    );
+    let coded: Vec<CodedValue> = codes.iter().map(|c| CodedValue::Code(c.clone())).collect();
+    let checks: Vec<(&str, &CodedValue)> = coded.iter().map(|c| (IG_VS, c)).collect();
+    let verdicts = provider.validate_codes(&checks).await;
+    assert!(
+        verdicts.iter().all(|v| matches!(v, Ok(true))),
+        "{verdicts:?}"
+    );
+    assert_eq!(*singles.lock().unwrap(), 0, "no single requests");
+    let mut sizes = batch_sizes.lock().unwrap().clone();
+    sizes.sort();
+    assert_eq!(sizes, vec![10, 25, 25]);
+}
+
+/// A batch the server does not answer in time is reported per check as
+/// not performed (the validator turns it into a "could not be performed"
+/// issue) and is not re-sent check by check to the busy server.
+#[tokio::test]
+async fn a_timed_out_batch_is_reported_not_refired() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let singles = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&singles);
+    let router = Router::new()
+        .route(
+            "/",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                Json(json!({"resourceType": "Bundle", "type": "batch-response", "entry": []}))
+            }),
+        )
+        .route(
+            "/ValueSet/$validate-code",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    *counter.lock().unwrap() += 1;
+                    Json(json!({"resourceType": "Parameters", "parameter": [{"name": "result", "valueBoolean": true}]}))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_millis(100),
+    );
+    let (a, b) = (CodedValue::Code("a".into()), CodedValue::Code("b".into()));
+    let verdicts = provider.validate_codes(&[(IG_VS, &a), (IG_VS, &b)]).await;
+    for v in &verdicts {
+        let e = v.as_ref().expect_err("timed out");
+        assert!(e.to_string().contains("timed out"), "{e}");
+    }
+    assert_eq!(*singles.lock().unwrap(), 0);
+}
