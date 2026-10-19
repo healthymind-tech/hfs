@@ -368,6 +368,9 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
     }
 
     let bundle_type = bundle.get("type").and_then(Value::as_str);
+    if bundle_type == Some("searchset") {
+        searchset_rules(bundle, &mut out);
+    }
     if !matches!(bundle_type, Some("document" | "message")) || list.is_empty() {
         return out;
     }
@@ -462,6 +465,97 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
     out
 }
 
+/// The resource types a search's `self` link asks for: the type in the
+/// URL path (`…/Patient?name=x`) or the `_type` parameter. `None` when the
+/// link does not say.
+fn searched_types(self_link: &str) -> Option<Vec<String>> {
+    let (path, query) = self_link.split_once('?').unwrap_or((self_link, ""));
+    let last = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if last.starts_with(|c: char| c.is_ascii_uppercase())
+        && last.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Some(vec![last.to_string()]);
+    }
+    query.split('&').find_map(|p| {
+        let types = p.strip_prefix("_type=")?;
+        Some(types.split(',').map(str::to_string).collect())
+    })
+}
+
+/// `searchset` Bundles (HL7 validator): a link relation occurs once;
+/// `match` entries carry an identified resource of a searched type;
+/// `outcome` entries carry an OperationOutcome.
+fn searchset_rules(bundle: &Value, out: &mut Vec<ValidationError>) {
+    let links = bundle.get("link").and_then(Value::as_array);
+    let mut seen = HashSet::new();
+    let mut self_link = None;
+    for (index, link) in links.into_iter().flatten().enumerate() {
+        let Some(relation) = link.get("relation").and_then(Value::as_str) else {
+            continue;
+        };
+        if relation == "self" && self_link.is_none() {
+            self_link = link.get("url").and_then(Value::as_str);
+        }
+        if !seen.insert(relation) {
+            out.push(error(
+                ErrorKind::BundleEntryMismatch,
+                format!("Bundle.link.{index}"),
+                format!("The link relationship type '{relation}' can only occur once"),
+            ));
+        }
+    }
+    let searched = self_link.and_then(searched_types);
+    for (index, entry) in bundle
+        .get("entry")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(resource) = entry.get("resource") else {
+            continue;
+        };
+        let rt = resource
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = format!("Bundle.entry.{index}.resource");
+        match entry.pointer("/search/mode").and_then(Value::as_str) {
+            Some("match") => {
+                if resource.get("id").is_none() {
+                    out.push(error(
+                        ErrorKind::Required,
+                        path.clone(),
+                        "Search results must have ids".to_string(),
+                    ));
+                }
+                if let Some(types) = &searched
+                    && !types.iter().any(|t| t == rt)
+                {
+                    out.push(error(
+                        ErrorKind::BundleEntryMismatch,
+                        path,
+                        format!(
+                            "This is not a matching resource type for the specified search ({rt} expecting [{}])",
+                            types.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Some("outcome") if rt != "OperationOutcome" => out.push(error(
+                ErrorKind::BundleEntryMismatch,
+                path,
+                format!("This is not an OperationOutcome ({rt})"),
+            )),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +624,38 @@ mod tests {
         let bare = [entry(None, &patient), entry(None, &obs)];
         assert_eq!(resolve(&bare, "Patient/p1", None), Resolution::Found(0));
         assert_eq!(resolve(&bare, "#x", None), Resolution::NotFound);
+    }
+
+    #[test]
+    fn searchset_rules_match_the_hl7_validator() {
+        let messages =
+            |b: Value| -> Vec<String> { bundle_rules(&b).into_iter().map(|e| e.message).collect() };
+        let link = |rel: &str, url: &str| json!({"relation": rel, "url": url});
+        let b = json!({"resourceType": "Bundle", "type": "searchset",
+            "link": [link("self", "base/Patient?name=x"), link("self", "base/Patient?name=x"),
+                     link("first", "base/Patient?name=x")],
+            "entry": [{"fullUrl": "http://x/fhir/OperationOutcome/o", "search": {"mode": "outcome"},
+                       "resource": {"resourceType": "OperationOutcome"}},
+                      {"fullUrl": "http://x/fhir/Patient/p", "search": {"mode": "match"},
+                       "resource": {"resourceType": "Patient", "id": "p"}}]});
+        assert_eq!(
+            messages(b),
+            vec!["The link relationship type 'self' can only occur once"]
+        );
+        let b = json!({"resourceType": "Bundle", "type": "searchset",
+            "link": [link("self", "base?name=x&_type=Observation,DocumentReference")],
+            "entry": [{"fullUrl": "urn:uuid:1", "search": {"mode": "outcome"},
+                       "resource": {"resourceType": "Immunization"}},
+                      {"fullUrl": "urn:uuid:2", "search": {"mode": "match"},
+                       "resource": {"resourceType": "OperationOutcome"}}]});
+        assert_eq!(
+            messages(b),
+            vec![
+                "This is not an OperationOutcome (Immunization)",
+                "Search results must have ids",
+                "This is not a matching resource type for the specified search (OperationOutcome expecting [Observation, DocumentReference])",
+            ]
+        );
     }
 
     #[test]
