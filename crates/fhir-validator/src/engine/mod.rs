@@ -7,6 +7,7 @@
 //! `docs/guide/mental-model.md` in the FHIR Schema repo for the model, and
 //! `walk.rs` for the deterministic error-emission order.
 
+mod attachment;
 mod bounds;
 mod bundle;
 mod errors;

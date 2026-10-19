@@ -592,6 +592,13 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         return;
     };
 
+    if set
+        .schemas()
+        .any(|s| s.url.as_deref() == Some("http://hl7.org/fhir/StructureDefinition/Attachment"))
+    {
+        super::attachment::check_attachment(ctx, obj);
+    }
+
     // FHIR JSON has no empty objects: an element is present only with a
     // value or children (ele-1). The typed FHIRPath model drops `{}` before
     // ele-1 can see it, so the walk reports it.

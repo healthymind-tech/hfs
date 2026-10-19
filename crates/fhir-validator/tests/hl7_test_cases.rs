@@ -482,3 +482,35 @@ async fn min_and_max_values() {
         1
     );
 }
+
+/// `base64-ws-*`, `attachment-with-wrong-size`: Attachment.data must be
+/// valid base64 (whitespace tolerated) and match a stated size and hash.
+#[test]
+fn attachment_data_size_and_hash() {
+    let text = "This is the content of a test attachment. It is long enough that its base64 form is wrapped onto more than one line.";
+    let b64 = "VGhpcyBpcyB0aGUgY29udGVudCBvZiBhIHRlc3QgYXR0YWNobWVudC4gSXQgaXMgbG9uZyBlbm91Z2ggdGhhdCBpdHMgYmFzZTY0IGZvcm0gaXMgd3JhcHBlZCBvbnRvIG1vcmUgdGhhbiBvbmUgbGluZS4=";
+    let params = |data: &str, size: usize, hash: &str| {
+        json!({"resourceType": "Parameters", "parameter": [{"name": "a", "valueAttachment": {
+            "contentType": "text/plain", "data": data, "size": size, "hash": hash}}]})
+    };
+    let hash = "0TUjD0LsI0HVJR71SRAloD71d+o=";
+    let wrapped = format!("{}\r\n{}", &b64[..76], &b64[76..]);
+    assert!(structural_errors(&params(&wrapped, text.len(), hash)).is_empty());
+    let errs = structural_errors(&params(b64, 999, hash));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(
+        errs[0].1.starts_with("Stated Attachment Size 999"),
+        "{errs:#?}"
+    );
+    let errs = structural_errors(&params(b64, text.len(), "LEZwlbCg5nvlH2vQD4DLIRiEbdw="));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(
+        errs[0].1.starts_with("The hash of the data did not match"),
+        "{errs:#?}"
+    );
+    // Padding in the middle of the data (base64-ws/r4-bad-padding.json).
+    let bad = "VGhpcyBpcyB0aGUgY29udGVudCBvZiBhIHRlc3QgYXR0YWNobWVudA==\r\nLiBJdCBpcyBsb25nIGVub3VnaCB0aGF0IGl0cyBiYXNlNjQgZm9ybSBpcyB3cmFwcGVkIG9udG8g\r\nbW9yZSB0aGFuIG9uZSBsaW5lLg==";
+    let errs = structural_errors(&params(bad, text.len(), hash));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(errs[0].1.contains("not valid base64"), "{errs:#?}");
+}

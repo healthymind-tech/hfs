@@ -44,6 +44,9 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 helios-fhirpath = { path = "../fhirpath", version = "0.2.4", optional = true, default-features = false }
 roxmltree = { version = "0.20", optional = true }
+# Attachment.data checks (base64 validity, SHA-1 hash).
+base64 = "0.22"
+sha1 = "0.10"
 
 [dev-dependencies]
 serde = { workspace = true }
