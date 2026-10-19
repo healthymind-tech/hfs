@@ -332,13 +332,33 @@ pub trait ConstraintEvaluator: Send + Sync {
 /// `memberOf()` answers for one resource's invariants, filled from the
 /// [`TerminologyProvider`]. Questions not yet answered are recorded, so the
 /// effects layer can ask them and evaluate again.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemberOfAnswers {
     known: HashMap<(String, String), bool>,
     missed: Mutex<Vec<(String, CodedValue)>>,
+    /// Answers `conformsTo()`: does this JSON conform to that profile.
+    conformance: Option<Conformance>,
+}
+
+/// Whether a JSON value conforms to a profile (structural validation).
+pub type Conformance = Arc<dyn Fn(&Value, &str) -> bool + Send + Sync>;
+
+impl std::fmt::Debug for MemberOfAnswers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemberOfAnswers")
+            .field("known", &self.known)
+            .field("conformance", &self.conformance.is_some())
+            .finish()
+    }
 }
 
 impl MemberOfAnswers {
+    /// `conformsTo()`: whether `value` conforms to `profile`, when the
+    /// validator supplied a conformance check.
+    pub fn conforms(&self, value: &Value, profile: &str) -> Option<bool> {
+        self.conformance.as_ref().map(|c| c(value, profile))
+    }
+
     /// The answer for `coded` in `value_set`, or `None` (recorded as asked).
     pub fn lookup(&self, value_set: &str, coded: CodedValue) -> Option<bool> {
         let key = (value_set.to_string(), coded_key(&coded));
@@ -424,7 +444,19 @@ pub async fn execute(
     handlers: &EffectHandlers<'_>,
     errors: &mut Vec<ValidationError>,
 ) {
-    execute_constraints(resource, version, deferred, handlers, errors).await;
+    execute_with(resource, version, deferred, handlers, None, errors).await;
+}
+
+/// [`execute`], with `conformsTo()` answered by `conformance`.
+pub async fn execute_with(
+    resource: &Value,
+    version: FhirVersion,
+    deferred: &[Deferred],
+    handlers: &EffectHandlers<'_>,
+    conformance: Option<Conformance>,
+    errors: &mut Vec<ValidationError>,
+) {
+    execute_constraints(resource, version, deferred, handlers, conformance, errors).await;
     execute_terminology(resource, deferred, handlers, errors).await;
 }
 
@@ -433,6 +465,7 @@ async fn execute_constraints(
     version: FhirVersion,
     deferred: &[Deferred],
     handlers: &EffectHandlers<'_>,
+    conformance: Option<Conformance>,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(evaluator) = handlers.constraints else {
@@ -489,12 +522,17 @@ async fn execute_constraints(
             },
         )
         .collect();
+    let wants_conformance =
+        conformance.is_some() && refs.iter().any(|c| c.expression.contains("conformsTo("));
     let outcomes = if let Some(tx) = handlers.terminology
         && refs.iter().any(|c| c.expression.contains("memberOf("))
     {
         // Two passes: the first records the memberOf() questions, the
         // provider answers them, the second evaluates with the answers.
-        let first = Arc::new(MemberOfAnswers::default());
+        let first = Arc::new(MemberOfAnswers {
+            conformance: conformance.clone(),
+            ..Default::default()
+        });
         let outcomes = evaluator.evaluate_all_with_members(resource, version, &refs, &first);
         let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
         if asked.is_empty() {
@@ -512,9 +550,16 @@ async fn execute_constraints(
             let second = Arc::new(MemberOfAnswers {
                 known,
                 missed: Mutex::default(),
+                conformance,
             });
             evaluator.evaluate_all_with_members(resource, version, &refs, &second)
         }
+    } else if wants_conformance {
+        let answers = Arc::new(MemberOfAnswers {
+            conformance,
+            ..Default::default()
+        });
+        evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
     } else {
         evaluator.evaluate_all(resource, version, &refs)
     };

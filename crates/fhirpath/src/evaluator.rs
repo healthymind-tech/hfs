@@ -192,6 +192,13 @@ pub type RootMemo = Arc<Mutex<HashMap<usize, EvaluationResult>>>;
 /// answer is not known, and `memberOf()` then yields an empty result.
 pub trait MemberOfResolver: Send + Sync {
     fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool>;
+
+    /// Answers `conformsTo(profile)`: whether the focus conforms to the
+    /// profile. `None` (the default) means unknown: an empty result.
+    fn conforms_to(&self, focus: &EvaluationResult, profile: &str) -> Option<bool> {
+        let _ = (focus, profile);
+        None
+    }
 }
 
 impl Clone for EvaluationContext {
@@ -5087,6 +5094,23 @@ fn call_function(
                     "join requires string items or a collection of strings".to_string(),
                 )),
             }
+        }
+        "conformsTo" => {
+            let Some(EvaluationResult::String(profile, _, _)) = args.first() else {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'conformsTo' expects 1 string argument (profile URL)".to_string(),
+                ));
+            };
+            let focus = match invocation_base {
+                EvaluationResult::Collection { items, .. } if items.len() == 1 => &items[0],
+                EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
+                other => other,
+            };
+            Ok(context
+                .member_of
+                .as_ref()
+                .and_then(|r| r.conforms_to(focus, profile))
+                .map_or(EvaluationResult::Empty, EvaluationResult::boolean))
         }
         "memberOf" => {
             if args.len() != 1 {

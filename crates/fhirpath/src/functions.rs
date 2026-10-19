@@ -431,6 +431,11 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: Math,
         },
         FunctionInfo {
+            name: "conformsTo",
+            signature: "conformsTo(profile)",
+            category: Terminology,
+        },
+        FunctionInfo {
             name: "memberOf",
             signature: "memberOf(valueSet)",
             category: Terminology,

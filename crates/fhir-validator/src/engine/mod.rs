@@ -317,7 +317,33 @@ impl Validator {
         if effects.best_practice {
             errors.extend(narrative::best_practice_warnings(resource));
         }
-        crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
+        let resolver = Arc::clone(&self.resolver);
+        let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {
+            let opts = ValidationOptions {
+                profiles: vec![profile.to_string()],
+                use_meta_profiles: false,
+                ..Default::default()
+            };
+            // Structure, plus the core value sets' required bindings
+            // (embedded, so answerable synchronously).
+            let outcome = Validator::new(Arc::clone(&resolver)).validate_sync(value, &opts);
+            let tx = crate::terminology::core_terminology(version)
+                .required_binding_errors(&outcome.deferred);
+            outcome
+                .errors
+                .iter()
+                .chain(&tx)
+                .all(|e| e.severity != Severity::Error)
+        });
+        crate::effects::execute_with(
+            resource,
+            version,
+            &deferred,
+            effects,
+            Some(conformance),
+            &mut errors,
+        )
+        .await;
         errors
     }
 }

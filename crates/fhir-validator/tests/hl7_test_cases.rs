@@ -1779,3 +1779,34 @@ async fn bundled_reference_targets_meet_target_profiles() {
     .await;
     assert!(errors(&good).is_empty(), "{good:#?}");
 }
+
+/// `patient-bad-gender#profile`: FHIRPath `conformsTo()` in an invariant.
+#[tokio::test]
+async fn conforms_to_in_invariants() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/conform",
+        "name": "Conform", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Patient", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient", "path": "Patient",
+            "constraint": [{"key": "ck-1", "severity": "error", "human": "conformsToCheck",
+                "expression": "conformsTo('http://hl7.org/fhir/StructureDefinition/Patient')"}]}]}
+    });
+    let url = "http://example.org/StructureDefinition/conform";
+    let ck1 = |issues: &[ValidationError]| issues.iter().any(|e| e.message.contains("ck-1"));
+    let bad = validate_with(
+        &json!({"resourceType": "Patient", "gender": "bad"}),
+        &[sd.clone()],
+        &[url],
+    )
+    .await;
+    assert!(ck1(&bad), "{bad:#?}");
+    let good = validate_with(
+        &json!({"resourceType": "Patient", "gender": "male"}),
+        &[sd],
+        &[url],
+    )
+    .await;
+    assert!(!ck1(&good), "{good:#?}");
+}

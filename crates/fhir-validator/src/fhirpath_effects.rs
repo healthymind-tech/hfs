@@ -107,13 +107,51 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
     }
 }
 
-/// `memberOf()` answered from [`MemberOfAnswers`].
-struct Members(Arc<MemberOfAnswers>);
+/// `memberOf()` and `conformsTo()` answered from [`MemberOfAnswers`]; the
+/// resource's JSON locates a `conformsTo()` focus.
+struct Members(Arc<MemberOfAnswers>, Arc<Value>);
 
 impl helios_fhirpath::MemberOfResolver for Members {
     fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool> {
         self.0.lookup(value_set, coded_value(coded)?)
     }
+
+    fn conforms_to(&self, focus: &EvaluationResult, profile: &str) -> Option<bool> {
+        let json = resource_json(&self.1, focus)?;
+        self.0.conforms(json, profile)
+    }
+}
+
+/// The JSON of a resource focus: the resource with that type and id in
+/// `raw` (the root itself when it matches and has no id).
+fn resource_json<'v>(raw: &'v Value, focus: &EvaluationResult) -> Option<&'v Value> {
+    let EvaluationResult::Object { map, type_info } = focus else {
+        return None;
+    };
+    let text = |e: &EvaluationResult| match e {
+        EvaluationResult::String(s, _, _) => Some(s.clone()),
+        _ => None,
+    };
+    let rt = map
+        .get("resourceType")
+        .and_then(text)
+        .or_else(|| type_info.as_ref().map(|t| t.name.clone()))?;
+    let id = map.get("id").and_then(text);
+    fn find<'v>(v: &'v Value, rt: &str, id: Option<&str>) -> Option<&'v Value> {
+        match v {
+            Value::Object(o) => {
+                if o.get("resourceType").and_then(Value::as_str) == Some(rt)
+                    && o.get("id").and_then(Value::as_str) == id
+                {
+                    return Some(v);
+                }
+                o.values().find_map(|c| find(c, rt, id))
+            }
+            Value::Array(a) => a.iter().find_map(|c| find(c, rt, id)),
+            _ => None,
+        }
+    }
+    find(raw, &rt, id.as_deref())
 }
 
 /// A FHIRPath code, Coding or CodeableConcept as a [`CodedValue`].
@@ -195,7 +233,7 @@ impl FhirPathConstraintEvaluator {
         };
         let mut context = EvaluationContext::new(vec![typed]);
         if let Some(m) = members {
-            context.member_of = Some(Arc::new(Members(Arc::clone(m))));
+            context.member_of = Some(Arc::new(Members(Arc::clone(m), Arc::new(resource.clone()))));
         }
         // Sound: every AST evaluated here is held by `self.asts` for the
         // life of the evaluator, which outlives this context.
