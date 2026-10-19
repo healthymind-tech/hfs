@@ -624,6 +624,30 @@ pub(crate) fn answered_from_resources(param_name: &str) -> bool {
     PARAMS_ANSWERED_FROM_RESOURCES.contains(&param_name)
 }
 
+/// Longest text value stored in an indexed `search_index` column, in bytes.
+///
+/// A B-tree entry holds at most 2704 bytes (a third of a page), the key
+/// columns `(tenant_id, resource_type, param_name, value)` together; a
+/// longer value fails the whole write ("index row size … exceeds btree
+/// version 4 maximum 2704"), which made e.g. Da Vinci DTR's
+/// `OperationDefinition/questionnaire-package` (a 3 kB description)
+/// impossible to store. Values are cut at a character boundary: string
+/// search matches by prefix, so only a `:exact` or `:contains` match beyond
+/// the first 1,400 bytes of a value is lost.
+const MAX_INDEXED_TEXT: usize = 1400;
+
+/// `s`, cut to [`MAX_INDEXED_TEXT`] bytes at a character boundary.
+fn indexed_text(s: &str) -> String {
+    if s.len() <= MAX_INDEXED_TEXT {
+        return s.to_string();
+    }
+    let mut end = MAX_INDEXED_TEXT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 impl IndexRow {
     /// Flattens one extracted value into a row.
     ///
@@ -644,8 +668,8 @@ impl IndexRow {
 
         match &extracted.value {
             IndexValue::String(s) => {
-                row.value_string = Some(s.clone());
-                row.value_string_folded = Some(crate::search::fold_text(s));
+                row.value_string = Some(indexed_text(s));
+                row.value_string_folded = Some(indexed_text(&crate::search::fold_text(s)));
             }
             IndexValue::Token {
                 system,
@@ -656,7 +680,7 @@ impl IndexRow {
             } => {
                 row.value_token_system = system.clone();
                 row.value_token_code = Some(code.clone());
-                row.value_token_display = display.clone();
+                row.value_token_display = display.as_deref().map(indexed_text);
                 row.value_identifier_type_system = identifier_type_system.clone();
                 row.value_identifier_type_code = identifier_type_code.clone();
             }
@@ -711,10 +735,10 @@ impl IndexRow {
                 // able to use a `/_history/<vid>` suffix, and three of them are
                 // silently broken by one.
                 row.value_reference = Some(strip_reference_version(reference).to_string());
-                row.value_reference_display = display.clone();
+                row.value_reference_display = display.as_deref().map(indexed_text);
             }
             IndexValue::Uri(uri) => {
-                row.value_uri = Some(uri.clone());
+                row.value_uri = Some(indexed_text(uri));
             }
         }
 
@@ -771,7 +795,7 @@ impl IndexRow {
             value_token_code: row.value_token_code.clone(),
             value_token_system_2: row.value_token_system_2.clone(),
             value_token_code_2: row.value_token_code_2.clone(),
-            value_string: row.value_string.clone(),
+            value_string: row.value_string.as_deref().map(indexed_text),
             value_date: date_range.map(|(start, _)| start),
             value_date_end: date_range.map(|(_, end)| end),
             value_number: row.value_number,
@@ -1897,6 +1921,24 @@ mod tests {
     fn row_of(value: IndexValue) -> IndexRow {
         IndexRow::from_extracted(&extracted(value), "Observation", "abc", Some(Utc::now()))
             .expect("value should map to a row")
+    }
+
+    /// A value longer than a B-tree entry can hold (a 3 kB
+    /// OperationDefinition description, CJK text) is cut at a character
+    /// boundary instead of failing the write.
+    #[test]
+    fn long_text_values_fit_the_index() {
+        let long = "說明".repeat(1000); // 6,000 bytes
+        let row = row_of(IndexValue::String(long.clone()));
+        let stored = row.value_string.unwrap();
+        assert!(stored.len() <= MAX_INDEXED_TEXT, "{}", stored.len());
+        assert!(long.starts_with(&stored));
+        assert!(row.value_string_folded.unwrap().len() <= MAX_INDEXED_TEXT);
+        let row = row_of(IndexValue::Uri(format!("http://x/{}", "a".repeat(5000))));
+        assert_eq!(row.value_uri.unwrap().len(), MAX_INDEXED_TEXT);
+        // Short values are stored as they are.
+        let row = row_of(IndexValue::String("Peter".into()));
+        assert_eq!(row.value_string.as_deref(), Some("Peter"));
     }
 
     /// A pre-v18 database is read with the grouped composite form, which only
