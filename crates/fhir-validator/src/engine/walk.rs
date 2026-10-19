@@ -211,6 +211,15 @@ impl<'a> WalkCtx<'a> {
             return true;
         }
         self.conformance.borrow_mut().insert(key.clone(), true);
+        let outcome = self.nested_outcome(value, profile);
+        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        self.conformance.borrow_mut().insert(key, conforms);
+        conforms
+    }
+
+    /// Validate `value` against `profile` alone, in a fresh walk (paths
+    /// rooted at the value).
+    pub(super) fn nested_outcome(&self, value: &'a Value, profile: &str) -> SyncOutcome {
         let opts = ValidationOptions {
             profiles: vec![profile.to_string()],
             use_meta_profiles: false,
@@ -243,10 +252,7 @@ impl<'a> WalkCtx<'a> {
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
         };
-        let outcome = run(&mut nested, value, &opts);
-        let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
-        self.conformance.borrow_mut().insert(key, conforms);
-        conforms
+        run(&mut nested, value, &opts)
     }
 
     /// Whether `#id` names a contained resource of the innermost resource,
@@ -1288,6 +1294,34 @@ fn with_type_profiles<'a>(
                 names.join(", ")
             ),
         );
+        // and, as the HL7 validator lists them, why each candidate failed
+        let here = ctx.path.render_dotted();
+        let root = value
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        for (url, _) in &resolved {
+            for e in ctx.nested_outcome(value, url).errors {
+                if e.severity != Severity::Error {
+                    continue;
+                }
+                let rest = e.path.strip_prefix(root.as_str()).unwrap_or(&e.path);
+                let rest = rest.trim_start_matches('.');
+                let path = if rest.is_empty() {
+                    here.clone()
+                } else {
+                    format!("{here}.{rest}")
+                };
+                let mut issue = e;
+                issue.message = format!("{} (validating against {url})", issue.message);
+                issue.hl7_message = issue
+                    .hl7_message
+                    .map(|m| format!("{m} (validating against {url})"));
+                issue.path = path;
+                ctx.errors.push(issue);
+            }
+        }
     }
     elset.clone()
 }

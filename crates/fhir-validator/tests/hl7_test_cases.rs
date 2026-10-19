@@ -785,8 +785,17 @@ async fn type_profiles_bind_element_values() {
         count(validate_with(&patient(json!({"type": "postal"})), &sds(&[a1, a2]), &[p]).await),
         0
     );
+    // neither: the no-match error plus each candidate's own failure
     let issues = validate_with(&patient(json!({"city": "x"})), &sds(&[a1, a2]), &[p]).await;
-    assert_eq!(count(issues), 1);
+    let errs: Vec<String> = errors(&issues).iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        errs,
+        vec![
+            "Patient.address.0".to_string(),
+            "Patient.address.0.use".to_string(),
+            "Patient.address.0.type".to_string()
+        ]
+    );
     // one profile: its rules apply directly
     let issues = validate_with(&patient(json!({"city": "x"})), &sds(&[a1]), &[p]).await;
     let errs: Vec<String> = errors(&issues).iter().map(|e| e.path.clone()).collect();
