@@ -834,3 +834,61 @@ async fn terminology_goes_to_the_terminology_server_and_is_removed_from_it() {
     assert_eq!(left[0]["id"], "shared", "pre-existing terminology stays");
     assert_eq!(job["result"]["keptPreexisting"], 1);
 }
+
+/// THO 6.1.0 ships two CodeSystems with the same canonical
+/// (`http://hl7.org/fhir/sid/icd-9-cm|3.0.0`, diagnosis and procedure
+/// codes). When they travel in different terminology batches, the second
+/// one finds the first on the server; it is still the package's own, so
+/// uninstalling (or upgrading away from) the package must remove it.
+#[tokio::test]
+async fn a_canonical_the_package_ships_twice_is_still_removed() {
+    let (hts, store) = mock_hts().await;
+    let cache = tempfile::tempdir().unwrap();
+    let server = hts_server(&hts, cache.path());
+    let cs = |id: &str, url: &str| {
+        json!({"resourceType": "CodeSystem", "id": id, "url": url, "version": "3.0.0",
+               "status": "active", "content": "not-present"})
+    };
+    let dup = "http://acme.org/sid/icd-9-cm";
+    // 250 code systems: the two duplicates are first and last, more than
+    // one terminology batch apart.
+    let mut files: Vec<(String, Value)> =
+        vec![("CodeSystem-a-diagnosis.json".into(), cs("a-diagnosis", dup))];
+    for i in 0..248 {
+        let id = format!("filler-{i:03}");
+        files.push((
+            format!("CodeSystem-{id}.json"),
+            cs(&id, &format!("http://acme.org/CodeSystem/{id}")),
+        ));
+    }
+    files.push(("CodeSystem-z-procedure.json".into(), cs("z-procedure", dup)));
+    let members: Vec<(&str, Value)> = files.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
+    let pkg = package("acme.dup", "1.0.0", json!({}), &members);
+    upload(&server, pkg, "").await.assert_status(StatusCode::OK);
+    let job = install(&server, "acme.dup#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let detail: Value = server.get("/admin/packages/acme.dup/1.0.0").await.json();
+    let rows = detail["resources"]["CodeSystem"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        rows.iter().all(|r| r["preexisting"] == false),
+        "nothing was on the terminology server before: {:?}",
+        rows.iter()
+            .filter(|r| r["preexisting"] == true)
+            .collect::<Vec<_>>()
+    );
+
+    let job: Value = server
+        .delete("/admin/packages/acme.dup/1.0.0?wait=30")
+        .await
+        .json();
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let left: Vec<Value> = store.lock().unwrap().clone();
+    assert!(
+        left.is_empty(),
+        "{:?}",
+        left.iter().map(|r| &r["url"]).collect::<Vec<_>>()
+    );
+}
