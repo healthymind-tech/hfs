@@ -1102,3 +1102,87 @@ async fn fhirpath_extension_contexts_are_evaluated() {
     assert_eq!(run("home").await, 0);
     assert_eq!(run("work").await, 1);
 }
+
+/// `exta-ctxt-bad-name`, `extb-ctxt-bad`: abstract contexts (DomainResource,
+/// DomainResource.text, BackboneElement) and a contextInvariant.
+#[tokio::test]
+async fn abstract_contexts_and_context_invariants() {
+    let ext = |url: &str, contexts: Value, invariant: Option<&str>| {
+        let mut sd = json!({
+            "resourceType": "StructureDefinition", "url": url, "name": "X", "status": "active",
+            "kind": "complex-type", "abstract": false, "type": "Extension", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+            "context": contexts,
+            "differential": {"element": [
+                {"id": "Extension.url", "path": "Extension.url", "fixedUri": url},
+                {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "boolean"}]}]}});
+        if let Some(i) = invariant {
+            sd["contextInvariant"] = json!([i]);
+        }
+        sd
+    };
+    let a = "http://example.org/StructureDefinition/exta";
+    let b = "http://example.org/StructureDefinition/extb";
+    let sds = vec![
+        ext(
+            a,
+            json!([{"type": "element", "expression": "DomainResource"},
+                      {"type": "element", "expression": "DomainResource.text"},
+                      {"type": "element", "expression": "BackboneElement"}]),
+            None,
+        ),
+        ext(
+            b,
+            json!([{"type": "element", "expression": "Patient"}]),
+            Some("Patient.active.not()"),
+        ),
+    ];
+    let run = |patient: Value| {
+        let sds = sds.clone();
+        async move {
+            let core = core_registry(FhirVersion::R4);
+            let mut overlay = SchemaRegistry::new();
+            for sd in &sds {
+                overlay.insert(convert(sd).unwrap().schema);
+            }
+            let resolver: Arc<dyn SchemaResolver> =
+                Arc::new(CompositeResolver::new(vec![Arc::new(overlay), core]));
+            let evaluator = FhirPathConstraintEvaluator::new();
+            let handlers = EffectHandlers {
+                constraints: Some(&evaluator),
+                ..Default::default()
+            };
+            let opts = ValidationOptions {
+                check_extension_context: true,
+                ..Default::default()
+            };
+            Validator::new(resolver)
+                .validate(&patient, FhirVersion::R4, &opts, &handlers)
+                .await
+                .into_iter()
+                .filter(|e| e.severity == Severity::Error)
+                .count()
+        }
+    };
+    let e = |url: &str| json!([{"url": url, "valueBoolean": true}]);
+    assert_eq!(
+        run(json!({"resourceType": "Patient", "extension": e(a)})).await,
+        0
+    );
+    assert_eq!(run(json!({"resourceType": "Patient",
+        "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">x</div>",
+                 "extension": e(a)}})).await, 0);
+    assert_eq!(run(json!({"resourceType": "Patient", "contact": [{"extension": e(a), "name": {"family": "y"}}]})).await, 0);
+    assert_eq!(
+        run(json!({"resourceType": "Patient", "name": [{"family": "x", "extension": e(a)}]})).await,
+        1
+    );
+    assert_eq!(
+        run(json!({"resourceType": "Patient", "active": false, "extension": e(b)})).await,
+        0
+    );
+    assert_eq!(
+        run(json!({"resourceType": "Patient", "active": true, "extension": e(b)})).await,
+        1
+    );
+}

@@ -1631,9 +1631,43 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
         let Some(schema) = ctx.resolver.resolve(url) else {
             continue;
         };
-        let Some(contexts) = schema.context.as_ref().filter(|c| !c.is_empty()) else {
+        let Some(all_contexts) = schema.context.as_ref().filter(|c| !c.is_empty()) else {
             continue;
         };
+        let invariants: Vec<&str> = all_contexts
+            .iter()
+            .filter_map(|c| c.strip_prefix("invariant:"))
+            .collect();
+        let contexts: Vec<String> = all_contexts
+            .iter()
+            .filter(|c| !c.starts_with("invariant:"))
+            .cloned()
+            .collect();
+        let contexts = &contexts;
+        // contextInvariants: checked on the extension's parent, wherever it
+        // is allowed.
+        if !invariants.is_empty() {
+            let at = ctx.path.render_dotted();
+            let parent_path = at
+                .rsplit_once('.')
+                .map_or(at.as_str(), |(p, _)| p)
+                .to_string();
+            for expr in &invariants {
+                ctx.deferred.push(Deferred::Constraint {
+                    path: parent_path.clone(),
+                    id: format!("ext-context-invariant:{url}"),
+                    expression: (*expr).to_string(),
+                    human: Some(format!(
+                        "The extension {url} is not allowed to be used at this point (based on context invariant '{expr}')"
+                    )),
+                    severity: Some("error".to_string()),
+                    own_resource: false,
+                });
+            }
+        }
+        if contexts.is_empty() {
+            continue;
+        }
 
         let mut met = false;
         let mut judgeable = true;
@@ -1686,6 +1720,38 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
                     } else {
                         conditions.push(format!("($this{rest}).exists()"));
                     }
+                }
+                continue;
+            }
+            // Abstract contexts: any element; a resource root (or an
+            // element of every resource, `DomainResource.text`); a
+            // backbone element.
+            match c.as_str() {
+                "Element" => {
+                    met = true;
+                    continue;
+                }
+                "Resource" | "DomainResource" => {
+                    if keys.is_empty() {
+                        met = true;
+                    }
+                    continue;
+                }
+                "BackboneElement" => {
+                    if parent_types.iter().any(|t| t == "BackboneElement") {
+                        met = true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(tail) = c
+                .strip_prefix("DomainResource.")
+                .or_else(|| c.strip_prefix("Resource."))
+            {
+                let wanted: Vec<&str> = tail.split('.').collect();
+                if !sidecar && keys.iter().map(String::as_str).eq(wanted.iter().copied()) {
+                    met = true;
                 }
                 continue;
             }

@@ -361,7 +361,9 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     // `fhirpath:<expr>` / `extension:<url>`, which no element path equals —
     // dropping them made an extension allowed by a FHIRPath context look
     // misplaced to the context check.
-    let contexts: Vec<String> = sd
+    // `contextInvariant`s ride along as `invariant:<expr>` (they restrict
+    // where the extension may be used, on top of the contexts).
+    let mut contexts: Vec<String> = sd
         .get("context")
         .and_then(Value::as_array)
         .map(|items| {
@@ -379,6 +381,14 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
                 .collect()
         })
         .unwrap_or_default();
+    contexts.extend(
+        sd.get("contextInvariant")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|expr| format!("invariant:{expr}")),
+    );
     if !contexts.is_empty() {
         schema.context = Some(contexts);
     }
