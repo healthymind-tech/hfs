@@ -183,7 +183,7 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
             return Err(HtsError::NotFound(format!("Concept not found: {code}")));
         }
     }
-    let result = process_lookup_inner(state, params).await;
+    let result = snomed_lookup(state, params).await;
     match (&result, cache_key) {
         (Ok(value), Some(key)) => {
             lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
@@ -194,6 +194,245 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
         _ => {}
     }
     result
+}
+
+/// `$lookup` with the SNOMED CT specifics: a post-coordinated expression is
+/// looked up as its focus concept, then described as itself (see
+/// [`crate::snomed::ops::lookup_response`]); every SNOMED CT response names
+/// the description types, the attribute and value terms, and the concept's
+/// effective time and module, and leaves the preferred-for-language
+/// designations to the display.
+async fn snomed_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    use crate::snomed::{SNOMED_URL, ops};
+    if find_str_param(&params, "system").as_deref() != Some(SNOMED_URL) {
+        return process_lookup_inner(state, params).await;
+    }
+    let code = find_str_param(&params, "code").unwrap_or_default();
+    let version = find_str_param(&params, "version");
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let is_expression = code
+        .contains(|c: char| matches!(c, ':' | '+' | '|' | '{' | '(' | '=') || c.is_whitespace());
+    if is_expression {
+        if let Some(model) = state
+            .backend()
+            .snomed_model(&ctx, SNOMED_URL, version.as_deref())
+            .await?
+        {
+            return match ops::check(&model, &code) {
+                ops::Checked::Invalid(reason) => {
+                    Err(HtsError::Coded(Box::new(crate::error::CodedIssue {
+                        code: "code-invalid",
+                        tx_code: "invalid-code",
+                        text: format!(
+                            "Unknown code '{code}' in the CodeSystem '{SNOMED_URL}' version '{}': {reason}",
+                            model.version.as_deref().unwrap_or_default()
+                        ),
+                        expression: Some("code".into()),
+                    })))
+                }
+                ops::Checked::Valid { expr, display, .. } => {
+                    let focus = expr.body.focus[0].id.clone();
+                    let mut focus_params = params.clone();
+                    focus_params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("code"));
+                    focus_params.push(json!({"name": "code", "valueCode": focus}));
+                    let looked_up = process_lookup_inner(state, focus_params.clone()).await?;
+                    let looked_up = snomed_lookup_details(state, &focus_params, looked_up).await;
+                    Ok(ops::lookup_response(
+                        &model, &code, &display, &expr, looked_up,
+                    ))
+                }
+            };
+        }
+    }
+    let looked_up = process_lookup_inner(state, params.clone()).await?;
+    Ok(snomed_lookup_details(state, &params, looked_up).await)
+}
+
+/// The SNOMED CT details of a `$lookup` response (see [`snomed_lookup`]).
+async fn snomed_lookup_details<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+    mut value: Value,
+) -> Value {
+    use crate::snomed::SNOMED_URL;
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let code = find_str_param(params, "code").unwrap_or_default();
+    let version = find_str_param(params, "version");
+    let requested = collect_str_params(params, "property");
+    let wanted = |p: &str| requested.is_empty() || requested.iter().any(|r| r == p || r == "*");
+    let Some(list) = value.get_mut("parameter").and_then(|v| v.as_array_mut()) else {
+        return value;
+    };
+    // Codes whose terms the properties need.
+    let mut codes: Vec<String> = vec![code.clone()];
+    let part_str = |parts: &[Value], name: &str| -> Option<String> {
+        parts
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|p| {
+                ["valueCode", "valueString", "valueCoding"]
+                    .iter()
+                    .find_map(|k| p.get(*k))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+                    })
+            })
+    };
+    for p in list.iter() {
+        if p.get("name").and_then(|v| v.as_str()) != Some("property") {
+            continue;
+        }
+        let Some(parts) = p.get("part").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if let Some(c) = part_str(parts, "code") {
+            if c.bytes().all(|b| b.is_ascii_digit()) {
+                codes.push(c);
+            }
+        }
+        if let Some(v) = part_str(parts, "value") {
+            codes.push(v);
+        }
+    }
+    let rows = state
+        .backend()
+        .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &codes)
+        .await
+        .unwrap_or_default();
+    let module = rows.get(&code).and_then(|info| info.row.module.clone());
+    let module_display = match &module {
+        Some(m) => state
+            .backend()
+            .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &[m.clone()])
+            .await
+            .ok()
+            .and_then(|r| r.get(m).and_then(|i| i.display.clone())),
+        None => None,
+    };
+    let display_of = |c: &str| rows.get(c).and_then(|i| i.display.clone());
+    list.retain(|p| {
+        p.get("name").and_then(|v| v.as_str()) != Some("designation")
+            || !p
+                .get("part")
+                .and_then(|v| v.as_array())
+                .is_some_and(|parts| {
+                    parts.iter().any(|x| {
+                        x.get("valueCoding")
+                            .and_then(|c| c.get("code"))
+                            .and_then(|c| c.as_str())
+                            == Some("preferredForLanguage")
+                    })
+                })
+    });
+    // Designations in description id order.
+    if let Some(info) = rows.get(&code) {
+        let first = list
+            .iter()
+            .position(|p| p.get("name").and_then(|v| v.as_str()) == Some("designation"));
+        if let Some(first) = first {
+            let mut designations: Vec<Value> = Vec::new();
+            list.retain(|p| {
+                if p.get("name").and_then(|v| v.as_str()) == Some("designation") {
+                    designations.push(p.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let rank = |d: &Value| {
+                let value = d
+                    .get("part")
+                    .and_then(|v| v.as_array())
+                    .and_then(|parts| {
+                        parts
+                            .iter()
+                            .find(|x| x.get("name").and_then(|v| v.as_str()) == Some("value"))
+                    })
+                    .and_then(|x| x.get("valueString"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                info.row
+                    .terms
+                    .iter()
+                    .position(|t| t == value)
+                    .unwrap_or(usize::MAX)
+            };
+            designations.sort_by_key(|d| rank(d));
+            for (i, d) in designations.into_iter().enumerate() {
+                list.insert(first + i, d);
+            }
+        }
+    }
+    for p in list.iter_mut() {
+        let name = p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(parts) = p.get_mut("part").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        if name == "designation" {
+            for x in parts.iter_mut() {
+                if let Some(coding) = x.get_mut("valueCoding") {
+                    let use_code = coding
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    if let Some(n) = crate::snomed::description_type_name(use_code) {
+                        coding["display"] = json!(n);
+                    }
+                }
+            }
+            continue;
+        }
+        if name != "property" {
+            continue;
+        }
+        let prop = part_str(parts, "code").unwrap_or_default();
+        let has = |parts: &Vec<Value>, n: &str| {
+            parts
+                .iter()
+                .any(|x| x.get("name").and_then(|v| v.as_str()) == Some(n))
+        };
+        let attribute = prop.bytes().all(|b| b.is_ascii_digit()) && !prop.is_empty();
+        if attribute && !has(parts, "code-display") {
+            if let Some(d) = display_of(&prop) {
+                parts.push(json!({"name": "code-display", "valueString": d}));
+            }
+        }
+        if (attribute || prop == "parent" || prop == "child") && !has(parts, "description") {
+            if let Some(d) = part_str(parts, "value").and_then(|v| display_of(&v)) {
+                parts.push(json!({"name": "description", "valueString": d}));
+            }
+        }
+    }
+    if let Some(info) = rows.get(&code) {
+        if wanted("effectiveTime") {
+            if let Some(t) = info.row.effective_time.as_deref().filter(|t| t.len() == 8) {
+                list.push(json!({"name": "property", "part": [
+                    {"name": "code", "valueCode": "effectiveTime"},
+                    {"name": "value", "valueDateTime": format!("{}-{}-{}", &t[..4], &t[4..6], &t[6..])},
+                ]}));
+            }
+        }
+        if wanted("module") {
+            if let Some(m) = &module {
+                let mut parts = vec![json!({"name": "code", "valueCode": "module"})];
+                if let Some(d) = &module_display {
+                    parts.push(json!({"name": "description", "valueString": d}));
+                }
+                parts.push(json!({"name": "value", "valueCode": m}));
+                list.push(json!({"name": "property", "part": parts}));
+            }
+        }
+    }
+    value
 }
 
 async fn process_lookup_inner<B: TerminologyBackend>(
