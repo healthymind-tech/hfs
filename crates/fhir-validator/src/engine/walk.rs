@@ -763,7 +763,10 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         if let Some(choices) = &schema.choices {
             // Runs when a choice-group declarer joins a branch element's
             // set; the branch key is the last named path segment.
+            // An empty list comes from a `foo[x]` element that constrains
+            // without narrowing the types: no restriction.
             if let Some(branch) = ctx.path.last_key()
+                && !choices.is_empty()
                 && !choices.iter().any(|c| c == branch)
             {
                 let message = errors::msg_choice_excluded(branch);

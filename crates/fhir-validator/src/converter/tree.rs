@@ -423,6 +423,13 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         .entry(base_name.to_string())
         .or_insert_with(|| Node::new(base_name.to_string()));
     record_types(declarer, ed);
+    // A differential `foo[x]` without `type` (a binding or constraint added
+    // to `Observation.value[x]`) keeps the base's types: it declares no
+    // branches (an empty `choices` list restricts nothing) and its keywords
+    // ride on the declarer, which joins whichever branch the data uses.
+    if ed.types.is_empty() {
+        apply_value_keywords(&mut declarer.schema, ed, warnings);
+    }
     match &mut declarer.schema.choices {
         Some(existing) => {
             for name in branch_names {
