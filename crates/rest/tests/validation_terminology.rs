@@ -552,14 +552,22 @@ async fn remote_checks_of_one_resource_share_one_batch() {
     let other = "http://example.org/ValueSet/other";
     let (url, singles, batches) =
         start_batching_mock_hts(&[(IG_VS, &["M", "S"]), (other, &["x"])]).await;
-    let provider =
-        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_secs(5),
+    );
     let m = CodedValue::Code("M".into());
     let bad = CodedValue::Code("nope".into());
     let x = CodedValue::Code("x".into());
     let missing = "http://example.org/ValueSet/missing";
     let verdicts = provider
-        .validate_codes(&[(IG_VS, &m), (other, &x), (IG_VS, &m), (IG_VS, &bad), (missing, &x)])
+        .validate_codes(&[
+            (IG_VS, &m),
+            (other, &x),
+            (IG_VS, &m),
+            (IG_VS, &bad),
+            (missing, &x),
+        ])
         .await;
     assert!(singles.lock().unwrap().is_empty(), "no single requests");
     let sent = batches.lock().unwrap().clone();
@@ -592,8 +600,10 @@ async fn remote_checks_fall_back_to_single_requests() {
     use helios_fhir_validator::{CodedValue, TerminologyProvider};
     let other = "http://example.org/ValueSet/other";
     let (url, requests) = start_mock_hts(&[(IG_VS, &["M"]), (other, &["x"])]).await;
-    let provider =
-        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_secs(5),
+    );
     let m = CodedValue::Code("M".into());
     let x = CodedValue::Code("y".into());
     let verdicts = provider.validate_codes(&[(IG_VS, &m), (other, &x)]).await;

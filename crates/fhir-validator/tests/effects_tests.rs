@@ -300,7 +300,11 @@ async fn non_required_bindings_are_not_checked() {
             &handlers,
         )
         .await;
-    assert_eq!(errors, vec![], "a text-only concept satisfies an extensible binding");
+    assert_eq!(
+        errors,
+        vec![],
+        "a text-only concept satisfies an extensible binding"
+    );
 
     // A coded value outside an extensible binding: silent by default, a
     // warning (never an error) when extensible checks are on.
@@ -334,7 +338,12 @@ async fn non_required_bindings_are_not_checked() {
     };
     let errors = bindings(
         validator()
-            .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &on)
+            .validate(
+                &resource,
+                FhirVersion::R4,
+                &ValidationOptions::default(),
+                &on,
+            )
             .await,
     );
     assert_eq!(errors.len(), 1, "{errors:#?}");
