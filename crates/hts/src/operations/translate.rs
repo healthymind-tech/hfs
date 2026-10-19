@@ -774,9 +774,9 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["resourceType"], "OperationOutcome");
         assert_eq!(json["issue"][0]["code"], "invalid");
-        let diag = json["issue"][0]["diagnostics"]
+        let diag = json["issue"][0]["details"]["text"]
             .as_str()
-            .expect("diagnostics string");
+            .expect("details.text string");
         for spelling in [
             "sourceCoding",
             "coding",

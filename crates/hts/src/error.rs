@@ -40,7 +40,7 @@ use thiserror::Error;
 /// All errors that the HTS service can produce.
 ///
 /// Each variant carries a human-readable diagnostic message that is embedded
-/// verbatim in the `OperationOutcome.issue[0].diagnostics` field of the HTTP
+/// verbatim in the `OperationOutcome.issue[0].details.text` field of the HTTP
 /// response.  See the module-level documentation for the HTTP status code each
 /// variant maps to.
 #[derive(Debug, Error)]
@@ -165,7 +165,6 @@ impl HtsError {
                         }],
                         "text": msg,
                     },
-                    "diagnostics": msg,
                 }]
             });
         }
@@ -193,10 +192,11 @@ impl HtsError {
             HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
-        // The HL7 IG validator's TxTesterScrubbers strips OperationOutcome.issue
-        // entries that have `diagnostics` but no `details` — every such issue
-        // disappears from comparison. The IG fixtures additionally expect a
-        // tx-issue-type coding inside details.
+        // The message goes in `details.text` only, with the tx-issue-type
+        // coding beside it. The HL7 IG validator strips issues that have
+        // `diagnostics` but no `details`, and on some operations
+        // (CodeSystem/$validate-code) rejects a `diagnostics` that
+        // duplicates `details.text`.
         let mut issue = json!({
             "severity": "error",
             "code": code,
@@ -207,7 +207,6 @@ impl HtsError {
                 }],
                 "text": text,
             },
-            "diagnostics": text,
         });
         if let Some(expr) = expression {
             issue["expression"] = json!([expr]);
@@ -253,5 +252,7 @@ mod outcome_tests {
             coded.to_operation_outcome()["issue"][0]["expression"],
             json!(["codeA"])
         );
+        // The text is in details.text only (no duplicate `diagnostics`).
+        assert!(coded.to_operation_outcome()["issue"][0].get("diagnostics").is_none());
     }
 }
