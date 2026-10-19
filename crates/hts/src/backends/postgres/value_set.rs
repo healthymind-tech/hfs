@@ -2785,10 +2785,11 @@ async fn pg_expand_vs_reference(
                 full_chain.join(", ")
             )));
         }
-        warnings.push(format!(
-            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
-        ));
-        return Ok(vec![]);
+        // A value set that includes itself, directly or through others, has
+        // no defined expansion (IG `simple/simple-expand-contained-circular`).
+        return Err(HtsError::VsInvalid(format!(
+            "Cyclic reference detected when including {ref_url}: the value set includes itself"
+        )));
     }
     let mut child = ctx.clone();
     child.visited.insert(ref_url.to_owned());

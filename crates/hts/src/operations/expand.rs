@@ -4679,7 +4679,7 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
     let HtsError::VsInvalid(msg) = err else {
         return None;
     };
-    if !msg.starts_with("Cyclic reference detected when excluding ") {
+    if !msg.starts_with("Cyclic reference detected when ") {
         return None;
     }
     let body = json!({

@@ -602,3 +602,39 @@ async fn lookup_abstract_property_filter_and_language_warning() {
     assert!(param(&body, "abstract").is_none(), "{body}");
     assert!(param(&body, "warning").is_none(), "{body}");
 }
+
+/// simple/simple-expand-contained-circular: a value set that includes
+/// itself through contained value sets has no expansion — 4xx
+/// VALUESET_CIRCULAR_REFERENCE, not an expansion with a warning.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn circular_include_is_an_error() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&simple_bundle()).await;
+    let (st, oo) = app
+        .post_fhir(
+            "/ValueSet/$expand",
+            json!({"resourceType": "Parameters", "parameter": [{"name": "valueSet", "resource": {
+            "resourceType": "ValueSet", "url": "http://hts.test/vs/circular", "status": "active",
+            "compose": {"include": [{"valueSet": ["#vs1"]}]},
+            "contained": [
+                {"resourceType": "ValueSet", "id": "vs1", "status": "active",
+                 "compose": {"include": [{"valueSet": ["#vs2"]}]}},
+                {"resourceType": "ValueSet", "id": "vs2", "status": "active",
+                 "compose": {"include": [
+                    {"system": "http://hts.test/simple", "concept": [{"code": "code1"}]},
+                    {"valueSet": ["#vs1"]}]}}
+            ]}}]})
+            .to_string(),
+        )
+        .await;
+    assert!(st.is_client_error(), "{st} {oo}");
+    assert_eq!(oo["issue"][0]["code"], "processing");
+    assert_eq!(oo["issue"][0]["details"]["coding"][0]["code"], "vs-invalid");
+    assert!(
+        oo["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("vs1")
+    );
+}

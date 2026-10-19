@@ -3337,10 +3337,11 @@ fn expand_vs_reference(
                 "Cyclic reference detected when excluding {origin} via [{chain_str}]"
             )));
         }
-        warnings.push(format!(
-            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
-        ));
-        return Ok(vec![]);
+        // A value set that includes itself, directly or through others, has
+        // no defined expansion (IG `simple/simple-expand-contained-circular`).
+        return Err(HtsError::VsInvalid(format!(
+            "Cyclic reference detected when including {ref_url}: the value set includes itself"
+        )));
     }
 
     let mut child_ctx = ctx.clone();
@@ -13072,8 +13073,7 @@ mod tests {
     }
 
     /// Cycle in `compose.include[].valueSet[]` resolution must not loop —
-    /// the visited-set guard breaks recursion. The non-cyclic include in
-    /// the same compose still resolves.
+    /// the visited-set guard breaks recursion and the expansion fails.
     #[tokio::test]
     async fn cyclic_value_set_reference_is_rejected_without_loop() {
         let b = backend();
@@ -13111,9 +13111,9 @@ mod tests {
             ]
         });
 
-        // Returns Ok rather than hanging. The non-cyclic include still
-        // resolves so the response is non-empty.
-        let resp = b
+        // Fails (vs-invalid) rather than hanging: a value set that includes
+        // itself has no defined expansion.
+        let err = b
             .expand(
                 &ctx(),
                 ExpandRequest {
@@ -13122,14 +13122,10 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-
-        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
-        assert!(codes.contains(&"code1"));
+            .unwrap_err();
         assert!(
-            resp.warnings.iter().any(|w| w.contains("Cyclic")),
-            "expected a vs-invalid cycle warning, got {:?}",
-            resp.warnings
+            matches!(&err, HtsError::VsInvalid(m) if m.starts_with("Cyclic reference detected when including #a")),
+            "{err:?}"
         );
     }
 
