@@ -785,10 +785,10 @@ async fn execute_terminology(
 
 /// Whether a code the terminology service does not find in its code system
 /// is wrong for every reader. SNOMED CT is the exception: a service holds
-/// one or a few editions, and a concept from a national extension (an SCTID
-/// in an extension namespace, or a post-coordinated expression) is simply
-/// not in them. A malformed SCTID (bad Verhoeff check digit) or a
-/// core-namespace id the edition lacks is still reported.
+/// one or a few editions (and may omit inactive concepts), so a well-formed
+/// concept id it does not know may well exist in another edition or
+/// release — only malformed ids (not digits, bad length, bad Verhoeff check
+/// digit) are reported. Post-coordinated expressions are not judged.
 fn reportable_unknown_code(coding: &Value) -> bool {
     if coding.get("system").and_then(Value::as_str) != Some("http://snomed.info/sct") {
         return true;
@@ -797,16 +797,9 @@ fn reportable_unknown_code(coding: &Value) -> bool {
         return false;
     };
     if !code.chars().all(|c| c.is_ascii_digit()) {
-        // expressions (`a:b=c`) are not judged; anything else is malformed
         return !code.contains([':', '=', '+', '{', '|']);
     }
-    if !(6..=18).contains(&code.len()) || !verhoeff_valid(code) {
-        return true;
-    }
-    // Partition identifier: the two digits before the check digit; the
-    // first is 0 for the core (short format), 1 for an extension.
-    let partition = &code[code.len() - 3..code.len() - 1];
-    partition.starts_with('0')
+    !(6..=18).contains(&code.len()) || !verhoeff_valid(code)
 }
 
 /// The Verhoeff check SNOMED CT identifiers carry in their last digit.
@@ -924,11 +917,12 @@ mod tests {
         assert!(!super::verhoeff_valid("276885008"));
         let sct =
             |code: &str| serde_json::json!({"system": "http://snomed.info/sct", "code": code});
-        // core namespace, bad check digit, junk: reported
-        assert!(super::reportable_unknown_code(&sct("276885007")));
+        // bad check digit, junk: reported
         assert!(super::reportable_unknown_code(&sct("276885008")));
         assert!(super::reportable_unknown_code(&sct("276885007x")));
-        // extension namespaces and expressions: an edition question
+        // well-formed ids (any namespace) and expressions: an edition or
+        // release question
+        assert!(!super::reportable_unknown_code(&sct("276885007")));
         assert!(!super::reportable_unknown_code(&sct("56248011000036107")));
         assert!(!super::reportable_unknown_code(&sct("731000124108")));
         assert!(!super::reportable_unknown_code(&sct(
