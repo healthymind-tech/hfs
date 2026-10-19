@@ -89,8 +89,8 @@ pub use effects::{
     TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{
-    ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
-    Validator, dotted_to_fhirpath,
+    ErrorKind, Severity, SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy,
+    ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};

@@ -71,6 +71,23 @@ pub struct ValidationOptions {
     /// hundreds of canonical resources — useful to a profile author,
     /// noise to everyone else.
     pub check_extension_context: bool,
+    /// How an extension whose url resolves to no definition is reported.
+    pub unknown_extensions: UnknownExtensionPolicy,
+}
+
+/// Policy for extensions whose url resolves to no StructureDefinition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownExtensionPolicy {
+    /// FHIR lets receivers accept extensions they do not know: only a url
+    /// in HL7's own namespaces (where every extension is published) draws a
+    /// warning, when HL7's extension definitions are loaded (default).
+    #[default]
+    Lenient,
+    /// The HL7 validator's default: any unresolvable extension is an error
+    /// ("could not be found so is not allowed here"), except example urls
+    /// (`example.org`, `acme.com`), `nema.org` (DICOM), HL7 tooling
+    /// extensions and cross-version extensions.
+    Error,
 }
 
 impl Default for ValidationOptions {
@@ -80,6 +97,7 @@ impl Default for ValidationOptions {
             use_meta_profiles: true,
             check_extension_context: false,
             unknown_profile: UnknownProfilePolicy::default(),
+            unknown_extensions: UnknownExtensionPolicy::default(),
         }
     }
 }

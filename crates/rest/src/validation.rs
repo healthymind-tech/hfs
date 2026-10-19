@@ -23,8 +23,8 @@ use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
     CodedValue, CompositeResolver, CompositeTerminologyProvider, EffectHandlers, ErrorKind,
     SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyFailMode,
-    TerminologyProvider, TxCheck, TxVerdict, UnknownProfilePolicy, ValidationError,
-    ValidationOptions, Validator, dotted_to_fhirpath,
+    TerminologyProvider, TxCheck, TxVerdict, UnknownExtensionPolicy, UnknownProfilePolicy,
+    ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -101,6 +101,8 @@ pub struct ValidationService {
     check_extensible: bool,
     /// HL7 best-practice warnings (`HFS_VALIDATION_BEST_PRACTICE`).
     best_practice: bool,
+    /// Unresolvable extension urls (`HFS_VALIDATION_UNKNOWN_EXTENSIONS`).
+    unknown_extensions: UnknownExtensionPolicy,
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
@@ -135,6 +137,7 @@ impl Default for ValidationService {
             display_issues: Severity::Warning,
             check_extensible: true,
             best_practice: true,
+            unknown_extensions: UnknownExtensionPolicy::Lenient,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
@@ -215,6 +218,10 @@ impl ValidationService {
             },
             check_extensible: config.extensible_bindings != "off",
             best_practice: config.best_practice != "off",
+            unknown_extensions: match config.unknown_extensions.as_str() {
+                "error" => UnknownExtensionPolicy::Error,
+                _ => UnknownExtensionPolicy::Lenient,
+            },
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
@@ -317,6 +324,7 @@ impl ValidationService {
             // An extension outside its declared context is an error, as
             // the HL7 validator reports it (warning on canonical resources).
             check_extension_context: true,
+            unknown_extensions: self.unknown_extensions,
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -779,7 +787,10 @@ impl ValidationService {
             }
         }
         if report.removed > 0 {
-            debug!(removed = report.removed, "dropped cached profiles no longer in storage");
+            debug!(
+                removed = report.removed,
+                "dropped cached profiles no longer in storage"
+            );
         }
     }
 
@@ -1061,7 +1072,11 @@ fn prepare_stored_profiles(
     shadow_core: bool,
     tenant: &str,
     items: Vec<(FhirVersion, Value)>,
-) -> Vec<(FhirVersion, Value, Option<helios_fhir_validator::FhirSchema>)> {
+) -> Vec<(
+    FhirVersion,
+    Value,
+    Option<helios_fhir_validator::FhirSchema>,
+)> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1374,10 +1389,22 @@ impl RemoteTerminologyProvider {
             TxCheck::InValueSet(value_set, coded) => format!("{value_set}|{coded:?}"),
             TxCheck::Coding(coding) => format!(
                 "cs|{}|{}|{}|{}",
-                coding.get("system").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("version").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("code").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("display").and_then(Value::as_str).unwrap_or_default(),
+                coding
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("display")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -1410,7 +1437,11 @@ impl RemoteTerminologyProvider {
     }
 
     /// A still-fresh cached verdict (or remembered unknown value set).
-    fn cached(&self, check: &TxCheck<'_>, key: &str) -> Option<Result<TxVerdict, TerminologyError>> {
+    fn cached(
+        &self,
+        check: &TxCheck<'_>,
+        key: &str,
+    ) -> Option<Result<TxVerdict, TerminologyError>> {
         if let Some(entry) = self.cache.get(key) {
             let (verdict, at) = &*entry;
             if at.elapsed() < CACHE_TTL {
@@ -1500,7 +1531,8 @@ impl RemoteTerminologyProvider {
                     .map(str::to_string);
                 let unknown_system = Self::caused_by_unknown_system(body).is_some()
                     || issues.iter().any(|i| {
-                        i.pointer("/extension/0/valueString").and_then(Value::as_str)
+                        i.pointer("/extension/0/valueString")
+                            .and_then(Value::as_str)
                             == Some("UNKNOWN_CODESYSTEM")
                     });
                 Ok(TxVerdict {
@@ -1719,9 +1751,7 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             };
             let verdicts = match verdicts {
                 Some(v) => v,
-                None => {
-                    futures::future::join_all(requests.iter().map(|c| self.check_one(c))).await
-                }
+                None => futures::future::join_all(requests.iter().map(|c| self.check_one(c))).await,
             };
             for ((_, positions), verdict) in pending.iter().zip(verdicts) {
                 for &i in positions {
@@ -1913,7 +1943,9 @@ mod remote_provider_tests {
     /// NGS specimen types (`LP7057-5` "Bld") must not fail their binding.
     #[test]
     fn a_wrong_display_never_makes_a_code_invalid() {
-        let coded = CodedValue::Coding(json!({"system": "http://loinc.org", "code": "LP7057-5", "display": "Bld"}));
+        let coded = CodedValue::Coding(
+            json!({"system": "http://loinc.org", "code": "LP7057-5", "display": "Bld"}),
+        );
         let vs = TxCheck::InValueSet("http://example.org/vs", &coded);
         let display = issue("error", "invalid-display", "Wrong Display Name 'Bld'", None);
         let verdict = RemoteTerminologyProvider::read_verdict(
@@ -1945,7 +1977,16 @@ mod remote_provider_tests {
         let text = "Wrong Display Name 'MCV' for http://loinc.org#787-2. Valid display is 'MCV [Entitic mean volume] in Red Blood Cells by Automated count'";
         let verdict = RemoteTerminologyProvider::read_verdict(
             &check,
-            &answer(false, vec![issue("error", "invalid-display", text, Some("Display_Name_for__should_be_one_of__instead_of"))], vec![]),
+            &answer(
+                false,
+                vec![issue(
+                    "error",
+                    "invalid-display",
+                    text,
+                    Some("Display_Name_for__should_be_one_of__instead_of"),
+                )],
+                vec![],
+            ),
         )
         .unwrap();
         assert!(verdict.valid);
@@ -1966,7 +2007,11 @@ mod remote_provider_tests {
 
         let verdict = RemoteTerminologyProvider::read_verdict(
             &check,
-            &answer(false, vec![], vec![json!({"name": "x-unknown-system", "valueCanonical": "http://x"})]),
+            &answer(
+                false,
+                vec![],
+                vec![json!({"name": "x-unknown-system", "valueCanonical": "http://x"})],
+            ),
         )
         .unwrap();
         assert!(verdict.unknown_system);

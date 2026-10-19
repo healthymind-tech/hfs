@@ -37,7 +37,7 @@
 use super::bundle::{Entry, Resolution};
 use super::errors::{self, ErrorKind, Severity, ValidationError};
 use super::path::PathTracker;
-use super::{SyncOutcome, UnknownProfilePolicy, ValidationOptions};
+use super::{SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy, ValidationOptions};
 use crate::effects::Deferred;
 use crate::resolver::SchemaResolver;
 use crate::schema::FhirSchema;
@@ -94,6 +94,7 @@ pub(super) struct WalkCtx<'a> {
     use_meta_profiles: bool,
     /// What an unresolvable `meta.profile` claim reports.
     unknown_profile: UnknownProfilePolicy,
+    unknown_extensions: UnknownExtensionPolicy,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -212,6 +213,7 @@ impl<'a> WalkCtx<'a> {
             use_meta_profiles: false,
             unknown_profile: UnknownProfilePolicy::Ignore,
             check_extension_context: false,
+            unknown_extensions: self.unknown_extensions,
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
@@ -226,6 +228,7 @@ impl<'a> WalkCtx<'a> {
             check_extension_context: false,
             use_meta_profiles: false,
             unknown_profile: UnknownProfilePolicy::Ignore,
+            unknown_extensions: self.unknown_extensions,
             emitted: HashSet::new(),
             deferred_bindings: HashSet::new(),
             contained: Vec::new(),
@@ -318,6 +321,7 @@ pub(super) fn validate(
         check_extension_context: opts.check_extension_context,
         use_meta_profiles: opts.use_meta_profiles,
         unknown_profile: opts.unknown_profile,
+        unknown_extensions: opts.unknown_extensions,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
@@ -1008,6 +1012,13 @@ fn validate_extension_item<'a>(
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
+            } else if ctx.unknown_extensions == UnknownExtensionPolicy::Error {
+                if !may_be_unknown(url) {
+                    ctx.error(
+                        ErrorKind::UnknownExtension,
+                        errors::msg_unknown_extension(url),
+                    );
+                }
             } else if is_hl7_namespace(url)
                 && !is_cross_version_extension(url)
                 && knows_hl7_extensions(ctx.resolver)
@@ -1030,6 +1041,17 @@ fn validate_extension_item<'a>(
 
 /// Extension urls in HL7's own namespaces, which HL7 publishes definitions
 /// for.
+/// Extension urls the HL7 validator accepts without a definition
+/// (`isKnownExtension`): example domains, DICOM (`nema.org`), HL7 tooling
+/// extensions, and cross-version extensions.
+fn may_be_unknown(url: &str) -> bool {
+    url.contains("example.org")
+        || url.contains("acme.com")
+        || url.contains("nema.org")
+        || url.starts_with("http://hl7.org/fhir/tools/StructureDefinition/")
+        || is_cross_version_extension(url)
+}
+
 /// A cross-version extension (`http://hl7.org/fhir/5.0/StructureDefinition/
 /// extension-Questionnaire.item.answerConstraint`): HL7 defines one for every
 /// element of every FHIR version, implicitly — the HL7 validator generates

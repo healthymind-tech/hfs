@@ -317,3 +317,45 @@ async fn profile_children_of_a_primitive_apply_to_its_sidecar() {
     let issues = validate_with(&obs(with_id), &[sd], &[url]).await;
     assert_eq!(errors(&issues).len(), 1, "{issues:#?}");
 }
+
+/// `pat-dob-ext`, `uuid-extension`, `obs-vs-1`: with the HL7 validator's
+/// policy an extension nobody defines is an error — except example urls,
+/// HL7 tooling and cross-version extensions; the lenient default keeps
+/// non-HL7 unknown extensions silent.
+#[tokio::test]
+async fn unknown_extension_policy() {
+    use helios_fhir_validator::UnknownExtensionPolicy;
+    let patient = |url: &str| {
+        json!({"resourceType": "Patient",
+               "_birthDate": {"extension": [{"url": url, "valueString": "x"}]},
+               "birthDate": "2000-01-01",
+               "extension": [{"url": url, "valueString": "x"}]})
+    };
+    let run = |policy: UnknownExtensionPolicy, url: &'static str| async move {
+        let validator = Validator::new(core_registry(FhirVersion::R4));
+        let opts = ValidationOptions {
+            unknown_extensions: policy,
+            ..Default::default()
+        };
+        let outcome = validator.validate_sync(&patient(url), &opts);
+        outcome
+            .errors
+            .into_iter()
+            .filter(|e| e.severity == Severity::Error)
+            .count()
+    };
+    let local = "http://validitron.unimelb.edu.au/fhir/StructureDefinition/age";
+    assert_eq!(run(UnknownExtensionPolicy::Error, local).await, 2);
+    assert_eq!(run(UnknownExtensionPolicy::Lenient, local).await, 0);
+    for allowed in [
+        "http://example.org/fhir/StructureDefinition/x",
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-Patient.birthDate",
+        "http://hl7.org/fhir/tools/StructureDefinition/x",
+    ] {
+        assert_eq!(
+            run(UnknownExtensionPolicy::Error, allowed).await,
+            0,
+            "{allowed}"
+        );
+    }
+}
