@@ -242,6 +242,16 @@ impl CoreTerminology {
         let (system, code) = coding_parts(coding);
         let codes = displays.get(system?)?;
         let mut verdict = TxVerdict::valid();
+        if let Some(code) = code
+            && !codes.contains_key(code)
+        {
+            // The pack holds every code of these (complete) code systems.
+            verdict.unknown_code = Some(format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                system.unwrap_or_default()
+            ));
+            return Some(verdict);
+        }
         let (Some(code), Some(display)) = (code, coding.get("display").and_then(Value::as_str))
         else {
             return Some(verdict);

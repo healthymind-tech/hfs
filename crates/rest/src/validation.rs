@@ -1535,10 +1535,22 @@ impl RemoteTerminologyProvider {
                             .and_then(Value::as_str)
                             == Some("UNKNOWN_CODESYSTEM")
                     });
+                // A known system that does not define the code.
+                let unknown_code = (!result && !unknown_system)
+                    .then(|| {
+                        issues.iter().find(|i| {
+                            i.get("severity").and_then(Value::as_str) == Some("error")
+                                && Self::tx_issue_type(i) == Some("invalid-code")
+                        })
+                    })
+                    .flatten()
+                    .and_then(|i| i.pointer("/details/text").and_then(Value::as_str))
+                    .map(str::to_string);
                 Ok(TxVerdict {
                     valid: true,
                     wrong_display,
                     unknown_system,
+                    unknown_code,
                 })
             }
         }

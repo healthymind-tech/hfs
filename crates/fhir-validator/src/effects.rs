@@ -170,6 +170,9 @@ pub struct TxVerdict {
     pub wrong_display: Option<String>,
     /// [`TxCheck::Coding`]: the service knows no code system with this URL.
     pub unknown_system: bool,
+    /// [`TxCheck::Coding`]: the code system is known and does not define the
+    /// code; the message says so (HL7 validator wording).
+    pub unknown_code: Option<String>,
 }
 
 impl TxVerdict {
@@ -184,6 +187,7 @@ impl TxVerdict {
             valid,
             wrong_display: None,
             unknown_system: false,
+            unknown_code: None,
         }
     }
 }
@@ -601,14 +605,14 @@ async fn execute_terminology(
             ));
             continue;
         }
-        // Only what can produce an issue is asked: a display to judge, or
-        // an HL7-namespace system that must resolve.
+        // Only what can produce an issue is asked: a display to judge, an
+        // HL7-namespace system that must resolve, or a code its code system
+        // must define.
         let has_display = coding.get("display").is_some_and(Value::is_string);
-        let hl7 = coding
-            .get("system")
-            .and_then(Value::as_str)
-            .is_some_and(crate::terminology::is_hl7_namespace);
-        if !has_display && !hl7 {
+        let system = coding.get("system").and_then(Value::as_str);
+        let hl7 = system.is_some_and(crate::terminology::is_hl7_namespace);
+        let has_code = system.is_some() && coding.get("code").is_some_and(Value::is_string);
+        if !has_display && !hl7 && !has_code {
             continue;
         }
         asked.push(Asked::Coding { path, coding });
@@ -723,6 +727,16 @@ async fn execute_terminology(
                         .with_severity(handlers.display_issues),
                     );
                 }
+                if let Some(message) = &verdict.unknown_code
+                    && !unknown_version.contains(&index)
+                    && reportable_unknown_code(coding)
+                {
+                    errors.push(ValidationError::new(
+                        ErrorKind::TerminologyBinding,
+                        format!("{path}.code"),
+                        message.clone(),
+                    ));
+                }
                 if unknown_version.contains(&index)
                     && let Some(system) = coding.get("system").and_then(Value::as_str)
                 {
@@ -754,6 +768,63 @@ async fn execute_terminology(
             }
         }
     }
+}
+
+/// Whether a code the terminology service does not find in its code system
+/// is wrong for every reader. SNOMED CT is the exception: a service holds
+/// one or a few editions, and a concept from a national extension (an SCTID
+/// in an extension namespace, or a post-coordinated expression) is simply
+/// not in them. A malformed SCTID (bad Verhoeff check digit) or a
+/// core-namespace id the edition lacks is still reported.
+fn reportable_unknown_code(coding: &Value) -> bool {
+    if coding.get("system").and_then(Value::as_str) != Some("http://snomed.info/sct") {
+        return true;
+    }
+    let Some(code) = coding.get("code").and_then(Value::as_str) else {
+        return false;
+    };
+    if !code.chars().all(|c| c.is_ascii_digit()) {
+        // expressions (`a:b=c`) are not judged; anything else is malformed
+        return !code.contains([':', '=', '+', '{', '|']);
+    }
+    if !(6..=18).contains(&code.len()) || !verhoeff_valid(code) {
+        return true;
+    }
+    // Partition identifier: the two digits before the check digit; the
+    // first is 0 for the core (short format), 1 for an extension.
+    let partition = &code[code.len() - 3..code.len() - 1];
+    partition.starts_with('0')
+}
+
+/// The Verhoeff check SNOMED CT identifiers carry in their last digit.
+fn verhoeff_valid(digits: &str) -> bool {
+    const D: [[u8; 10]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    ];
+    const P: [[u8; 10]; 8] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+    ];
+    let mut c = 0u8;
+    for (i, ch) in digits.bytes().rev().enumerate() {
+        c = D[c as usize][P[i % 8][(ch - b'0') as usize] as usize];
+    }
+    c == 0
 }
 
 /// Whether an `extensible` binding to `vs` is superseded by another
@@ -825,6 +896,37 @@ pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<Code
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn snomed_unknown_codes_worth_reporting() {
+        for valid in [
+            "276885007",
+            "38266002",
+            "22298006",
+            "731000124108",
+            "56248011000036107",
+        ] {
+            assert!(super::verhoeff_valid(valid), "{valid}");
+        }
+        assert!(!super::verhoeff_valid("276885008"));
+        let sct =
+            |code: &str| serde_json::json!({"system": "http://snomed.info/sct", "code": code});
+        // core namespace, bad check digit, junk: reported
+        assert!(super::reportable_unknown_code(&sct("276885007")));
+        assert!(super::reportable_unknown_code(&sct("276885008")));
+        assert!(super::reportable_unknown_code(&sct("276885007x")));
+        // extension namespaces and expressions: an edition question
+        assert!(!super::reportable_unknown_code(&sct("56248011000036107")));
+        assert!(!super::reportable_unknown_code(&sct("731000124108")));
+        assert!(!super::reportable_unknown_code(&sct(
+            "249943000:363698007=72098002"
+        )));
+        // other systems: always
+        assert!(super::reportable_unknown_code(
+            &serde_json::json!({"system": "http://loinc.org", "code": "99999-9"})
+        ));
+    }
+
     use super::*;
 
     #[test]

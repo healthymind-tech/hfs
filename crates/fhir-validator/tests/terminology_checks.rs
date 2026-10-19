@@ -132,6 +132,7 @@ impl TerminologyProvider for Scripted {
                                 .then(|| "Wrong Display Name 'x'".to_string()),
                             unknown_system: self.unknown_systems.contains(&system)
                                 || self.unknown_systems.contains(&versioned.as_str()),
+                            unknown_code: None,
                         }
                     }
                 })
@@ -159,8 +160,9 @@ async fn wrong_display_is_not_a_binding_failure() {
 }
 
 /// Bindings and codings of one resource — a whole Bundle — cost one
-/// provider call; codings without a display outside the HL7 namespaces are
-/// not asked about.
+/// provider call; every coding with a system and code is asked about (its
+/// code system must define the code, HL7 validator test case
+/// contract-binding-test).
 #[tokio::test]
 async fn one_terminology_call_per_resource() {
     let tx = Scripted::new();
@@ -197,8 +199,8 @@ async fn one_terminology_call_per_resource() {
     );
     assert_eq!(
         asked.iter().filter(|a| *a == "cs http://loinc.org").count(),
-        1,
-        "the display-less LOINC coding is not asked: {asked:?}"
+        2,
+        "the display-less LOINC coding is asked too: {asked:?}"
     );
     assert!(
         asked
@@ -396,4 +398,35 @@ async fn unknown_version_of_a_known_code_system_warns() {
     let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
     assert_eq!(unknown.len(), 1, "{issues:#?}");
     assert_eq!(unknown[0].severity, Severity::Error);
+}
+
+/// `contract-binding-test` (HL7 validator test cases): a code its (complete,
+/// embedded) code system does not define is an error, bound or not.
+#[tokio::test]
+async fn unknown_codes_in_known_code_systems_are_errors() {
+    let tx = core_terminology(FhirVersion::R4);
+    let handlers = EffectHandlers {
+        terminology: Some(tx.as_ref()),
+        ..Default::default()
+    };
+    let contract = json!({"resourceType": "Contract",
+        "legalState": {"coding": [{"system": "http://hl7.org/fhir/contract-legalstate",
+                                   "code": "invalid-code-test"}]}});
+    let issues = run(&contract, &handlers).await;
+    let unknown: Vec<_> = issues
+        .iter()
+        .filter(|e| e.message.starts_with("Unknown code 'invalid-code-test'"))
+        .collect();
+    assert_eq!(unknown.len(), 1, "{issues:#?}");
+    assert_eq!(unknown[0].severity, Severity::Error);
+    assert_eq!(unknown[0].path, "Contract.legalState.coding.0.code");
+
+    let good = json!({"resourceType": "Contract",
+        "legalState": {"coding": [{"system": "http://hl7.org/fhir/contract-legalstate",
+                                   "code": "amended"}]}});
+    let issues = run(&good, &handlers).await;
+    assert!(
+        !issues.iter().any(|e| e.message.starts_with("Unknown code")),
+        "{issues:#?}"
+    );
 }

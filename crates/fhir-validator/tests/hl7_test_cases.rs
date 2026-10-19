@@ -47,6 +47,28 @@ async fn validate_with(resource: &Value, sds: &[Value], profiles: &[&str]) -> Ve
         .await
 }
 
+/// Core pack, FHIRPath constraints and the embedded core terminology.
+async fn validate_with_tx(resource: &Value) -> Vec<ValidationError> {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let tx = helios_fhir_validator::core_terminology(FhirVersion::R4);
+    let suppress = vec!["dom-6".to_string()];
+    let handlers = EffectHandlers {
+        constraints: Some(&evaluator),
+        terminology: Some(tx.as_ref()),
+        suppress_constraints: &suppress,
+        ..Default::default()
+    };
+    validator
+        .validate(
+            resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
+        .await
+}
+
 fn errors(issues: &[ValidationError]) -> Vec<&ValidationError> {
     issues
         .iter()
@@ -232,7 +254,8 @@ async fn required_bound_code_without_value_is_an_error() {
     assert_eq!(errs[0].path, "DocumentReference.status");
 }
 
-/// Diagnostic, not a check: invariant failures per constraint id over the R4
+/// Diagnostic, not a check: invariant failures per constraint id (and
+/// unknown codes in the embedded core code systems) over the R4
 /// spec examples (`crates/fhir/tests/data/json/R4`), to measure how a change
 /// to constraint evaluation moves false positives. Run with
 /// `cargo test -p helios-fhir-validator --features fhirpath --test hl7_test_cases
@@ -257,16 +280,20 @@ async fn constraint_sweep_r4_spec_examples() {
             continue;
         }
         files += 1;
-        for e in validate_with(&resource, &[], &[]).await {
-            if let Some(id) = e.extra.get("constraint").and_then(Value::as_str)
-                && e.severity == Severity::Error
-            {
-                counts.entry(id.to_string()).or_default().push(format!(
-                    "{} {}",
-                    entry.file_name().to_string_lossy(),
-                    e.path
-                ));
+        for e in validate_with_tx(&resource).await {
+            if e.severity != Severity::Error {
+                continue;
             }
+            let key = match e.extra.get("constraint").and_then(Value::as_str) {
+                Some(id) => id.to_string(),
+                None if e.message.starts_with("Unknown code") => "unknown-code".to_string(),
+                None => continue,
+            };
+            counts.entry(key).or_default().push(format!(
+                "{} {}",
+                entry.file_name().to_string_lossy(),
+                e.path
+            ));
         }
     }
     eprintln!("{files} resources");
