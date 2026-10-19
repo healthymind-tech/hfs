@@ -1191,3 +1191,28 @@ async fn ucum_grammar_operations() {
         "{body}"
     );
 }
+
+/// A code system whose content is not present cannot rule a code out: as
+/// tx.fhir.org, an unknown code is a warning (it may exist), not an error.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_code_in_a_not_present_code_system_is_a_warning() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(
+        &json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "url": "http://hts.test/np", "version": "1",
+              "status": "active", "content": "not-present"}}]})
+        .to_string(),
+    )
+    .await;
+    let (st, body) = app
+        .get_fhir("/CodeSystem/$validate-code?url=http://hts.test/np&code=anything")
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(issues(&body)[0]["severity"], "warning");
+}

@@ -310,7 +310,9 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 let cs_version_str = resolved_cs_version.clone();
                 let cs_content: Option<String> =
                     cs_content_for_system_id(&client, &system_id).await;
-                if cs_content.as_deref() == Some("fragment") {
+                // A fragment — or, as tx.fhir.org treats it, a code system whose
+                // content is not present — may hold the code elsewhere.
+                if matches!(cs_content.as_deref(), Some("fragment" | "not-present")) {
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
                             "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",

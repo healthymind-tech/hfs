@@ -486,7 +486,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // fixtures expect ONE warning issue, result=true, and the
                     // `UNKNOWN_CODE_IN_FRAGMENT` message-id with the
                     // "...labeled as a fragment..." text.
-                    if cs_content.as_deref() == Some("fragment") {
+                    // A code system whose content is not present is treated
+                    // the same way (as tx.fhir.org does).
+                    if matches!(cs_content.as_deref(), Some("fragment" | "not-present")) {
                         let text = match cs_version_str.as_deref() {
                             Some(v) => format!(
                                 "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",

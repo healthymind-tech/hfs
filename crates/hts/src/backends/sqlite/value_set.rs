@@ -8016,7 +8016,7 @@ fn finish_validate_code_response(
             // pair), result=true, and the `UNKNOWN_CODE_IN_FRAGMENT` message-id —
             // the missing code might still be valid in a different fragment of
             // the same system.
-            if cs_content == Some("fragment") && code_unknown_in_cs {
+            if matches!(cs_content, Some("fragment" | "not-present")) && code_unknown_in_cs {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(
