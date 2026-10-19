@@ -91,10 +91,14 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
     // `targetCode`, `targetSystem`. Accept either form.
     let mut source_code =
         find_str_param(&params, "sourceCode").or_else(|| find_str_param(&params, "code"));
-    let mut target_code = find_str_param(&params, "targetCode");
+    // R4 has no target-code input; `targetcode` is accepted as a spelling of
+    // the R5 `targetCode` (IG `translate/translate-reverse-r4-b`).
+    let mut target_code =
+        find_str_param(&params, "targetCode").or_else(|| find_str_param(&params, "targetcode"));
     let mut source_system =
         find_str_param(&params, "sourceSystem").or_else(|| find_str_param(&params, "system"));
-    let mut target_system = find_str_param(&params, "targetSystem");
+    let mut target_system =
+        find_str_param(&params, "targetSystem").or_else(|| find_str_param(&params, "targetsystem"));
 
     // The scalar pair wins when present; Coding/CodeableConcept only fill the gaps, so a
     // request mixing the spellings keeps the explicit `code`/`system` the caller named.
@@ -152,13 +156,23 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
     };
 
     let ctx = TenantContext::system();
+    let tx_maps: Vec<Value> = super::params::collect_resource_params(&params, "tx-resource")
+        .into_iter()
+        .filter(|r| r.get("resourceType").and_then(|t| t.as_str()) == Some("ConceptMap"))
+        .collect();
+    // A map named by `url` that came with the request is not looked up.
+    let url_from_request = req
+        .url
+        .as_deref()
+        .is_some_and(|u| tx_maps.iter().any(|m| str_field(m, &["url"]) == Some(u)));
 
     // `conceptMapVersion` (explicit or promoted from `url=X|V`): a version
     // that is not stored is a 404 rather than a silent answer from a
     // different version; a stored one is the map the backend translates with.
-    if let (Some(url), Some(want)) = (
+    if let (Some(url), Some(want), false) = (
         req.url.as_deref(),
         find_str_param(&params, "conceptMapVersion"),
+        url_from_request,
     ) {
         let hits = ConceptMapOperations::search(
             state.backend(),
@@ -178,93 +192,651 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
         }
     }
 
-    let resp = ConceptMapOperations::translate(state.backend(), &ctx, req).await?;
+    // The lookup side: the source concept, or for a reverse translation the
+    // target concept (`reverse=true` names it with `code`/`system`, the R5
+    // form with `targetCode`/`targetSystem`); `other` restricts the far side.
+    let (lookup_system, lookup_code, other_system) = if req.target_code.is_some() {
+        (
+            req.target_system.clone(),
+            req.target_code.clone().unwrap_or_default(),
+            req.system.clone(),
+        )
+    } else {
+        (
+            req.system.clone(),
+            req.code.clone(),
+            req.target_system.clone(),
+        )
+    };
+    let source_vs = req.source.clone();
+    let target_vs = req.target.clone();
+    let url = req.url.clone();
+    let map_version = req.map_version.clone();
+    let resp = if url_from_request {
+        crate::types::TranslateResponse {
+            result: false,
+            message: None,
+            matches: Vec::new(),
+        }
+    } else {
+        ConceptMapOperations::translate(state.backend(), &ctx, req).await?
+    };
 
-    // ── Build FHIR Parameters response ─────────────────────────────────────────
-    //
-    // The `match` parts come *before* `result` in the IG fixtures; emit in the
-    // same order so byte-for-byte comparison passes.
-    let mut parameter: Vec<Value> = Vec::with_capacity(resp.matches.len() + 2);
-
-    for m in resp.matches {
-        let mut parts: Vec<Value> = Vec::with_capacity(5);
-
-        // `concept` Coding always first — fixtures rely on this ordering.
-        // The IG translate fixtures expect bare {system, code} Codings here,
-        // so we only emit `display` when the backend resolved one. (For now
-        // it never does — see comment on `TranslateRow.display`.)
-        let mut concept_coding = serde_json::Map::new();
-        concept_coding.insert("system".into(), json!(m.concept_system));
-        concept_coding.insert("code".into(), json!(m.concept_code));
-        if let Some(disp) = m.concept_display.as_deref() {
-            if !disp.is_empty() {
-                concept_coding.insert("display".into(), json!(disp));
+    // ── Candidate maps ─────────────────────────────────────────────────────
+    // The element index (the backend translate above) finds the maps with a
+    // row for this code; the maps of the lookup system are added so their
+    // noMap / unmapped rules apply to codes they have no row for.
+    let mut candidates: Vec<(String, Option<String>)> = Vec::new();
+    let mut push_candidate = |u: String, v: Option<String>| {
+        if !candidates.iter().any(|(cu, _)| *cu == u) {
+            candidates.push((u, v));
+        }
+    };
+    match url.as_deref() {
+        Some(u) => {
+            let v = map_version.clone().or_else(|| {
+                resp.matches
+                    .iter()
+                    .find(|m| m.source.as_deref() == Some(u))
+                    .and_then(|m| m.map_version.clone())
+            });
+            push_candidate(u.to_string(), v);
+        }
+        None => {
+            for m in &resp.matches {
+                if let Some(u) = m.source.clone() {
+                    push_candidate(u, m.map_version.clone());
+                }
+            }
+            if let Some(sys) = lookup_system.as_deref() {
+                for (u, v) in ConceptMapOperations::concept_maps_for_system(
+                    state.backend(),
+                    &ctx,
+                    sys,
+                    is_reverse,
+                )
+                .await
+                .unwrap_or_default()
+                {
+                    push_candidate(u, v);
+                }
             }
         }
-        parts.push(json!({
-            "name": "concept",
-            "valueCoding": Value::Object(concept_coding),
-        }));
-
-        // R4 uses `equivalence`; R5/R6 renamed it to `relationship`. The
-        // tx-ecosystem fixtures mark each as `$optional$ version:N`, but the
-        // validator's TxTesterSorters alphabetises the part list before
-        // comparison. When we emit BOTH names the actual array has 4 parts
-        // sorted as [concept, equivalence, relationship, source] while the
-        // version-filtered expected has 3 parts sorted as [concept,
-        // relationship, source] (R5 case), and position-1 mismatches with
-        // "Expected:'relationship' Actual:'equivalence'". Emit only the
-        // version-appropriate name so both arrays sort identically.
-        #[cfg(any(feature = "R5", feature = "R6"))]
-        parts.push(json!({"name": "relationship", "valueCode": m.equivalence}));
-        #[cfg(not(any(feature = "R5", feature = "R6")))]
-        parts.push(json!({"name": "equivalence", "valueCode": m.equivalence}));
-
-        // `originMap` — canonical ConceptMap reference, with `|version` if known.
-        // Only emitted on forward translations: the IG `translate/translate-reverse`
-        // fixture omits originMap on reverse responses because the caller already
-        // knows which CM was queried (they invoked it explicitly).
-        if !is_reverse {
-            if let Some(src) = m.source.as_deref() {
-                let canonical = match m.map_version.as_deref() {
-                    Some(v) if !v.is_empty() => format!("{src}|{v}"),
-                    _ => src.to_owned(),
-                };
-                parts.push(json!({"name": "originMap", "valueCanonical": canonical}));
-            }
-        }
-
-        // For reverse responses include the source-side Coding of the
-        // matched ConceptMap element as a `source` part — IG `translate-
-        // reverse` fixture expects this so the caller can read the
-        // resolved source code. Skip in forward mode: the caller already
-        // knows the source code they sent.
-        if is_reverse {
-            if let (Some(sys), Some(code)) = (m.source_system.as_deref(), m.source_code.as_deref())
-            {
-                parts.push(json!({
-                    "name": "source",
-                    "valueCoding": {
-                        "system": sys,
-                        "code": code
-                    }
-                }));
-            }
-        }
-
-        parameter.push(json!({"name": "match", "part": parts}));
     }
+    // Request-supplied maps of the lookup system (or the one named by `url`).
+    for m in &tx_maps {
+        let Some(u) = str_field(m, &["url"]) else {
+            continue;
+        };
+        let wanted = match url.as_deref() {
+            Some(want) => want == u,
+            None => map_has_system(m, lookup_system.as_deref(), is_reverse),
+        };
+        if wanted {
+            push_candidate(
+                u.to_string(),
+                str_field(m, &["version"]).map(str::to_string),
+            );
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
-    parameter.push(json!({"name": "result", "valueBoolean": resp.result}));
+    let query = MapQuery {
+        system: lookup_system.as_deref(),
+        code: &lookup_code,
+        other_system: other_system.as_deref(),
+        reverse: is_reverse,
+        source_vs: source_vs.as_deref(),
+        target_vs: target_vs.as_deref(),
+        tx_maps: &tx_maps,
+    };
+    let mut matches: Vec<MapMatch> = Vec::new();
+    let mut used_maps: Vec<String> = Vec::new();
+    for (u, v) in &candidates {
+        let map = load_concept_map(state, &ctx, &tx_maps, u, v.as_deref()).await;
+        match map.as_ref().filter(|m| m.get("group").is_some()) {
+            Some(map) => {
+                evaluate_map(state, &ctx, map, &query, 0, &mut matches, &mut used_maps).await;
+            }
+            // No stored definition to read the rules from: the element rows.
+            None => {
+                for m in resp
+                    .matches
+                    .iter()
+                    .filter(|m| m.source.as_deref() == Some(u.as_str()))
+                {
+                    matches.push(MapMatch {
+                        concept: Some(coding(
+                            &m.concept_system,
+                            &m.concept_code,
+                            m.concept_display.as_deref(),
+                        )),
+                        relationship: to_relationship(&m.equivalence),
+                        equivalence: r4_equivalence_code(&m.equivalence).map(str::to_string),
+                        no_map: false,
+                        origin: canonical(u, m.map_version.as_deref().or(v.as_deref())),
+                        source_concept: coding(
+                            m.source_system
+                                .as_deref()
+                                .or(lookup_system.as_deref())
+                                .unwrap_or_default(),
+                            m.source_code.as_deref().unwrap_or(&lookup_code),
+                            None,
+                        ),
+                        source_comment: None,
+                        target_comment: None,
+                    });
+                }
+            }
+        }
+    }
+    // The same answer reached through two maps is one answer (the first).
+    let mut seen: Vec<(Option<Value>, String, bool)> = Vec::new();
+    matches.retain(|m| {
+        let key = (m.concept.clone(), m.relationship.clone(), m.no_map);
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
 
-    if let Some(msg) = resp.message {
-        parameter.push(json!({"name": "message", "valueString": msg}));
+    // ── Build FHIR Parameters response ─────────────────────────────────────
+    let mut parameter: Vec<Value> = Vec::with_capacity(matches.len() + 2);
+    let result = matches
+        .iter()
+        .any(|m| !m.no_map && m.relationship != "not-related-to");
+    for m in &matches {
+        parameter.push(json!({"name": "match", "part": match_parts(m)}));
+    }
+    parameter.push(json!({"name": "result", "valueBoolean": result}));
+    if matches.is_empty() {
+        let sys = lookup_system.as_deref().unwrap_or("(no system)");
+        let to = other_system
+            .as_deref()
+            .map(|t| format!(" to {t}"))
+            .unwrap_or_default();
+        parameter.push(json!({
+            "name": "message",
+            "valueString": format!("No mapping found for the code '{lookup_code}' in {sys}{to}"),
+        }));
+    }
+    for u in &used_maps {
+        parameter.push(json!({"name": "used-conceptmap", "valueUri": u}));
     }
 
     Ok(json!({
         "resourceType": "Parameters",
         "parameter": parameter
     }))
+}
+
+// ── ConceptMap evaluation ─────────────────────────────────────────────────────
+
+/// What to translate, as seen from the ConceptMap: the concept on the lookup
+/// side (the source side, or the target side of a reverse translation) and
+/// the restrictions on the other side.
+struct MapQuery<'a> {
+    system: Option<&'a str>,
+    code: &'a str,
+    other_system: Option<&'a str>,
+    reverse: bool,
+    /// `source` / `target` value sets the maps must be scoped to.
+    source_vs: Option<&'a str>,
+    target_vs: Option<&'a str>,
+    /// ConceptMaps supplied with the request (`tx-resource`); they win over
+    /// stored maps with the same url.
+    tx_maps: &'a [Value],
+}
+
+/// One `match` of a `$translate` response.
+struct MapMatch {
+    /// The concept translated to (none for `noMap`).
+    concept: Option<Value>,
+    /// R5 `relationship` code.
+    relationship: String,
+    /// R4 `equivalence` code when the map states one (else derived).
+    equivalence: Option<String>,
+    no_map: bool,
+    /// `originMap` canonical.
+    origin: String,
+    source_concept: Value,
+    source_comment: Option<String>,
+    target_comment: Option<String>,
+}
+
+fn canonical(url: &str, version: Option<&str>) -> String {
+    match version.filter(|v| !v.is_empty()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    }
+}
+
+fn coding(system: &str, code: &str, display: Option<&str>) -> Value {
+    let mut c = serde_json::Map::new();
+    c.insert("system".into(), json!(system));
+    c.insert("code".into(), json!(code));
+    if let Some(d) = display.filter(|d| !d.is_empty()) {
+        c.insert("display".into(), json!(d));
+    }
+    Value::Object(c)
+}
+
+/// The R5 `relationship` code for an R5 relationship or R4 equivalence code.
+fn to_relationship(code: &str) -> String {
+    match code {
+        "equal" | "equivalent" => "equivalent",
+        "wider" | "subsumes" => "source-is-narrower-than-target",
+        "narrower" | "specializes" => "source-is-broader-than-target",
+        "relatedto" | "inexact" => "related-to",
+        "disjoint" | "unmatched" => "not-related-to",
+        other => other,
+    }
+    .to_string()
+}
+
+/// `code` when it is an R4 `ConceptMapEquivalence` code.
+fn r4_equivalence_code(code: &str) -> Option<&str> {
+    matches!(
+        code,
+        "relatedto"
+            | "equivalent"
+            | "equal"
+            | "wider"
+            | "subsumes"
+            | "narrower"
+            | "specializes"
+            | "inexact"
+            | "unmatched"
+            | "disjoint"
+    )
+    .then_some(code)
+}
+
+/// The R4 `equivalence` code for an R5 relationship.
+fn relationship_to_equivalence(rel: &str) -> &'static str {
+    match rel {
+        "equivalent" => "equivalent",
+        "source-is-narrower-than-target" => "wider",
+        "source-is-broader-than-target" => "narrower",
+        "not-related-to" => "disjoint",
+        _ => "relatedto",
+    }
+}
+
+fn match_parts(m: &MapMatch) -> Vec<Value> {
+    let mut parts: Vec<Value> = Vec::new();
+    if m.no_map {
+        parts.push(json!({"name": "noMap", "valueBoolean": true}));
+    } else {
+        if let Some(c) = &m.concept {
+            parts.push(json!({"name": "concept", "valueCoding": c}));
+        }
+        #[cfg(any(feature = "R5", feature = "R6"))]
+        parts.push(json!({"name": "relationship", "valueCode": m.relationship}));
+        #[cfg(not(any(feature = "R5", feature = "R6")))]
+        {
+            let eq = m
+                .equivalence
+                .clone()
+                .unwrap_or_else(|| relationship_to_equivalence(&m.relationship).to_string());
+            parts.push(json!({"name": "equivalence", "valueCode": eq}));
+        }
+    }
+    parts.push(json!({"name": "originMap", "valueCanonical": m.origin}));
+    // R4 names the map a mapping comes from `source`.
+    #[cfg(not(any(feature = "R5", feature = "R6")))]
+    parts.push(json!({"name": "source", "valueCanonical": m.origin}));
+    if let Some(c) = &m.source_comment {
+        parts.push(json!({"name": "sourceComment", "valueString": c}));
+    }
+    parts.push(json!({"name": "sourceConcept", "valueCoding": m.source_concept}));
+    if let Some(c) = &m.target_comment {
+        parts.push(json!({"name": "targetComment", "valueString": c}));
+    }
+    parts
+}
+
+/// Whether a ConceptMap has a group mapping from `system` (into it when
+/// `reverse`); any map when `system` is unknown.
+fn map_has_system(map: &Value, system: Option<&str>, reverse: bool) -> bool {
+    let Some(system) = system else {
+        return true;
+    };
+    let side = if reverse { "target" } else { "source" };
+    map.get("group")
+        .and_then(|g| g.as_array())
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|g| str_field(g, &[side]).map(bare) == Some(system))
+        })
+}
+
+/// The ConceptMap `url` (`version`, or the default one): a request-supplied
+/// one, else the stored one.
+async fn load_concept_map<B: TerminologyBackend>(
+    state: &AppState<B>,
+    ctx: &TenantContext,
+    tx_maps: &[Value],
+    url: &str,
+    version: Option<&str>,
+) -> Option<Value> {
+    if let Some(m) = tx_maps.iter().find(|m| {
+        str_field(m, &["url"]) == Some(url)
+            && version.is_none_or(|v| str_field(m, &["version"]) == Some(v))
+    }) {
+        return Some(m.clone());
+    }
+    let mut hits = ConceptMapOperations::search(
+        state.backend(),
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(url.to_string()),
+            version: version.map(str::to_string),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?;
+    hits.pop()
+}
+
+fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .filter(|s| !s.is_empty())
+}
+
+/// `url` of a canonical `url|version`.
+fn bare(canonical: &str) -> &str {
+    canonical.split('|').next().unwrap_or(canonical)
+}
+
+/// The comment on a ConceptMap element (R6 `comment`, or its cross-version
+/// extension in R4/R5).
+fn element_comment(el: &Value) -> Option<String> {
+    if let Some(c) = str_field(el, &["comment"]) {
+        return Some(c.to_string());
+    }
+    el.get("extension")
+        .and_then(|e| e.as_array())?
+        .iter()
+        .find(|e| {
+            e.get("url")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| u.ends_with("extension-ConceptMap.group.element.comment"))
+        })
+        .and_then(|e| e.get("valueString").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Whether the map applies to the lookup concept: a map is limited to its
+/// scope (`sourceScope` — R4 `source` — or, for a reverse translation,
+/// `targetScope`), which also has to be the value set the caller named.
+async fn map_in_scope<B: TerminologyBackend>(
+    state: &AppState<B>,
+    ctx: &TenantContext,
+    map: &Value,
+    q: &MapQuery<'_>,
+) -> bool {
+    let source_scope = str_field(
+        map,
+        &[
+            "sourceScopeUri",
+            "sourceScopeCanonical",
+            "sourceUri",
+            "sourceCanonical",
+        ],
+    );
+    let target_scope = str_field(
+        map,
+        &[
+            "targetScopeUri",
+            "targetScopeCanonical",
+            "targetUri",
+            "targetCanonical",
+        ],
+    );
+    for (wanted, scope) in [(q.source_vs, source_scope), (q.target_vs, target_scope)] {
+        if let (Some(w), Some(s)) = (wanted, scope) {
+            if bare(w) != bare(s) {
+                return false;
+            }
+        }
+    }
+    let scope = if q.reverse {
+        target_scope
+    } else {
+        source_scope
+    };
+    let (Some(scope), Some(system)) = (scope, q.system) else {
+        return true;
+    };
+    let scope = bare(scope);
+    // A scope value set this server does not have cannot be checked.
+    let known = crate::traits::ValueSetOperations::search(
+        state.backend(),
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(scope.to_string()),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|h| !h.is_empty())
+    .unwrap_or(false);
+    if !known {
+        return true;
+    }
+    let req = crate::types::ValidateCodeRequest {
+        url: Some(scope.to_string()),
+        value_set_version: None,
+        system: Some(system.to_string()),
+        code: q.code.to_string(),
+        version: None,
+        display: None,
+        date: None,
+        include_abstract: None,
+        input_form: None,
+        lenient_display_validation: None,
+        default_value_set_versions: std::collections::HashMap::new(),
+    };
+    crate::traits::ValueSetOperations::validate_code(state.backend(), ctx, req)
+        .await
+        .map(|r| r.result)
+        .unwrap_or(true)
+}
+
+/// Translate with one ConceptMap's own definition: its elements, `noMap`
+/// and `group.unmapped` rules (following `other-map` up to a few maps deep,
+/// the matches credited to `map` and the other map reported as used).
+fn evaluate_map<'a, B: TerminologyBackend>(
+    state: &'a AppState<B>,
+    ctx: &'a TenantContext,
+    map: &'a Value,
+    q: &'a MapQuery<'a>,
+    depth: u8,
+    out: &'a mut Vec<MapMatch>,
+    used_maps: &'a mut Vec<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 4 || !map_in_scope(state, ctx, map, q).await {
+            return;
+        }
+        let url = str_field(map, &["url"]).unwrap_or_default();
+        let origin = canonical(url, str_field(map, &["version"]));
+        let Some(groups) = map.get("group").and_then(|g| g.as_array()) else {
+            return;
+        };
+        for group in groups {
+            let g_source = str_field(group, &["source"]).map(bare);
+            let g_target = str_field(group, &["target"]).map(bare);
+            let (lookup_side, other_side) = if q.reverse {
+                (g_target, g_source)
+            } else {
+                (g_source, g_target)
+            };
+            if q.system.is_some_and(|s| lookup_side != Some(s))
+                || q.other_system.is_some_and(|s| other_side != Some(s))
+            {
+                continue;
+            }
+            let g_source = g_source.unwrap_or_default();
+            let g_target = g_target.unwrap_or_default();
+            let elements: Vec<&Value> = group
+                .get("element")
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
+            let mut found = false;
+            for el in &elements {
+                let el_code = str_field(el, &["code"]).unwrap_or_default();
+                let targets: Vec<&Value> = el
+                    .get("target")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().collect())
+                    .unwrap_or_default();
+                if q.reverse {
+                    for t in &targets {
+                        if str_field(t, &["code"]) != Some(q.code) {
+                            continue;
+                        }
+                        found = true;
+                        out.push(target_match(
+                            t,
+                            g_target,
+                            &origin,
+                            coding(g_source, el_code, str_field(el, &["display"])),
+                            None,
+                        ));
+                    }
+                    continue;
+                }
+                if el_code != q.code {
+                    continue;
+                }
+                found = true;
+                let source_concept = coding(g_source, el_code, None);
+                let source_comment = element_comment(el);
+                // R5 `noMap`; R4 states it as a codeless `unmatched` target.
+                let no_map = el.get("noMap").and_then(|v| v.as_bool()) == Some(true)
+                    || (!targets.is_empty()
+                        && targets.iter().all(|t| {
+                            str_field(t, &["code"]).is_none()
+                                && str_field(t, &["equivalence"]) == Some("unmatched")
+                        }));
+                if no_map {
+                    out.push(MapMatch {
+                        concept: None,
+                        relationship: "not-related-to".into(),
+                        equivalence: None,
+                        no_map: true,
+                        origin: origin.clone(),
+                        source_concept,
+                        source_comment,
+                        target_comment: None,
+                    });
+                    continue;
+                }
+                for t in targets.iter().filter(|t| str_field(t, &["code"]).is_some()) {
+                    out.push(target_match(
+                        t,
+                        g_target,
+                        &origin,
+                        source_concept.clone(),
+                        source_comment.clone(),
+                    ));
+                }
+            }
+            if found || q.reverse {
+                continue;
+            }
+            // No element for the code: the group's `unmapped` rule.
+            let Some(unmapped) = group.get("unmapped") else {
+                continue;
+            };
+            let source_concept = coding(g_source, q.code, None);
+            let relationship = str_field(unmapped, &["relationship", "equivalence"])
+                .map(to_relationship)
+                .unwrap_or_else(|| "related-to".into());
+            let fixed = |code: &str, display: Option<&str>| MapMatch {
+                concept: Some(coding(g_target, code, display)),
+                relationship: relationship.clone(),
+                equivalence: str_field(unmapped, &["equivalence"])
+                    .and_then(r4_equivalence_code)
+                    .map(str::to_string),
+                no_map: false,
+                origin: origin.clone(),
+                source_concept: source_concept.clone(),
+                source_comment: None,
+                target_comment: None,
+            };
+            match str_field(unmapped, &["mode"]) {
+                Some("fixed") => {
+                    if let Some(code) = str_field(unmapped, &["code"]) {
+                        out.push(fixed(code, str_field(unmapped, &["display"])));
+                    }
+                }
+                Some("provided") | Some("use-source-code") => out.push(fixed(q.code, None)),
+                Some("other-map") => {
+                    let Some(other) = str_field(unmapped, &["otherMap", "url"]) else {
+                        continue;
+                    };
+                    let (other_url, other_ver) = match other.split_once('|') {
+                        Some((u, v)) => (u, Some(v)),
+                        None => (other, None),
+                    };
+                    let Some(other_map) =
+                        load_concept_map(state, ctx, q.tx_maps, other_url, other_ver).await
+                    else {
+                        continue;
+                    };
+                    let used = canonical(other_url, str_field(&other_map, &["version"]));
+                    if !used_maps.contains(&used) {
+                        used_maps.push(used);
+                    }
+                    let mut via: Vec<MapMatch> = Vec::new();
+                    evaluate_map(state, ctx, &other_map, q, depth + 1, &mut via, used_maps).await;
+                    for mut m in via {
+                        m.origin = origin.clone();
+                        out.push(m);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+/// A match on one `element.target`.
+fn target_match(
+    t: &Value,
+    g_target: &str,
+    origin: &str,
+    source_concept: Value,
+    source_comment: Option<String>,
+) -> MapMatch {
+    let raw = str_field(t, &["relationship", "equivalence"]).unwrap_or("equivalent");
+    MapMatch {
+        concept: Some(coding(
+            g_target,
+            str_field(t, &["code"]).unwrap_or_default(),
+            str_field(t, &["display"]),
+        )),
+        relationship: to_relationship(raw),
+        equivalence: str_field(t, &["equivalence"])
+            .and_then(r4_equivalence_code)
+            .map(str::to_string),
+        no_map: false,
+        origin: origin.to_string(),
+        source_concept,
+        source_comment,
+        target_comment: str_field(t, &["comment"]).map(str::to_string),
+    }
 }
 
 /// POST /ConceptMap/$translate
@@ -571,7 +1143,7 @@ mod tests {
         let concept = parts.iter().find(|p| p["name"] == "concept").unwrap();
         assert_eq!(concept["valueCoding"]["code"], "X");
         assert_eq!(concept["valueCoding"]["system"], "http://example.org/tgt");
-        let source = parts.iter().find(|p| p["name"] == "source").unwrap();
+        let source = parts.iter().find(|p| p["name"] == "sourceConcept").unwrap();
         assert_eq!(source["valueCoding"]["code"], "A");
         assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
@@ -694,7 +1266,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["name"] == "source")
+            .find(|p| p["name"] == "sourceConcept")
             .unwrap();
         assert_eq!(source["valueCoding"]["code"], "A");
     }
@@ -863,7 +1435,7 @@ mod tests {
         assert_eq!(concept["valueCoding"]["code"], "X");
         assert_eq!(concept["valueCoding"]["system"], "http://example.org/tgt");
 
-        let source = parts.iter().find(|p| p["name"] == "source").unwrap();
+        let source = parts.iter().find(|p| p["name"] == "sourceConcept").unwrap();
         assert_eq!(source["valueCoding"]["code"], "A");
         assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
     }
@@ -896,10 +1468,20 @@ mod tests {
         } else {
             "equivalence"
         };
+        let expected: Vec<&str> = if cfg!(any(feature = "R5", feature = "R6")) {
+            vec!["concept", equiv_or_rel, "originMap", "sourceConcept"]
+        } else {
+            vec![
+                "concept",
+                equiv_or_rel,
+                "originMap",
+                "source",
+                "sourceConcept",
+            ]
+        };
         assert_eq!(
-            names,
-            vec!["concept", equiv_or_rel, "source"],
-            "reverse-mode parts must be concept/<equivalence|relationship>/source"
+            names, expected,
+            "reverse-mode parts must be concept/<equivalence|relationship>/originMap/[source]/sourceConcept"
         );
     }
 
@@ -987,9 +1569,13 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
+        // `source` (R4) is the canonical of the map, never a Coding.
         assert!(
-            parts.iter().all(|p| p["name"] != "source"),
-            "forward response must not include `source` Coding part"
+            parts
+                .iter()
+                .filter(|p| p["name"] == "source")
+                .all(|p| p.get("valueCoding").is_none() && p.get("valueCanonical").is_some()),
+            "`source` must be the map canonical"
         );
     }
 

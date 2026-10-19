@@ -28,6 +28,50 @@ use super::SqliteTerminologyBackend;
 
 #[async_trait]
 impl ConceptMapOperations for SqliteTerminologyBackend {
+    async fn concept_maps_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system: &str,
+        reverse: bool,
+    ) -> Result<Vec<(String, Option<String>)>, HtsError> {
+        let pool = self.pool().clone();
+        let system = system.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let col = if reverse {
+                "target_system"
+            } else {
+                "source_system"
+            };
+            // Per map (default version of each URL), an indexed probe on
+            // (map_id, source_system) — no scan of the elements table.
+            let sql = format!(
+                "SELECT cm.url, cm.version FROM concept_maps cm
+                  WHERE cm.id = (SELECT c2.id FROM concept_maps c2 WHERE c2.url = cm.url
+                                  ORDER BY {order} LIMIT 1)
+                    AND EXISTS (SELECT 1 FROM concept_map_elements cme
+                                 WHERE cme.map_id = cm.id AND cme.{col} = ?1)
+                  ORDER BY cm.url",
+                order = crate::backends::cm_precedence_order_by("c2")
+            );
+            let mut stmt = conn
+                .prepare_cached(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map([&system], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(e.to_string()))?
+    }
+
     async fn translate(
         &self,
         _ctx: &TenantContext,

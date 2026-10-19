@@ -753,3 +753,169 @@ async fn used_valueset_from_the_request_keeps_its_version() {
         .collect();
     assert_eq!(used, ["http://hts.test/vs/two|0.10"], "{body}");
 }
+
+fn translate_bundle() -> String {
+    json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "tsrc", "url": "http://hts.test/tsrc",
+          "version": "1", "status": "active", "content": "complete",
+          "concept": [{"code": "s1"}, {"code": "s2"}, {"code": "s3"}, {"code": "s4"}, {"code": "s5"}, {"code": "s6"}]}},
+        {"resource": {"resourceType": "CodeSystem", "id": "ttgt", "url": "http://hts.test/ttgt",
+          "version": "1", "status": "active", "content": "complete",
+          "concept": [{"code": "t1"}, {"code": "t2"}, {"code": "t9", "display": "Nine"}]}},
+        {"resource": {"resourceType": "ValueSet", "id": "tscope", "url": "http://hts.test/vs/tscope",
+          "version": "1", "status": "active",
+          "compose": {"include": [{"system": "http://hts.test/tsrc",
+            "concept": [{"code": "s1"}, {"code": "s2"}, {"code": "s3"}, {"code": "s4"}, {"code": "s5"}]}]}}},
+        {"resource": {"resourceType": "ConceptMap", "id": "tmap", "url": "http://hts.test/cm/main",
+          "version": "0.1", "status": "active", "sourceScopeUri": "http://hts.test/vs/tscope",
+          "group": [{"source": "http://hts.test/tsrc", "target": "http://hts.test/ttgt",
+            "element": [
+              {"code": "s1", "target": [{"code": "t1", "relationship": "equivalent", "comment": "c1"}]},
+              {"code": "s2", "target": [{"code": "t2", "relationship": "not-related-to"}]},
+              {"code": "s3", "noMap": true}
+            ],
+            "unmapped": {"mode": "fixed", "code": "t9", "display": "Nine", "relationship": "related-to"}}]}}
+    ]})
+    .to_string()
+}
+
+async fn translate(app: &TestApp, params: Value) -> Value {
+    let (st, body) = app
+        .post_fhir(
+            "/ConceptMap/$translate",
+            json!({"resourceType": "Parameters", "parameter": params}).to_string(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    body
+}
+
+fn matches(body: &Value) -> Vec<Vec<Value>> {
+    body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "match")
+        .map(|p| p["part"].as_array().unwrap().clone())
+        .collect()
+}
+
+fn part<'a>(parts: &'a [Value], name: &str) -> Option<&'a Value> {
+    parts.iter().find(|p| p["name"] == name)
+}
+
+/// translate/*, translate2/*: $translate follows the ConceptMap definition —
+/// comments, noMap, unmapped, sourceScope, not-related-to, reverse, and
+/// maps supplied with the request.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn translate_follows_the_concept_map_definition() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&translate_bundle()).await;
+    let fwd = |code: &str| {
+        json!([
+            {"name": "system", "valueUri": "http://hts.test/tsrc"},
+            {"name": "code", "valueCode": code},
+            {"name": "targetsystem", "valueUri": "http://hts.test/ttgt"}
+        ])
+    };
+
+    // A mapping, with its target comment and the source concept.
+    let body = translate(&app, fwd("s1")).await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], true);
+    let m = &matches(&body)[0];
+    assert_eq!(part(m, "concept").unwrap()["valueCoding"]["code"], "t1");
+    assert_eq!(
+        part(m, "originMap").unwrap()["valueCanonical"],
+        "http://hts.test/cm/main|0.1"
+    );
+    assert_eq!(
+        part(m, "sourceConcept").unwrap()["valueCoding"]["code"],
+        "s1"
+    );
+    assert_eq!(part(m, "targetComment").unwrap()["valueString"], "c1");
+
+    // not-related-to is an answer, but not a translation.
+    let body = translate(&app, fwd("s2")).await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
+    assert_eq!(matches(&body).len(), 1);
+
+    // noMap.
+    let body = translate(&app, fwd("s3")).await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
+    assert_eq!(
+        part(&matches(&body)[0], "noMap").unwrap()["valueBoolean"],
+        true
+    );
+
+    // No element: the group's unmapped rule.
+    let body = translate(&app, fwd("s4")).await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], true);
+    let m = &matches(&body)[0];
+    assert_eq!(part(m, "concept").unwrap()["valueCoding"]["code"], "t9");
+    assert_eq!(
+        part(m, "concept").unwrap()["valueCoding"]["display"],
+        "Nine"
+    );
+
+    // Outside the map's sourceScope: the map does not apply at all.
+    let body = translate(&app, fwd("s6")).await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
+    assert!(matches(&body).is_empty());
+    let msg = param(&body, "message").unwrap()["valueString"]
+        .as_str()
+        .unwrap();
+    assert!(msg.contains("s6"), "{msg}");
+
+    // Reverse (R4 `reverse=true`): the target concept, back to the source.
+    let body = translate(
+        &app,
+        json!([
+            {"name": "system", "valueUri": "http://hts.test/ttgt"},
+            {"name": "code", "valueCode": "t1"},
+            {"name": "reverse", "valueBoolean": true},
+            {"name": "targetsystem", "valueUri": "http://hts.test/tsrc"}
+        ]),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(
+        part(&matches(&body)[0], "sourceConcept").unwrap()["valueCoding"]["code"],
+        "s1"
+    );
+
+    // A map supplied with the request, following other-map.
+    let body = translate(
+        &app,
+        json!([
+            {"name": "url", "valueUri": "http://hts.test/cm/req"},
+            {"name": "system", "valueUri": "http://hts.test/tsrc"},
+            {"name": "code", "valueCode": "s5"},
+            {"name": "tx-resource", "resource": {"resourceType": "ConceptMap", "url": "http://hts.test/cm/req",
+              "version": "2", "status": "active",
+              "group": [{"source": "http://hts.test/tsrc", "target": "http://hts.test/ttgt",
+                "element": [{"code": "s1", "target": [{"code": "t1", "relationship": "equivalent"}]}],
+                "unmapped": {"mode": "other-map", "otherMap": "http://hts.test/cm/main"}}]}}
+        ]),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    let m = &matches(&body)[0];
+    assert_eq!(part(m, "concept").unwrap()["valueCoding"]["code"], "t9");
+    assert_eq!(
+        part(m, "originMap").unwrap()["valueCanonical"],
+        "http://hts.test/cm/req|2"
+    );
+    assert_eq!(
+        param(&body, "used-conceptmap").unwrap()["valueUri"],
+        "http://hts.test/cm/main|0.1"
+    );
+}
