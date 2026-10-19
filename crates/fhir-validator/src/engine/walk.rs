@@ -935,7 +935,13 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         if let Some(fixed) = &schema.fixed
             && data != fixed
         {
-            ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
+            if fixed.is_object() && data.is_object() && knows_hl7_extensions(ctx.resolver) {
+                // As the HL7 validator reports a fixed complex value: per
+                // child that differs, is missing, or is extra.
+                fixed_value_diffs(ctx, fixed, data);
+            } else {
+                ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
+            }
         }
         if let Some(pattern) = &schema.pattern
             && !is_partial_match(data, pattern)
@@ -1245,6 +1251,71 @@ fn eval_element<'a>(
         let value_set = with_type_profiles(ctx, &elset, &profiles, value);
         validate_node(ctx, &value_set, value);
         ctx.primitive_sidecar = outer;
+    }
+}
+
+/// Differences of a complex value from its fixed value, one issue per
+/// child (HL7 validator wording).
+fn fixed_value_diffs(ctx: &mut WalkCtx<'_>, fixed: &Value, data: &Value) {
+    let (Some(f), Some(d)) = (fixed.as_object(), data.as_object()) else {
+        if fixed != data {
+            ctx.error(
+                ErrorKind::FixedValue,
+                format!(
+                    "Value is '{}' but is fixed to '{}' in the profile",
+                    show(data),
+                    show(fixed)
+                ),
+            );
+        }
+        return;
+    };
+    fn show(v: &Value) -> String {
+        v.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())
+    }
+    for (key, fv) in f {
+        ctx.path.push_key(key);
+        match d.get(key) {
+            None => ctx.error(
+                ErrorKind::FixedValue,
+                format!("Missing element '{key}' - required by fixed value assigned in profile"),
+            ),
+            Some(dv) => match (fv, dv) {
+                (Value::Array(fa), Value::Array(da)) if fa.len() == da.len() => {
+                    for (i, (fi, di)) in fa.iter().zip(da).enumerate() {
+                        ctx.path.push_index(i);
+                        fixed_value_diffs(ctx, fi, di);
+                        ctx.path.pop();
+                    }
+                }
+                _ if fv.is_object() && dv.is_object() => fixed_value_diffs(ctx, fv, dv),
+                _ if fv != dv => ctx.error(
+                    ErrorKind::FixedValue,
+                    format!(
+                        "Value is '{}' but is fixed to '{}' in the profile",
+                        show(dv),
+                        show(fv)
+                    ),
+                ),
+                _ => {}
+            },
+        }
+        ctx.path.pop();
+    }
+    for key in d
+        .keys()
+        .filter(|k| !f.contains_key(*k) && !k.starts_with('_'))
+    {
+        ctx.path.push_key(key);
+        ctx.error(
+            ErrorKind::FixedValue,
+            format!(
+                "The element {key} is present in the instance but not allowed in the applicable fixed value specified in profile"
+            ),
+        );
+        ctx.path.pop();
     }
 }
 

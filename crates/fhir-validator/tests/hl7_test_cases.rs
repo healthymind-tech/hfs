@@ -1281,3 +1281,35 @@ async fn an_item_matching_two_slices() {
     .await;
     assert!(errors(&one).is_empty(), "{one:#?}");
 }
+
+/// `ad-practitioner-resource`: a fixed complex value is judged per child.
+#[tokio::test]
+async fn fixed_complex_values_per_child() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/home-telecom",
+        "name": "HomeTelecom", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Practitioner", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Practitioner",
+        "differential": {"element": [{"id": "Practitioner.telecom", "path": "Practitioner.telecom",
+            "fixedContactPoint": {"use": "home"}}]}
+    });
+    let url = "http://example.org/StructureDefinition/home-telecom";
+    let p = |t: Value| json!({"resourceType": "Practitioner", "telecom": [t]});
+    let issues = validate_with(
+        &p(json!({"system": "phone", "value": "555", "use": "home"})),
+        &[sd.clone()],
+        &[url],
+    )
+    .await;
+    let paths: Vec<String> = errors(&issues).iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "Practitioner.telecom.0.system",
+            "Practitioner.telecom.0.value"
+        ],
+        "{issues:#?}"
+    );
+    assert!(errors(&validate_with(&p(json!({"use": "home"})), &[sd], &[url]).await).is_empty());
+}
