@@ -421,6 +421,11 @@ pub(crate) fn msg_extensible_binding(
 
 /// [helios] a uri in an HL7 namespace that names nothing known (HL7
 /// validator wording).
+/// A required-bound primitive present only as id/extension.
+pub(crate) fn msg_no_code_required(value_set: &str) -> String {
+    format!("No code provided, and a code is required from the value set '{value_set}'")
+}
+
 pub(crate) fn msg_url_unresolved(url: &str) -> String {
     format!("No definition could be found for URL value '{url}'")
 }

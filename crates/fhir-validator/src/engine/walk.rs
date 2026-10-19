@@ -619,7 +619,7 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         if let Some(base_key) = key.strip_prefix('_')
             && !base_key.is_empty()
         {
-            handle_sidecar(ctx, set, key, base_key, value);
+            handle_sidecar(ctx, set, key, base_key, value, obj.get(base_key));
         } else {
             eval_element(ctx, set, &mut multi_choice, key, value);
         }
@@ -1210,6 +1210,7 @@ fn handle_sidecar<'a>(
     key: &str,
     base_key: &str,
     value: &'a Value,
+    base_value: Option<&'a Value>,
 ) {
     // Collect the base element's sub-set; choice bookkeeping is discarded
     // (a sidecar is not a branch occurrence).
@@ -1225,6 +1226,53 @@ fn handle_sidecar<'a>(
 
     // The sidecar mirrors the base element's shape.
     let expect_array = base_elset.schemas().any(|s| s.array == Some(true));
+
+    // A primitive with a required binding that is present only through its
+    // sidecar (`"_status": {"extension": [data-absent-reason]}`) carries no
+    // code at all: the HL7 validator rejects it (Terminology_TX_NoValid_1).
+    let required_vs = base_elset.schemas().find_map(|s| {
+        s.binding
+            .as_ref()
+            .filter(|b| b.strength.as_deref() == Some("required"))
+            .map(|b| b.value_set.clone())
+    });
+    if let Some(vs) = required_vs {
+        let missing: Vec<Option<usize>> = match value {
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .filter(|(i, item)| {
+                    !item.is_null()
+                        && base_value
+                            .and_then(Value::as_array)
+                            .and_then(|b| b.get(*i))
+                            .is_none_or(Value::is_null)
+                })
+                .map(|(i, _)| Some(i))
+                .collect(),
+            Value::Null => Vec::new(),
+            _ if base_value.is_none_or(Value::is_null) => vec![None],
+            _ => Vec::new(),
+        };
+        if !missing.is_empty() {
+            ctx.path.pop();
+            ctx.path.push_key(base_key);
+            for index in missing {
+                if let Some(i) = index {
+                    ctx.path.push_index(i);
+                }
+                ctx.error(
+                    ErrorKind::TerminologyBinding,
+                    errors::msg_no_code_required(&vs),
+                );
+                if index.is_some() {
+                    ctx.path.pop();
+                }
+            }
+            ctx.path.pop();
+            ctx.path.push_key(key);
+        }
+    }
     match (expect_array, value.is_array()) {
         (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
         (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),

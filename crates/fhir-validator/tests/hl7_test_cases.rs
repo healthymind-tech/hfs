@@ -203,3 +203,31 @@ async fn contained_references_inside_bundle_entries() {
     let bad = validate_with(&bundle(vec![first, other]), &[], &[]).await;
     assert_eq!(constraint_failures(&bad, "dom-3").len(), 1, "{bad:#?}");
 }
+
+/// `allergy`, `us-docref`: a required-bound code present only as a
+/// data-absent-reason sidecar has no code; a bound code with a value and a
+/// sidecar, or an unbound primitive (Attachment.data) without value, is fine.
+#[tokio::test]
+async fn required_bound_code_without_value_is_an_error() {
+    let dar = json!({"extension": [{
+        "url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason", "valueCode": "unknown"}]});
+    let allergy = json!({
+        "resourceType": "AllergyIntolerance", "patient": {"reference": "Patient/p"},
+        "clinicalStatus": {"coding": [{
+            "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+            "code": "active"}]},
+        "category": ["food", null], "_category": [dar.clone(), dar.clone()]
+    });
+    let issues = validate_with(&allergy, &[], &[]).await;
+    let errs = errors(&issues);
+    assert_eq!(errs.len(), 1, "{issues:#?}");
+    assert_eq!(errs[0].path, "AllergyIntolerance.category.1");
+    let docref = json!({
+        "resourceType": "DocumentReference", "_status": dar.clone(),
+        "content": [{"attachment": {"contentType": "text/plain", "_data": dar}}]
+    });
+    let issues = validate_with(&docref, &[], &[]).await;
+    let errs = errors(&issues);
+    assert_eq!(errs.len(), 1, "{issues:#?}");
+    assert_eq!(errs[0].path, "DocumentReference.status");
+}
