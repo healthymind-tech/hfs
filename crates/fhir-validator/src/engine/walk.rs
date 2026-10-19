@@ -981,7 +981,16 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 validate_excluded(ctx, excluded, data);
             }
         }
-        if let Some(binding) = &schema.binding {
+        // A binding on a multi-type `value[x]` (the vital signs profiles bind
+        // Quantity|CodeableConcept|... to their unit value set) is judged on
+        // the coded branches only, as the HL7 validator does; a
+        // Quantity-only element still binds its units.
+        let multi_type_quantity = schema.type_.as_deref() == Some("Quantity")
+            && schema.choice_of.is_some()
+            && schemas
+                .iter()
+                .any(|s| s.choices.as_ref().is_some_and(|c| c.len() > 1));
+        if let Some(binding) = schema.binding.as_ref().filter(|_| !multi_type_quantity) {
             let path = ctx.path.render_dotted();
             if ctx.deferred_bindings.insert((
                 path.clone(),

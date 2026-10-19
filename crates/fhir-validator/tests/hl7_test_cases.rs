@@ -1021,3 +1021,26 @@ async fn complex_extensions_and_datatype_element_contexts() {
         "{errs:#?}"
     );
 }
+
+/// `obs-fio2`, `obs-percent`: the vital signs profiles bind
+/// `component.value[x]` (Quantity|CodeableConcept|...) to their unit value
+/// set; the HL7 validator does not hold a Quantity of that multi-type element
+/// to it (`fixed-quantity-binding-observation`: a Quantity-only element is).
+#[test]
+fn multi_type_value_bindings_skip_quantities() {
+    let obs = json!({"resourceType": "Observation", "status": "final",
+        "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                                  "code": "vital-signs"}]}],
+        "code": {"coding": [{"system": "http://loinc.org", "code": "2708-6"}]},
+        "subject": {"reference": "Patient/p"}, "effectiveDateTime": "2020-10-11",
+        "valueQuantity": {"value": 98, "system": "http://unitsofmeasure.org", "code": "%", "unit": "%"},
+        "component": [{"code": {"coding": [{"system": "http://loinc.org", "code": "3151-8"}]},
+            "valueQuantity": {"value": 2, "system": "http://unitsofmeasure.org", "code": "L/min"}}]});
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let outcome = validator.validate_sync(&obs, &ValidationOptions::default());
+    let deferred_on_component_value = outcome.deferred.iter().any(|d| {
+        matches!(d, helios_fhir_validator::Deferred::Binding { path, .. }
+            if path == "Observation.component.0.valueQuantity")
+    });
+    assert!(!deferred_on_component_value, "{:?}", outcome.deferred);
+}
