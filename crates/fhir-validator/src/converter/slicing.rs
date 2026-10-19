@@ -102,6 +102,29 @@ fn profile_element_match(node: &super::tree::Node) -> Option<Match> {
     })
 }
 
+/// A value/pattern discriminator answered by the type profile of an element
+/// on its path: `{type: profile-value, path, profiles, rest}`, where `rest`
+/// is the path inside the profile (`ofType(...)` steps dropped).
+fn profile_value_part(node: &super::tree::Node, path: &str) -> Option<Value> {
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|s| !s.starts_with("ofType("))
+        .collect();
+    let mut current = node;
+    for (i, segment) in segments.iter().enumerate() {
+        current = current.children.get(*segment)?;
+        if !current.type_profiles.is_empty() && i + 1 < segments.len() {
+            return Some(serde_json::json!({
+                "type": "profile-value",
+                "path": path,
+                "profiles": current.type_profiles,
+                "rest": segments[i + 1..].join("."),
+            }));
+        }
+    }
+    None
+}
+
 /// Build the slice match from the discriminators.
 ///
 /// `value`/`pattern` discriminators compile to one partial-match pattern
@@ -135,6 +158,13 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
                 // discriminators unset matches any value there (the HL7
                 // validator judges it on the others).
                 let Some(constant) = constant_at(node, &disc.path) else {
+                    // The value may live in the type profile of an element
+                    // on the path (`resource.ofType(Observation).code`, the
+                    // code pattern of the entry's Observation profile).
+                    if let Some(part) = profile_value_part(node, &disc.path) {
+                        parts.push(part);
+                        continue;
+                    }
                     if discriminators.len() > 1 && disc.path != "$this" {
                         continue;
                     }

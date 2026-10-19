@@ -1810,3 +1810,57 @@ async fn conforms_to_in_invariants() {
     .await;
     assert!(!ck1(&good), "{good:#?}");
 }
+
+/// `bnd-slicing-cgm#profile`: a discriminator value defined only in the
+/// slices' type profiles (`resource.ofType(Observation).code`).
+#[tokio::test]
+async fn discriminator_values_from_type_profiles() {
+    let obs_profile = |name: &str, code: &str| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{name}"),
+            "name": name, "status": "active", "kind": "resource", "abstract": false,
+            "type": "Observation", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+            "differential": {"element": [{"id": "Observation.code", "path": "Observation.code",
+                "patternCodeableConcept": {"coding": [{"system": "http://example.org/cs", "code": code}]}}]}
+        })
+    };
+    let slice = |name: &str| {
+        vec![
+            json!({"id": format!("Bundle.entry:{name}"), "path": "Bundle.entry", "sliceName": name, "min": 1}),
+            json!({"id": format!("Bundle.entry:{name}.resource"), "path": "Bundle.entry.resource",
+            "type": [{"code": "Observation", "profile": [format!("http://example.org/StructureDefinition/{name}")]}]}),
+        ]
+    };
+    let mut elements = vec![json!({"id": "Bundle.entry", "path": "Bundle.entry",
+        "slicing": {"discriminator": [{"type": "type", "path": "resource"},
+                                      {"type": "value", "path": "resource.ofType(Observation).code"}], "rules": "open"}})];
+    elements.extend(slice("a"));
+    elements.extend(slice("b"));
+    let bundle_sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/obs-bundle",
+        "name": "ObsBundle", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Bundle", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Bundle",
+        "differential": {"element": elements}
+    });
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"fullUrl": "urn:uuid:7f1c0b9e-1d7b-4c3a-9a51-2f3b8e6d4c11",
+         "resource": {"resourceType": "Observation", "status": "final",
+            "code": {"coding": [{"system": "http://example.org/cs", "code": "a"}]}}}]});
+    let issues = validate_with(
+        &bundle,
+        &[obs_profile("a", "a"), obs_profile("b", "b"), bundle_sd],
+        &["http://example.org/StructureDefinition/obs-bundle"],
+    )
+    .await;
+    let missing: Vec<String> = errors(&issues)
+        .iter()
+        .filter_map(|e| e.hl7_message.clone())
+        .filter(|m| m.contains("a matching slice is required"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{issues:#?}");
+    assert!(missing[0].contains("Bundle.entry:b"), "{missing:?}");
+}

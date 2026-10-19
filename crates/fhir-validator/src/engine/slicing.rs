@@ -389,6 +389,23 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         };
     }
     match part.get("type").and_then(Value::as_str) {
+        Some("profile-value") => {
+            let Some(ctx) = ctx else {
+                return false;
+            };
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = strings("profiles")
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return true; // no profile fixes a value there
+            }
+            values_at(item, path)
+                .into_iter()
+                .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+        }
         Some("profile-element") => {
             let (Some(ctx), Some(url), Some(element)) = (
                 ctx,
@@ -413,6 +430,15 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         }
         _ => false,
     }
+}
+
+/// The fixed or pattern value a schema states at a dotted element path.
+fn schema_constant(schema: &FhirSchema, path: &str) -> Option<Value> {
+    let mut current = schema;
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        current = current.elements.as_ref()?.get(segment)?;
+    }
+    current.fixed.clone().or_else(|| current.pattern.clone())
 }
 
 /// The slice `element` (`Composition.section:codeA`) of the profile at
@@ -467,6 +493,18 @@ fn parents_at<'v>(item: &'v Value, path: &str) -> (Vec<&'v Value>, Option<String
     let mut current = vec![item];
     for segment in parents {
         let mut next = Vec::new();
+        // `ofType(Observation)`: the resources of that type.
+        if let Some(ty) = segment
+            .strip_prefix("ofType(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            current.retain(|v| {
+                v.get("resourceType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|rt| rt == ty)
+            });
+            continue;
+        }
         for value in current {
             match value.get(*segment) {
                 Some(Value::Array(items)) => next.extend(items.iter()),
