@@ -1637,6 +1637,7 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
 
         let mut met = false;
         let mut judgeable = true;
+        let mut conditions: Vec<String> = Vec::new();
         // The extension sits directly in another extension.
         // (directly, or on the parent extension's primitive value:
         // `extension[0]._valueBoolean.extension[0]`)
@@ -1672,9 +1673,19 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
                     && prefix
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '.');
-                if !simple || parent_paths.iter().any(|p| path_matches(prefix, p)) {
+                if !simple {
                     judgeable = false;
                     break;
+                }
+                if parent_paths.iter().any(|p| path_matches(prefix, p)) {
+                    // On that element the rest of the expression decides:
+                    // checked as an invariant of the parent below.
+                    let rest = &expression[prefix.len()..];
+                    if rest.trim().is_empty() {
+                        met = true;
+                    } else {
+                        conditions.push(format!("($this{rest}).exists()"));
+                    }
                 }
                 continue;
             }
@@ -1720,13 +1731,38 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
         }
 
         let parent = &parent_paths[0];
-        ctx.path.push_index(index);
         let message = errors::msg_extension_context(url, parent, contexts);
         let severity = if CANONICAL_RESOURCES.contains(&root.as_str()) {
             Severity::Warning
         } else {
             Severity::Error
         };
+        if !conditions.is_empty() {
+            // Only a FHIRPath context can still allow it: evaluated on the
+            // extension's parent with the other invariants.
+            let at = ctx.path.render_dotted();
+            let parent_path = at
+                .rsplit_once('.')
+                .map_or(at.as_str(), |(p, _)| p)
+                .to_string();
+            ctx.deferred.push(Deferred::Constraint {
+                path: parent_path,
+                id: "ext-context".to_string(),
+                expression: conditions.join(" or "),
+                human: Some(message),
+                severity: Some(
+                    if severity == Severity::Warning {
+                        "warning"
+                    } else {
+                        "error"
+                    }
+                    .to_string(),
+                ),
+                own_resource: false,
+            });
+            continue;
+        }
+        ctx.path.push_index(index);
         ctx.error_with_severity(ErrorKind::ExtensionContext, message, severity);
         ctx.path.pop();
     }

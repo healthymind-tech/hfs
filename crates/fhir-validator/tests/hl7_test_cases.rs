@@ -1053,3 +1053,52 @@ fn multi_type_value_bindings_skip_quantities() {
     });
     assert!(!deferred_on_component_value, "{:?}", outcome.deferred);
 }
+
+/// `ext-ctxt-bad-address`: a FHIRPath extension context
+/// (`Patient.address.where(use = 'home')`) is evaluated on the extension's
+/// parent.
+#[tokio::test]
+async fn fhirpath_extension_contexts_are_evaluated() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/home-only",
+        "name": "HomeOnly", "status": "active", "kind": "complex-type", "abstract": false,
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "context": [{"type": "fhirpath", "expression": "Patient.address.where(use = 'home')"}],
+        "differential": {"element": [
+            {"id": "Extension.url", "path": "Extension.url",
+             "fixedUri": "http://example.org/StructureDefinition/home-only"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "boolean"}]}
+        ]}
+    });
+    let run = |address_use: &'static str| {
+        let sd = sd.clone();
+        async move {
+            let core = core_registry(FhirVersion::R4);
+            let mut overlay = SchemaRegistry::new();
+            overlay.insert(convert(&sd).unwrap().schema);
+            let resolver: Arc<dyn SchemaResolver> =
+                Arc::new(CompositeResolver::new(vec![Arc::new(overlay), core]));
+            let evaluator = FhirPathConstraintEvaluator::new();
+            let handlers = EffectHandlers {
+                constraints: Some(&evaluator),
+                ..Default::default()
+            };
+            let opts = ValidationOptions {
+                check_extension_context: true,
+                ..Default::default()
+            };
+            let patient = json!({"resourceType": "Patient", "address": [{"use": address_use, "city": "x",
+                "extension": [{"url": "http://example.org/StructureDefinition/home-only", "valueBoolean": true}]}]});
+            Validator::new(resolver)
+                .validate(&patient, FhirVersion::R4, &opts, &handlers)
+                .await
+                .into_iter()
+                .filter(|e| e.severity == Severity::Error)
+                .count()
+        }
+    };
+    assert_eq!(run("home").await, 0);
+    assert_eq!(run("work").await, 1);
+}
