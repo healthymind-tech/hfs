@@ -22,7 +22,7 @@ use serde_json::Value;
 const CORE_SD_PREFIX: &str = "http://hl7.org/fhir/StructureDefinition/";
 
 /// Run the reference checks when `data` is a Reference object.
-pub(super) fn check_reference(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
+pub(super) fn check_reference<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'a Value) {
     if !set
         .schemas()
         .any(|s| s.type_.as_deref() == Some("Reference"))
@@ -96,6 +96,64 @@ pub(super) fn check_reference(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Val
             ErrorKind::ReferenceInvalid,
             errors::msg_reference_target_type(&found, &allowed),
         );
+        return;
+    }
+
+    // A target at hand (a Bundle entry, a contained resource) must conform
+    // to one of the target profiles of its type (HL7 validator,
+    // Reference_REF_CantMatchChoice). Unresolvable profiles leave the
+    // layer unjudged, like unknown types above.
+    if let Some(reference) = literal
+        && super::walk::knows_hl7_extensions(ctx.resolver())
+        && let Some(target) = ctx.resolve_reference(reference)
+        && let Some(target_type) = target.get("resourceType").and_then(Value::as_str)
+    {
+        let layers: Vec<Vec<String>> = set.schemas().filter_map(|s| s.refers.clone()).collect();
+        for refers in layers {
+            let mut candidates: Vec<String> = Vec::new();
+            let mut judgeable = true;
+            for url in &refers {
+                let bare = url.split('|').next().unwrap_or(url);
+                if bare == format!("{CORE_SD_PREFIX}{target_type}")
+                    || matches!(
+                        bare.strip_prefix(CORE_SD_PREFIX),
+                        Some("Resource" | "DomainResource")
+                    )
+                {
+                    judgeable = false; // the plain type is allowed
+                    break;
+                }
+                if bare
+                    .strip_prefix(CORE_SD_PREFIX)
+                    .is_some_and(|n| is_resource_type(ctx, n))
+                {
+                    continue; // another core type
+                }
+                match ctx.resolver().resolve(bare) {
+                    Some(schema) if schema.type_.as_deref() == Some(target_type) => {
+                        candidates.push(url.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        judgeable = false;
+                        break;
+                    }
+                }
+            }
+            if !judgeable || candidates.is_empty() {
+                continue;
+            }
+            if !candidates.iter().any(|p| ctx.conforms_to(target, p)) {
+                ctx.error(
+                    ErrorKind::ReferenceInvalid,
+                    format!(
+                        "Unable to find a profile match for {reference} among choices: {}",
+                        candidates.join(", ")
+                    ),
+                );
+                return;
+            }
+        }
     }
 }
 

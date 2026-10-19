@@ -1758,7 +1758,7 @@ fn is_hl7_namespace(url: &str) -> bool {
 /// Whether HL7's extension definitions are loaded at all. R4/R4B ship them
 /// in the core packs; from R5 on they live in `hl7.fhir.uv.extensions`,
 /// and without that package every HL7 extension would look unknown.
-fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
+pub(super) fn knows_hl7_extensions(resolver: &dyn SchemaResolver) -> bool {
     resolver
         .resolve("http://hl7.org/fhir/StructureDefinition/data-absent-reason")
         .is_some()

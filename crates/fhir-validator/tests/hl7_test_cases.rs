@@ -1728,3 +1728,54 @@ fn versioned_extension_urls() {
         "{errs:#?}"
     );
 }
+
+/// `bundle-conformsto`, difftest `Bundle-example-PMR`: a Bundle-internal
+/// reference target must conform to one of the Reference's target
+/// profiles.
+#[tokio::test]
+async fn bundled_reference_targets_meet_target_profiles() {
+    let patient_profile = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/identified-patient",
+        "name": "IdentifiedPatient", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Patient", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient.identifier", "path": "Patient.identifier", "min": 1}]}
+    });
+    let obs_profile = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/obs",
+        "name": "Obs", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [{"id": "Observation.subject", "path": "Observation.subject",
+            "type": [{"code": "Reference", "targetProfile": ["http://example.org/StructureDefinition/identified-patient"]}]}]}
+    });
+    let bundle = |patient: Value| {
+        json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"fullUrl": "http://example.org/fhir/Observation/o", "resource": {"resourceType": "Observation", "id": "o",
+            "meta": {"profile": ["http://example.org/StructureDefinition/obs"]},
+            "status": "final", "code": {"text": "x"}, "subject": {"reference": "Patient/p"}}},
+        {"fullUrl": "http://example.org/fhir/Patient/p", "resource": patient}]})
+    };
+    let sds = [patient_profile, obs_profile];
+    let bad = validate_with(
+        &bundle(json!({"resourceType": "Patient", "id": "p"})),
+        &sds,
+        &[],
+    )
+    .await;
+    assert!(
+        errors(&bad).iter().any(|e| e
+            .message
+            .starts_with("Unable to find a profile match for Patient/p")),
+        "{bad:#?}"
+    );
+    let good = validate_with(
+        &bundle(json!({"resourceType": "Patient", "id": "p", "identifier": [{"value": "1"}]})),
+        &sds,
+        &[],
+    )
+    .await;
+    assert!(errors(&good).is_empty(), "{good:#?}");
+}
