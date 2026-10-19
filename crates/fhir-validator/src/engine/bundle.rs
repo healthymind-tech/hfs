@@ -192,6 +192,53 @@ pub(super) fn resolve(
     }
 }
 
+/// A relative reference from `source_full_url` that several entries share
+/// the target fullUrl of: the HL7 validator's errors for it, or `None`
+/// when at most one entry has it (or a versioned reference names one of
+/// their versions).
+fn ambiguous_reference(
+    entries: &[Entry<'_>],
+    reference: &str,
+    source_full_url: Option<&str>,
+) -> Option<Vec<String>> {
+    let (ty, id) = relative_type_id(reference)?;
+    let base = source_full_url.and_then(restful_base)?;
+    let wanted = format!("{base}/{ty}/{id}");
+    let matching: Vec<&Entry<'_>> = entries
+        .iter()
+        .filter(|e| e.full_url.is_some_and(|u| strip_history(u) == wanted))
+        .collect();
+    if matching.len() < 2 {
+        return None;
+    }
+    let version = reference
+        .split_once("/_history/")
+        .map(|(_, v)| v.split(['?', '#']).next().unwrap_or(v));
+    match version {
+        Some(v) => {
+            let has = matching.iter().any(|e| {
+                e.resource
+                    .pointer("/meta/versionId")
+                    .and_then(Value::as_str)
+                    == Some(v)
+            });
+            (!has).then(|| {
+                vec![format!(
+                    "Can't find '{reference}' in the bundle (Composition). Note that there are {} resources in the bundle with the same type and id, but they do not match because of the fullUrl based rules around matching relative references (must be '{wanted}')",
+                    matching.len()
+                )]
+            })
+        }
+        None => Some(vec![
+            format!("Multiple matches in bundle for reference {reference}"),
+            format!(
+                "Found {} matches for '{reference}' in the bundle (Composition)",
+                matching.len()
+            ),
+        ]),
+    }
+}
+
 fn msg_not_found(reference: &str, location: &str) -> String {
     format!("Can't find '{reference}' in the bundle ({location})")
 }
@@ -463,6 +510,15 @@ pub(super) fn bundle_rules_with(
     let prefix = format!("Bundle.entry.{first_index}.resource");
     for (path, reference) in composition_references(first.resource, &prefix) {
         if reference.starts_with('#') {
+            continue;
+        }
+        // Several entries with the target's fullUrl (versions of one
+        // resource): an unversioned reference is ambiguous, a versioned one
+        // must name a version that is there.
+        if let Some(messages) = ambiguous_reference(&list, &reference, first.full_url) {
+            for message in messages {
+                out.push(error(ErrorKind::ReferenceUnresolved, path.clone(), message));
+            }
             continue;
         }
         let message = match resolve(&list, &reference, first.full_url) {
@@ -763,6 +819,37 @@ mod tests {
         let issues = bundle_rules(&bundle);
         assert_eq!(issues.len(), 1, "{issues:#?}");
         assert_eq!(issues[0].path, "Bundle.entry.0");
+    }
+
+    /// `bundle-document-versioned-references-bad`: two versions of one
+    /// resource in a document.
+    #[test]
+    fn versioned_and_duplicate_document_references() {
+        let obs = |v: &str| {
+            json!({"fullUrl": "http://example.org/Observation/o",
+            "resource": {"resourceType": "Observation", "id": "o", "meta": {"versionId": v},
+                "status": "final", "code": {"text": "x"}}})
+        };
+        let bundle = json!({"resourceType": "Bundle", "type": "document", "entry": [
+            {"fullUrl": "http://example.org/Composition/c", "resource": {"resourceType": "Composition", "id": "c",
+                "section": [{"entry": [{"reference": "Observation/o/_history/3"},
+                                       {"reference": "Observation/o"},
+                                       {"reference": "Observation/o/_history/2"}]}]}},
+            obs("1"), obs("2")]});
+        let msgs: Vec<String> = bundle_rules(&bundle)
+            .into_iter()
+            .filter(|e| e.kind == ErrorKind::ReferenceUnresolved)
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(msgs.len(), 3, "{msgs:#?}");
+        assert!(
+            msgs[0].starts_with("Can't find 'Observation/o/_history/3'"),
+            "{msgs:#?}"
+        );
+        assert_eq!(
+            msgs[1],
+            "Multiple matches in bundle for reference Observation/o"
+        );
     }
 
     #[test]
