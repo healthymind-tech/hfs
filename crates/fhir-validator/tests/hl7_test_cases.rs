@@ -278,3 +278,42 @@ async fn constraint_sweep_r4_spec_examples() {
         );
     }
 }
+
+/// `obs-de` (KBV): a profile requiring `coding.display.extension` judges the
+/// `_display` sidecar, not the display string.
+#[tokio::test]
+async fn profile_children_of_a_primitive_apply_to_its_sidecar() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/display-translated",
+        "name": "DisplayTranslated", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [
+            {"id": "Observation.code.coding.display.extension",
+             "path": "Observation.code.coding.display.extension", "min": 1},
+            {"id": "Observation.code.coding.display.id",
+             "path": "Observation.code.coding.display.id", "max": "0"}
+        ]}
+    });
+    let url = "http://example.org/StructureDefinition/display-translated";
+    let obs = |coding: Value| {
+        json!({"resourceType": "Observation", "status": "final",
+               "code": {"coding": [coding]}, "subject": {"reference": "Patient/p"}})
+    };
+    let translated = json!({"system": "http://example.org/cs", "code": "x", "display": "X",
+        "_display": {"extension": [{"url": "http://example.org/ext", "valueString": "x"}]}});
+    let issues = validate_with(&obs(translated), &[sd.clone()], &[url]).await;
+    assert!(errors(&issues).is_empty(), "{issues:#?}");
+
+    let plain = json!({"system": "http://example.org/cs", "code": "x", "display": "X"});
+    let issues = validate_with(&obs(plain), &[sd.clone()], &[url]).await;
+    let errs = errors(&issues);
+    assert_eq!(errs.len(), 1, "{issues:#?}");
+    assert_eq!(errs[0].path, "Observation.code.coding.0.display.extension");
+
+    let with_id = json!({"system": "http://example.org/cs", "code": "x", "display": "X",
+        "_display": {"id": "d", "extension": [{"url": "http://example.org/ext", "valueString": "x"}]}});
+    let issues = validate_with(&obs(with_id), &[sd], &[url]).await;
+    assert_eq!(errors(&issues).len(), 1, "{issues:#?}");
+}

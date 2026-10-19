@@ -119,6 +119,10 @@ pub(super) struct WalkCtx<'a> {
     /// last: element paths of extension parents are taken relative to the
     /// innermost resource (`Patient.name` inside `Bundle.entry.0.resource`).
     resource_roots: Vec<(usize, String)>,
+    /// The `_foo` sidecar (id/extension) of the primitive being validated,
+    /// if any: element keywords on a primitive (`required: ["extension"]`
+    /// from a profile constraining `display.extension`) describe it.
+    primitive_sidecar: Option<&'a Value>,
     /// How many slice-membership validations enclose this walk (each
     /// validates a value against a profile in a fresh context).
     nesting: usize,
@@ -228,6 +232,7 @@ impl<'a> WalkCtx<'a> {
             bundles: self.bundles.clone(),
             resources: self.resources.clone(),
             resource_roots: Vec::new(),
+            primitive_sidecar: None,
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
         };
@@ -319,6 +324,7 @@ pub(super) fn validate(
         bundles: Vec::new(),
         resources: Vec::new(),
         resource_roots: Vec::new(),
+        primitive_sidecar: None,
         nesting: 0,
         conformance: Rc::default(),
     };
@@ -621,7 +627,8 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         {
             handle_sidecar(ctx, set, key, base_key, value, obj.get(base_key));
         } else {
-            eval_element(ctx, set, &mut multi_choice, key, value);
+            let sidecar = obj.get(&format!("_{key}"));
+            eval_element(ctx, set, &mut multi_choice, key, value, sidecar);
         }
         ctx.path.pop();
     }
@@ -733,11 +740,16 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 });
             }
         }
-        if let Some(required) = &schema.required {
-            validate_required(ctx, set, required, data);
-        }
-        if let Some(excluded) = &schema.excluded {
-            validate_excluded(ctx, excluded, data);
+        if !data.is_object() && primitive_set {
+            // Keywords on a primitive's children describe its sidecar.
+            validate_primitive_children(ctx, schema);
+        } else {
+            if let Some(required) = &schema.required {
+                validate_required(ctx, set, required, data);
+            }
+            if let Some(excluded) = &schema.excluded {
+                validate_excluded(ctx, excluded, data);
+            }
         }
         if let Some(binding) = &schema.binding {
             let path = ctx.path.render_dotted();
@@ -776,6 +788,27 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 let message = errors::msg_choice_excluded(branch);
                 ctx.error(ErrorKind::ChoiceExcluded, message);
             }
+        }
+    }
+}
+
+/// `required` / `excluded` on a primitive element (`display.extension`
+/// min 1 in a profile) judged against its `_foo` sidecar: the primitive's
+/// id and extensions live there in JSON.
+fn validate_primitive_children(ctx: &mut WalkCtx<'_>, schema: &FhirSchema) {
+    let sidecar = ctx.primitive_sidecar.and_then(Value::as_object);
+    for key in schema.required.iter().flatten() {
+        if !sidecar.is_some_and(|s| s.contains_key(key)) {
+            ctx.path.push_key(key);
+            ctx.error(ErrorKind::Required, errors::msg_required(key));
+            ctx.path.pop();
+        }
+    }
+    for key in schema.excluded.iter().flatten() {
+        if sidecar.is_some_and(|s| s.contains_key(key)) {
+            ctx.path.push_key(key);
+            ctx.error(ErrorKind::Excluded, errors::msg_excluded(key));
+            ctx.path.pop();
         }
     }
 }
@@ -849,6 +882,7 @@ fn eval_element<'a>(
     multi_choice: &mut IndexMap<String, Vec<String>>,
     key: &str,
     value: &'a Value,
+    sidecar: Option<&'a Value>,
 ) {
     let mut elset = SchemaSet::new();
     collect_schemas_for_element(ctx, set, &mut elset, multi_choice, key);
@@ -921,12 +955,21 @@ fn eval_element<'a>(
             if is_extension_array {
                 validate_extension_item(ctx, &elset, item, key == "modifierExtension");
             } else {
+                let outer = ctx.primitive_sidecar.take();
+                ctx.primitive_sidecar = sidecar
+                    .and_then(Value::as_array)
+                    .and_then(|s| s.get(index))
+                    .filter(|s| !s.is_null());
                 validate_node(ctx, &elset, item);
+                ctx.primitive_sidecar = outer;
             }
             ctx.path.pop();
         }
     } else {
+        let outer = ctx.primitive_sidecar.take();
+        ctx.primitive_sidecar = sidecar.filter(|s| s.is_object());
         validate_node(ctx, &elset, value);
+        ctx.primitive_sidecar = outer;
     }
 }
 
