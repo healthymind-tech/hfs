@@ -175,6 +175,7 @@ pub async fn import_snomed_rf2(
             association_refsets: assoc_refset_paths,
             language_refsets: lang_refset_paths,
             simple_refsets: simple_refset_paths,
+            module_dependency,
         } = find_rf2_paths(&path_owned, &languages)?;
 
         tracing::info!(
@@ -268,8 +269,21 @@ pub async fn import_snomed_rf2(
             active_members(latest)
         };
 
-        let release_version = extract_release_date(&concept_path)
-            .map(|date| edition_version(&concept_path, &modules, date));
+        let edition_module = match module_dependency.as_deref() {
+            Some(md_path) => {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(md_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open module dependency file: {e}"))
+                })?;
+                edition_module_from_dependencies(BufReader::new(entry))
+            }
+            None => None,
+        };
+        let release_version =
+            extract_release_date(&concept_path).map(|date| match &edition_module {
+                Some(module) => edition_uri(module, &date),
+                None => edition_version(&concept_path, &modules, date),
+            });
 
         Ok(SnomedParseResult {
             concept_terms,
@@ -592,6 +606,8 @@ struct Rf2Paths {
     language_refsets: Vec<String>,
     /// `der2_Refset_Simple*` files: Simple reference set membership.
     simple_refsets: Vec<String>,
+    /// The Module Dependency reference set (names the edition's module).
+    module_dependency: Option<String>,
 }
 
 fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, HtsError> {
@@ -603,6 +619,7 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
     let mut assoc_refset_paths: Vec<String> = Vec::new();
     let mut lang_refset_paths: Vec<String> = Vec::new();
     let mut simple_refset_paths: Vec<String> = Vec::new();
+    let mut module_dependency_paths: Vec<String> = Vec::new();
 
     for i in 0..zip.len() {
         let entry = zip
@@ -615,7 +632,9 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
         }
         let lower = name.to_lowercase();
         if lower.contains("refset") {
-            if lower.contains("association") {
+            if lower.contains("moduledependency") {
+                module_dependency_paths.push(name);
+            } else if lower.contains("association") {
                 assoc_refset_paths.push(name);
             } else if lower.contains("language") {
                 lang_refset_paths.push(name);
@@ -672,6 +691,7 @@ fn find_rf2_paths(path: &Path, languages: &LanguageFilter) -> Result<Rf2Paths, H
         association_refsets: assoc_refset_paths,
         language_refsets: lang_refset_paths,
         simple_refsets: simple_refset_paths,
+        module_dependency: pick_single(prefer_snapshot(module_dependency_paths)),
     })
 }
 
@@ -1217,6 +1237,53 @@ fn edition_version(concept_path: &str, modules: &HashMap<String, u64>, date: Str
     }
 }
 
+/// The edition module a Module Dependency reference set describes: the
+/// module that depends on others and nothing depends on, the International
+/// modules aside (the International release's own top modules, 449080006
+/// etc., are not editions). `None` for the International
+/// edition, or when the refset does not single one out.
+fn edition_module_from_dependencies(reader: impl BufRead) -> Option<String> {
+    let mut sources: HashSet<String> = HashSet::new();
+    let mut targets: HashSet<String> = HashSet::new();
+    for (n, line) in reader.lines().enumerate() {
+        let Ok(line) = line else { continue };
+        if n == 0 {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        // id effectiveTime active moduleId refsetId referencedComponentId …
+        if parts.len() < 6 || parts[2].trim() != "1" {
+            continue;
+        }
+        let (source, target) = (parts[3].trim(), parts[5].trim());
+        sources.insert(source.to_string());
+        // A module may list itself; that is not a dependency on it.
+        if source != target {
+            targets.insert(target.to_string());
+        }
+    }
+    let mut tops: Vec<String> = sources
+        .into_iter()
+        // An extension module is a long-form SCTID (partition 10): the
+        // International modules (900000000000207008, 449080006, …) are not.
+        .filter(|m| !targets.contains(m) && m.len() > 10 && m.as_bytes()[m.len() - 3] == b'1')
+        .collect();
+    (tops.len() == 1).then(|| tops.remove(0))
+}
+
+/// The edition URI of a release of `module`. Editions in the SNOMED test
+/// namespace (1000003) are experimental: `http://snomed.info/xsct/…`.
+fn edition_uri(module: &str, date: &str) -> String {
+    // A long-form SCTID: item, 7-digit namespace, 2-digit partition, check digit.
+    let namespace = (module.len() > 10).then(|| &module[module.len() - 10..module.len() - 3]);
+    let scheme = if namespace == Some("1000003") {
+        "http://snomed.info/xsct"
+    } else {
+        SNOMED_URL
+    };
+    format!("{scheme}/{module}/version/{date}")
+}
+
 fn extract_release_date(path: &str) -> Option<String> {
     let stem = path.rsplit('/').next().unwrap_or(path);
     let without_ext = stem.strip_suffix(".txt")?;
@@ -1423,6 +1490,28 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         assert!(active.contains("789012001"));
         assert!(!active.contains("999999001"));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn edition_module_comes_from_the_module_dependency_refset() {
+        let md = "id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\n\
+a\t20250801\t1\t449080006\t900000000000534007\t900000000000012004\n\
+b\t20250801\t1\t900000000000207008\t900000000000534007\t900000000000012004\n\
+c\t20250909\t1\t31000003106\t900000000000534007\t449080006\n\
+d\t20250909\t1\t31000003106\t900000000000534007\t31000003106\n";
+        let module = edition_module_from_dependencies(md.as_bytes());
+        assert_eq!(module.as_deref(), Some("31000003106"));
+        assert_eq!(
+            edition_uri("31000003106", "20250909"),
+            "http://snomed.info/xsct/31000003106/version/20250909"
+        );
+        assert_eq!(
+            edition_uri("731000124108", "20250301"),
+            "http://snomed.info/sct/731000124108/version/20250301"
+        );
+        // The International release alone names no edition.
+        let int: String = md.lines().take(3).map(|l| format!("{l}\n")).collect();
+        assert_eq!(edition_module_from_dependencies(int.as_bytes()), None);
     }
 
     #[test]
