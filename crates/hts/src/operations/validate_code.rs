@@ -320,6 +320,8 @@ fn build_validate_response_inner(
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                             || i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND")
+                            || i.message_id.as_deref()
+                                == Some("UNKNOWN_CODESYSTEM_CODING_NOT_CHECKED")
                             || i.message_id
                                 .as_deref()
                                 .is_some_and(|m| INCOMPLETE_CODING_MESSAGE_IDS.contains(&m))
@@ -529,6 +531,33 @@ async fn lookup_concept_status<B: TerminologyBackend>(
         }
     }
     None
+}
+
+/// Whether `code` is inactive in `system`: its `inactive` property is true,
+/// or its `status` is `inactive` / `retired`.
+async fn concept_inactive_in_cs<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+    code: &str,
+) -> bool {
+    let req = crate::types::LookupRequest {
+        system: system.to_string(),
+        code: code.to_string(),
+        version: None,
+        display_language: None,
+        expression: None,
+        properties: vec!["inactive".to_string(), "status".to_string()],
+        date: None,
+        use_supplements: vec![],
+    };
+    let Ok(resp) = CodeSystemOperations::lookup(backend, ctx, req).await else {
+        return false;
+    };
+    resp.properties.iter().any(|p| {
+        (p.code == "inactive" && p.value == "true")
+            || (p.code == "status" && matches!(p.value.as_str(), "inactive" | "retired"))
+    })
 }
 
 /// Apply IG-style language-aware display validation to a `validate-code`
@@ -5621,7 +5650,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     Some(v) => format!("{url}|{v}"),
                     None => url.clone(),
                 };
-                for (other_idx, (other_system, other_code)) in codings.iter().enumerate() {
+                // Notes about the other codings that do not change the result:
+                // an unchecked unknown code system, an inactive code.
+                let mut notes: Vec<ValidationIssue> = Vec::new();
+                for (other_system, other_code) in codings.iter() {
+                    let other_idx = coding_index
+                        .get(&(other_system.clone(), other_code.clone()))
+                        .copied()
+                        .unwrap_or(0);
                     if other_idx == success_idx {
                         continue;
                     }
@@ -5631,6 +5667,35 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         .await
                         .unwrap_or(false);
                     if !cs_exists {
+                        // IG `validation-simple-codeableconcept-unknown-system`:
+                        // the coding is not (known to be) in the value set,
+                        // and its code system could not be checked.
+                        notes.push(ValidationIssue {
+                            severity: "information".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "this-code-not-in-vs".into(),
+                            text: format!(
+                                "The provided code '{other_system}#{other_code}' was not \
+                                 found in the value set '{url_with_version}'"
+                            ),
+                            expression: Some(format!("CodeableConcept.coding[{other_idx}].code")),
+                            location: None,
+                            message_id: Some(
+                                "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                            ),
+                        });
+                        notes.push(ValidationIssue {
+                            severity: "warning".into(),
+                            fhir_code: "not-found".into(),
+                            tx_code: "not-found".into(),
+                            text: format!(
+                                "A definition for CodeSystem '{other_system}' could not be \
+                                 found, so the code cannot be validated"
+                            ),
+                            expression: Some(format!("CodeableConcept.coding[{other_idx}].system")),
+                            location: None,
+                            message_id: Some("UNKNOWN_CODESYSTEM_CODING_NOT_CHECKED".into()),
+                        });
                         continue;
                     }
                     let cs_version = state
@@ -5659,6 +5724,24 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                             .map(|r| r.result)
                             .unwrap_or(false);
                     if code_in_cs {
+                        // IG `inactive/inactive-4-validate`: an inactive code
+                        // is worth a warning whichever coding carries the result.
+                        if concept_inactive_in_cs(state.backend(), &ctx, other_system, other_code)
+                            .await
+                        {
+                            notes.push(ValidationIssue {
+                                severity: "warning".into(),
+                                fhir_code: "business-rule".into(),
+                                tx_code: "code-comment".into(),
+                                text: format!(
+                                    "The concept '{other_code}' has a status of inactive and \
+                                     its use should be reviewed"
+                                ),
+                                expression: Some(format!("CodeableConcept.coding[{other_idx}]")),
+                                location: None,
+                                message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
+                            });
+                        }
                         continue;
                     }
                     // Hard failure: emit `Unknown_Code_in_Version` error +
@@ -5710,6 +5793,21 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 }
                 let has_bad_codings = !accumulated_issues.is_empty();
                 let mut hybrid_resp = resp.clone();
+                // The winning coding's own issues are about its position in
+                // the CodeableConcept, which need not be the first.
+                for issue in &mut hybrid_resp.issues {
+                    for field in [&mut issue.expression, &mut issue.location] {
+                        if let Some(path) = field.as_deref() {
+                            if path == "Coding" {
+                                *field = Some(format!("CodeableConcept.coding[{success_idx}]"));
+                            } else if let Some(rest) = path.strip_prefix("Coding.") {
+                                *field =
+                                    Some(format!("CodeableConcept.coding[{success_idx}].{rest}"));
+                            }
+                        }
+                    }
+                }
+                hybrid_resp.issues.extend(notes);
                 if has_bad_codings {
                     hybrid_resp.result = false;
                     hybrid_resp.issues.extend(accumulated_issues);

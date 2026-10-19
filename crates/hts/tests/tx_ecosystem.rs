@@ -329,3 +329,79 @@ async fn status_check_notes() {
     let body = vs_validate(&app, coding("http://hts.test/norm", "b")).await;
     assert!(issues(&body).is_empty(), "{body}");
 }
+
+/// inactive/inactive-4-validate, inactive-5-validate,
+/// validation-simple-codeableconcept-unknown-system: in a CodeableConcept,
+/// the codings that do not carry the result still get their notes (an
+/// inactive code, an unchecked unknown code system), at their own index,
+/// and the result stays true.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn codeable_concept_notes_for_the_other_codings() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(
+        &json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "inact", "url": "http://hts.test/inact",
+              "version": "0.1.0", "status": "active", "content": "complete",
+              "property": [{"code": "status", "uri": "http://hl7.org/fhir/concept-properties#status", "type": "code"}],
+              "concept": [
+                {"code": "on", "display": "Active"},
+                {"code": "off", "display": "Inactive", "property": [{"code": "status", "valueCode": "inactive"}]}
+              ]}},
+            {"resource": {"resourceType": "ValueSet", "id": "inact-all", "url": "http://hts.test/vs/inact-all",
+              "version": "1.0", "status": "active",
+              "compose": {"include": [{"system": "http://hts.test/inact"}]}}}
+        ]})
+        .to_string(),
+    )
+    .await;
+    let cc = |codings: Value| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://hts.test/vs/inact-all"},
+            {"name": "codeableConcept", "valueCodeableConcept": {"coding": codings}}
+        ]})
+    };
+    let warning_at = |body: &Value| -> Vec<Value> {
+        issues(body)
+            .into_iter()
+            .filter(|i| i["severity"] == "warning")
+            .map(|i| i["expression"][0].clone())
+            .collect()
+    };
+
+    // Active first, inactive second: the warning names coding[1].
+    let body = vs_validate(
+        &app,
+        cc(json!([
+            {"system": "http://hts.test/inact", "code": "on"},
+            {"system": "http://hts.test/inact", "code": "off"}
+        ])),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(warning_at(&body), [json!("CodeableConcept.coding[1]")]);
+
+    // An unknown code system next to a good coding.
+    let body = vs_validate(
+        &app,
+        cc(json!([
+            {"system": "http://hts.test/unknown", "code": "x"},
+            {"system": "http://hts.test/inact", "code": "on"}
+        ])),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["not-found", "this-code-not-in-vs"]);
+    assert_eq!(
+        warning_at(&body),
+        [json!("CodeableConcept.coding[0].system")]
+    );
+}
