@@ -359,3 +359,33 @@ async fn unknown_extension_policy() {
         );
     }
 }
+
+fn structural_errors(resource: &Value) -> Vec<(String, String)> {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    validator
+        .validate_sync(resource, &ValidationOptions::default())
+        .errors
+        .into_iter()
+        .filter(|e| e.severity == Severity::Error)
+        .map(|e| (e.path, e.message))
+        .collect()
+}
+
+/// `patient-hs-1`, `empty-array`: JSON-representation rules.
+#[test]
+fn json_representation_rules() {
+    // A primitive array position with neither value nor sidecar.
+    let errs = structural_errors(&json!({"resourceType": "Patient",
+        "name": [{"given": ["a"], "_given": [{"id": "test"}, null]}]}));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert_eq!(errs[0].0, "Patient.name.0.given");
+    assert!(errs[0].1.contains("invalid at index 1"), "{errs:#?}");
+    let errs = structural_errors(&json!({"resourceType": "Patient",
+        "name": [{"given": ["a", null], "_given": [null, {"id": "b"}]}]}));
+    assert!(errs.is_empty(), "{errs:#?}");
+
+    // Empty arrays.
+    let errs = structural_errors(&json!({"resourceType": "Patient", "name": []}));
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(errs[0].1.starts_with("Array cannot be empty"), "{errs:#?}");
+}

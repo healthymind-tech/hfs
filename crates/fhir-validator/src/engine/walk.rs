@@ -907,6 +907,13 @@ fn eval_element<'a>(
     // validator (the mismatched value still validates against the set).
 
     if let Some(items) = value.as_array() {
+        if items.is_empty() {
+            ctx.error(
+                ErrorKind::EmptyObject,
+                "Array cannot be empty - the property should not be present if it has no values"
+                    .to_string(),
+            );
+        }
         // A known extension used outside its declared context draws a
         // warning (#615). Runs for every item, sliced or not — placement is
         // orthogonal to slicing.
@@ -1363,6 +1370,33 @@ fn handle_sidecar<'a>(
         (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
         (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),
         _ => {}
+    }
+
+    // Every position of a primitive array needs a value, an id/extension
+    // sidecar, or both.
+    if let Value::Array(sidecars) = value {
+        let values = base_value.and_then(Value::as_array);
+        let len = sidecars.len().max(values.map_or(0, Vec::len));
+        let empty: Vec<usize> = (0..len)
+            .filter(|&i| {
+                values.and_then(|v| v.get(i)).is_none_or(Value::is_null)
+                    && sidecars.get(i).is_none_or(Value::is_null)
+            })
+            .collect();
+        if !empty.is_empty() {
+            ctx.path.pop();
+            ctx.path.push_key(base_key);
+            for i in empty {
+                ctx.error(
+                    ErrorKind::Type,
+                    format!(
+                        "The JSON array for '{base_key}' is invalid at index {i} - must have at least one valid value"
+                    ),
+                );
+            }
+            ctx.path.pop();
+            ctx.path.push_key(key);
+        }
     }
 
     // Validate the Element part(s). Without a resolvable `Element` schema
