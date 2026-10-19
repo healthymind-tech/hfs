@@ -1016,7 +1016,7 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 validate_required(ctx, set, required, data);
             }
             if let Some(excluded) = &schema.excluded {
-                validate_excluded(ctx, excluded, data);
+                validate_excluded(ctx, set, excluded, data);
             }
         }
         // A binding on a multi-type `value[x]` (the vital signs profiles bind
@@ -1058,12 +1058,37 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
             // set; the branch key is the last named path segment.
             // An empty list comes from a `foo[x]` element that constrains
             // without narrowing the types: no restriction.
-            if let Some(branch) = ctx.path.last_key()
+            if let Some(branch) = ctx.path.last_key().map(str::to_string)
                 && !choices.is_empty()
-                && !choices.iter().any(|c| c == branch)
+                && !choices.iter().any(|c| *c == branch)
             {
-                let message = errors::msg_choice_excluded(branch);
-                ctx.error(ErrorKind::ChoiceExcluded, message);
+                let branch = branch.as_str();
+                let rendered = ctx.path.render_dotted();
+                let mut parts = rendered.rsplit('.');
+                let (_, index, holder) = (parts.next(), parts.next(), parts.next());
+                let on_extension = branch.starts_with("value")
+                    && index.is_some_and(|i| i.parse::<usize>().is_ok())
+                    && matches!(holder, Some("extension" | "modifierExtension"));
+                if on_extension
+                    && knows_hl7_extensions(ctx.resolver)
+                    && let Some(url) = ctx.extension_urls.last().cloned()
+                {
+                    // In the HL7 validator's wording, on the extension.
+                    let allowed: Vec<String> =
+                        choices.iter().map(|c| extension_value_type(c)).collect();
+                    let message = format!(
+                        "The Extension '{url}' definition allows for the types [{}] but found type {}",
+                        allowed.join(", "),
+                        extension_value_type(branch)
+                    );
+                    let key = branch.to_string();
+                    ctx.path.pop();
+                    ctx.error(ErrorKind::ChoiceExcluded, message);
+                    ctx.path.push_key(&key);
+                } else {
+                    let message = errors::msg_choice_excluded(branch);
+                    ctx.error(ErrorKind::ChoiceExcluded, message);
+                }
             }
         }
     }
@@ -1134,7 +1159,7 @@ fn has_key(obj: &serde_json::Map<String, Value>, key: &str) -> bool {
     obj.contains_key(key) || obj.contains_key(&format!("_{key}"))
 }
 
-fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
+fn validate_excluded(ctx: &mut WalkCtx<'_>, set: &SchemaSet, excluded: &[String], data: &Value) {
     let Some(obj) = data.as_object() else {
         ctx.error(
             ErrorKind::Type,
@@ -1142,12 +1167,89 @@ fn validate_excluded(ctx: &mut WalkCtx<'_>, excluded: &[String], data: &Value) {
         );
         return;
     };
+    if let Some(url) = obj.get("url").and_then(Value::as_str)
+        && knows_hl7_extensions(ctx.resolver)
+        && let Some(found) = excluded
+            .iter()
+            .find(|k| k.len() > 5 && k.starts_with("value") && obj.contains_key(k.as_str()))
+    {
+        // An extension's value of a type its definition does not allow,
+        // in the HL7 validator's wording.
+        let all_excluded: HashSet<&str> = set
+            .schemas()
+            .filter_map(|s| s.excluded.as_ref())
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut allowed: Vec<String> = Vec::new();
+        for schema in set.schemas() {
+            let choices = schema
+                .elements
+                .as_ref()
+                .and_then(|e| e.get("value"))
+                .and_then(|v| v.choices.as_ref());
+            for c in choices.into_iter().flatten() {
+                let name = extension_value_type(c);
+                if !all_excluded.contains(c.as_str()) && !allowed.contains(&name) {
+                    allowed.push(name);
+                }
+            }
+        }
+        if !allowed.is_empty() {
+            ctx.error(
+                ErrorKind::Excluded,
+                format!(
+                    "The Extension '{url}' definition allows for the types [{}] but found type {}",
+                    allowed.join(", "),
+                    extension_value_type(found)
+                ),
+            );
+            return;
+        }
+    }
     for key in excluded {
         ctx.path.push_key(key);
         if obj.contains_key(key) {
             ctx.error(ErrorKind::Excluded, errors::msg_excluded(key));
         }
         ctx.path.pop();
+    }
+}
+
+/// The FHIR type of a `value[x]` branch key (`valueUri` → `uri`,
+/// `valueCodeableConcept` → `CodeableConcept`).
+fn extension_value_type(key: &str) -> String {
+    const PRIMITIVES: &[&str] = &[
+        "base64Binary",
+        "boolean",
+        "canonical",
+        "code",
+        "date",
+        "dateTime",
+        "decimal",
+        "id",
+        "instant",
+        "integer",
+        "integer64",
+        "markdown",
+        "oid",
+        "positiveInt",
+        "string",
+        "time",
+        "unsignedInt",
+        "uri",
+        "url",
+        "uuid",
+    ];
+    let rest = key.strip_prefix("value").unwrap_or(key);
+    let mut lower = rest.to_string();
+    if let Some(first) = lower.get(..1) {
+        lower.replace_range(..1, &first.to_ascii_lowercase());
+    }
+    if PRIMITIVES.contains(&lower.as_str()) {
+        lower
+    } else {
+        rest.to_string()
     }
 }
 

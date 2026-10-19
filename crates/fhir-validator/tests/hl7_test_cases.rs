@@ -1411,3 +1411,30 @@ async fn duration_relative_bounds() {
         assert!(errors(&validate_with(&p(good), &[sd(key, years)], &[&url]).await).is_empty());
     }
 }
+
+/// `ips-htmlrefs-backwards`: an extension value of a type the definition
+/// does not allow is reported on the extension, naming the allowed types.
+#[tokio::test]
+async fn extension_value_of_a_disallowed_type() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/link",
+        "name": "Link", "status": "active", "kind": "complex-type", "abstract": false,
+        "context": [{"type": "element", "expression": "Element"}],
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "differential": {"element": [
+            {"id": "Extension", "path": "Extension"},
+            {"id": "Extension.url", "path": "Extension.url", "fixedUri": "http://example.org/StructureDefinition/link"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "url"}]}]}
+    });
+    let patient = json!({"resourceType": "Patient", "extension": [
+        {"url": "http://example.org/StructureDefinition/link", "valueUri": "#a"}]});
+    let issues = validate_with(&patient, &[sd], &[]).await;
+    let errs = errors(&issues);
+    assert!(
+        errs.iter().any(|e| e.path == "Patient.extension.0"
+            && e.message == "The Extension 'http://example.org/StructureDefinition/link' definition allows for the types [url] but found type uri"),
+        "{issues:#?}"
+    );
+}
