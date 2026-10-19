@@ -1448,14 +1448,37 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                 Some(v) => format!("{sys}|{v}"),
                 None => sys.to_string(),
             };
+            let (text, message_id) = if status == "draft" && value_set_url.is_some() {
+                // A draft CodeSystem is only worth a note when a ValueSet that
+                // is not itself a draft relies on it (IG
+                // `deprecated/draft-validate`: MSG_DRAFT_SRC_STATUS).
+                match value_set_status(backend, ctx, value_set_url.unwrap_or_default()).await {
+                    Some((vs_status, _)) if vs_status == "draft" => continue,
+                    Some((vs_status, vs_uri)) => (
+                        format!(
+                            "Reference to draft CodeSystem {cs_uri} from {vs_status} ValueSet {vs_uri}"
+                        ),
+                        "MSG_DRAFT_SRC_STATUS",
+                    ),
+                    None => (
+                        format!("Reference to draft CodeSystem {cs_uri}"),
+                        status_message_id(&status),
+                    ),
+                }
+            } else {
+                (
+                    format!("Reference to {status} CodeSystem {cs_uri}"),
+                    status_message_id(&status),
+                )
+            };
             resp.issues.push(ValidationIssue {
                 severity: "information".into(),
                 fhir_code: "business-rule".into(),
                 tx_code: "status-check".into(),
-                text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                text,
                 expression: None,
                 location: None,
-                message_id: Some(status_message_id(&status).into()),
+                message_id: Some(message_id.into()),
             });
         }
     }
@@ -1724,6 +1747,38 @@ fn concept_marked_deprecated(concept: &Value) -> bool {
     false
 }
 
+/// `(status, url|version)` of the stored ValueSet `vs_url` (`url` or
+/// `url|version`) names.
+async fn value_set_status<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    vs_url: &str,
+) -> Option<(String, String)> {
+    let (url, version) = match vs_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (vs_url, None),
+    };
+    let vs = crate::traits::ValueSetOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(url.to_string()),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    let status = vs.get("status").and_then(|v| v.as_str())?.to_string();
+    let uri = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    Some((status, uri))
+}
+
 /// Collect the standards-status codes (deprecated, withdrawn, draft, etc.)
 /// declared on a CodeSystem or ValueSet resource_json. Used by the
 /// validate-code response builder to emit IG `MSG_DEPRECATED`-style
@@ -1743,8 +1798,13 @@ fn collect_status_check_codes(resource: &Value) -> Vec<String> {
                     "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
                 )
             {
+                // `normative`, `trial-use`, `informative`, `external` are
+                // ordinary maturity levels, not something a user of the
+                // code system needs warning about.
                 if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
-                    push_unique(code);
+                    if matches!(code, "deprecated" | "withdrawn" | "draft") {
+                        push_unique(code);
+                    }
                 }
             }
         }

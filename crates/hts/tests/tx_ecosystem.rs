@@ -287,3 +287,45 @@ async fn incomplete_validate_code_input() {
     assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
     assert_eq!(tx_codes(&body), ["invalid-data"]);
 }
+
+/// deprecated/draft-validate: a draft CodeSystem used by an active ValueSet
+/// is noted as such; a normative one is not noted at all.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn status_check_notes() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(
+        &json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "draft", "url": "http://hts.test/draft",
+              "version": "0.1.0", "status": "draft", "content": "complete",
+              "concept": [{"code": "a", "display": "A"}]}},
+            {"resource": {"resourceType": "CodeSystem", "id": "norm", "url": "http://hts.test/norm",
+              "version": "1.0", "status": "active", "content": "complete",
+              "extension": [{"url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                             "valueCode": "normative"}],
+              "concept": [{"code": "b", "display": "B"}]}},
+            {"resource": {"resourceType": "ValueSet", "id": "both", "url": "http://hts.test/vs/both",
+              "version": "1.0", "status": "active",
+              "compose": {"include": [{"system": "http://hts.test/draft"}, {"system": "http://hts.test/norm"}]}}}
+        ]})
+        .to_string(),
+    )
+    .await;
+
+    let coding = |system: &str, code: &str| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://hts.test/vs/both"},
+            {"name": "coding", "valueCoding": {"system": system, "code": code}}
+        ]})
+    };
+    let body = vs_validate(&app, coding("http://hts.test/draft", "a")).await;
+    let notes = issues(&body);
+    assert_eq!(notes.len(), 1, "{body}");
+    assert_eq!(
+        notes[0]["details"]["text"],
+        "Reference to draft CodeSystem http://hts.test/draft|0.1.0 from active ValueSet http://hts.test/vs/both|1.0"
+    );
+
+    let body = vs_validate(&app, coding("http://hts.test/norm", "b")).await;
+    assert!(issues(&body).is_empty(), "{body}");
+}
