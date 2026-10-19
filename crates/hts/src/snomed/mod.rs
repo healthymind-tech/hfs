@@ -3,6 +3,7 @@
 
 /// The SNOMED CT code system URI.
 pub const SNOMED_URL: &str = "http://snomed.info/sct";
+pub mod ecl;
 pub mod model;
 pub mod scg;
 pub mod store;
