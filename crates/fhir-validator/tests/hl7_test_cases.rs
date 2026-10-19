@@ -1944,3 +1944,58 @@ async fn candidate_failures_are_listed_per_profile() {
     .await;
     assert_eq!(errors(&issues).len(), 3, "{issues:#?}");
 }
+
+/// `bnd-slicing-cgm#profile` (cgm-summary.hasMember): a `resolve().code`
+/// value discriminator takes its value from the slices' target profiles.
+#[tokio::test]
+async fn resolved_discriminator_values_from_target_profiles() {
+    let obs_profile = |name: &str, code: &str| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{name}"),
+            "name": name, "status": "active", "kind": "resource", "abstract": false,
+            "type": "Observation", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+            "differential": {"element": [{"id": "Observation.code", "path": "Observation.code",
+                "patternCodeableConcept": {"coding": [{"system": "http://example.org/cs", "code": code}]}}]}
+        })
+    };
+    let summary = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/summary",
+        "name": "Summary", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [
+            {"id": "Observation.hasMember", "path": "Observation.hasMember",
+             "slicing": {"discriminator": [{"type": "value", "path": "resolve().code"}], "rules": "open"}},
+            {"id": "Observation.hasMember:a", "path": "Observation.hasMember", "sliceName": "a", "min": 1,
+             "type": [{"code": "Reference", "targetProfile": ["http://example.org/StructureDefinition/a"]}]},
+            {"id": "Observation.hasMember:b", "path": "Observation.hasMember", "sliceName": "b", "min": 1,
+             "type": [{"code": "Reference", "targetProfile": ["http://example.org/StructureDefinition/b"]}]}
+        ]}
+    });
+    let obs = |id: &str, code: &str| {
+        json!({"fullUrl": format!("http://example.org/fhir/Observation/{id}"),
+        "resource": {"resourceType": "Observation", "id": id, "status": "final",
+            "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}}})
+    };
+    let mut s = obs("s", "s");
+    s["resource"]["meta"] = json!({"profile": ["http://example.org/StructureDefinition/summary"]});
+    s["resource"]["hasMember"] = json!([{"reference": "Observation/m"}]);
+    let bundle =
+        json!({"resourceType": "Bundle", "type": "collection", "entry": [s, obs("m", "a")]});
+    let issues = validate_with(
+        &bundle,
+        &[obs_profile("a", "a"), obs_profile("b", "b"), summary],
+        &[],
+    )
+    .await;
+    let missing: Vec<String> = errors(&issues)
+        .iter()
+        .filter_map(|e| e.hl7_message.clone())
+        .filter(|m| m.contains("a matching slice is required"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{issues:#?}");
+    assert!(missing[0].contains("hasMember:b"), "{missing:?}");
+}

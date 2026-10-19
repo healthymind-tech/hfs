@@ -375,6 +375,22 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
             .filter_map(|r| ctx.resolve_reference(r))
             .collect();
         let profiles = strings("profiles");
+        if part.get("type").and_then(Value::as_str) == Some("profile-value") {
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = profiles
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return !targets.is_empty();
+            }
+            return targets.iter().any(|t| {
+                values_at(t, rest)
+                    .into_iter()
+                    .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+            });
+        }
         return match part.get("type").and_then(Value::as_str) {
             Some("profile") => targets
                 .iter()

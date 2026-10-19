@@ -237,6 +237,22 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
 /// after `resolve()`, or a value/pattern discriminator through it, stays
 /// untranslatable.
 fn resolve_part(node: &super::tree::Node, disc: &EdDiscriminator) -> Option<Value> {
+    // `resolve().code` (value/pattern): the value is the one the target
+    // profiles fix at `code`.
+    if matches!(disc.type_.as_str(), "value" | "pattern")
+        && let Some((prefix, rest)) = disc.path.split_once("resolve().")
+    {
+        let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
+        let prefix = if prefix.is_empty() { "$this" } else { prefix };
+        let target = node_at(node, prefix)?;
+        if target.type_target_profiles.is_empty() {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "profile-value", "path": prefix, "resolve": true,
+            "profiles": target.type_target_profiles, "rest": rest,
+        }));
+    }
     let prefix = disc.path.strip_suffix("resolve()")?;
     let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
     let prefix = if prefix.is_empty() { "$this" } else { prefix };
