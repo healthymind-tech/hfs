@@ -492,3 +492,35 @@ async fn expansion_status_of_an_inactive_concept() {
         "{body}"
     );
 }
+
+/// properties/expand-with-valueset.compose.property-*: the ValueSet's
+/// compose.property (here `*`) selects the properties of the expansion,
+/// and a Coding property keeps its own system.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn expansion_properties_from_compose_property() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&props_bundle()).await;
+    let (st, body) = app
+        .get_fhir("/ValueSet/$expand?url=http://hts.test/vs/props-all")
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let declared: Vec<String> = r5_props(
+        &body["expansion"],
+        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.expansion.property",
+    )
+    .iter()
+    .filter_map(|p| p["code"].as_str().map(str::to_owned))
+    .collect();
+    assert!(
+        declared.iter().any(|c| c == "colour") && declared.iter().any(|c| c == "link"),
+        "{body}"
+    );
+    assert!(contains_props(&body, "a").contains(&json!({"code": "colour", "valueString": "red"})));
+    let link = contains_props(&body, "b")
+        .into_iter()
+        .find(|p| p["code"] == "link")
+        .unwrap();
+    assert_eq!(link["valueCoding"]["system"], "http://elsewhere.test");
+    assert_eq!(link["valueCoding"]["code"], "x");
+}

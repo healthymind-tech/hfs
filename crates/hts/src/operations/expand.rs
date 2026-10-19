@@ -232,10 +232,12 @@ fn serialize_expansion_contains(
                     "Decimal" => "valueDecimal",
                     "DateTime" => "valueDateTime",
                     "Code" => "valueCode",
-                    "Coding" => "valueCoding",
+                    "Coding" | CODING_JSON => "valueCoding",
                     _ => "valueString",
                 };
-                let value: Value = if key == "valueCoding" {
+                let value: Value = if p.value_type == CODING_JSON {
+                    serde_json::from_str(&p.value).unwrap_or(Value::Null)
+                } else if key == "valueCoding" {
                     json!({"system": c.system, "code": p.value})
                 } else if key == "valueBoolean" {
                     json!(p.value == "true")
@@ -405,6 +407,111 @@ fn populate_designations<'a, B: TerminologyBackend>(
     })
 }
 
+/// `ExpansionContainsProperty::value_type` of a Coding property whose
+/// `value` is the full Coding as JSON.
+const CODING_JSON: &str = "CodingJson";
+
+/// Index the `valueCoding` properties of a stored CodeSystem's concepts by
+/// `(system, concept code, property code, coding code)`.
+fn collect_coding_properties(
+    system: &str,
+    concepts: Option<&Vec<Value>>,
+    out: &mut std::collections::HashMap<(String, String, String, String), Value>,
+) {
+    for concept in concepts.into_iter().flatten() {
+        let Some(code) = concept.get("code").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        for prop in concept
+            .get("property")
+            .and_then(|p| p.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(pcode), Some(coding)) = (
+                prop.get("code").and_then(|c| c.as_str()),
+                prop.get("valueCoding"),
+            ) {
+                if let Some(ccode) = coding.get("code").and_then(|c| c.as_str()) {
+                    out.insert(
+                        (system.into(), code.into(), pcode.into(), ccode.into()),
+                        coding.clone(),
+                    );
+                }
+            }
+        }
+        collect_coding_properties(
+            system,
+            concept.get("concept").and_then(|c| c.as_array()),
+            out,
+        );
+    }
+}
+
+/// The property codes a ValueSet asks its expansions to carry:
+/// `compose.property` (R5) or, in R4, the cross-version extension
+/// `extension-ValueSet.compose.property` on `compose`.
+fn compose_properties(vs: &Value) -> Vec<String> {
+    let Some(compose) = vs.get("compose") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = compose
+        .get("property")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(exts) = compose.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.property",
+                )
+            {
+                if let Some(code) = ext
+                    .get("valueCode")
+                    .or_else(|| ext.get("valueString"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.push(code.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `property[].code`s the CodeSystem `system` declares.
+async fn cs_declared_property_codes<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+) -> Vec<String> {
+    let hits = crate::traits::CodeSystemOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(system.to_string()),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_default();
+    hits.first()
+        .and_then(|cs| cs.get("property"))
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("code").and_then(|c| c.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Populate `properties` on each expansion entry from a per-system batched
 /// lookup of the named properties. Mirrors `populate_designations`. Walks
 /// nested `contains[]` recursively.
@@ -433,6 +540,9 @@ fn populate_properties<'a, B: TerminologyBackend>(
         // `parameters/parameters-expand-supplement-good` fixture's `prop1`
         // entry which the IG pins as a `valueString`.
         let mut prop_types_by_system: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Coding-valued properties are stored by code only; their full
+        // Coding (system, version, display) comes from the stored resource.
+        let mut codings: HashMap<(String, String, String, String), Value> = HashMap::new();
         // Per-system: issue (property-values, CS-search) concurrently inside
         // each task via `tokio::join!`, and fan all per-system tasks out via
         // `join_all` so multi-system VS expansions don't pay N×serialised
@@ -467,6 +577,11 @@ fn populate_properties<'a, B: TerminologyBackend>(
             if let Some(hits) = cs_opt {
                 let mut type_map: HashMap<String, String> = HashMap::new();
                 for cs in &hits {
+                    collect_coding_properties(
+                        &system,
+                        cs.get("concept").and_then(|c| c.as_array()),
+                        &mut codings,
+                    );
                     if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
                         for entry in props {
                             if let (Some(code), Some(ty)) = (
@@ -528,6 +643,20 @@ fn populate_properties<'a, B: TerminologyBackend>(
                             None if code == "definition" => "string".to_string(),
                             None => "Code".to_string(),
                         };
+                        if value_type == "Coding" {
+                            if let Some(full) = codings.get(&(
+                                c.system.clone(),
+                                c.code.clone(),
+                                code.clone(),
+                                value.clone(),
+                            )) {
+                                return ExpansionContainsProperty {
+                                    code,
+                                    value_type: CODING_JSON.into(),
+                                    value: full.to_string(),
+                                };
+                            }
+                        }
                         ExpansionContainsProperty {
                             code,
                             value_type,
@@ -2365,6 +2494,39 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .map(str::to_string)
         })
         .collect();
+    // Without `property` parameters, the ValueSet may name the properties
+    // itself (`compose.property`, R5; the R5 cross-version extension in R4).
+    let mut requested_properties = requested_properties;
+    if requested_properties.is_empty() {
+        let vs_for_props = source_vs
+            .clone()
+            .or_else(|| super::params::find_resource_param(&params, "valueSet"));
+        if let Some(vs) = vs_for_props.as_ref() {
+            requested_properties = compose_properties(vs);
+        }
+    }
+    // `*`: every property the contributing CodeSystems define.
+    if requested_properties.iter().any(|p| p == "*") {
+        let mut systems: Vec<String> = Vec::new();
+        for c in &resp.contains {
+            if !systems.contains(&c.system) {
+                systems.push(c.system.clone());
+            }
+        }
+        let mut all: Vec<String> = requested_properties
+            .iter()
+            .filter(|p| p.as_str() != "*")
+            .cloned()
+            .collect();
+        for system in &systems {
+            for code in cs_declared_property_codes(state.backend(), &ctx, system).await {
+                if !all.contains(&code) {
+                    all.push(code);
+                }
+            }
+        }
+        requested_properties = all;
+    }
     let mut population_properties: Vec<String> = requested_properties.clone();
     if !population_properties.iter().any(|p| p == "status") {
         population_properties.push("status".to_string());
