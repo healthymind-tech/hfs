@@ -25,11 +25,11 @@ pub(crate) mod messages {
     pub(crate) use super::errors::{
         msg_constraint_not_evaluable as constraint_not_evaluable,
         msg_constraints_not_evaluable as constraints_not_evaluable,
+        msg_extensible_binding as extensible_binding,
         msg_fhirpath_constraint as fhirpath_constraint,
         msg_terminology_binding as terminology_binding,
-        msg_extensible_binding as extensible_binding,
-        msg_terminology_unavailable as terminology_unavailable, msg_url_unresolved as url_unresolved,
-        msg_wrong_display as wrong_display,
+        msg_terminology_unavailable as terminology_unavailable,
+        msg_url_unresolved as url_unresolved, msg_wrong_display as wrong_display,
     };
 }
 

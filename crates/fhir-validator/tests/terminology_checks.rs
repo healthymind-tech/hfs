@@ -60,7 +60,11 @@ async fn wrong_display_on_any_coding_follows_the_display_setting() {
     assert_eq!(wrong.len(), 1, "{issues:#?}");
     assert_eq!(wrong[0].severity, Severity::Warning);
     assert_eq!(wrong[0].path, "Observation.category.0.coding.0.display");
-    assert!(wrong[0].message.starts_with("Wrong Display Name 'Vital Signs Wrong'"));
+    assert!(
+        wrong[0]
+            .message
+            .starts_with("Wrong Display Name 'Vital Signs Wrong'")
+    );
 
     handlers.display_issues = Severity::Error;
     let issues = run(&observation("Vital Signs Wrong"), &handlers).await;
@@ -181,14 +185,19 @@ async fn one_terminology_call_per_resource() {
     assert!(issues.is_empty(), "{issues:#?}");
     assert_eq!(*tx.calls.lock().unwrap(), 1);
     let asked = tx.asked.lock().unwrap();
-    assert!(asked.contains(&"cs http://loinc.org".to_string()), "{asked:?}");
+    assert!(
+        asked.contains(&"cs http://loinc.org".to_string()),
+        "{asked:?}"
+    );
     assert_eq!(
         asked.iter().filter(|a| *a == "cs http://loinc.org").count(),
         1,
         "the display-less LOINC coding is not asked: {asked:?}"
     );
     assert!(
-        asked.iter().any(|a| a.contains("v3-ObservationInterpretation")),
+        asked
+            .iter()
+            .any(|a| a.contains("v3-ObservationInterpretation")),
         "an HL7-namespace system is always asked: {asked:?}"
     );
 }
@@ -236,7 +245,11 @@ async fn unknown_hl7_code_systems_are_errors() {
         "Practitioner.qualification.0.code.coding.0.system"
     );
     assert!(
-        !tx.asked.lock().unwrap().iter().any(|a| a.contains("v2-0360")),
+        !tx.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.contains("v2-0360")),
         "a versioned system URL is judged without asking"
     );
 }
@@ -269,9 +282,9 @@ async fn extensible_bindings_warn_when_enabled() {
     assert_eq!(issues[0].severity, Severity::Warning);
     assert_eq!(issues[0].path, "Encounter.class");
     assert!(
-        issues[0]
-            .message
-            .starts_with("The Coding provided (http://example.org/casetype#01) was not found in the value set"),
+        issues[0].message.starts_with(
+            "The Coding provided (http://example.org/casetype#01) was not found in the value set"
+        ),
         "{}",
         issues[0].message
     );
