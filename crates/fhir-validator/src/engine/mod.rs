@@ -279,7 +279,18 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts);
+        self.validate_sync_with(resource, opts, None)
+    }
+
+    /// [`Self::validate_sync`], with invariants evaluated where the walk
+    /// must choose among type profiles.
+    fn validate_sync_with<'a>(
+        &'a self,
+        resource: &'a Value,
+        opts: &ValidationOptions,
+        invariants: Option<&'a walk::InvariantCheck<'a>>,
+    ) -> SyncOutcome {
+        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts, invariants);
         outcome
             .errors
             .extend(bundle_entry_type_mismatches(resource));
@@ -307,10 +318,29 @@ impl Validator {
         opts: &ValidationOptions,
         effects: &EffectHandlers<'_>,
     ) -> Vec<ValidationError> {
+        let check = |root: &Value, path: &str, id: &str, expression: &str| -> bool {
+            let Some(evaluator) = effects.constraints else {
+                return true;
+            };
+            let c = [crate::effects::DeferredConstraint {
+                path,
+                id,
+                expression,
+                own_resource: false,
+            }];
+            !matches!(
+                evaluator.evaluate_all(root, version, &c).first(),
+                Some(crate::effects::ConstraintOutcome::Failed)
+            )
+        };
+        let invariants: Option<&walk::InvariantCheck<'_>> = effects
+            .constraints
+            .is_some()
+            .then_some(&check as &walk::InvariantCheck<'_>);
         let SyncOutcome {
             mut errors,
             deferred,
-        } = self.validate_sync(resource, opts);
+        } = self.validate_sync_with(resource, opts, invariants);
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
         }

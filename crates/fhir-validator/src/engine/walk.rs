@@ -134,6 +134,10 @@ pub(super) struct WalkCtx<'a> {
     /// the nested walks of one validation. An entry is written `true` while
     /// its validation runs, so reference cycles terminate.
     conformance: Rc<RefCell<HashMap<(usize, String), bool>>>,
+    /// Evaluates one invariant (`root resource, dotted path, id,
+    /// expression` → passes) while choosing among type profiles; `None`
+    /// when the caller has no FHIRPath engine.
+    invariants: Option<&'a InvariantCheck<'a>>,
 }
 
 /// Nested slice-membership validations deeper than this are assumed to
@@ -261,6 +265,7 @@ impl<'a> WalkCtx<'a> {
             extension_urls: Vec::new(),
             nesting: self.nesting + 1,
             conformance: Rc::clone(&self.conformance),
+            invariants: self.invariants,
         };
         run(&mut nested, value, &opts)
     }
@@ -333,10 +338,14 @@ impl<'a> WalkCtx<'a> {
     }
 }
 
-pub(super) fn validate(
-    resolver: &dyn SchemaResolver,
-    resource: &Value,
+/// See [`WalkCtx::invariants`].
+pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + 'a;
+
+pub(super) fn validate<'a>(
+    resolver: &'a dyn SchemaResolver,
+    resource: &'a Value,
     opts: &ValidationOptions,
+    invariants: Option<&'a InvariantCheck<'a>>,
 ) -> SyncOutcome {
     let resource_type = resource
         .get("resourceType")
@@ -362,6 +371,7 @@ pub(super) fn validate(
         extension_urls: Vec::new(),
         nesting: 0,
         conformance: Rc::default(),
+        invariants,
     };
     run(&mut ctx, resource, opts)
 }
@@ -1511,7 +1521,62 @@ fn with_type_profiles<'a>(
         add_schemas_to_set(ctx, &mut set, Arc::clone(schema), url);
         return set;
     }
-    if !resolved.iter().any(|(url, _)| ctx.conforms_to(value, url)) {
+    // With a FHIRPath engine at hand the candidates' invariants count too
+    // (the HL7 validator evaluates them when choosing).
+    let here = ctx.path.render_dotted();
+    let root_type = value
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let rebase = |p: &str| {
+        let rest = p.strip_prefix(root_type.as_str()).unwrap_or(p);
+        let rest = rest.trim_start_matches('.');
+        if rest.is_empty() {
+            here.clone()
+        } else {
+            format!("{here}.{rest}")
+        }
+    };
+    let invariant_failures = |ctx: &WalkCtx<'a>, url: &str| -> Vec<ValidationError> {
+        let (Some(check), Some(root)) = (ctx.invariants, ctx.resources.first()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for d in ctx.nested_outcome(value, url).deferred {
+            if let Deferred::Constraint {
+                path,
+                id,
+                expression,
+                human,
+                severity,
+                ..
+            } = d
+                && matches!(severity.as_deref(), None | Some("error"))
+            {
+                let at = rebase(&path);
+                if !check(root, &at, &id, &expression) {
+                    out.push(ValidationError::new(
+                        ErrorKind::FhirpathConstraint,
+                        at,
+                        super::messages::fhirpath_constraint(&id, human.as_deref()),
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let passing: Vec<&(String, Arc<FhirSchema>)> = resolved
+        .iter()
+        .filter(|(url, _)| ctx.conforms_to(value, url) && invariant_failures(ctx, url).is_empty())
+        .collect();
+    if passing.len() == 1 && ctx.invariants.is_some() {
+        let (url, schema) = passing[0];
+        let mut set = elset.clone();
+        add_schemas_to_set(ctx, &mut set, Arc::clone(schema), url);
+        return set;
+    }
+    if passing.is_empty() {
         let names: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
         ctx.error(
             ErrorKind::SliceUnmatched,
@@ -1521,24 +1586,26 @@ fn with_type_profiles<'a>(
             ),
         );
         // and, as the HL7 validator lists them, why each candidate failed
-        let here = ctx.path.render_dotted();
-        let root = value
-            .get("resourceType")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        // The same failure from several candidates is listed once.
+        let mut listed: HashSet<(String, String)> = HashSet::new();
         for (url, _) in &resolved {
-            for e in ctx.nested_outcome(value, url).errors {
-                if e.severity != Severity::Error {
+            let mut failures: Vec<ValidationError> = ctx
+                .nested_outcome(value, url)
+                .errors
+                .into_iter()
+                .map(|mut e| {
+                    e.path = rebase(&e.path);
+                    e
+                })
+                .collect();
+            failures.extend(invariant_failures(ctx, url));
+            for e in failures {
+                if e.severity != Severity::Error
+                    || !listed.insert((e.path.clone(), e.message.clone()))
+                {
                     continue;
                 }
-                let rest = e.path.strip_prefix(root.as_str()).unwrap_or(&e.path);
-                let rest = rest.trim_start_matches('.');
-                let path = if rest.is_empty() {
-                    here.clone()
-                } else {
-                    format!("{here}.{rest}")
-                };
+                let path = e.path.clone();
                 let mut issue = e;
                 issue.message = format!("{} (validating against {url})", issue.message);
                 issue.hl7_message = issue

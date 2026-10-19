@@ -1864,3 +1864,49 @@ async fn discriminator_values_from_type_profiles() {
     assert_eq!(missing.len(), 1, "{issues:#?}");
     assert!(missing[0].contains("Bundle.entry:b"), "{missing:?}");
 }
+
+/// `inv-checks#profile`: invariants decide between type profiles too.
+#[tokio::test]
+async fn candidate_invariants_decide_type_profiles() {
+    let name_profile = |n: &str| {
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": format!("http://example.org/StructureDefinition/{n}"),
+            "name": n, "status": "active", "kind": "complex-type", "abstract": false,
+            "type": "HumanName", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/HumanName",
+            "differential": {"element": [{"id": "HumanName.given", "path": "HumanName.given",
+                "constraint": [{"key": "test1", "severity": "error", "human": "Always fail", "expression": "false"}]}]}
+        })
+    };
+    let patient_profile = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/inv-patient",
+        "name": "InvPatient", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Patient", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient.name", "path": "Patient.name",
+            "type": [{"code": "HumanName", "profile": ["http://example.org/StructureDefinition/n1",
+                                                        "http://example.org/StructureDefinition/n2"]}]}]}
+    });
+    let patient =
+        json!({"resourceType": "Patient", "name": [{"family": "Doe", "given": ["Jane"]}]});
+    let issues = validate_with(
+        &patient,
+        &[name_profile("n1"), name_profile("n2"), patient_profile],
+        &["http://example.org/StructureDefinition/inv-patient"],
+    )
+    .await;
+    let errs = errors(&issues);
+    assert!(
+        errs.iter().any(|e| e
+            .message
+            .starts_with("Unable to find a match for the specified profile")),
+        "{issues:#?}"
+    );
+    assert_eq!(
+        errs.iter().filter(|e| e.message.contains("test1")).count(),
+        1,
+        "{issues:#?}"
+    );
+}
