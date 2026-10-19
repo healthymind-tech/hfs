@@ -131,7 +131,15 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
         }
         match disc.type_.as_str() {
             "value" | "pattern" => {
-                let constant = constant_at(node, &disc.path)?;
+                // A slice that leaves one of several value/pattern
+                // discriminators unset matches any value there (the HL7
+                // validator judges it on the others).
+                let Some(constant) = constant_at(node, &disc.path) else {
+                    if discriminators.len() > 1 && disc.path != "$this" {
+                        continue;
+                    }
+                    return None;
+                };
                 if disc.path == "$this" {
                     if discriminators.len() > 1 {
                         return None; // $this plus siblings — ambiguous

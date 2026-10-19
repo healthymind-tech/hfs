@@ -1534,3 +1534,43 @@ fn empty_primitives_break_ele1() {
         "{errs:#?}"
     );
 }
+
+/// `type-subtype-slicing3#profile`: a slice that sets only one of two
+/// pattern discriminators matches on that one.
+#[tokio::test]
+async fn slice_setting_one_of_two_discriminators() {
+    let pattern =
+        |code: &str| json!({"coding": [{"system": "http://example.org/cs", "code": code}]});
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/ranges",
+        "name": "Ranges", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [
+            {"id": "Observation.referenceRange", "path": "Observation.referenceRange", "slicing": {
+                "discriminator": [{"type": "pattern", "path": "type"}, {"type": "pattern", "path": "appliesTo"}],
+                "rules": "open"}},
+            {"id": "Observation.referenceRange:s3", "path": "Observation.referenceRange", "sliceName": "s3", "min": 1, "max": "1"},
+            {"id": "Observation.referenceRange:s3.type", "path": "Observation.referenceRange.type", "patternCodeableConcept": pattern("t")}
+        ]}
+    });
+    let range = |a: &str| json!({"type": pattern("t"), "appliesTo": [pattern(a)], "text": "x"});
+    let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "c"},
+        "referenceRange": [range("a"), range("b")]});
+    let issues = validate_with(
+        &obs,
+        &[sd],
+        &["http://example.org/StructureDefinition/ranges"],
+    )
+    .await;
+    let errs = errors(&issues);
+    assert_eq!(errs.len(), 1, "{issues:#?}");
+    assert!(
+        errs[0]
+            .hl7_message
+            .as_deref()
+            .is_some_and(|m| m.contains("max allowed = 1, but found 2")),
+        "{issues:#?}"
+    );
+}
