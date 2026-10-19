@@ -360,6 +360,14 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             && !key.starts_with('_')
         {
             schema.pattern = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("minValue")
+            && !rest.is_empty()
+        {
+            schema.min_value = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("maxValue")
+            && !rest.is_empty()
+        {
+            schema.max_value = Some(value.clone());
         }
     }
 }

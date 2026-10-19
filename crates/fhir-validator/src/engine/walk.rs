@@ -771,6 +771,21 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 errors::msg_pattern_value(pattern, data),
             );
         }
+        for (bound, below) in [(&schema.min_value, true), (&schema.max_value, false)] {
+            let Some(bound) = bound else { continue };
+            let ordering = super::bounds::compare(data, bound);
+            let violated = match ordering {
+                Some(std::cmp::Ordering::Less) => below,
+                Some(std::cmp::Ordering::Greater) => !below,
+                _ => false,
+            };
+            if violated {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    super::bounds::message(data, bound, below),
+                );
+            }
+        }
         if let Some(constraints) = &schema.constraints {
             let path = ctx.path.render_dotted();
             // A resource definition's own root invariants (vs a profile's
@@ -1623,6 +1638,8 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         choice_of,
         fixed,
         pattern,
+        min_value,
+        max_value,
         binding,
         constraints,
         refers,

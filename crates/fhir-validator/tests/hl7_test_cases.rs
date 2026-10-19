@@ -406,3 +406,52 @@ fn json_representation_rules() {
     assert_eq!(errs.len(), 1, "{errs:#?}");
     assert_eq!(errs[0].0, "Condition.contained.1");
 }
+
+/// `obs-value-min`, `obs-value-min-g`, `pat-minvalue-date`, `param-mintime`:
+/// a profile's `minValue[x]` / `maxValue[x]` bound the data.
+#[tokio::test]
+async fn min_and_max_values() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/bounded",
+        "name": "Bounded", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [
+            {"id": "Observation.value[x]", "path": "Observation.value[x]",
+             "type": [{"code": "Quantity"}],
+             "minValueQuantity": {"value": 0, "system": "http://unitsofmeasure.org", "code": "kg"},
+             "maxValueQuantity": {"value": 10, "system": "http://unitsofmeasure.org", "code": "kg"}},
+            {"id": "Observation.effective[x]", "path": "Observation.effective[x]",
+             "type": [{"code": "dateTime"}], "minValueDateTime": "2025-01-01"}
+        ]}
+    });
+    let url = "http://example.org/StructureDefinition/bounded";
+    let obs = |value: f64, unit: &str, effective: &str| {
+        json!({"resourceType": "Observation", "status": "final", "code": {"text": "weight"},
+               "effectiveDateTime": effective,
+               "valueQuantity": {"value": value, "system": "http://unitsofmeasure.org", "code": unit}})
+    };
+    let count = |issues: Vec<ValidationError>| {
+        issues
+            .iter()
+            .filter(|e| e.severity == Severity::Error && e.message.contains("than the specified"))
+            .count()
+    };
+    assert_eq!(
+        count(validate_with(&obs(5.0, "kg", "2025-06-01"), &[sd.clone()], &[url]).await),
+        0
+    );
+    assert_eq!(
+        count(validate_with(&obs(-1.0, "g", "2025-06-01"), &[sd.clone()], &[url]).await),
+        1
+    );
+    assert_eq!(
+        count(validate_with(&obs(11000.0, "g", "2025-06-01"), &[sd.clone()], &[url]).await),
+        1
+    );
+    assert_eq!(
+        count(validate_with(&obs(5.0, "kg", "2024-12-31"), &[sd], &[url]).await),
+        1
+    );
+}

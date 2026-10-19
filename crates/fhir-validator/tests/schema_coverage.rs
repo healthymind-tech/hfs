@@ -101,6 +101,8 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             choice_of: Some(String::new()),
             fixed: Some(Value::Null),
             pattern: Some(Value::Null),
+            min_value: Some(Value::Null),
+            max_value: Some(Value::Null),
             binding: Some(Binding {
                 value_set: String::new(),
                 strength: None,
@@ -166,7 +168,11 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // treats "not an array" as "must be singular" (`engine/walk.rs`) —
         // stricter than the format's tri-state, so nothing is lost on packs we
         // generate ourselves.
-        Ctx::Schema => &["scalar"],
+        //
+        // `minValue` / `maxValue`: the packs predate the keywords (stored and
+        // IG profiles carry them); regenerating the packs would emit the few
+        // core ones.
+        Ctx::Schema => &["scalar", "minValue", "maxValue"],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.
         // (`order` used to live here — the converter now emits it under

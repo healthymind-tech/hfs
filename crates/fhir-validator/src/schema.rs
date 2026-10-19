@@ -117,6 +117,13 @@ pub struct FhirSchema {
     /// equal; extra data keys permitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<Value>,
+    /// `minValue[x]` of the element definition: the value (a number, a
+    /// date/time string, or a Quantity) the data must not be below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<Value>,
+    /// `maxValue[x]`: the value the data must not exceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<Value>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,
