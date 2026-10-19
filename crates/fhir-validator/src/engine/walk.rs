@@ -259,6 +259,11 @@ impl<'a> WalkCtx<'a> {
         self.error_from(kind, message, severity, None);
     }
 
+    /// Record an obligation for the effects pass.
+    pub(super) fn defer(&mut self, deferred: Deferred) {
+        self.deferred.push(deferred);
+    }
+
     /// Emit an issue attributed to the profile `source` (see
     /// [`ValidationError::source`]).
     pub(super) fn error_from(

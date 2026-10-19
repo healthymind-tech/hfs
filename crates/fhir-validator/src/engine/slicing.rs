@@ -27,13 +27,17 @@
 //! context, never across resource types), a presence check, and — for
 //! discriminators through `resolve()` — type/profile checks on the
 //! resource a Reference resolves to (contained, or inside the enclosing
-//! Bundle by the fullUrl rules). `binding` matchers are not evaluated. A
+//! Bundle by the fullUrl rules). `binding` matchers (value-set
+//! membership) need a terminology service: the walk defers them
+//! ([`Deferred::SliceMembership`]) together with the `closed` check and the
+//! cardinality of those slices. A
 //! slice whose matcher we cannot evaluate matches nothing — and then makes
 //! `closed`/`openAtEnd` unjudgeable for unmatched items — and a slice with
 //! no `match` at all (a constraining slice) also matches nothing.
 
 use super::errors::{self, ErrorKind, Severity};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
+use crate::effects::{Deferred, SliceBinding};
 use crate::schema::{Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -42,6 +46,23 @@ use std::sync::Arc;
 
 /// The reserved slice name that absorbs unmatched items in closed slicing.
 const DEFAULT_SLICE: &str = "@default";
+
+/// The match type of a slice whose membership is value-set membership (a
+/// `value`/`pattern` discriminator answered by a required binding).
+const BINDING_MATCH: &str = "binding";
+
+/// `(path, valueSet)` of a binding-matched slice.
+fn binding_of(slice: &Slice) -> Option<(&str, &str)> {
+    let m = slice.match_.as_ref()?;
+    if m.type_.as_deref() != Some(BINDING_MATCH) {
+        return None;
+    }
+    let v = m.value.as_ref()?;
+    Some((
+        v.get("path").and_then(Value::as_str).unwrap_or("$this"),
+        v.get("valueSet").and_then(Value::as_str)?,
+    ))
+}
 
 struct LayerMark {
     slicing: Slicing,
@@ -206,7 +227,62 @@ pub(super) fn validate_slices<'a>(
         // The element the slicing sits on, without array indices, for the
         // HL7 wording (`Observation.component:SystolicBP`).
         let element = ctx.path.render_unindexed();
+
+        // Slices decided by value-set membership: the items no other slice
+        // took, and the cardinality of those slices, are judged in the
+        // effects pass, where a terminology service can answer.
+        let binding_slices: Vec<SliceBinding> = mark
+            .slicing
+            .slices
+            .iter()
+            .filter_map(|(name, slice)| {
+                let (path, value_set) = binding_of(slice)?;
+                Some(SliceBinding {
+                    name: name.clone(),
+                    value_set: value_set.to_string(),
+                    min: slice.min,
+                    max: slice.max,
+                    path: path.to_string(),
+                })
+            })
+            .collect();
+        if !binding_slices.is_empty() {
+            let others_decidable = mark.slicing.slices.iter().all(|(name, slice)| {
+                name == DEFAULT_SLICE || is_decidable(slice) || binding_of(slice).is_some()
+            });
+            let closed = rules == "closed"
+                && others_decidable
+                && !mark.slicing.slices.contains_key(DEFAULT_SLICE);
+            let unmatched: Vec<(usize, Vec<Value>)> = items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mark.item_matches[*index].is_empty())
+                .map(|(index, item)| {
+                    let values = binding_slices
+                        .iter()
+                        .map(|b| {
+                            values_at(item, &b.path)
+                                .first()
+                                .map_or(Value::Null, |v| (*v).clone())
+                        })
+                        .collect();
+                    (index, values)
+                })
+                .collect();
+            ctx.defer(Deferred::SliceMembership {
+                path: ctx.path.render_dotted(),
+                element: element.clone(),
+                source: mark.source.clone(),
+                closed,
+                items: unmatched,
+                slices: binding_slices,
+            });
+        }
+
         for (name, slice) in &mark.slicing.slices {
+            if binding_of(slice).is_some() {
+                continue; // judged with the membership answers
+            }
             let found = mark.counters[name];
             if let Some(min) = slice.min
                 && min > 0
@@ -265,7 +341,10 @@ pub(crate) fn slice_matches(slice: &Slice, item: &Value) -> bool {
 /// discriminator answered by a required binding) matches nothing, so under
 /// `rules: closed` an unmatched item may well belong to it.
 fn is_decidable(slice: &Slice) -> bool {
-    slice.match_.is_some()
+    slice
+        .match_
+        .as_ref()
+        .is_some_and(|m| m.type_.as_deref() != Some(BINDING_MATCH))
         || slice
             .schema
             .as_ref()
@@ -284,6 +363,10 @@ fn slice_matches_in<'a>(
     item: &'a Value,
 ) -> bool {
     if let Some(match_) = &slice.match_ {
+        if match_.type_.as_deref() == Some(BINDING_MATCH) {
+            // Value-set membership: decided in the effects pass.
+            return false;
+        }
         if match_.type_.as_deref() == Some("all") {
             return match match_.value.as_ref() {
                 Some(Value::Array(parts)) => parts.iter().all(|p| part_matches(ctx, p, item)),

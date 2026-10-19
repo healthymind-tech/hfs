@@ -83,7 +83,7 @@ pub use editor::{
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
+    EffectHandlers, SliceBinding, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
     TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{

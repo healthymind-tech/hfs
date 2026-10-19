@@ -77,6 +77,44 @@ pub enum Deferred {
         /// The element's declared type, when the schema stated one.
         type_hint: Option<String>,
     },
+    /// Slices of one sliced array whose membership is value-set membership
+    /// (a `value`/`pattern` discriminator answered by a required binding,
+    /// as TW Core slices `Condition.code.coding`). The HL7 validator decides
+    /// them with `memberOf`; here the effects pass asks the terminology
+    /// service, then reports items no slice takes (`rules: closed`) and the
+    /// cardinality of these slices.
+    SliceMembership {
+        /// Dotted path of the sliced array element (no index).
+        path: String,
+        /// The element without indices, for the HL7 wording
+        /// (`Condition.code.coding`).
+        element: String,
+        /// The profile the slicing came from.
+        source: Option<String>,
+        /// Report items that belong to none of the slices.
+        closed: bool,
+        /// Items no other slice matched: their index and, aligned with
+        /// `slices`, the value at each slice's discriminator path (`null`
+        /// when absent).
+        items: Vec<(usize, Vec<Value>)>,
+        /// The binding-matched slices.
+        slices: Vec<SliceBinding>,
+    },
+}
+
+/// One slice of [`Deferred::SliceMembership`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SliceBinding {
+    /// Slice name.
+    pub name: String,
+    /// The value set membership in which puts an item into the slice.
+    pub value_set: String,
+    /// Discriminator path within the item (`$this`, `code`, ...).
+    pub path: String,
+    /// Slice minimum.
+    pub min: Option<u64>,
+    /// Slice maximum.
+    pub max: Option<u64>,
 }
 
 /// A coded value in one of FHIR's three coded shapes.
@@ -488,6 +526,14 @@ enum Asked<'a> {
     },
     /// A Coding at `path` (dotted, numeric indices).
     Coding { path: String, coding: &'a Value },
+    /// Is item `item` of slicing `slicing` ([`Deferred::SliceMembership`],
+    /// by position in `deferred`) in the value set of slice `slice`?
+    SliceMember {
+        slicing: usize,
+        item: usize,
+        slice: usize,
+        coded: CodedValue,
+    },
 }
 
 /// Bindings and per-coding code-system checks, asked of the provider in
@@ -558,6 +604,41 @@ async fn execute_terminology(
             coded,
         });
     }
+    // Slice membership by value set. Several layers (a profile and the
+    // profile it constrains) restate one slicing; ask each array once.
+    let mut slicings: Vec<&Deferred> = Vec::new();
+    for d in deferred {
+        let Deferred::SliceMembership { path, slices, .. } = d else {
+            continue;
+        };
+        let duplicate = slicings.iter().any(|seen| {
+            matches!(seen, Deferred::SliceMembership { path: p, slices: s, .. } if p == path && s == slices)
+        });
+        if !duplicate {
+            slicings.push(d);
+        }
+    }
+    for (slicing, d) in slicings.iter().enumerate() {
+        let Deferred::SliceMembership { items, .. } = d else {
+            continue;
+        };
+        for (item, (_, values)) in items.iter().enumerate() {
+            for (slice, value) in values.iter().enumerate() {
+                if value.is_null() {
+                    continue;
+                }
+                let Some(coded) = coded_value(value, None) else {
+                    continue;
+                };
+                asked.push(Asked::SliceMember {
+                    slicing,
+                    item,
+                    slice,
+                    coded,
+                });
+            }
+        }
+    }
     let root = resource
         .get("resourceType")
         .and_then(Value::as_str)
@@ -588,7 +669,7 @@ async fn execute_terminology(
         }
         asked.push(Asked::Coding { path, coding });
     }
-    if asked.is_empty() {
+    if asked.is_empty() && slicings.is_empty() {
         return;
     }
     let requests: Vec<TxCheck<'_>> = asked
@@ -598,10 +679,55 @@ async fn execute_terminology(
                 TxCheck::InValueSet(binding.value_set.as_str(), coded)
             }
             Asked::Coding { coding, .. } => TxCheck::Coding(coding),
+            Asked::SliceMember {
+                slicing,
+                slice,
+                coded,
+                ..
+            } => {
+                let Deferred::SliceMembership { slices, .. } = slicings[*slicing] else {
+                    unreachable!("slicings holds slice memberships only")
+                };
+                TxCheck::InValueSet(slices[*slice].value_set.as_str(), coded)
+            }
         })
         .collect();
-    let verdicts = provider.check(&requests).await;
+    let verdicts = if requests.is_empty() {
+        Vec::new()
+    } else {
+        provider.check(&requests).await
+    };
     debug_assert_eq!(verdicts.len(), asked.len(), "provider must align verdicts");
+
+    // Membership answers per slicing: [item][slice] = Some(member) or None
+    // (absent value, or the service could not judge).
+    let mut membership: Vec<Vec<Vec<Option<bool>>>> = slicings
+        .iter()
+        .map(|d| match d {
+            Deferred::SliceMembership { items, slices, .. } => {
+                vec![vec![None; slices.len()]; items.len()]
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut undecided: Vec<bool> = vec![false; slicings.len()];
+    for (asked, verdict) in asked.iter().zip(&verdicts) {
+        if let Asked::SliceMember {
+            slicing,
+            item,
+            slice,
+            ..
+        } = asked
+        {
+            match verdict {
+                Ok(v) => membership[*slicing][*item][*slice] = Some(v.valid),
+                Err(_) => undecided[*slicing] = true,
+            }
+        }
+    }
+    for (index, d) in slicings.iter().enumerate() {
+        slice_membership_issues(d, &membership[index], undecided[index], errors);
+    }
 
     for (asked, verdict) in asked.iter().zip(verdicts) {
         match asked {
@@ -656,6 +782,7 @@ async fn execute_terminology(
                     Err(_) => {}
                 }
             }
+            Asked::SliceMember { .. } => {} // judged above
             Asked::Coding { path, coding } => {
                 let Ok(verdict) = verdict else { continue };
                 if let Some(message) = verdict.wrong_display {
@@ -682,6 +809,90 @@ async fn execute_terminology(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// Issues of one [`Deferred::SliceMembership`] once the terminology service
+/// answered: an item in none of the value sets breaks `rules: closed`, and
+/// the slices' cardinality counts the items in each value set. When the
+/// service could not judge some item, only what the answers prove is
+/// reported (a maximum already exceeded); a missing item may be the one a
+/// minimum needs, or one of the slices.
+fn slice_membership_issues(
+    deferred: &Deferred,
+    membership: &[Vec<Option<bool>>],
+    undecided: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Deferred::SliceMembership {
+        path,
+        element,
+        source,
+        closed,
+        items,
+        slices,
+    } = deferred
+    else {
+        return;
+    };
+    if *closed {
+        for ((index, _), answers) in items.iter().zip(membership) {
+            // Every slice answered, and none took the item.
+            if answers.iter().all(|a| *a == Some(false)) {
+                errors.push(
+                    ValidationError::new(
+                        ErrorKind::SliceUnmatched,
+                        format!("{path}.{index}"),
+                        crate::engine::messages::slice_closed_unmatched(),
+                    )
+                    .with_source(source.clone()),
+                );
+            }
+        }
+    }
+    for (position, slice) in slices.iter().enumerate() {
+        let found = membership
+            .iter()
+            .filter(|answers| answers[position] == Some(true))
+            .count() as u64;
+        if let Some(min) = slice.min
+            && min > 0
+            && found < min
+            && !undecided
+        {
+            errors.push(
+                ValidationError::new(
+                    ErrorKind::SliceCardinality,
+                    path.clone(),
+                    crate::engine::messages::slice_min(min, found),
+                )
+                .with_source(source.clone())
+                .with_hl7_message(Some(crate::engine::messages::hl7_slice_min(
+                    element,
+                    &slice.name,
+                    min,
+                    found,
+                ))),
+            );
+        }
+        if let Some(max) = slice.max
+            && found > max
+        {
+            errors.push(
+                ValidationError::new(
+                    ErrorKind::SliceCardinality,
+                    path.clone(),
+                    crate::engine::messages::slice_max(max, found),
+                )
+                .with_source(source.clone())
+                .with_hl7_message(Some(crate::engine::messages::hl7_slice_max(
+                    element,
+                    &slice.name,
+                    max,
+                    found,
+                ))),
+            );
         }
     }
 }

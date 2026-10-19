@@ -7,7 +7,11 @@
 //! `profile` discriminators read the types/profiles declared at `P` and
 //! compile to an `all` match (see `build_match`), as do `exists`
 //! discriminators and `type`/`profile` discriminators through `resolve()`
-//! (judged on the resolved target). Discriminators we cannot evaluate
+//! (judged on the resolved target). A single `value`/`pattern`
+//! discriminator whose path has no constant but a required binding compiles
+//! to a `binding` match: membership in that value set, decided by the
+//! engine's effects pass through the terminology service, as the HL7
+//! validator does (`memberOf`). Discriminators we cannot evaluate
 //! (`extension(...)`, value/pattern through `resolve()`) produce a slice
 //! with **no match and no minimum**: it
 //! can never produce false cardinality errors, its constraints simply stay
@@ -113,7 +117,13 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
         }
         match disc.type_.as_str() {
             "value" | "pattern" => {
-                let constant = constant_at(node, &disc.path)?;
+                let Some(constant) = constant_at(node, &disc.path) else {
+                    // No fixed/pattern value at the path: the HL7 validator
+                    // decides membership by the element's required binding
+                    // (`memberOf`). That needs a terminology service, so the
+                    // engine defers it to the effects pass.
+                    return binding_match(node, discriminators);
+                };
                 if disc.path == "$this" {
                     if discriminators.len() > 1 {
                         return None; // $this plus siblings — ambiguous
@@ -169,6 +179,25 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
     Some(Match {
         type_: Some("all".to_string()),
         value: Some(Value::Array(parts)),
+        resolve_ref: None,
+    })
+}
+
+/// A single `value`/`pattern` discriminator answered by the required
+/// binding at its path (TW Core slices `Condition.code.coding` by
+/// `pattern@$this` with one bound value set per slice):
+/// `{"type": "binding", "value": {"path": P, "valueSet": vs}}`.
+fn binding_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> Option<Match> {
+    let [disc] = discriminators else {
+        return None;
+    };
+    let binding = node_at(node, &disc.path)?.schema.binding.as_ref()?;
+    if binding.strength.as_deref() != Some("required") {
+        return None;
+    }
+    Some(Match {
+        type_: Some("binding".to_string()),
+        value: Some(serde_json::json!({ "path": disc.path, "valueSet": binding.value_set })),
         resolve_ref: None,
     })
 }
