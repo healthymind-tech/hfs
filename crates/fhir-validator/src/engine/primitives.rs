@@ -81,6 +81,20 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         return;
     }
 
+    // FHIR caps strings at 1 MB (`base64Binary` and `xhtml` excepted).
+    if let Some(s) = data.as_str()
+        && s.len() > MAX_STRING_BYTES
+        && !matches!(type_name, "base64Binary" | "xhtml")
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            format!(
+                "value is longer than permitted maximum length of 1 MB ({MAX_STRING_BYTES} bytes)"
+            ),
+        );
+        return;
+    }
+
     if let Some(pattern) = &schema.regex
         && let Some(s) = data.as_str()
         && let Some(re) = compiled(pattern)
@@ -92,6 +106,9 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         );
     }
 }
+
+/// The HL7 validator's limit on a string value (FHIR: 1,048,576).
+const MAX_STRING_BYTES: usize = 1024 * 1024;
 
 /// The JSON type class a FHIR primitive requires.
 #[derive(Clone, Copy)]

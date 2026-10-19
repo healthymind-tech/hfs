@@ -538,3 +538,32 @@ fn unresolvable_contained_references() {
     assert_eq!(unresolved(&rx("#dr")), 0);
     assert_eq!(unresolved(&rx("#nobody")), 1);
 }
+
+/// `resource-invalid-eid-2`: a string longer than 1 MB is invalid; base64
+/// content is not capped.
+#[test]
+fn strings_are_capped_at_one_megabyte() {
+    let big = "x".repeat(1024 * 1024 + 1);
+    let errs = structural_errors(&json!({"resourceType": "Patient", "name": [{"text": big}]}));
+    assert_eq!(
+        errs.len(),
+        1,
+        "{:?}",
+        errs.iter().map(|e| &e.0).collect::<Vec<_>>()
+    );
+    assert!(
+        errs[0]
+            .1
+            .starts_with("value is longer than permitted maximum length")
+    );
+    let data = "QUJD".repeat(300_000);
+    let errs = structural_errors(
+        &json!({"resourceType": "Binary", "contentType": "text/plain",
+        "data": data}),
+    );
+    assert!(
+        errs.is_empty(),
+        "{:?}",
+        errs.iter().map(|e| &e.0).collect::<Vec<_>>()
+    );
+}
