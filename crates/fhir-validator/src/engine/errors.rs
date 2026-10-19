@@ -383,7 +383,10 @@ pub(crate) fn msg_wrong_display(
 /// [helios] no coding of the value is in an `extensible` binding's value
 /// set (HL7 validator wording: Terminology_TX_NoValid_2_CC /
 /// Terminology_TX_NoValid_13 / Terminology_TX_Confirm_5).
-pub(crate) fn msg_extensible_binding(coded: &crate::effects::CodedValue, value_set: &str) -> String {
+pub(crate) fn msg_extensible_binding(
+    coded: &crate::effects::CodedValue,
+    value_set: &str,
+) -> String {
     use crate::effects::CodedValue;
     let token = |c: &Value| {
         format!(
@@ -465,7 +468,9 @@ pub(crate) fn msg_unknown_schema(reference: &str) -> String {
 /// A resource profile of another resource type (HL7:
 /// `VALIDATION_VAL_PROFILE_WRONGTYPE`).
 pub(crate) fn msg_profile_wrong_type(expected: &str, actual: &str, profile: &str) -> String {
-    format!("Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'")
+    format!(
+        "Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'"
+    )
 }
 
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {
