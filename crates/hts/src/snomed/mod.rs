@@ -3,6 +3,21 @@
 
 /// The SNOMED CT code system URI.
 pub const SNOMED_URL: &str = "http://snomed.info/sct";
+/// Description types.
+pub const FSN: &str = "900000000000003001";
+pub const SYNONYM: &str = "900000000000013009";
+pub const DEFINITION: &str = "900000000000550004";
+
+/// The name of a description type, for `designation.use.display`.
+pub fn description_type_name(code: &str) -> Option<&'static str> {
+    match code {
+        FSN => Some("Fully specified name"),
+        SYNONYM => Some("Synonym"),
+        DEFINITION => Some("Definition"),
+        _ => None,
+    }
+}
+
 pub mod ecl;
 pub mod model;
 pub mod mrcm;

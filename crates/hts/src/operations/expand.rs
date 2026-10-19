@@ -188,9 +188,30 @@ fn serialize_expansion_contains(
         item.insert("inactive".into(), json!(true));
     }
     if !c.designations.is_empty() {
-        let designations: Vec<Value> = c
+        // SNOMED CT: the fully specified name and the preferred terms only,
+        // as tx.fhir.org (the other synonyms are for $lookup).
+        let snomed = c.system == crate::snomed::SNOMED_URL;
+        let preferred: Vec<&str> = c
             .designations
             .iter()
+            .filter(|d| d.use_code.as_deref() == Some("preferredForLanguage"))
+            .map(|d| d.value.as_str())
+            .collect();
+        let mut chosen: Vec<_> = c
+            .designations
+            .iter()
+            .filter(|d| {
+                !snomed
+                    || (d.use_system.as_deref() == Some(crate::snomed::SNOMED_URL)
+                        && (d.use_code.as_deref() == Some(crate::snomed::FSN)
+                            || preferred.contains(&d.value.as_str())))
+            })
+            .collect();
+        if snomed {
+            chosen.sort_by_key(|d| d.use_code.as_deref() != Some(crate::snomed::FSN));
+        }
+        let designations: Vec<Value> = chosen
+            .into_iter()
             .map(|d| {
                 let mut entry = serde_json::Map::new();
                 if !d.extensions.is_empty() {
@@ -206,6 +227,11 @@ fn serialize_expansion_contains(
                     }
                     if let Some(c) = &d.use_code {
                         us.insert("code".into(), json!(c));
+                        if snomed {
+                            if let Some(name) = crate::snomed::description_type_name(c) {
+                                us.insert("display".into(), json!(name));
+                            }
+                        }
                     }
                     entry.insert("use".into(), Value::Object(us));
                 }
