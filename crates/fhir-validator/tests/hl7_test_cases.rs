@@ -514,3 +514,27 @@ fn attachment_data_size_and_hash() {
     assert_eq!(errs.len(), 1, "{errs:#?}");
     assert!(errs[0].1.contains("not valid base64"), "{errs:#?}");
 }
+
+/// `hakan-se-nofetch`: a `#id` reference naming no contained resource is
+/// unresolvable (besides ref-1); `#` (the container) and references between
+/// a container's contained resources resolve.
+#[test]
+fn unresolvable_contained_references() {
+    let unresolved = |r: &Value| {
+        structural_errors(r)
+            .into_iter()
+            .filter(|(_, m)| m.starts_with("Unable to resolve resource"))
+            .count()
+    };
+    let rx = |requester: &str| {
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+               "medicationCodeableConcept": {"text": "x"}, "subject": {"reference": "Patient/p"},
+               "requester": {"reference": requester},
+               "contained": [{"resourceType": "Practitioner", "id": "dr"},
+                             {"resourceType": "PractitionerRole", "id": "role",
+                              "practitioner": {"reference": "#dr"}}],
+               "performer": {"reference": "#role"}})
+    };
+    assert_eq!(unresolved(&rx("#dr")), 0);
+    assert_eq!(unresolved(&rx("#nobody")), 1);
+}

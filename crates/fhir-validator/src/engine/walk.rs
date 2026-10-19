@@ -245,6 +245,16 @@ impl<'a> WalkCtx<'a> {
         conforms
     }
 
+    /// Whether `#id` names a contained resource of the innermost resource,
+    /// or — from inside a contained resource — of its container.
+    pub(super) fn contained_resolves(&self, id: &str) -> bool {
+        self.contained
+            .iter()
+            .rev()
+            .take(2)
+            .any(|level| level.iter().any(|(cid, _)| cid == id))
+    }
+
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
         self.contained
             .last()?

@@ -48,6 +48,15 @@ pub(super) fn check_reference(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Val
             return;
         }
         literal_type = target_type(ctx, reference);
+        if let Some(id) = reference.strip_prefix('#')
+            && !id.is_empty()
+            && !ctx.contained_resolves(id)
+        {
+            ctx.error(
+                ErrorKind::ReferenceUnresolved,
+                format!("Unable to resolve resource with reference '{reference}'"),
+            );
+        }
     }
 
     if let (Some(lit), Some(declared)) = (literal_type.as_deref(), declared)
