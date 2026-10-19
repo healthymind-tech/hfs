@@ -1237,3 +1237,47 @@ fn primitive_with_only_an_id() {
         .is_empty()
     );
 }
+
+/// `bnd-slicing-cgm`: an item matching two slices of one slicing.
+#[tokio::test]
+async fn an_item_matching_two_slices() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/overlap",
+        "name": "Overlap", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [
+            {"id": "Observation.category", "path": "Observation.category", "slicing": {
+                "discriminator": [{"type": "pattern", "path": "$this"}], "rules": "open"}},
+            {"id": "Observation.category:a", "path": "Observation.category", "sliceName": "a",
+             "patternCodeableConcept": {"coding": [{"code": "x"}]}},
+            {"id": "Observation.category:b", "path": "Observation.category", "sliceName": "b",
+             "patternCodeableConcept": {"coding": [{"system": "http://example.org/cs"}]}}
+        ]}
+    });
+    let obs = |coding: Value| {
+        json!({"resourceType": "Observation", "status": "final",
+        "code": {"text": "t"}, "category": [{"coding": [coding]}]})
+    };
+    let url = "http://example.org/StructureDefinition/overlap";
+    let both = validate_with(
+        &obs(json!({"system": "http://example.org/cs", "code": "x"})),
+        &[sd.clone()],
+        &[url],
+    )
+    .await;
+    assert!(
+        errors(&both)
+            .iter()
+            .any(|e| e.message.contains("matches more than one slice")),
+        "{both:#?}"
+    );
+    let one = validate_with(
+        &obs(json!({"system": "http://example.org/cs", "code": "y"})),
+        &[sd],
+        &[url],
+    )
+    .await;
+    assert!(errors(&one).is_empty(), "{one:#?}");
+}

@@ -100,6 +100,29 @@ pub(super) fn validate_slices<'a>(
         });
     }
 
+    // An item may belong to one slice of a slicing (re-slices aside).
+    for mark in &marks {
+        for (index, matches) in mark.item_matches.iter().enumerate() {
+            let top: Vec<&String> = matches
+                .iter()
+                .filter(|name| mark.slicing.slices[*name].reslice.is_none() && !name.contains('/'))
+                .collect();
+            if top.len() > 1 {
+                ctx.path.push_index(index);
+                let names: Vec<&str> = top.iter().map(|n| n.as_str()).collect();
+                let message = match &mark.source {
+                    Some(profile) => format!(
+                        "Profile {profile}, Element matches more than one slice - {}",
+                        names.join(", ")
+                    ),
+                    None => format!("Element matches more than one slice - {}", names.join(", ")),
+                };
+                ctx.error(ErrorKind::SliceUnmatched, message);
+                ctx.path.pop();
+            }
+        }
+    }
+
     // ---- validate matched items (item order), consuming them ----
     let mut consumed: HashSet<usize> = HashSet::new();
     for (index, item) in items.iter().enumerate() {
@@ -278,11 +301,7 @@ fn is_decidable(slice: &Slice) -> bool {
 /// missing `match` (constraining slice) matches nothing, and a `match` with
 /// no `value` matches everything (lodash `_.isMatch` semantics for an empty
 /// source).
-fn slice_matches_in<'a>(
-    ctx: Option<&WalkCtx<'a>>,
-    slice: &Slice,
-    item: &'a Value,
-) -> bool {
+fn slice_matches_in<'a>(ctx: Option<&WalkCtx<'a>>, slice: &Slice, item: &'a Value) -> bool {
     if let Some(match_) = &slice.match_ {
         if match_.type_.as_deref() == Some("all") {
             return match match_.value.as_ref() {
