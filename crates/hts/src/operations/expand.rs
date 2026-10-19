@@ -831,7 +831,10 @@ fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String,
             let prop = f.get("property").and_then(|v| v.as_str()).unwrap_or("");
             matches!(op, "is-a" | "descendent-of") && matches!(prop, "concept" | "code")
         });
-        if is_subsumption {
+        // SNOMED CT is a polyhierarchy: tx.fhir.org keeps its subtree
+        // expansions flat (a concept would otherwise appear under every
+        // parent).
+        if is_subsumption && system != crate::snomed::SNOMED_URL {
             let version = inc
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -840,6 +843,77 @@ fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String,
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// The version a `system-version` parameter pins for `system`, if any.
+fn system_version_pin(params: &[Value], system: &str) -> Option<String> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("system-version"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+        })
+        .find_map(|s| {
+            s.split_once('|')
+                .filter(|(u, _)| *u == system)
+                .map(|(_, v)| v.to_string())
+        })
+}
+
+/// `expansion.extension` for an expansion that draws on SNOMED CT by rule.
+///
+/// SNOMED CT has a compositional grammar: besides its concepts, every valid
+/// post-coordinated expression is a member of the code system, and of any
+/// value set selecting by a hierarchy, constraint or other filter (subsumption
+/// covers refinements of the concepts it selects). Such an expansion lists
+/// only the pre-coordinated concepts, so it is not closed — tx.fhir.org marks
+/// it `valueset-unclosed`, and the whole code system additionally with a
+/// reason. Value sets that enumerate their codes, or whose filters exclude
+/// expressions (`expressions = false`), are closed.
+fn snomed_unclosed(compose_vs: Option<&Value>, url: Option<&str>) -> Option<Vec<Value>> {
+    let unclosed = json!({"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed", "valueBoolean": true});
+    let whole = || {
+        Some(vec![
+            unclosed.clone(),
+            json!({"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+                   "valueString": "The code System 'http://snomed.info/sct' has a grammar and so has infinite members"}),
+        ])
+    };
+    if let Some(u) = url {
+        if let Some(rest) = u.strip_prefix(crate::snomed::SNOMED_URL) {
+            let rest = rest.split_once('?').map(|(_, q)| q).unwrap_or(rest);
+            return match rest {
+                "fhir_vs" => whole(),
+                r if r.starts_with("fhir_vs=") => Some(vec![unclosed]),
+                _ => None,
+            };
+        }
+    }
+    let includes = compose_vs?.get("compose")?.get("include")?.as_array()?;
+    let mut by_rule = false;
+    for inc in includes {
+        if inc.get("system").and_then(Value::as_str) != Some(crate::snomed::SNOMED_URL) {
+            continue;
+        }
+        let filters = inc.get("filter").and_then(Value::as_array);
+        let has_concepts = inc.get("concept").is_some();
+        match filters {
+            Some(f) if !f.is_empty() => {
+                let closed = f.iter().any(|f| {
+                    f.get("property").and_then(Value::as_str) == Some("expressions")
+                        && f.get("value").and_then(Value::as_str) == Some("false")
+                });
+                if !closed {
+                    by_rule = true;
+                }
+            }
+            _ if !has_concepts && inc.get("valueSet").is_none() => return whole(),
+            _ => {}
+        }
+    }
+    by_rule.then(|| vec![unclosed])
 }
 
 /// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
@@ -2322,6 +2396,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // Cloned for downstream `used-valueset` echo logic which needs to apply
     // the same default-version pins to refs lacking a `|version` suffix.
     let default_value_set_versions_for_echo = default_value_set_versions.clone();
+    let (url_for_echo, inline_vs_for_echo) = (url.clone(), value_set.clone());
     let req = ExpandRequest {
         url,
         value_set_version: effective_vs_version,
@@ -4029,6 +4104,12 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 == Some("fragment")
         })
         .collect();
+    if fragment_systems.is_empty() {
+        let compose_vs = inline_vs_for_echo.as_ref().or(source_vs.as_ref());
+        if let Some(ext) = snomed_unclosed(compose_vs, url_for_echo.as_deref()) {
+            expansion["extension"] = Value::Array(ext);
+        }
+    }
     if !fragment_systems.is_empty() {
         // Match the IG fixture wording verbatim — txTests compares the string
         // (no $external$ wildcard for the reason text).
