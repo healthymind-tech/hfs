@@ -34,7 +34,7 @@
 
 use super::errors::{self, ErrorKind, Severity};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
-use crate::schema::{Slice, Slicing};
+use crate::schema::{FhirSchema, Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -363,6 +363,17 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         };
     }
     match part.get("type").and_then(Value::as_str) {
+        Some("profile-element") => {
+            let (Some(ctx), Some(url), Some(element)) = (
+                ctx,
+                part.get("url").and_then(Value::as_str),
+                part.get("element").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            library_slice(ctx, url, element)
+                .is_some_and(|slice| slice_matches_in(Some(ctx), &slice, item))
+        }
         Some("pattern") => part
             .get("value")
             .is_none_or(|pattern| is_partial_match(item, pattern)),
@@ -376,6 +387,33 @@ fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) ->
         }
         _ => false,
     }
+}
+
+/// The slice `element` (`Composition.section:codeA`) of the profile at
+/// `url`.
+fn library_slice(ctx: &WalkCtx<'_>, url: &str, element: &str) -> Option<Slice> {
+    let root = ctx
+        .resolver()
+        .resolve(url.split('|').next().unwrap_or(url))?;
+    let mut schema: Arc<FhirSchema> = root;
+    let mut found: Option<Slice> = None;
+    for segment in element.split('.').skip(1) {
+        let (name, slice) = match segment.split_once(':') {
+            Some((n, s)) => (n, Some(s)),
+            None => (segment, None),
+        };
+        let child = Arc::clone(schema.elements.as_ref()?.get(name)?);
+        found = None;
+        schema = child;
+        if let Some(slice) = slice {
+            let s = schema.slicing.as_ref()?.slices.get(slice)?.clone();
+            if let Some(inner) = &s.schema {
+                schema = Arc::clone(inner);
+            }
+            found = Some(s);
+        }
+    }
+    found
 }
 
 /// The resource type a (target) profile constrains: the name itself for a

@@ -43,7 +43,7 @@ pub(super) fn build_slicing(
             extension_profile: _,
         } = slice_node;
 
-        let match_ = build_match(&node, discriminators);
+        let match_ = build_match(&node, discriminators).or_else(|| profile_element_match(&node));
         if match_.is_none() {
             warnings.push(format!(
                 "slice '{name}': discriminator(s) {:?} not translatable to a match; \
@@ -81,6 +81,24 @@ pub(super) fn build_slicing(
         slices: out,
         rules,
         ordered,
+    })
+}
+
+/// A slice whose type profile names an element of another profile
+/// (`elementdefinition-profile-element`, a library of slices): it matches
+/// what that element's slice matches, looked up when validating.
+fn profile_element_match(node: &super::tree::Node) -> Option<Match> {
+    let parts: Vec<Value> = node
+        .profile_elements
+        .iter()
+        .map(|(url, element)| {
+            serde_json::json!({"type": "profile-element", "url": url, "element": element})
+        })
+        .collect();
+    (parts.len() == 1).then(|| Match {
+        type_: Some("all".to_string()),
+        value: Some(Value::Array(parts)),
+        resolve_ref: None,
     })
 }
 
@@ -207,7 +225,8 @@ fn exists_at(node: &super::tree::Node, path: &str) -> Option<bool> {
     };
     let name = name.strip_suffix("[x]").unwrap_or(name);
     let parent = node_at(node, parent_path)?;
-    let listed = |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| l.iter().any(|k| k == name));
+    let listed =
+        |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| l.iter().any(|k| k == name));
     if listed(&parent.schema.required) {
         return Some(true);
     }

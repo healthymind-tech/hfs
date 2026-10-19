@@ -73,6 +73,9 @@ pub(super) struct Node {
     /// The ED's `type[].targetProfile`s, for `type`/`profile` slice
     /// discriminators through `resolve()`.
     pub type_target_profiles: Vec<String>,
+    /// `(profile, element id)` of type profiles that name an element of
+    /// the profile (`elementdefinition-profile-element`).
+    pub profile_elements: Vec<(String, String)>,
 }
 
 impl Node {
@@ -291,6 +294,7 @@ fn record_types(node: &mut Node, ed: &Ed) {
         .iter()
         .flat_map(|t| t.target_profile.iter().cloned())
         .collect();
+    node.profile_elements = ed.types.iter().flat_map(EdType::profile_elements).collect();
 }
 
 /// Type reference, contentReference, and the value-level keywords.
@@ -480,6 +484,7 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
         type_codes: _,
         type_profiles: _,
         type_target_profiles: _,
+        profile_elements: _,
     } = node;
 
     if dead {

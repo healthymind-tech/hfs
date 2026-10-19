@@ -163,6 +163,33 @@ pub(crate) struct EdType {
     pub target_profile: Vec<String>,
     #[serde(default)]
     pub extension: Vec<EdTypeExtension>,
+    /// Extensions on each `profile` (`_profile`), aligned with it.
+    #[serde(rename = "_profile", default)]
+    pub profile_meta: Vec<Option<Value>>,
+}
+
+impl EdType {
+    /// `(profile, element id)` for each profile naming one of its elements
+    /// (`elementdefinition-profile-element`).
+    pub(crate) fn profile_elements(&self) -> Vec<(String, String)> {
+        const EXT: &str =
+            "http://hl7.org/fhir/StructureDefinition/elementdefinition-profile-element";
+        self.profile
+            .iter()
+            .zip(&self.profile_meta)
+            .filter_map(|(url, meta)| {
+                let element = meta
+                    .as_ref()?
+                    .get("extension")?
+                    .as_array()?
+                    .iter()
+                    .find(|e| e.get("url").and_then(Value::as_str) == Some(EXT))?
+                    .get("valueString")?
+                    .as_str()?;
+                Some((url.clone(), element.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1459,3 +1459,57 @@ async fn specialization_of_the_same_type_is_a_profile() {
     .await;
     assert_eq!(errors(&issues).len(), 1, "{issues:#?}");
 }
+
+/// `document-bad-no-sections#profile`: a slice typed by an element of a
+/// library profile (`elementdefinition-profile-element`) matches what that
+/// element's slice matches, and keeps its minimum.
+#[tokio::test]
+async fn slices_from_a_library_profile() {
+    let library = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/library",
+        "name": "Library", "status": "active", "kind": "resource", "abstract": true,
+        "type": "Composition", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Composition",
+        "differential": {"element": [
+            {"path": "Composition"},
+            {"path": "Composition.section", "slicing": {"discriminator": [{"type": "pattern", "path": "code"}], "rules": "closed"}},
+            {"path": "Composition.section", "sliceName": "codeA"},
+            {"path": "Composition.section.code", "min": 1,
+                "patternCodeableConcept": {"coding": [{"system": "http://example.org/cs", "code": "a"}]}}]}
+    });
+    let structure = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/structure",
+        "name": "Structure", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Composition", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Composition",
+        "differential": {"element": [
+            {"path": "Composition"},
+            {"path": "Composition.section", "slicing": {"discriminator": [{"type": "pattern", "path": "code"}], "rules": "open"}},
+            {"path": "Composition.section", "sliceName": "code-A", "min": 1,
+                "type": [{"code": "BackboneElement",
+                    "profile": ["http://example.org/StructureDefinition/library"],
+                    "_profile": [{"extension": [{"url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-profile-element",
+                        "valueString": "Composition.section:codeA"}]}]}]}]}
+    });
+    let composition = |code: &str| {
+        json!({
+            "resourceType": "Composition", "status": "final",
+            "type": {"text": "doc"}, "date": "2024-01-01", "title": "t", "author": [{"display": "a"}],
+            "section": [{"title": "s", "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}, "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">x</div>"}}]
+        })
+    };
+    let url = "http://example.org/StructureDefinition/structure";
+    let sds = [library, structure];
+    let bad = validate_with(&composition("b"), &sds, &[url]).await;
+    assert!(
+        errors(&bad).iter().any(|e| e
+            .hl7_message
+            .as_deref()
+            .is_some_and(|m| m.contains("code-A"))),
+        "{bad:#?}"
+    );
+    let good = validate_with(&composition("a"), &sds, &[url]).await;
+    assert!(errors(&good).is_empty(), "{good:#?}");
+}
