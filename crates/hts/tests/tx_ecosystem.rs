@@ -638,3 +638,53 @@ async fn circular_include_is_an_error() {
             .contains("vs1")
     );
 }
+
+/// extensions/validate-code-inactive-display-*: a display matching a
+/// withdrawn designation is wrong — an error (warning when lenient) naming
+/// the designation's own status and the correct display.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn inactive_display_is_an_error_unless_lenient() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(
+        &json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "disp", "url": "http://hts.test/disp",
+              "version": "1", "status": "active", "content": "complete",
+              "concept": [{"code": "c2", "display": "Display 2", "designation": [
+                {"language": "de", "value": "2nd Code", "extension": [{
+                  "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+                  "valueCode": "withdrawn"}]}]}]}}
+        ]})
+        .to_string(),
+    )
+    .await;
+    for (lenient, result, severity) in [(false, false, "error"), (true, true, "warning")] {
+        let mut p = vec![
+            json!({"name": "url", "valueUri": "http://hts.test/disp"}),
+            json!({"name": "code", "valueCode": "c2"}),
+            json!({"name": "display", "valueString": "2nd Code"}),
+        ];
+        if lenient {
+            p.push(json!({"name": "lenient-display-validation", "valueBoolean": true}));
+        }
+        let (st, body) = app
+            .post_fhir(
+                "/CodeSystem/$validate-code",
+                json!({"resourceType": "Parameters", "parameter": p}).to_string(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(
+            param(&body, "result").unwrap()["valueBoolean"],
+            result,
+            "{body}"
+        );
+        let issue = &issues(&body)[0];
+        assert_eq!(issue["severity"], severity);
+        assert_eq!(
+            issue["details"]["text"],
+            "'2nd Code' is no longer considered a correct display for code 'c2' (status = withdrawn). The correct display is 'Display 2'"
+        );
+        assert!(param(&body, "message").is_some());
+    }
+}

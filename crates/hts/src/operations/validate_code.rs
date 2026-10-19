@@ -320,6 +320,7 @@ fn build_validate_response_inner(
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                             || i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND")
+                            || i.message_id.as_deref() == Some("INACTIVE_DISPLAY_FOUND")
                             || i.message_id.as_deref()
                                 == Some("UNKNOWN_CODESYSTEM_CODING_NOT_CHECKED")
                             || i.message_id
@@ -969,6 +970,7 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
     code: &str,
     request_path: RequestPath,
     expected_display: Option<&str>,
+    lenient_display_validation: bool,
     resp: &mut ValidateCodeResponse,
 ) {
     let entry_map = match backend
@@ -1081,7 +1083,7 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
                 }
             }
         }
-        let Some(_status_code) = desig_status else {
+        let Some(status_code) = desig_status else {
             continue;
         };
         // Replace the response display with the concept's primary display so
@@ -1092,16 +1094,20 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
         // Drop any pre-existing display-mismatch issue — the supplied display
         // matched a known designation, just an inactive one.
         resp.issues.retain(|i| i.tx_code != "invalid-display");
-        let valid_str = match primary_display.as_deref() {
-            Some(d) => format!("\"{d}\""),
-            None => "(none)".to_string(),
+        let correct = match primary_display.as_deref() {
+            Some(d) => format!("The correct display is '{d}'"),
+            None => "There is no correct display".to_string(),
         };
-        // The IG fixture wording uses "(status = deprecated)" regardless of
-        // whether the designation is marked deprecated or withdrawn — the
-        // concept of "inactive display" subsumes both per the IG.
         let text = format!(
-            "'{expected}' is no longer considered a correct display for code '{code}' (status = deprecated). The correct display is one of {valid_str}."
+            "'{expected}' is no longer considered a correct display for code '{code}' (status = {status_code}). {correct}"
         );
+        // An inactive display is a wrong display: an error, unless the
+        // caller asked for lenient display validation.
+        let severity = if lenient_display_validation {
+            "warning"
+        } else {
+            "error"
+        };
         let already = resp
             .issues
             .iter()
@@ -1116,18 +1122,17 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
                 _ => ("Coding.display".to_string(), "Coding.display".to_string()),
             };
             resp.issues.push(ValidationIssue {
-                severity: "warning".into(),
+                severity: severity.into(),
                 fhir_code: "invalid".into(),
                 tx_code: "display-comment".into(),
-                text,
+                text: text.clone(),
                 expression: Some(expr_path),
                 location: Some(loc_path),
                 message_id: Some("INACTIVE_DISPLAY_FOUND".into()),
             });
         }
-        // Mark result=true so the response is "validated with warnings".
-        resp.result = true;
-        resp.message = None;
+        resp.result = lenient_display_validation;
+        resp.message = Some(text);
         break;
     }
 }
@@ -1548,6 +1553,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             cd,
             request_path,
             expected_display,
+            lenient_display_validation,
             &mut resp,
         )
         .await;
