@@ -326,6 +326,8 @@ fn bad_scheme(href: &str) -> Option<String> {
 /// narrative does not count.
 pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
     let mut errors = Vec::new();
+    // The same bad link twice in one narrative is one issue.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     for (path, res) in all_resources(resource) {
         let Some(div) = res.pointer("/text/div").and_then(Value::as_str) else {
             continue;
@@ -342,11 +344,11 @@ pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
                 ),
                 None => msg_narrative_link(&href, &at, &text),
             };
-            errors.push(ValidationError::new(
-                ErrorKind::Narrative,
-                format!("{path}.text.div"),
-                message,
-            ));
+            let at = format!("{path}.text.div");
+            if !seen.insert((at.clone(), message.clone())) {
+                continue;
+            }
+            errors.push(ValidationError::new(ErrorKind::Narrative, at, message));
         }
     }
     errors
