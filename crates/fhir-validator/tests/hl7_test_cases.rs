@@ -231,3 +231,50 @@ async fn required_bound_code_without_value_is_an_error() {
     assert_eq!(errs.len(), 1, "{issues:#?}");
     assert_eq!(errs[0].path, "DocumentReference.status");
 }
+
+/// Diagnostic, not a check: invariant failures per constraint id over the R4
+/// spec examples (`crates/fhir/tests/data/json/R4`), to measure how a change
+/// to constraint evaluation moves false positives. Run with
+/// `cargo test -p helios-fhir-validator --features fhirpath --test hl7_test_cases
+///  constraint_sweep -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn constraint_sweep_r4_spec_examples() {
+    let dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fhir/tests/data/json/R4");
+    let mut counts: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut files = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(&dir).expect("corpus").flatten().collect();
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(resource) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if resource.get("resourceType").is_none() {
+            continue;
+        }
+        files += 1;
+        for e in validate_with(&resource, &[], &[]).await {
+            if let Some(id) = e.extra.get("constraint").and_then(Value::as_str)
+                && e.severity == Severity::Error
+            {
+                counts.entry(id.to_string()).or_default().push(format!(
+                    "{} {}",
+                    entry.file_name().to_string_lossy(),
+                    e.path
+                ));
+            }
+        }
+    }
+    eprintln!("{files} resources");
+    for (id, hits) in &counts {
+        eprintln!(
+            "{id}: {} e.g. {}",
+            hits.len(),
+            hits.iter().take(3).cloned().collect::<Vec<_>>().join(" | ")
+        );
+    }
+}
