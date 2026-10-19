@@ -376,6 +376,30 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
     }
 
     let bundle_type = bundle.get("type").and_then(Value::as_str);
+    // Every entry with a resource has a fullUrl, except in transactions
+    // and batches (BUNDLE_BUNDLE_ENTRY_FULLURL_REQD).
+    if bundle_type.is_some()
+        && !matches!(
+            bundle_type,
+            Some("transaction" | "batch" | "transaction-response" | "batch-response")
+        )
+    {
+        for (index, entry) in bundle
+            .get("entry")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if entry.get("resource").is_some() && entry.get("fullUrl").is_none() {
+                out.push(error(
+                    ErrorKind::Required,
+                    format!("Bundle.entry.{index}"),
+                    "Except for transactions and batches, each entry in a Bundle must have a fullUrl which is the identity of the resource in the entry".to_string(),
+                ));
+            }
+        }
+    }
     if bundle_type == Some("searchset") {
         searchset_rules(bundle, &mut out);
     }
@@ -667,15 +691,29 @@ mod tests {
     }
 
     #[test]
-    fn restful_fullurls_must_name_the_entry() {
+    fn fullurls_are_required_and_restful_ones_must_name_the_entry() {
+        let messages =
+            |b: Value| -> Vec<String> { bundle_rules(&b).into_iter().map(|e| e.message).collect() };
         let b = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p"}},
             {"fullUrl": "http://acme.com/Patient/pat1",
              "resource": {"resourceType": "DocumentManifest", "id": "pat1"}},
             {"fullUrl": "http://acme.com/fhir/DocumentManifest/m",
              "resource": {"resourceType": "DocumentManifest", "id": "m"}}]});
-        let got: Vec<String> = bundle_rules(&b).into_iter().map(|e| e.message).collect();
-        assert_eq!(got.len(), 1, "{got:#?}");
-        assert!(got[0].contains("must end with the correct type and id (/DocumentManifest/pat1)"));
+        let got = messages(b);
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert!(
+            got.iter()
+                .any(|m| m.starts_with("Except for transactions and batches"))
+        );
+        assert!(
+            got.iter()
+                .any(|m| m
+                    .contains("must end with the correct type and id (/DocumentManifest/pat1)"))
+        );
+        let tx = json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"resource": {"resourceType": "Patient"}, "request": {"method": "POST", "url": "Patient"}}]});
+        assert!(messages(tx).is_empty());
     }
 
     #[test]
