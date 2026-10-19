@@ -20,9 +20,11 @@ pub(super) fn check_attachment(ctx: &mut WalkCtx<'_>, attachment: &serde_json::M
             // Characters outside the alphabet are the base64Binary
             // primitive's own (regex) error; malformed padding or length
             // inside the alphabet is reported here.
-            let alphabet = compact
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
+            // (So is a length that is no multiple of 4.)
+            let alphabet = compact.len() % 4 == 0
+                && compact
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
             if alphabet {
                 ctx.error(
                     ErrorKind::PrimitiveValue,
