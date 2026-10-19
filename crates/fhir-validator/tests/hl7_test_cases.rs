@@ -1574,3 +1574,40 @@ async fn slice_setting_one_of_two_discriminators() {
         "{issues:#?}"
     );
 }
+
+/// `fixed-quantity-binding-observation#profile`: a profile that narrows
+/// value[x] to Quantity and binds it judges the Quantity's units.
+#[test]
+fn narrowed_quantity_value_binding_applies() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/aged",
+        "name": "Aged", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [{"id": "Observation.value[x]", "path": "Observation.value[x]",
+            "type": [{"code": "Quantity"}],
+            "binding": {"strength": "required", "valueSet": "http://hl7.org/fhir/ValueSet/age-units"}}]}
+    });
+    let mut overlay = SchemaRegistry::new();
+    assert!(overlay.insert(convert(&sd).expect("profile converts").schema));
+    let resolver: Arc<dyn SchemaResolver> = Arc::new(CompositeResolver::new(vec![
+        Arc::new(overlay),
+        core_registry(FhirVersion::R4),
+    ]));
+    let obs = json!({"resourceType": "Observation", "status": "final", "code": {"text": "age"},
+        "valueQuantity": {"value": 3, "system": "http://unitsofmeasure.org", "code": "m"}});
+    let opts = ValidationOptions {
+        profiles: vec!["http://example.org/StructureDefinition/aged".into()],
+        ..Default::default()
+    };
+    let outcome = Validator::new(resolver).validate_sync(&obs, &opts);
+    assert!(
+        outcome.deferred.iter().any(
+            |d| matches!(d, helios_fhir_validator::Deferred::Binding { path, .. }
+            if path == "Observation.valueQuantity")
+        ),
+        "{:?}",
+        outcome.deferred
+    );
+}

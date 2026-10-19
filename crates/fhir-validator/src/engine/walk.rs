@@ -936,9 +936,13 @@ fn contained_types(resource: &serde_json::Map<String, Value>) -> Vec<(String, St
 fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
     // Clone the Arcs up front: keyword validators need `&mut ctx` while the
     // set is borrowed, and Arc clones are cheap.
-    let schemas: Vec<Arc<FhirSchema>> = set.schemas().cloned().collect();
+    let keyed: Vec<(String, Arc<FhirSchema>)> = set
+        .iter()
+        .map(|(k, s)| (k.to_string(), Arc::clone(s)))
+        .collect();
+    let schemas: Vec<Arc<FhirSchema>> = keyed.iter().map(|(_, s)| Arc::clone(s)).collect();
     let primitive_set = schemas.iter().any(|s| s.is_primitive());
-    for schema in &schemas {
+    for (schema_key, schema) in &keyed {
         if schema.is_primitive() {
             super::primitives::validate_primitive(ctx, schema, data);
         }
@@ -1033,11 +1037,23 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         // Quantity|CodeableConcept|... to their unit value set) is judged on
         // the coded branches only, as the HL7 validator does; a
         // Quantity-only element still binds its units.
+        // Judged on the element definition that states the binding: its
+        // own layer's declarer (`<layer>.value` beside `<layer>.valueQuantity`)
+        // tells whether it allows several types; a profile narrowing value[x]
+        // to Quantity binds its units.
+        let own_declarer = schema.choice_of.as_ref().and_then(|group| {
+            let (layer, _) = schema_key.rsplit_once('.')?;
+            let wanted = format!("{layer}.{group}");
+            keyed.iter().find(|(k, _)| *k == wanted).map(|(_, d)| d)
+        });
         let multi_type_quantity = schema.type_.as_deref() == Some("Quantity")
             && schema.choice_of.is_some()
-            && schemas
-                .iter()
-                .any(|s| s.choices.as_ref().is_some_and(|c| c.len() > 1));
+            && match own_declarer {
+                Some(d) => d.choices.as_ref().is_some_and(|c| c.len() > 1),
+                None => schemas
+                    .iter()
+                    .any(|s| s.choices.as_ref().is_some_and(|c| c.len() > 1)),
+            };
         if let Some(binding) = schema.binding.as_ref().filter(|_| !multi_type_quantity) {
             let path = ctx.path.render_dotted();
             if ctx.deferred_bindings.insert((
