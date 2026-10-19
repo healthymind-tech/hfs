@@ -1484,9 +1484,14 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
         let mut met = false;
         let mut judgeable = true;
         // The extension sits directly in another extension.
-        let in_extension = keys
-            .last()
-            .is_some_and(|k| k == "extension" || k == "modifierExtension");
+        // (directly, or on the parent extension's primitive value:
+        // `extension[0]._valueBoolean.extension[0]`)
+        let is_ext = |k: &String| k == "extension" || k == "modifierExtension";
+        let in_extension = keys.last().is_some_and(is_ext)
+            || (sidecar
+                && keys.last().is_some_and(|k| k.starts_with("value"))
+                && keys.len() >= 2
+                && is_ext(&keys[keys.len() - 2]));
         for c in contexts {
             // `extension` context (`extension:<url>`): the url of the
             // extension it may sit in.

@@ -822,3 +822,46 @@ fn vital_signs_observations_meet_their_core_profile() {
     lab["category"][0]["coding"][0]["code"] = json!("laboratory");
     assert!(structural_errors(&lab).len() > errs.len(), "{errs:#?}");
 }
+
+/// `ext-ctxt-good-ext`: an extension whose context is another extension may
+/// sit on that extension's primitive value.
+#[tokio::test]
+async fn extension_context_on_an_extension_value() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/on-interpreter",
+        "name": "OnInterpreter", "status": "active", "kind": "complex-type", "abstract": false,
+        "type": "Extension", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension",
+        "context": [{"type": "extension",
+                     "expression": "http://hl7.org/fhir/StructureDefinition/patient-interpreterRequired"}],
+        "differential": {"element": [
+            {"id": "Extension.url", "path": "Extension.url",
+             "fixedUri": "http://example.org/StructureDefinition/on-interpreter"},
+            {"id": "Extension.value[x]", "path": "Extension.value[x]", "type": [{"code": "boolean"}]}
+        ]}
+    });
+    let patient = json!({"resourceType": "Patient", "extension": [{
+        "url": "http://hl7.org/fhir/StructureDefinition/patient-interpreterRequired",
+        "valueBoolean": true,
+        "_valueBoolean": {"extension": [{"url": "http://example.org/StructureDefinition/on-interpreter",
+                                         "valueBoolean": true}]}}]});
+    let core = core_registry(FhirVersion::R4);
+    let mut overlay = SchemaRegistry::new();
+    overlay.insert(convert(&sd).unwrap().schema);
+    let resolver: Arc<dyn SchemaResolver> =
+        Arc::new(CompositeResolver::new(vec![Arc::new(overlay), core]));
+    let opts = ValidationOptions {
+        check_extension_context: true,
+        ..Default::default()
+    };
+    let issues = Validator::new(resolver)
+        .validate_sync(&patient, &opts)
+        .errors;
+    assert!(
+        !issues
+            .iter()
+            .any(|e| e.kind == helios_fhir_validator::ErrorKind::ExtensionContext),
+        "{issues:#?}"
+    );
+}
