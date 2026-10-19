@@ -521,8 +521,18 @@ pub async fn import_snomed_rf2(
         );
     }
 
-    // Simple reference set membership (ECL `^`, `?fhir_vs=refset/<id>`).
+    // Simple reference set membership (ECL `^`, `?fhir_vs=refset/<id>`), and
+    // the referenced components of the association reference sets (members
+    // too: `^ 900000000000526001 |REPLACED BY|`).
     // Written even when empty so a re-import that drops a refset clears it.
+    let mut refset_members = refset_members;
+    for (refset_id, mappings) in &association_refsets {
+        refset_members.extend(
+            mappings
+                .iter()
+                .map(|(src, _)| (refset_id.clone(), src.clone())),
+        );
+    }
     let member_count = refset_members.len();
     let written = backend
         .import_refset_members(ctx, SNOMED_URL, Some(&meta_version), refset_members)
