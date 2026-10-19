@@ -705,3 +705,36 @@ fn extension_urls_and_empty_values() {
         0
     );
 }
+
+/// `slicing-types-by-string`: in a differential without element ids, the
+/// elements after a `sliceName` element constrain that slice.
+#[tokio::test]
+async fn idless_differentials_constrain_the_open_slice() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/payload-slices",
+        "name": "PayloadSlices", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Communication", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Communication",
+        "differential": {"element": [
+            {"path": "Communication"},
+            {"path": "Communication.payload", "slicing": {
+                "discriminator": [{"type": "type", "path": "content"}], "rules": "open"}},
+            {"path": "Communication.payload", "sliceName": "string"},
+            {"path": "Communication.payload.contentString", "min": 1, "type": [{"code": "string"}]},
+            {"path": "Communication.payload", "sliceName": "attachment", "max": "10"},
+            {"path": "Communication.payload.contentAttachment", "type": [{"code": "Attachment"}]}
+        ]}
+    });
+    let comm = json!({"resourceType": "Communication", "status": "in-progress", "payload": [
+        {"contentString": "test"},
+        {"contentAttachment": {"title": "some title"}},
+        {"contentAttachment": {"title": "some other title"}}]});
+    let issues = validate_with(
+        &comm,
+        &[sd],
+        &["http://example.org/StructureDefinition/payload-slices"],
+    )
+    .await;
+    assert!(errors(&issues).is_empty(), "{issues:#?}");
+}

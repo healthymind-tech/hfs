@@ -303,17 +303,45 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
 
     // Build the nested element tree by navigating each ED's id segments.
     let mut root = tree::Node::new(sd_type.clone());
+    // Hand-authored differentials may omit ids: the slice an element
+    // belongs to is then the one opened by the closest preceding
+    // `sliceName` element on an ancestor path (document order, as the
+    // HL7 snapshot generator reads them). `(path, id of the slice)`.
+    let mut open_slices: Vec<(String, String)> = Vec::new();
     for ed in &elements {
-        // Navigation is id-based; hand-authored differentials may omit ids,
-        // in which case the slice position is reconstructed from sliceName.
+        // Navigation is id-based; ids are synthesized where missing.
         let synthesized;
         let id = match (&ed.id, &ed.slice_name) {
             (Some(id), _) => id.as_str(),
-            (None, Some(slice)) => {
-                synthesized = format!("{}:{slice}", ed.path);
+            (None, slice) => {
+                let path = ed.path.as_str();
+                let within = |p: &str| {
+                    path.len() > p.len() && path.starts_with(p) && path.as_bytes()[p.len()] == b'.'
+                };
+                let base = open_slices
+                    .iter()
+                    .filter(|(p, _)| within(p))
+                    .max_by_key(|(p, _)| p.len())
+                    .map(|(p, slice_id)| format!("{slice_id}{}", &path[p.len()..]))
+                    .unwrap_or_else(|| path.to_string());
+                // A sliceName opens a slice; the bare element closes the
+                // slices opened at (or below) its path.
+                open_slices.retain(|(p, _)| {
+                    p != path
+                        && !(p.len() > path.len()
+                            && p.starts_with(path)
+                            && p.as_bytes()[path.len()] == b'.')
+                });
+                synthesized = match slice {
+                    Some(slice) => {
+                        let id = format!("{base}:{slice}");
+                        open_slices.push((path.to_string(), id.clone()));
+                        id
+                    }
+                    None => base,
+                };
                 &synthesized
             }
-            (None, None) => &ed.path,
         };
         let segments = tree::parse_segments(id)
             .map_err(|e| ConvertError::Malformed(format!("element id '{id}': {e}")))?;
