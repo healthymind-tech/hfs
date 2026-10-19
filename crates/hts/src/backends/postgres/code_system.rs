@@ -77,6 +77,41 @@ fn lookup_cache_key(req: &LookupRequest) -> Option<String> {
 
 #[async_trait]
 impl CodeSystemOperations for PostgresTerminologyBackend {
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        match crate::snomed::store::system_id_pg(&client, url, version).await? {
+            Some(id) => crate::snomed::store::load_pg(&client, &id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        match crate::snomed::store::system_id_pg(&client, url, version).await? {
+            Some(id) => crate::snomed::store::concepts_pg(&client, &id, codes).await,
+            None => Ok(std::collections::HashMap::new()),
+        }
+    }
+
     async fn lookup(
         &self,
         _ctx: &TenantContext,

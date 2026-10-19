@@ -195,6 +195,49 @@ impl SqliteTerminologyBackend {
 
 #[async_trait]
 impl CodeSystemOperations for SqliteTerminologyBackend {
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::load_sqlite(&conn, &id),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version, codes) = (url.to_string(), version.map(str::to_string), codes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::concepts_sqlite(&conn, &id, &codes),
+                None => Ok(std::collections::HashMap::new()),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     /// Look up a concept by system URL + code.
     ///
     /// Returns the concept display, all (or filtered) properties, and all

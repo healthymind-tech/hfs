@@ -70,6 +70,7 @@ pub mod migrate;
 pub(crate) mod mimetypes;
 pub mod operations;
 pub(crate) mod resource_ids;
+pub mod snomed;
 pub mod server;
 pub mod state;
 pub mod string_search;

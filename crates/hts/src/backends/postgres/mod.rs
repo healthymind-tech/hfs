@@ -1334,6 +1334,23 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         Ok(written)
     }
 
+    async fn import_snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let written = crate::snomed::store::write_pg(&mut client, url, version, &data).await?;
+        self.invalidate_caches();
+        Ok(written)
+    }
+
     async fn write_concept_properties(
         &self,
         _ctx: &TenantContext,
