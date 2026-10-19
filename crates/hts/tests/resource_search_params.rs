@@ -263,10 +263,9 @@ async fn sqlite_existing_rows_become_searchable_after_upgrade() {
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_existing_rows_become_searchable_after_upgrade() {
-    use helios_hts::backends::PostgresTerminologyBackend;
     let url = common::fresh_pg_database().await;
     {
-        let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+        let backend = common::pg_hts_backend(&url).await.unwrap();
         backend
             .import_bundle(&TenantContext::system(), BUNDLE.as_bytes())
             .await
@@ -289,7 +288,7 @@ async fn postgres_existing_rows_become_searchable_after_upgrade() {
         drop(client);
         let _ = driver.await;
     }
-    let backend = PostgresTerminologyBackend::new(&url).await.unwrap();
+    let backend = common::pg_hts_backend(&url).await.unwrap();
     let found = CodeSystemOperations::search(
         &backend,
         &TenantContext::system(),

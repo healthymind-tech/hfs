@@ -535,7 +535,12 @@ impl PostgresTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub async fn new(database_url: &str) -> Result<Self, HtsError> {
-        let pool = build_pool(database_url)?;
+        Self::with_pool_size(database_url, default_pool_size()).await
+    }
+
+    /// Like [`Self::new`], with at most `pool_size` connections.
+    pub async fn with_pool_size(database_url: &str, pool_size: usize) -> Result<Self, HtsError> {
+        let pool = build_pool(database_url, pool_size)?;
 
         {
             let mut client = pool.get().await.map_err(|e| {
@@ -841,16 +846,28 @@ pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
+/// Default connection pool size; `HTS_PG_POOL_SIZE` overrides it.
+///
+/// 32 connections: warm requests bypass the pool entirely (see the
+/// closure-page / inline-compose warm-hit fast paths in value_set.rs), so
+/// the pool only gates *cold* expansions. 16 was too few to warm a
+/// ~6.5k-entry benchmark pool within a 30s vu50 stage; 32 doubles the
+/// cold-warming throughput while staying well under PG's
+/// `max_connections=100`.
+pub const DEFAULT_POOL_SIZE: usize = 32;
+
+fn default_pool_size() -> usize {
+    std::env::var("HTS_PG_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_POOL_SIZE)
+}
+
+fn build_pool(database_url: &str, size: usize) -> Result<Pool, HtsError> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
-    // 32 connections: warm requests bypass the pool entirely (see the
-    // closure-page / inline-compose warm-hit fast paths in value_set.rs), so
-    // the pool only gates *cold* expansions. 16 was too few to warm a
-    // ~6.5k-entry benchmark pool within a 30s vu50 stage; 32 doubles the
-    // cold-warming throughput while staying well under PG's
-    // `max_connections=100`.
-    cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(size.max(1)));
     cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
         HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
     })
