@@ -84,6 +84,7 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
     match ctx {
         Ctx::Schema => keys_of(&FhirSchema {
             url: Some(String::new()),
+            version: Some(String::new()),
             name: Some(String::new()),
             base: Some(String::new()),
             kind: Some(String::new()),
@@ -178,7 +179,11 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // core ones.
         //
         // `typeProfiles`: core datatype elements carry no type profiles.
+        //
+        // `version`: the embedded packs predate it (stored profiles carry
+        // it; it orders side-by-side releases of one canonical).
         Ctx::Schema => &[
+            "version",
             "scalar",
             "minValue",
             "maxValue",

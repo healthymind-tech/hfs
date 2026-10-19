@@ -1393,7 +1393,7 @@ impl PackageManager {
         let parsed = Range::parse(range);
         let mut meeting: Vec<&String> = installed
             .iter()
-            .filter(|(n, v)| n == dep && parsed.satisfied_by(v, policy))
+            .filter(|(n, v)| n == dep && parsed.satisfied_by(dep, v, policy))
             .map(|(_, v)| v)
             .collect();
         meeting.sort_by(|a, b| super::version::compare(b, a));
@@ -1633,9 +1633,15 @@ impl PackageManager {
         if r.resource_type == "StructureDefinition"
             && let Some(url) = existing.content().get("url").and_then(Value::as_str)
         {
+            // `url|version`: an older release removed next to a newer one
+            // must not take the newer one's registration with it.
+            let reference = match existing.content().get("version").and_then(Value::as_str) {
+                Some(v) => format!("{url}|{v}"),
+                None => url.to_string(),
+            };
             self.deps
                 .validation
-                .remove_stored_profile(tenant, existing.fhir_version(), url);
+                .remove_stored_profile(tenant, existing.fhir_version(), &reference);
             // Another installed package still ships this canonical: put its
             // definition back in the registry.
             if let Some(other_id) = other_profiles.get(url)

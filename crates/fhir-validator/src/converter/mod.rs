@@ -478,6 +478,10 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
 
     // Header fields.
     schema.url = Some(url);
+    schema.version = sd
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     schema.name = name;
     schema.base = base;
     schema.kind = Some(kind);

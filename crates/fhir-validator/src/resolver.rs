@@ -112,14 +112,34 @@ impl SchemaRegistry {
     /// guaranteed to win the name alias.
     ///
     /// Returns `false` (and stores nothing) if the schema has no `url`.
+    ///
+    /// A versioned definition is also indexed as `url|version`. Under the
+    /// bare `url` the highest version stays: with two releases of an IG
+    /// installed side by side (US Core 5.0.1 for mCODE next to 7.0.0), a
+    /// claim without a version means the latest, whatever order they were
+    /// written in.
     pub fn insert_by_url(&mut self, schema: FhirSchema) -> bool {
-        match schema.url.clone() {
-            Some(url) => {
-                self.map.insert(url, Arc::new(schema));
-                true
-            }
-            None => false,
+        let Some(url) = schema.url.clone() else {
+            return false;
+        };
+        let schema = Arc::new(schema);
+        if let Some(version) = &schema.version {
+            self.map
+                .insert(format!("{url}|{version}"), Arc::clone(&schema));
         }
+        let newer_stays =
+            self.map
+                .get(&url)
+                .is_some_and(|current| match (&current.version, &schema.version) {
+                    (Some(have), Some(new)) => {
+                        compare_versions(have, new) == std::cmp::Ordering::Greater
+                    }
+                    _ => false,
+                });
+        if !newer_stays {
+            self.map.insert(url, schema);
+        }
+        true
     }
 
     /// Remove the schema reachable under `reference`, together with every
@@ -164,6 +184,34 @@ impl SchemaResolver for SchemaRegistry {
     }
 }
 
+/// Orders two business versions: dot-separated parts numerically where both
+/// are numbers, a pre-release (`-ballot`) below its release.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let split = |v: &str| -> (Vec<String>, bool) {
+        let (main, pre) = match v.split_once('-') {
+            Some((m, _)) => (m, true),
+            None => (v, false),
+        };
+        (main.split('.').map(str::to_string).collect(), pre)
+    };
+    let ((pa, a_pre), (pb, b_pre)) = (split(a), split(b));
+    for i in 0..pa.len().max(pb.len()) {
+        let (x, y) = (
+            pa.get(i).map(String::as_str).unwrap_or("0"),
+            pb.get(i).map(String::as_str).unwrap_or("0"),
+        );
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    b_pre.cmp(&a_pre)
+}
+
 /// Layered resolver: earlier layers win. Used to overlay tenant-uploaded
 /// profiles on top of an embedded core pack.
 #[derive(Clone, Default)]
@@ -191,6 +239,44 @@ impl SchemaResolver for CompositeResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_highest_version_answers_an_unversioned_canonical() {
+        let profile = |version: &str| FhirSchema {
+            url: Some("http://example.org/p".into()),
+            version: Some(version.into()),
+            name: Some(format!("p{version}")),
+            ..Default::default()
+        };
+        let mut r = SchemaRegistry::new();
+        r.insert_by_url(profile("7.0.0"));
+        r.insert_by_url(profile("5.0.1")); // written later, older
+        fn name(r: &SchemaRegistry, reference: &str) -> Option<String> {
+            r.resolve(reference).and_then(|s| s.name.clone())
+        }
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.0"));
+        assert_eq!(
+            name(&r, "http://example.org/p|5.0.1").as_deref(),
+            Some("p5.0.1")
+        );
+        assert_eq!(
+            name(&r, "http://example.org/p|7.0.0").as_deref(),
+            Some("p7.0.0")
+        );
+        // Removing the older release leaves the newer one.
+        assert!(r.remove("http://example.org/p|5.0.1"));
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.0"));
+        // (a version no longer held falls back to the canonical)
+        assert_eq!(
+            name(&r, "http://example.org/p|5.0.1").as_deref(),
+            Some("p7.0.0")
+        );
+        // A newer release replaces under the bare url.
+        r.insert_by_url(profile("7.0.1"));
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.1"));
+        assert!(compare_versions("3.0.0-ballot", "3.0.0").is_lt());
+        assert!(compare_versions("10.0.0", "9.1.0").is_gt());
+    }
 
     fn named(name: &str) -> FhirSchema {
         FhirSchema {

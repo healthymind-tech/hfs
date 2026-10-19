@@ -892,3 +892,128 @@ async fn a_canonical_the_package_ships_twice_is_still_removed() {
         left.iter().map(|r| &r["url"]).collect::<Vec<_>>()
     );
 }
+
+/// A package built on an older major release of an IG (mCODE 3.0.0 on US
+/// Core 5.0.1, whose `us-core-observation-clinical-test` US Core 7 no
+/// longer has) gets that release installed side by side instead of being
+/// pointed at the newer one; an unversioned profile claim still means the
+/// newest release, whatever order they were installed in.
+#[tokio::test]
+async fn an_older_major_dependency_is_installed_side_by_side() {
+    let (server, _cache) = server(true);
+    let base = |version: &str, profiles: &[(&str, &str)]| {
+        let resources: Vec<(String, Value)> = profiles
+            .iter()
+            .map(|(id, element)| {
+                (
+                    format!("StructureDefinition-{id}.json"),
+                    profile(id, version, element),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Value)> = resources
+            .iter()
+            .map(|(p, r)| (p.as_str(), r.clone()))
+            .collect();
+        package(
+            "acme.core",
+            version,
+            json!({"hl7.fhir.r4.core": "4.0.1"}),
+            &refs,
+        )
+    };
+    // 1.0.0 has `acme-old`; 2.0.0 dropped it, and its patient needs gender.
+    let v1 = base(
+        "1.0.0",
+        &[("acme-core-patient", "birthDate"), ("acme-old", "active")],
+    );
+    let v2 = base("2.0.0", &[("acme-core-patient", "gender")]);
+    let mut on_old = profile("acme-on-old", "1.0.0", "name");
+    on_old["baseDefinition"] = json!("http://acme.org/StructureDefinition/acme-old");
+    let ext = package(
+        "acme.onold",
+        "1.0.0",
+        json!({"hl7.fhir.r4.core": "4.0.1", "acme.core": "1.0.0"}),
+        &[("StructureDefinition-acme-on-old.json", on_old)],
+    );
+    for p in [v1, v2.clone(), ext] {
+        upload(&server, p, "").await.assert_status(StatusCode::OK);
+    }
+    let job = install(&server, "acme.core#2.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let job = install(&server, "acme.onold#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+
+    let list: Value = server.get("/admin/packages").await.json();
+    let mut installed: Vec<String> = list["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            format!(
+                "{}#{}",
+                p["name"].as_str().unwrap(),
+                p["version"].as_str().unwrap()
+            )
+        })
+        .collect();
+    installed.sort();
+    assert_eq!(
+        installed,
+        ["acme.core#1.0.0", "acme.core#2.0.0", "acme.onold#1.0.0"]
+    );
+
+    // The dependent's base resolves (from 1.0.0) ...
+    let issues = validate(
+        &server,
+        "acme-on-old",
+        json!({"resourceType": "Patient", "name": [{"family": "x"}]}),
+    )
+    .await;
+    assert!(!unresolved(&issues), "{issues:?}");
+    assert!(
+        has_error(
+            &validate(
+                &server,
+                "acme-on-old",
+                json!({"resourceType": "Patient", "name": [{"family": "x"}]})
+            )
+            .await
+        ),
+        "acme-old (1.0.0) requires active"
+    );
+    // ... and the unversioned patient profile is 2.0.0's (gender required).
+    let issues = validate(
+        &server,
+        "acme-core-patient",
+        json!({"resourceType": "Patient", "birthDate": "2000-01-01"}),
+    )
+    .await;
+    assert!(has_error(&issues), "2.0.0 requires gender: {issues:?}");
+    let issues = validate(
+        &server,
+        "acme-core-patient",
+        json!({"resourceType": "Patient", "gender": "male"}),
+    )
+    .await;
+    assert!(!has_error(&issues), "{issues:?}");
+
+    // Removing the dependent and the older release keeps 2.0.0 registered.
+    for path in ["acme.onold/1.0.0", "acme.core/1.0.0"] {
+        let job: Value = server
+            .delete(&format!("/admin/packages/{path}?wait=30"))
+            .await
+            .json();
+        assert_eq!(job["status"], "succeeded", "{job}");
+    }
+    let issues = validate(
+        &server,
+        "acme-core-patient",
+        json!({"resourceType": "Patient", "birthDate": "2000-01-01"}),
+    )
+    .await;
+    assert!(
+        has_error(&issues),
+        "2.0.0 is still the registered one: {issues:?}"
+    );
+}

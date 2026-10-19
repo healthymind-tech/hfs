@@ -511,6 +511,10 @@ impl ValidationService {
         let Some(registries) = &self.tenant_profiles else {
             return false;
         };
+        // `url` may carry `|version` (one release of several); the index
+        // keys stored profiles by bare canonical.
+        let reference = url;
+        let url = url.split('|').next().unwrap_or(url);
         {
             let mut index = self.stored_index.lock().expect("stored profile index lock");
             let before = index.entries.len();
@@ -527,7 +531,7 @@ impl ValidationService {
         let removed = registry
             .write()
             .expect("tenant profile registry lock")
-            .remove(url);
+            .remove(reference);
         if removed {
             debug!(tenant = %tenant, url = %url, "tenant profile unregistered");
         }
@@ -1726,7 +1730,8 @@ impl RemoteTerminologyProvider {
             .await
             .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
         let verdict = self.settle(check, key, &url, status, Some(&body), "");
-        self.check_unverifiable(check, &body, verdict, language).await
+        self.check_unverifiable(check, &body, verdict, language)
+            .await
     }
 
     /// Several uncached checks in one FHIR `batch` Bundle (`POST [base]`,
@@ -1834,7 +1839,10 @@ impl RemoteTerminologyProvider {
             // A `false` may only mean the code system has no content on the
             // server; that check stays per verdict (rare: only on failures).
             let body = resource.cloned().unwrap_or(Value::Null);
-            out.push(self.check_unverifiable(check, &body, verdict, language).await);
+            out.push(
+                self.check_unverifiable(check, &body, verdict, language)
+                    .await,
+            );
         }
         Some(out)
     }
@@ -1880,8 +1888,10 @@ impl RemoteTerminologyProvider {
             if self.system_is_complete(system).await != Some(true) {
                 let mut v = v.clone();
                 v.unknown_code = None;
-                self.cache
-                    .insert(Self::cache_key(check, language), (v.clone(), Instant::now()));
+                self.cache.insert(
+                    Self::cache_key(check, language),
+                    (v.clone(), Instant::now()),
+                );
                 return Ok(v);
             }
             return verdict;

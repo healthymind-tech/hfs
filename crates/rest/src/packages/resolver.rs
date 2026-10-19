@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::tarball::Manifest;
-use super::version::{DependencyPolicy, Range, compare};
+use super::version::{DependencyPolicy, Range, compare, interchangeable};
 
 /// Versions a source knows for one package.
 #[derive(Debug, Clone, Default)]
@@ -424,7 +424,7 @@ async fn traverse(
             // Installed versions that meet the requirement (best first).
             let mut meeting: Vec<&String> = have
                 .iter()
-                .filter(|v| parsed.satisfied_by(v, request.policy))
+                .filter(|v| parsed.satisfied_by(dep, v, request.policy))
                 .collect();
             meeting.sort_by(|a, b| compare(b, a));
             let planned = chosen.get(dep);
@@ -432,7 +432,7 @@ async fn traverse(
             // over an installed one: some other requirement needs it, and
             // every edge should point at the version actually installed.
             let planned_elsewhere = planned
-                .is_some_and(|p| parsed.satisfied_by(p, request.policy) && !have.contains(p));
+                .is_some_and(|p| parsed.satisfied_by(dep, p, request.policy) && !have.contains(p));
             if let (Some(best), false) = (meeting.first(), planned_elsewhere) {
                 let key = format!("{dep}#{best}");
                 attach(&mut t, &parent_key, &key, requirement, || PlanNode {
@@ -467,7 +467,11 @@ async fn traverse(
                 }
             };
             let version = match (request.policy, planned) {
-                (DependencyPolicy::Newer, Some(p)) if compare(p, &own).is_ge() => p.clone(),
+                (DependencyPolicy::Newer, Some(p))
+                    if compare(p, &own).is_ge() && interchangeable(dep, &own, p) =>
+                {
+                    p.clone()
+                }
                 _ => own.clone(),
             };
             if request.policy == DependencyPolicy::Newer {
@@ -515,9 +519,11 @@ async fn traverse(
                 });
                 continue;
             }
+            // Only an interchangeable older release is replaced; one of an
+            // older major stays for the packages built on it.
             let lower: Vec<String> = have
                 .iter()
-                .filter(|v| compare(v, &version).is_lt())
+                .filter(|v| compare(v, &version).is_lt() && interchangeable(dep, v, &version))
                 .cloned()
                 .collect();
             let action = if have.iter().any(|v| compare(v, &version).is_eq()) {
@@ -818,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_newer_versions_satisfy_and_older_ones_are_upgraded() {
+    async fn installed_newer_versions_satisfy_within_their_line_and_older_ones_are_upgraded() {
         let source = twcore_world();
         let installed = vec![
             ("tw.gov.mohw.twcore".to_string(), "1.0.0".to_string()),
@@ -831,12 +837,11 @@ mod tests {
         )
         .await
         .unwrap();
-        // twcore 0.3.2 is met by the installed 1.0.0.
+        // twcore 0.3.2 is another release line than the installed 1.0.0:
+        // installed side by side (1.0.0 stays).
         assert_eq!(
-            plan.node("tw.gov.mohw.twcore#1.0.0").unwrap().action,
-            NodeAction::Satisfied {
-                by: "tw.gov.mohw.twcore#1.0.0".into()
-            }
+            plan.node("tw.gov.mohw.twcore#0.3.2").unwrap().action,
+            NodeAction::Install
         );
         // THO 7.4.0 is newer than the installed 7.0.0: upgrade.
         assert_eq!(
@@ -847,7 +852,11 @@ mod tests {
         );
         assert_eq!(
             plan.install_order,
-            ["hl7.terminology.r4#7.4.0", "tw.gov.mohw.nhi.pas#1.2.7"]
+            [
+                "hl7.terminology.r4#7.4.0",
+                "tw.gov.mohw.twcore#0.3.2",
+                "tw.gov.mohw.nhi.pas#1.2.7"
+            ]
         );
     }
 

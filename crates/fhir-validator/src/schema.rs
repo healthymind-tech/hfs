@@ -41,6 +41,9 @@ pub struct FhirSchema {
     /// Canonical URL this schema is published under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Business version of the definition (`StructureDefinition.version`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Machine-readable name (also usable as a resolution alias).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
