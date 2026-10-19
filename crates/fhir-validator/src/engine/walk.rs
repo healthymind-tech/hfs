@@ -1590,6 +1590,14 @@ fn validate_extension_item<'a>(
                 "Extension.url must be an absolute URL".to_string(),
             )
         }
+        // A canonical version in the url (`…/patient-congregation|4.0.0`):
+        // the definition is found without it, but the url is wrong.
+        Some(u) if u.contains('|') && u.contains("://") && knows_hl7_extensions(ctx.resolver) => {
+            ctx.error(
+                ErrorKind::PrimitiveValue,
+                "The extension URL must not contain a version".to_string(),
+            )
+        }
         _ => {}
     }
     let url = item

@@ -1716,3 +1716,15 @@ async fn attachment_max_size() {
         "{issues:#?}"
     );
 }
+
+/// `versioned-extension`: an extension url carrying a version is an error.
+#[test]
+fn versioned_extension_urls() {
+    let errs = structural_errors(&json!({"resourceType": "Patient", "extension": [
+        {"url": "http://hl7.org/fhir/StructureDefinition/patient-congregation|4.0.0", "valueString": "x"}]}));
+    assert!(
+        errs.iter().any(|e| e.0 == "Patient.extension.0"
+            && e.1 == "The extension URL must not contain a version"),
+        "{errs:#?}"
+    );
+}
