@@ -3402,8 +3402,19 @@ fn extract_precision_keyword(expr: &Expression) -> Result<String, EvaluationErro
 /// accesses and argument-less, side-effect-free functions only.
 fn is_root_chain(expr: &Expression) -> bool {
     const PURE: &[&str] = &[
-        "first", "last", "tail", "single", "count", "exists", "empty", "distinct",
-        "isDistinct", "children", "descendants", "hasValue", "not",
+        "first",
+        "last",
+        "tail",
+        "single",
+        "count",
+        "exists",
+        "empty",
+        "distinct",
+        "isDistinct",
+        "children",
+        "descendants",
+        "hasValue",
+        "not",
     ];
     let mut current = expr;
     let mut steps = 0;
