@@ -81,6 +81,16 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         return;
     }
 
+    // FHIR JSON has no empty strings: a primitive without a value is
+    // absent (or carried by its `_name` sidecar).
+    if data.as_str() == Some("") {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            "value cannot be empty".to_string(),
+        );
+        return;
+    }
+
     // FHIR caps strings at 1 MB (`base64Binary` and `xhtml` excepted).
     if let Some(s) = data.as_str()
         && s.len() > MAX_STRING_BYTES
