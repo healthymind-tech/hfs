@@ -206,13 +206,28 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
+    // `property` names what to return; `*` (or nothing) means everything.
+    // `abstract` is reported whatever was asked for, so the backend is also
+    // asked for `notSelectable`.
+    let requested_properties = collect_str_params(&params, "property");
+    let want_all_properties = requested_properties.iter().any(|p| p == "*");
+    let property_filter: Option<Vec<String>> =
+        if requested_properties.is_empty() || want_all_properties {
+            None
+        } else {
+            Some(requested_properties.clone())
+        };
+    let mut backend_properties = requested_properties.clone();
+    if property_filter.is_some() && !backend_properties.iter().any(|p| p == "notSelectable") {
+        backend_properties.push("notSelectable".into());
+    }
     let req = LookupRequest {
         system: system.clone(),
         code: code.clone(),
         version: find_str_param(&params, "version"),
         display_language: find_str_param(&params, "displayLanguage"),
         expression: find_str_param(&params, "expression"),
-        properties: collect_str_params(&params, "property"),
+        properties: backend_properties,
         date: find_str_param(&params, "date"),
         use_supplements: collect_str_params(&params, "useSupplement"),
     };
@@ -414,12 +429,59 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     // when set.
     parameter.push(json!({"name": "system", "valueUri": system}));
     parameter.push(json!({"name": "code", "valueCode": code}));
-    if resp
+    let is_abstract = resp
         .properties
         .iter()
-        .any(|p| p.code == "notSelectable" && p.value == "true")
-    {
-        parameter.push(json!({"name": "abstract", "valueBoolean": true}));
+        .any(|p| p.code == "notSelectable" && p.value == "true");
+    // `abstract` when the concept is abstract, or when every property was
+    // asked for — then also as the `notSelectable` property (IG
+    // `simple/simple-lookup-1`, `simple-lookup-zxx`).
+    if is_abstract || want_all_properties {
+        parameter.push(json!({"name": "abstract", "valueBoolean": is_abstract}));
+    }
+    if want_all_properties && !resp.properties.iter().any(|p| p.code == "notSelectable") {
+        resp.properties.push(PropertyValue {
+            code: "notSelectable".into(),
+            value_type: "boolean".into(),
+            value: "false".into(),
+            description: None,
+        });
+    }
+    if let Some(filter) = property_filter.as_ref() {
+        // Only what was asked for, plus the notSelectable flag of an
+        // abstract concept; designations are a property too.
+        resp.properties.retain(|p| {
+            filter.contains(&p.code) || (p.code == "notSelectable" && p.value == "true")
+        });
+        if !filter.iter().any(|p| p == "designation") {
+            resp.designations.clear();
+        }
+    }
+    // A single requested display language the code system has nothing in.
+    if let Some(lang) = display_language.as_deref().filter(|l| {
+        !l.contains(',')
+            && l.split('-').next().is_some_and(|p| {
+                (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic())
+            })
+    }) {
+        let has_lang = base_lang_matched
+            || cs_language
+                .as_deref()
+                .is_some_and(|cl| crate::language::lang_matches(lang, cl))
+            || resp.designations.iter().any(|d| {
+                d.language
+                    .as_deref()
+                    .is_some_and(|dl| crate::language::lang_matches(lang, dl))
+            });
+        if !has_lang {
+            parameter.push(json!({
+                "name": "warning",
+                "valueString": format!(
+                    "The code system {system} has no display or designation in the requested \
+                     language '{lang}'"
+                ),
+            }));
+        }
     }
 
     for prop in resp.properties {

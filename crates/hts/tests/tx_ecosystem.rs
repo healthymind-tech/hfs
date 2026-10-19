@@ -524,3 +524,81 @@ async fn expansion_properties_from_compose_property() {
     assert_eq!(link["valueCoding"]["system"], "http://elsewhere.test");
     assert_eq!(link["valueCoding"]["code"], "x");
 }
+
+/// simple/simple-lookup-1, simple-lookup-zxx: `$lookup` reports `abstract`
+/// (and the notSelectable property) for property=*, and for an abstract
+/// concept whatever was asked; a property filter also limits designations;
+/// a display language the code system has nothing in gets a warning.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn lookup_abstract_property_filter_and_language_warning() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(
+        &json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "lk", "url": "http://hts.test/lk",
+              "version": "1", "status": "active", "content": "complete", "language": "en",
+              "property": [{"code": "notSelectable", "uri": "http://hl7.org/fhir/concept-properties#notSelectable", "type": "boolean"}],
+              "concept": [
+                {"code": "top", "display": "Top", "definition": "Abstract top",
+                 "property": [{"code": "notSelectable", "valueBoolean": true}],
+                 "concept": [{"code": "leaf", "display": "Leaf", "definition": "A leaf"}]}
+              ]}}
+        ]})
+        .to_string(),
+    )
+    .await;
+    let names = |body: &Value| -> Vec<String> {
+        body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let prop_codes = |body: &Value| -> Vec<String> {
+        body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["name"] == "property")
+            .map(|p| p["part"][0]["valueCode"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let (_, body) = app
+        .get_fhir("/CodeSystem/$lookup?system=http://hts.test/lk&code=leaf&property=*")
+        .await;
+    assert_eq!(
+        param(&body, "abstract").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    assert!(
+        prop_codes(&body).contains(&"notSelectable".to_string()),
+        "{body}"
+    );
+
+    let (_, body) = app
+        .get_fhir(
+            "/CodeSystem/$lookup?system=http://hts.test/lk&code=top&property=definition&displayLanguage=zxx",
+        )
+        .await;
+    assert_eq!(
+        param(&body, "abstract").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(prop_codes(&body), ["notSelectable"]);
+    assert!(!names(&body).contains(&"designation".to_string()), "{body}");
+    let warning = param(&body, "warning").unwrap()["valueString"]
+        .as_str()
+        .unwrap();
+    assert!(warning.contains("zxx"), "{warning}");
+
+    // No property parameter: no abstract for a concept that is not abstract.
+    let (_, body) = app
+        .get_fhir("/CodeSystem/$lookup?system=http://hts.test/lk&code=leaf")
+        .await;
+    assert!(param(&body, "abstract").is_none(), "{body}");
+    assert!(param(&body, "warning").is_none(), "{body}");
+}
