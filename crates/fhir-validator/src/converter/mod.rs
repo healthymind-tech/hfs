@@ -223,6 +223,46 @@ pub(crate) struct EdBinding {
     pub strength: Option<String>,
     #[serde(rename = "valueSet")]
     pub value_set: Option<String>,
+    #[serde(default)]
+    pub extension: Vec<Value>,
+}
+
+impl EdBinding {
+    /// The value set of an unconditional `required` additional binding
+    /// (R5 `binding.additional`, carried in R4 as the cross-version
+    /// extension or the tools extension).
+    pub(crate) fn required_additional(&self) -> Option<String> {
+        const URLS: &[&str] = &[
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.binding.additional",
+            "http://hl7.org/fhir/tools/StructureDefinition/additional-binding",
+        ];
+        let mut found = self.extension.iter().filter_map(|ext| {
+            let url = ext.get("url")?.as_str()?;
+            if !URLS.contains(&url) {
+                return None;
+            }
+            let parts = ext.get("extension")?.as_array()?;
+            let part = |name: &str| {
+                parts
+                    .iter()
+                    .find(|p| p.get("url").and_then(Value::as_str) == Some(name))
+            };
+            if part("usage").is_some() {
+                return None; // conditional on a usage context
+            }
+            let purpose = part("purpose")?.get("valueCode")?.as_str()?;
+            if purpose != "required" {
+                return None;
+            }
+            let vs = part("valueSet")?;
+            vs.get("valueCanonical")
+                .or_else(|| vs.get("valueUri"))?
+                .as_str()
+                .map(str::to_string)
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
 }
 
 #[derive(Debug, Deserialize)]

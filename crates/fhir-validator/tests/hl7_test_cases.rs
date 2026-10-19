@@ -1611,3 +1611,26 @@ fn narrowed_quantity_value_binding_applies() {
         outcome.deferred
     );
 }
+
+/// `additional-bindings-observation-2#profile`: a required additional
+/// binding is checked.
+#[test]
+fn required_additional_binding() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/additional",
+        "name": "Additional", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Observation", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [{"id": "Observation.code", "path": "Observation.code",
+            "binding": {"strength": "example", "valueSet": "http://hl7.org/fhir/ValueSet/observation-codes",
+                "extension": [{"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.binding.additional",
+                    "extension": [{"url": "purpose", "valueCode": "required"},
+                                  {"url": "valueSet", "valueCanonical": "http://example.org/ValueSet/vs1"}]}]}}]}
+    });
+    let schema = convert(&sd).expect("profile converts").schema;
+    let code = &schema.elements.as_ref().unwrap()["code"];
+    let binding = code.binding.as_ref().expect("binding");
+    assert_eq!(binding.value_set, "http://example.org/ValueSet/vs1");
+    assert_eq!(binding.strength.as_deref(), Some("required"));
+}

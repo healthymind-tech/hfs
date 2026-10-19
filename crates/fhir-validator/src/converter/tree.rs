@@ -355,6 +355,17 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             strength: binding.strength.clone(),
         });
     }
+    // A required additional binding on a binding that is not itself
+    // enforced (example/preferred) is the one to check.
+    if let Some(binding) = &ed.binding
+        && !matches!(binding.strength.as_deref(), Some("required" | "extensible"))
+        && let Some(value_set) = binding.required_additional()
+    {
+        schema.binding = Some(Binding {
+            value_set,
+            strength: Some("required".to_string()),
+        });
+    }
     apply_constraints(schema, &ed.constraint, false);
     for (key, value) in &ed.rest {
         if let Some(rest) = key.strip_prefix("fixed")
