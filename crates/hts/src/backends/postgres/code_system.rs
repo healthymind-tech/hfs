@@ -312,7 +312,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     cs_content_for_system_id(&client, &system_id).await;
                 // A fragment — or, as tx.fhir.org treats it, a code system whose
                 // content is not present — may hold the code elsewhere.
-                if matches!(cs_content.as_deref(), Some("fragment" | "not-present")) {
+                if crate::types::may_hold_unlisted_codes(cs_content.as_deref(), Some(&*system)) {
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
                             "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",

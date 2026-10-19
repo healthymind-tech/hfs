@@ -488,7 +488,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // "...labeled as a fragment..." text.
                     // A code system whose content is not present is treated
                     // the same way (as tx.fhir.org does).
-                    if matches!(cs_content.as_deref(), Some("fragment" | "not-present")) {
+                    if crate::types::may_hold_unlisted_codes(cs_content.as_deref(), Some(&*system)) {
                         let text = match cs_version_str.as_deref() {
                             Some(v) => format!(
                                 "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",
