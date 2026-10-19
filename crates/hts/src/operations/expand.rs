@@ -3471,7 +3471,12 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     .iter()
                     .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
                     .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()));
+                let implicit_sys = url_for_echo
+                    .as_deref()
+                    .and_then(|u| u.split_once("?fhir_vs"))
+                    .map(|(s, _)| s);
                 let echo = match pin_sys {
+                    Some(sys) if implicit_sys == Some(sys.as_str()) => true,
                     Some(sys) => source_vs
                         .as_ref()
                         .and_then(|vs| vs.get("compose"))
@@ -3853,6 +3858,26 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     }
                 }
             }
+        }
+    }
+
+    // An implicit value set (`<system>?fhir_vs…`) draws on its system even
+    // when the page is empty (`count = 0`).
+    if used_pairs.is_empty() {
+        if let Some(sys) = url_for_echo
+            .as_deref()
+            .and_then(|u| u.split_once("?fhir_vs"))
+            .map(|(s, _)| s)
+        {
+            let ver = system_version_pin(&params, sys).or_else(|| {
+                cs_by_url
+                    .get(sys)
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.get("version"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+            used_pairs.push((sys.to_string(), ver));
         }
     }
 
@@ -4623,6 +4648,15 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // the canonical-resource fields. For inline ValueSet requests, the
     // caller supplied the body — copy from there.
     let mut response = json!({ "resourceType": "ValueSet" });
+    // The implicit value set of all of SNOMED CT, named as tx.fhir.org names
+    // it.
+    if source_vs.is_none()
+        && url_for_echo.as_deref() == Some(&format!("{}?fhir_vs", crate::snomed::SNOMED_URL))
+    {
+        response["url"] = json!(format!("{}?fhir_vs", crate::snomed::SNOMED_URL));
+        response["title"] = json!("SNOMED CT Reference Set (All of SNOMED CT)");
+        response["status"] = json!("active");
+    }
     if let Some(ref vs) = source_vs {
         if let Some(obj) = vs.as_object() {
             // Copy required-by-fixtures fields plus a few common optionals.
