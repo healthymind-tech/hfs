@@ -4515,6 +4515,31 @@ fn apply_compose_filters(
             continue;
         }
 
+        // `is-not-a`: every concept except the value and its descendants (the
+        // complement of `is-a`, FHIR R5 filter-operator). Without this arm the
+        // ECL fallback below treated it as unsupported and the include came
+        // back empty, so every code failed validation against such a ValueSet.
+        if (property == "concept" || property == "code") && op == "is-not-a" {
+            any_filter_seen = true;
+            let subtree: HashSet<String> =
+                query_descendants_full(conn, system_url, system_id, value, true)?
+                    .into_iter()
+                    .map(|c| c.code)
+                    .collect();
+            match result.as_mut() {
+                Some(prev) => prev.retain(|c| !subtree.contains(&c.code)),
+                None => {
+                    let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                    result = Some(
+                        all.into_iter()
+                            .filter(|c| !subtree.contains(&c.code))
+                            .collect(),
+                    );
+                }
+            }
+            continue;
+        }
+
         // Normalise `code` → `concept` so IG fixtures that use either property
         // alias for the concept identifier (e.g. search/search-filter-yes uses
         // `property=code, op=is-a`) hit the same hierarchy paths.
@@ -5817,6 +5842,11 @@ fn apply_compose_filters_to_candidates(
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_direct_children_in_set(conn, system_id, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
+            }
+            ("concept", "is-not-a") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let subtree = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                candidates.retain(|c| !subtree.contains(&c.code));
             }
             (_, "regex") => {
                 let regex = compile_vs_regex(value)?;

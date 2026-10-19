@@ -2956,8 +2956,10 @@ async fn apply_compose_filters_pg(
         // The hierarchy operators apply to the concept itself: SQLite only
         // accepts `property` = `concept` / `code` for them and treats any
         // other property as an unsupported filter, i.e. an empty set.
-        if matches!(op, "is-a" | "descendent-of" | "generalizes" | "child-of")
-            && property != "concept"
+        if matches!(
+            op,
+            "is-a" | "descendent-of" | "generalizes" | "child-of" | "is-not-a"
+        ) && property != "concept"
             && property != "code"
         {
             tracing::warn!(
@@ -3068,6 +3070,19 @@ async fn apply_compose_filters_pg(
                 v
             }
             "child-of" => pg_filter_child_of(client, system_url, system_id, value).await?,
+            // `is-not-a`: the complement of `is-a` — every concept except the
+            // value and its descendants.
+            "is-not-a" => {
+                let subtree: HashSet<String> = pg_filter_is_a(client, system_url, system_id, value)
+                    .await?
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect();
+                let mut all =
+                    pg_filter_property_ne(client, meta, system_url, system_id, "", "").await?;
+                all.retain(|(c, _)| !subtree.contains(c));
+                all
+            }
             "regex" => pg_filter_regex(client, system_id, property, value).await?,
             // Single-value `not-in` reduces to `!=`; both return concepts
             // whose property is NOT this value (concepts without the
