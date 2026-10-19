@@ -206,6 +206,11 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
+    // UCUM: any well-formed unit expression, described from its atoms.
+    if system == crate::ucum_validate::UCUM_URL {
+        return ucum_lookup(state, &code).await;
+    }
+
     // `property` names what to return; `*` (or nothing) means everything.
     // `abstract` is reported whatever was asked for, so the backend is also
     // asked for `notSelectable`.
@@ -543,6 +548,56 @@ async fn process_lookup_inner<B: TerminologyBackend>(
         "resourceType": "Parameters",
         "parameter": parameter
     }))
+}
+
+/// `$lookup` of a UCUM unit expression (see [`crate::ucum`]): the code is its
+/// own display, with its description (`(milligram) / (deciliter)`) and the
+/// common units value set's name for it as designations.
+async fn ucum_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    code: &str,
+) -> Result<Value, HtsError> {
+    use crate::ucum_validate::{UCUM_URL, is_valid_ucum_code};
+    if !is_valid_ucum_code(code) {
+        return Err(HtsError::coded(
+            "code-invalid",
+            "invalid-code",
+            format!(
+                "Unknown code '{code}' in the CodeSystem '{UCUM_URL}': {}",
+                crate::ucum::error_message(code)
+            ),
+            Some("code"),
+        ));
+    }
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let (common, _) = crate::ucum::common_units(state.backend()).await;
+    let mut parameter = vec![
+        json!({"name": "name", "valueString": "UCUM"}),
+        json!({"name": "version", "valueString": version}),
+        json!({"name": "display", "valueString": code}),
+        json!({"name": "system", "valueUri": UCUM_URL}),
+        json!({"name": "code", "valueCode": code}),
+        json!({"name": "property", "part": [
+            {"name": "code", "valueCode": "inactive"},
+            {"name": "value", "valueBoolean": false}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": code}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": crate::ucum::description(code)}]}),
+    ];
+    if let Some(name) = common
+        .iter()
+        .find(|(c, _)| c == code)
+        .and_then(|(_, d)| d.as_deref())
+    {
+        parameter.push(json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "use", "valueCoding": {"system": "http://snomed.info/sct", "code": "900000000000013009"}},
+            {"name": "value", "valueString": name}]}));
+    }
+    Ok(json!({"resourceType": "Parameters", "parameter": parameter}))
 }
 
 /// `POST /CodeSystem/$lookup`

@@ -403,6 +403,13 @@ async fn build_overlay<B: TerminologyBackend>(
         compose_canonicals(r, &mut refs);
         pending.extend(refs.into_iter().map(|c| (c, 0)));
     }
+    // UCUM answers draw on the common units value set (see crate::ucum).
+    if pending
+        .iter()
+        .any(|(c, _)| c == crate::ucum_validate::UCUM_URL)
+    {
+        pending.push((crate::ucum::UCUM_COMMON.to_string(), 0));
+    }
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut copied_concepts = 0usize;
     while let Some((canonical, depth)) = pending.pop() {

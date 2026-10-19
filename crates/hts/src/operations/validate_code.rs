@@ -544,6 +544,115 @@ async fn media_type_vs_validate<B: TerminologyBackend>(
     ))
 }
 
+/// `ValueSet/$validate-code` against a value set over the UCUM grammar
+/// (the whole of it, or filtered by `canonical`; see [`crate::ucum`]);
+/// `None` for any other value set.
+async fn ucum_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::ucum_validate::{UCUM_URL, is_valid_ucum_code};
+    let vs = requested_value_set(state, params).await?;
+    if !crate::ucum::is_ucum_grammar_value_set(&vs) {
+        return None;
+    }
+    let (code, path) = if let Some(code) = find_str_param(params, "code") {
+        if find_str_param(params, "system").is_some_and(|s| s != UCUM_URL) {
+            return None;
+        }
+        (code, RequestPath::BareCode)
+    } else if let Some((system, code, _, _)) = extract_coding_full(params, "coding") {
+        if system != UCUM_URL {
+            return None;
+        }
+        (code, RequestPath::Coding)
+    } else {
+        return None;
+    };
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+    let label = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    let valid = is_valid_ucum_code(&code);
+    let in_vs = valid && crate::ucum::in_value_set(&vs, &code);
+    let mut issues = Vec::new();
+    let mut message = None;
+    if !in_vs {
+        let not_in = format!(
+            "The provided code '{UCUM_URL}#{code}' was not found in the value set '{label}'"
+        );
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: not_in.clone(),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+        if valid {
+            // Say why: its canonical unit is not the value set's.
+            if let Some(c) = crate::ucum::canonical(&code) {
+                message = Some(format!(
+                    "{not_in} (its canonical unit is {})",
+                    crate::ucum::canonical_unit(&c)
+                ));
+            }
+        } else {
+            let unknown =
+                format!("Unknown code '{code}' in the CodeSystem '{UCUM_URL}' version '{version}'");
+            issues.push(ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "invalid-code".into(),
+                text: unknown,
+                expression: Some("Coding.code".into()),
+                location: None,
+                message_id: Some("Unknown_Code_in_Version".into()),
+            });
+            issues.push(ValidationIssue {
+                severity: "information".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "invalid-code".into(),
+                text: crate::ucum::error_message(&code),
+                expression: Some("Coding.code".into()),
+                location: None,
+                message_id: None,
+            });
+        }
+    }
+    let mut value = build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: valid.then(|| code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(UCUM_URL),
+        Some(&version),
+        None,
+        None,
+        path,
+    );
+    if let (Some(m), Some(ps)) = (message, value["parameter"].as_array_mut()) {
+        for p in ps.iter_mut() {
+            if p["name"] == "message" {
+                p["valueString"] = Value::String(m.clone());
+            }
+        }
+    }
+    Some(value)
+}
+
 /// Look up the `status` property of a concept (e.g. `retired`, `deprecated`,
 /// `withdrawn`, `inactive`). Returns `None` when the concept has no status
 /// Extract a VS-implied `displayLanguage` from a stored ValueSet resource.
@@ -4396,6 +4505,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
     if let Some(value) = media_type_vs_validate(state, &params).await {
+        return Ok(value);
+    }
+    if let Some(value) = ucum_vs_validate(state, &params).await {
         return Ok(value);
     }
     // ValueSet/$validate-code accepts either `url` (canonical URL of a stored

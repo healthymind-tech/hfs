@@ -120,6 +120,28 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
         }
     };
 
+    // UCUM: a grammar, judged by canonical form and magnitude.
+    if system == crate::ucum_validate::UCUM_URL {
+        let side = if coding_form { "coding" } else { "code" };
+        let outcome = crate::ucum::subsumes(&code_a, &code_b).map_err(|bad| {
+            let which = if bad == code_a { "A" } else { "B" };
+            HtsError::coded(
+                "code-invalid",
+                "invalid-code",
+                format!(
+                    "Unknown code '{bad}' in the CodeSystem '{}': {}",
+                    crate::ucum_validate::UCUM_URL,
+                    crate::ucum::error_message(bad)
+                ),
+                Some(&format!("{side}{which}")),
+            )
+        })?;
+        return Ok(json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "outcome", "valueCode": outcome.as_str()}]
+        }));
+    }
+
     // Media types: a grammar, judged without stored content.
     if system == crate::mimetypes::SYSTEM {
         let side = if coding_form { "coding" } else { "code" };

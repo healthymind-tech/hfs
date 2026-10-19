@@ -1121,3 +1121,73 @@ async fn media_type_code_system() {
         "cannot-determine"
     );
 }
+
+/// UCUM/*: UCUM is a grammar — $subsumes compares canonical form and
+/// magnitude, value sets filter on the canonical unit, $lookup describes
+/// any expression.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn ucum_grammar_operations() {
+    let app = TestApp::new().await;
+    let subsumes = |a: &str, b: &str| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "system", "valueUri": "http://unitsofmeasure.org"},
+            {"name": "codeA", "valueCode": a}, {"name": "codeB", "valueCode": b}]})
+        .to_string()
+    };
+    for (a, b, outcome) in [
+        ("1/min", "min-1", "equivalent"),
+        ("N", "kg.m/s2", "equivalent"),
+        ("mg/dL", "g/L", "not-subsumed"),
+        ("Cel", "K", "not-subsumed"),
+    ] {
+        let (st, body) = app.post_fhir("/CodeSystem/$subsumes", subsumes(a, b)).await;
+        assert_eq!(st, StatusCode::OK, "{a} {b}: {body}");
+        assert_eq!(
+            param(&body, "outcome").unwrap()["valueCode"],
+            outcome,
+            "{a} {b}"
+        );
+    }
+    let (st, _) = app
+        .post_fhir("/CodeSystem/$subsumes", subsumes("not-a-unit", "mg"))
+        .await;
+    assert!(st.is_client_error());
+
+    let canonical = json!({"resourceType": "ValueSet", "url": "http://hts.test/vs/mass", "status": "active",
+        "compose": {"include": [{"system": "http://unitsofmeasure.org",
+            "filter": [{"property": "canonical", "op": "=", "value": "g"}]}]}});
+    let validate = |code: &str| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://hts.test/vs/mass"},
+            {"name": "system", "valueUri": "http://unitsofmeasure.org"},
+            {"name": "code", "valueCode": code},
+            {"name": "tx-resource", "resource": canonical.clone()}]})
+    };
+    let body = vs_validate(&app, validate("kg")).await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    let body = vs_validate(&app, validate("mL")).await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    let msg = param(&body, "message").unwrap()["valueString"]
+        .as_str()
+        .unwrap();
+    assert!(msg.contains("m3"), "{msg}");
+
+    let (st, body) = app
+        .get_fhir("/CodeSystem/$lookup?system=http://unitsofmeasure.org&code=mg/dL")
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "mg/dL");
+    assert!(
+        body.to_string().contains("(milligram) / (deciliter)"),
+        "{body}"
+    );
+}

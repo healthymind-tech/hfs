@@ -26,7 +26,7 @@ pub fn is_valid_ucum_code(code: &str) -> bool {
     if code.is_empty() {
         return false;
     }
-    if validate_ucum_expression(code).is_ok() {
+    if validate_ucum_expression(code).is_ok() || crate::ucum::canonical(code).is_some() {
         return true;
     }
     match strip_annotations(code) {

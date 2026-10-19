@@ -1755,6 +1755,76 @@ async fn media_type_expand<B: TerminologyBackend>(
     )))
 }
 
+/// `$expand` of a value set over the UCUM grammar (see [`crate::ucum`]):
+/// based on the common UCUM units, filtered by the value set, and marked
+/// unclosed; `None` for any other value set.
+async fn ucum_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Result<Option<Bytes>, HtsError> {
+    use crate::ucum_validate::UCUM_URL;
+    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
+        return Ok(None);
+    };
+    if !crate::ucum::is_ucum_grammar_value_set(&vs) {
+        return Ok(None);
+    }
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let (common, common_vs) = crate::ucum::common_units(state.backend()).await;
+    let mut codes: Vec<String> = common
+        .into_iter()
+        .map(|(c, _)| c)
+        .filter(|c| crate::ucum::takes_whole_grammar(&vs) || crate::ucum::in_value_set(&vs, c))
+        .collect();
+    codes.sort();
+    codes.dedup();
+    let mut parameter =
+        vec![json!({"name": "used-codesystem", "valueUri": format!("{UCUM_URL}|{version}")})];
+    // The whole grammar is the common units value set, with its status.
+    if crate::ucum::takes_whole_grammar(&vs) {
+        if let Some(cvs) = common_vs.as_ref() {
+            let canonical = match cvs.get("version").and_then(|v| v.as_str()) {
+                Some(v) => format!("{}|{v}", crate::ucum::UCUM_COMMON),
+                None => crate::ucum::UCUM_COMMON.to_string(),
+            };
+            let status = if cvs.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
+                Some("experimental")
+            } else {
+                cvs.get("status")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| *s != "active")
+            };
+            if let Some(status) = status {
+                parameter.push(json!({"name": format!("warning-{status}"), "valueUri": canonical}));
+            }
+        }
+    }
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "extension": [
+            {"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed", "valueBoolean": true},
+            {"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+             "valueString": crate::ucum::UNCLOSED_REASON}
+        ],
+        "parameter": parameter,
+        "contains": codes.iter().map(|c| json!({"system": UCUM_URL, "code": c, "display": c})).collect::<Vec<_>>(),
+    });
+    if !crate::ucum::takes_whole_grammar(&vs) {
+        expansion["total"] = json!(codes.len());
+    }
+    let mut out = json!({"resourceType": "ValueSet"});
+    for key in ["url", "version", "name", "status"] {
+        if let Some(v) = vs.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out["expansion"] = expansion;
+    Ok(Some(Bytes::from(
+        serde_json::to_vec(&out).map_err(|e| HtsError::Internal(e.to_string()))?,
+    )))
+}
+
 pub(crate) async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -1786,6 +1856,9 @@ pub(crate) async fn process_expand<B: TerminologyBackend>(
     )
     .await;
     if let Some(bytes) = media_type_expand(state, &params).await? {
+        return Ok(bytes);
+    }
+    if let Some(bytes) = ucum_expand(state, &params).await? {
         return Ok(bytes);
     }
     if let Some(key) = build_expand_cache_key(&params) {
