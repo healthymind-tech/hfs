@@ -64,6 +64,8 @@ pub enum Deferred {
         human: Option<String>,
         /// `error` | `warning` | `guideline`.
         severity: Option<String>,
+        /// See [`DeferredConstraint::own_resource`].
+        own_resource: bool,
     },
     /// A terminology binding to check (filtered to `required` strength at
     /// execution time).
@@ -317,6 +319,12 @@ pub struct DeferredConstraint<'a> {
     pub path: &'a str,
     pub id: &'a str,
     pub expression: &'a str,
+    /// The constraint belongs to the definition of the resource at `path`
+    /// (a `dom-*` / `pat-1` invariant on a contained or entry resource), so
+    /// `%resource` is that resource; otherwise it is the innermost resource
+    /// *containing* the node (a profile's invariant on `Bundle.entry.resource`
+    /// sees the Bundle as `%resource`).
+    pub own_resource: bool,
 }
 
 /// The handlers for one validation run.
@@ -383,7 +391,7 @@ fn execute_constraints(
 
     // Select, filter, and dedup — preserving deferred order.
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity)> = Vec::new();
+    let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity, bool)> = Vec::new();
     for d in deferred {
         let Deferred::Constraint {
             path,
@@ -391,6 +399,7 @@ fn execute_constraints(
             expression,
             human,
             severity,
+            own_resource,
         } = d
         else {
             continue;
@@ -406,7 +415,14 @@ fn execute_constraints(
         if !seen.insert((path.clone(), id.clone())) {
             continue; // same constraint from several cooperative layers
         }
-        selected.push((path, id, expression, human.as_deref(), issue_severity));
+        selected.push((
+            path,
+            id,
+            expression,
+            human.as_deref(),
+            issue_severity,
+            *own_resource,
+        ));
     }
     if selected.is_empty() {
         return;
@@ -414,11 +430,14 @@ fn execute_constraints(
 
     let refs: Vec<DeferredConstraint<'_>> = selected
         .iter()
-        .map(|(path, id, expression, _, _)| DeferredConstraint {
-            path,
-            id,
-            expression,
-        })
+        .map(
+            |(path, id, expression, _, _, own_resource)| DeferredConstraint {
+                path,
+                id,
+                expression,
+                own_resource: *own_resource,
+            },
+        )
         .collect();
     let outcomes = evaluator.evaluate_all(resource, version, &refs);
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
@@ -447,7 +466,7 @@ fn execute_constraints(
         return;
     }
 
-    for ((path, id, _, human, severity), outcome) in selected.iter().zip(outcomes) {
+    for ((path, id, _, human, severity, _), outcome) in selected.iter().zip(outcomes) {
         match outcome {
             ConstraintOutcome::Passed => {}
             ConstraintOutcome::Failed => {

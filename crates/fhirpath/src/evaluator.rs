@@ -1679,9 +1679,13 @@ fn evaluate_term(
                 if let Some(var_name) = name.strip_prefix('%') {
                     if var_name == "context" || var_name == "resource" || var_name == "rootResource"
                     {
-                        // Return %context / %resource / %rootResource value. In this
-                        // engine all three resolve to the resource(s) in scope: the
-                        // root resource being evaluated.
+                        // Return %context / %resource / %rootResource value: the
+                        // caller's binding when it set one (an invariant on a
+                        // nested element or resource), else the resource(s) in
+                        // scope — the root resource being evaluated.
+                        if let Some(bound) = context.lookup_variable(var_name) {
+                            return Ok(bound.clone());
+                        }
                         // Correctly wrap the entire conditional result in Ok()
                         return Ok(if context.resources.is_empty() {
                             EvaluationResult::Empty
@@ -1803,6 +1807,9 @@ fn evaluate_term(
             // Special handling for %context / %resource / %rootResource — all
             // resolve to the resource(s) currently in scope.
             if name == "context" || name == "resource" || name == "rootResource" {
+                if let Some(bound) = context.lookup_variable(name) {
+                    return Ok(bound.clone());
+                }
                 Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {

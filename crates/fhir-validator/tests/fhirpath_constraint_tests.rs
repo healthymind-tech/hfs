@@ -242,6 +242,7 @@ fn spec_example_narratives_pass_html_checks() {
         path: "Patient.text.div",
         id,
         expression: "htmlChecks()",
+        own_resource: false,
     });
     let mut failures = Vec::new();
     for (div, files) in &divs {

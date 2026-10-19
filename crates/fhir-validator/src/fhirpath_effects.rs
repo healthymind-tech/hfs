@@ -29,10 +29,13 @@
 //! Parsed expression ASTs are memoized per evaluator instance — core
 //! invariants repeat across every resource of a type.
 //!
-//! Known limitation (documented in the plan): helios-fhirpath resolves
-//! `%resource`/`%rootResource` to the root resource, so constraints that
-//! depend on nested-resource `%resource` semantics may misfire; and the
-//! `.all()` wrapping makes `%context` the root rather than the node.
+//! Environment variables (FHIR invariant semantics): `%context` is the node
+//! the invariant is evaluated on; `%resource` the resource that node belongs
+//! to — the node itself for a resource definition's own invariants on a
+//! contained or entry resource, else the innermost resource containing it;
+//! `%rootResource` the container of `%resource` when that is a contained
+//! resource, else `%resource`. helios-fhirpath resolves all three to the root
+//! resource unless bound, so they are bound whenever they differ from it.
 
 use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
 use helios_fhir::{FhirResource, FhirVersion};
@@ -114,7 +117,17 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
             .map(|c| {
                 let expression = effective_expression(c.id, c.expression);
                 match self.ast(&expression) {
-                    Ok(ast) => evaluate_at(&ast, c.path, &context, &mut nodes),
+                    Ok(ast) => evaluate_at(
+                        &ast,
+                        &Scope {
+                            path: c.path,
+                            own_resource: c.own_resource,
+                            expression: &expression,
+                            raw: resource,
+                        },
+                        &context,
+                        &mut nodes,
+                    ),
                     Err(e) => ConstraintOutcome::NotEvaluable(format!("parse error: {e}")),
                 }
             })
@@ -191,12 +204,90 @@ fn step(
 /// as focus — the same semantics as the combined expression
 /// `<relative path>.all((<expr>).allTrue())` (see the module docs), without
 /// parsing a path-specific expression or re-navigating from the root.
+/// Where one invariant runs: its node, and what decides the environment
+/// variables there (see the module docs).
+struct Scope<'a> {
+    path: &'a str,
+    own_resource: bool,
+    expression: &'a str,
+    raw: &'a Value,
+}
+
+/// `context` with `%resource` / `%rootResource` bound for a node below the
+/// root, or `None` when both are the root resource (the evaluator's default).
+fn scoped_context(
+    scope: &Scope<'_>,
+    relative: &str,
+    context: &EvaluationContext,
+    nodes: &mut NodeCache,
+) -> Result<Option<EvaluationContext>, String> {
+    let segments: Vec<&str> = relative.split('.').collect();
+    // Resources along the path: (number of leading segments, contained?).
+    let mut resources: Vec<(usize, bool)> = vec![(0, false)];
+    let mut current = scope.raw;
+    let mut last_key = "";
+    for (i, segment) in segments.iter().enumerate() {
+        let next = match current {
+            Value::Object(map) => map.get(*segment),
+            Value::Array(items) => segment.parse::<usize>().ok().and_then(|n| items.get(n)),
+            _ => None,
+        };
+        let Some(next) = next else { break };
+        current = next;
+        if !segment.chars().all(|c| c.is_ascii_digit()) {
+            last_key = segment;
+        }
+        if current
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            resources.push((i + 1, last_key == "contained"));
+        }
+    }
+    let focus_is_resource = resources
+        .last()
+        .is_some_and(|(len, _)| *len == segments.len());
+    let resource_at = if focus_is_resource && !scope.own_resource {
+        resources.len() - 2
+    } else {
+        resources.len() - 1
+    };
+    let root_at = if resources[resource_at].1 && resource_at > 0 {
+        resource_at - 1
+    } else {
+        resource_at
+    };
+    if resource_at == 0 {
+        return Ok(None);
+    }
+    let mut node = |len: usize| -> Result<EvaluationResult, String> {
+        if len == 0 {
+            return Ok(context
+                .this
+                .as_deref()
+                .cloned()
+                .unwrap_or(EvaluationResult::Empty));
+        }
+        Ok(nodes.focus(&segments[..len].join("."), context)?.clone())
+    };
+    let resource = node(resources[resource_at].0)?;
+    let root = node(resources[root_at].0)?;
+    let mut scoped = context.clone();
+    // The memo caches `%resource`-rooted chains for the root resource.
+    scoped.root_memo = None;
+    scoped.set_variable_result("resource", resource);
+    scoped.set_variable_result("rootResource", root);
+    Ok(Some(scoped))
+}
+
 fn evaluate_at(
     ast: &Expression,
-    path: &str,
+    scope: &Scope<'_>,
     context: &EvaluationContext,
     nodes: &mut NodeCache,
 ) -> ConstraintOutcome {
+    let path = scope.path;
     let relative = path.split_once('.').map(|(_, rest)| rest).unwrap_or("");
     if relative.is_empty() {
         return match helios_fhirpath::evaluator::evaluate(ast, context, None) {
@@ -204,6 +295,15 @@ fn evaluate_at(
             Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
         };
     }
+    let scoped =
+        if scope.expression.contains("%resource") || scope.expression.contains("%rootResource") {
+            match scoped_context(scope, relative, context, nodes) {
+                Ok(scoped) => scoped,
+                Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
+            }
+        } else {
+            None
+        };
     let focus = match nodes.focus(relative, context) {
         Ok(focus) => focus,
         Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
@@ -213,7 +313,18 @@ fn evaluate_at(
         EvaluationResult::Empty => &[],
         single => std::slice::from_ref(single),
     };
+    let base_context = scoped.as_ref().unwrap_or(context);
+    let binds_context = scope.expression.contains("%context");
     for item in items {
+        let item_context;
+        let context = if binds_context {
+            let mut c = base_context.clone();
+            c.set_variable_result("context", item.clone());
+            item_context = c;
+            &item_context
+        } else {
+            base_context
+        };
         let result = match helios_fhirpath::evaluator::evaluate(ast, context, Some(item)) {
             Ok(result) => result,
             Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
@@ -432,11 +543,13 @@ mod tests {
                         path,
                         id,
                         expression,
+                        own_resource,
                         ..
                     } => Some(DeferredConstraint {
                         path,
                         id,
                         expression,
+                        own_resource: *own_resource,
                     }),
                     _ => None,
                 })
@@ -504,11 +617,13 @@ mod tests {
                     path,
                     id,
                     expression,
+                    own_resource,
                     ..
                 } => Some(DeferredConstraint {
                     path,
                     id,
                     expression,
+                    own_resource: *own_resource,
                 }),
                 _ => None,
             })

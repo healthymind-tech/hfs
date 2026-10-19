@@ -719,6 +719,9 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
         }
         if let Some(constraints) = &schema.constraints {
             let path = ctx.path.render_dotted();
+            // A resource definition's own root invariants (vs a profile's
+            // invariant on an element that holds a resource).
+            let own_resource = schema.kind.as_deref() == Some("resource");
             for (id, c) in constraints {
                 ctx.deferred.push(Deferred::Constraint {
                     path: path.clone(),
@@ -726,6 +729,7 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                     expression: c.expression.clone(),
                     human: c.human.clone(),
                     severity: c.severity.clone(),
+                    own_resource,
                 });
             }
         }
