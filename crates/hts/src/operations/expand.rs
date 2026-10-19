@@ -3513,6 +3513,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
             if matches!(name, "uuid" | "binding-style") {
                 return false;
             }
+            // tx.fhir.org's knob to lift its expansion size limit; it
+            // does not echo it.
+            if name == "allowMaximumSizeExpansion" {
+                return false;
+            }
             // Synthetic internal-only params injected by handlers — never
             // echo (e.g. `__max_expansion_size__` set by the
             // X-TOO-COSTLY-THRESHOLD header injector).
