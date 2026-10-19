@@ -318,6 +318,18 @@ fn error(kind: ErrorKind, path: String, message: String) -> ValidationError {
 /// The Bundle-level rules (see the module docs). Nested Bundles are judged
 /// when the walk validates them on their own; only the root is checked here.
 pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
+    bundle_rules_with(bundle, &|t: &str| {
+        t.starts_with(|c: char| c.is_ascii_uppercase())
+    })
+}
+
+/// [`bundle_rules`] with `is_resource_type` telling resource type names
+/// (`Observation`) from other path segments (`Obervation`) in RESTful
+/// fullUrls.
+pub(super) fn bundle_rules_with(
+    bundle: &Value,
+    is_resource_type: &dyn Fn(&str) -> bool,
+) -> Vec<ValidationError> {
     let mut out = Vec::new();
     if bundle.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
         return out;
@@ -363,6 +375,7 @@ pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
         );
         let restful = url_type.starts_with(|c: char| c.is_ascii_uppercase())
             && url_type.chars().all(|c| c.is_ascii_alphabetic())
+            && is_resource_type(url_type)
             && !url_id.is_empty();
         if restful && (url_type != ty || url_id != id) {
             out.push(error(

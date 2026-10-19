@@ -284,7 +284,15 @@ impl Validator {
             .errors
             .extend(bundle_entry_type_mismatches(resource));
         outcome.errors.extend(bundle_unresolved_urns(resource));
-        outcome.errors.extend(bundle::bundle_rules(resource));
+        let resolver = self.resolver.as_ref();
+        let is_resource_type = |name: &str| {
+            resolver
+                .resolve(name)
+                .is_some_and(|s| crate::editor::is_resource(&s))
+        };
+        outcome
+            .errors
+            .extend(bundle::bundle_rules_with(resource, &is_resource_type));
         outcome
     }
 
