@@ -105,6 +105,7 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             max_value: Some(Value::Null),
             max_length: Some(0),
             min_length: Some(0),
+            max_size: Some(0),
             binding: Some(Binding {
                 value_set: String::new(),
                 strength: None,
@@ -184,6 +185,7 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
             "typeProfiles",
             "maxLength",
             "minLength",
+            "maxSize",
         ],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.

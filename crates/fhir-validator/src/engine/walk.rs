@@ -771,7 +771,8 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         .schemas()
         .any(|s| s.url.as_deref() == Some("http://hl7.org/fhir/StructureDefinition/Attachment"))
     {
-        super::attachment::check_attachment(ctx, obj);
+        let max_size = set.schemas().filter_map(|s| s.max_size).min();
+        super::attachment::check_attachment(ctx, obj, max_size);
     }
 
     // FHIR JSON has no empty objects: an element is present only with a
@@ -2437,6 +2438,7 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         max_value,
         max_length,
         min_length,
+        max_size,
         binding,
         constraints,
         refers,

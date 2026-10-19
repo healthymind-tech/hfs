@@ -132,6 +132,10 @@ pub struct FhirSchema {
     /// characters a string value may have.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_length: Option<u64>,
+    /// The `maxSize` extension on the element definition: most bytes an
+    /// Attachment's data may hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,

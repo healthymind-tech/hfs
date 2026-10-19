@@ -1685,3 +1685,34 @@ async fn profile_matched_slices_may_overlap() {
         "{issues:#?}"
     );
 }
+
+/// `ch/mixed-valueset-dr#profile`: the maxSize extension caps an
+/// Attachment's data.
+#[tokio::test]
+async fn attachment_max_size() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/small",
+        "name": "Small", "status": "active", "kind": "resource", "abstract": false,
+        "type": "DocumentReference", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/DocumentReference",
+        "differential": {"element": [{"id": "DocumentReference.content.attachment",
+            "path": "DocumentReference.content.attachment",
+            "extension": [{"url": "http://hl7.org/fhir/StructureDefinition/maxSize", "valueDecimal": 15}]}]}
+    });
+    // "Hello World Data!" = 17 bytes
+    let doc = json!({"resourceType": "DocumentReference", "status": "current",
+        "content": [{"attachment": {"contentType": "text/plain", "data": "SGVsbG8gV29ybGQgRGF0YSE="}}]});
+    let issues = validate_with(
+        &doc,
+        &[sd],
+        &["http://example.org/StructureDefinition/small"],
+    )
+    .await;
+    let errs = errors(&issues);
+    assert!(
+        errs.iter().any(|e| e.message
+            == "Attachment size is 17 bytes which exceeds the stated limit of 15 bytes"),
+        "{issues:#?}"
+    );
+}

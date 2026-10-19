@@ -9,7 +9,11 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 
 /// Check an Attachment's `data` against its `size` and `hash`.
-pub(super) fn check_attachment(ctx: &mut WalkCtx<'_>, attachment: &serde_json::Map<String, Value>) {
+pub(super) fn check_attachment(
+    ctx: &mut WalkCtx<'_>,
+    attachment: &serde_json::Map<String, Value>,
+    max_size: Option<u64>,
+) {
     let Some(data) = attachment.get("data").and_then(Value::as_str) else {
         return;
     };
@@ -34,6 +38,18 @@ pub(super) fn check_attachment(ctx: &mut WalkCtx<'_>, attachment: &serde_json::M
             return;
         }
     };
+    // The profile's `maxSize` extension caps the content.
+    if let Some(max) = max_size
+        && decoded.len() as u64 > max
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            format!(
+                "Attachment size is {} bytes which exceeds the stated limit of {max} bytes",
+                decoded.len()
+            ),
+        );
+    }
     if let Some(size) = attachment.get("size").and_then(Value::as_u64)
         && size != decoded.len() as u64
     {

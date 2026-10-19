@@ -395,6 +395,15 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
                 {
                     schema.min_length = ext.get("valueInteger").and_then(serde_json::Value::as_u64);
                 }
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/maxSize")
+                {
+                    schema.max_size = ext
+                        .get("valueDecimal")
+                        .or_else(|| ext.get("valueInteger"))
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|n| n as u64);
+                }
             }
         }
     }
