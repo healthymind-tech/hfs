@@ -657,3 +657,51 @@ async fn extension_contexts_of_every_kind() {
         1
     );
 }
+
+/// `patient-extension-bad*`: an extension needs an absolute url (relative
+/// urls are for a complex extension's own sub-extensions), and FHIR JSON has
+/// no empty string values.
+#[test]
+fn extension_urls_and_empty_values() {
+    let count = |r: Value, prefix: &str| {
+        structural_errors(&r)
+            .into_iter()
+            .filter(|(_, m)| m.starts_with(prefix))
+            .count()
+    };
+    let patient = |ext: Value| json!({"resourceType": "Patient", "extension": [ext]});
+    assert_eq!(
+        count(
+            patient(json!({"valueString": "x"})),
+            "Extension.url is required"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            patient(json!({"url": "", "valueString": "x"})),
+            "Extension.url is required"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            patient(json!({"url": "", "valueString": "x"})),
+            "value cannot be empty"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            patient(json!({"url": "something", "valueString": "x"})),
+            "Extension.url must be an absolute URL"
+        ),
+        1
+    );
+    let complex = json!({"url": "http://hl7.org/fhir/StructureDefinition/patient-animal",
+        "extension": [{"url": "species", "valueCodeableConcept": {"text": "dog"}}]});
+    assert_eq!(
+        count(patient(complex), "Extension.url must be an absolute URL"),
+        0
+    );
+}

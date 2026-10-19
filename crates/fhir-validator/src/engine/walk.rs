@@ -1078,6 +1078,33 @@ fn validate_extension_item<'a>(
     item: &'a Value,
     modifier: bool,
 ) {
+    // A sub-extension of a complex extension names itself with a relative
+    // url (`species`); anything else needs an absolute one.
+    let keys = ctx.path.keys_from(0);
+    let nested = keys.len() >= 2
+        && matches!(keys[keys.len() - 2], "extension" | "modifierExtension")
+        && !ctx.extension_urls.is_empty();
+    match item.get("url").and_then(Value::as_str) {
+        None | Some("") if item.is_object() => ctx.error(
+            ErrorKind::Required,
+            "Extension.url is required in order to identify, use and validate the extension"
+                .to_string(),
+        ),
+        // (Judged with the FHIR packs only: FHIR Schema fixtures name
+        // extensions by bare keys.)
+        Some(u)
+            if !nested
+                && !u.is_empty()
+                && !u.contains(':')
+                && knows_hl7_extensions(ctx.resolver) =>
+        {
+            ctx.error(
+                ErrorKind::PrimitiveValue,
+                "Extension.url must be an absolute URL".to_string(),
+            )
+        }
+        _ => {}
+    }
     let url = item
         .get("url")
         .and_then(Value::as_str)
