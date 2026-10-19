@@ -1959,11 +1959,136 @@ fn adopt_limit_param(params: &mut Vec<Value>) {
     params.retain(|p| p.get("name").and_then(Value::as_str) != Some("limit"));
 }
 
+/// A SNOMED CT value set that lists post-coordinated expressions, or filters
+/// on `expressions`: the backends expand concepts only, so the request is
+/// answered from a copy without them (an `expressions` filter selects the
+/// same concepts either way), and the listed expressions that are valid are
+/// added to the expansion after. The `valueset-unclosed` marking follows the
+/// original definition.
+async fn snomed_expression_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Result<Bytes, HtsError>> {
+    let vs = super::validate_code::requested_value_set(state, params).await?;
+    let includes = vs.get("compose")?.get("include")?.as_array()?;
+    let is_expr = |c: &str| !c.bytes().all(|b| b.is_ascii_digit());
+    let affected = includes.iter().any(|inc| {
+        inc.get("system").and_then(Value::as_str) == Some(crate::snomed::SNOMED_URL)
+            && (inc
+                .get("filter")
+                .and_then(Value::as_array)
+                .is_some_and(|f| {
+                    f.iter()
+                        .any(|f| f.get("property").and_then(Value::as_str) == Some("expressions"))
+                })
+                || inc
+                    .get("concept")
+                    .and_then(Value::as_array)
+                    .is_some_and(|cs| {
+                        cs.iter()
+                            .any(|c| c.get("code").and_then(Value::as_str).is_some_and(is_expr))
+                    }))
+    });
+    if !affected {
+        return None;
+    }
+    let mut copy = vs.clone();
+    let mut expressions: Vec<String> = Vec::new();
+    let mut kept = Vec::new();
+    for inc in includes {
+        let mut inc = inc.clone();
+        if inc.get("system").and_then(Value::as_str) == Some(crate::snomed::SNOMED_URL) {
+            if let Some(f) = inc.get_mut("filter").and_then(Value::as_array_mut) {
+                f.retain(|f| f.get("property").and_then(Value::as_str) != Some("expressions"));
+            }
+            if let Some(cs) = inc.get_mut("concept").and_then(Value::as_array_mut) {
+                cs.retain(|c| {
+                    let code = c.get("code").and_then(Value::as_str).unwrap_or_default();
+                    if is_expr(code) {
+                        expressions.push(code.to_string());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if cs.is_empty() {
+                    continue;
+                }
+            }
+        }
+        kept.push(inc);
+    }
+    copy["compose"]["include"] = Value::Array(kept);
+    let mut inner: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.get("name").and_then(Value::as_str),
+                Some("url" | "valueSetVersion" | "valueSet")
+            )
+        })
+        .cloned()
+        .collect();
+    inner.push(json!({"name": "valueSet", "resource": copy}));
+    let bytes = match process_expand_cached(state, inner).await {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let Ok(mut out) = serde_json::from_slice::<Value>(&bytes) else {
+        return Some(Ok(bytes));
+    };
+    let model = state
+        .backend()
+        .snomed_model(&TenantContext::system(), crate::snomed::SNOMED_URL, None)
+        .await
+        .ok()
+        .flatten();
+    if let Some(exp) = out.get_mut("expansion") {
+        let mut added = 0u64;
+        if let Some(m) = model.as_deref() {
+            let list = exp
+                .as_object_mut()
+                .map(|o| o.entry("contains").or_insert_with(|| json!([])));
+            if let Some(Value::Array(list)) = list {
+                for code in &expressions {
+                    if let crate::snomed::ops::Checked::Valid { display, .. } =
+                        crate::snomed::ops::check(m, code)
+                    {
+                        list.push(json!({"system": crate::snomed::SNOMED_URL, "code": code, "display": display}));
+                        added += 1;
+                    }
+                }
+            }
+        }
+        if let Some(t) = exp.get("total").and_then(Value::as_u64) {
+            exp["total"] = json!(t + added);
+        }
+        match snomed_unclosed(Some(&vs), None) {
+            Some(ext) => exp["extension"] = Value::Array(ext),
+            None => {
+                if let Some(o) = exp.as_object_mut() {
+                    o.remove("extension");
+                }
+            }
+        }
+    }
+    // Answer as for the value set itself.
+    if let Some(o) = out.as_object_mut() {
+        o.remove("compose");
+    }
+    Some(Ok(Bytes::from(
+        serde_json::to_vec(&out).unwrap_or_default(),
+    )))
+}
+
 async fn process_expand_cached<B: TerminologyBackend>(
     state: &AppState<B>,
     mut params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    if let Some(result) = Box::pin(snomed_expression_expand(state, &params)).await {
+        return result;
+    }
     // SNOMED CT edition URIs in `*-system-version` pins and an inline
     // ValueSet's includes → the stored release they name.
     crate::operations::snomed_version::normalize_snomed_versions(

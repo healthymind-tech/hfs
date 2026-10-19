@@ -142,6 +142,29 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
         }));
     }
 
+    // SNOMED CT expressions: compared by their normal forms.
+    let expression = |c: &str| {
+        c.contains(|ch: char| matches!(ch, ':' | '+' | '|' | '{' | '(' | '=') || ch.is_whitespace())
+    };
+    if system == crate::snomed::SNOMED_URL && (expression(&code_a) || expression(&code_b)) {
+        let version = find_str_param(&params, "version");
+        if let Some(model) = state
+            .backend()
+            .snomed_model(
+                &helios_persistence::tenant::TenantContext::system(),
+                &system,
+                version.as_deref(),
+            )
+            .await?
+        {
+            let outcome = crate::snomed::ops::subsumes(&model, &code_a, &code_b)?;
+            return Ok(json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "outcome", "valueCode": outcome}]
+            }));
+        }
+    }
+
     // Media types: a grammar, judged without stored content.
     if system == crate::mimetypes::SYSTEM {
         let side = if coding_form { "coding" } else { "code" };

@@ -627,6 +627,260 @@ fn media_type_cs_validate(params: &[Value]) -> Option<Value> {
     ))
 }
 
+/// Whether `code` is written in the SNOMED CT compositional grammar (a
+/// refinement, conjunction or terms) rather than being a concept id.
+fn is_snomed_expression(code: &str) -> bool {
+    code.contains(|c: char| matches!(c, ':' | '+' | '|' | '{' | '(' | '=') || c.is_whitespace())
+}
+
+/// The SNOMED CT expression a `$validate-code` request validates, with the
+/// request path and the version it pins.
+fn snomed_expression_param(
+    params: &[Value],
+    cs: bool,
+) -> Option<(String, RequestPath, Option<String>)> {
+    let sys_name = if cs { "url" } else { "system" };
+    let (code, path, version) = if let Some(code) = find_str_param(params, "code") {
+        let system = find_str_param(params, sys_name).or_else(|| find_str_param(params, "system"));
+        if system.as_deref() != Some(crate::snomed::SNOMED_URL) {
+            return None;
+        }
+        let version = if cs {
+            find_str_param(params, "version")
+        } else {
+            find_str_param(params, "systemVersion")
+        };
+        (code, RequestPath::BareCode, version)
+    } else {
+        let (system, code, _, version) = extract_coding_full(params, "coding")?;
+        if system != crate::snomed::SNOMED_URL {
+            return None;
+        }
+        (code, RequestPath::Coding, version)
+    };
+    is_snomed_expression(&code).then_some((code, path, version))
+}
+
+/// The issues and response of an expression that failed its checks.
+fn snomed_invalid_response(
+    code: &str,
+    version: Option<&str>,
+    reason: String,
+    path: RequestPath,
+) -> Value {
+    let text = format!(
+        "Unknown code '{code}' in the CodeSystem '{}' version '{}'",
+        crate::snomed::SNOMED_URL,
+        version.unwrap_or_default()
+    );
+    build_validate_response(
+        ValidateCodeResponse {
+            result: false,
+            message: None,
+            display: None,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![
+                ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "invalid-code".into(),
+                    text,
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: Some("Unknown_Code_in_Version".into()),
+                },
+                ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "invalid-code".into(),
+                    text: reason,
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: None,
+                },
+            ],
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(code),
+        Some(crate::snomed::SNOMED_URL),
+        version,
+        None,
+        None,
+        path,
+    )
+}
+
+/// `CodeSystem/$validate-code` of a post-coordinated SNOMED CT expression:
+/// its syntax, concepts and concept model (MRCM) rules.
+async fn snomed_cs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::snomed::ops::{Checked, check};
+    let (code, path, version) = snomed_expression_param(params, true)?;
+    let model = state
+        .backend()
+        .snomed_model(
+            &TenantContext::system(),
+            crate::snomed::SNOMED_URL,
+            version.as_deref(),
+        )
+        .await
+        .ok()??;
+    let version = model.version.clone();
+    Some(match check(&model, &code) {
+        Checked::Invalid(reason) => {
+            snomed_invalid_response(&code, version.as_deref(), reason, path)
+        }
+        Checked::Valid {
+            display,
+            normal_form,
+            ..
+        } => {
+            let mut issues = Vec::new();
+            if let Some(nf) = &normal_form {
+                issues.push(ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-rule".into(),
+                    text: format!(
+                        "The code '{code}' is valid, but it is not the normal form for the code system '{}|{}'; the normal form is '{nf}'",
+                        crate::snomed::SNOMED_URL,
+                        version.as_deref().unwrap_or_default()
+                    ),
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: Some("CODE_NOT_IN_NORMAL_FORM".into()),
+                });
+            }
+            build_validate_response(
+                ValidateCodeResponse {
+                    result: true,
+                    message: None,
+                    display: Some(display),
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues,
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: normal_form,
+                },
+                Some(&code),
+                Some(crate::snomed::SNOMED_URL),
+                version.as_deref(),
+                None,
+                None,
+                path,
+            )
+        }
+    })
+}
+
+/// `ValueSet/$validate-code` of a SNOMED CT expression, or of any code
+/// against an implicit SNOMED CT value set that names no concept or
+/// reference set (which does not exist).
+async fn snomed_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Result<Value, HtsError>> {
+    use crate::snomed::ops::{self, Checked};
+    let ctx = TenantContext::system();
+    let url = find_str_param(params, "url");
+    let implicit_url = url
+        .as_deref()
+        .filter(|u| u.starts_with(crate::snomed::SNOMED_URL) && u.contains("?fhir_vs"));
+    let expr_param = snomed_expression_param(params, false);
+    if implicit_url.is_none() && expr_param.is_none() {
+        return None;
+    }
+    let version = expr_param
+        .as_ref()
+        .and_then(|(_, _, v)| v.clone())
+        .or_else(|| {
+            find_str_param(params, "system-version")
+                .and_then(|s| s.split_once('|').map(|(_, v)| v.to_string()))
+        });
+    let model = state
+        .backend()
+        .snomed_model(&ctx, crate::snomed::SNOMED_URL, version.as_deref())
+        .await
+        .ok()??;
+    let implicit = match implicit_url.map(|u| ops::implicit(&model, u)) {
+        Some(Some(Err(e))) => return Some(Err(e)),
+        Some(Some(Ok(i))) => Some(i),
+        _ => None,
+    };
+    let (code, path, _) = expr_param?;
+    let version = model.version.clone();
+    let (expr, display) = match ops::check(&model, &code) {
+        Checked::Invalid(reason) => {
+            return Some(Ok(snomed_invalid_response(
+                &code,
+                version.as_deref(),
+                reason,
+                path,
+            )));
+        }
+        Checked::Valid { expr, display, .. } => (expr, display),
+    };
+    let virt = ops::virtual_of(&model, &expr)?;
+    let (in_vs, label) = match &implicit {
+        Some(i) => (
+            ops::in_implicit(&model, i, &virt),
+            url.clone().unwrap_or_default(),
+        ),
+        None => {
+            let vs = requested_value_set(state, params).await?;
+            let vs_url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let label = match vs.get("version").and_then(|v| v.as_str()) {
+                Some(v) => format!("{vs_url}|{v}"),
+                None => vs_url.to_string(),
+            };
+            (ops::in_value_set(&model, &vs, &expr, &virt), label)
+        }
+    };
+    let mut issues = Vec::new();
+    if !in_vs {
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: format!(
+                "The provided code '{}#{code}' was not found in the value set '{label}'",
+                crate::snomed::SNOMED_URL
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+    }
+    Some(Ok(build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: Some(display),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(crate::snomed::SNOMED_URL),
+        version.as_deref(),
+        None,
+        None,
+        path,
+    )))
+}
+
 /// `ValueSet/$validate-code` against a value set over the UCUM grammar
 /// (the whole of it, or filtered by `canonical`; see [`crate::ucum`]);
 /// `None` for any other value set.
@@ -2668,6 +2922,9 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
     if let Some(value) = media_type_cs_validate(&params) {
         return Ok(value);
     }
+    if let Some(value) = snomed_cs_validate(state, &params).await {
+        return Ok(value);
+    }
     let ctx = TenantContext::system();
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
     // pin the response display + invalid-display issue text against the
@@ -4595,6 +4852,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     }
     if let Some(value) = ucum_vs_validate(state, &params).await {
         return Ok(value);
+    }
+    if let Some(result) = snomed_vs_validate(state, &params).await {
+        return result;
     }
     // ValueSet/$validate-code accepts either `url` (canonical URL of a stored
     // ValueSet) or `valueSet` (an inline ValueSet resource). The IG
