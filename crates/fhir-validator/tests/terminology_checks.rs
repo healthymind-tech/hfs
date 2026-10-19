@@ -431,3 +431,30 @@ async fn unknown_codes_in_known_code_systems_are_errors() {
         "{issues:#?}"
     );
 }
+
+/// `capabilitystatement-measure-processor` (HL7 validator test cases):
+/// CapabilityStatement.format accepts the spec's short forms xml/json/ttl;
+/// anything else still has to be a mime type from the bound value set.
+#[tokio::test]
+async fn capability_statement_format_short_forms() {
+    let mut tx = Scripted::new();
+    tx.reject_value_sets = &["mimetypes"];
+    let handlers = EffectHandlers {
+        terminology: Some(&tx),
+        ..Default::default()
+    };
+    let cs = |format: &str| {
+        json!({"resourceType": "CapabilityStatement", "status": "active", "date": "2024-01-01",
+               "kind": "instance", "fhirVersion": "4.0.1", "format": ["xml", format]})
+    };
+    let issues = run(&cs("json"), &handlers).await;
+    assert!(
+        of_kind(&issues, ErrorKind::TerminologyBinding).is_empty(),
+        "{issues:#?}"
+    );
+    let issues = run(&cs("jason"), &handlers).await;
+    assert!(
+        !of_kind(&issues, ErrorKind::TerminologyBinding).is_empty(),
+        "{issues:#?}"
+    );
+}

@@ -563,6 +563,11 @@ async fn execute_terminology(
         let Some(coded) = coded_value(value, type_hint.as_deref()) else {
             continue; // shape not coded (e.g. null gap) — structural checks own it
         };
+        // CapabilityStatement.format is "xml | json | ttl | mime type": the
+        // short forms are no BCP-13 codes but the spec allows them.
+        if is_capability_format_shorthand(path, &coded) {
+            continue;
+        }
         if binding.strength.as_deref() == Some("extensible") {
             let vs = binding.value_set.split('|').next().unwrap_or_default();
             // A text-only concept satisfies an extensible binding; a bare
@@ -783,6 +788,14 @@ async fn execute_terminology(
             }
         }
     }
+}
+
+/// `CapabilityStatement.format` (and `patchFormat`'s base) values `xml`,
+/// `json`, `ttl`, which the element definition allows besides mime types.
+fn is_capability_format_shorthand(path: &str, coded: &CodedValue) -> bool {
+    let element = path.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    element.ends_with("CapabilityStatement.format")
+        && matches!(coded, CodedValue::Code(c) if matches!(c.as_str(), "xml" | "json" | "ttl"))
 }
 
 /// dom-3 as the HL7 validator judges it: a contained resource is
