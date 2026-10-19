@@ -178,12 +178,21 @@ pub struct EvaluationContext {
     /// Opt-in memo of `%resource`-rooted navigation chains (see
     /// [`EvaluationContext::enable_root_memo`]); shared by clones.
     pub root_memo: Option<RootMemo>,
+    /// Answers `memberOf()` without a terminology server, when set.
+    pub member_of: Option<Arc<dyn MemberOfResolver>>,
 }
 
 /// Results of `%resource`/`%rootResource` navigation chains, keyed by the
 /// address of their AST node. Only sound while those ASTs stay alive and
 /// unchanged for as long as the context is used.
 pub type RootMemo = Arc<Mutex<HashMap<usize, EvaluationResult>>>;
+
+/// Answers `memberOf()` in place of a terminology server: the host (a
+/// validator) supplies membership from its own terminology. `None` means the
+/// answer is not known, and `memberOf()` then yields an empty result.
+pub trait MemberOfResolver: Send + Sync {
+    fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool>;
+}
 
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
@@ -203,6 +212,7 @@ impl Clone for EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(),
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
             root_memo: self.root_memo.clone(),
+            member_of: self.member_of.clone(),
         }
     }
 }
@@ -270,6 +280,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -306,6 +317,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -337,6 +349,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -596,6 +609,7 @@ impl EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
             root_memo: self.root_memo.clone(),
+            member_of: self.member_of.clone(),
         }
     }
 
@@ -5091,6 +5105,15 @@ fn call_function(
                 }
             };
 
+            if let Some(resolver) = &context.member_of {
+                if invocation_base == &EvaluationResult::Empty {
+                    return Ok(EvaluationResult::Empty);
+                }
+                return Ok(match resolver.member_of(invocation_base, value_set_url) {
+                    Some(b) => EvaluationResult::boolean(b),
+                    None => EvaluationResult::Empty,
+                });
+            }
             // Use the member_of function from terminology_functions
             crate::terminology_functions::member_of(invocation_base, value_set_url, context)
         }

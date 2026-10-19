@@ -1313,3 +1313,72 @@ async fn fixed_complex_values_per_child() {
     );
     assert!(errors(&validate_with(&p(json!({"use": "home"})), &[sd], &[url]).await).is_empty());
 }
+
+/// `member-of-CC-*`: `memberOf()` in an invariant is answered by the
+/// validator's terminology.
+#[tokio::test]
+async fn member_of_in_invariants() {
+    struct Vs;
+    #[async_trait::async_trait]
+    impl helios_fhir_validator::TerminologyProvider for Vs {
+        async fn validate_code(
+            &self,
+            value_set: &str,
+            coded: &helios_fhir_validator::CodedValue,
+        ) -> Result<bool, helios_fhir_validator::TerminologyError> {
+            let helios_fhir_validator::CodedValue::CodeableConcept(cc) = coded else {
+                return Ok(false);
+            };
+            Ok(value_set == "http://example.org/ValueSet/vs" && cc["coding"][0]["code"] == "good")
+        }
+    }
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/member-of",
+        "name": "MemberOf", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Basic", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Basic",
+        "differential": {"element": [{"id": "Basic.code", "path": "Basic.code",
+            "constraint": [{"key": "bc-mm-1", "severity": "error", "human": "must be in a value set",
+                "expression": "memberOf('http://example.org/ValueSet/vs')"}]}]}
+    });
+    let mut overlay = SchemaRegistry::new();
+    assert!(overlay.insert(convert(&sd).expect("profile converts").schema));
+    let resolver: Arc<dyn SchemaResolver> = Arc::new(CompositeResolver::new(vec![
+        Arc::new(overlay),
+        core_registry(FhirVersion::R4),
+    ]));
+    let validator = Validator::new(resolver);
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let suppress = vec!["dom-6".to_string()];
+    let handlers = EffectHandlers {
+        constraints: Some(&evaluator),
+        terminology: Some(&Vs),
+        suppress_constraints: &suppress,
+        ..Default::default()
+    };
+    let opts = ValidationOptions {
+        profiles: vec!["http://example.org/StructureDefinition/member-of".into()],
+        ..Default::default()
+    };
+    let basic = |code: &str| {
+        json!({"resourceType": "Basic",
+        "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}})
+    };
+    let bad = validator
+        .validate(&basic("bad"), FhirVersion::R4, &opts, &handlers)
+        .await;
+    let failed: Vec<_> = errors(&bad)
+        .into_iter()
+        .filter(|e| e.message.contains("bc-mm-1"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{bad:#?}");
+    assert_eq!(failed[0].path, "Basic.code");
+    let good = validator
+        .validate(&basic("good"), FhirVersion::R4, &opts, &handlers)
+        .await;
+    assert!(
+        !good.iter().any(|e| e.message.contains("bc-mm-1")),
+        "{good:#?}"
+    );
+}

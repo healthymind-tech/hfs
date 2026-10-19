@@ -85,7 +85,7 @@ pub use editor::{
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
+    EffectHandlers, MemberOfAnswers, TerminologyError, TerminologyErrorKind, TerminologyFailMode,
     TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{

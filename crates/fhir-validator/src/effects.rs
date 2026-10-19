@@ -43,7 +43,8 @@ use crate::schema::Binding;
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 // Message templates live with the rest of the contract in engine::errors;
 // re-exported crate-internally via these thin wrappers.
@@ -313,6 +314,51 @@ pub trait ConstraintEvaluator: Send + Sync {
         version: FhirVersion,
         constraints: &[DeferredConstraint<'_>],
     ) -> Vec<ConstraintOutcome>;
+
+    /// As [`evaluate_all`](Self::evaluate_all), with `memberOf()` answered
+    /// from `members`. An evaluator that cannot use them ignores them.
+    fn evaluate_all_with_members(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: &Arc<MemberOfAnswers>,
+    ) -> Vec<ConstraintOutcome> {
+        let _ = members;
+        self.evaluate_all(resource, version, constraints)
+    }
+}
+
+/// `memberOf()` answers for one resource's invariants, filled from the
+/// [`TerminologyProvider`]. Questions not yet answered are recorded, so the
+/// effects layer can ask them and evaluate again.
+#[derive(Debug, Default)]
+pub struct MemberOfAnswers {
+    known: HashMap<(String, String), bool>,
+    missed: Mutex<Vec<(String, CodedValue)>>,
+}
+
+impl MemberOfAnswers {
+    /// The answer for `coded` in `value_set`, or `None` (recorded as asked).
+    pub fn lookup(&self, value_set: &str, coded: CodedValue) -> Option<bool> {
+        let key = (value_set.to_string(), coded_key(&coded));
+        if let Some(b) = self.known.get(&key) {
+            return Some(*b);
+        }
+        self.missed
+            .lock()
+            .expect("memberOf lock")
+            .push((value_set.to_string(), coded));
+        None
+    }
+}
+
+fn coded_key(coded: &CodedValue) -> String {
+    match coded {
+        CodedValue::Code(c) => format!("code:{c}"),
+        CodedValue::Coding(v) => format!("coding:{v}"),
+        CodedValue::CodeableConcept(v) => format!("cc:{v}"),
+    }
 }
 
 /// A borrowed view of one deferred constraint, handed to evaluators.
@@ -378,11 +424,11 @@ pub async fn execute(
     handlers: &EffectHandlers<'_>,
     errors: &mut Vec<ValidationError>,
 ) {
-    execute_constraints(resource, version, deferred, handlers, errors);
+    execute_constraints(resource, version, deferred, handlers, errors).await;
     execute_terminology(resource, deferred, handlers, errors).await;
 }
 
-fn execute_constraints(
+async fn execute_constraints(
     resource: &Value,
     version: FhirVersion,
     deferred: &[Deferred],
@@ -443,7 +489,35 @@ fn execute_constraints(
             },
         )
         .collect();
-    let outcomes = evaluator.evaluate_all(resource, version, &refs);
+    let outcomes = if let Some(tx) = handlers.terminology
+        && refs.iter().any(|c| c.expression.contains("memberOf("))
+    {
+        // Two passes: the first records the memberOf() questions, the
+        // provider answers them, the second evaluates with the answers.
+        let first = Arc::new(MemberOfAnswers::default());
+        let outcomes = evaluator.evaluate_all_with_members(resource, version, &refs, &first);
+        let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
+        if asked.is_empty() {
+            outcomes
+        } else {
+            let checks: Vec<(&str, &CodedValue)> =
+                asked.iter().map(|(vs, c)| (vs.as_str(), c)).collect();
+            let answers = tx.validate_codes(&checks).await;
+            let mut known = HashMap::new();
+            for ((vs, coded), answer) in asked.iter().zip(answers) {
+                if let Ok(b) = answer {
+                    known.insert((vs.clone(), coded_key(coded)), b);
+                }
+            }
+            let second = Arc::new(MemberOfAnswers {
+                known,
+                missed: Mutex::default(),
+            });
+            evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+        }
+    } else {
+        evaluator.evaluate_all(resource, version, &refs)
+    };
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
 
     // When nothing could be evaluated for the same reason (the resource does

@@ -37,7 +37,9 @@
 //! resource, else `%resource`. helios-fhirpath resolves all three to the root
 //! resource unless bound, so they are bound whenever they differ from it.
 
-use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
+use crate::effects::{
+    CodedValue, ConstraintEvaluator, ConstraintOutcome, DeferredConstraint, MemberOfAnswers,
+};
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath::parser::{Expression, Invocation, Term};
 use helios_fhirpath::{EvaluationContext, EvaluationResult};
@@ -91,6 +93,91 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         version: FhirVersion,
         constraints: &[DeferredConstraint<'_>],
     ) -> Vec<ConstraintOutcome> {
+        self.evaluate(resource, version, constraints, None)
+    }
+
+    fn evaluate_all_with_members(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: &Arc<MemberOfAnswers>,
+    ) -> Vec<ConstraintOutcome> {
+        self.evaluate(resource, version, constraints, Some(members))
+    }
+}
+
+/// `memberOf()` answered from [`MemberOfAnswers`].
+struct Members(Arc<MemberOfAnswers>);
+
+impl helios_fhirpath::MemberOfResolver for Members {
+    fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool> {
+        self.0.lookup(value_set, coded_value(coded)?)
+    }
+}
+
+/// A FHIRPath code, Coding or CodeableConcept as a [`CodedValue`].
+fn coded_value(item: &EvaluationResult) -> Option<CodedValue> {
+    fn text(e: &EvaluationResult) -> Option<String> {
+        match e {
+            EvaluationResult::String(s, _, _) => Some(s.clone()),
+            EvaluationResult::Collection { items, .. } if items.len() == 1 => text(&items[0]),
+            _ => None,
+        }
+    }
+    fn coding(map: &HashMap<String, EvaluationResult>) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in ["system", "version", "code", "display"] {
+            if let Some(t) = map.get(key).and_then(text) {
+                out.insert(key.to_string(), Value::String(t));
+            }
+        }
+        Value::Object(out)
+    }
+    match item {
+        EvaluationResult::Collection { items, .. } if items.len() == 1 => coded_value(&items[0]),
+        EvaluationResult::String(s, _, _) => Some(CodedValue::Code(s.clone())),
+        EvaluationResult::Object { map, .. } => {
+            if let Some(codings) = map.get("coding") {
+                let list: Vec<Value> = match codings {
+                    EvaluationResult::Collection { items, .. } => items
+                        .iter()
+                        .filter_map(|i| match i {
+                            EvaluationResult::Object { map, .. } => Some(coding(map)),
+                            _ => None,
+                        })
+                        .collect(),
+                    EvaluationResult::Object { map, .. } => vec![coding(map)],
+                    _ => Vec::new(),
+                };
+                let mut cc = serde_json::Map::new();
+                cc.insert("coding".into(), Value::Array(list));
+                if let Some(t) = map.get("text").and_then(text) {
+                    cc.insert("text".into(), Value::String(t));
+                }
+                Some(CodedValue::CodeableConcept(Value::Object(cc)))
+            } else if map.contains_key("code") {
+                Some(CodedValue::Coding(coding(map)))
+            } else if map.contains_key("text") {
+                Some(CodedValue::CodeableConcept(
+                    serde_json::json!({"text": map.get("text").and_then(text)}),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+impl FhirPathConstraintEvaluator {
+    fn evaluate(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: Option<&Arc<MemberOfAnswers>>,
+    ) -> Vec<ConstraintOutcome> {
         if constraints.is_empty() {
             return Vec::new();
         }
@@ -107,6 +194,9 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
             }
         };
         let mut context = EvaluationContext::new(vec![typed]);
+        if let Some(m) = members {
+            context.member_of = Some(Arc::new(Members(Arc::clone(m))));
+        }
         // Sound: every AST evaluated here is held by `self.asts` for the
         // life of the evaluator, which outlives this context.
         context.enable_root_memo();
