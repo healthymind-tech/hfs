@@ -176,6 +176,33 @@ fn converts_content_reference() {
     assert_eq!(actual, expected);
 }
 
+/// Newer IG Publisher snapshots write a contentReference with the defining
+/// StructureDefinition's canonical in front
+/// (`http://hl7.org/fhir/StructureDefinition/Questionnaire#Questionnaire.item`);
+/// it names the same element (US Core, IPS, SDC, Da Vinci profiles of
+/// Questionnaire, Composition, Bundle, Parameters).
+#[test]
+fn converts_a_canonical_content_reference() {
+    let mut sd = load_sd("mini-questionnaire.json");
+    let mut found = false;
+    for e in sd["snapshot"]["element"].as_array_mut().unwrap() {
+        if let Some(r) = e.get("contentReference").and_then(Value::as_str) {
+            e["contentReference"] = json!(format!(
+                "http://hl7.org/fhir/StructureDefinition/Questionnaire{r}"
+            ));
+            found = true;
+        }
+    }
+    assert!(found, "fixture has a contentReference");
+    let conversion = convert(&sd).expect("converts");
+    assert!(conversion.warnings.is_empty(), "{:?}", conversion.warnings);
+    let schema = serde_json::to_value(&conversion.schema).unwrap();
+    assert_eq!(
+        schema["elements"]["item"]["elements"]["item"]["elementReference"],
+        json!(["Questionnaire", "elements", "item"])
+    );
+}
+
 #[test]
 fn converts_primitive_with_regex() {
     let actual = convert_to_value("primitive-string.json");

@@ -531,7 +531,11 @@ fn parse_numeric_max(max: Option<&str>) -> Option<u64> {
 }
 
 fn parse_content_reference(reference: &str) -> Option<Vec<String>> {
-    let path = reference.strip_prefix('#')?;
+    // `#Questionnaire.item`, or with the defining StructureDefinition's
+    // canonical in front (`http://hl7.org/fhir/StructureDefinition/Composition#Composition.section`),
+    // as newer IG Publisher snapshots write it. The path names the element
+    // either way.
+    let (_, path) = reference.split_once('#')?;
     let mut parts = path.split('.');
     let root = parts.next()?;
     if root.is_empty() {
