@@ -1008,7 +1008,10 @@ fn validate_extension_item<'a>(
                     ErrorKind::UnknownSchema,
                     errors::msg_unknown_modifier_extension(url),
                 );
-            } else if is_hl7_namespace(url) && knows_hl7_extensions(ctx.resolver) {
+            } else if is_hl7_namespace(url)
+                && !is_cross_version_extension(url)
+                && knows_hl7_extensions(ctx.resolver)
+            {
                 // HL7 publishes every extension it defines; a url in its
                 // namespace that resolves to nothing is a typo or an
                 // uninstalled package (the HL7 validator rejects it). Other
@@ -1027,6 +1030,24 @@ fn validate_extension_item<'a>(
 
 /// Extension urls in HL7's own namespaces, which HL7 publishes definitions
 /// for.
+/// A cross-version extension (`http://hl7.org/fhir/5.0/StructureDefinition/
+/// extension-Questionnaire.item.answerConstraint`): HL7 defines one for every
+/// element of every FHIR version, implicitly — the HL7 validator generates
+/// them on demand rather than loading definitions — so no definition being
+/// installed says nothing about the url.
+fn is_cross_version_extension(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://hl7.org/fhir/") else {
+        return false;
+    };
+    let Some((version, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && version.contains('.')
+        && tail.starts_with("StructureDefinition/extension-")
+}
+
 fn is_hl7_namespace(url: &str) -> bool {
     let rest = url
         .strip_prefix("http://")
@@ -1427,7 +1448,7 @@ fn compile_extensions(
                 continue;
             };
             let resolved = ctx.resolver.resolve(&url);
-            if resolved.is_none() {
+            if resolved.is_none() && !is_cross_version_extension(&url) {
                 ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&url));
             }
             let merged = merge_extension_schema(entry, resolved.as_deref());
@@ -2115,6 +2136,22 @@ mod tests {
             "modifierExtension": [{"url": "http://example.org/x", "valueBoolean": true}]}));
         assert_eq!(modifier.len(), 1, "{modifier:?}");
         assert_eq!(modifier[0].path, "Patient.modifierExtension.0");
+    }
+
+    #[test]
+    fn cross_version_extension_urls() {
+        assert!(super::is_cross_version_extension(
+            "http://hl7.org/fhir/5.0/StructureDefinition/extension-Questionnaire.item.answerConstraint"
+        ));
+        assert!(super::is_cross_version_extension(
+            "http://hl7.org/fhir/3.0/StructureDefinition/extension-Patient.animal"
+        ));
+        assert!(!super::is_cross_version_extension(
+            "http://hl7.org/fhir/StructureDefinition/patient-birthTime"
+        ));
+        assert!(!super::is_cross_version_extension(
+            "http://hl7.org/fhir/us/core/StructureDefinition/extension-x"
+        ));
     }
 
     /// Without HL7's extension definitions loaded (R5 core without the
