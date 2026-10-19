@@ -150,3 +150,140 @@ async fn inactive_code_outside_filtered_vs_is_not_a_status_error() {
         .unwrap();
     assert_eq!(warning["expression"], json!(["code"]));
 }
+
+/// A versioned CodeSystem and a ValueSet including all of it.
+fn simple_bundle() -> String {
+    json!({
+      "resourceType": "Bundle", "type": "collection",
+      "entry": [
+        {"resource": {
+          "resourceType": "CodeSystem", "id": "simple", "url": "http://hts.test/simple",
+          "version": "0.1.0", "status": "active", "content": "complete",
+          "concept": [{"code": "code1", "display": "Display 1"}, {"code": "code2", "display": "Display 2"}]
+        }},
+        {"resource": {
+          "resourceType": "ValueSet", "id": "simple-all", "url": "http://hts.test/vs/simple-all",
+          "version": "5.0.0", "status": "active",
+          "compose": {"include": [{"system": "http://hts.test/simple"}]}
+        }}
+      ]
+    })
+    .to_string()
+}
+
+fn vs_params(extra: Value) -> Value {
+    let mut p = vec![json!({"name": "url", "valueUri": "http://hts.test/vs/simple-all"})];
+    p.extend(extra.as_array().unwrap().iter().cloned());
+    json!({"resourceType": "Parameters", "parameter": p})
+}
+
+/// validation/validation-missing-*: nothing to validate is a 400
+/// invalid / invalid-data; an incomplete Coding is result=false with a
+/// warning against that Coding.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_validate_code_input() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&simple_bundle()).await;
+
+    // Request errors.
+    for (path, body) in [
+        ("/ValueSet/$validate-code", vs_params(json!([]))),
+        // A bare code with no system and no inferSystem.
+        (
+            "/ValueSet/$validate-code",
+            vs_params(json!([{"name": "code", "valueCode": "code1"}])),
+        ),
+        (
+            "/CodeSystem/$validate-code",
+            json!({"resourceType": "Parameters", "parameter": [{"name": "code", "valueCode": "code1"}]}),
+        ),
+    ] {
+        let (st, oo) = app.post_fhir(path, body.to_string()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{oo}");
+        assert_eq!(oo["issue"][0]["code"], "invalid");
+        assert_eq!(
+            oo["issue"][0]["details"]["coding"][0]["code"],
+            "invalid-data"
+        );
+        assert!(oo["issue"][0].get("diagnostics").is_none(), "{oo}");
+    }
+
+    // inferSystem lets a bare code through.
+    let body = vs_validate(
+        &app,
+        vs_params(json!([
+            {"name": "code", "valueCode": "code1"},
+            {"name": "inferSystem", "valueBoolean": true}
+        ])),
+    )
+    .await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], true);
+
+    // A Coding with a system but no code.
+    let body = vs_validate(
+        &app,
+        vs_params(json!([{"name": "coding", "valueCoding": {"system": "http://hts.test/simple"}}])),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["invalid-data"]);
+    assert_eq!(issues(&body)[0]["severity"], "warning");
+    assert_eq!(issues(&body)[0]["expression"], json!(["Coding"]));
+    assert!(param(&body, "message").is_some());
+
+    // A CodeableConcept with text only: fails as a whole.
+    let body = vs_validate(
+        &app,
+        vs_params(json!([{"name": "codeableConcept", "valueCodeableConcept": {"text": "x"}}])),
+    )
+    .await;
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
+    assert_eq!(tx_codes(&body), ["not-in-vs"]);
+    let msg = param(&body, "message").unwrap()["valueString"]
+        .as_str()
+        .unwrap();
+    assert!(msg.contains("http://hts.test/vs/simple-all|5.0.0"), "{msg}");
+
+    // A systemless coding next to a good one: the good one carries the
+    // result, the systemless one is reported against its own index.
+    let body = vs_validate(
+        &app,
+        vs_params(
+            json!([{"name": "codeableConcept", "valueCodeableConcept": {"coding": [
+                {"code": "code1"},
+                {"system": "http://hts.test/simple", "code": "code1"}
+            ]}}]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["invalid-data", "this-code-not-in-vs"]);
+    let warning = issues(&body)
+        .into_iter()
+        .find(|i| i["severity"] == "warning")
+        .unwrap();
+    assert_eq!(warning["expression"], json!(["CodeableConcept.coding[0]"]));
+
+    // CodeSystem/$validate-code: a CodeableConcept whose coding has no code.
+    let (st, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "codeableConcept", "valueCodeableConcept": {"coding": [{"system": "http://hts.test/simple"}]}}
+            ]})
+            .to_string(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "result").unwrap()["valueBoolean"], false);
+    assert_eq!(tx_codes(&body), ["invalid-data"]);
+}

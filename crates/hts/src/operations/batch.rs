@@ -400,6 +400,7 @@ mod tests {
                         "resourceType": "Parameters",
                         "parameter": [
                             {"name": "url", "valueUri": "http://example.org/vs"},
+                            {"name": "system", "valueUri": "http://example.org/cs"},
                             {"name": "code", "valueCode": "A"}
                         ]
                     },
@@ -464,6 +465,7 @@ mod tests {
                         "resourceType": "Parameters",
                         "parameter": [
                             {"name": "url", "valueUri": "http://example.org/vs"},
+                            {"name": "system", "valueUri": "http://example.org/cs"},
                             {"name": "code", "valueCode": "A"}
                         ]
                     },

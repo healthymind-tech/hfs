@@ -40,6 +40,12 @@ use super::params::{
     parse_query_string, query_params_to_fhir_params,
 };
 
+#[path = "validate_input.rs"]
+mod validate_input;
+use validate_input::{
+    INCOMPLETE_CODING_MESSAGE_IDS, InputCheck, check_validate_input, merge_issues,
+};
+
 /// Identifies which FHIR `$validate-code` input form the operations layer is
 /// rendering a response for. Used to keep `OperationOutcome.issue.location`
 /// on each emitted issue aligned with the FHIRPath the IG fixtures expect:
@@ -314,8 +320,9 @@ fn build_validate_response_inner(
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                             || i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND")
-                            || i.message_id.as_deref()
-                                == Some("Coding_has_no_system__cannot_validate")
+                            || i.message_id
+                                .as_deref()
+                                .is_some_and(|m| INCOMPLETE_CODING_MESSAGE_IDS.contains(&m))
                             || i.tx_code == "invalid-display"))
                     || (i.severity == "information"
                         && i.message_id
@@ -2233,7 +2240,17 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_validate_code_inner(state, params).await;
+    let result = match check_validate_input(state, &params, false).await {
+        Err(e) => Err(e),
+        Ok(InputCheck::Done(value)) => Ok(value),
+        Ok(InputCheck::Proceed) => process_validate_code_inner(state, params).await,
+        Ok(InputCheck::ProceedThenAdd(issues)) => process_validate_code_inner(state, params)
+            .await
+            .map(|mut value| {
+                merge_issues(&mut value, issues);
+                value
+            }),
+    };
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.cs_validate_code_handler_cache,
@@ -4145,7 +4162,17 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_vs_validate_code_inner(state, params).await;
+    let result = match check_validate_input(state, &params, true).await {
+        Err(e) => Err(e),
+        Ok(InputCheck::Done(value)) => Ok(value),
+        Ok(InputCheck::Proceed) => process_vs_validate_code_inner(state, params).await,
+        Ok(InputCheck::ProceedThenAdd(issues)) => process_vs_validate_code_inner(state, params)
+            .await
+            .map(|mut value| {
+                merge_issues(&mut value, issues);
+                value
+            }),
+    };
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
@@ -5287,11 +5314,20 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // Map (system, code) → original CC index so per-coding failure issues
         // reference `CodeableConcept.coding[N]` with the input order's N. Keep
         // the FIRST occurrence to match first-wins coding selection.
-        let coding_index: std::collections::HashMap<(String, String), usize> = codings
+        // The index is the coding's position in the CodeableConcept as sent,
+        // counting codings that lack a system or code (`codings` skips them).
+        let coding_index: std::collections::HashMap<(String, String), usize> = coding_entries
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .enumerate()
-            .fold(std::collections::HashMap::new(), |mut m, (i, (s, c))| {
-                m.entry((s.clone(), c.clone())).or_insert(i);
+            .filter_map(|(i, c)| {
+                let s = c.get("system").and_then(|v| v.as_str())?;
+                let cd = c.get("code").and_then(|v| v.as_str())?;
+                Some(((s.to_string(), cd.to_string()), i))
+            })
+            .fold(std::collections::HashMap::new(), |mut m, (k, i)| {
+                m.entry(k).or_insert(i);
                 m
             });
         for (system, code) in codings.clone().into_iter() {
@@ -6864,6 +6900,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6884,6 +6921,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "C" }
             ]
         });
@@ -6932,6 +6970,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://unknown.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6947,6 +6986,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6985,7 +7025,8 @@ mod tests {
             .with_state(state)
     }
 
-    /// IG Publisher Library `contentType`: inline core `mimetypes` ValueSet, no `url` param.
+    /// IG Publisher Library `contentType`: inline core `mimetypes` ValueSet, no `url` param,
+    /// the code system inferred (`inferSystem`).
     #[tokio::test]
     async fn vs_inline_mimetypes_publisher_shape_validates_text_cql() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
@@ -7000,6 +7041,7 @@ mod tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
+                {"name": "inferSystem", "valueBoolean": true},
                 {"name": "code", "valueCode": "text/cql"},
                 {
                     "name": "valueSet",
@@ -7040,6 +7082,7 @@ mod tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
+                {"name": "inferSystem", "valueBoolean": true},
                 {"name": "code", "valueCode": "not-a-mime"},
                 {
                     "name": "valueSet",
