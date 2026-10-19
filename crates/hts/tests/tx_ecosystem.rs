@@ -688,3 +688,68 @@ async fn inactive_display_is_an_error_unless_lenient() {
         assert!(param(&body, "message").is_some());
     }
 }
+
+/// exclude/exclude-valueset: a value set used by the expansion that came
+/// with the request is reported as used with its own version.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn used_valueset_from_the_request_keeps_its_version() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&simple_bundle()).await;
+    let (st, body) = app
+        .post_fhir(
+            "/ValueSet/$expand",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "url", "valueUri": "http://hts.test/vs/minus"},
+                {"name": "tx-resource", "resource": {"resourceType": "ValueSet",
+                  "url": "http://hts.test/vs/minus", "status": "active",
+                  "compose": {"include": [{"system": "http://hts.test/simple"}],
+                              "exclude": [{"valueSet": ["http://hts.test/vs/two"]}]}}},
+                {"name": "tx-resource", "resource": {"resourceType": "ValueSet",
+                  "url": "http://hts.test/vs/two", "version": "0.3", "status": "active",
+                  "compose": {"include": [{"system": "http://hts.test/simple", "concept": [{"code": "code2"}]}]}}}
+            ]})
+            .to_string(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let used: Vec<&str> = body["expansion"]["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "used-valueset")
+        .filter_map(|p| p["valueUri"].as_str())
+        .collect();
+    assert_eq!(used, ["http://hts.test/vs/two|0.3"], "{body}");
+
+    // default-valueset-version/indirect-expand-zero: of several supplied
+    // versions, the latest.
+    let (st, body) = app
+        .post_fhir(
+            "/ValueSet/$expand",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "url", "valueUri": "http://hts.test/vs/minus"},
+                {"name": "tx-resource", "resource": {"resourceType": "ValueSet",
+                  "url": "http://hts.test/vs/minus", "status": "active",
+                  "compose": {"include": [{"system": "http://hts.test/simple"}],
+                              "exclude": [{"valueSet": ["http://hts.test/vs/two"]}]}}},
+                {"name": "tx-resource", "resource": {"resourceType": "ValueSet",
+                  "url": "http://hts.test/vs/two", "version": "0.3", "status": "active",
+                  "compose": {"include": [{"system": "http://hts.test/simple", "concept": [{"code": "code2"}]}]}}},
+                {"name": "tx-resource", "resource": {"resourceType": "ValueSet",
+                  "url": "http://hts.test/vs/two", "version": "0.10", "status": "active",
+                  "compose": {"include": [{"system": "http://hts.test/simple", "concept": [{"code": "code2"}]}]}}}
+            ]})
+            .to_string(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let used: Vec<&str> = body["expansion"]["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "used-valueset")
+        .filter_map(|p| p["valueUri"].as_str())
+        .collect();
+    assert_eq!(used, ["http://hts.test/vs/two|0.10"], "{body}");
+}

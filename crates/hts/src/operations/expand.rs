@@ -3906,45 +3906,70 @@ async fn process_expand_inner<B: TerminologyBackend>(
             } else {
                 None
             };
-            let referenced_vs: Option<Value> = ValueSetOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some(bare_url.clone()),
-                    version: pinned_version.clone(),
-                    count: Some(count_hint),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-            .and_then(|mut hits| {
-                if pinned_version.is_some() {
-                    hits.pop()
-                } else if let Some(ref resolved) = resolved_vs_version {
-                    hits.iter()
-                        .find(|r| {
-                            r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
-                        })
-                        .cloned()
-                        .or_else(|| {
-                            hits.sort_by(|a, b| {
-                                let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                                let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                                bv.cmp(av)
-                            });
-                            hits.into_iter().next()
-                        })
-                } else {
-                    // Backend has no opinion: fall back to highest version.
-                    hits.sort_by(|a, b| {
-                        let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                        let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                        bv.cmp(av)
+            // A ValueSet supplied with the request (`tx-resource`) is the one
+            // the expansion used (IG `exclude/exclude-valueset`).
+            let from_request: Option<Value> =
+                super::params::collect_resource_params(&params, "tx-resource")
+                    .into_iter()
+                    .filter(|r| {
+                        r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                            && r.get("url").and_then(|v| v.as_str()) == Some(bare_url.as_str())
+                            && pinned_version.as_deref().is_none_or(|want| {
+                                r.get("version").and_then(|v| v.as_str()) == Some(want)
+                            })
+                    })
+                    // Several versions supplied: the latest, as for stored ones.
+                    .max_by(|a, b| {
+                        crate::version_order::compare_versions(
+                            a.get("version").and_then(|v| v.as_str()),
+                            b.get("version").and_then(|v| v.as_str()),
+                        )
                     });
-                    hits.into_iter().next()
-                }
-            });
+            let referenced_vs: Option<Value> = if from_request.is_some() {
+                from_request
+            } else {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(bare_url.clone()),
+                        version: pinned_version.clone(),
+                        count: Some(count_hint),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| {
+                    if pinned_version.is_some() {
+                        hits.pop()
+                    } else if let Some(ref resolved) = resolved_vs_version {
+                        hits.iter()
+                            .find(|r| {
+                                r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
+                            })
+                            .cloned()
+                            .or_else(|| {
+                                hits.sort_by(|a, b| {
+                                    let av =
+                                        a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                    let bv =
+                                        b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                    bv.cmp(av)
+                                });
+                                hits.into_iter().next()
+                            })
+                    } else {
+                        // Backend has no opinion: fall back to highest version.
+                        hits.sort_by(|a, b| {
+                            let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                            let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                            bv.cmp(av)
+                        });
+                        hits.into_iter().next()
+                    }
+                })
+            };
             let resolved_version = referenced_vs
                 .as_ref()
                 .and_then(|h| {
