@@ -1541,11 +1541,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .system
                                 .as_deref()
                                 .and_then(|s| cs_version_for_msg(&backend, &conn,s));
-                            let cs_is_fragment = req
-                                .system
-                                .as_deref()
-                                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                                .unwrap_or(false);
+                            let cs_content: Option<String> = req
+ .system
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn, s));
                             let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                             return finish_validate_code_response(
                                 found,
@@ -1557,12 +1556,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 inactive_for_msg,
                                 vs_version_owned.as_deref(),
                                 inactive_in_cs,
+                                false, // an implicit ValueSet keeps inactive codes
                                 code_unknown_in_cs,
                                 false, // version-only-unknown not applicable here
                                 cs_version.as_deref(),
                                 req.version.as_deref(),
                                 req.lenient_display_validation.unwrap_or(false),
-                                cs_is_fragment,
+                                cs_content.as_deref(),
                                 None, // cs_display_lookup — only used by the URL path below
                                 None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                             );
@@ -1603,11 +1603,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .system
                             .as_deref()
                             .and_then(|s| cs_version_for_msg(&backend, &conn,s));
-                        let cs_is_fragment = req
-                            .system
-                            .as_deref()
-                            .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                            .unwrap_or(false);
+                        let cs_content: Option<String> = req
+ .system
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn, s));
                         let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                         return finish_validate_code_response(
                             found,
@@ -1619,12 +1618,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             inactive_for_msg,
                             vs_version_owned.as_deref(),
                             inactive_in_cs,
+                            false, // an implicit ValueSet keeps inactive codes
                             code_unknown_in_cs,
                             false, // version-only-unknown not applicable here
                             cs_version.as_deref(),
                             req.version.as_deref(),
                             req.lenient_display_validation.unwrap_or(false),
-                            cs_is_fragment,
+                            cs_content.as_deref(),
                             None, // cs_display_lookup — only used by the URL path below
                             None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                         );
@@ -2070,10 +2070,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .or_else(|| cs_version_for_msg(&backend, &conn,s))
             });
             let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
-            let cs_is_fragment = system_for_msg
-                .as_deref()
-                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                .unwrap_or(false);
+            let cs_content: Option<String> = system_for_msg
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn,s));
             // When the caller didn't supply a display and we still need to
             // echo one (the code is in the underlying CS, just not in this
             // VS — the IG `overload/validate-bad-enum-code1` and
@@ -2087,10 +2086,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 || code_unknown_in_cs
             {
                 None
-            } else if let (Some(sys), Some(ver)) =
-                (system_for_msg.as_deref(), cs_version.as_deref())
-            {
-                lookup_display_at_version(&conn, sys, ver, &req.code)
+            } else if let Some(sys) = system_for_msg.as_deref() {
+                match cs_version.as_deref() {
+                    Some(ver) => lookup_display_at_version(&conn, sys, ver, &req.code),
+                    // A versionless CodeSystem has no cs_version: take the winning row.
+                    None => lookup_display_any_version(&conn, sys, &req.code),
+                }
             } else {
                 None
             };
@@ -2105,12 +2106,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inactive_for_msg,
                 vs_version_owned.as_deref(),
                 inactive_in_cs,
+                compose_inactive_false,
                 code_unknown_in_cs,
                 code_unknown_at_version_only,
                 cs_version.as_deref(),
                 req.version.as_deref(),
                 req.lenient_display_validation.unwrap_or(false),
-                cs_is_fragment,
+                cs_content.as_deref(),
                 echo_display_lookup.as_deref(),
                 normalized_code.as_deref(),
             )?;
@@ -7498,6 +7500,22 @@ fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
 }
 
 /// Look up the display for a specific code at a specific CS version.
+/// Display of `code` in the CodeSystem row that wins for `system_url`
+/// (no version pin), following the shared precedence order.
+fn lookup_display_any_version(conn: &Connection, system_url: &str, code: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT c.display FROM concepts c \
+         JOIN code_systems s ON c.system_id = s.id \
+         WHERE s.url = ?1 AND c.code = ?2 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("s")
+    );
+    conn.query_row(&sql, rusqlite::params![system_url, code], |row| {
+        row.get::<_, Option<String>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
 fn lookup_display_at_version(
     conn: &Connection,
     system_url: &str,
@@ -7951,12 +7969,13 @@ fn finish_validate_code_response(
     is_inactive: bool,
     vs_version: Option<&str>,
     is_inactive_in_underlying_cs: bool,
+    inactive_excluded_by_vs: bool,
     code_unknown_in_cs: bool,
     code_unknown_at_version_only: bool,
     cs_version_for_msg: Option<&str>,
     req_version_hint: Option<&str>,
     lenient_display: bool,
-    cs_is_fragment: bool,
+    cs_content: Option<&str>,
     cs_display_lookup: Option<&str>,
     normalized_code: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
@@ -7996,7 +8015,7 @@ fn finish_validate_code_response(
             // pair), result=true, and the `UNKNOWN_CODE_IN_FRAGMENT` message-id —
             // the missing code might still be valid in a different fragment of
             // the same system.
-            if cs_is_fragment && code_unknown_in_cs {
+            if cs_content == Some("fragment") && code_unknown_in_cs {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(
@@ -8039,7 +8058,7 @@ fn finish_validate_code_response(
             // or activeOnly=true). The IG expects a business-rule error
             // ("valid but not active"), the not-in-vs error, AND a
             // code-comment warning ("has a status of inactive").
-            if is_inactive_in_underlying_cs {
+            if is_inactive_in_underlying_cs && inactive_excluded_by_vs {
                 issues.push(crate::types::ValidationIssue {
                     severity: "error".into(),
                     fhir_code: "business-rule".into(),
@@ -8066,7 +8085,10 @@ fn finish_validate_code_response(
             // is itself unknown — the operations layer already adds a
             // `not-found` / `not-found` issue for that case, and double-emitting
             // would inflate the issue count.
-            if code_unknown_in_cs && cs_version_for_msg.is_some() {
+            // A versionless CodeSystem is still a loaded one: report the code
+            // as unknown unless the CodeSystem is only a `not-present` stub.
+            let cs_known = cs_content.is_some_and(|c| c != "not-present");
+            if code_unknown_in_cs && (cs_version_for_msg.is_some() || cs_known) {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => {
