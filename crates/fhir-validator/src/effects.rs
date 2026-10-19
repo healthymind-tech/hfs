@@ -595,6 +595,12 @@ async fn execute_terminology(
         let Some(coded) = coded_value(value, type_hint.as_deref()) else {
             continue; // shape not coded (e.g. null gap) — structural checks own it
         };
+        if restated_later(
+            binding,
+            bound.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[]),
+        ) {
+            continue;
+        }
         if binding.strength.as_deref() == Some("extensible") {
             let vs = binding.value_set.split('|').next().unwrap_or_default();
             // A text-only concept satisfies an extensible binding; a bare
@@ -937,6 +943,25 @@ fn slice_membership_issues(
     }
 }
 
+/// Whether a more derived layer binds the same element to the same value set
+/// with another strength: its binding is the one that applies. The base
+/// `vitalsigns` profile binds `Observation.component.value[x]` to
+/// `ucum-vitals-common` as required, US Core's snapshot restates it as
+/// extensible (so `L/min` for an oxygen flow rate passes); the HL7 validator
+/// judges only the snapshot of the profile in use. Layers come base first.
+fn restated_later(binding: &Binding, bindings: &[(&str, Option<&str>)]) -> bool {
+    let vs = binding.value_set.split('|').next().unwrap_or_default();
+    let strength = binding.strength.as_deref();
+    bindings
+        .iter()
+        .position(|(v, s)| *v == vs && *s == strength)
+        .is_some_and(|pos| {
+            bindings[pos + 1..]
+                .iter()
+                .any(|(v, s)| *v == vs && *s != strength)
+        })
+}
+
 /// Whether an `extensible` binding to `vs` is superseded by another
 /// binding on the same element: a profile that rebinds an element (TW Core
 /// `identifier.type` to its own value set) replaces the base binding, as
@@ -1021,6 +1046,30 @@ mod tests {
         let chain = [(core, ext), (tw, ext), (ig2, ext)];
         assert!(overridden(tw, &chain));
         assert!(!overridden(ig2, &chain));
+    }
+
+    #[test]
+    fn a_derived_layer_restating_a_binding_decides_its_strength() {
+        let ucum = "http://hl7.org/fhir/ValueSet/ucum-vitals-common";
+        let b = |strength: &str| Binding {
+            value_set: format!("{ucum}|4.0.1"),
+            strength: Some(strength.to_string()),
+        };
+        // vitalsigns (required) then US Core (extensible): extensible applies.
+        let layers = [(ucum, Some("required")), (ucum, Some("extensible"))];
+        assert!(restated_later(&b("required"), &layers));
+        assert!(!restated_later(&b("extensible"), &layers));
+        // The other way round, required applies.
+        let layers = [(ucum, Some("extensible")), (ucum, Some("required"))];
+        assert!(restated_later(&b("extensible"), &layers));
+        assert!(!restated_later(&b("required"), &layers));
+        // Alone, or next to another value set, a binding stands.
+        assert!(!restated_later(&b("required"), &[(ucum, Some("required"))]));
+        let other = [
+            (ucum, Some("required")),
+            ("http://x/vs", Some("extensible")),
+        ];
+        assert!(!restated_later(&b("required"), &other));
     }
 
     #[test]
