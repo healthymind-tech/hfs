@@ -23,14 +23,15 @@ pub use path::dotted_to_fhirpath;
 /// template catalog lives in `errors.rs`, the single source of truth).
 pub(crate) mod messages {
     pub(crate) use super::errors::{
+        hl7_slice_max, hl7_slice_min, msg_code_system_unknown as code_system_unknown,
         msg_constraint_not_evaluable as constraint_not_evaluable,
         msg_constraints_not_evaluable as constraints_not_evaluable,
-        msg_fhirpath_constraint as fhirpath_constraint,
-        msg_terminology_binding as terminology_binding,
         msg_extensible_binding as extensible_binding,
-        msg_terminology_unavailable as terminology_unavailable, msg_url_unresolved as url_unresolved,
-        msg_wrong_display as wrong_display, msg_slice_closed_unmatched as slice_closed_unmatched,
-        msg_slice_min as slice_min, msg_slice_max as slice_max, hl7_slice_min, hl7_slice_max,
+        msg_fhirpath_constraint as fhirpath_constraint,
+        msg_slice_closed_unmatched as slice_closed_unmatched, msg_slice_max as slice_max,
+        msg_slice_min as slice_min, msg_terminology_binding as terminology_binding,
+        msg_terminology_unavailable as terminology_unavailable,
+        msg_url_unresolved as url_unresolved, msg_wrong_display as wrong_display,
     };
 }
 

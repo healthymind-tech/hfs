@@ -422,6 +422,19 @@ pub(crate) fn msg_url_unresolved(url: &str) -> String {
     format!("No definition could be found for URL value '{url}'")
 }
 
+/// HL7 validator UNKNOWN_CODESYSTEM / UNKNOWN_CODESYSTEM_VERSION (warning):
+/// a Coding whose code system the terminology service does not have.
+pub(crate) fn msg_code_system_unknown(system: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!(
+            "A definition for CodeSystem '{system}' version '{v}' could not be found, so the code cannot be validated"
+        ),
+        None => format!(
+            "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
+        ),
+    }
+}
+
 /// [helios] an internal narrative hyperlink with no target (HL7 validator
 /// wording).
 pub(crate) fn msg_narrative_link(href: &str, at: &str, text: &str) -> String {

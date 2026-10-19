@@ -149,8 +149,8 @@ async fn wrong_display_is_not_a_binding_failure() {
 }
 
 /// Bindings and codings of one resource — a whole Bundle — cost one
-/// provider call; codings without a display outside the HL7 namespaces are
-/// not asked about.
+/// provider call; every coding with a system and a code is asked about (as
+/// the HL7 validator checks them all), each distinct one once.
 #[tokio::test]
 async fn one_terminology_call_per_resource() {
     let tx = Scripted::new();
@@ -184,8 +184,8 @@ async fn one_terminology_call_per_resource() {
     assert!(asked.contains(&"cs http://loinc.org".to_string()), "{asked:?}");
     assert_eq!(
         asked.iter().filter(|a| *a == "cs http://loinc.org").count(),
-        1,
-        "the display-less LOINC coding is not asked: {asked:?}"
+        2,
+        "the display-less LOINC coding is asked too: {asked:?}"
     );
     assert!(
         asked.iter().any(|a| a.contains("v3-ObservationInterpretation")),
@@ -195,8 +195,8 @@ async fn one_terminology_call_per_resource() {
 
 /// An unresolvable code system in the HL7 namespaces is an error on
 /// `Coding.system` (HL7 validator Type_Specific_Checks_DT_URL_Resolve); a
-/// `system|version` there never resolves; elsewhere an unknown system says
-/// nothing.
+/// `system|version` there never resolves; elsewhere an unknown system is a
+/// warning that the code cannot be validated (UNKNOWN_CODESYSTEM).
 #[tokio::test]
 async fn unknown_hl7_code_systems_are_errors() {
     let mut tx = Scripted::new();
@@ -213,13 +213,58 @@ async fn unknown_hl7_code_systems_are_errors() {
         "type": [{"coding": [{"system": "http://example.org/cs", "code": "x", "display": "X"}]}]});
     let issues = run(&encounter, &handlers).await;
     let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
-    assert_eq!(unknown.len(), 1, "{issues:#?}");
+    assert_eq!(unknown.len(), 2, "{issues:#?}");
     assert_eq!(unknown[0].severity, Severity::Error);
     assert_eq!(unknown[0].path, "Encounter.class.system");
     assert_eq!(
         unknown[0].message,
         "No definition could be found for URL value 'http://terminology.hl7.org/CodeSystem/v3-ActEncounterCode'"
     );
+    assert_eq!(unknown[1].severity, Severity::Warning);
+    assert_eq!(unknown[1].path, "Encounter.type.0.coding.0.system");
+    assert_eq!(
+        unknown[1].message,
+        "A definition for CodeSystem 'http://example.org/cs' could not be found, so the code cannot be validated"
+    );
+
+    // A system the service holds no content for (the provider says so with
+    // an UnknownCodeSystem failure) is unknown too; any other failure is
+    // silent. A display-less coding is asked as well.
+    struct NoContent;
+    #[async_trait]
+    impl TerminologyProvider for NoContent {
+        async fn validate_code(&self, _: &str, _: &CodedValue) -> Result<bool, TerminologyError> {
+            unreachable!()
+        }
+        async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+            checks
+                .iter()
+                .map(|c| match c {
+                    TxCheck::Coding(coding) if coding["system"] == "http://www.genenames.org" => {
+                        Err(TerminologyError::unknown_code_system("not-present stub"))
+                    }
+                    TxCheck::Coding(_) => Err(TerminologyError::new("down")),
+                    TxCheck::InValueSet(..) => Ok(TxVerdict::valid()),
+                })
+                .collect()
+        }
+    }
+    let observation = json!({"resourceType": "Observation", "status": "final",
+        "code": {"coding": [{"system": "http://www.genenames.org", "code": "HGNC:1100"},
+                            {"system": "http://example.org/other", "code": "y", "version": "2"}]},
+        "subject": {"reference": "Patient/p"}, "performer": [{"reference": "Practitioner/x"}]});
+    let issues = run(
+        &observation,
+        &EffectHandlers {
+            terminology: Some(&NoContent),
+            ..Default::default()
+        },
+    )
+    .await;
+    let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
+    assert_eq!(unknown.len(), 1, "{issues:#?}");
+    assert_eq!(unknown[0].severity, Severity::Warning);
+    assert_eq!(unknown[0].path, "Observation.code.coding.0.system");
 
     let practitioner = json!({"resourceType": "Practitioner", "qualification": [{"code": {"coding": [{
         "system": "http://terminology.hl7.org/CodeSystem/v2-0360|2.7", "code": "MD", "display": "Doctor of Medicine"}]}}]});

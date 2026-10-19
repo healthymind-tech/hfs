@@ -26,11 +26,12 @@
 //!   — all of them (`Closed`), or only "ValueSet not known"
 //!   (`ClosedRequired`) — to errors. Failures on extensible bindings are
 //!   silent.
-//! - codings: every Coding with a `display` (or an HL7-namespace `system`)
-//!   is checked against its code system ([`TxCheck::Coding`]): a wrong
-//!   display is a [`ErrorKind::DisplayMismatch`] issue of
+//! - codings: every Coding with a `system` and a `code` is checked
+//!   against its code system ([`TxCheck::Coding`]): a wrong display is a
+//!   [`ErrorKind::DisplayMismatch`] issue of
 //!   [`EffectHandlers::display_issues`] severity — never a binding failure —
-//!   and an unknown code system in the HL7 namespaces is an error.
+//!   an unknown code system in the HL7 namespaces is an error, and any
+//!   other unknown code system a warning (the code cannot be checked).
 //!   Bindings and codings of one resource are asked of the provider in a
 //!   single [`TerminologyProvider::check`] call.
 //!
@@ -657,14 +658,13 @@ async fn execute_terminology(
             ));
             continue;
         }
-        // Only what can produce an issue is asked: a display to judge, or
-        // an HL7-namespace system that must resolve.
+        // Every Coding with a system and a code is asked, as the HL7
+        // validator does: its display is judged, an HL7-namespace system
+        // must resolve, and any other unknown system draws a warning.
+        let has_system = coding.get("system").is_some_and(Value::is_string);
+        let has_code = coding.get("code").is_some_and(Value::is_string);
         let has_display = coding.get("display").is_some_and(Value::is_string);
-        let hl7 = coding
-            .get("system")
-            .and_then(Value::as_str)
-            .is_some_and(crate::terminology::is_hl7_namespace);
-        if !has_display && !hl7 {
+        if !(has_system && (has_code || has_display)) {
             continue;
         }
         asked.push(Asked::Coding { path, coding });
@@ -784,7 +784,18 @@ async fn execute_terminology(
             }
             Asked::SliceMember { .. } => {} // judged above
             Asked::Coding { path, coding } => {
-                let Ok(verdict) = verdict else { continue };
+                let system = coding.get("system").and_then(Value::as_str);
+                let verdict = match verdict {
+                    Ok(v) => v,
+                    // A system the service holds no content for (absent, or
+                    // a `content: not-present` stub such as HGNC).
+                    Err(e) if e.kind() == TerminologyErrorKind::UnknownCodeSystem => TxVerdict {
+                        valid: true,
+                        wrong_display: None,
+                        unknown_system: true,
+                    },
+                    Err(_) => continue,
+                };
                 if let Some(message) = verdict.wrong_display {
                     errors.push(
                         ValidationError::new(
@@ -796,17 +807,32 @@ async fn execute_terminology(
                     );
                 }
                 if verdict.unknown_system
-                    && let Some(system) = coding.get("system").and_then(Value::as_str)
-                    && crate::terminology::is_hl7_namespace(system)
+                    && let Some(system) = system
                 {
-                    // The HL7 validator resolves every uri in the HL7
-                    // namespaces and rejects one nobody defines
-                    // (Type_Specific_Checks_DT_URL_Resolve).
-                    errors.push(ValidationError::new(
-                        ErrorKind::UnknownCodeSystem,
-                        format!("{path}.system"),
-                        messages::url_unresolved(system),
-                    ));
+                    if crate::terminology::is_hl7_namespace(system) {
+                        // The HL7 validator resolves every uri in the HL7
+                        // namespaces and rejects one nobody defines
+                        // (Type_Specific_Checks_DT_URL_Resolve).
+                        errors.push(ValidationError::new(
+                            ErrorKind::UnknownCodeSystem,
+                            format!("{path}.system"),
+                            messages::url_unresolved(system),
+                        ));
+                    } else {
+                        // Elsewhere the code just cannot be checked
+                        // (UNKNOWN_CODESYSTEM, a warning).
+                        errors.push(
+                            ValidationError::new(
+                                ErrorKind::UnknownCodeSystem,
+                                format!("{path}.system"),
+                                messages::code_system_unknown(
+                                    system,
+                                    coding.get("version").and_then(Value::as_str),
+                                ),
+                            )
+                            .with_severity(Severity::Warning),
+                        );
+                    }
                 }
             }
         }
