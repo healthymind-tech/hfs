@@ -1662,6 +1662,99 @@ fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Byte
 /// nonetheless map to the same canonical URL+params bucket (e.g. when the
 /// caller adds `valueSet` / `tx-resource` inline payloads that force this
 /// outer cache to skip but otherwise produce the same expansion).
+/// `$expand` of a value set over media types only (see
+/// [`crate::mimetypes`]); `None` for any other value set. The core
+/// `mimetypes` value set keeps its own handling.
+async fn media_type_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Result<Option<Bytes>, HtsError> {
+    use crate::mimetypes;
+    if find_str_param(params, "url")
+        .as_deref()
+        .is_some_and(crate::bcp13::is_mimetypes_valueset_url)
+    {
+        return Ok(None);
+    }
+    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
+        return Ok(None);
+    };
+    if !mimetypes::is_media_type_value_set(&vs) {
+        return Ok(None);
+    }
+    let (codes, unclosed) = mimetypes::expand(&vs).map_err(|()| {
+        HtsError::coded(
+            "not-supported",
+            "not-supported",
+            mimetypes::NOT_ENUMERABLE,
+            None,
+        )
+    })?;
+    let int_param = |name: &str| {
+        params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|p| {
+                p.get("valueInteger")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| p.get("valueString").and_then(|v| v.as_str()?.parse().ok()))
+            })
+    };
+    let count = int_param("count");
+    let offset = int_param("offset");
+    let limit = int_param("__max_expansion_size__").unwrap_or(u64::from(state.max_expansion_size));
+    if count.is_none() && codes.len() as u64 > limit {
+        return Err(HtsError::TooCostly(format!(
+            "The value set '{}' has {} codes, more than the limit of {limit}",
+            vs.get("url").and_then(|v| v.as_str()).unwrap_or_default(),
+            codes.len()
+        )));
+    }
+    let start = offset.unwrap_or(0) as usize;
+    let page: Vec<&String> = codes
+        .iter()
+        .skip(start)
+        .take(count.map_or(usize::MAX, |c| c as usize))
+        .collect();
+    let mut parameter = Vec::new();
+    if let Some(c) = count {
+        parameter.push(json!({"name": "count", "valueInteger": c}));
+    }
+    if let Some(o) = offset {
+        parameter.push(json!({"name": "offset", "valueInteger": o}));
+    }
+    parameter.push(json!({"name": "used-codesystem", "valueUri": mimetypes::SYSTEM}));
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "total": codes.len(),
+        "parameter": parameter,
+        "contains": page.iter().map(|c| json!({
+            "system": mimetypes::SYSTEM, "code": c, "display": c
+        })).collect::<Vec<_>>(),
+    });
+    if offset.is_some() || count.is_some() {
+        expansion["offset"] = json!(start);
+    }
+    if unclosed {
+        expansion["extension"] = json!([{
+            "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed",
+            "valueBoolean": true
+        }]);
+    }
+    // The value set's identity, and its expansion.
+    let mut out = json!({"resourceType": "ValueSet"});
+    for key in ["url", "version", "name", "status"] {
+        if let Some(v) = vs.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out["expansion"] = expansion;
+    Ok(Some(Bytes::from(
+        serde_json::to_vec(&out).map_err(|e| HtsError::Internal(e.to_string()))?,
+    )))
+}
+
 pub(crate) async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -1692,6 +1785,9 @@ pub(crate) async fn process_expand<B: TerminologyBackend>(
         &mut params,
     )
     .await;
+    if let Some(bytes) = media_type_expand(state, &params).await? {
+        return Ok(bytes);
+    }
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);

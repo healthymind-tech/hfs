@@ -431,6 +431,119 @@ fn build_validate_response_inner(
     })
 }
 
+/// The ValueSet a `$validate-code` / `$expand` request names: the stored
+/// one (`url` + `valueSetVersion`), a request-supplied one with that url, or
+/// the inline `valueSet`.
+pub(crate) async fn requested_value_set<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    let Some(url) = find_str_param(params, "url") else {
+        return find_resource_param(params, "valueSet");
+    };
+    let version = find_str_param(params, "valueSetVersion");
+    if let Some(vs) = collect_resource_params(params, "tx-resource")
+        .into_iter()
+        .find(|r| {
+            r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                && r.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
+                && version
+                    .as_deref()
+                    .is_none_or(|v| r.get("version").and_then(|x| x.as_str()) == Some(v))
+        })
+    {
+        return Some(vs);
+    }
+    ValueSetOperations::search(
+        state.backend(),
+        &TenantContext::system(),
+        crate::types::ResourceSearchQuery {
+            url: Some(url),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()
+}
+
+/// `ValueSet/$validate-code` against a value set over media types only
+/// (see [`crate::mimetypes`]); `None` for any other value set. The core
+/// `mimetypes` value set keeps its own handling.
+async fn media_type_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::mimetypes;
+    if find_str_param(params, "url")
+        .as_deref()
+        .is_some_and(crate::bcp13::is_mimetypes_valueset_url)
+    {
+        return None;
+    }
+    let vs = requested_value_set(state, params).await?;
+    if !mimetypes::is_media_type_value_set(&vs) {
+        return None;
+    }
+    let (code, path) = if let Some(code) = find_str_param(params, "code") {
+        if find_str_param(params, "system").is_some_and(|s| s != mimetypes::SYSTEM) {
+            return None;
+        }
+        (code, RequestPath::BareCode)
+    } else if let Some((system, code, _, _)) = extract_coding_full(params, "coding") {
+        if system != mimetypes::SYSTEM {
+            return None;
+        }
+        (code, RequestPath::Coding)
+    } else {
+        return None;
+    };
+    let url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+    let label = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    let in_vs = mimetypes::parse(&code).is_some_and(|mt| mimetypes::in_value_set(&vs, &mt));
+    let issues = if in_vs {
+        vec![]
+    } else {
+        vec![ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: format!(
+                "The provided code '{}#{code}' was not found in the value set '{label}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        }]
+    };
+    Some(build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: Some(code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(mimetypes::SYSTEM),
+        None,
+        None,
+        None,
+        path,
+    ))
+}
+
 /// Look up the `status` property of a concept (e.g. `retired`, `deprecated`,
 /// `withdrawn`, `inactive`). Returns `None` when the concept has no status
 /// Extract a VS-implied `displayLanguage` from a stored ValueSet resource.
@@ -4282,6 +4395,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    if let Some(value) = media_type_vs_validate(state, &params).await {
+        return Ok(value);
+    }
     // ValueSet/$validate-code accepts either `url` (canonical URL of a stored
     // ValueSet) or `valueSet` (an inline ValueSet resource). The IG
     // `validation/validate-contained-{good,bad}` fixtures exercise the inline

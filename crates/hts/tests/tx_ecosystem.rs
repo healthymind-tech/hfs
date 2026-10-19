@@ -1042,3 +1042,82 @@ async fn request_supplements_are_not_applied_automatically() {
     assert_eq!(st, StatusCode::OK, "{body}");
     assert!(used(&body), "{body}");
 }
+
+/// mimetypes/*: media types (urn:ietf:bcp:13) are a grammar — value sets
+/// over them, $validate-code, $expand and $subsumes work without stored
+/// content.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn media_type_code_system() {
+    let app = TestApp::new().await;
+    let base = json!({"resourceType": "ValueSet", "url": "http://hts.test/vs/mt-text", "version": "1",
+        "status": "active", "compose": {"include": [{"system": "urn:ietf:bcp:13",
+            "filter": [{"property": "base", "op": "=", "value": "text"}]}]}});
+    let narrow = json!({"resourceType": "ValueSet", "url": "http://hts.test/vs/mt-reg", "version": "1",
+        "status": "active", "compose": {"include": [{"system": "urn:ietf:bcp:13", "filter": [
+            {"property": "registered", "op": "=", "value": "true"},
+            {"property": "base", "op": "=", "value": "text/plain"}]}]}});
+    let validate = |code: &str| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://hts.test/vs/mt-text"},
+            {"name": "system", "valueUri": "urn:ietf:bcp:13"},
+            {"name": "code", "valueCode": code},
+            {"name": "tx-resource", "resource": base.clone()}]})
+    };
+    let body = vs_validate(&app, validate("text/html; charset=utf-8")).await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+    let body = vs_validate(&app, validate("application/json")).await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["not-in-vs"]);
+
+    // A base filter cannot be expanded; registered=true can, unclosed.
+    let expand = |vs: &Value| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": vs["url"]},
+            {"name": "tx-resource", "resource": vs}]})
+        .to_string()
+    };
+    let (st, _) = app.post_fhir("/ValueSet/$expand", expand(&base)).await;
+    assert!(st.is_client_error(), "{st}");
+    let (st, body) = app.post_fhir("/ValueSet/$expand", expand(&narrow)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["expansion"]["contains"][0]["code"], "text/plain");
+    assert_eq!(body["expansion"]["total"], 1);
+
+    let subsumes = |a: &str, b: &str| {
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "system", "valueUri": "urn:ietf:bcp:13"},
+            {"name": "codeA", "valueCode": a}, {"name": "codeB", "valueCode": b}]})
+        .to_string()
+    };
+    let (_, body) = app
+        .post_fhir(
+            "/CodeSystem/$subsumes",
+            subsumes("application/xml", "application/xml; charset=utf-8"),
+        )
+        .await;
+    assert_eq!(
+        param(&body, "outcome").unwrap()["valueCode"],
+        "subsumes",
+        "{body}"
+    );
+    let (st, oo) = app
+        .post_fhir(
+            "/CodeSystem/$subsumes",
+            subsumes("text/plain", "text/plain; foo=bar"),
+        )
+        .await;
+    assert!(st.is_client_error(), "{st}");
+    assert_eq!(
+        oo["issue"][0]["details"]["coding"][0]["code"],
+        "cannot-determine"
+    );
+}

@@ -120,6 +120,40 @@ pub(crate) async fn process_subsumes<B: TerminologyBackend>(
         }
     };
 
+    // Media types: a grammar, judged without stored content.
+    if system == crate::mimetypes::SYSTEM {
+        let side = if coding_form { "coding" } else { "code" };
+        let parse = |code: &str, which: &str| {
+            crate::mimetypes::parse(code).ok_or_else(|| {
+                HtsError::coded(
+                    "code-invalid",
+                    "invalid-code",
+                    format!(
+                        "Unknown code '{code}' in the CodeSystem '{}': not a well formed media type",
+                        crate::mimetypes::SYSTEM
+                    ),
+                    Some(&format!("{side}{which}")),
+                )
+            })
+        };
+        let (a, b) = (parse(&code_a, "A")?, parse(&code_b, "B")?);
+        let outcome = crate::mimetypes::subsumes(&a, &b).map_err(|param| {
+            HtsError::coded(
+                "not-supported",
+                "cannot-determine",
+                format!(
+                    "Cannot determine how '{code_a}' and '{code_b}' relate: whether the \
+                     parameter '{param}' narrows the media type is not known"
+                ),
+                None,
+            )
+        })?;
+        return Ok(json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "outcome", "valueCode": outcome.as_str()}]
+        }));
+    }
+
     let req = SubsumesRequest {
         system,
         version: find_str_param(&params, "version"),

@@ -67,6 +67,7 @@ pub(crate) mod language;
 pub mod loinc_filters;
 #[cfg(all(feature = "sqlite", feature = "postgres"))]
 pub mod migrate;
+pub(crate) mod mimetypes;
 pub mod operations;
 pub(crate) mod resource_ids;
 pub mod server;
