@@ -247,7 +247,13 @@ const VOID: &[&str] = &[
 ];
 
 /// Unresolved internal links (`<a href="#x">`) in one narrative `div`.
-fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String, String)> {
+/// Each entry: href, element path in the div, link text, and the scheme
+/// when the link is bad because of it (else an unresolved `#fragment`).
+#[allow(clippy::type_complexity)]
+fn unresolved_links(
+    xhtml: &str,
+    known: &HashSet<String>,
+) -> Vec<(String, String, String, Option<String>)> {
     let all = tags(xhtml);
     let mut out = Vec::new();
     let mut stack: Vec<&str> = Vec::new();
@@ -268,11 +274,12 @@ fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String
         let Some(href) = attr(tag, "href") else {
             continue;
         };
-        let Some(fragment) = href.strip_prefix('#') else {
-            continue;
-        };
-        if fragment.is_empty() || known.contains(fragment) {
-            continue;
+        let scheme = bad_scheme(href);
+        match href.strip_prefix('#') {
+            Some(fragment) if fragment.is_empty() || known.contains(fragment) => continue,
+            Some(_) => {}
+            None if scheme.is_none() => continue,
+            None => {}
         }
         let at = if void {
             let mut p = stack.join("/");
@@ -291,9 +298,26 @@ fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String
         } else {
             text_between(xhtml, tag.end, close)
         };
-        out.push((href.to_string(), at, text));
+        out.push((href.to_string(), at, text, scheme));
     }
     out
+}
+
+/// Schemes a narrative hyperlink may use (HL7 validator).
+const LINK_SCHEMES: &[&str] = &[
+    "http", "https", "ftp", "ftps", "sftp", "mailto", "tel", "fax", "sms", "data", "file", "news",
+];
+
+/// The scheme of an absolute `href` that is not a hyperlinkable one
+/// (`urn:uuid:…`), if any.
+fn bad_scheme(href: &str) -> Option<String> {
+    let (scheme, _) = href.split_once(':')?;
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (is_scheme && !LINK_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()))
+        .then(|| scheme.to_string())
 }
 
 /// `<a href="#fragment">` links in a resource's narrative that point at
@@ -311,11 +335,17 @@ pub(crate) fn narrative_link_errors(resource: &Value) -> Vec<ValidationError> {
         }
         let mut known = HashSet::new();
         targets(res, &mut known);
-        for (href, at, text) in unresolved_links(div, &known) {
+        for (href, at, text, scheme) in unresolved_links(div, &known) {
+            let message = match scheme {
+                Some(scheme) => format!(
+                    "Hyperlink scheme '{scheme}' in '{href}' at '{at}' for '{text}' is not a valid hyperlinkable scheme"
+                ),
+                None => msg_narrative_link(&href, &at, &text),
+            };
             errors.push(ValidationError::new(
                 ErrorKind::Narrative,
                 format!("{path}.text.div"),
-                msg_narrative_link(&href, &at, &text),
+                message,
             ));
         }
     }
@@ -393,6 +423,18 @@ mod tests {
         assert_eq!(
             errors[0].message,
             "Hyperlink '#Patient_x' at 'div/ul/li/a' for 'See above (Patient/x)' does not resolve"
+        );
+    }
+
+    #[test]
+    fn hyperlinks_need_a_hyperlinkable_scheme() {
+        let patient = json!({"resourceType": "Patient", "text": {"status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><a href=\"urn:uuid:7221aa91\">Saint Luke</a> <a href=\"https://x.org/a\">ok</a> <a href=\"mailto:a@b.c\">ok</a> <a href=\"Patient/1\">relative</a></p></div>"}});
+        let errors = narrative_link_errors(&patient);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(
+            errors[0].message,
+            "Hyperlink scheme 'urn' in 'urn:uuid:7221aa91' at 'div/p/a' for 'Saint Luke' is not a valid hyperlinkable scheme"
         );
     }
 
