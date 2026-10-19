@@ -94,6 +94,9 @@ const ALLOWED_ATTRIBUTES: &[&str] = &[
     "id",
     "lang",
     "xml:lang",
+    // whitespace handling (`<pre xml:space="preserve">`); the HL7 validator
+    // accepts it
+    "xml:space",
     "dir",
     "accesskey",
     "tabindex",
@@ -330,6 +333,10 @@ mod tests {
         )));
         assert!(check_html_names(&div(
             r#"<span xml:lang="zh-TW">中文</span>"#
+        )));
+        // HL7 validator test case dr-xml-space
+        assert!(check_html_names(&div(
+            "<pre xml:space=\"preserve\">  kept  </pre>"
         )));
     }
 
