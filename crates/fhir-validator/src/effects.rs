@@ -677,6 +677,19 @@ async fn execute_terminology(
                 match verdict {
                     Ok(v) if v.valid => {}
                     Ok(_) if required => {
+                        // A bare `code` from none of the value set's systems:
+                        // the HL7 validator first reports that no system can
+                        // be determined for it, then the binding failure.
+                        if let CodedValue::Code(code) = coded {
+                            errors.push(ValidationError::new(
+                                ErrorKind::TerminologyBinding,
+                                (*path).clone(),
+                                format!(
+                                    "The System URI could not be determined for the code '{code}' in the ValueSet '{}'",
+                                    binding.value_set
+                                ),
+                            ));
+                        }
                         errors.push(
                             ValidationError::new(
                                 ErrorKind::TerminologyBinding,

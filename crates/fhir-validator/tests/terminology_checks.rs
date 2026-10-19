@@ -297,11 +297,12 @@ async fn extensible_bindings_warn_when_enabled() {
         issues[0].message
     );
 
-    // A required binding failing is still an error, never a warning.
+    // A required binding failing is still an error, never a warning (a
+    // bare code also draws "System URI could not be determined").
     let gender = json!({"resourceType": "Patient", "gender": "male"});
     let issues = run(&gender, &on).await;
-    assert_eq!(issues.len(), 1, "{issues:#?}");
-    assert_eq!(issues[0].severity, Severity::Error);
+    assert_eq!(issues.len(), 2, "{issues:#?}");
+    assert!(issues.iter().all(|i| i.severity == Severity::Error));
 }
 
 /// Narrative links and best-practice warnings run when the handlers ask for

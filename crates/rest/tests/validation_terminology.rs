@@ -250,12 +250,17 @@ async fn remote_mode_checks_core_bindings_locally_and_splits_versioned_canonical
     let server = hfs(&ts_url, "remote", "open");
     upload_profile(&server).await;
 
-    // Core binding, bogus code: an error, and the server was never asked.
+    // Core binding, bogus code: an error (with the HL7 validator's "System
+    // URI could not be determined" for a bare code), and the server was
+    // never asked.
     let outcome = validate(&server, &patient("unknownx", "M"), false).await;
     let issues = binding_issues(&outcome);
-    assert_eq!(issues.len(), 1, "{outcome:#}");
-    assert_eq!(issues[0].0, "error");
-    assert_eq!(issues[0].1, "Patient.gender");
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(
+        issues
+            .iter()
+            .all(|i| i.0 == "error" && i.1 == "Patient.gender")
+    );
     assert!(
         requests.lock().unwrap().is_empty(),
         "core bindings never reach HTS"
@@ -311,8 +316,8 @@ async fn remote_only_sends_core_bindings_to_the_server() {
     )
     .await;
     let issues = binding_issues(&outcome);
-    assert_eq!(issues.len(), 1, "{outcome:#}");
-    assert_eq!(issues[0].0, "error");
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(issues.iter().all(|i| i.0 == "error"));
     let reqs = requests.lock().unwrap();
     assert_eq!(reqs.len(), 1, "{reqs:#?}");
     assert_eq!(

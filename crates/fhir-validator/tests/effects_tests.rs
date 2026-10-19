@@ -267,9 +267,15 @@ async fn required_binding_pass_and_fail() {
         )
         .await;
     let as_json = serde_json::to_value(&errors).unwrap();
+    // A bare code from none of the value set's systems: first that no
+    // system can be determined (HL7 validator), then the binding failure.
     assert_eq!(
         as_json,
         json!([{
+            "type": "terminology-binding",
+            "path": "Patient.gender",
+            "message": "The System URI could not be determined for the code 'zzz' in the ValueSet 'http://hl7.org/fhir/ValueSet/administrative-gender'"
+        }, {
             "type": "terminology-binding",
             "path": "Patient.gender",
             "message": "Provided coded value 'zzz' does not pass validation against the following valueset: 'http://hl7.org/fhir/ValueSet/administrative-gender'",
