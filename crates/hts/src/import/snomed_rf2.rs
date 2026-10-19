@@ -134,6 +134,8 @@ struct ConceptTerms {
 struct SnomedParseResult {
     /// concept id → display term + designations.
     concept_terms: HashMap<String, ConceptTerms>,
+    /// Ids of the inactive concepts among `concept_terms`.
+    inactive_concepts: HashSet<String>,
     /// (child, parent) is-a edges.
     is_a_edges: Vec<(String, String)>,
     /// source_concept_id → Vec<(type_id, destination_concept_id)> for non-IS_A relationships.
@@ -188,13 +190,18 @@ pub async fn import_snomed_rf2(
         let mut parse_errors: Vec<String> = Vec::new();
         let mut modules: HashMap<String, u64> = HashMap::new();
 
-        let active_concepts = {
+        let (active_concepts, inactive_concepts) = {
             let mut zip = open_zip(&path_owned)?;
             let entry = zip
                 .by_name(&concept_path)
                 .map_err(|e| HtsError::InvalidRequest(format!("Cannot open concept file: {e}")))?;
-            parse_active_concepts(BufReader::new(entry), &mut parse_errors, &mut modules)
+            parse_concepts(BufReader::new(entry), &mut parse_errors, &mut modules)
         };
+        // Inactive concepts are imported too (marked inactive) so a retired
+        // code is reported as inactive rather than unknown; they take part in
+        // no relationship.
+        let known_concepts: HashSet<String> =
+            active_concepts.union(&inactive_concepts).cloned().collect();
 
         let concept_terms = {
             let mut by_desc_id: HashMap<String, (usize, ParsedDescription)> = HashMap::new();
@@ -206,7 +213,7 @@ pub async fn import_snomed_rf2(
                 })?;
                 parse_descriptions(
                     BufReader::new(entry),
-                    &active_concepts,
+                    &known_concepts,
                     &languages,
                     &mut next_order,
                     &mut by_desc_id,
@@ -223,7 +230,7 @@ pub async fn import_snomed_rf2(
                 parse_language_refsets(BufReader::new(entry), &mut preferred_in, &mut parse_errors);
             }
 
-            build_concept_terms(by_desc_id, &preferred_in, &active_concepts)
+            build_concept_terms(by_desc_id, &preferred_in, &known_concepts)
         };
 
         let (is_a_edges, role_relationships) = {
@@ -266,6 +273,7 @@ pub async fn import_snomed_rf2(
 
         Ok(SnomedParseResult {
             concept_terms,
+            inactive_concepts,
             is_a_edges,
             role_relationships,
             association_refsets,
@@ -279,6 +287,7 @@ pub async fn import_snomed_rf2(
 
     let SnomedParseResult {
         concept_terms,
+        inactive_concepts,
         is_a_edges,
         role_relationships,
         association_refsets,
@@ -385,7 +394,18 @@ pub async fn import_snomed_rf2(
                     })
                     .unwrap_or_default();
 
-                [parent_extras, role_extras].concat()
+                let inactive_extra = inactive_concepts.contains(code).then_some(BuilderProperty {
+                    code: "inactive",
+                    value_key: "valueBoolean",
+                    value: "true",
+                });
+
+                [
+                    parent_extras,
+                    role_extras,
+                    inactive_extra.into_iter().collect(),
+                ]
+                .concat()
             })
             .collect();
 
@@ -662,15 +682,17 @@ fn file_name_of(path: &str) -> &str {
 
 // ── RF2 parsers ───────────────────────────────────────────────────────────────
 
-/// The active concept ids of a Concept file, counting the active concepts
-/// per `moduleId` (column 4) into `modules`, from which [`edition_version`]
-/// tells an extension edition from the International one.
-fn parse_active_concepts(
+/// The `(active, inactive)` concept ids of a Concept file (last row of an id
+/// wins), counting the active concepts per `moduleId` (column 4) into
+/// `modules`, from which [`edition_version`] tells an extension edition from
+/// the International one.
+fn parse_concepts(
     reader: impl BufRead,
     errors: &mut Vec<String>,
     modules: &mut HashMap<String, u64>,
-) -> HashSet<String> {
+) -> (HashSet<String>, HashSet<String>) {
     let mut active = HashSet::new();
+    let mut inactive = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = match line_result {
@@ -698,12 +720,14 @@ fn parse_active_concepts(
             if let Some(module) = parts.get(3) {
                 *modules.entry(module.trim().to_string()).or_default() += 1;
             }
+            inactive.remove(&id);
             active.insert(id);
         } else {
             active.remove(&id);
+            inactive.insert(id);
         }
     }
-    active
+    (active, inactive)
 }
 
 /// Parse one RF2 Description file into `by_desc_id`, keyed on description id
@@ -940,7 +964,7 @@ fn build_concept_terms(
         );
     }
 
-    // Active concepts without any description keep an (empty-display) entry.
+    // Concepts without any description keep an (empty-display) entry.
     for concept_id in active_concepts {
         terms.entry(concept_id.clone()).or_default();
     }
@@ -1208,6 +1232,14 @@ fn extract_release_date(path: &str) -> Option<String> {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    fn parse_concepts_active(
+        reader: impl std::io::BufRead,
+        errors: &mut Vec<String>,
+        modules: &mut std::collections::HashMap<String, u64>,
+    ) -> std::collections::HashSet<String> {
+        super::parse_concepts(reader, errors, modules).0
+    }
+
     use super::*;
     use crate::backends::SqliteTerminologyBackend;
     use std::io::Write;
@@ -1340,7 +1372,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     fn parse_fixture_terms() -> HashMap<String, ConceptTerms> {
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
@@ -1386,11 +1418,20 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     fn parse_active_concepts_returns_only_active_ids() {
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         assert!(active.contains("123456001"));
         assert!(active.contains("789012001"));
         assert!(!active.contains("999999001"));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn inactive_concepts_are_kept_apart() {
+        let mut errors = Vec::new();
+        let (active, inactive) =
+            super::parse_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+        assert!(inactive.contains("999999001"));
+        assert!(!active.contains("999999001"));
     }
 
     #[test]
@@ -1412,7 +1453,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     fn display_without_language_refsets_keeps_first_synonym() {
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
         parse_descriptions(
@@ -1494,7 +1535,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     fn inactive_description_row_revokes_earlier_state() {
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         // Full-file style: the synonym is later inactivated.
         let full_tsv = "\
@@ -1519,7 +1560,7 @@ id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcase
     fn parse_relationships_returns_correct_is_a_pairs() {
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let (edges, roles) = parse_relationships(RELATIONSHIP_TSV.as_bytes(), &active, &mut errors);
 
         assert_eq!(edges.len(), 1);
@@ -1538,7 +1579,7 @@ id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\r\n\
 BADLINE\r\n";
         let mut errors = Vec::new();
         let active =
-            parse_active_concepts(concept_data.as_bytes(), &mut errors, &mut HashMap::new());
+            parse_concepts_active(concept_data.as_bytes(), &mut errors, &mut HashMap::new());
         assert_eq!(active.len(), 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("line 3"));
@@ -1598,7 +1639,7 @@ BADLINE\r\n";
                    1\t20250301\t1\t731000124108\t900000000000074008\n\
                    2\t20250301\t0\t731000124108\t900000000000074008\n\
                    3\t20250301\t1\t900000000000207008\t900000000000074008\n";
-        let active = parse_active_concepts(rf2.as_bytes(), &mut errors, &mut counts);
+        let active = parse_concepts_active(rf2.as_bytes(), &mut errors, &mut counts);
         assert_eq!(active.len(), 2);
         assert_eq!(counts.get("731000124108"), Some(&1));
         assert_eq!(counts.get("900000000000207008"), Some(&1));
@@ -1629,7 +1670,7 @@ BADLINE\r\n";
         .expect("dry-run should succeed");
 
         assert_eq!(stats.code_systems, 1);
-        assert_eq!(stats.concepts, 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
 
         assert_eq!(count_rows(&backend, "code_systems"), 0);
         assert_eq!(count_rows(&backend, "concepts"), 0);
@@ -1654,10 +1695,10 @@ BADLINE\r\n";
         .expect("live import should succeed");
 
         assert_eq!(stats.code_systems, 1);
-        assert_eq!(stats.concepts, 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 3);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
     }
 
@@ -1681,10 +1722,10 @@ BADLINE\r\n";
         // Identical to the snapshot-only archive: the Full files' poison rows
         // (extra concept 555555001, stale description, duplicate edge) must
         // not be parsed.
-        assert_eq!(stats.concepts, 2);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
+        assert_eq!(count_rows(&backend, "concepts"), 3);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // the inactive concept's term too
     }
 
     #[tokio::test]
@@ -1711,7 +1752,7 @@ BADLINE\r\n";
         // synonym a bare-`en` and a dialect preferredForLanguage row
         // (111005 → en + en-US, 111001 → en + en-GB) = 8;
         // 789012001: en FSN + de FSN = 2.
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // includes the inactive concept 999999001
 
         // displayLanguage=de resolves the German synonym as the display.
         let resp = backend
@@ -1801,7 +1842,7 @@ BADLINE\r\n";
         // Full import yields 10 designation rows (see
         // import_snomed_rf2_writes_multilingual_designations); the 2 German
         // synonyms/FSNs from the per-language Description file are dropped.
-        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+        assert_eq!(count_rows(&backend, "concept_designations"), 9); // includes the inactive concept 999999001
 
         // English lookups behave exactly as without a filter.
         let resp = backend
@@ -1844,7 +1885,7 @@ BADLINE\r\n";
 
         // en is force-retained alongside the requested de, so the result is
         // identical to an unfiltered import.
-        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+        assert_eq!(count_rows(&backend, "concept_designations"), 11); // includes the inactive concept 999999001
     }
 
     #[test]
@@ -2112,7 +2153,7 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         .unwrap();
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(count_rows(&backend, "concepts"), 3); // includes the inactive concept 999999001
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
     }
 
@@ -2133,8 +2174,8 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         .await
         .unwrap();
 
-        assert_eq!(stats.concepts, 2);
-        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(stats.concepts, 3); // includes the inactive concept 999999001
+        assert_eq!(count_rows(&backend, "concepts"), 3);
     }
 
     #[tokio::test]
