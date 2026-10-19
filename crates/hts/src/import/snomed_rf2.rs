@@ -186,13 +186,14 @@ pub async fn import_snomed_rf2(
         );
 
         let mut parse_errors: Vec<String> = Vec::new();
+        let mut modules: HashMap<String, u64> = HashMap::new();
 
         let active_concepts = {
             let mut zip = open_zip(&path_owned)?;
             let entry = zip
                 .by_name(&concept_path)
                 .map_err(|e| HtsError::InvalidRequest(format!("Cannot open concept file: {e}")))?;
-            parse_active_concepts(BufReader::new(entry), &mut parse_errors)
+            parse_active_concepts(BufReader::new(entry), &mut parse_errors, &mut modules)
         };
 
         let concept_terms = {
@@ -260,7 +261,8 @@ pub async fn import_snomed_rf2(
             active_members(latest)
         };
 
-        let release_version = extract_release_date(&concept_path);
+        let release_version = extract_release_date(&concept_path)
+            .map(|date| edition_version(&concept_path, &modules, date));
 
         Ok(SnomedParseResult {
             concept_terms,
@@ -660,7 +662,14 @@ fn file_name_of(path: &str) -> &str {
 
 // ── RF2 parsers ───────────────────────────────────────────────────────────────
 
-fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> HashSet<String> {
+/// The active concept ids of a Concept file, counting the active concepts
+/// per `moduleId` (column 4) into `modules`, from which [`edition_version`]
+/// tells an extension edition from the International one.
+fn parse_active_concepts(
+    reader: impl BufRead,
+    errors: &mut Vec<String>,
+    modules: &mut HashMap<String, u64>,
+) -> HashSet<String> {
     let mut active = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
@@ -686,6 +695,9 @@ fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> Hash
         let is_active = parts[2].trim() == "1";
 
         if is_active {
+            if let Some(module) = parts.get(3) {
+                *modules.entry(module.trim().to_string()).or_default() += 1;
+            }
             active.insert(id);
         } else {
             active.remove(&id);
@@ -1151,6 +1163,36 @@ fn build_assoc_refset_concept_map_bundle(
     serde_json::to_vec(&bundle).expect("serialise ConceptMap bundle")
 }
 
+/// The International edition's own modules (SNOMED CT core, model
+/// component): every edition carries concepts in them.
+const INTERNATIONAL_MODULES: [&str; 2] = ["900000000000207008", "900000000000012004"];
+
+/// The CodeSystem version a release is stored under. The International
+/// edition (`sct2_Concept_Snapshot_INT_<date>.txt`) keeps the plain release
+/// date, which the API reports as
+/// `http://snomed.info/sct/900000000000207008/version/<date>`. Any other
+/// edition (`…_US1000124_<date>.txt`, a national extension) is stored as its
+/// edition URI `http://snomed.info/sct/<module>/version/<date>`, the module
+/// being the one holding most of its active concepts outside the
+/// International modules — otherwise it would be reported, and pinned, as
+/// an International release.
+fn edition_version(concept_path: &str, modules: &HashMap<String, u64>, date: String) -> String {
+    let stem = concept_path.rsplit('/').next().unwrap_or(concept_path);
+    let tag = stem.rsplit('_').nth(1).unwrap_or_default();
+    if tag.eq_ignore_ascii_case("INT") {
+        return date;
+    }
+    let edition = modules
+        .iter()
+        .filter(|(m, _)| !INTERNATIONAL_MODULES.contains(&m.as_str()))
+        .max_by(|(ma, a), (mb, b)| a.cmp(b).then_with(|| mb.cmp(ma)))
+        .map(|(m, _)| m.clone());
+    match edition {
+        Some(module) => format!("{SNOMED_URL}/{module}/version/{date}"),
+        None => date,
+    }
+}
+
 fn extract_release_date(path: &str) -> Option<String> {
     let stem = path.rsplit('/').next().unwrap_or(path);
     let without_ext = stem.strip_suffix(".txt")?;
@@ -1297,7 +1339,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     /// Run the description/refset parsing pipeline over the test fixtures.
     fn parse_fixture_terms() -> HashMap<String, ConceptTerms> {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
@@ -1342,7 +1385,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn parse_active_concepts_returns_only_active_ids() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         assert!(active.contains("123456001"));
         assert!(active.contains("789012001"));
         assert!(!active.contains("999999001"));
@@ -1367,7 +1411,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn display_without_language_refsets_keeps_first_synonym() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let mut by_desc_id = HashMap::new();
         let mut next_order = 0;
         parse_descriptions(
@@ -1448,7 +1493,8 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     #[test]
     fn inactive_description_row_revokes_earlier_state() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
 
         // Full-file style: the synonym is later inactivated.
         let full_tsv = "\
@@ -1472,7 +1518,8 @@ id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcase
     #[test]
     fn parse_relationships_returns_correct_is_a_pairs() {
         let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors, &mut HashMap::new());
         let (edges, roles) = parse_relationships(RELATIONSHIP_TSV.as_bytes(), &active, &mut errors);
 
         assert_eq!(edges.len(), 1);
@@ -1490,7 +1537,8 @@ id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\r\n\
 123456001\t20240101\t1\t900000000000207008\t900000000000074008\r\n\
 BADLINE\r\n";
         let mut errors = Vec::new();
-        let active = parse_active_concepts(concept_data.as_bytes(), &mut errors);
+        let active =
+            parse_active_concepts(concept_data.as_bytes(), &mut errors, &mut HashMap::new());
         assert_eq!(active.len(), 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("line 3"));
@@ -1502,6 +1550,58 @@ BADLINE\r\n";
             extract_release_date("Snapshot/Terminology/sct2_Concept_Snapshot_INT_20240101.txt"),
             Some("20240101".to_string())
         );
+    }
+
+    #[test]
+    fn extension_editions_are_stored_under_their_edition_uri() {
+        let modules: HashMap<String, u64> = [
+            ("900000000000207008".to_string(), 350_000),
+            ("900000000000012004".to_string(), 500),
+            ("731000124108".to_string(), 12_000),
+            ("5991000124107".to_string(), 30),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            edition_version(
+                "Snapshot/Terminology/sct2_Concept_Snapshot_US1000124_20250301.txt",
+                &modules,
+                "20250301".into()
+            ),
+            "http://snomed.info/sct/731000124108/version/20250301"
+        );
+        // The International edition keeps the plain date, whatever modules.
+        assert_eq!(
+            edition_version(
+                "Snapshot/Terminology/sct2_Concept_Snapshot_INT_20250601.txt",
+                &modules,
+                "20250601".into()
+            ),
+            "20250601"
+        );
+        // An extension file with only International modules: plain date.
+        let core: HashMap<String, u64> = [("900000000000207008".to_string(), 10)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            edition_version(
+                "sct2_Concept_Snapshot_XX_20250101.txt",
+                &core,
+                "20250101".into()
+            ),
+            "20250101"
+        );
+        // Module counting reads column 4 of active rows only.
+        let mut counts = HashMap::new();
+        let mut errors = Vec::new();
+        let rf2 = "id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\n\
+                   1\t20250301\t1\t731000124108\t900000000000074008\n\
+                   2\t20250301\t0\t731000124108\t900000000000074008\n\
+                   3\t20250301\t1\t900000000000207008\t900000000000074008\n";
+        let active = parse_active_concepts(rf2.as_bytes(), &mut errors, &mut counts);
+        assert_eq!(active.len(), 2);
+        assert_eq!(counts.get("731000124108"), Some(&1));
+        assert_eq!(counts.get("900000000000207008"), Some(&1));
     }
 
     #[test]
