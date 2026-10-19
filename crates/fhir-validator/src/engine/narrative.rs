@@ -6,9 +6,7 @@
 //! in the instance (the root, Bundle entries, contained and other nested
 //! resources), each resource judged on its own as the HL7 validator does.
 
-use super::errors::{
-    msg_narrative_link, msg_observation_performer, msg_observation_subject,
-};
+use super::errors::{msg_narrative_link, msg_observation_performer, msg_observation_subject};
 use super::{ErrorKind, Severity, ValidationError};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -87,7 +85,11 @@ fn tags(xhtml: &str) -> Vec<Tag<'_>> {
             j += 1;
         }
         let name_start = j;
-        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' && bytes[j] != b'/' {
+        while j < bytes.len()
+            && !bytes[j].is_ascii_whitespace()
+            && bytes[j] != b'>'
+            && bytes[j] != b'/'
+        {
             j += 1;
         }
         let name = &xhtml[name_start..j];
@@ -142,7 +144,8 @@ fn tags(xhtml: &str) -> Vec<Tag<'_>> {
                     }
                     _ => {
                         let v_start = j;
-                        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>'
+                        {
                             j += 1;
                         }
                         value = &xhtml[v_start..j];
@@ -239,7 +242,9 @@ fn text_between(xhtml: &str, from: usize, to: usize) -> String {
 }
 
 /// Void HTML elements (never closed).
-const VOID: &[&str] = &["br", "hr", "img", "col", "area", "input", "meta", "link", "wbr"];
+const VOID: &[&str] = &[
+    "br", "hr", "img", "col", "area", "input", "meta", "link", "wbr",
+];
 
 /// Unresolved internal links (`<a href="#x">`) in one narrative `div`.
 fn unresolved_links(xhtml: &str, known: &HashSet<String>) -> Vec<(String, String, String)> {
@@ -337,8 +342,12 @@ pub(crate) fn best_practice_warnings(resource: &Value) -> Vec<ValidationError> {
         };
         if !present("subject") {
             warnings.push(
-                ValidationError::new(ErrorKind::BestPractice, path.clone(), msg_observation_subject())
-                    .with_severity(Severity::Warning),
+                ValidationError::new(
+                    ErrorKind::BestPractice,
+                    path.clone(),
+                    msg_observation_subject(),
+                )
+                .with_severity(Severity::Warning),
             );
         }
         if !present("performer") {
@@ -402,7 +411,11 @@ mod tests {
         let errors = narrative_link_errors(&bundle);
         assert_eq!(errors.len(), 1, "{errors:#?}");
         assert_eq!(errors[0].path, "Bundle.entry.1.resource.text.div");
-        assert!(errors[0].message.contains("at 'div/p/a'"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("at 'div/p/a'"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]
