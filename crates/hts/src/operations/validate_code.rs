@@ -4345,7 +4345,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_vs_validate_code_inner(state, params).await;
+    let mut result = process_vs_validate_code_inner(state, params.clone()).await;
+    if let Ok(value) = &result
+        && response_result(value) == Some(false)
+        && let Some(answer) = retry_without_unknown_version_includes(state, &params).await
+    {
+        result = Ok(answer);
+    }
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
@@ -4354,6 +4360,132 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         );
     }
     result
+}
+
+/// The `result` parameter of a `$validate-code` answer.
+fn response_result(value: &Value) -> Option<bool> {
+    value
+        .get("parameter")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("result"))?
+        .get("valueBoolean")?
+        .as_bool()
+}
+
+/// A stored ValueSet that also includes another code system at a version
+/// the server does not have (NHI CI's `nhi-category` 1.0.2 includes
+/// `condition-category` "1.0.2", which no release carries) cannot be
+/// expanded, and the membership check of a code of its *own* system failed
+/// with it. Such an include can never contain a code of another system, so
+/// the code is judged again against the includes and excludes of its own
+/// system only (an inline ValueSet with the stored url and version). `None`
+/// when that does not apply: no include of the coded system, an unknown
+/// version nowhere, or value-set imports (which may contain any system).
+async fn retry_without_unknown_version_includes<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    if params
+        .iter()
+        .any(|p| p.get("name").and_then(Value::as_str) == Some("valueSet"))
+    {
+        return None;
+    }
+    let ctx = TenantContext::system();
+    let url = find_str_param(params, "url")?;
+    let systems: Vec<String> = match extract_coding_full(params, "coding") {
+        Some((system, _, _, _)) => vec![system],
+        None => match find_codeable_concept_param(params) {
+            Some(cc) => coding_entries_from_codeable_concept(&cc)?
+                .iter()
+                .filter_map(|c| c.get("system").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            None => vec![find_str_param(params, "system")?],
+        },
+    };
+    let systems: Vec<String> = systems.into_iter().filter(|s| !s.is_empty()).collect();
+    if systems.is_empty() {
+        return None;
+    }
+    let vs = ValueSetOperations::search(
+        state.backend(),
+        &ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(url.clone()),
+            version: find_str_param(params, "valueSetVersion"),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    let compose = vs.get("compose")?;
+    let includes = compose.get("include")?.as_array()?;
+    let of = |e: &Value| e.get("system").and_then(Value::as_str).map(str::to_string);
+    if includes.iter().any(|i| i.get("valueSet").is_some())
+        || !includes
+            .iter()
+            .any(|i| of(i).is_some_and(|s| systems.contains(&s)))
+    {
+        return None;
+    }
+    let mut unknown_version = false;
+    for inc in includes {
+        let (Some(system), Some(version)) = (of(inc), inc.get("version").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        if systems.contains(&system) {
+            continue;
+        }
+        let stored = cs_stored_versions(state.backend(), &ctx, &system).await;
+        if !stored.is_empty() && !stored.iter().any(|v| v == version) {
+            unknown_version = true;
+        }
+    }
+    if !unknown_version {
+        return None;
+    }
+    let keep = |key: &str| -> Value {
+        Value::Array(
+            compose
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter(|e| of(e).is_some_and(|s| systems.contains(&s)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    let mut reduced = json!({"resourceType": "ValueSet", "url": url, "status": "active",
+        "compose": {"include": keep("include")}});
+    if let Some(v) = vs.get("version") {
+        reduced["version"] = v.clone();
+    }
+    let excludes = keep("exclude");
+    if excludes.as_array().is_some_and(|a| !a.is_empty()) {
+        reduced["compose"]["exclude"] = excludes;
+    }
+    let mut inline_params: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.get("name").and_then(Value::as_str),
+                Some("url") | Some("valueSetVersion")
+            )
+        })
+        .cloned()
+        .collect();
+    inline_params.push(json!({"name": "valueSet", "resource": reduced.clone()}));
+    let answer = process_inline_vs_validate_code(state, inline_params, reduced)
+        .await
+        .ok()?;
+    (response_result(&answer) == Some(true)).then_some(answer)
 }
 
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(

@@ -1055,3 +1055,46 @@ async fn expand_implicit_vs_total_matches_concept_count() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["expansion"]["total"], 3);
 }
+
+/// NHI CI's `nhi-category` 1.0.2 includes its own code system and HL7's
+/// `condition-category` at version "1.0.2", which no release carries: the
+/// value set cannot be expanded, but a code of its own code system is still
+/// a member (tx.fhir.org and the HL7 validator accept Condition-con-min's
+/// category `01`). A code in neither stays out.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_version_of_another_systems_include_does_not_hide_members() {
+    let app = TestApp::new().await;
+    let bundle = serde_json::json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "nhi-category", "url": "http://nhi.test/CodeSystem/nhi-category",
+            "version": "1.0.2", "status": "active", "content": "complete",
+            "concept": [{"code": "01", "display": "癌症"}, {"code": "02", "display": "先天性凝血因子異常"}]}},
+        {"resource": {"resourceType": "CodeSystem", "id": "condition-category", "url": "http://hl7.test/CodeSystem/condition-category",
+            "version": "4.0.1", "status": "active", "content": "complete",
+            "concept": [{"code": "problem-list-item"}, {"code": "encounter-diagnosis"}]}},
+        {"resource": {"resourceType": "ValueSet", "id": "nhi-category", "url": "http://nhi.test/ValueSet/nhi-category",
+            "version": "1.0.2", "status": "active", "compose": {"include": [
+                {"system": "http://nhi.test/CodeSystem/nhi-category"},
+                {"system": "http://hl7.test/CodeSystem/condition-category", "version": "1.0.2"}]}}}
+    ]});
+    app.import_bundle_ok(&bundle.to_string()).await;
+    let check = |code: &str| {
+        serde_json::json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://nhi.test/ValueSet/nhi-category"},
+            {"name": "codeableConcept", "valueCodeableConcept": {"coding": [
+                {"system": "http://nhi.test/CodeSystem/nhi-category", "code": code}]}}
+        ]})
+        .to_string()
+    };
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+    let (status, body) = app.post_fhir("/ValueSet/$validate-code", check("01")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(true), "{body}");
+    let (_, body) = app.post_fhir("/ValueSet/$validate-code", check("99")).await;
+    assert_eq!(result(&body), Some(false), "{body}");
+}
