@@ -38,10 +38,10 @@
 //! compared by their date within an edition (`map_version`); a release of
 //! another edition is a different version.
 //!
-//! Known limit: the RF2 importer does not record which edition it loaded, so
-//! a plain-date release is always reported as the International edition. An
-//! extension edition imported from RF2 (e.g. the US edition) would need its
-//! module recorded at import to be reported correctly.
+//! The RF2 importer stores the International edition under the plain date
+//! and any other edition (US, national extensions) under its edition URI
+//! (`…/<module>/version/<date>`), so a plain-date release is an
+//! International one.
 
 use helios_persistence::tenant::TenantContext;
 use serde_json::Value;
