@@ -1369,32 +1369,50 @@ impl RemoteTerminologyProvider {
 }
 
 impl RemoteTerminologyProvider {
-    fn cache_key(check: &TxCheck<'_>) -> String {
+    fn cache_key(check: &TxCheck<'_>, language: Option<&str>) -> String {
         match check {
             TxCheck::InValueSet(value_set, coded) => format!("{value_set}|{coded:?}"),
             TxCheck::Coding(coding) => format!(
-                "cs|{}|{}|{}|{}",
-                coding.get("system").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("version").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("code").and_then(Value::as_str).unwrap_or_default(),
-                coding.get("display").and_then(Value::as_str).unwrap_or_default(),
+                "cs|{}|{}|{}|{}|{}",
+                coding
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                coding
+                    .get("display")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                language.unwrap_or_default(),
             ),
         }
     }
 
     /// The operation and Parameters for one check.
-    fn request(check: &TxCheck<'_>) -> (&'static str, Value) {
+    fn request(check: &TxCheck<'_>, language: Option<&str>) -> (&'static str, Value) {
         match check {
             TxCheck::InValueSet(value_set, coded) => {
                 ("ValueSet/$validate-code", Self::payload(value_set, coded))
             }
-            TxCheck::Coding(coding) => ("CodeSystem/$validate-code", Self::coding_payload(coding)),
+            TxCheck::Coding(coding) => (
+                "CodeSystem/$validate-code",
+                Self::coding_payload(coding, language),
+            ),
         }
     }
 
     /// `CodeSystem/$validate-code` Parameters for one Coding: the system as
-    /// `url`, the code, and the display and version when the Coding has them.
-    fn coding_payload(coding: &Value) -> Value {
+    /// `url`, the code, and the display and version when the Coding has them;
+    /// `displayLanguage` is the language of the resource, when it declares
+    /// one (a display is judged against the designations in that language).
+    fn coding_payload(coding: &Value, language: Option<&str>) -> Value {
         let text = |k: &str| coding.get(k).and_then(Value::as_str);
         let mut parameter = vec![
             json!({ "name": "url", "valueUri": text("system").unwrap_or_default() }),
@@ -1405,6 +1423,9 @@ impl RemoteTerminologyProvider {
         }
         if let Some(display) = text("display") {
             parameter.push(json!({ "name": "display", "valueString": display }));
+            if let Some(language) = language {
+                parameter.push(json!({ "name": "displayLanguage", "valueCode": language }));
+            }
         }
         json!({ "resourceType": "Parameters", "parameter": parameter })
     }
@@ -1548,12 +1569,16 @@ impl RemoteTerminologyProvider {
     }
 
     /// One check, one request.
-    async fn check_one(&self, check: &TxCheck<'_>) -> Result<TxVerdict, TerminologyError> {
-        let key = Self::cache_key(check);
+    async fn check_one(
+        &self,
+        check: &TxCheck<'_>,
+        language: Option<&str>,
+    ) -> Result<TxVerdict, TerminologyError> {
+        let key = Self::cache_key(check, language);
         if let Some(cached) = self.cached(check, &key) {
             return cached;
         }
-        let (op, payload) = Self::request(check);
+        let (op, payload) = Self::request(check, language);
         let url = format!("{}/{op}", self.base_url);
         let response = self
             .client
@@ -1582,11 +1607,12 @@ impl RemoteTerminologyProvider {
     async fn check_batch(
         &self,
         checks: &[TxCheck<'_>],
+        language: Option<&str>,
     ) -> Option<Vec<Result<TxVerdict, TerminologyError>>> {
         let entries: Vec<Value> = checks
             .iter()
             .map(|check| {
-                let (op, payload) = Self::request(check);
+                let (op, payload) = Self::request(check, language);
                 json!({
                     "request": {"method": "POST", "url": op},
                     "resource": payload,
@@ -1616,10 +1642,10 @@ impl RemoteTerminologyProvider {
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
             let resource = answer.get("resource");
             let raw = resource.map(Value::to_string).unwrap_or_default();
-            let op_url = format!("{}/{}", self.base_url, Self::request(check).0);
+            let op_url = format!("{}/{}", self.base_url, Self::request(check, language).0);
             let verdict = self.settle(
                 check,
-                Self::cache_key(check),
+                Self::cache_key(check, language),
                 &op_url,
                 status,
                 resource,
@@ -1648,7 +1674,7 @@ impl RemoteTerminologyProvider {
         if matches!(&verdict, Ok(v) if !v.valid)
             && let Some(system) = self.unverifiable_system(value_set, coded, body).await
         {
-            let key = Self::cache_key(check);
+            let key = Self::cache_key(check, None);
             self.cache.remove(&key);
             let message = format!(
                 "code system '{system}' has no content on the terminology server \
@@ -1669,7 +1695,7 @@ impl TerminologyProvider for RemoteTerminologyProvider {
         value_set: &str,
         coded: &CodedValue,
     ) -> Result<bool, TerminologyError> {
-        self.check_one(&TxCheck::InValueSet(value_set, coded))
+        self.check_one(&TxCheck::InValueSet(value_set, coded), None)
             .await
             .map(|v| v.valid)
     }
@@ -1693,12 +1719,21 @@ impl TerminologyProvider for RemoteTerminologyProvider {
     /// duplicates are asked once, the rest go out as one batch Bundle
     /// (single requests, concurrently, if the server rejects batches).
     async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        self.check_in_language(checks, None).await
+    }
+
+    /// [`Self::check`], judging displays in `language` (the resource's).
+    async fn check_in_language(
+        &self,
+        checks: &[TxCheck<'_>],
+        language: Option<&str>,
+    ) -> Vec<Result<TxVerdict, TerminologyError>> {
         let mut out: Vec<Option<Result<TxVerdict, TerminologyError>>> = vec![None; checks.len()];
         // Distinct uncached checks, each with the positions it answers.
         let mut pending: Vec<(TxCheck<'_>, Vec<usize>)> = Vec::new();
         let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (i, check) in checks.iter().enumerate() {
-            let key = Self::cache_key(check);
+            let key = Self::cache_key(check, language);
             if let Some(cached) = self.cached(check, &key) {
                 out[i] = Some(cached);
                 continue;
@@ -1715,12 +1750,13 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             let requests: Vec<TxCheck<'_>> = pending.iter().map(|(c, _)| *c).collect();
             let verdicts = match requests.len() {
                 1 => None,
-                _ => self.check_batch(&requests).await,
+                _ => self.check_batch(&requests, language).await,
             };
             let verdicts = match verdicts {
                 Some(v) => v,
                 None => {
-                    futures::future::join_all(requests.iter().map(|c| self.check_one(c))).await
+                    futures::future::join_all(requests.iter().map(|c| self.check_one(c, language)))
+                        .await
                 }
             };
             for ((_, positions), verdict) in pending.iter().zip(verdicts) {
@@ -1971,7 +2007,7 @@ mod remote_provider_tests {
         .unwrap();
         assert!(verdict.unknown_system);
 
-        let payload = RemoteTerminologyProvider::coding_payload(&coding);
+        let payload = RemoteTerminologyProvider::coding_payload(&coding, None);
         assert_eq!(
             names_and_values(&payload),
             vec![
@@ -1979,6 +2015,16 @@ mod remote_provider_tests {
                 ("code".into(), json!("787-2")),
                 ("display".into(), json!("MCV")),
             ]
+        );
+        // A resource language is the display language of the check.
+        let payload = RemoteTerminologyProvider::coding_payload(&coding, Some("zh-TW"));
+        assert_eq!(
+            names_and_values(&payload).last(),
+            Some(&("displayLanguage".into(), json!("zh-TW")))
+        );
+        assert_ne!(
+            RemoteTerminologyProvider::cache_key(&check, Some("zh-TW")),
+            RemoteTerminologyProvider::cache_key(&check, None)
         );
     }
 

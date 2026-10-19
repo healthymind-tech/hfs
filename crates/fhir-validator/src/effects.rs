@@ -181,6 +181,19 @@ pub trait TerminologyProvider: Send + Sync {
         }
         out
     }
+
+    /// [`check`](Self::check) for a resource that declares its `language`:
+    /// displays are judged against the designations in that language (the
+    /// HL7 validator sends it as `displayLanguage`). The default ignores the
+    /// language.
+    async fn check_in_language(
+        &self,
+        checks: &[TxCheck<'_>],
+        language: Option<&str>,
+    ) -> Vec<Result<TxVerdict, TerminologyError>> {
+        let _ = language;
+        self.check(checks).await
+    }
 }
 
 /// One terminology question asked during a validation run.
@@ -692,10 +705,11 @@ async fn execute_terminology(
             }
         })
         .collect();
+    let language = resource.get("language").and_then(Value::as_str);
     let verdicts = if requests.is_empty() {
         Vec::new()
     } else {
-        provider.check(&requests).await
+        provider.check_in_language(&requests, language).await
     };
     debug_assert_eq!(verdicts.len(), asked.len(), "provider must align verdicts");
 

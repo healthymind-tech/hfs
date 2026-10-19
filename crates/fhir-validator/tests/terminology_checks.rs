@@ -384,3 +384,44 @@ async fn cpb16_does_not_confuse_implementation_with_implementation_guide() {
     let issues = run(&cs, &handlers).await;
     assert!(cpb16(&issues), "{issues:#?}");
 }
+
+/// A resource that declares its `language` has its displays judged in that
+/// language: the provider is asked with it (sent as `displayLanguage`), so a
+/// zh-TW display from a translation supplement validates.
+#[tokio::test]
+async fn the_resource_language_is_the_display_language() {
+    struct Lang(Mutex<Vec<Option<String>>>);
+    #[async_trait]
+    impl TerminologyProvider for Lang {
+        async fn validate_code(&self, _: &str, _: &CodedValue) -> Result<bool, TerminologyError> {
+            unreachable!()
+        }
+        async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+            self.check_in_language(checks, None).await
+        }
+        async fn check_in_language(
+            &self,
+            checks: &[TxCheck<'_>],
+            language: Option<&str>,
+        ) -> Vec<Result<TxVerdict, TerminologyError>> {
+            self.0.lock().unwrap().push(language.map(str::to_string));
+            checks.iter().map(|_| Ok(TxVerdict::valid())).collect()
+        }
+    }
+    let tx = Lang(Mutex::new(Vec::new()));
+    let handlers = EffectHandlers {
+        terminology: Some(&tx),
+        ..Default::default()
+    };
+    let condition = |language: Option<&str>| {
+        let mut c = json!({"resourceType": "Condition", "subject": {"reference": "Patient/p"},
+            "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "A00", "display": "霍亂"}]}});
+        if let Some(l) = language {
+            c["language"] = json!(l);
+        }
+        c
+    };
+    run(&condition(Some("zh-TW")), &handlers).await;
+    run(&condition(None), &handlers).await;
+    assert_eq!(*tx.0.lock().unwrap(), vec![Some("zh-TW".to_string()), None]);
+}

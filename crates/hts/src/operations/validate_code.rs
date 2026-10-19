@@ -519,6 +519,71 @@ async fn lookup_concept_status<B: TerminologyBackend>(
     None
 }
 
+/// The supplements a display check draws on: the requested ones, plus —
+/// when the request names a `displayLanguage` — every stored supplement of
+/// `system` that has a designation of `code` in that language (a
+/// translation supplement such as the zh-Hant ICD-10-CM one; `zh-TW` is
+/// served by `zh-Hant`). A display in the requested language that the
+/// server itself hands out (`$lookup` and `$expand` apply stored
+/// supplements automatically) must then also validate, as the HL7 validator
+/// accepts any designation in the requested language. Without a
+/// `displayLanguage` only requested supplements count, as on tx.fhir.org.
+async fn with_language_supplements<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+    code: &str,
+    display_language: Option<&str>,
+    supplements: &[SupplementInfo],
+) -> Vec<SupplementInfo> {
+    let mut out = supplements.to_vec();
+    let requested: Vec<&str> = display_language
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return out;
+    }
+    for info in backend
+        .supplements_for_system(ctx, system)
+        .await
+        .unwrap_or_default()
+    {
+        let bare = info
+            .supplement_canonical
+            .split('|')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if out
+            .iter()
+            .any(|s| s.supplement_canonical.split('|').next() == Some(bare.as_str()))
+        {
+            continue;
+        }
+        let in_language = backend
+            .supplement_designations(ctx, std::slice::from_ref(&bare), &[code.to_string()])
+            .await
+            .ok()
+            .and_then(|mut m| m.remove(code))
+            .unwrap_or_default()
+            .iter()
+            .any(|d| {
+                d.language.as_deref().is_some_and(|stored| {
+                    requested
+                        .iter()
+                        .any(|req| crate::language::lang_matches(req, stored))
+                })
+            });
+        if in_language {
+            out.push(info);
+        }
+    }
+    out
+}
+
 /// Apply IG-style language-aware display validation to a `validate-code`
 /// response.
 ///
@@ -1457,6 +1522,8 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // `CodeSystem.language` and `concept.designation[].language`) and an
     // `expected_display` was supplied (otherwise there is nothing to validate).
     if let (Some(sys), Some(cs), Some(cd)) = (effective_system, cs_resource.as_ref(), code) {
+        let supplements =
+            with_language_supplements(backend, ctx, sys, cd, display_language, supplements).await;
         apply_language_display_validation(
             backend,
             ctx,
@@ -1465,7 +1532,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             cs,
             display_language,
             expected_display,
-            supplements,
+            &supplements,
             lenient_display_validation,
             &mut resp,
         )

@@ -441,6 +441,16 @@ impl TerminologyProvider for CompositeTerminologyProvider {
     /// Value sets and code systems the embedded packs know are answered
     /// locally; everything else goes to the remote provider as one batch.
     async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        self.check_in_language(checks, None).await
+    }
+
+    /// [`check`](Self::check); the remote provider judges displays in
+    /// `language`.
+    async fn check_in_language(
+        &self,
+        checks: &[TxCheck<'_>],
+        language: Option<&str>,
+    ) -> Vec<Result<TxVerdict, TerminologyError>> {
         let mut out: Vec<Option<Result<TxVerdict, TerminologyError>>> = checks
             .iter()
             .map(|c| match c {
@@ -458,7 +468,7 @@ impl TerminologyProvider for CompositeTerminologyProvider {
             .collect();
         if !remote.is_empty() {
             let requests: Vec<TxCheck<'_>> = remote.iter().map(|(_, c)| *c).collect();
-            let verdicts = self.remote.check(&requests).await;
+            let verdicts = self.remote.check_in_language(&requests, language).await;
             for ((index, _), verdict) in remote.iter().zip(verdicts) {
                 out[*index] = Some(verdict);
             }
