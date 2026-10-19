@@ -3476,6 +3476,7 @@ dependencies = [
  "helios-fhirpath",
  "indexmap 2.14.0",
  "regex",
+ "roxmltree",
  "serde",
  "serde_json",
  "tokio",

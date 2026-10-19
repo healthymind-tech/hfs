@@ -101,12 +101,16 @@ fn value_to_xml(value: &Value) -> Result<String, String> {
 /// the typed FHIR Resource enum.
 #[cfg(feature = "xml")]
 pub fn xml_to_value(xml: &str) -> Result<Value, String> {
-    // Default to R4 for incoming XML (the specific version can be overridden)
+    // Default to R4 for incoming XML (the specific version can be overridden).
+    // Lossless, schema-driven conversion: the typed model would silently drop
+    // unknown elements and attributes and reject values it cannot hold, so
+    // neither validation nor storage would see what the client sent (the
+    // JSON path keeps everything too).
     #[cfg(feature = "R4")]
     {
-        let resource: helios_fhir::r4::Resource = helios_serde::xml::from_xml_str(xml)
-            .map_err(|e| format!("Failed to parse XML: {}", e))?;
-        serde_json::to_value(&resource).map_err(|e| format!("Failed to convert to JSON: {}", e))
+        let registry = helios_fhir_validator::packs::core_registry(helios_fhir::FhirVersion::R4);
+        helios_fhir_validator::xml::xml_to_json(xml, registry.as_ref())
+            .map_err(|e| format!("Failed to parse XML: {e}"))
     }
     #[cfg(not(feature = "R4"))]
     {

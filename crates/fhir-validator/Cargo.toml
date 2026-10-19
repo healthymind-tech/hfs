@@ -18,6 +18,8 @@ R5 = ["helios-fhir/R5", "helios-fhirpath?/R5"]
 R6 = ["helios-fhir/R6", "helios-fhirpath?/R6"]
 # FHIRPath-backed ConstraintEvaluator (pulls in helios-fhirpath).
 fhirpath = ["dep:helios-fhirpath"]
+# Lossless, schema-driven FHIR XML → JSON conversion (`xml` module).
+xml = ["dep:roxmltree"]
 # Enables the generate-schema-packs binary (dev-time; reads the FHIR spec
 # bundles from crates/fhir-gen/resources and writes packs/).
 gen-packs = []
@@ -41,6 +43,7 @@ regex = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 helios-fhirpath = { path = "../fhirpath", version = "0.2.4", optional = true, default-features = false }
+roxmltree = { version = "0.20", optional = true }
 
 [dev-dependencies]
 serde = { workspace = true }

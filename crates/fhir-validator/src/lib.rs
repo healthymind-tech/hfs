@@ -72,6 +72,8 @@ pub mod packs;
 pub mod resolver;
 pub mod schema;
 pub mod terminology;
+#[cfg(feature = "xml")]
+pub mod xml;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
