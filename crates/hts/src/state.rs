@@ -257,6 +257,11 @@ pub struct AppState<B: TerminologyBackend> {
 
     /// This state is a `tx-resource` overlay (never overlaid again).
     pub is_tx_overlay: bool,
+
+    /// Supplements never applied automatically: in an overlay, the ones the
+    /// request supplied (a client sending a supplement asks for it with
+    /// `useSupplement`; automatic use is for the operator's own).
+    pub auto_supplements_skip: Arc<HashSet<String>>,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -284,6 +289,7 @@ impl<B: TerminologyBackend> AppState<B> {
             #[cfg(feature = "sqlite")]
             tx_overlays: Arc::new(crate::tx_overlay::TxOverlayCache::default()),
             is_tx_overlay: false,
+            auto_supplements_skip: Arc::new(HashSet::new()),
         }
     }
 

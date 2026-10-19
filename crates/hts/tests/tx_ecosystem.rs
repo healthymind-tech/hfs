@@ -1004,3 +1004,41 @@ async fn operations_on_request_supplied_resources() {
         .await;
     assert!(st.is_client_error(), "{st}");
 }
+
+/// parameters/parameters-*-supplement-none: a supplement that came with the
+/// request is applied when asked for (`useSupplement`), never automatically;
+/// the operator's stored supplements still are (HTS_AUTO_SUPPLEMENTS).
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn request_supplements_are_not_applied_automatically() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&simple_bundle()).await;
+    let supplement = json!({"resourceType": "CodeSystem", "url": "http://hts.test/supp", "version": "1",
+        "status": "active", "content": "supplement", "supplements": "http://hts.test/simple",
+        "concept": [{"code": "code1", "designation": [{"language": "nl", "value": "een"}]}]});
+    let lookup = |extra: Vec<Value>| {
+        let mut p = vec![
+            json!({"name": "system", "valueUri": "http://hts.test/simple"}),
+            json!({"name": "code", "valueCode": "code1"}),
+            json!({"name": "tx-resource", "resource": supplement.clone()}),
+        ];
+        p.extend(extra);
+        json!({"resourceType": "Parameters", "parameter": p}).to_string()
+    };
+    let used = |body: &Value| param(body, "used-supplement").is_some();
+
+    let (st, body) = app.post_fhir("/CodeSystem/$lookup", lookup(vec![])).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(!used(&body), "{body}");
+
+    let (st, body) = app
+        .post_fhir(
+            "/CodeSystem/$lookup",
+            lookup(vec![
+                json!({"name": "useSupplement", "valueCanonical": "http://hts.test/supp"}),
+            ]),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(used(&body), "{body}");
+}

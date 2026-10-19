@@ -471,5 +471,12 @@ async fn build_overlay<B: TerminologyBackend>(
         .with_max_expansion_size(state.max_expansion_size)
         .with_auto_supplements(state.auto_supplements);
     overlay.is_tx_overlay = true;
+    overlay.auto_supplements_skip = Arc::new(
+        supplied
+            .iter()
+            .filter(|r| str_of(r, "content") == Some("supplement"))
+            .filter_map(|r| str_of(r, "url").map(str::to_string))
+            .collect(),
+    );
     Ok(Some(Arc::new(overlay)))
 }

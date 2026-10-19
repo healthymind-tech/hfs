@@ -275,6 +275,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             if supplement_inputs
                 .iter()
                 .any(|s| s.split('|').next() == Some(bare.as_str()))
+                || state.auto_supplements_skip.contains(&bare)
             {
                 continue;
             }
