@@ -1216,3 +1216,42 @@ async fn unknown_code_in_a_not_present_code_system_is_a_warning() {
     );
     assert_eq!(issues(&body)[0]["severity"], "warning");
 }
+
+/// A bare `json` is not a media type: as tx.fhir.org, an unknown code of
+/// urn:ietf:bcp:13 (not an unknown code system), against the core mimetypes
+/// value set and the code system alike.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_subtype_is_not_a_media_type() {
+    let app = TestApp::new().await;
+    let (_, body) = app
+        .get_fhir("/ValueSet/$validate-code?url=http://hl7.org/fhir/ValueSet/mimetypes&system=urn:ietf:bcp:13&code=json")
+        .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["invalid-code", "not-in-vs"]);
+    assert!(
+        param(&body, "x-caused-by-unknown-system").is_none(),
+        "{body}"
+    );
+    let (_, body) = app
+        .get_fhir("/CodeSystem/$validate-code?url=urn:ietf:bcp:13&code=json")
+        .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        false,
+        "{body}"
+    );
+    assert_eq!(tx_codes(&body), ["invalid-code"]);
+    let (_, body) = app
+        .get_fhir("/CodeSystem/$validate-code?url=urn:ietf:bcp:13&code=application/json")
+        .await;
+    assert_eq!(
+        param(&body, "result").unwrap()["valueBoolean"],
+        true,
+        "{body}"
+    );
+}

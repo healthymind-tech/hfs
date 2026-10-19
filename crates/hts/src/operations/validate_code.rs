@@ -477,13 +477,18 @@ async fn media_type_vs_validate<B: TerminologyBackend>(
     params: &[Value],
 ) -> Option<Value> {
     use crate::mimetypes;
-    if find_str_param(params, "url")
-        .as_deref()
-        .is_some_and(crate::bcp13::is_mimetypes_valueset_url)
-    {
-        return None;
-    }
-    let vs = requested_value_set(state, params).await?;
+    let vs = match requested_value_set(state, params).await {
+        Some(vs) => vs,
+        // The core mimetypes value set, even when it is not stored.
+        None if find_str_param(params, "url")
+            .as_deref()
+            .is_some_and(crate::bcp13::is_mimetypes_valueset_url) =>
+        {
+            json!({"url": crate::bcp13::MIMETYPES_VS_URL,
+                   "compose": {"include": [{"system": mimetypes::SYSTEM}]}})
+        }
+        None => return None,
+    };
     if !mimetypes::is_media_type_value_set(&vs) {
         return None;
     }
@@ -505,11 +510,30 @@ async fn media_type_vs_validate<B: TerminologyBackend>(
         Some(v) => format!("{url}|{v}"),
         None => url.to_string(),
     };
-    let in_vs = mimetypes::parse(&code).is_some_and(|mt| mimetypes::in_value_set(&vs, &mt));
+    let parsed = mimetypes::parse(&code);
+    let in_vs = parsed
+        .as_ref()
+        .is_some_and(|mt| mimetypes::in_value_set(&vs, mt));
+    let mut issues = Vec::new();
+    if parsed.is_none() {
+        // As tx.fhir.org: not a media type at all (`json`) is an unknown code.
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "invalid-code".into(),
+            text: format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("Unknown_Code_in".into()),
+        });
+    }
     let issues = if in_vs {
-        vec![]
+        issues
     } else {
-        vec![ValidationIssue {
+        issues.push(ValidationIssue {
             severity: "error".into(),
             fhir_code: "code-invalid".into(),
             tx_code: "not-in-vs".into(),
@@ -520,13 +544,72 @@ async fn media_type_vs_validate<B: TerminologyBackend>(
             expression: Some("Coding.code".into()),
             location: None,
             message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
-        }]
+        });
+        issues
     };
     Some(build_validate_response(
         ValidateCodeResponse {
             result: in_vs,
             message: None,
-            display: Some(code.clone()),
+            display: parsed.is_some().then(|| code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(mimetypes::SYSTEM),
+        None,
+        None,
+        None,
+        path,
+    ))
+}
+
+/// `CodeSystem/$validate-code` of a media type (`urn:ietf:bcp:13`, a
+/// grammar): any well-formed `type/subtype[; parameters]` is a code.
+fn media_type_cs_validate(params: &[Value]) -> Option<Value> {
+    use crate::mimetypes;
+    let (code, path) = match find_str_param(params, "code") {
+        Some(code) => {
+            let system = find_str_param(params, "url").or_else(|| find_str_param(params, "system"));
+            if system.as_deref() != Some(mimetypes::SYSTEM) {
+                return None;
+            }
+            (code, RequestPath::BareCode)
+        }
+        None => match extract_coding_full(params, "coding") {
+            Some((system, code, _, _)) if system == mimetypes::SYSTEM => {
+                (code, RequestPath::Coding)
+            }
+            _ => return None,
+        },
+    };
+    let valid = mimetypes::parse(&code).is_some();
+    let issues = if valid {
+        vec![]
+    } else {
+        vec![ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "invalid-code".into(),
+            text: format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("Unknown_Code_in".into()),
+        }]
+    };
+    Some(build_validate_response(
+        ValidateCodeResponse {
+            result: valid,
+            message: None,
+            display: valid.then(|| code.clone()),
             system: None,
             cs_version: None,
             inactive: None,
@@ -2582,6 +2665,9 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    if let Some(value) = media_type_cs_validate(&params) {
+        return Ok(value);
+    }
     let ctx = TenantContext::system();
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
     // pin the response display + invalid-display issue text against the
