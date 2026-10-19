@@ -213,13 +213,18 @@ fn build_validate_response_inner(
     if matches!(request_path, RequestPath::BareCode) {
         for issue in &mut issues {
             // Rewrite FHIRPath expression paths for bare-code requests:
-            // `Coding.code` → `code`, `Coding.system` → `system`, `Coding` → drop.
-            for field in [&mut issue.expression, &mut issue.location] {
+            // `Coding.code` → `code`, `Coding.system` → `system`. An issue
+            // about the whole Coding is about the `code` parameter (IG
+            // `tho/validate-isa-other-branch`: INACTIVE_CONCEPT_FOUND at
+            // `code`); its location is dropped.
+            for (field, is_expression) in
+                [(&mut issue.expression, true), (&mut issue.location, false)]
+            {
                 if let Some(path) = field.as_deref() {
                     if let Some(stripped) = path.strip_prefix("Coding.") {
                         *field = Some(stripped.to_string());
                     } else if path == "Coding" {
-                        *field = None;
+                        *field = is_expression.then(|| "code".to_string());
                     }
                 }
             }
