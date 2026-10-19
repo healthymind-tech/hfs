@@ -473,6 +473,8 @@ fn execute_constraints(
     for ((path, id, _, human, severity, _), outcome) in selected.iter().zip(outcomes) {
         match outcome {
             ConstraintOutcome::Passed => {}
+            ConstraintOutcome::Failed
+                if *id == "dom-3" && contained_all_referenced(resource, path) => {}
             ConstraintOutcome::Failed => {
                 errors.push(
                     ValidationError::new(
@@ -781,6 +783,54 @@ async fn execute_terminology(
             }
         }
     }
+}
+
+/// dom-3 as the HL7 validator judges it: a contained resource is
+/// referenced when `#id` appears anywhere in its container — in an element
+/// (reference, canonical, uri) or in a narrative (`<img src="#id">`,
+/// `<a href="#id">`), which the FHIRPath expression cannot see. Used to
+/// overrule a FHIRPath dom-3 failure when every contained id is so
+/// referenced.
+fn contained_all_referenced(resource: &Value, path: &str) -> bool {
+    let mut node = resource;
+    for segment in path.split('.').skip(1) {
+        node = match node {
+            Value::Array(items) => match segment.parse::<usize>().ok().and_then(|i| items.get(i)) {
+                Some(v) => v,
+                None => return false,
+            },
+            Value::Object(map) => match map.get(segment) {
+                Some(v) => v,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    let Some(contained) = node.get("contained").and_then(Value::as_array) else {
+        return false;
+    };
+    // `#id` as a whole value, or as a narrative attribute value.
+    fn mentions(value: &Value, target: &str) -> bool {
+        match value {
+            Value::String(s) => {
+                s == target
+                    || s.contains(&format!("=\"{target}\""))
+                    || s.contains(&format!("='{target}'"))
+            }
+            Value::Array(items) => items.iter().any(|v| mentions(v, target)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(k, v)| k != "contained" && mentions(v, target)),
+            _ => false,
+        }
+    }
+    contained.iter().all(|c| {
+        c.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| mentions(node, &format!("#{id}")))
+            // or the contained resource refers back to its container (`#`)
+            || mentions(c, "#")
+    })
 }
 
 /// Whether a code the terminology service does not find in its code system

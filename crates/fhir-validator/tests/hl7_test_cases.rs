@@ -865,3 +865,28 @@ async fn extension_context_on_an_extension_value() {
         "{issues:#?}"
     );
 }
+
+/// `binary-ref-internal`: a contained resource referenced only from the
+/// narrative (`<img src="#imageResource">`) satisfies dom-3.
+#[tokio::test]
+async fn contained_resources_referenced_from_narrative() {
+    let composition = |src: &str| {
+        json!({"resourceType": "Composition", "status": "final", "type": {"text": "x"},
+               "date": "2021-02-01", "author": [{"display": "y"}], "title": "z",
+               "contained": [{"resourceType": "Binary", "id": "imageResource",
+                              "contentType": "image/png", "data": "iVBORw0KGgo="}],
+               "section": [{"text": {"status": "additional",
+                   "div": format!("<div xmlns=\"http://www.w3.org/1999/xhtml\"><img src=\"{src}\" alt=\"an image\"/></div>")}}]})
+    };
+    let issues = validate_with(&composition("#imageResource"), &[], &[]).await;
+    assert!(
+        constraint_failures(&issues, "dom-3").is_empty(),
+        "{issues:#?}"
+    );
+    let issues = validate_with(&composition("#other"), &[], &[]).await;
+    assert_eq!(
+        constraint_failures(&issues, "dom-3").len(),
+        1,
+        "{issues:#?}"
+    );
+}
