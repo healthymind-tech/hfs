@@ -371,6 +371,16 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             && !rest.is_empty()
         {
             schema.max_value = Some(value.clone());
+        } else if key == "maxLength" {
+            schema.max_length = value.as_u64().filter(|n| *n > 0);
+        } else if key == "extension" {
+            for ext in value.as_array().into_iter().flatten() {
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/minLength")
+                {
+                    schema.min_length = ext.get("valueInteger").and_then(serde_json::Value::as_u64);
+                }
+            }
         }
     }
 }

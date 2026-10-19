@@ -1186,3 +1186,36 @@ async fn abstract_contexts_and_context_invariants() {
         1
     );
 }
+
+/// `patient-min-length`: ElementDefinition.maxLength and the minLength
+/// extension bound string lengths.
+#[tokio::test]
+async fn string_length_bounds() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/lengths",
+        "name": "Lengths", "status": "active", "kind": "resource", "abstract": false,
+        "type": "Patient", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [
+            {"id": "Patient.id", "path": "Patient.id", "extension": [{
+                "url": "http://hl7.org/fhir/StructureDefinition/minLength", "valueInteger": 3}]},
+            {"id": "Patient.name.family", "path": "Patient.name.family", "maxLength": 5}
+        ]}
+    });
+    let url = "http://example.org/StructureDefinition/lengths";
+    let count = |issues: Vec<ValidationError>| errors(&issues).len();
+    let p = |id: &str, family: &str| json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]});
+    assert_eq!(
+        count(validate_with(&p("abc", "Smith"), &[sd.clone()], &[url]).await),
+        0
+    );
+    assert_eq!(
+        count(validate_with(&p("ab", "Smith"), &[sd.clone()], &[url]).await),
+        1
+    );
+    assert_eq!(
+        count(validate_with(&p("abc", "Smithers"), &[sd], &[url]).await),
+        1
+    );
+}

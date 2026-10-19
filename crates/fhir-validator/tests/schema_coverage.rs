@@ -103,6 +103,8 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             pattern: Some(Value::Null),
             min_value: Some(Value::Null),
             max_value: Some(Value::Null),
+            max_length: Some(0),
+            min_length: Some(0),
             binding: Some(Binding {
                 value_set: String::new(),
                 strength: None,
@@ -175,7 +177,14 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // core ones.
         //
         // `typeProfiles`: core datatype elements carry no type profiles.
-        Ctx::Schema => &["scalar", "minValue", "maxValue", "typeProfiles"],
+        Ctx::Schema => &[
+            "scalar",
+            "minValue",
+            "maxValue",
+            "typeProfiles",
+            "maxLength",
+            "minLength",
+        ],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.
         // (`order` used to live here — the converter now emits it under

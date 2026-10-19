@@ -124,6 +124,14 @@ pub struct FhirSchema {
     /// `maxValue[x]`: the value the data must not exceed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_value: Option<Value>,
+    /// `ElementDefinition.maxLength`: most characters a string value may
+    /// have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// The `minLength` extension on the element definition: fewest
+    /// characters a string value may have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,

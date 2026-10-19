@@ -945,6 +945,25 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 errors::msg_pattern_value(pattern, data),
             );
         }
+        if let Some(text) = data.as_str() {
+            let length = text.chars().count() as u64;
+            if let Some(max) = schema.max_length
+                && length > max
+            {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    format!("value is longer than permitted maximum length of {max}"),
+                );
+            }
+            if let Some(min) = schema.min_length
+                && length < min
+            {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    format!("Value '{text}' is shorter than permitted minimum length of {min}"),
+                );
+            }
+        }
         for (bound, below) in [(&schema.min_value, true), (&schema.max_value, false)] {
             let Some(bound) = bound else { continue };
             let ordering = super::bounds::compare(data, bound);
@@ -2166,6 +2185,8 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         pattern,
         min_value,
         max_value,
+        max_length,
+        min_length,
         binding,
         constraints,
         refers,
