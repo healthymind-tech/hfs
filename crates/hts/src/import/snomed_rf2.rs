@@ -2044,6 +2044,44 @@ BADLINE\r\n";
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
     }
 
+    /// An inactive concept (SNOMED 58108001 in the HL7 validator test case
+    /// patient-animal) is imported and validates as a known code, not as an
+    /// unknown one.
+    #[tokio::test]
+    async fn import_snomed_rf2_inactive_concepts_validate_as_inactive() {
+        use crate::traits::CodeSystemOperations;
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_rf2_zip();
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("live import should succeed");
+        let resp = backend
+            .validate_code(
+                &ctx,
+                crate::types::ValidateCodeRequest {
+                    system: Some("http://snomed.info/sct".into()),
+                    code: "999999001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(resp.result, "{resp:?}");
+        assert_eq!(resp.display.as_deref(), Some("Inactive concept"));
+        assert!(
+            !resp.issues.iter().any(|i| i.tx_code == "invalid-code"),
+            "{resp:?}"
+        );
+    }
+
     #[tokio::test]
     async fn import_snomed_rf2_ignores_full_files_when_snapshot_present() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
@@ -2488,9 +2526,16 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
                  d2\t20240101\t1\t900000000000012004\t723561005\t123456001\t789012001\t1\t0..*\t0..1\t723597001\t723594008\r\n",
             ),
         ]);
-        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false, &LanguageFilter::default())
-            .await
-            .expect("import should succeed");
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("import should succeed");
         assert_eq!(count_rows(&backend, "snomed_concepts"), 3);
         assert_eq!(count_rows(&backend, "snomed_relationships"), 2);
         // The precoordinated-only rule (723594008) is left out.
@@ -2505,7 +2550,12 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
         let row = &rows["123456001"].row;
         assert_eq!(
             row.terms,
-            ["Foo disorder", "Foo disorder (disorder)", "Foo malady", "Foo Erkrankung"]
+            [
+                "Foo disorder",
+                "Foo disorder (disorder)",
+                "Foo malady",
+                "Foo Erkrankung"
+            ]
         );
         assert_eq!(row.effective_time.as_deref(), Some("20240101"));
         assert!(row.active && row.primitive);
@@ -2513,7 +2563,10 @@ m2\t20240101\t0\t900000000000207008\t723264001\t789012001\r\n";
             .unwrap()
             .expect("a model");
         let bar = model.idx("789012001").unwrap();
-        assert_eq!(model.parents[bar as usize], [model.idx("123456001").unwrap()]);
+        assert_eq!(
+            model.parents[bar as usize],
+            [model.idx("123456001").unwrap()]
+        );
         assert_eq!(model.rels[bar as usize].len(), 1);
         assert_eq!(model.rels[bar as usize][0].group, 1);
         assert_eq!(model.domains.len(), 1);
