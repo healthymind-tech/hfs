@@ -1696,6 +1696,72 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
     }
 }
 
+/// A SNOMED CT display that is one of the concept's inactive descriptions:
+/// tx.fhir.org reports it as `INACTIVE_DISPLAY_FOUND` (a warning when
+/// display validation is lenient, otherwise an error) instead of a wrong
+/// display, naming the active terms.
+async fn snomed_inactive_display<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    code: &str,
+    request_path: RequestPath,
+    expected_display: Option<&str>,
+    lenient: bool,
+    resp: &mut ValidateCodeResponse,
+) {
+    let Some(expected) = expected_display.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    if !resp.issues.iter().any(|i| i.tx_code == "invalid-display") {
+        return;
+    }
+    let Ok(rows) = backend
+        .snomed_concepts(ctx, crate::snomed::SNOMED_URL, None, &[code.to_string()])
+        .await
+    else {
+        return;
+    };
+    let Some(info) = rows.get(code) else { return };
+    let matches = |t: &String| t.eq_ignore_ascii_case(expected);
+    if info.row.terms.iter().any(matches) || !info.row.inactive_terms.iter().any(matches) {
+        return;
+    }
+    let mut correct: Vec<&str> = Vec::new();
+    for t in info.display.iter().chain(info.row.terms.iter()) {
+        if !correct.contains(&t.as_str()) {
+            correct.push(t);
+        }
+    }
+    let text = format!(
+        "'{expected}' is no longer considered a correct display for code '{code}' (status = inactive). The correct display is one of {}",
+        correct.join(",")
+    );
+    resp.issues.retain(|i| i.tx_code != "invalid-display");
+    if let Some(d) = &info.display {
+        resp.display = Some(d.clone());
+    }
+    let path = match request_path {
+        RequestPath::BareCode => "display".to_string(),
+        RequestPath::CodeableConcept => "CodeableConcept.coding[0].display".to_string(),
+        _ => "Coding.display".to_string(),
+    };
+    resp.issues.push(ValidationIssue {
+        severity: if lenient { "warning" } else { "error" }.into(),
+        fhir_code: "invalid".into(),
+        tx_code: "display-comment".into(),
+        text,
+        expression: Some(path.clone()),
+        location: Some(path),
+        // The message id puts the warning in `message`, which tx.fhir.org
+        // leaves out for a lenient SNOMED CT check.
+        message_id: (!lenient).then(|| "INACTIVE_DISPLAY_FOUND".to_string()),
+    });
+    if lenient {
+        resp.message = None;
+    }
+    resp.result = resp.result || lenient;
+}
+
 /// Format the "Valid display is ..." segment of an IG `invalid-display`
 /// message.
 ///
@@ -2116,6 +2182,18 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             &mut resp,
         )
         .await;
+        if crate::snomed::is_snomed(sys) {
+            snomed_inactive_display(
+                backend,
+                ctx,
+                cd,
+                request_path,
+                expected_display,
+                lenient_display_validation,
+                &mut resp,
+            )
+            .await;
+        }
     }
 
     // Mirror the same status-check emission for the validated ValueSet on
