@@ -1846,6 +1846,49 @@ pub(crate) async fn process_expand<B: TerminologyBackend>(
     // Canonical `url|version` is folded into `url` + `valueSetVersion` first so
     // the cache key, the negative cache and every resolver below see one shape.
     let mut params = params;
+    adopt_limit_param(&mut params);
+    let limit = params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("__max_expansion_size__"))
+        .and_then(|p| p.get("valueInteger").and_then(Value::as_u64))
+        .unwrap_or(u64::from(state.max_expansion_size));
+    let label = find_str_param(&params, "url")
+        .or_else(|| {
+            find_resource_param(&params, "valueSet")
+                .and_then(|vs| vs.get("url").and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| "??".to_string());
+    process_expand_cached(state, params)
+        .await
+        .map_err(|e| match e {
+            HtsError::TooCostly(_) => HtsError::TooCostly(format!(
+                "The value set '{label}' expansion has too many codes to produce (>{limit})"
+            )),
+            other => other,
+        })
+}
+
+/// tx.fhir.org's `limit` parameter: the most codes the client will take in
+/// an expansion (`too-costly` beyond it), the same as the
+/// `X-TOO-COSTLY-THRESHOLD` header.
+fn adopt_limit_param(params: &mut Vec<Value>) {
+    let has_threshold = params
+        .iter()
+        .any(|p| p.get("name").and_then(Value::as_str) == Some("__max_expansion_size__"));
+    let limit = params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("limit"))
+        .and_then(|p| p.get("valueInteger").and_then(Value::as_u64));
+    if let (false, Some(n)) = (has_threshold, limit) {
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": n}));
+    }
+    params.retain(|p| p.get("name").and_then(Value::as_str) != Some("limit"));
+}
+
+async fn process_expand_cached<B: TerminologyBackend>(
+    state: &AppState<B>,
+    mut params: Vec<Value>,
+) -> Result<Bytes, HtsError> {
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
     // SNOMED CT edition URIs in `*-system-version` pins and an inline
     // ValueSet's includes → the stored release they name.
