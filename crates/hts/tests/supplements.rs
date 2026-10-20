@@ -237,3 +237,29 @@ async fn validate_code_accepts_supplement_display_in_the_requested_language() {
         assert_eq!(result(&body), Some(expected), "VS {lang}: {body}");
     }
 }
+
+/// A concept without any display (IPS's ATC fragment) gives nothing to
+/// judge a supplied display against, also when the request names a
+/// language (a resource in fr-LU): no "Valid display is unknown" error.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concept_without_displays_accepts_any_display_in_any_language() {
+    let app = TestApp::new().await;
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "atc-frag", "url": "http://hts.test/atc",
+            "status": "active", "content": "fragment", "concept": [{"code": "J07CA02"}]}}
+    ]});
+    app.import_bundle_ok(&bundle.to_string()).await;
+    for lang in ["", "&displayLanguage=fr-LU"] {
+        let (status, body) = app
+            .get_fhir(&format!(
+                "/CodeSystem/$validate-code?url=http://hts.test/atc&code=J07CA02&display=diphtheria-pertussis{lang}"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.to_string().contains("invalid-display"),
+            "{lang}: {body}"
+        );
+    }
+}

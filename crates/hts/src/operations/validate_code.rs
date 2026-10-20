@@ -1394,6 +1394,19 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     if display_language.is_none() && !has_existing_invalid_display {
         return;
     }
+    // A concept with no display at all (an ATC code of IPS's fragment code
+    // system) gives nothing to judge a supplied display against, whatever
+    // language was asked for.
+    if displays_for_lang.is_empty() {
+        if has_existing_invalid_display {
+            resp.issues.retain(|i| i.tx_code != "invalid-display");
+            if !resp.issues.iter().any(|i| i.severity == "error") {
+                resp.result = true;
+                resp.message = None;
+            }
+        }
+        return;
+    }
 
     // Decide whether the supplied display is valid. The accepted set mirrors
     // exactly the choices advertised by `format_valid_displays`:
@@ -5109,12 +5122,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
         Err(e) => Err(e),
         Ok(InputCheck::Done(value)) => Ok(value),
         Ok(InputCheck::Proceed) => process_vs_validate_code_inner(state, params.clone()).await,
-        Ok(InputCheck::ProceedThenAdd(issues)) => process_vs_validate_code_inner(state, params.clone())
-            .await
-            .map(|mut value| {
-                merge_issues(&mut value, issues);
-                value
-            }),
+        Ok(InputCheck::ProceedThenAdd(issues)) => {
+            process_vs_validate_code_inner(state, params.clone())
+                .await
+                .map(|mut value| {
+                    merge_issues(&mut value, issues);
+                    value
+                })
+        }
     };
     if let Ok(value) = &result
         && response_result(value) == Some(false)
