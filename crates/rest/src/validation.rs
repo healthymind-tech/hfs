@@ -1632,8 +1632,12 @@ impl RemoteTerminologyProvider {
         match check {
             TxCheck::InValueSet(..) => Ok(TxVerdict::member(result || display_only)),
             TxCheck::Coding(_) => {
+                // An information-level display note ("no valid display
+                // names for language 'L'; it is valid for the default
+                // language") is no wrong display.
                 let wrong_display = issues
                     .iter()
+                    .filter(|i| i.get("severity").and_then(Value::as_str) != Some("information"))
                     .find(|i| Self::is_display_issue(i))
                     .and_then(|i| i.pointer("/details/text").and_then(Value::as_str))
                     .map(str::to_string);
@@ -2269,6 +2273,23 @@ mod remote_provider_tests {
         )
         .unwrap();
         assert!(verdict.unknown_system);
+
+        // An information-level display note is no wrong display.
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &check,
+            &answer(
+                true,
+                vec![issue(
+                    "information",
+                    "invalid-display",
+                    "There are no valid display names found for the code x for language(s) 'en-US'. The display is 'MCV' which is a valid display for the default language",
+                    Some("NO_VALID_DISPLAY_FOUND_NONE_FOR_LANG_OK"),
+                )],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert!(verdict.wrong_display.is_none());
 
         let payload = RemoteTerminologyProvider::coding_payload(&coding, None);
         assert_eq!(
