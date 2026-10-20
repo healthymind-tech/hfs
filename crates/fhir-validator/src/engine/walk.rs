@@ -2148,8 +2148,32 @@ fn check_extension_context(ctx: &mut WalkCtx<'_>, set: &SchemaSet, items: &[Valu
 fn path_matches(context: &str, instance: &str) -> bool {
     let c: Vec<&str> = context.split('.').collect();
     let i: Vec<&str> = instance.split('.').collect();
+    segments_match(&c, &i) || segments_match(&c, &definitional_path(&i))
+}
+
+/// The element-definition path of an instance path through recursive
+/// elements (contentReference): `QuestionnaireResponse.item.item.answer`
+/// and `….item.answer.item.answer` are defined as
+/// `QuestionnaireResponse.item.answer`, which is what an extension context
+/// names. A segment met again cuts the path back to its first occurrence;
+/// `extension` segments are never collapsed (a nested extension is not
+/// its parent).
+fn definitional_path<'a>(segments: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    for seg in segments {
+        match out.iter().position(|s| s == seg) {
+            Some(pos) if !matches!(*seg, "extension" | "modifierExtension") && pos > 0 => {
+                out.truncate(pos + 1);
+            }
+            _ => out.push(seg),
+        }
+    }
+    out
+}
+
+fn segments_match(c: &[&str], i: &[&str]) -> bool {
     c.len() == i.len()
-        && c.iter().zip(&i).all(|(c, i)| match c.strip_suffix("[x]") {
+        && c.iter().zip(i).all(|(c, i)| match c.strip_suffix("[x]") {
             Some(stem) => i.strip_prefix(stem).is_some_and(|rest| {
                 rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_uppercase())
             }),
@@ -2576,6 +2600,30 @@ pub(crate) fn is_partial_match(data: &Value, pattern: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Da Vinci DTR's information-origin extension (context
+    /// QuestionnaireResponse.item.answer) on answers of nested items: the
+    /// nested elements are defined by contentReference as the outer ones.
+    #[test]
+    fn extension_contexts_match_through_recursive_elements() {
+        let ctx = "QuestionnaireResponse.item.answer";
+        assert!(path_matches(ctx, "QuestionnaireResponse.item.answer"));
+        assert!(path_matches(ctx, "QuestionnaireResponse.item.item.answer"));
+        assert!(path_matches(
+            ctx,
+            "QuestionnaireResponse.item.item.item.answer"
+        ));
+        assert!(path_matches(
+            ctx,
+            "QuestionnaireResponse.item.answer.item.answer"
+        ));
+        assert!(!path_matches(ctx, "QuestionnaireResponse.item"));
+        // A nested extension is not its parent extension.
+        assert!(!path_matches(
+            "Patient.extension",
+            "Patient.extension.extension"
+        ));
+    }
     use serde_json::json;
 
     /// #615: a known extension outside its declared element context draws a
