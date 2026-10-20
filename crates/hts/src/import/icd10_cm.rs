@@ -230,7 +230,7 @@ fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), Hts
             });
 
             for diag in section.children().filter(|n| n.has_tag_name("diag")) {
-                walk_diag(&diag, &sec_id, &mut concepts, &mut errors);
+                walk_diag(&diag, &sec_id, None, &mut concepts, &mut errors);
             }
         }
     }
@@ -238,12 +238,36 @@ fn parse_tabular_xml(xml: &[u8]) -> Result<(Vec<Icd10Concept>, Vec<String>), Hts
     Ok((concepts, errors))
 }
 
+/// The `<sevenChrDef>` of a `<diag>`: 7th characters and their meanings.
+fn seven_chr_def(node: &roxmltree::Node) -> Option<Vec<(String, String)>> {
+    let def = node.children().find(|n| n.has_tag_name("sevenChrDef"))?;
+    let out: Vec<(String, String)> = def
+        .children()
+        .filter(|n| n.has_tag_name("extension"))
+        .filter_map(|e| {
+            Some((
+                e.attribute("char")?.to_string(),
+                e.text().map(|t| t.trim().to_string()).unwrap_or_default(),
+            ))
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// A diag and its descendants. `seven` is the nearest `<sevenChrDef>` in
+/// scope: every leaf under it is a category, its billable codes being the
+/// leaf padded with `X` to six characters plus one 7th character
+/// (`S06.0X1` + `A` = `S06.0X1A`, "…, initial encounter"; `S02.0` →
+/// `S02.0XXA`), as CMS's order file lists them.
 fn walk_diag(
     node: &roxmltree::Node,
     parent_code: &str,
+    inherited_seven: Option<&[(String, String)]>,
     concepts: &mut Vec<Icd10Concept>,
     errors: &mut Vec<String>,
 ) {
+    let own_seven = seven_chr_def(node);
+    let seven = own_seven.as_deref().or(inherited_seven);
     let code = match child_text(node, "name") {
         Some(c) if !c.is_empty() => c,
         _ => {
@@ -262,17 +286,40 @@ fn walk_diag(
     };
 
     let children: Vec<_> = node.children().filter(|n| n.has_tag_name("diag")).collect();
-    let billable = children.is_empty();
+    let leaf = children.is_empty();
+    let extended = leaf && seven.is_some();
 
     concepts.push(Icd10Concept {
         code: code.clone(),
-        display: desc,
-        billable,
+        display: desc.clone(),
+        billable: leaf && !extended,
         parent: Some(parent_code.to_string()),
     });
 
+    if extended && let Some(seven) = seven {
+        let mut base = code.clone();
+        while base.chars().filter(|c| *c != '.').count() < 6 {
+            if !base.contains('.') {
+                base.push('.');
+            }
+            base.push('X');
+        }
+        for (ch, meaning) in seven {
+            concepts.push(Icd10Concept {
+                code: format!("{base}{ch}"),
+                display: if meaning.is_empty() {
+                    desc.clone()
+                } else {
+                    format!("{desc}, {meaning}")
+                },
+                billable: true,
+                parent: Some(code.clone()),
+            });
+        }
+    }
+
     for child in children {
-        walk_diag(&child, &code, concepts, errors);
+        walk_diag(&child, &code, seven, concepts, errors);
     }
 }
 
@@ -386,6 +433,73 @@ mod tests {
         let a001 = concepts.iter().find(|c| c.code == "A00.1").unwrap();
         assert!(a001.billable);
         assert_eq!(a001.parent.as_deref(), Some("A00"));
+    }
+
+    /// CMS defines the injury and laterality codes by a `<sevenChrDef>` on
+    /// a category: the billable codes (`S06.0X1A`, `S02.0XXA`, `E08.3211`)
+    /// appear nowhere else in the tabular file and must be generated.
+    #[test]
+    fn seventh_character_codes_are_generated() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ICD10CM.tabular><version>2025</version>
+ <chapter><name>19</name><desc>Injury</desc>
+  <section id="S00-S09"><desc>Injuries to the head</desc>
+   <diag><name>S02</name><desc>Fracture of skull and facial bones</desc>
+    <sevenChrDef><extension char="A">initial encounter for closed fracture</extension>
+                 <extension char="D">subsequent encounter</extension></sevenChrDef>
+    <diag><name>S02.0</name><desc>Fracture of vault of skull</desc></diag>
+   </diag>
+   <diag><name>S06</name><desc>Intracranial injury</desc>
+    <sevenChrDef><extension char="A">initial encounter</extension></sevenChrDef>
+    <diag><name>S06.0</name><desc>Concussion</desc>
+     <diag><name>S06.0X1</name><desc>Concussion with loss of consciousness of 30 minutes or less</desc></diag>
+    </diag>
+   </diag>
+  </section>
+ </chapter>
+ <chapter><name>4</name><desc>Endocrine</desc>
+  <section id="E08-E13"><desc>Diabetes mellitus</desc>
+   <diag><name>E08</name><desc>Diabetes due to underlying condition</desc>
+    <diag><name>E08.32</name><desc>with mild retinopathy</desc>
+     <sevenChrDef><extension char="1">right eye</extension></sevenChrDef>
+     <diag><name>E08.321</name><desc>with mild retinopathy with macular edema</desc></diag>
+    </diag>
+    <diag><name>E08.9</name><desc>without complications</desc></diag>
+   </diag>
+  </section>
+ </chapter>
+</ICD10CM.tabular>"#;
+        let (concepts, errors) = parse_tabular_xml(xml.as_bytes()).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let get = |code: &str| concepts.iter().find(|c| c.code == code);
+        let a = get("S02.0XXA").expect("S02.0XXA");
+        assert_eq!(
+            a.display,
+            "Fracture of vault of skull, initial encounter for closed fracture"
+        );
+        assert!(a.billable);
+        assert_eq!(a.parent.as_deref(), Some("S02.0"));
+        assert!(get("S02.0XXD").is_some());
+        assert!(
+            !get("S02.0").unwrap().billable,
+            "the category is no longer billable"
+        );
+        let c = get("S06.0X1A").expect("S06.0X1A");
+        assert_eq!(
+            c.display,
+            "Concussion with loss of consciousness of 30 minutes or less, initial encounter"
+        );
+        assert_eq!(
+            get("E08.3211").map(|c| c.display.as_str()),
+            Some("with mild retinopathy with macular edema, right eye")
+        );
+        // Outside a sevenChrDef nothing changes.
+        assert!(get("E08.9").unwrap().billable);
+        assert!(
+            !concepts
+                .iter()
+                .any(|c| c.code.starts_with("E08.9") && c.code != "E08.9")
+        );
     }
 
     #[test]
