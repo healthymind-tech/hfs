@@ -1,0 +1,88 @@
+# Build the hfs binary on GitHub-hosted runners (free for public repos),
+# package it with the repo's runtime-only Dockerfile, and push to a PRIVATE
+# Google Artifact Registry repo. Auth = Workload Identity Federation (no keys).
+# Repo variables needed: GCP_WIF_PROVIDER, GCP_IMAGE (see DEPLOY-GCP.md).
+# Deploy branch = hm/main (HealthyMind's integration branch). The GCE VM pulls
+# :latest every few minutes, so a push to hm/main = a deploy.
+name: Build & publish HFS image
+
+on:
+  push:
+    branches: [hm/main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC token for Workload Identity Federation
+
+concurrency:
+  group: hfs-image
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable) + clang/lld
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+
+      # helios-fhir (8 MB of generated R4 models) alone peaks at ~4.7 GB RSS
+      # in release mode; extra swap keeps parallel jobs from being OOM-killed.
+      - name: Add 8 GiB swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -h
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hfs-release
+
+      - name: Build hfs (release)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-zstack-size=8388608
+          CARGO_BUILD_JOBS: "3"
+        run: cargo build --release --locked -p helios-hfs --bin hfs --features postgres
+
+      - name: Stage Docker build context
+        run: |
+          mkdir -p docker-context
+          cp target/release/hfs docker-context/
+          cp -r data docker-context/data
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Docker login to Artifact Registry
+        run: gcloud auth configure-docker -q "${GCP_IMAGE%%/*}"
+        env:
+          GCP_IMAGE: ${{ vars.GCP_IMAGE }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: docker-context
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BINARY_NAME=hfs
+            EXPOSE_PORT=8080
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: |
+            ${{ vars.GCP_IMAGE }}:latest
+            ${{ vars.GCP_IMAGE }}:sha-${{ github.sha }}
