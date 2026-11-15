@@ -478,17 +478,45 @@ fn check_concept_codes(
     }
 }
 
+const PRIMITIVE_TYPES: &[&str] = &[
+    "base64Binary",
+    "boolean",
+    "canonical",
+    "code",
+    "date",
+    "dateTime",
+    "decimal",
+    "id",
+    "instant",
+    "integer",
+    "integer64",
+    "markdown",
+    "oid",
+    "positiveInt",
+    "string",
+    "time",
+    "unsignedInt",
+    "uri",
+    "url",
+    "uuid",
+];
+
 /// The FHIR type of a `value[x]` key (`valueDateTime` → `dateTime`).
 fn value_type(map: &Map<String, Value>) -> Option<(String, &Value)> {
     map.iter().find_map(|(k, v)| {
         let suffix = k.strip_prefix("value")?;
         let mut chars = suffix.chars();
         let first = chars.next()?;
-        first.is_ascii_uppercase().then(|| {
-            (
-                format!("{}{}", first.to_ascii_lowercase(), chars.as_str()),
-                v,
-            )
+        if !first.is_ascii_uppercase() {
+            return None;
+        }
+        // Primitive type names start lowercase (`valueDateTime` → dateTime);
+        // complex ones keep their name (`valueCoding` → Coding).
+        let lowered = format!("{}{}", first.to_ascii_lowercase(), chars.as_str());
+        Some(if PRIMITIVE_TYPES.contains(&lowered.as_str()) {
+            (lowered, v)
+        } else {
+            (suffix.to_string(), v)
         })
     })
 }
@@ -721,6 +749,14 @@ mod tests {
         );
         assert_eq!(errs.len(), 1, "{errs:#?}");
         assert!(errs[0].contains("Unknown CodeSystem Property"), "{errs:#?}");
+        // `cs-filter`: a Coding property holds valueCoding.
+        let errs = messages(
+            json!({"resourceType": "CodeSystem", "url": "http://example.org/cs",
+            "content": "complete", "property": [{"code": "p", "type": "Coding"}],
+            "concept": [{"code": "a", "property": [{"code": "p",
+                "valueCoding": {"system": "http://example.org/x", "code": "y"}}]}]}),
+        );
+        assert!(errs.is_empty(), "{errs:#?}");
         // Internal code references.
         let errs = messages(
             json!({"resourceType": "CodeSystem", "url": "http://example.org/cs",
