@@ -120,6 +120,36 @@ async fn expansion_only_value_set_membership() {
     }
 }
 
+/// cqf `R4FhirTerminologyProvider.in()` does
+/// `((BooleanType) respParam.getParameter().get(0).getValue()).booleanValue()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_code_puts_result_first() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&bundle()).await;
+    for path in [
+        format!("/ValueSet/{VS_ID}/$validate-code?code=E11.9&system={LOCAL_CS}"),
+        format!("/ValueSet/{VS_ID}/$validate-code?code=I10&system={LOCAL_CS}"),
+        format!("/ValueSet/$validate-code?url={VS_URL}&code=E11.9&system={LOCAL_CS}"),
+        format!("/CodeSystem/$validate-code?url={LOCAL_CS}&code=E11.9"),
+        format!("/CodeSystem/$validate-code?url={LOCAL_CS}&code=NOPE"),
+    ] {
+        let (st, body) = app.get_fhir(&path).await;
+        assert_eq!(st, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["parameter"][0]["name"], "result", "{path}: {body}");
+        assert!(body["parameter"][0]["valueBoolean"].is_boolean(), "{path}: {body}");
+    }
+    let (st, body) = app
+        .post_fhir(
+            &format!("/ValueSet/{VS_ID}/$validate-code"),
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "coding", "valueCoding": {"system": LOCAL_CS, "code": "E11.9"}}]})
+            .to_string(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["parameter"][0]["name"], "result", "{body}");
+}
+
 /// `resolveValueSetId` fails on anything but exactly one match.
 #[tokio::test(flavor = "multi_thread")]
 async fn value_set_search_by_url_finds_one() {
