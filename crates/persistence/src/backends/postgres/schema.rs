@@ -5115,8 +5115,9 @@ mod postgres_integration_migrations {
         host: String,
         port: u16,
         /// Kept alive for the test binary; the `container_cleanup` exit hook
-        /// removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        /// removes it at process exit. `None` when `HFS_TEST_PG_HOST` points
+        /// the tests at an existing server.
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -5125,6 +5126,19 @@ mod postgres_integration_migrations {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                // An existing PostgreSQL 16 (superuser postgres/postgres) can
+                // stand in for the container, e.g. on hosts without Docker.
+                if let Ok(host) = std::env::var("HFS_TEST_PG_HOST") {
+                    let port = std::env::var("HFS_TEST_PG_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(5432);
+                    return SharedPg {
+                        host,
+                        port,
+                        _container: None,
+                    };
+                }
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // `SHARED_PG` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
@@ -5148,7 +5162,7 @@ mod postgres_integration_migrations {
                 SharedPg {
                     host,
                     port,
-                    _container: container,
+                    _container: Some(container),
                 }
             })
             .await
