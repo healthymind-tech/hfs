@@ -73,6 +73,7 @@ mod bulk_provider;
 mod bulk_submit;
 mod login_sessions;
 mod package_registry;
+mod retention;
 mod schema;
 pub mod search;
 mod search_impl;

@@ -77,6 +77,12 @@ where
 
     match resource {
         Some(stored) => {
+            // Patient-centric audit: name the patient the resource belongs to.
+            if let Some(patient) =
+                super::extract_patient_from_resource(&resource_type, stored.content())
+            {
+                helios_audit::context::add_patient(&patient);
+            }
             // If client requested specific version, verify match
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {
@@ -230,6 +236,12 @@ where
 
     match resource {
         Some(stored) => {
+            // Patient-centric audit: name the patient the resource belongs to.
+            if let Some(patient) =
+                super::extract_patient_from_resource(&resource_type, stored.content())
+            {
+                helios_audit::context::add_patient(&patient);
+            }
             // If client requested specific version, verify match
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {

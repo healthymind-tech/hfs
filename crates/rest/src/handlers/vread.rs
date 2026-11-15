@@ -97,6 +97,12 @@ where
             }
         }
         Some(stored) => {
+            // Patient-centric audit: name the patient the resource belongs to.
+            if let Some(patient) =
+                super::extract_patient_from_resource(&resource_type, stored.content())
+            {
+                helios_audit::context::add_patient(&patient);
+            }
             // If the client requested a specific FHIR version, verify it matches.
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {

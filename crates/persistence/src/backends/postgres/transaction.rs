@@ -416,6 +416,26 @@ impl PostgresBackend {
     }
 
     /// Begins a transaction under the shared tenant gate and `plan`'s keys.
+    /// Begins a transaction that only **creates** resources under ids this
+    /// server has just generated (`fresh`), such as a batch of audit events.
+    ///
+    /// No other writer can name those ids, so it takes only the tenant's
+    /// shared write lock — unlike [`TransactionProvider::begin_transaction`],
+    /// whose unplanned transaction holds the tenant's exclusive write gate and
+    /// so stalls every other write in the tenant for as long as it runs.
+    pub async fn begin_fresh_create_transaction(
+        &self,
+        tenant: &TenantContext,
+        options: TransactionOptions,
+        fresh: Vec<(String, String)>,
+    ) -> StorageResult<PostgresTransaction> {
+        let plan = LockPlan {
+            locked: Vec::new(),
+            fresh,
+        };
+        self.begin_bundle_transaction(tenant, options, plan).await
+    }
+
     pub(super) async fn begin_bundle_transaction(
         &self,
         tenant: &TenantContext,

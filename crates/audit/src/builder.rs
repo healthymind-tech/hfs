@@ -208,8 +208,8 @@ impl AuditEventBuilder {
 
         AuditEvent {
             id: Some(fhir_string(uuid::Uuid::new_v4().to_string())),
-            meta: Some(Meta {
-                profile: Some(vec![canonical(profile_url)]),
+            meta: profile_url.map(|url| Meta {
+                profile: Some(vec![canonical(url)]),
                 ..Default::default()
             }),
             r#type: coding(type_system, type_code),

@@ -81,6 +81,7 @@ mod cleanup;
 mod lock_protocol;
 mod login_sessions;
 mod package_registry;
+mod retention;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;

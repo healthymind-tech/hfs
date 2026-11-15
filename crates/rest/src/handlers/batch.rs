@@ -373,6 +373,7 @@ where
         "Processing batch request"
     );
     let correlation = AuditCorrelation::new("batch");
+    helios_audit::context::set_bundle_type("batch");
 
     let entries = bundle
         .get("entry")
@@ -511,6 +512,7 @@ where
         "Processing transaction request"
     );
     let correlation = AuditCorrelation::new("transaction");
+    helios_audit::context::set_bundle_type("transaction");
 
     let json_entries = bundle
         .get("entry")
@@ -2292,6 +2294,48 @@ fn emit_entry_audit<S>(
                 })
         });
 
+    let patient_ref =
+        patient_ref.or_else(|| audit_target.and_then(|t| t.patient_reference.clone()));
+    let outcome_desc = failure_desc
+        .map(str::to_string)
+        .or_else(|| extract_outcome_description(result.outcome.as_ref()));
+
+    // Inside an audited request the entry is recorded by the audit middleware,
+    // which completes it with the request's parties (client, user, server,
+    // request id) and its tenant, as a BALP event of its own interaction.
+    if helios_audit::context::current().is_some() {
+        let mut spec = entry_audit_spec(method, url, state.base_url());
+        spec.status = if failure_desc.is_some() && result.status < 400 {
+            // The entry itself succeeded but the transaction around it failed
+            // and was rolled back: nothing it did persisted.
+            409
+        } else {
+            result.status
+        };
+        spec.outcome_desc = outcome_desc;
+        if !resource_type.is_empty() && spec.resource_type.as_deref() != Some("Bundle") {
+            spec.resource_type = Some(resource_type.clone());
+        }
+        if resource_id.is_some() {
+            spec.resource_id = resource_id.clone();
+        }
+        if let Some(p) = &patient_ref {
+            spec.add_patient(p);
+        }
+        if let Some(correlation) = correlation {
+            spec.details = vec![
+                ("bundle-id".to_string(), correlation.bundle_id.clone()),
+                ("bundle-type".to_string(), correlation.bundle_type.clone()),
+                (
+                    "entry-index".to_string(),
+                    correlation.entry_index.to_string(),
+                ),
+            ];
+        }
+        helios_audit::context::push_entry(spec);
+        return;
+    }
+
     let mut builder = AuditEventBuilder::new(state.audit_source_observer())
         .action(action)
         .outcome(outcome);
@@ -2314,9 +2358,7 @@ fn emit_entry_audit<S>(
             .detail("entry-index", correlation.entry_index.to_string());
     }
 
-    if let Some(patient_ref) =
-        patient_ref.or_else(|| audit_target.and_then(|t| t.patient_reference.clone()))
-    {
+    if let Some(patient_ref) = patient_ref {
         builder = builder.patient(patient_ref);
     }
     if let Some(principal) = principal {
@@ -2328,6 +2370,31 @@ fn emit_entry_audit<S>(
     tokio::spawn(async move {
         sink.record(event).await;
     });
+}
+
+/// Describes a bundle entry for the audit trail from its method and URL
+/// (relative `Patient/1`, `Observation?code=x`, or absolute).
+fn entry_audit_spec(method: &str, url: &str, base_url: &str) -> helios_audit::RestEventSpec {
+    let relative = match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            let full = parsed.path().to_string();
+            let base_path = url::Url::parse(base_url)
+                .map(|b| b.path().trim_end_matches('/').to_string())
+                .unwrap_or_default();
+            let path = full.strip_prefix(&base_path).unwrap_or(&full).to_string();
+            match parsed.query() {
+                Some(q) => format!("{path}?{q}"),
+                None => path,
+            }
+        }
+        _ => url.to_string(),
+    };
+    let (path, query) = match relative.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (relative, None),
+    };
+    let path = format!("/{}", path.trim_start_matches('/'));
+    helios_audit::RestEventSpec::from_request(method, &path, query.as_deref(), None, base_url)
 }
 
 fn method_to_audit_action(method: &str) -> AuditAction {

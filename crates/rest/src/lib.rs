@@ -1004,16 +1004,6 @@ where
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
-    // Apply audit middleware if enabled (inner layer = runs after auth)
-    let router = if let Some(audit) = audit_state {
-        router.layer(axum::middleware::from_fn_with_state(
-            audit,
-            helios_audit::middleware::audit_middleware,
-        ))
-    } else {
-        router
-    };
-
     // Per-client rate limiting (`HFS_RATE_LIMIT_*`). Inside authentication,
     // so a request is billed to its OAuth client when it has one, and outside
     // authorization and the handlers.
@@ -1022,12 +1012,20 @@ where
         .enabled()
         .then(|| middleware::client_rate_limit::ClientRateLimiter::new(rate_limit));
 
-    // Apply auth middleware if enabled (outermost = runs first)
+    // Apply auth middleware if enabled. Just inside authentication, the
+    // authenticated principal is reported to the audit context (the audit
+    // layer itself sits outside auth, see below).
     let router = if let Some(ref auth) = auth_state {
-        let router = router.layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
-            middleware::auth::authz_middleware,
-        ));
+        let router = router
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::authz_middleware,
+            ))
+            // Between authentication and authorization, so a request
+            // authorization refuses (403) is still attributed to its user.
+            .layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
+            ));
         let router = match rate_limiter {
             Some(limiter) => router.layer(axum::middleware::from_fn_with_state(
                 limiter,
@@ -1105,6 +1103,11 @@ where
                 auth.clone(),
                 middleware::auth::admin_authz_middleware,
             ))
+            // Between authentication and authorization, so a request
+            // authorization refuses (403) is still attributed to its user.
+            .route_layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
+            ))
             .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::auth_middleware,
@@ -1113,6 +1116,19 @@ where
         admin_console
     };
     let router = router.merge(admin_console);
+
+    // Audit: outermost of the API's own layers, so that requests refused by
+    // authentication (401) or authorization (403) are recorded too, with the
+    // same request context as everything else. Not recursive: audit events
+    // are written to storage directly, never through this router.
+    let router = if let Some(audit) = audit_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            audit,
+            helios_audit::middleware::audit_middleware,
+        ))
+    } else {
+        router
+    };
 
     // Build middleware stack
     let service_builder = ServiceBuilder::new()

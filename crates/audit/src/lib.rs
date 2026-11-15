@@ -52,25 +52,31 @@ compile_error!(
 pub mod balp;
 pub mod builder;
 pub mod config;
+pub mod context;
 pub mod correlation;
 pub mod error;
 pub mod exclusion;
 pub mod helpers;
+pub mod interaction;
 pub mod lifecycle;
 pub mod middleware;
 pub mod patient;
+pub mod rest_event;
 pub mod sink;
 pub mod sinks;
 
 // Re-exports for convenience
 pub use balp::AuditAction;
 pub use builder::AuditEventBuilder;
-pub use config::{AuditBackend, AuditConfig};
+pub use config::{AuditBackend, AuditConfig, RetentionConfig};
+pub use context::RequestAudit;
 pub use correlation::{AuditCorrelation, BundleAuditEntry};
 pub use error::{AuditError, AuditResult};
 pub use exclusion::ExclusionFilter;
+pub use interaction::{RestInteraction, classify};
 pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
-pub use sink::AuditSink;
+pub use rest_event::{AuditUser, RequestParties, RestEventSpec, build_rest_events};
+pub use sink::{AuditRecord, AuditSink};
 #[cfg(feature = "cloudwatch")]
 pub use sinks::CloudWatchLogsSink;
-pub use sinks::{DatabaseSink, FileSink, NullSink};
+pub use sinks::{DatabaseSink, FileSink, NullSink, QueueConfig, QueuedSink};

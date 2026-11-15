@@ -10,6 +10,7 @@
 //! - [`resource_type`] - Refuses paths whose type segment is not a resource type
 //! - [`smart_access`] - Patient-compartment, granular-scope and bundle filtering for SMART tokens
 
+pub mod audit;
 pub mod auth;
 pub mod client_rate_limit;
 pub mod conditional;
