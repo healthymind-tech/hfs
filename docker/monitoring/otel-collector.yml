@@ -1,0 +1,31 @@
+# OpenTelemetry Collector: receives OTLP traces from hfs/hts (built with the
+# `otel` feature, OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317) and
+# forwards them to a tracing backend. Replace the jaeger exporter with your
+# site's backend (Tempo, Elastic APM, a vendor endpoint).
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: 0.0.0.0:4317}
+      http: {endpoint: 0.0.0.0:4318}
+processors:
+  batch: {}
+  # FHIR request spans carry method, route template, tenant and status only --
+  # never resource content or query strings. To drop the tenant attribute
+  # (tracing backend shared outside the hospital), uncomment and add
+  # "attributes/redact" to the pipeline's processors.
+  # attributes/redact:
+  #   actions:
+  #     - key: tenant
+  #       action: delete
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls: {insecure: true}
+  debug:
+    verbosity: basic
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]

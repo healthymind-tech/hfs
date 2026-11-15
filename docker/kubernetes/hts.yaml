@@ -1,0 +1,74 @@
+# One HTS replica: terminology imports and the admin upload area use a local
+# volume (/data), so HTS is not horizontally scaled in this minimal layout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hts
+  labels: {app: hts}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: hts}}
+  template:
+    metadata:
+      labels: {app: hts}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, runAsNonRoot: true}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: hts
+          image: healthymind/hts
+          ports: [{name: http, containerPort: 8090}]
+          envFrom: [{configMapRef: {name: hts-config}}]
+          env:
+            - name: HTS_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: hfs-secrets, key: hts-db-url}}
+            - name: HTS_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: hfs-secrets, key: admin-password}}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {memory: 8Gi}          # SNOMED/LOINC imports peak at several GB
+          startupProbe:                    # first boot imports bundled terminologies (~4 min)
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: import, mountPath: /import, readOnly: true}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: hts-data}
+        - name: import
+          persistentVolumeClaim: {claimName: terminology-sources}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: hts-data}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 10Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: terminology-sources}
+spec:
+  accessModes: [ReadOnlyMany]
+  resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: hts, labels: {app: hts}}
+spec:
+  selector: {app: hts}
+  ports: [{name: http, port: 8090, targetPort: http}]
