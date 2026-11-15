@@ -5915,6 +5915,42 @@ mod postgres_integration {
             .with_parameter(patient)
             .with_parameter(code_param(None));
         assert_eq!(all(q).await, expect(&|g| g % 2 == 1 && matches(g)));
+
+        // Over 1,000 values the list is first cut to the codes present: the
+        // same 40 codes plus 1,200 absent ones answer the same.
+        let mut long = values.clone();
+        long.extend(
+            (5000..6200).map(|c| SearchValue::new(SearchPrefix::Eq, format!("http://snomed.info/sct|{c}"))),
+        );
+        let long_param = |modifier, values: Vec<SearchValue>| SearchParameter {
+            name: "code".into(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values,
+            chain: vec![],
+            components: vec![],
+        };
+        let q = SearchQuery::new("Condition").with_parameter(long_param(None, long.clone()));
+        assert_eq!(all(q).await, expect(&matches));
+        let q = SearchQuery::new("Condition")
+            .with_parameter(long_param(Some(SearchModifier::Not), long.clone()));
+        assert_eq!(all(q).await, expect(&|g| !matches(g)));
+        let q = SearchQuery::new("Condition").with_parameter(long_param(None, long.clone()));
+        assert_eq!(
+            backend.search_count(&tenant, &q).await.unwrap() as usize,
+            expect(&matches).len()
+        );
+
+        // A long list with no present code matches nothing (it is not dropped),
+        // and its `:not` matches everything.
+        let absent: Vec<SearchValue> = (5000..6200)
+            .map(|c| SearchValue::new(SearchPrefix::Eq, format!("http://snomed.info/sct|{c}")))
+            .collect();
+        let q = SearchQuery::new("Condition").with_parameter(long_param(None, absent.clone()));
+        assert_eq!(all(q).await, Vec::<String>::new());
+        let q = SearchQuery::new("Condition")
+            .with_parameter(long_param(Some(SearchModifier::Not), absent));
+        assert_eq!(all(q).await, expect(&|_| true));
     }
 
     /// Broad token + date conjunctions take the broad walk driven by the token
