@@ -18,7 +18,9 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{
+    BuilderConcept, CodeSystemMeta, build_code_system_bundle, build_parsed_code_system,
+};
 
 // ── ICD-10-CM constants ───────────────────────────────────────────────────────
 
@@ -107,8 +109,15 @@ pub async fn import_icd10_cm(
                 ..Default::default()
             })
             .collect();
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        // A chunked bulk load, like SNOMED CT and LOINC: the backends then skip
+        // the per-batch closure rebuild (each batch drops the system's closure,
+        // and rebuilding all of it after every batch is quadratic: ~70 k codes
+        // with the 7th-character extensions took over 30 min on PostgreSQL).
+        // The closure is built once afterwards by the CLI, the admin import
+        // job's `closure` step, or the next server start.
+        let mut parsed = build_parsed_code_system(&meta, &builder);
+        parsed.chunked = true;
+        let chunk = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk.errors);
 
         crate::import::progress::report_batch(batch_idx + 1, total_batches);
@@ -631,6 +640,32 @@ mod tests {
         assert_eq!(stats.concepts, 11);
         assert_eq!(count_rows(&backend, "concepts"), 11);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 10);
+    }
+
+    #[tokio::test]
+    async fn import_icd10_batched_closure_is_built_once_at_finalize() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let f = make_xml_file();
+
+        // Batches of 3: a chunked bulk load leaves the closure to the
+        // finalize step instead of rebuilding it after every batch.
+        import_icd10_cm(&backend, &ctx, f.path(), 3, false)
+            .await
+            .unwrap();
+        backend.finalize_after_bootstrap().unwrap();
+
+        let conn = backend.pool().get().unwrap();
+        let pair = |a: &str, d: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM concept_closure WHERE ancestor_code = ?1 AND descendant_code = ?2",
+                rusqlite::params![a, d],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pair("A00", "A00.9"), 1);
+        assert_eq!(pair("ICD-10-CM", "C00.0"), 1);
     }
 
     #[tokio::test]
