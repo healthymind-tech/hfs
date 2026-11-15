@@ -3373,6 +3373,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-cloudwatchlogs",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "helios-fhir",
  "serde",
@@ -3380,6 +3381,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -3541,6 +3543,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "flate2",
  "helios-admin-auth",
  "helios-audit",
  "helios-auth",

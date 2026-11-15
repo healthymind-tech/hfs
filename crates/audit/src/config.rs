@@ -67,6 +67,82 @@ pub struct AuditConfig {
     pub cloudwatch_log_stream: Option<String>,
     /// AWS region override for CloudWatch Logs.
     pub cloudwatch_region: Option<String>,
+    /// Use the first `X-Forwarded-For` address as the client address
+    /// (`HFS_AUDIT_TRUST_FORWARDED_FOR`). Only behind a reverse proxy that
+    /// sets the header, since a client can send any value.
+    pub trust_forwarded_for: bool,
+    /// Tenant that receives every audit event (`HFS_AUDIT_TENANT`). `None`:
+    /// the tenant of the audited request, or the server's default tenant for
+    /// events outside any request.
+    pub tenant: Option<String>,
+    /// Capacity of the in-memory write queue (`HFS_AUDIT_QUEUE_CAPACITY`).
+    pub queue_capacity: usize,
+    /// Events written per batch (`HFS_AUDIT_BATCH_SIZE`).
+    pub batch_size: usize,
+    /// Concurrent writer tasks (`HFS_AUDIT_WRITERS`).
+    pub writers: usize,
+    /// Longest wait for the queue to drain on shutdown, in seconds
+    /// (`HFS_AUDIT_SHUTDOWN_TIMEOUT`).
+    pub shutdown_timeout_secs: u64,
+    /// NDJSON file events are spilled to when the database cannot take them
+    /// (`HFS_AUDIT_FALLBACK_FILE`); replayed on the next start.
+    pub fallback_file: Option<String>,
+    /// Also record the per-request authentication/authorization events of the
+    /// auth layer (`HFS_AUDIT_AUTH_EVENTS`, default `false`). The REST events
+    /// already carry the user and record 401/403 refusals, so these only
+    /// triple the volume.
+    pub auth_events: bool,
+    /// Retention policy (`HFS_AUDIT_RETENTION_*`).
+    pub retention: RetentionConfig,
+}
+
+/// How long stored audit events are kept (database backend).
+#[derive(Debug, Clone, Default)]
+pub struct RetentionConfig {
+    /// Purge events last updated more than this many days ago
+    /// (`HFS_AUDIT_RETENTION_DAYS`). `None` keeps events forever.
+    pub days: Option<u32>,
+    /// Hours between purge runs (`HFS_AUDIT_RETENTION_INTERVAL_HOURS`, default 24).
+    pub interval_hours: u64,
+    /// Rows deleted per transaction (`HFS_AUDIT_RETENTION_BATCH`, default 1000).
+    pub batch: usize,
+    /// Directory purged events are archived to as gzip NDJSON before they are
+    /// deleted (`HFS_AUDIT_RETENTION_ARCHIVE_DIR`). `None`: no archive.
+    pub archive_dir: Option<String>,
+}
+
+impl RetentionConfig {
+    fn from_env() -> Self {
+        Self {
+            days: env::var("HFS_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|d| *d > 0),
+            interval_hours: env_parse("HFS_AUDIT_RETENTION_INTERVAL_HOURS", 24u64).max(1),
+            batch: env_parse("HFS_AUDIT_RETENTION_BATCH", 1000usize).max(1),
+            archive_dir: env::var("HFS_AUDIT_RETENTION_ARCHIVE_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+        }
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str) -> bool {
+    env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl AuditConfig {
@@ -88,10 +164,8 @@ impl AuditConfig {
             .map(|paths| {
                 paths
                     .split(',')
-                    .map(|p| ExclusionRule {
-                        path: p.trim().to_string(),
-                        method: None,
-                    })
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| ExclusionRule::parse(p.trim()))
                     .collect()
             })
             .unwrap_or_default();
@@ -114,6 +188,30 @@ impl AuditConfig {
             cloudwatch_log_group: env::var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP").ok(),
             cloudwatch_log_stream: env::var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM").ok(),
             cloudwatch_region: env::var("HFS_AUDIT_CLOUDWATCH_REGION").ok(),
+            trust_forwarded_for: env_bool("HFS_AUDIT_TRUST_FORWARDED_FOR"),
+            tenant: env::var("HFS_AUDIT_TENANT")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            queue_capacity: env_parse("HFS_AUDIT_QUEUE_CAPACITY", 10_000usize).max(1),
+            batch_size: env_parse("HFS_AUDIT_BATCH_SIZE", 64usize).max(1),
+            writers: env_parse("HFS_AUDIT_WRITERS", 4usize).max(1),
+            shutdown_timeout_secs: env_parse("HFS_AUDIT_SHUTDOWN_TIMEOUT", 30u64),
+            fallback_file: env::var("HFS_AUDIT_FALLBACK_FILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            auth_events: env_bool("HFS_AUDIT_AUTH_EVENTS"),
+            retention: RetentionConfig::from_env(),
+        }
+    }
+
+    /// Queue tuning derived from this configuration.
+    pub fn queue_config(&self) -> crate::sinks::QueueConfig {
+        crate::sinks::QueueConfig {
+            capacity: self.queue_capacity,
+            batch_size: self.batch_size,
+            workers: self.writers,
+            flush_timeout: std::time::Duration::from_secs(self.shutdown_timeout_secs),
         }
     }
 }
@@ -134,6 +232,20 @@ impl Default for AuditConfig {
             cloudwatch_log_group: None,
             cloudwatch_log_stream: None,
             cloudwatch_region: None,
+            trust_forwarded_for: false,
+            tenant: None,
+            queue_capacity: 10_000,
+            batch_size: 64,
+            writers: 4,
+            shutdown_timeout_secs: 30,
+            fallback_file: None,
+            auth_events: false,
+            retention: RetentionConfig {
+                days: None,
+                interval_hours: 24,
+                batch: 1000,
+                archive_dir: None,
+            },
         }
     }
 }
@@ -159,6 +271,19 @@ mod tests {
         "HFS_AUDIT_CLOUDWATCH_LOG_GROUP",
         "HFS_AUDIT_CLOUDWATCH_LOG_STREAM",
         "HFS_AUDIT_CLOUDWATCH_REGION",
+        "HFS_AUDIT_TRUST_FORWARDED_FOR",
+        "HFS_AUDIT_TENANT",
+        "HFS_AUDIT_QUEUE_CAPACITY",
+        "HFS_AUDIT_BATCH_SIZE",
+        "HFS_AUDIT_WRITERS",
+        "HFS_AUDIT_SHUTDOWN_TIMEOUT",
+        "HFS_AUDIT_FALLBACK_FILE",
+        "HFS_AUDIT_AUTH_EVENTS",
+        "HFS_AUDIT_RETENTION_DAYS",
+        "HFS_AUDIT_RETENTION_INTERVAL_HOURS",
+        "HFS_AUDIT_RETENTION_BATCH",
+        "HFS_AUDIT_RETENTION_ARCHIVE_DIR",
+        "HFS_AUDIT_EXCLUDE_PATHS",
     ];
 
     fn clear_audit_env() {
@@ -254,6 +379,45 @@ mod tests {
         clear_audit_env();
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::None);
+    }
+
+    #[test]
+    fn test_from_env_queue_tenant_and_retention() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
+        let defaults = AuditConfig::from_env();
+        assert_eq!(defaults.retention.days, None);
+        assert_eq!(defaults.retention.interval_hours, 24);
+        assert!(!defaults.trust_forwarded_for);
+        assert!(!defaults.auth_events);
+        assert_eq!(defaults.tenant, None);
+        assert_eq!(defaults.writers, 4);
+        unsafe {
+            env::set_var("HFS_AUDIT_TENANT", "audit");
+            env::set_var("HFS_AUDIT_TRUST_FORWARDED_FOR", "true");
+            env::set_var("HFS_AUDIT_QUEUE_CAPACITY", "50");
+            env::set_var("HFS_AUDIT_WRITERS", "2");
+            env::set_var("HFS_AUDIT_RETENTION_DAYS", "2190");
+            env::set_var(
+                "HFS_AUDIT_RETENTION_ARCHIVE_DIR",
+                "/var/lib/hfs/audit-archive",
+            );
+            env::set_var("HFS_AUDIT_EXCLUDE_PATHS", "/ping, GET /Basic/*");
+        }
+        let c = AuditConfig::from_env();
+        assert_eq!(c.tenant.as_deref(), Some("audit"));
+        assert!(c.trust_forwarded_for);
+        assert_eq!(c.queue_config().capacity, 50);
+        assert_eq!(c.queue_config().workers, 2);
+        assert_eq!(c.retention.days, Some(2190));
+        assert_eq!(
+            c.retention.archive_dir.as_deref(),
+            Some("/var/lib/hfs/audit-archive")
+        );
+        assert_eq!(c.exclusions.len(), 2);
+        assert_eq!(c.exclusions[1].method.as_deref(), Some("GET"));
+        assert_eq!(c.exclusions[1].path, "/Basic/*");
+        clear_audit_env();
     }
 
     #[test]

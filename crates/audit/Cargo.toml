@@ -32,7 +32,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros", "rt"] }
 async-trait = "0.1"
 
 # Time
@@ -43,6 +43,9 @@ tracing = "0.1"
 
 # Error handling
 thiserror = "2"
+
+# Query entity encoding
+base64 = "0.22"
 
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
@@ -60,3 +63,4 @@ aws-config = { version = "1", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
