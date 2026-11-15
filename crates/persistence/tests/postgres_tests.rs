@@ -19749,7 +19749,8 @@ mod postgres_integration {
             };
             pin_last_updated(&backend, id, instant(&at)).await;
         }
-        let got = drain_export_type(&backend, &tenant, &ExportRequest::system(), "Patient", 2).await;
+        let got =
+            drain_export_type(&backend, &tenant, &ExportRequest::system(), "Patient", 2).await;
         ids.sort();
         assert_eq!(got, ids, "every row once, in primary-key order");
 
@@ -19934,7 +19935,8 @@ mod postgres_integration {
         // One patient of 24 is a small set (index path); all 24 is a large one.
         for selected in [vec![patients[3].clone()], patients.clone()] {
             for page in [1, 4, 1000] {
-                let obs = drain_compartment_type(&backend, &tenant, "Observation", &selected, page).await;
+                let obs =
+                    drain_compartment_type(&backend, &tenant, "Observation", &selected, page).await;
                 // Rows passing the reference prefilter but failing the exact
                 // compartment test (`focus` only) are skipped, not exported;
                 // a focus row is a member through its *subject*, the next
@@ -19947,7 +19949,8 @@ mod postgres_integration {
                 }
                 want.sort();
                 assert_eq!(obs, want, "{} patients, page {page}", selected.len());
-                let pats = drain_compartment_type(&backend, &tenant, "Patient", &selected, page).await;
+                let pats =
+                    drain_compartment_type(&backend, &tenant, "Patient", &selected, page).await;
                 let mut want_p = selected.clone();
                 want_p.sort();
                 assert_eq!(pats, want_p, "{} patients, page {page}", selected.len());

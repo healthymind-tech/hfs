@@ -1406,7 +1406,9 @@ impl PatientExportProvider for PostgresBackend {
             .map(|id| format!("Patient/{id}"))
             .collect();
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
-        let after = cursor.and_then(parse_export_keyset_cursor).map(str::to_string);
+        let after = cursor
+            .and_then(parse_export_keyset_cursor)
+            .map(str::to_string);
         let selected: HashSet<&str> = patient_ids.iter().map(String::as_str).collect();
 
         let mut client = self.get_client().await?;
@@ -1426,7 +1428,10 @@ impl PatientExportProvider for PostgresBackend {
         //   group export quadratic in the group's size.
         // * without the index (search offloaded) the JSON predicate is
         //   evaluated in a key-ordered walk.
-        let large = indexed && self.is_large_patient_set(&client, tenant_id, patient_ids.len()).await?;
+        let large = indexed
+            && self
+                .is_large_patient_set(&client, tenant_id, patient_ids.len())
+                .await?;
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
