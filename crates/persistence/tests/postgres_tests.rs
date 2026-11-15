@@ -2553,7 +2553,8 @@ mod postgres_integration {
         /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
         /// container-removal path — never runs. The `container_cleanup` exit
         /// hook removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        /// `None` when `HFS_TEST_PG_HOST` points the tests at an existing server.
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -2563,6 +2564,13 @@ mod postgres_integration {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                let external = std::env::var("HFS_TEST_PG_HOST").ok().map(|host| {
+                    let port = std::env::var("HFS_TEST_PG_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(5432);
+                    (host, port)
+                });
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // Pin the major version. testcontainers-modules defaults to
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
@@ -2570,25 +2578,29 @@ mod postgres_integration {
                 // connection FATAL. The rest of the repo runs 16.
                 // `SHARED_PG` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
-                let container = super::container_cleanup::with_cleanup_label(
-                    Postgres::default()
-                        .with_tag("16-alpine")
-                        .with_label("github.run_id", &run_id),
-                )
-                .start()
-                .await
-                .expect("Failed to start PostgreSQL container");
-
-                let port = container
-                    .get_host_port_ipv4(5432)
-                    .await
-                    .expect("Failed to get host port");
-
-                let host = container
-                    .get_host()
-                    .await
-                    .expect("Failed to get host")
-                    .to_string();
+                let (host, port, container) = match external {
+                    Some((host, port)) => (host, port, None),
+                    None => {
+                        let container = super::container_cleanup::with_cleanup_label(
+                            Postgres::default()
+                                .with_tag("16-alpine")
+                                .with_label("github.run_id", &run_id),
+                        )
+                        .start()
+                        .await
+                        .expect("Failed to start PostgreSQL container");
+                        let port = container
+                            .get_host_port_ipv4(5432)
+                            .await
+                            .expect("Failed to get host port");
+                        let host = container
+                            .get_host()
+                            .await
+                            .expect("Failed to get host")
+                            .to_string();
+                        (host, port, Some(container))
+                    }
+                };
 
                 // Initialize schema once on the shared container.
                 let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5651,11 +5663,11 @@ mod postgres_integration {
             )
             .await
             .unwrap();
-        assert_eq!(
-            statements.len(),
-            2,
-            "one count and one page statement expected"
-        );
+        // The count keeps the #1580 `INTERSECT`. The first page of this
+        // broad code + quantity pair is the broad-conjunction walk instead
+        // (the code drives, the quantity is a per-row probe), so it carries
+        // no `INTERSECT` and is checked by the answer above.
+        assert_eq!(statements.len(), 1, "one count statement expected");
         for statement in statements {
             let sql: String = statement.get(0);
             let plan: serde_json::Value = client
@@ -5680,6 +5692,138 @@ mod postgres_integration {
                 "both independent candidate arms execute: {plan}"
             );
         }
+    }
+
+    /// Broad token + date conjunctions take the broad walk driven by the token
+    /// (the date estimate is low by the column's null fraction), including a
+    /// repeated date parameter that the general plan folds into an
+    /// `INTERSECT`. The first page must equal the independent-membership answer.
+    #[tokio::test]
+    async fn postgres_integration_token_and_date_walk_keeps_the_answer() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("token-date-walk");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // 6,000 Observations; ids ascending = page order (equal last_updated).
+        // category: every third is vital-signs; status: all final;
+        // effective date: one per day from 2015-01-01; the resources whose
+        // id is a multiple of 7 carry a second date row in 2030, so a
+        // resource can match `ge` and `lt` on different rows.
+        client
+            .batch_execute(&format!(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT '{tenant_id}', 'Observation', 'w-' || lpad(g::text, 5, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'w-' || lpad(g::text, 5, '0')),
+                        '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 6000) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT '{tenant_id}', 'Observation', 'w-' || lpad(g::text, 5, '0'), 'category',
+                        CASE WHEN g % 3 = 0 THEN 'vital-signs' ELSE 'laboratory' END, '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, 6000) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT '{tenant_id}', 'Observation', 'w-' || lpad(g::text, 5, '0'), 'status', 'final', '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, 6000) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date, value_date_end, value_date_precision, last_updated)
+                 SELECT '{tenant_id}', 'Observation', 'w-' || lpad(g::text, 5, '0'), 'date',
+                        TIMESTAMPTZ '2015-01-01' + (g || ' days')::interval,
+                        TIMESTAMPTZ '2015-01-01' + (g || ' days')::interval + interval '1 day' - interval '1 microsecond',
+                        'day', '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, 6000) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date, value_date_end, value_date_precision, last_updated)
+                 SELECT '{tenant_id}', 'Observation', 'w-' || lpad(g::text, 5, '0'), 'date',
+                        TIMESTAMPTZ '2030-06-01', TIMESTAMPTZ '2030-06-02' - interval '1 microsecond',
+                        'day', '2020-01-01T00:00:00Z'
+                 FROM generate_series(7, 6000, 7) g;
+                 ANALYZE resources; ANALYZE search_index;"
+            ))
+            .await
+            .unwrap();
+        drop(client);
+
+        let param = |name: &str, param_type, value| SearchParameter {
+            name: name.into(),
+            param_type,
+            modifier: None,
+            values: vec![value],
+            chain: vec![],
+            components: vec![],
+        };
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        let expected = |keep: &dyn Fn(u32) -> bool| {
+            (1..=6000u32)
+                .filter(|g| keep(*g))
+                .take(20)
+                .map(|g| format!("w-{g:05}"))
+                .collect::<Vec<_>>()
+        };
+        let day = |g: u32| g; // day offset from 2015-01-01
+
+        // category=vital-signs & date=ge2025-01-01 (day >= 3653, or the 2030 row)
+        let ge_2025 = 3653;
+        let q = SearchQuery::new("Observation")
+            .with_parameter(param("category", SearchParamType::Token, SearchValue::eq("vital-signs")))
+            .with_parameter(param(
+                "date",
+                SearchParamType::Date,
+                SearchValue::new(SearchPrefix::Ge, "2025-01-01"),
+            ))
+            .with_count(20);
+        let got = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            ids(&got),
+            expected(&|g| g % 3 == 0 && (day(g) >= ge_2025 || g % 7 == 0))
+        );
+
+        // status=final & date=ge2025-01-01
+        let q = SearchQuery::new("Observation")
+            .with_parameter(param("status", SearchParamType::Token, SearchValue::eq("final")))
+            .with_parameter(param(
+                "date",
+                SearchParamType::Date,
+                SearchValue::new(SearchPrefix::Ge, "2025-01-01"),
+            ))
+            .with_count(20);
+        let got = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(ids(&got), expected(&|g| day(g) >= ge_2025 || g % 7 == 0));
+
+        // category=vital-signs & date=ge2018-01-01 & date=lt2018-07-01: each
+        // occurrence may match a different row (the 2030 row satisfies `ge`)
+        let (ge_2018, lt_2018h) = (1096, 1277);
+        let q = SearchQuery::new("Observation")
+            .with_parameter(param("category", SearchParamType::Token, SearchValue::eq("vital-signs")))
+            .with_parameter(param(
+                "date",
+                SearchParamType::Date,
+                SearchValue::new(SearchPrefix::Ge, "2018-01-01"),
+            ))
+            .with_parameter(param(
+                "date",
+                SearchParamType::Date,
+                SearchValue::new(SearchPrefix::Lt, "2018-07-01"),
+            ))
+            .with_count(20);
+        let got = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            ids(&got),
+            expected(&|g| g % 3 == 0 && (day(g) >= ge_2018 || g % 7 == 0) && day(g) < lt_2018h)
+        );
+        assert_eq!(
+            backend.search_count(&tenant, &q).await.unwrap() as usize,
+            (1..=6000u32)
+                .filter(|g| g % 3 == 0 && (day(*g) >= ge_2018 || g % 7 == 0) && day(*g) < lt_2018h)
+                .count()
+        );
     }
 
     #[tokio::test]
