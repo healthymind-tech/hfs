@@ -1425,7 +1425,7 @@ impl PatientExportProvider for PostgresBackend {
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
         let selected: HashSet<&str> = patient_ids.iter().map(String::as_str).collect();
 
-        let mut client = self.get_client().await?;
+        let client = self.get_client().await?;
         let indexed = self.has_patient_export_index() && !(is_patient && matcher.is_empty());
 
         // Three plans, all paging on `(last_updated, id)` like system export,
@@ -1437,16 +1437,16 @@ impl PatientExportProvider for PostgresBackend {
         //   which keeps PostgreSQL from walking a whole type evaluating the
         //   JSON expression; only the page's rows are then read in full.
         // * a large set (a Group of a sizable share of the patients) walks the
-        //   type along `idx_resources_search` and tests each row. Its candidates are most of
+        //   type along `idx_resources_search`, like system export, and the
+        //   matcher tests each row. Its candidates are most of
         //   the database, and re-materializing them for every page made each
         //   page cost a full scan: a 14,000-patient Group hit the 30 s
         //   statement timeout on its first page and the export failed.
-        // * without the index (search offloaded) the JSON predicate is
-        //   evaluated in the same ordered walk.
-        let large = indexed
-            && self
-                .is_large_patient_set(&client, tenant_id, patient_ids.len())
-                .await?;
+        // * a small set without the index (search offloaded) evaluates the
+        //   JSON predicate in the same ordered walk.
+        let large = self
+            .is_large_patient_set(&client, tenant_id, patient_ids.len())
+            .await?;
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1497,22 +1497,26 @@ impl PatientExportProvider for PostgresBackend {
                 batch_size + 1
             ));
             sql
+        } else if large {
+            // No reference predicate at all: overlapping each row's references
+            // with an array of thousands of patients costs PostgreSQL ~2 ms a
+            // row (the overlap is a nested loop), and nearly every row matches
+            // anyway. The matcher below, with a hash set, decides.
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
+                .to_string();
+            let idx = push_export_window(&mut sql, &mut params, request, 3);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
+            sql
         } else {
             let mut sql = "SELECT id, data, last_updated, version_id FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
                 .to_string();
-            let next_idx = if indexed && is_patient {
-                sql.push_str(
-                    " AND (id = ANY($3::text[]) OR hfs_patient_references_v1(data) && $4::text[])",
-                );
-                params.push(Box::new(patient_ids.to_vec()));
-                params.push(Box::new(patient_ref_list));
-                5
-            } else if indexed {
-                sql.push_str(" AND hfs_patient_references_v1(data) && $3::text[]");
-                params.push(Box::new(patient_ref_list));
-                4
-            } else if is_patient && matcher.is_empty() {
+            let next_idx = if is_patient && matcher.is_empty() {
                 sql.push_str(" AND id = ANY($3::text[])");
                 params.push(Box::new(patient_ids.to_vec()));
                 4
@@ -1543,31 +1547,10 @@ impl PatientExportProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // The ordered walk must stay an ordered walk: a bitmap plan over the
-        // patient-reference index would collect and sort the whole candidate
-        // set again for every page, which is the cost the walk exists to avoid.
-        let rows = if large {
-            let tx = client
-                .transaction()
-                .await
-                .map_err(|e| internal_error(format!("Failed to begin compartment read: {e}")))?;
-            tx.batch_execute("SET LOCAL enable_bitmapscan = off")
-                .await
-                .map_err(|e| internal_error(format!("Failed to plan compartment read: {e}")))?;
-            let rows = tx
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
-            tx.commit()
-                .await
-                .map_err(|e| internal_error(format!("Failed to end compartment read: {e}")))?;
-            rows
-        } else {
-            client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?
-        };
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
 
         // The cursor advances over every candidate the query returned, kept or
         // not, so a page of candidates that all fail the exact test still
