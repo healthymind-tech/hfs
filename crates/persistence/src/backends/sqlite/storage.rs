@@ -7770,6 +7770,59 @@ mod tests {
     /// REST layer, and its half of #350 is pinned by
     /// `batch_entries_stamp_the_configured_default` in
     /// `helios-rest/tests/default_version_fallback.rs`.
+    /// A transaction-bundle `PUT` to a deleted id brings the resource back
+    /// with the next version (FHIR http.html#delete) instead of failing as
+    /// "resource already exists" against the soft-deleted row.
+    #[tokio::test]
+    async fn test_transaction_put_resurrects_a_deleted_resource() {
+        use crate::core::transaction::BundleProvider;
+        use crate::core::{HistoryParams, InstanceHistoryProvider};
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "lazarus"}),
+                helios_fhir::FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "lazarus").await.unwrap();
+
+        let put = BundleEntry {
+            method: BundleMethod::Put,
+            url: "Patient/lazarus".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "id": "lazarus",
+                                  "name": [{"family": "Back"}]})),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        let result = backend
+            .process_transaction(&tenant, vec![put], helios_fhir::FhirVersion::default())
+            .await
+            .expect("transaction PUT to a deleted id");
+        assert_eq!(result.entries[0].status, 201, "{:?}", result.entries[0]);
+
+        let stored = backend.read(&tenant, "Patient", "lazarus").await.unwrap().unwrap();
+        assert_eq!(stored.version_id(), "3", "create 1, delete 2, resurrect 3");
+        assert_eq!(stored.content()["name"][0]["family"], "Back");
+        let history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "lazarus",
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 3);
+    }
+
     #[cfg(feature = "R5")]
     #[tokio::test]
     async fn test_bundle_writes_stamp_the_negotiated_version() {

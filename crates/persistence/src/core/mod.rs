@@ -104,6 +104,10 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod cluster_change_feed;
+pub mod package_jobs;
+pub mod cluster_job_store;
+pub mod event_fanout;
 pub mod history;
 pub mod package_registry;
 pub mod patch;
@@ -113,10 +117,13 @@ pub mod retention;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
+pub mod subscription_delivery;
+pub mod subscription_state;
 pub mod transaction;
 pub mod user_settings;
 pub mod versioned;
 pub mod write_observer;
+pub mod ws_binding_tokens;
 
 // Re-export main types
 pub use backend::{Backend, BackendCapability, BackendConfig, BackendKind, BackendPoolStats};
@@ -164,6 +171,12 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use cluster_change_feed::{ChangeCursor, ClusterChangeFeed, ResourceChange};
+pub use cluster_job_store::{
+    ClusterJobId, ClusterJobLease, ClusterJobRecord, ClusterJobState, ClusterJobStore,
+    ClusterLeaseError, JobKind,
+};
+pub use event_fanout::{EventFanout, FanoutEnvelope, FanoutKind, LifecycleOp};
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -194,6 +207,13 @@ pub use storage::{
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
     ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
 };
+pub use subscription_delivery::{
+    ClaimedDelivery, DeliveryId, DeliveryLease, DeliveryLeaseError, DeliveryRecord, DeliveryState,
+    NewDelivery, SubscriptionDeliveryOutbox,
+};
+pub use subscription_state::{
+    HydratedResource, SubscriptionHydrationSource, SubscriptionStateRecord, SubscriptionStateStore,
+};
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
     BundleType, ConditionalTransaction, IsolationLevel, LockingStrategy, PatchCandidateValidator,
@@ -208,3 +228,4 @@ pub use write_observer::{
     ErasedScope, ResourceWrite, WriteEvent, WriteKind, WriteNotice, WriteObserver, WriteObservers,
     WriteOrigin,
 };
+pub use ws_binding_tokens::WsBindingTokenStore;

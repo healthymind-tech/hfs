@@ -292,9 +292,46 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = helios_hts::state::AppState::new(backend.clone())
         .with_resource_store_pg(resource_store)
-        .with_terminology_importer(Arc::new(backend))
+        .with_terminology_importer(Arc::new(backend.clone()))
         .with_max_expansion_size(config.max_expansion_size)
         .with_auto_supplements(config.auto_supplements);
+
+    // Administrator sessions shared by every replica (and kept across restarts).
+    match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
+        backend.pool().clone(),
+        "HTS",
+    )
+    .await
+    {
+        Ok(store) => {
+            let _ = helios_hts::server::ADMIN_SESSION_STORE.set(Arc::new(store));
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "admin session store unavailable; administrator sessions stay per instance"
+        ),
+    }
+
+    // Cluster cache coherence: drop every response cache when another replica
+    // (or `hts import`) moved the shared terminology epoch.
+    {
+        use helios_hts::traits::TerminologyCaches;
+        let st = state.clone();
+        helios_hts::backends::postgres::epoch::spawn_cache_sync(
+            backend,
+            std::time::Duration::from_millis(config.cache_sync_interval_ms),
+            Arc::new(move || {
+                st.clear_expand_cache();
+                st.backend().invalidate_caches();
+            }),
+        );
+        if config.cache_sync_interval_ms > 0 {
+            info!(
+                interval_ms = config.cache_sync_interval_ms,
+                "terminology cache sync ENABLED (shared terminology_epoch)"
+            );
+        }
+    }
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -346,6 +383,17 @@ async fn bootstrap_sync_sqlite(
     bootstrap_sync(&tracker, backend, &dir, config).await
 }
 
+/// Runs the Postgres bootstrap sync under a session-scoped advisory lock
+/// ([`helios_hts::backends::postgres::schema::with_bootstrap_lock`]) so that
+/// N instances cold-starting concurrently against one empty (or
+/// partially-populated) database don't each redundantly run the same heavy
+/// SNOMED/LOINC/RxNorm/ICD-10-CM import.
+///
+/// The lock covers the whole `bootstrap_sync` call (every file in the
+/// directory, not per-file) — the per-file ledger check inside
+/// `bootstrap_sync` still runs normally, so an instance that queues behind
+/// the lock and then acquires it naturally skips any files the winner
+/// already imported.
 #[cfg(feature = "postgres")]
 async fn bootstrap_sync_postgres(
     backend: &PostgresTerminologyBackend,
@@ -354,8 +402,12 @@ async fn bootstrap_sync_postgres(
     let Some(dir) = resolve_bootstrap_dir(&config.bootstrap_dir) else {
         return Ok(());
     };
+
     let tracker = BootstrapTracker::Postgres(backend);
-    bootstrap_sync(&tracker, backend, &dir, config).await
+    helios_hts::backends::postgres::schema::with_bootstrap_lock(backend.pool(), || {
+        bootstrap_sync(&tracker, backend, &dir, config)
+    })
+    .await
 }
 
 /// Backend-agnostic bootstrap sync: import the directory, gating each file on

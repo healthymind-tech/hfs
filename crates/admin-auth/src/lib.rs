@@ -28,6 +28,7 @@
 pub mod auth;
 pub mod client;
 pub mod settings;
+pub mod store;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -38,6 +39,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 pub use auth::{AdminAuth, CookieSpec, Denial, Granted, LoginOutcome, Via};
+pub use store::{AdminSessionStore, StoredSession};
 pub use client::IpNet;
 pub use settings::{AdminSettings, CookieSecure, DEFAULT_USER, Secret};
 
@@ -124,6 +126,21 @@ impl AdminGate {
         self.auth().and_then(|auth| auth.session_user(headers))
     }
 
+    /// [`Self::login`] that shares the session and lockout with other
+    /// instances when a store is attached (see [`AdminAuth::login_shared`]).
+    pub async fn login_shared(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer: Option<IpAddr>,
+        user: &str,
+        password: &str,
+    ) -> LoginOutcome {
+        match self {
+            Self::Password(auth) => auth.login_shared(headers, peer, user, password).await,
+            _ => LoginOutcome::NotConfigured,
+        }
+    }
+
     /// Handles a sign-in form submission.
     pub fn login(
         &self,
@@ -193,16 +210,22 @@ pub async fn guard(State(guard): State<Guard>, mut request: Request, next: Next)
             }
         }
         AdminGate::Password(auth) => {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip());
+            // Multi-instance: adopt sessions, sign-outs and lockouts that
+            // other instances recorded before deciding synchronously.
+            // (Headers are cloned: a `Request` body is not `Sync`, so it
+            // cannot be borrowed across an await in a `Send` future.)
+            let headers = request.headers().clone();
+            auth.sync_request(&headers, peer).await;
             if !protected {
                 if let Some(user) = auth.session_user(request.headers()) {
                     request.extensions_mut().insert(AdminUser(user));
                 }
                 return next.run(request).await;
             }
-            let peer = request
-                .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0.ip());
             match auth.authorize(request.method(), request.headers(), peer) {
                 Ok(granted) => {
                     let headers = request.headers_mut();
@@ -213,7 +236,12 @@ pub async fn guard(State(guard): State<Guard>, mut request: Request, next: Next)
                     request.extensions_mut().insert(AdminUser(granted.user));
                     next.run(request).await
                 }
-                Err(denial) => refuse(guard.style, &request, denial, ""),
+                Err(denial) => {
+                    if denial == Denial::BadCredentials {
+                        auth.share_failure(&headers, peer).await;
+                    }
+                    refuse(guard.style, &request, denial, "")
+                }
             }
         }
     }

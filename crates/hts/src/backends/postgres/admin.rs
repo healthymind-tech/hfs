@@ -381,6 +381,7 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
         // Rows may already be gone even when a later step failed: drop the
         // caches either way (as SQLite does).
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         deleted?;
         Ok(report)
     }
@@ -396,6 +397,7 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .await
             .map_err(pg)?;
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(n)
     }
 
@@ -406,6 +408,7 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .await
             .map_err(pg)?;
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(n)
     }
 
@@ -464,6 +467,7 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
         super::fhir_ids::reassign(&*tx, "code_systems", &declared).await?;
         tx.commit().await.map_err(pg)?;
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(())
     }
 
@@ -477,6 +481,7 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             _ => {}
         }
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(())
     }
 

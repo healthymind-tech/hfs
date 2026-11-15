@@ -162,6 +162,30 @@ impl FromStr for StorageBackendMode {
     }
 }
 
+/// Unified async-job store backend (docs/cluster-capable-state-design.md §4).
+///
+/// Selects where cluster-affected async job state (SQL-on-FHIR export,
+/// reindex) lives. Resolved by [`ServerConfig::job_store_backend_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStoreBackend {
+    /// In-process job state — visible only to this instance; lost on restart.
+    Memory,
+    /// Job state in the shared primary database — cluster-capable.
+    Database,
+}
+
+/// Subscriptions event fan-out backend (docs/cluster-capable-state-design.md
+/// §Class B). Resolved by [`ServerConfig::subscriptions_fanout_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionsFanoutMode {
+    /// In-process only — notifications reach only sockets and workers on
+    /// the instance that served the triggering write.
+    Memory,
+    /// Postgres LISTEN/NOTIFY fan-out plus the shared state/outbox seams —
+    /// cluster-capable.
+    PgNotify,
+}
+
 /// Tenant routing mode for multi-tenant deployments.
 ///
 /// Determines how the server identifies tenants from incoming requests.
@@ -1662,6 +1686,46 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
+    /// Declares this process one of N instances behind a load balancer.
+    ///
+    /// Flips cluster-safe defaults (e.g. the unified job store backend) and
+    /// makes the server fail fast at boot on configurations that cannot be
+    /// clustered instead of silently degrading.
+    #[arg(long, env = "HFS_CLUSTER", default_value = "false")]
+    pub cluster: bool,
+
+    /// Unified async-job store backend: "memory" (in-process, single
+    /// instance) or "database" (shared primary database, cluster-capable).
+    ///
+    /// Unset resolves to "memory", or to "database" when `HFS_CLUSTER=true`.
+    /// Parsed ahead of the unified-job-store phases; not consumed yet.
+    #[arg(long, env = "HFS_JOB_STORE_BACKEND", default_value = "")]
+    pub job_store_backend: String,
+
+    /// How often (milliseconds) a cluster instance (`HFS_CLUSTER=true`) polls
+    /// the shared database for definition changes written by other instances:
+    /// stored StructureDefinitions (the validation profile registry) and
+    /// SearchParameters (the search registry). Bounds how long a profile or
+    /// SearchParameter installed through one instance is unknown to the
+    /// others. `0` disables the sync.
+    #[arg(long, env = "HFS_CLUSTER_SYNC_INTERVAL_MS", default_value = "1000")]
+    pub cluster_sync_interval_ms: u64,
+
+    /// Enables the topic-based Subscriptions engine.
+    ///
+    /// Kept as a raw string for backward-compatible truthiness ("false"/"0"
+    /// and unset disable; anything else enables) — resolved by
+    /// [`ServerConfig::subscriptions_enabled`].
+    #[arg(long, env = "HFS_SUBSCRIPTIONS_ENABLED", default_value = "")]
+    pub subscriptions_enabled: String,
+
+    /// Subscriptions event fan-out: "memory" (per-instance) or "pg-notify"
+    /// (cluster-capable, Postgres primary).
+    ///
+    /// Unset resolves to "memory", or to "pg-notify" when `HFS_CLUSTER=true`.
+    #[arg(long, env = "HFS_SUBSCRIPTIONS_FANOUT", default_value = "")]
+    pub subscriptions_fanout: String,
+
     /// Elasticsearch node URLs (comma-separated).
     /// Used when storage_backend is sqlite-elasticsearch, postgres-elasticsearch,
     /// or mongodb-elasticsearch.
@@ -2038,6 +2102,61 @@ impl ServerConfig {
     pub fn storage_backend_mode(&self) -> Result<StorageBackendMode, String> {
         self.storage_backend.parse()
     }
+
+    /// Resolves the unified async-job store backend.
+    ///
+    /// An unset value defaults to [`JobStoreBackend::Database`] when
+    /// `cluster` is set and [`JobStoreBackend::Memory`] otherwise
+    /// (docs/cluster-capable-state-design.md §6).
+    pub fn job_store_backend_mode(&self) -> Result<JobStoreBackend, String> {
+        match self.job_store_backend.to_lowercase().as_str() {
+            "" => Ok(if self.cluster {
+                JobStoreBackend::Database
+            } else {
+                JobStoreBackend::Memory
+            }),
+            "memory" => Ok(JobStoreBackend::Memory),
+            "database" | "db" => Ok(JobStoreBackend::Database),
+            other => Err(format!(
+                "Invalid job store backend '{}'. Valid values: memory, database",
+                other
+            )),
+        }
+    }
+
+    /// Whether the Subscriptions engine is enabled
+    /// (`HFS_SUBSCRIPTIONS_ENABLED`): unset, "false", and "0" disable;
+    /// anything else enables (the historical truthiness).
+    pub fn subscriptions_enabled(&self) -> bool {
+        !matches!(
+            self.subscriptions_enabled
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "" | "false" | "0"
+        )
+    }
+
+    /// Resolves the subscriptions fan-out backend.
+    ///
+    /// An unset value defaults to [`SubscriptionsFanoutMode::PgNotify`] when
+    /// `cluster` is set and [`SubscriptionsFanoutMode::Memory`] otherwise
+    /// (docs/cluster-capable-state-design.md §Class B).
+    pub fn subscriptions_fanout_mode(&self) -> Result<SubscriptionsFanoutMode, String> {
+        match self.subscriptions_fanout.to_lowercase().as_str() {
+            "" => Ok(if self.cluster {
+                SubscriptionsFanoutMode::PgNotify
+            } else {
+                SubscriptionsFanoutMode::Memory
+            }),
+            "memory" => Ok(SubscriptionsFanoutMode::Memory),
+            "pg-notify" | "pg_notify" | "pgnotify" => Ok(SubscriptionsFanoutMode::PgNotify),
+            other => Err(format!(
+                "Invalid subscriptions fanout '{}'. Valid values: memory, pg-notify",
+                other
+            )),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -2067,6 +2186,11 @@ impl Default for ServerConfig {
             max_page_size: 1000,
             everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
+            subscriptions_enabled: String::new(),
+            subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -2291,6 +2415,14 @@ impl ServerConfig {
             ));
         }
 
+        if let Err(job_store_error) = self.job_store_backend_mode() {
+            errors.push(job_store_error);
+        }
+
+        if let Err(fanout_error) = self.subscriptions_fanout_mode() {
+            errors.push(fanout_error);
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -2356,6 +2488,11 @@ impl ServerConfig {
             max_page_size: 100,
             everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
+            subscriptions_enabled: String::new(),
+            subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -2497,6 +2634,89 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("max terms count")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_job_store_backend_default_flips_with_cluster() {
+        // Unset → memory single-instance, database when clustered.
+        let mut config = ServerConfig::default();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = true;
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+
+        // Explicit values win regardless of the cluster switch.
+        config.job_store_backend = "memory".to_string();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = false;
+        config.job_store_backend = "Database".to_string();
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+    }
+
+    #[test]
+    fn test_subscriptions_fanout_default_flips_with_cluster() {
+        // Unset → memory single-instance, pg-notify when clustered.
+        let mut config = ServerConfig::default();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::Memory)
+        );
+        config.cluster = true;
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::PgNotify)
+        );
+
+        // Explicit values win regardless of the cluster switch.
+        config.subscriptions_fanout = "memory".to_string();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::Memory)
+        );
+        config.cluster = false;
+        config.subscriptions_fanout = "pg-notify".to_string();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::PgNotify)
+        );
+
+        // Invalid values fail validation, naming the valid set.
+        config.subscriptions_fanout = "zookeeper".to_string();
+        assert!(config.subscriptions_fanout_mode().is_err());
+    }
+
+    #[test]
+    fn test_subscriptions_enabled_truthiness_is_preserved() {
+        let mut config = ServerConfig::default();
+        assert!(!config.subscriptions_enabled(), "unset disables");
+        for disabled in ["false", "0", "FALSE", " false "] {
+            config.subscriptions_enabled = disabled.to_string();
+            assert!(!config.subscriptions_enabled(), "{disabled:?} disables");
+        }
+        for enabled in ["true", "1", "yes", "on"] {
+            config.subscriptions_enabled = enabled.to_string();
+            assert!(config.subscriptions_enabled(), "{enabled:?} enables");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_job_store_backend() {
+        let config = ServerConfig {
+            job_store_backend: "kafka".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Invalid job store backend 'kafka'")),
+            "expected a job-store error, got: {errors:?}"
         );
     }
 

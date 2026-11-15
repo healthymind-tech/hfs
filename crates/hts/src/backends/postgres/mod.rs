@@ -4,6 +4,7 @@
 //! connection pooling and `tokio-postgres` for query execution.
 
 pub mod admin;
+pub mod epoch;
 pub mod schema;
 
 mod code_system;
@@ -1297,6 +1298,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // Invalidate per-instance response caches — they may now shadow
         // newly-imported codes.
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
 
         Ok(stats)
     }
@@ -1382,6 +1384,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         // Cached expansions may hold ECL `^` results.
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(written)
     }
 
@@ -1399,6 +1402,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let written = crate::snomed::store::write_pg(&mut client, url, version, &data).await?;
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(written)
     }
 
@@ -1510,6 +1514,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         tx.commit().await.map_err(db)?;
         if wrote {
             self.invalidate_caches();
+            self.bump_terminology_epoch().await;
         }
         Ok((props, desigs))
     }
@@ -1550,6 +1555,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                 fhir_ids::reassign(&**client, table, &[declared]).await?;
             }
             self.invalidate_caches();
+            self.bump_terminology_epoch().await;
             return Ok(());
         }
         match resource_type {
@@ -1591,6 +1597,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             _ => {}
         }
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
         Ok(())
     }
 
@@ -1652,6 +1659,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // Invalidate per-instance response caches — they may reference the
         // now-deleted resource.
         self.invalidate_caches();
+        self.bump_terminology_epoch().await;
 
         Ok(())
     }

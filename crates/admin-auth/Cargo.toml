@@ -23,6 +23,14 @@ sha2 = "0.10"
 base64 = "0.22"
 serde_json = "1"
 tracing = "0.1"
+# Cluster-shared sessions (`store`): the trait is async.
+async-trait = "0.1"
+# PostgreSQL session store (feature `postgres`), for multi-instance deployments.
+deadpool-postgres = { version = "0.14", optional = true }
+
+[features]
+default = []
+postgres = ["dep:deadpool-postgres"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

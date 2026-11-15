@@ -887,136 +887,7 @@ impl Transaction for PostgresTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        self.tenant
-            .check_permission(Operation::Update, current.resource_type())?;
-
-        self.ensure_usable()?;
-        self.ensure_planned_key(current.resource_type(), current.id())?;
-
-        // Buffered creates must be visible to everything that is not another
-        // create. This is what keeps `read`/`update`/`delete` — and therefore a
-        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
-        // what they saw before: the batch is a wire-level optimisation, never a
-        // change of visibility inside the transaction.
-        self.flush().await?;
-        self.refresh_search_snapshot_if_dirty().await?;
-        self.poisoned = true;
-
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str().to_string();
-        let resource_type = current.resource_type();
-        let id = current.id();
-
-        // The expected version is `current`'s, and the UPDATE below only matches a
-        // row that still carries it — so the new version follows from what the
-        // caller already read, with no round trip to ask what is stored.
-        let expected_version = current.version_id().to_string();
-        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Build the resource with id and resourceType
-        let mut data = resource;
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-        }
-
-        let now = Utc::now();
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param();
-        // Version check, update and history row in one statement. Folding the
-        // expected version into the `WHERE` makes the check and write atomic:
-        // a concurrent writer cannot bump the version between two statements
-        // and have this update overwrite it while reporting success.
-        let updated = execute_cached(
-            client,
-            "WITH upd AS (
-                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                   AND is_deleted = FALSE AND version_id = $7
-                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
-             )
-             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
-            &[
-                &new_version_str,
-                &data,
-                &now,
-                &tenant_id,
-                &resource_type,
-                &id,
-                &expected_version,
-                &fhir_version_str,
-            ],
-        )
-        .await
-        .or_query_error("Failed to update resource")?;
-
-        if updated == 0 {
-            // The statement matched nothing because the row is missing,
-            // soft-deleted, or has a different version. Only the last case is
-            // a concurrency conflict; the lookup is needed only on this error
-            // path to distinguish it from the two not-found cases.
-            let actual = query_opt_cached(
-                client,
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to get current version")?;
-
-            return match actual {
-                Some(row) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version,
-                        actual_version: row.get::<_, String>(0),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
-        }
-
-        // Re-index the resource for search
-        if resource_type == "SearchParameter" {
-            self.search_snapshot_dirty = true;
-            self.refresh_search_snapshot_if_dirty().await?;
-        }
-        if let Err(error) = self
-            .index_resource(
-                &tenant_id,
-                resource_type,
-                id,
-                now,
-                super::storage::IndexWrite::Replace,
-                &data,
-            )
-            .await
-        {
-            self.poisoned = true;
-            return Err(error);
-        }
-        self.poisoned = false;
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            self.tenant.tenant_id().clone(),
-            data,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+        self.update_inner(current, resource, false).await
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
@@ -1436,5 +1307,191 @@ mod tests {
         let attempted = [("Patient", "x")];
         let mut inserted = key_set(&[("Observation", "x")]);
         assert_eq!(first_unaccounted_key(&attempted, &mut inserted), Some(0));
+    }
+}
+
+impl PostgresTransaction {
+    /// `update`, or — with `from_deleted` — the resurrection of a
+    /// soft-deleted row at `current`'s (delete-marker) version.
+    async fn update_inner(
+        &mut self,
+        current: &StoredResource,
+        resource: Value,
+        from_deleted: bool,
+    ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
+        self.ensure_usable()?;
+        self.ensure_planned_key(current.resource_type(), current.id())?;
+
+        // Buffered creates must be visible to everything that is not another
+        // create. This is what keeps `read`/`update`/`delete` — and therefore a
+        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
+        // what they saw before: the batch is a wire-level optimisation, never a
+        // change of visibility inside the transaction.
+        self.flush().await?;
+        self.refresh_search_snapshot_if_dirty().await?;
+        self.poisoned = true;
+
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str().to_string();
+        let resource_type = current.resource_type();
+        let id = current.id();
+
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Build the resource with id and resourceType
+        let mut data = resource;
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+        }
+
+        let now = Utc::now();
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param();
+        // Version check, update and history row in one statement. Folding the
+        // expected version into the `WHERE` makes the check and write atomic:
+        // a concurrent writer cannot bump the version between two statements
+        // and have this update overwrite it while reporting success.
+        let updated = execute_cached(
+            client,
+            "WITH upd AS (
+                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3,
+                     is_deleted = FALSE, deleted_at = NULL
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = $9 AND version_id = $7
+                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+             )
+             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
+            &[
+                &new_version_str,
+                &data,
+                &now,
+                &tenant_id,
+                &resource_type,
+                &id,
+                &expected_version,
+                &fhir_version_str,
+                &from_deleted,
+            ],
+        )
+        .await
+        .or_query_error("Failed to update resource")?;
+
+        if updated == 0 {
+            // The statement matched nothing because the row is missing,
+            // soft-deleted, or has a different version. Only the last case is
+            // a concurrency conflict; the lookup is needed only on this error
+            // path to distinguish it from the two not-found cases.
+            let actual = query_opt_cached(
+                client,
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                &[&tenant_id, &resource_type, &id],
+            )
+            .await
+            .or_query_error("Failed to get current version")?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
+        // Re-index the resource for search
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+            self.refresh_search_snapshot_if_dirty().await?;
+        }
+        if let Err(error) = self
+            .index_resource(
+                &tenant_id,
+                resource_type,
+                id,
+                now,
+                super::storage::IndexWrite::Replace,
+                &data,
+            )
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.poisoned = false;
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            self.tenant.tenant_id().clone(),
+            data,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
+    /// Brings a soft-deleted resource back to life inside this transaction —
+    /// a bundle `PUT` to a deleted id (FHIR http.html#delete) — continuing
+    /// its version chain. `Ok(None)` when no deleted row exists for the id.
+    pub(crate) async fn restore_deleted(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.ensure_usable()?;
+        self.flush().await?;
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str().to_string();
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id, fhir_version FROM resources
+             WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to look up a deleted resource")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let version: String = row.get(0);
+        let fhir_version_str: String = row.get(1);
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(FhirVersion::default_enabled);
+        let marker = StoredResource::from_storage(
+            resource_type,
+            id,
+            version,
+            self.tenant.tenant_id().clone(),
+            Value::Null,
+            Utc::now(),
+            Utc::now(),
+            None,
+            fhir_version,
+        );
+        self.update_inner(&marker, resource, true).await.map(Some)
     }
 }

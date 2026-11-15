@@ -71,6 +71,10 @@ pub struct PostgresBackend {
     pub(super) reindex_test_pause: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(super) reindex_test_entered: Option<Arc<tokio::sync::Notify>>,
+    /// Memoized subscription event fan-out: one LISTEN connection per
+    /// backend, spawned lazily by the first `subscription_fanout()` call
+    /// (which must happen inside a Tokio runtime) and stopped on drop.
+    subscription_fanout: std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>>,
 }
 
 impl Debug for PostgresBackend {
@@ -493,6 +497,7 @@ impl PostgresBackend {
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
             write_registry_cache: Arc::new(RwLock::new(HashMap::new())),
+            subscription_fanout: std::sync::OnceLock::new(),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -1085,6 +1090,38 @@ impl PostgresBackend {
         self.reload_stored_cache().await
     }
 
+    /// Sum of every tenant's SearchParameter epoch (migration v47's
+    /// trigger-maintained counters). Changes whenever any instance — or any
+    /// other writer — creates, updates or deletes a stored SearchParameter, so
+    /// a cluster instance can poll it and refresh its query-side registry
+    /// instead of waiting for the `HFS_SEARCH_PARAM_CACHE_TTL` sweep.
+    pub async fn search_parameter_epoch_sum(&self) -> StorageResult<i64> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(epoch), 0)::BIGINT FROM search_parameter_epochs",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to query SearchParameter epochs: {e}"),
+                    source: None,
+                })
+            })?;
+        Ok(row.get(0))
+    }
+
+    /// A handle on this backend's connection pool, for process-level
+    /// services that keep their own small tables in the primary database
+    /// (the shared administrator session store of a cluster deployment).
+    /// Not stable API, like [`Self::get_client`].
+    #[doc(hidden)]
+    pub fn shared_pool(&self) -> deadpool_postgres::Pool {
+        self.pool()
+    }
+
     /// Get a client from the pool.
     ///
     /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
@@ -1167,6 +1204,14 @@ impl PostgresBackend {
     /// retries is not counted.
     pub fn pool_status(&self) -> super::PoolStatus {
         self.pool.status()
+    }
+
+    /// Returns the memoization slot for the subscription event fan-out
+    /// (see the field docs on [`PostgresBackend`]).
+    pub(crate) fn fanout_slot(
+        &self,
+    ) -> &std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>> {
+        &self.subscription_fanout
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.

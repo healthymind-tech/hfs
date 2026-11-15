@@ -718,6 +718,38 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the cluster coordinator for IG package jobs (see
+    /// [`crate::core::package_jobs`]), if this backend can back one. The
+    /// default `None` keeps package jobs and their lock in process.
+    fn package_job_coordinator(
+        &self,
+    ) -> Option<Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
+        None
+    }
+
+    /// Returns the cross-instance change feed for definition resources (see
+    /// [`crate::core::cluster_change_feed`]), if this backend can back one
+    /// (a shared database that records writes by trigger).
+    ///
+    /// The default `None` leaves per-process caches built from stored
+    /// resources (the validation profile registry) instance-local.
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        None
+    }
+
+    /// Returns the unified cluster job store for this backend, if it can back
+    /// one (a shared database — see [`crate::core::cluster_job_store`]).
+    ///
+    /// The default implementation returns `None`, which keeps async job
+    /// surfaces on their process-local (single-instance) paths.
+    fn cluster_job_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        None
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the
@@ -729,6 +761,62 @@ pub trait ResourceStorage: Send + Sync {
     /// (#1228). Backends with a search index keep the default `None`: their
     /// index answers the lookup and a scan would only be slower.
     fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
+        None
+    }
+
+    /// Returns the shared per-subscription state store (counters, status,
+    /// stored notification bundles — see
+    /// [`crate::core::subscription_state`]), if this backend can back one.
+    ///
+    /// The default implementation returns `None`, which keeps subscription
+    /// counters on their process-local (single-instance) paths.
+    fn subscription_state_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        None
+    }
+
+    /// Returns the boot-time hydration read path for subscription/topic
+    /// resources (see [`crate::core::subscription_state`]), if this backend
+    /// can back one.
+    ///
+    /// The default implementation returns `None`.
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+        None
+    }
+
+    /// Returns the durable subscription delivery outbox (see
+    /// [`crate::core::subscription_delivery`]), if this backend can back
+    /// one.
+    ///
+    /// The default implementation returns `None`, which keeps delivery
+    /// retries on their process-local (single-instance) path.
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>> {
+        None
+    }
+
+    /// Returns the shared WebSocket binding-token store (see
+    /// [`crate::core::ws_binding_tokens`]), if this backend can back one.
+    ///
+    /// The default implementation returns `None`, which keeps binding
+    /// tokens in the process-local map.
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        None
+    }
+
+    /// Returns the cluster event fan-out for subscriptions (see
+    /// [`crate::core::event_fanout`]), if this backend can back one.
+    ///
+    /// Backends memoize the fan-out: repeated calls return the same
+    /// instance, and the first call from an async runtime context spawns
+    /// its listener. The default implementation returns `None`.
+    fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
         None
     }
 

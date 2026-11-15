@@ -236,7 +236,8 @@ pub(crate) async fn login_submit(
     };
     match state
         .admin_gate
-        .login(&headers, peer, user.trim(), &password)
+        .login_shared(&headers, peer, user.trim(), &password)
+        .await
     {
         LoginOutcome::Success { set_cookie } => {
             let mut response = Redirect::to(&next).into_response();
@@ -288,7 +289,7 @@ pub(crate) async fn logout(State(state): State<WebState>, headers: HeaderMap) ->
     let mut response = Redirect::to("/ui").into_response();
     response
         .headers_mut()
-        .append(header::SET_COOKIE, auth.logout(&headers));
+        .append(header::SET_COOKIE, auth.logout_shared(&headers).await);
     response
 }
 

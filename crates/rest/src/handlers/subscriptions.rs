@@ -85,7 +85,8 @@ async fn resolve_snapshot<S>(
 where
     S: ResourceStorage + Send + Sync,
 {
-    if let Some(sub) = engine.manager().get_subscription(tenant.tenant_id(), id) {
+    // Cluster-aware read: shared eventNumber/status overlay when clustered.
+    if let Some(sub) = engine.subscription_snapshot(tenant.tenant_id(), id).await {
         return Ok(StatusSnapshot {
             status: sub.status,
             topic_url: sub.topic_url,
@@ -217,8 +218,8 @@ where
 
     // Verify subscription exists.
     let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
+        .subscription_snapshot(tenant.tenant_id(), &id)
+        .await
         .ok_or(RestError::NotFound {
             resource_type: "Subscription".to_string(),
             id: id.clone(),
@@ -235,10 +236,14 @@ where
         });
     }
 
-    // Generate binding token.
+    // Generate binding token (in the shared store when clustered, so the
+    // WebSocket upgrade may land on any instance).
     let (token, expiration) = engine
-        .ws_token_manager()
-        .generate_token(tenant.tenant_id(), &id);
+        .generate_ws_token(tenant.tenant_id(), &id)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("failed to mint WebSocket binding token: {e}"),
+        })?;
 
     // Build WebSocket URL from the base URL.
     let ws_http_url = state.public_url_for_request(&tenant, ["ws", "subscriptions", "bind"]);

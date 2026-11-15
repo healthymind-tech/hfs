@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use base64::Engine;
@@ -12,6 +12,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::client::{IpNet, client_ip};
+use crate::store::{AdminSessionStore, StoredSession};
 use crate::settings::{AdminSettings, CookieSecure, Secret, normalize_origin, strip_default_port};
 
 /// Failed attempts from one client address within [`FAILURE_WINDOW`] that
@@ -25,6 +26,14 @@ pub const LOCKOUT: Duration = Duration::from_secs(15 * 60);
 /// A session ends after this long even when in constant use (or after the
 /// idle lifetime, when that is longer).
 pub const ABSOLUTE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// With a shared session store attached, how long a session this instance
+/// has confirmed is trusted before the store is asked again — the bound on
+/// how long a sign-out on another instance takes to reach this one.
+pub const STORE_RECHECK: Duration = Duration::from_secs(10);
+/// How often a session in use reports its last-use time to the shared store
+/// (so the idle timeout holds across instances without a write per request).
+const STORE_TOUCH_EVERY: Duration = Duration::from_secs(30);
 
 const MAX_SESSIONS: usize = 1024;
 const MAX_TRACKED_CLIENTS: usize = 10_000;
@@ -96,6 +105,10 @@ struct Session {
     user: String,
     created: Instant,
     last_seen: Instant,
+    /// Last confirmed against the shared store (creation counts).
+    checked: Instant,
+    /// Last use reported to the shared store.
+    touched: Instant,
 }
 
 struct Failures {
@@ -121,6 +134,9 @@ pub struct AdminAuth {
     cookie: CookieSpec,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
     failures: Mutex<HashMap<IpAddr, Failures>>,
+    /// Cluster-shared sessions and lockout (see [`crate::store`]); unset on a
+    /// single instance.
+    store: OnceLock<Arc<dyn AdminSessionStore>>,
 }
 
 impl std::fmt::Debug for AdminAuth {
@@ -172,7 +188,25 @@ impl AdminAuth {
             cookie,
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            store: OnceLock::new(),
         }
+    }
+
+    /// Shares sessions and the failed-attempt lockout with every other
+    /// instance through `store` (a multi-instance deployment). Only the first
+    /// call takes effect.
+    pub fn attach_store(&self, store: Arc<dyn AdminSessionStore>) {
+        if self.store.set(store).is_ok() {
+            tracing::info!(
+                "{} admin sessions are shared across instances",
+                self.prefix
+            );
+        }
+    }
+
+    /// Whether a shared store is attached.
+    pub fn has_shared_store(&self) -> bool {
+        self.store.get().is_some()
     }
 
     /// The environment-variable prefix (`HFS`, `HTS`), for messages.
@@ -323,6 +357,8 @@ impl AdminAuth {
                 user: self.user.clone(),
                 created: now,
                 last_seen: now,
+                checked: now,
+                touched: now,
             },
         );
         token
@@ -436,18 +472,29 @@ impl AdminAuth {
         user: &str,
         password: &str,
     ) -> LoginOutcome {
+        self.login_inner(headers, peer, user, password).0
+    }
+
+    /// [`Self::login`], also returning the new session token on success.
+    fn login_inner(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+        user: &str,
+        password: &str,
+    ) -> (LoginOutcome, Option<String>) {
         if !self.same_origin(headers) {
             tracing::warn!(
                 client = %self.client_ip(headers, peer),
                 "{} admin sign-in refused: not posted from this site",
                 self.prefix
             );
-            return LoginOutcome::CrossOrigin;
+            return (LoginOutcome::CrossOrigin, None);
         }
         let ip = self.client_ip(headers, peer);
         match self.check_credentials(ip, user, password, "sign-in") {
-            Some(Denial::RateLimited(left)) => LoginOutcome::RateLimited(left),
-            Some(_) => LoginOutcome::Invalid,
+            Some(Denial::RateLimited(left)) => (LoginOutcome::RateLimited(left), None),
+            Some(_) => (LoginOutcome::Invalid, None),
             None => {
                 let token = self.new_session();
                 tracing::info!(client = %ip, user = %self.user, "{} admin signed in", self.prefix);
@@ -456,11 +503,211 @@ impl AdminAuth {
                     CookieSecure::Never => false,
                     CookieSecure::Auto => request_is_https(headers),
                 };
-                LoginOutcome::Success {
-                    set_cookie: self.cookie_header(&token, secure, None),
-                }
+                let set_cookie = self.cookie_header(&token, secure, None);
+                (LoginOutcome::Success { set_cookie }, Some(token))
             }
         }
+    }
+
+    // ------------------------------------------------ cluster-shared state
+
+    /// Brings this instance's view of a request's session and its client's
+    /// lockout up to date with the shared store (no-op without one). Called
+    /// by the [`crate::guard`] middleware before it decides, so the
+    /// synchronous checks that follow see sessions created, and sign-outs and
+    /// lockouts recorded, on other instances.
+    pub async fn sync_request(&self, headers: &HeaderMap, peer: Option<IpAddr>) {
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        if headers.contains_key(header::AUTHORIZATION) {
+            let ip = self.client_ip(headers, peer);
+            self.adopt_shared_lockout(store.as_ref(), ip).await;
+        }
+        let Some(token) = self.cookie_token(headers) else {
+            return;
+        };
+        let key = digest(token.as_bytes());
+        let now = Instant::now();
+        let local = {
+            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            sessions
+                .get(&key)
+                .map(|s| (now.duration_since(s.checked), now.duration_since(s.touched)))
+        };
+        if let Some((since_check, since_touch)) = local
+            && since_check < STORE_RECHECK
+        {
+            if since_touch >= STORE_TOUCH_EVERY {
+                if let Err(e) = store.touch(&hex(&key), unix_now()).await {
+                    tracing::debug!(error = %e, "{} admin session touch failed", self.prefix);
+                }
+                if let Some(s) = self
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&key)
+                {
+                    s.touched = now;
+                }
+            }
+            return;
+        }
+        match store.get(&hex(&key)).await {
+            Ok(Some(stored)) => {
+                let unix = unix_now();
+                let idle_ok = unix - stored.last_seen_unix < self.idle.as_secs() as i64;
+                let absolute_ok = unix - stored.created_unix < self.absolute.as_secs() as i64;
+                let expired = !(idle_ok && absolute_ok);
+                // The guard lives in this block only: a std `MutexGuard` must
+                // not be held across the `await` below (the future must be
+                // `Send`).
+                {
+                    let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    if expired {
+                        sessions.remove(&key);
+                    } else {
+                        let created = instant_from_unix(stored.created_unix, now, unix);
+                        let stored_seen = instant_from_unix(stored.last_seen_unix, now, unix);
+                        match sessions.get_mut(&key) {
+                            Some(s) => {
+                                s.last_seen = s.last_seen.max(stored_seen);
+                                s.checked = now;
+                            }
+                            None => {
+                                sessions.insert(
+                                    key,
+                                    Session {
+                                        user: stored.user.clone(),
+                                        created,
+                                        last_seen: stored_seen,
+                                        checked: now,
+                                        touched: now,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                if expired {
+                    let _ = store.delete(&hex(&key)).await;
+                }
+            }
+            Ok(None) => {
+                // Signed out (or expired) on another instance.
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+            }
+            Err(e) => {
+                // Availability first: keep whatever this instance knows.
+                tracing::warn!(error = %e, "{} admin session store unavailable", self.prefix);
+            }
+        }
+    }
+
+    /// Records a refused credential in the shared lockout (no-op without a
+    /// store), adopting the lockout locally when it now applies.
+    pub async fn share_failure(&self, headers: &HeaderMap, peer: Option<IpAddr>) {
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let ip = self.client_ip(headers, peer);
+        match store
+            .record_failure(
+                &ip.to_string(),
+                FAILURE_WINDOW.as_secs() as i64,
+                MAX_FAILURES,
+                LOCKOUT.as_secs() as i64,
+            )
+            .await
+        {
+            Ok(Some(until)) => self.lock_locally(ip, until),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "{} admin lockout store unavailable", self.prefix),
+        }
+    }
+
+    async fn adopt_shared_lockout(&self, store: &dyn AdminSessionStore, ip: IpAddr) {
+        match store.locked_until(&ip.to_string()).await {
+            Ok(Some(until)) => self.lock_locally(ip, until),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "{} admin lockout store unavailable", self.prefix),
+        }
+    }
+
+    fn lock_locally(&self, ip: IpAddr, until_unix: i64) {
+        let now = Instant::now();
+        let left = Duration::from_secs((until_unix - unix_now()).max(0) as u64);
+        if left.is_zero() {
+            return;
+        }
+        let mut table = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = table.entry(ip).or_insert(Failures {
+            count: MAX_FAILURES,
+            window_start: now,
+            locked_until: None,
+        });
+        entry.count = entry.count.max(MAX_FAILURES);
+        entry.locked_until = Some(now + left);
+    }
+
+    /// [`Self::login`] for a multi-instance deployment: honours a lockout
+    /// another instance recorded, stores the new session so every instance
+    /// accepts its cookie, and counts a failure cluster-wide. Identical to
+    /// [`Self::login`] without a shared store.
+    pub async fn login_shared(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+        user: &str,
+        password: &str,
+    ) -> LoginOutcome {
+        let Some(store) = self.store.get().cloned() else {
+            return self.login(headers, peer, user, password);
+        };
+        let ip = self.client_ip(headers, peer);
+        self.adopt_shared_lockout(store.as_ref(), ip).await;
+        let (outcome, token) = self.login_inner(headers, peer, user, password);
+        match (&outcome, token) {
+            (LoginOutcome::Success { .. }, Some(token)) => {
+                let unix = unix_now();
+                let stored = StoredSession {
+                    user: self.user.clone(),
+                    created_unix: unix,
+                    last_seen_unix: unix,
+                };
+                if let Err(e) = store.put(&hex(&digest(token.as_bytes())), &stored).await {
+                    tracing::warn!(
+                        error = %e,
+                        "{} admin session not shared (store unavailable); it works on this \
+                         instance only",
+                        self.prefix
+                    );
+                }
+                let _ = store.clear_failures(&ip.to_string()).await;
+                outcome
+            }
+            (LoginOutcome::Invalid, _) => {
+                self.share_failure(headers, peer).await;
+                match self.locked_for(ip) {
+                    Some(left) => LoginOutcome::RateLimited(left),
+                    None => LoginOutcome::Invalid,
+                }
+            }
+            _ => outcome,
+        }
+    }
+
+    /// [`Self::logout`] that also ends the session on every other instance.
+    pub async fn logout_shared(&self, headers: &HeaderMap) -> HeaderValue {
+        if let (Some(store), Some(token)) = (self.store.get(), self.cookie_token(headers))
+            && let Err(e) = store.delete(&hex(&digest(token.as_bytes()))).await
+        {
+            tracing::warn!(error = %e, "{} admin sign-out not shared (store unavailable)", self.prefix);
+        }
+        self.logout(headers)
     }
 
     /// Ends the request's session (if any) and returns the `Set-Cookie` that
@@ -498,6 +745,24 @@ impl AdminAuth {
         header.set_sensitive(true);
         header
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The local `Instant` matching Unix time `unix`, given that `now` is
+/// `now_unix` (clamped to the past: an instance never trusts a future stamp).
+fn instant_from_unix(unix: i64, now: Instant, now_unix: i64) -> Instant {
+    let age = Duration::from_secs((now_unix - unix).max(0) as u64);
+    now.checked_sub(age).unwrap_or(now)
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `Origin`, else the origin of `Referer`, normalized.
@@ -753,5 +1018,104 @@ mod tests {
             ("origin", "https://console.example"),
         ]);
         assert!(!a.same_origin(&fwd));
+    }
+
+    // ------------------------------------------------ cluster-shared state
+
+    fn cluster() -> (AdminAuth, AdminAuth, Arc<crate::store::testing::MemoryStore>) {
+        let store = Arc::new(crate::store::testing::MemoryStore::default());
+        let (a, b) = (auth(), auth());
+        a.attach_store(store.clone());
+        b.attach_store(store.clone());
+        (a, b, store)
+    }
+
+    fn signed_in_cookie(a: &AdminAuth, outcome: LoginOutcome) -> HeaderMap {
+        let LoginOutcome::Success { set_cookie } = outcome else {
+            panic!("login failed: {outcome:?}");
+        };
+        let token = set_cookie
+            .to_str()
+            .unwrap()
+            .trim_start_matches("hfs_admin=")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let _ = a;
+        headers(&[
+            ("cookie", &format!("hfs_admin={token}")),
+            ("host", "hfs.example"),
+            ("origin", "https://hfs.example"),
+        ])
+    }
+
+    /// A session signed in on instance A is accepted on instance B (which
+    /// never saw it) once B consults the shared store; signing out on B ends
+    /// it for an instance that has to ask the store.
+    #[tokio::test]
+    async fn a_session_from_one_instance_works_on_another_and_signs_out_everywhere() {
+        let (a, b, _store) = cluster();
+        let form = headers(&[("host", "hfs.example"), ("origin", "https://hfs.example")]);
+        let cookie = signed_in_cookie(&a, a.login_shared(&form, None, "admin", "correct horse").await);
+
+        assert_eq!(
+            b.authorize(&Method::GET, &cookie, None).unwrap_err(),
+            Denial::Unauthenticated,
+            "without the store B does not know the cookie"
+        );
+        b.sync_request(&cookie, None).await;
+        assert_eq!(b.authorize(&Method::GET, &cookie, None).unwrap().via, Via::Session);
+        assert_eq!(b.session_user(&cookie).as_deref(), Some("admin"));
+
+        b.logout_shared(&cookie).await;
+        assert!(b.session_user(&cookie).is_none(), "signed out locally");
+        let c = auth();
+        c.attach_store(_store.clone());
+        c.sync_request(&cookie, None).await;
+        assert!(c.session_user(&cookie).is_none(), "and in the shared store");
+    }
+
+    /// Failures spread over two instances count towards one lockout, which
+    /// then applies on both — the guesser does not get N × MAX_FAILURES.
+    #[tokio::test]
+    async fn failed_attempts_on_several_instances_share_one_lockout() {
+        let (a, b, _store) = cluster();
+        let peer = Some("198.51.100.7".parse().unwrap());
+        let wrong = headers(&[("authorization", &basic("admin", "nope"))]);
+        for i in 0..MAX_FAILURES - 1 {
+            let inst = if i % 2 == 0 { &a } else { &b };
+            inst.sync_request(&wrong, peer).await;
+            assert_eq!(
+                inst.authorize(&Method::GET, &wrong, peer).unwrap_err(),
+                Denial::BadCredentials
+            );
+            inst.share_failure(&wrong, peer).await;
+        }
+        // The fifth failure, on A, locks the client cluster-wide.
+        a.sync_request(&wrong, peer).await;
+        let _ = a.authorize(&Method::GET, &wrong, peer);
+        a.share_failure(&wrong, peer).await;
+
+        let right = headers(&[("authorization", &basic("admin", "correct horse"))]);
+        b.sync_request(&right, peer).await;
+        assert!(
+            matches!(
+                b.authorize(&Method::GET, &right, peer).unwrap_err(),
+                Denial::RateLimited(_)
+            ),
+            "B adopts the lockout recorded through A"
+        );
+    }
+
+    /// Without a store nothing changes: the shared calls are no-ops.
+    #[tokio::test]
+    async fn without_a_store_the_shared_calls_are_plain() {
+        let a = auth();
+        assert!(!a.has_shared_store());
+        let form = headers(&[("host", "hfs.example"), ("origin", "https://hfs.example")]);
+        let cookie = signed_in_cookie(&a, a.login_shared(&form, None, "admin", "correct horse").await);
+        a.sync_request(&cookie, None).await;
+        assert_eq!(a.session_user(&cookie).as_deref(), Some("admin"));
     }
 }

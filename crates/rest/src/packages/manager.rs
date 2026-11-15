@@ -242,8 +242,11 @@ pub struct PackageManager {
     fhir_version: FhirVersion,
     default_tenant: String,
     config: PackageConfig,
-    jobs: JobTable,
+    jobs: Arc<JobTable>,
     install_lock: tokio::sync::Mutex<()>,
+    /// Cluster-wide install lock and job mirror (shared database), when the
+    /// storage backend provides one.
+    coordinator: Option<Arc<dyn helios_persistence::core::package_jobs::PackageJobCoordinator>>,
     /// `true` once the core terminology is known to be on the terminology
     /// server (see [`PackageManager::ensure_core_terminology`]); the lock
     /// keeps the startup sync and an install from sending it twice.
@@ -314,9 +317,44 @@ impl PackageManager {
             default_tenant: config.default_tenant.clone(),
             config: config.packages.clone(),
             deps,
-            jobs: JobTable::default(),
+            jobs: Arc::new(JobTable::default()),
             install_lock: tokio::sync::Mutex::new(()),
+            coordinator: None,
             core_synced: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    /// Coordinates package jobs with the other instances of a cluster through
+    /// the shared database: one install at a time cluster-wide, and every
+    /// job visible (and cancellable) from every instance.
+    pub fn with_coordinator(
+        mut self,
+        coordinator: Arc<dyn helios_persistence::core::package_jobs::PackageJobCoordinator>,
+        instance_id: String,
+    ) -> Self {
+        self.jobs.attach_mirror(Arc::clone(&coordinator), instance_id);
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    /// Takes the cluster-wide install lock `key` (no-op on one instance). A
+    /// failure to take it is logged and the job proceeds on the per-process
+    /// lock alone, as before clustering.
+    async fn cluster_lock(
+        &self,
+        job: Option<&Job>,
+        key: i32,
+    ) -> Option<Box<dyn helios_persistence::core::package_jobs::InstallLockGuard>> {
+        let coordinator = self.coordinator.as_ref()?;
+        match coordinator.lock_installs(key).await {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                warn!(error = %e, "cluster package lock unavailable; serializing on this instance only");
+                if let Some(job) = job {
+                    job.log(format!("cluster package lock unavailable: {e}"));
+                }
+                None
+            }
         }
     }
 
@@ -870,6 +908,7 @@ impl PackageManager {
     ) {
         job.phase("waiting for other package jobs");
         let _guard = self.install_lock.lock().await;
+        let _cluster_guard = self.cluster_lock(Some(job), 0).await;
         job.start();
         if self.routes_terminology_to_hts(options) {
             job.phase("checking the core terminology on the terminology server");
@@ -1453,6 +1492,7 @@ impl PackageManager {
     ) {
         job.phase("waiting for other package jobs");
         let _guard = self.install_lock.lock().await;
+        let _cluster_guard = self.cluster_lock(Some(job), 0).await;
         job.start();
         job.update(|s| s.packages_total = 1);
         let key = format!("{name}#{version}");
@@ -1889,6 +1929,9 @@ impl PackageManager {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Cluster: instances booting together take turns, so the second
+            // finds the first's installs done instead of racing them.
+            let _startup_guard = this.cluster_lock(None, 1).await;
             if sync_core {
                 this.sync_core_terminology_at_startup().await;
             }

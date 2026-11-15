@@ -848,6 +848,73 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(self.clone()))
     }
 
+    fn package_job_coordinator(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
+        use super::package_jobs::PgPackageJobCoordinator;
+        Some(std::sync::Arc::new(PgPackageJobCoordinator::new(self.pool())))
+    }
+
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        use super::cluster_change_feed::PgClusterChangeFeed;
+        Some(std::sync::Arc::new(PgClusterChangeFeed::new(self.pool())))
+    }
+
+    fn cluster_job_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        use super::cluster_jobs::PgClusterJobStore;
+        Some(std::sync::Arc::new(PgClusterJobStore::new(self.pool())))
+    }
+
+    fn subscription_state_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        use super::subscription_state::PgSubscriptionStateStore;
+        Some(std::sync::Arc::new(PgSubscriptionStateStore::new(
+            self.pool(),
+        )))
+    }
+
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>>
+    {
+        use super::subscription_state::PgSubscriptionStateStore;
+        Some(std::sync::Arc::new(PgSubscriptionStateStore::new(
+            self.pool(),
+        )))
+    }
+
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>>
+    {
+        use super::subscription_outbox::PgSubscriptionDeliveryOutbox;
+        Some(std::sync::Arc::new(PgSubscriptionDeliveryOutbox::new(
+            self.pool(),
+        )))
+    }
+
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        use super::subscription_ws_tokens::PgWsBindingTokenStore;
+        Some(std::sync::Arc::new(PgWsBindingTokenStore::new(self.pool())))
+    }
+
+    fn subscription_fanout(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::event_fanout::EventFanout>> {
+        use super::subscription_fanout::PgNotifyFanout;
+        let fanout = self.fanout_slot().get_or_init(|| {
+            std::sync::Arc::new(PgNotifyFanout::new(self.pool(), self.config().clone()))
+        });
+        Some(std::sync::Arc::clone(fanout) as _)
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,
@@ -1005,34 +1072,40 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // An unconditional PUT is last-writer-wins at the API surface. The
+        // update below is version-guarded, so when another writer (another
+        // instance of a cluster) commits between our read and our write it
+        // reports a version conflict, and two racing first PUTs make one
+        // create fail as a duplicate. Both are transient for an unconditional
+        // PUT: re-read and try again, a bounded number of times.
+        //
+        // Racing PUTs of one id are serialized on a per-id criteria lock
+        // first (the same lock a conditional write on `_id` takes), so under
+        // heavy contention — thirty instances' worth of PUTs to one resource
+        // — the read-then-write does not lose its race repeatedly; the retry
+        // stays as a backstop for writers that do not take the lock.
+        let _id_lock = self
+            .lock_condition(tenant, resource_type, &format!("_id={id}"))
+            .await?;
+        const ATTEMPTS: usize = 8;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = self
+                .create_or_update_once(tenant, resource_type, id, resource.clone(), fhir_version)
+                .await;
+            match result {
+                Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }))
+                | Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))
+                    if attempt < ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (attempt as u64) * 5,
+                    ))
+                    .await;
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -4168,6 +4241,13 @@ impl ConditionalStorage for PostgresBackend {
         search_params: &str,
         fhir_version: FhirVersion,
     ) -> StorageResult<ConditionalCreateResult> {
+        // Search-then-create is atomic only under the criteria lock: without
+        // it, concurrent requests (on one instance or several) all find no
+        // match and all create — duplicate patients from a retried
+        // `If-None-Exist` POST.
+        let _criteria_lock = self
+            .lock_condition(tenant, resource_type, search_params)
+            .await?;
         // Find matching resources based on search parameters
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
@@ -4205,6 +4285,11 @@ impl ConditionalStorage for PostgresBackend {
         fhir_version: FhirVersion,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
+        // Same check-then-act as conditional create (an upsert creates on no
+        // match): serialize on the criteria.
+        let _criteria_lock = self
+            .lock_condition(tenant, resource_type, search_params)
+            .await?;
         // Find matching resources based on search parameters
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
@@ -4812,6 +4897,15 @@ impl PostgresBackend {
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
+                        // A deleted resource is brought back to life by an
+                        // update (FHIR http.html#delete), continuing its
+                        // version chain; inserting it afresh would collide
+                        // with the soft-deleted row.
+                        if let Some(restored) =
+                            tx.restore_deleted(&resource_type, &id, resource.clone()).await?
+                        {
+                            return Ok(BundleEntryResult::created(restored));
+                        }
                         // Create new resource with specified ID
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
@@ -7881,5 +7975,137 @@ mod standalone_reindex_classify_tests {
             ),
             "PoolExhausted must pass through, got {classified:?}"
         );
+    }
+}
+
+impl PostgresBackend {
+    /// One read-then-write attempt of [`ResourceStorage::create_or_update`].
+    async fn create_or_update_once(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        // Check if exists
+        match self.read(tenant, resource_type, id).await {
+            // Update existing (preserves original FHIR version)
+            Ok(Some(current)) => {
+                let updated = self.update(tenant, &current, resource).await?;
+                Ok((updated, false))
+            }
+            // Create new with specific ID
+            Ok(None) => {
+                let mut resource = resource;
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                }
+                let created = self
+                    .create(tenant, resource_type, resource, fhir_version)
+                    .await?;
+                Ok((created, true))
+            }
+            // A deleted resource is brought back to life by a subsequent update
+            // (FHIR http.html#delete), continuing the existing version chain
+            // rather than being rejected with `Gone`.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let restored = self
+                    .restore_deleted(tenant, resource_type, id, resource)
+                    .await?;
+                Ok((restored, true))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+}
+
+/// Held while a conditional interaction checks and writes; dropping it
+/// releases the session advisory lock (on a background task) and returns the
+/// connection to the pool.
+pub(crate) struct ConditionLock {
+    client: Option<deadpool_postgres::Client>,
+    key: i32,
+}
+
+impl Drop for ConditionLock {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let key = self.key;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = client
+                        .execute(
+                            "SELECT pg_advisory_unlock($1, $2)",
+                            &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
+                        )
+                        .await;
+                });
+            }
+            Err(_) => {
+                // Discard the session so the lock cannot leak into the pool.
+                let _ = deadpool_postgres::Object::take(client);
+            }
+        }
+    }
+}
+
+impl PostgresBackend {
+    /// Takes the advisory lock serializing conditional creates / upserts on
+    /// `criteria` across every connection of every instance. Waiters poll
+    /// with `pg_try_advisory_lock` and give their connection back between
+    /// tries, so a queue of waiters cannot exhaust the pool the holder needs
+    /// for its own write.
+    async fn lock_condition(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<ConditionLock> {
+        let key = super::lock_protocol::condition_key(
+            tenant.tenant_id().as_str(),
+            resource_type,
+            criteria,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut backoff = std::time::Duration::from_millis(2);
+        loop {
+            let client = self.get_client().await?;
+            let acquired: bool = client
+                .query_one(
+                    "SELECT pg_try_advisory_lock($1, $2)",
+                    &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
+                )
+                .await
+                .map_err(|e| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("conditional interaction lock: {e}"),
+                        source: None,
+                    })
+                })?
+                .get(0);
+            if acquired {
+                return Ok(ConditionLock {
+                    client: Some(client),
+                    key,
+                });
+            }
+            drop(client);
+            if std::time::Instant::now() >= deadline {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "postgres".to_string(),
+                    message: "timed out waiting for a concurrent conditional write on the same \
+                              criteria"
+                        .to_string(),
+                }));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+        }
     }
 }

@@ -18,6 +18,8 @@
 //! Set `HFS_STORAGE_BACKEND` to `sqlite`, `sqlite-elasticsearch`, `postgres`,
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
+mod cluster;
+
 use std::sync::Arc;
 
 mod audit_retention;
@@ -1188,6 +1190,11 @@ async fn serve(
     // admin pages (installed into the UI before it is mounted) and the admin
     // API, which the IG Packages page calls with the same session cookie.
     let admin_gate = admin_gate(config);
+    // PostgreSQL primary: administrator sessions and the sign-in lockout are
+    // shared by every instance (and survive restarts).
+    if let (Some(auth), Some(store)) = (admin_gate.auth(), ADMIN_SESSION_STORE.get()) {
+        auth.attach_store(store.clone());
+    }
     #[cfg(feature = "ui")]
     helios_ui::set_admin_gate(admin_gate.clone());
 
@@ -1339,6 +1346,40 @@ async fn admin_guard_unless_jwt(
         return next.run(request).await;
     }
     helios_admin_auth::guard(axum::extract::State(guard), request, next).await
+}
+
+/// The shared administrator session store, opened once the PostgreSQL primary
+/// is up and attached to the admin gate in [`serve`].
+static ADMIN_SESSION_STORE: std::sync::OnceLock<Arc<dyn helios_admin_auth::AdminSessionStore>> =
+    std::sync::OnceLock::new();
+
+/// Opens [`ADMIN_SESSION_STORE`] in the primary database. A failure leaves
+/// admin sessions in process (logged): sign-in still works, per instance.
+#[cfg(feature = "postgres")]
+async fn open_admin_session_store(
+    backend: &helios_persistence::backends::postgres::PostgresBackend,
+) {
+    match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
+        backend.shared_pool(),
+        "HFS",
+    )
+    .await
+    {
+        Ok(store) => {
+            let _ = ADMIN_SESSION_STORE.set(Arc::new(store));
+        }
+        Err(e) => warn!(
+            error = %e,
+            "admin session store unavailable; administrator sessions stay per instance"
+        ),
+    }
+}
+
+/// `true` for an environment variable set to `true`/`1`/`yes` (any case).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
 }
 
 /// The administrative API: package and tenant administration, and the
@@ -1926,6 +1967,38 @@ async fn run() -> anyhow::Result<()> {
         .storage_backend_mode()
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
+    // Cluster-mode fail-fast: refuse configurations that cannot run as one
+    // of N instances (docs/ops/cluster.md) before any
+    // subsystem starts. The audit config is re-parsed by its init function
+    // below; parsing here too is cheap and keeps this check pure.
+    {
+        let audit_config = AuditConfig::from_env();
+        let view = cluster::ClusterConfigView {
+            cluster: config.cluster,
+            primary_backend: backend_mode.primary_backend_kind(),
+            job_store_backend: &config.job_store_backend,
+            bulk_export_enabled: config.bulk_export.enabled,
+            bulk_export_output_backend: &config.bulk_export.output_backend,
+            bulk_export_output_shared: env_flag("HFS_BULK_EXPORT_OUTPUT_SHARED"),
+            bulk_submit_enabled: config.bulk_submit.enabled,
+            bulk_submit_output_backend: &config.bulk_submit.output_backend,
+            bulk_submit_output_shared: env_flag("HFS_BULK_SUBMIT_OUTPUT_SHARED"),
+            audit_backend: audit_config.backend,
+            // Feature-gated: a binary without the subscriptions feature
+            // cannot run the engine, so its configuration cannot hurt a
+            // cluster.
+            subscriptions_enabled: cfg!(feature = "subscriptions")
+                && config.subscriptions_enabled(),
+            subscriptions_fanout: &config.subscriptions_fanout,
+        };
+        if let Err(errors) = cluster::validate_cluster_config(&view) {
+            for error in &errors {
+                eprintln!("Configuration error: {}", error);
+            }
+            std::process::exit(1);
+        }
+    }
+
     // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
     // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
     // operations (memberOf, subsumes) to the configured HTS instance.
@@ -2146,6 +2219,45 @@ fn spawn_postgres_search_param_refresh(
     config: &ServerConfig,
 ) {
     let ttl = config.search_param_cache_ttl;
+    // Cluster mode: follow the trigger-maintained SearchParameter epochs so a
+    // SearchParameter written through another instance takes effect for
+    // searches here within one sync interval, not one TTL.
+    if config.cluster && config.cluster_sync_interval_ms > 0 {
+        let interval = std::time::Duration::from_millis(config.cluster_sync_interval_ms);
+        let sweep = (ttl > 0).then(|| std::time::Duration::from_secs(ttl));
+        tokio::spawn(async move {
+            let mut seen: Option<i64> = None;
+            let mut last_refresh = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(interval).await;
+                let epoch = match backend.search_parameter_epoch_sum().await {
+                    Ok(epoch) => epoch,
+                    Err(e) => {
+                        tracing::warn!("SearchParameter epoch poll failed: {e}");
+                        continue;
+                    }
+                };
+                let moved = seen.is_some_and(|prev| prev != epoch);
+                let swept = sweep.is_some_and(|s| last_refresh.elapsed() >= s);
+                seen = Some(epoch);
+                if !(moved || swept) {
+                    continue;
+                }
+                last_refresh = std::time::Instant::now();
+                match backend.refresh_stored_search_parameters().await {
+                    Ok(stored) => tracing::debug!(
+                        stored,
+                        epoch,
+                        "SearchParameter registry refreshed (cluster sync)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                    ),
+                }
+            }
+        });
+        return;
+    }
     if ttl == 0 {
         return;
     }
@@ -3464,6 +3576,7 @@ async fn start_postgres(
     let backend = Arc::new(backend);
     register_pg_pool_metrics("primary", backend.clone());
     attach_login_sessions(auth_state.as_ref(), backend.clone());
+    open_admin_session_store(&backend).await;
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -3555,6 +3668,7 @@ async fn start_postgres_elasticsearch(
     // skips the large local patient export index.
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
+    open_admin_session_store(&backend).await;
 
     // Offload search to Elasticsearch
     let pg = Arc::new(backend);

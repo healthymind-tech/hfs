@@ -40,7 +40,28 @@ pub const FORK_SEARCH_PARAMETER_EPOCHS: &str = "hm-0001-search-parameter-epochs"
 /// recorded by name in `hm_schema_migrations`. Append only; never renumber or
 /// reorder, and every body must be idempotent (it may run against a schema
 /// where an earlier build already created its objects).
-pub const FORK_MIGRATIONS: &[&str] = &[FORK_SEARCH_PARAMETER_EPOCHS];
+/// Shared async job queue (`cluster_jobs`); upstream `feat/cluster-capable-state`
+/// v14 -> v15, taken by hm/p3-cluster (first shipped there as ladder v48).
+pub const FORK_CLUSTER_JOBS: &str = "hm-0002-cluster-jobs";
+
+/// Subscriptions cluster delivery tables (state, notification events,
+/// delivery outbox, WebSocket binding tokens); upstream branch v16 -> v17.
+pub const FORK_SUBSCRIPTION_CLUSTER: &str = "hm-0003-subscription-cluster-delivery";
+
+/// Trigger-fed `resource_change_feed` for cross-instance definition
+/// propagation (fork, hm/p3-cluster).
+pub const FORK_RESOURCE_CHANGE_FEED: &str = "hm-0004-resource-change-feed";
+
+/// Shared IG package job mirror `hfs_package_jobs` (fork, hm/p3-cluster).
+pub const FORK_PACKAGE_JOBS: &str = "hm-0005-package-jobs";
+
+pub const FORK_MIGRATIONS: &[&str] = &[
+    FORK_SEARCH_PARAMETER_EPOCHS,
+    FORK_CLUSTER_JOBS,
+    FORK_SUBSCRIPTION_CLUSTER,
+    FORK_RESOURCE_CHANGE_FEED,
+    FORK_PACKAGE_JOBS,
+];
 
 /// Environment switch that lets this binary start against a database whose
 /// upstream schema version is newer than [`SCHEMA_VERSION`]. Off by default:
@@ -245,6 +266,10 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
         }
         match *name {
             FORK_SEARCH_PARAMETER_EPOCHS => fork_search_parameter_epochs(client).await?,
+            FORK_CLUSTER_JOBS => fork_cluster_jobs(client).await?,
+            FORK_SUBSCRIPTION_CLUSTER => fork_subscription_cluster_delivery(client).await?,
+            FORK_RESOURCE_CHANGE_FEED => fork_resource_change_feed(client).await?,
+            FORK_PACKAGE_JOBS => fork_package_jobs(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client
@@ -5078,6 +5103,278 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// Fork migration `hm-0002-cluster-jobs`: the unified `cluster_jobs` table (upstream cluster design doc §4;
+/// upstream numbered it v14 -> v15 on `feat/cluster-capable-state`).
+///
+/// One shared queue for every async job surface that was process-local
+/// (SoF `$export` #169, search reindex A2), discriminated by `kind`. Claiming
+/// uses the same lease + fencing-token discipline as `bulk_export_jobs`
+/// (worker_id / lease_expiry / heartbeat_at / fencing_token columns and the
+/// `FOR UPDATE SKIP LOCKED` claim in `cluster_jobs.rs`); bulk export/submit
+/// deliberately stay on their own tables (resolved decision F3).
+async fn fork_cluster_jobs(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_jobs (
+                id               TEXT PRIMARY KEY,
+                tenant_id        TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'queued',
+                payload          JSONB NOT NULL,
+                progress         JSONB,
+                result           JSONB,
+                error_message    TEXT,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                worker_id        TEXT,
+                lease_expiry     TIMESTAMPTZ,
+                heartbeat_at     TIMESTAMPTZ,
+                fencing_token    BIGINT NOT NULL DEFAULT 0,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at       TIMESTAMPTZ,
+                finished_at      TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration hm-0002-cluster-jobs failed: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_claim
+                 ON cluster_jobs(kind, status, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_tenant
+                 ON cluster_jobs(tenant_id, kind, created_at DESC)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
+    Ok(())
+}
+
+/// Fork migration `hm-0005-package-jobs`: the shared mirror of IG package jobs (fork,
+/// `crate::core::package_jobs`), so a job started on one instance can be
+/// polled and cancelled through any other.
+async fn fork_package_jobs(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hfs_package_jobs (
+                 id               TEXT PRIMARY KEY,
+                 tenant_id        TEXT NOT NULL,
+                 kind             TEXT NOT NULL,
+                 status           TEXT NOT NULL,
+                 terminal         BOOLEAN NOT NULL DEFAULT FALSE,
+                 view             JSONB NOT NULL,
+                 cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                 owner            TEXT NOT NULL,
+                 created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE INDEX IF NOT EXISTS idx_hfs_package_jobs_created
+                 ON hfs_package_jobs (created_at DESC);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration hm-0005-package-jobs failed: {e}")))?;
+    Ok(())
+}
+
+/// Fork migration `hm-0004-resource-change-feed`: the cross-instance change feed for definition resources.
+///
+/// Each HFS instance compiles stored StructureDefinitions into its own
+/// validation profile registry; a write served by one instance must reach the
+/// others (`crate::core::cluster_change_feed`). The trigger records every
+/// write to a watched type with the writing transaction's id, for every write
+/// path that touches the row — CRUD, bundles, package installs, bulk submit,
+/// purge, maintenance SQL. `WHEN` keeps it free for every other type.
+async fn fork_resource_change_feed(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS resource_change_feed (
+                 seq           BIGSERIAL PRIMARY KEY,
+                 txid          xid8 NOT NULL DEFAULT pg_current_xact_id(),
+                 tenant_id     TEXT NOT NULL,
+                 resource_type TEXT NOT NULL,
+                 resource_id   TEXT NOT NULL,
+                 changed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE INDEX IF NOT EXISTS idx_resource_change_feed_txid
+                 ON resource_change_feed (txid);
+             CREATE INDEX IF NOT EXISTS idx_resource_change_feed_changed_at
+                 ON resource_change_feed (changed_at);
+             CREATE OR REPLACE FUNCTION hfs_record_resource_change() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF TG_OP = 'DELETE' THEN
+                     INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id)
+                     VALUES (OLD.tenant_id, OLD.resource_type, OLD.id);
+                 ELSE
+                     INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id)
+                     VALUES (NEW.tenant_id, NEW.resource_type, NEW.id);
+                 END IF;
+                 RETURN NULL;
+             END
+             $$;
+             DROP TRIGGER IF EXISTS trg_resource_change_feed_write ON resources;
+             CREATE TRIGGER trg_resource_change_feed_write
+                 AFTER INSERT OR UPDATE ON resources FOR EACH ROW
+                 WHEN (NEW.resource_type = 'StructureDefinition')
+                 EXECUTE FUNCTION hfs_record_resource_change();
+             DROP TRIGGER IF EXISTS trg_resource_change_feed_delete ON resources;
+             CREATE TRIGGER trg_resource_change_feed_delete
+                 AFTER DELETE ON resources FOR EACH ROW
+                 WHEN (OLD.resource_type = 'StructureDefinition')
+                 EXECUTE FUNCTION hfs_record_resource_change();",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration hm-0004-resource-change-feed failed: {e}")))?;
+    Ok(())
+}
+
+/// Fork migration `hm-0003-subscription-cluster-delivery` (upstream branch v16 -> v17): Subscriptions cluster delivery (design doc §Class B, #170).
+///
+/// Four tables:
+/// - `subscription_state` — shared per-subscription counters/status (B4);
+///   rows are created lazily by the first upsert-increment so a Subscription
+///   update can never reset them.
+/// - `subscription_notification_events` — built websocket-channel bundles,
+///   loaded by the instances holding the sockets when a fan-out envelope
+///   arrives (B1; NOTIFY payloads cap at ~8KB so bundles never ride it).
+/// - `subscription_delivery_outbox` — durable push-channel deliveries under
+///   the cluster-jobs lease + fencing discipline plus a retry schedule (B5).
+/// - `subscription_ws_tokens` — single-use WebSocket binding tokens,
+///   redeemed with `DELETE … RETURNING` (B2).
+async fn fork_subscription_cluster_delivery(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_state (
+                tenant_id            TEXT NOT NULL,
+                subscription_id      TEXT NOT NULL,
+                event_number         BIGINT NOT NULL DEFAULT 0,
+                consecutive_failures INT NOT NULL DEFAULT 0,
+                status               TEXT,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration hm-0003 (subscription_state) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_notification_events (
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                event_number    BIGINT NOT NULL,
+                bundle          JSONB NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, subscription_id, event_number)
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration hm-0003 (subscription_notification_events) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_notification_events_reap
+                 ON subscription_notification_events(created_at)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_sub_notification_events_reap: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_delivery_outbox (
+                id                BIGSERIAL PRIMARY KEY,
+                tenant_id         TEXT NOT NULL,
+                subscription_id   TEXT NOT NULL,
+                event_number      BIGINT,
+                notification_type TEXT NOT NULL,
+                bundle            JSONB NOT NULL,
+                attempts          INT NOT NULL DEFAULT 0,
+                next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status            TEXT NOT NULL DEFAULT 'queued',
+                last_error        TEXT,
+                worker_id         TEXT,
+                lease_expiry      TIMESTAMPTZ,
+                fencing_token     BIGINT NOT NULL DEFAULT 0,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at       TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration hm-0003 (subscription_delivery_outbox) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_claim
+                 ON subscription_delivery_outbox(status, next_attempt_at, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_sub_outbox_tenant
+                 ON subscription_delivery_outbox(tenant_id, subscription_id)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_sub_outbox_tenant: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS subscription_ws_tokens (
+                token           TEXT PRIMARY KEY,
+                tenant_id       TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                expires_at      TIMESTAMPTZ NOT NULL
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration hm-0003 (subscription_ws_tokens) failed: {}",
+                e
+            ))
+        })?;
+
+    Ok(())
+}
+
 fn pg_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -5369,9 +5666,14 @@ mod postgres_integration_migrations {
         initialize_schema(&mut client).await.expect("upgrade fork v47");
 
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        // hm-0001 is recorded by the re-stamp (not re-run); the later fork
+        // migrations (hm/p3-cluster tables) are then applied normally.
         assert_eq!(
             applied_fork_migrations(&client).await.unwrap(),
-            vec![FORK_SEARCH_PARAMETER_EPOCHS.to_string()]
+            FORK_MIGRATIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
         let epoch: i64 = client
             .query_one(

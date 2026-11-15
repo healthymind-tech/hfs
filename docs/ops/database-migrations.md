@@ -38,6 +38,22 @@ At startup:
 4. Fork migrations not yet in `hm_schema_migrations` run in list order
    (`FORK_MIGRATIONS` in `crates/persistence/src/backends/postgres/schema.rs`).
 
+Fork migrations in this build:
+
+| Name | Adds | From |
+|---|---|---|
+| `hm-0001-search-parameter-epochs` | `search_parameter_epochs` + triggers | fork (was ladder "v47") |
+| `hm-0002-cluster-jobs` | `cluster_jobs` (shared async job queue) | upstream branch `feat/cluster-capable-state` (its v14→v15), via hm/p3-cluster |
+| `hm-0003-subscription-cluster-delivery` | `subscription_state`, `subscription_notification_events`, `subscription_delivery_outbox`, `subscription_ws_tokens` | same upstream branch (v16→v17) |
+| `hm-0004-resource-change-feed` | `resource_change_feed` + StructureDefinition triggers | fork (hm/p3-cluster) |
+| `hm-0005-package-jobs` | `hfs_package_jobs` | fork (hm/p3-cluster) |
+
+hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
+this track when it was merged with hm/p3-pgops (upstream has its own v48+). No
+deployed database ever carried v48–v51. When upstream releases the cluster
+tables under its own numbers, the upstream step must tolerate them existing
+(all bodies here are `IF NOT EXISTS` / `CREATE OR REPLACE`) — check at rebase.
+
 ```sql
 -- what a database is at
 SELECT version FROM schema_version;

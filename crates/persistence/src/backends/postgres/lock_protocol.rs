@@ -104,6 +104,32 @@ pub(super) fn resource_key(tenant_id: &str, resource_type: &str, id: &str) -> St
     ])
 }
 
+/// Advisory-lock namespace for conditional-interaction criteria (`HFSC`).
+pub(super) const CONDITION_LOCK_NAMESPACE: i32 = 0x4846_5343;
+
+/// Derives the key serializing conditional creates / upserts that share
+/// `tenant_id` / `resource_type` / search criteria. The criteria's `&`-separated
+/// parameters are sorted first, so `a=1&b=2` and `b=2&a=1` share a key.
+pub(super) fn condition_key(
+    tenant_id: &str,
+    resource_type: &str,
+    criteria: &str,
+) -> StorageResult<i32> {
+    let mut params: Vec<&str> = criteria
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .collect();
+    params.sort_unstable();
+    let normalized = params.join("&");
+    hash_components(&[
+        b"conditional",
+        tenant_id.as_bytes(),
+        resource_type.as_bytes(),
+        normalized.as_bytes(),
+    ])
+}
+
 /// Derives the per-resource keys for a group, deduplicated and sorted ascending.
 ///
 /// Acquiring the returned keys in order is what keeps overlapping groups from
