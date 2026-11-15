@@ -769,6 +769,14 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         self.inner.list_manifests_awaiting_reindex(limit).await
     }
 
+    async fn submission_index_pending(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<bool> {
+        self.inner.submission_index_pending(tenant, id).await
+    }
+
     async fn set_manifest_fetch_params(
         &self,
         tenant: &TenantContext,

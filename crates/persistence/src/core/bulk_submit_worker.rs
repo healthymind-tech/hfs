@@ -615,6 +615,20 @@ pub trait SubmitWorkerStorage: Send + Sync {
         Ok(())
     }
 
+    /// Whether any manifest of the submission still owes the search-index
+    /// rebuild that deferred indexing postponed, i.e. whether resources it
+    /// reported written are not yet searchable. The status poll keeps
+    /// answering `202` while this holds. The default (no marker kept) is
+    /// `false`.
+    async fn submission_index_pending(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<bool> {
+        let (_, _) = (tenant, id);
+        Ok(false)
+    }
+
     /// Manifests that still owe a rebuild, oldest first — what a restarted
     /// server has to re-fire. The default returns nothing.
     async fn list_manifests_awaiting_reindex(

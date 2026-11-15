@@ -1520,6 +1520,87 @@ async fn test_import_mode_replace_applied_to_ingestion() {
     }
 }
 
+/// Marks (or clears) the "owes a search-index rebuild" marker on every
+/// manifest behind `poll_path`, as deferred indexing does after a manifest.
+async fn set_index_pending(backend: &Arc<SqliteBackend>, poll_path: &str, pending: bool) {
+    let token = poll_path.rsplit('/').next().unwrap().to_string();
+    let target = backend
+        .resolve_poll_token(&token)
+        .await
+        .unwrap()
+        .expect("poll token resolves");
+    for manifest in backend
+        .list_manifests(&target.tenant, &target.submission_id)
+        .await
+        .unwrap()
+    {
+        if pending {
+            let lease = helios_persistence::core::ManifestLease {
+                tenant: target.tenant.clone(),
+                submission_id: target.submission_id.clone(),
+                manifest_id: manifest.manifest_id.clone(),
+                worker_id: WorkerId::new("marker"),
+                lease_expiry: chrono::Utc::now(),
+                lease_duration: Duration::from_secs(60),
+                fencing_token: 0,
+            };
+            backend.mark_manifest_index_pending(&lease).await.unwrap();
+        } else {
+            backend
+                .clear_manifest_index_pending(&target.tenant, &manifest.manifest_id)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Written is not searchable: while a finished submission still owes the
+/// search-index rebuild that deferred indexing postponed, the poll stays at
+/// `202` and says so; the `200` manifest follows the rebuild. The
+/// `status_waits_for_index = false` opt-out restores the old answer.
+#[tokio::test]
+async fn test_poll_waits_for_the_deferred_index_rebuild() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    assert_eq!(server.get(&poll_path).await.status_code(), StatusCode::OK);
+
+    set_index_pending(&backend, &poll_path, true).await;
+    let indexing = server.get(&poll_path).await;
+    assert_eq!(indexing.status_code(), StatusCode::ACCEPTED);
+    let progress = indexing
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(progress.starts_with("Indexing"), "{progress}");
+    assert!(
+        !progress.to_ascii_lowercase().starts_with("processing "),
+        "an indeterminate phase must not parse as a percentage: {progress}"
+    );
+    assert!(indexing.headers().get("retry-after").is_some());
+
+    set_index_pending(&backend, &poll_path, false).await;
+    assert_eq!(server.get(&poll_path).await.status_code(), StatusCode::OK);
+
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            status_waits_for_index: false,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    set_index_pending(&backend, &poll_path, true).await;
+    assert_eq!(
+        server.get(&poll_path).await.status_code(),
+        StatusCode::OK,
+        "opted out: 200 once written"
+    );
+}
+
 #[tokio::test]
 async fn test_full_lifecycle_ingests_and_polls() {
     let (server, backend, fetcher, output, _tmp) = create_submit_server().await;

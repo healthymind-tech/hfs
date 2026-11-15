@@ -2394,6 +2394,21 @@ impl SubmitWorkerStorage for SqliteBackend {
         Ok(())
     }
 
+    async fn submission_index_pending(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM bulk_manifests
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND index_pending = 1)",
+            params![tenant.tenant_id().as_str(), id.submitter, id.submission_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| internal_error(format!("submission index pending: {e}")))
+    }
+
     /// The resource types come from what the manifest actually ingested
     /// (`bulk_entry_results`), so nothing extra has to be stored to re-fire
     /// the rebuild.
@@ -5771,7 +5786,20 @@ mod tests {
                 .unwrap();
             }
         }
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &sub_id)
+                .await
+                .unwrap()
+        );
         backend.mark_manifest_index_pending(&lease).await.unwrap();
+        assert!(
+            backend
+                .submission_index_pending(&tenant, &sub_id)
+                .await
+                .unwrap(),
+            "a manifest owing a rebuild makes the submission not yet searchable"
+        );
 
         let pending = backend.list_manifests_awaiting_reindex(10).await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -5788,6 +5816,12 @@ mod tests {
             .clear_manifest_index_pending(&tenant, &lease.manifest_id)
             .await
             .unwrap();
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &sub_id)
+                .await
+                .unwrap()
+        );
         assert!(
             backend
                 .list_manifests_awaiting_reindex(10)

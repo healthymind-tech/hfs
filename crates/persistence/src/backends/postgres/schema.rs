@@ -62,6 +62,7 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_RESOURCE_CHANGE_FEED,
     FORK_PACKAGE_JOBS,
     FORK_SEARCH_INDEX_STATISTICS,
+    FORK_BULK_MANIFEST_INDEX_PENDING,
 ];
 
 /// Fork migration replacing the `search_index` extended statistics with
@@ -69,6 +70,10 @@ pub const FORK_MIGRATIONS: &[&str] = &[
 /// target. Numbered after line F's `hm-0002`..`hm-0005`; fork migrations
 /// are applied by name, so the gap on branches without them is harmless.
 pub const FORK_SEARCH_INDEX_STATISTICS: &str = "hm-0006-search-index-statistics";
+
+/// `bulk_manifests.index_pending` for deferred bulk-submit indexing (fork,
+/// hm/p3-interop2).
+pub const FORK_BULK_MANIFEST_INDEX_PENDING: &str = "hm-0007-bulk-manifest-index-pending";
 
 /// Statistics target for `search_index.value_token_code` after
 /// [`FORK_SEARCH_INDEX_STATISTICS`] (was 4000 since v16). See
@@ -283,6 +288,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_RESOURCE_CHANGE_FEED => fork_resource_change_feed(client).await?,
             FORK_PACKAGE_JOBS => fork_package_jobs(client).await?,
             FORK_SEARCH_INDEX_STATISTICS => fork_search_index_statistics(client).await?,
+            FORK_BULK_MANIFEST_INDEX_PENDING => fork_bulk_manifest_index_pending(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client
@@ -4475,6 +4481,27 @@ async fn fork_search_index_statistics(client: &mut deadpool_postgres::Client) ->
         })?;
     }
     analyze_search_index_with_timeout(client, "0").await
+}
+
+/// Fork migration `hm-0007-bulk-manifest-index-pending`:
+/// `bulk_manifests.index_pending` (#1125 on PostgreSQL), set when a manifest
+/// was ingested with indexing deferred and cleared when its search-index
+/// rebuild finishes. A boolean with a constant default is a catalog-only
+/// change. (hm/p3-interop2 added it as idempotent startup DDL; registered on
+/// the fork track at merge so every fork schema change is recorded by name.)
+async fn fork_bulk_manifest_index_pending(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration {FORK_BULK_MANIFEST_INDEX_PENDING} failed: {e}"
+            ))
+        })
 }
 
 const PATIENT_EXPORT_INDEX_NAME: &str = "idx_resources_patient_refs_v1";

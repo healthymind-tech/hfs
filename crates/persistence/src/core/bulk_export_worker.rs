@@ -16,13 +16,16 @@ use chrono::{DateTime, Utc};
 
 use crate::core::bulk_export::{
     BulkExportStorage, ExportDataProvider, ExportJobId, ExportLevel, ExportProgress, ExportRequest,
-    ExportStatus, GroupExportProvider, PatientExportProvider, TypeExportProgress,
+    ExportStatus, GroupExportProvider, NdjsonBatch, PatientExportProvider, TypeExportProgress,
 };
 use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey, FinalizedPart};
 use crate::core::search::SearchProvider;
 use crate::error::{BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
-use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use crate::types::{SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue};
+
+/// Prefix of a `_typeFilter` export page cursor (the search engine's cursor).
+const SEARCH_EXPORT_CURSOR_PREFIX: &str = "search:";
 
 /// Identifier for an export worker instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1067,7 +1070,31 @@ where
                     return Ok(outcome);
                 }
 
+                // A system- or Patient-level type with a `_typeFilter` is
+                // walked by the search engine itself: only matching resources
+                // are read, instead of every resource of the type being
+                // fetched and then intersected with the filter batch by batch
+                // (a 20k-match filter over 929k Observations read all 929k).
+                let search_filter = filters
+                    .get(resource_type.as_str())
+                    .filter(|_| group_patient_ids.is_none())
+                    .filter(|_| {
+                        !(matches!(view.level, ExportLevel::Patient)
+                            && !request.patient_refs.is_empty())
+                    });
                 let fetch = async {
+                    if let Some(filter) = search_filter {
+                        return self
+                            .search_export_batch(
+                                tenant,
+                                request,
+                                resource_type,
+                                filter,
+                                cursor.as_deref(),
+                                batch_size,
+                            )
+                            .await;
+                    }
                     match &group_patient_ids {
                         Some(pids) => {
                             self.data
@@ -1144,6 +1171,7 @@ where
                 // from `batch` — the traversal itself is unaffected by
                 // filtering; only what gets written is.
                 let lines = match filters.get(resource_type.as_str()) {
+                    Some(_) if search_filter.is_some() => batch.lines.clone(),
                     Some(filter) => {
                         let filtering = self.filter_batch_lines(
                             tenant,
@@ -1257,6 +1285,84 @@ where
     /// read, and drops the lines the search did not return. A line whose JSON
     /// has no `id` field cannot be matched at all and is dropped with a
     /// warning rather than kept unconditionally.
+    /// One page of `resource_type` resources matching `filter`, read through
+    /// the search engine with the export window applied.
+    ///
+    /// The window goes into the query as `_lastUpdated` bounds — a superset at
+    /// sub-second precision, since a date search value's range is widened to
+    /// its precision — and is then applied exactly, inclusive at both ends,
+    /// like `fetch_export_batch`. The cursor is the search engine's own,
+    /// prefixed so it is never mistaken for a backend export cursor.
+    async fn search_export_batch(
+        &self,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        resource_type: &str,
+        filter: &SearchQuery,
+        cursor: Option<&str>,
+        batch_size: u32,
+    ) -> StorageResult<NdjsonBatch> {
+        let mut query = filter.clone();
+        query.resource_type = resource_type.to_string();
+        let bound = |prefix: SearchPrefix, at: &DateTime<Utc>| SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(
+                prefix,
+                at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            )],
+            chain: Vec::new(),
+            components: Vec::new(),
+        };
+        if let Some(since) = &request.since {
+            query.parameters.push(bound(SearchPrefix::Ge, since));
+        }
+        if let Some(until) = &request.until {
+            query.parameters.push(bound(SearchPrefix::Le, until));
+        }
+        query.count = Some(batch_size);
+        query.cursor = cursor
+            .and_then(|c| c.strip_prefix(SEARCH_EXPORT_CURSOR_PREFIX))
+            .map(str::to_string);
+        query.offset = None;
+        query.total = None;
+        query.summary = None;
+        query.elements.clear();
+        query.sort.clear();
+        query.includes.clear();
+
+        let result = self.data.search(tenant, &query).await?;
+        let mut lines = Vec::with_capacity(result.resources.items.len());
+        for resource in &result.resources.items {
+            let at = resource.last_modified();
+            if request.since.is_some_and(|since| at < since)
+                || request.until.is_some_and(|until| at > until)
+            {
+                continue;
+            }
+            let line = serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
+                StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name: "export-worker".to_string(),
+                    message: format!("serialize filtered export line: {e}"),
+                    source: None,
+                })
+            })?;
+            lines.push(line);
+        }
+        let next = result
+            .resources
+            .page_info
+            .next_cursor
+            .filter(|_| result.resources.page_info.has_next)
+            .map(|c| format!("{SEARCH_EXPORT_CURSOR_PREFIX}{c}"));
+        Ok(NdjsonBatch {
+            lines,
+            is_last: next.is_none(),
+            next_cursor: next,
+        })
+    }
+
     async fn filter_batch_lines(
         &self,
         tenant: &TenantContext,

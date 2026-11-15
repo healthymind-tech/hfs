@@ -978,6 +978,106 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1125 on PostgreSQL: the marker that a manifest still owes a
+    /// search-index rebuild lives on the manifest row; it is listed with the
+    /// types the manifest ingested, it makes the submission report
+    /// `submission_index_pending` (which holds the status poll at 202), and
+    /// clearing it releases both.
+    #[tokio::test]
+    async fn postgres_manifest_index_pending_marks_lists_and_clears() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+            SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("manifest-index-pending");
+        let submission = SubmissionId::generate("manifest-index-pending");
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "index-pending-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient"})),
+                    NdjsonEntry::new(
+                        2,
+                        "Provenance",
+                        json!({"resourceType": "Provenance",
+                        "recorded": "2026-01-01T00:00:00Z",
+                        "target": [{"reference": "Patient/x"}],
+                        "agent": [{"who": {"display": "x"}}]}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let ours = |pending: Vec<helios_persistence::core::bulk_submit_worker::PendingReindex>| {
+            pending
+                .into_iter()
+                .filter(|p| p.manifest_id == manifest.manifest_id)
+                .collect::<Vec<_>>()
+        };
+        assert!(ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap()).is_empty());
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+
+        backend.mark_manifest_index_pending(&lease).await.unwrap();
+        let pending = ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].submission, submission);
+        assert_eq!(pending[0].tenant.tenant_id(), tenant.tenant_id());
+        assert_eq!(
+            pending[0].resource_types,
+            vec!["Patient".to_string(), "Provenance".to_string()],
+            "the types come from what the manifest ingested"
+        );
+        assert!(
+            backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+
+        backend
+            .clear_manifest_index_pending(&tenant, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert!(ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap()).is_empty());
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_publication_exact_contract() {
         use helios_persistence::core::{
@@ -20040,6 +20140,110 @@ mod postgres_integration {
         }
         ids.sort();
         ids
+    }
+
+    /// A small patient set's candidate keys are scanned once and paged from
+    /// memory: a resource deleted between two pages is skipped (its row is
+    /// read by key and is gone), every other one comes out once, and a
+    /// different patient set — or another window — never reuses the keys.
+    #[tokio::test]
+    async fn postgres_integration_small_set_pages_from_one_candidate_scan() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-candidate-cache");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patients: Vec<String> = (0..30).map(|i| format!("{prefix}-p{i:02}")).collect();
+        for p in &patients {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": p}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let obs = |p: &str, k: usize| format!("{p}-o{k}");
+        for p in &patients[..2] {
+            for k in 0..5 {
+                backend
+                    .create(
+                        &tenant,
+                        "Observation",
+                        json!({"resourceType": "Observation", "id": obs(p, k), "status": "final",
+                            "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p}")}}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let request = ExportRequest::patient();
+        let one = vec![patients[0].clone()];
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &one, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.is_last);
+        let seen_first = line_ids(&first.lines);
+        // Delete one that has not been exported yet.
+        let victim = (0..5)
+            .map(|k| obs(&patients[0], k))
+            .find(|id| !seen_first.contains(id))
+            .unwrap();
+        backend
+            .delete(&tenant, "Observation", &victim)
+            .await
+            .unwrap();
+
+        let mut got = seen_first.clone();
+        let mut cursor = first.next_cursor;
+        loop {
+            let batch = backend
+                .fetch_patient_compartment_batch(
+                    &tenant,
+                    &request,
+                    "Observation",
+                    &one,
+                    cursor.as_deref(),
+                    2,
+                )
+                .await
+                .unwrap();
+            got.extend(line_ids(&batch.lines));
+            if batch.is_last {
+                break;
+            }
+            cursor = batch.next_cursor;
+        }
+        got.sort();
+        let mut want: Vec<String> = (0..5)
+            .map(|k| obs(&patients[0], k))
+            .filter(|id| *id != victim)
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "deleted mid-export is skipped, nothing repeats");
+
+        // Another patient set has its own candidates.
+        let other = vec![patients[1].clone()];
+        let mut got_other =
+            drain_compartment_type(&backend, &tenant, "Observation", &other, 3).await;
+        got_other.sort();
+        let mut want_other: Vec<String> = (0..5).map(|k| obs(&patients[1], k)).collect();
+        want_other.sort();
+        assert_eq!(got_other, want_other);
+
+        // And a window that excludes everything is not served from the keys
+        // scanned without one.
+        let future = ExportRequest::patient().with_since(instant("2999-01-01T00:00:00Z"));
+        let none = backend
+            .fetch_patient_compartment_batch(&tenant, &future, "Observation", &other, None, 10)
+            .await
+            .unwrap();
+        assert!(none.lines.is_empty() && none.is_last);
     }
 
     /// A Group or patient list that is a large share of the tenant's patients
