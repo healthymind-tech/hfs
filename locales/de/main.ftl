@@ -2336,3 +2336,13 @@ editor-new-title = Neue Ressource: { $type }
 editor-crumb-new = Neu
 history-heading-for = Verlauf · { $subject }
 history-crumb = Verlauf
+tenants-default-tag = Standard
+tenants-default-hint = Der Standardmandant des Servers: Anfragen ohne Mandantenangabe landen hier, daher kann er nicht gelöscht werden.
+tenants-error-delete-default = „{ $id }" ist der Standardmandant des Servers und kann hier nicht abgemeldet werden.
+tenants-delete-title = Mandant „{ $id }" abmelden?
+tenants-delete-impact = { $count ->
+    [one] Mandant „{ $id }" enthält eine Ressource.
+   *[other] Mandant „{ $id }" enthält { $count } Ressourcen.
+    } Beim Abmelden wird er aus dem Mandantenregister entfernt; die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
+tenants-delete-type-id = Zur Bestätigung { $id } eingeben
+tenants-delete-submit = Abmelden

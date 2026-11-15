@@ -2453,3 +2453,15 @@ editor-crumb-new = New
 # The history page's heading once an instance is chosen; $subject is "Patient/123".
 history-heading-for = History · { $subject }
 history-crumb = History
+# Tenants page (UI/UX review §3.8): the default tenant cannot be deleted, and
+# Delete opens a dialog that states the impact and asks for the id.
+tenants-default-tag = Default
+tenants-default-hint = The server's default tenant: requests that name no tenant land here, so it cannot be deleted.
+tenants-error-delete-default = "{ $id }" is the server's default tenant and cannot be deregistered here.
+tenants-delete-title = Deregister tenant "{ $id }"?
+tenants-delete-impact = { $count ->
+    [one] Tenant "{ $id }" holds one resource.
+   *[other] Tenant "{ $id }" holds { $count } resources.
+    } Deregistering removes it from the tenant registry; its stored data is kept unless it is purged through the API.
+tenants-delete-type-id = Type { $id } to confirm
+tenants-delete-submit = Deregister

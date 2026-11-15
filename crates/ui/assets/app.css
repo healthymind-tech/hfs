@@ -2219,13 +2219,15 @@ form.htmx-request .btn[type="submit"]::after,
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
    outside the panel closes the dialog without any script. */
-.addbox--modal[open] > summary.btn {
+.addbox--modal[open] > summary.btn,
+.addbox--modal[open] > summary.icon-button {
   position: fixed;
   inset: 0;
   z-index: var(--z-dialog-backdrop);
   /* The summary doubles as the button (.btn/.btn--primary), whose fixed
      height would beat the inset stretch and shrink the backdrop to a bar
      across the top of the viewport. */
+  width: auto;
   height: auto;
   padding: 0;
   border: 0;
@@ -2241,6 +2243,8 @@ form.htmx-request .btn[type="submit"]::after,
 }
 
 .addbox--modal[open] > .addbox__panel {
+  text-align: start;
+  white-space: normal;
   position: fixed;
   top: 50%;
   left: 50%;
@@ -2320,6 +2324,24 @@ form.htmx-request .btn[type="submit"]::after,
 .tag--muted {
   background: var(--accent-soft);
   color: var(--muted);
+}
+
+/* The tenant Delete dialog (UI/UX review §3.8): its trigger is the row's
+   trash icon-button; open, that summary becomes the modal backdrop. */
+.tenant-delete > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.tenant-delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tenant-delete__impact {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
 }
 
 /* Failed provisioning job row (#581), matching .btn--danger's tokens. */
