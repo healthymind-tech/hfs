@@ -32,16 +32,71 @@ pub struct SmartConfiguration {
     pub capabilities: Vec<String>,
 }
 
+/// `scopes_supported` advertised when `HFS_SMART_SCOPES_SUPPORTED` is unset:
+/// the scope shapes HFS enforces (SMART v1 and v2, patient/user/system).
+pub const DEFAULT_SCOPES_SUPPORTED: &[&str] = &[
+    "openid",
+    "fhirUser",
+    "profile",
+    "launch/patient",
+    "offline_access",
+    "online_access",
+    "patient/*.rs",
+    "patient/*.read",
+    "user/*.cruds",
+    "user/*.rs",
+    "user/*.read",
+    "user/*.write",
+    "system/*.cruds",
+    "system/*.rs",
+    "system/*.read",
+];
+
 impl SmartConfiguration {
     /// Build the SMART configuration document from `AuthConfig`.
+    ///
+    /// Every list can be overridden from the environment (`HFS_SMART_*`), so
+    /// the document describes what the IdP in front of this server actually
+    /// offers; the defaults describe a Keycloak-style IdP with public,
+    /// client-secret and `private_key_jwt` clients.
     pub fn from_config(config: &AuthConfig) -> Self {
-        let mut response_types_supported = vec!["token".to_string()];
-        let mut grant_types_supported = vec!["client_credentials".to_string()];
+        let interactive = config.smart_authorize_endpoint.is_some();
+        let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        if config.smart_authorize_endpoint.is_some() {
-            response_types_supported.push("code".to_string());
-            grant_types_supported.push("authorization_code".to_string());
-        }
+        let response_types_supported = if interactive {
+            owned(&["code"])
+        } else {
+            Vec::new()
+        };
+        let grant_types_supported = config.smart_grant_types.clone().unwrap_or_else(|| {
+            if interactive {
+                owned(&["authorization_code", "client_credentials", "refresh_token"])
+            } else {
+                owned(&["client_credentials"])
+            }
+        });
+        let capabilities = config.smart_capabilities.clone().unwrap_or_else(|| {
+            let mut caps = Vec::new();
+            if interactive {
+                caps.extend(owned(&[
+                    "launch-standalone",
+                    "context-standalone-patient",
+                    "client-public",
+                    "client-confidential-symmetric",
+                    "sso-openid-connect",
+                    "permission-offline",
+                    "permission-online",
+                    "permission-patient",
+                    "permission-user",
+                ]));
+            }
+            caps.extend(owned(&[
+                "client-confidential-asymmetric",
+                "permission-v1",
+                "permission-v2",
+            ]));
+            caps
+        });
 
         Self {
             issuer: config.expected_issuer.clone(),
@@ -55,23 +110,21 @@ impl SmartConfiguration {
             management_endpoint: config.smart_management_endpoint.clone(),
             registration_endpoint: config.smart_registration_endpoint.clone(),
             revocation_endpoint: config.smart_revocation_endpoint.clone(),
-            scopes_supported: vec![
-                "system/*.cruds".to_string(),
-                "system/*.rs".to_string(),
-                "system/*.r".to_string(),
-            ],
+            scopes_supported: config
+                .smart_scopes_supported
+                .clone()
+                .unwrap_or_else(|| owned(DEFAULT_SCOPES_SUPPORTED)),
             response_types_supported,
             grant_types_supported,
-            token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
-            code_challenge_methods_supported: vec!["S256".to_string()],
-            token_endpoint_auth_signing_alg_values_supported: vec![
-                "RS384".to_string(),
-                "ES384".to_string(),
-            ],
-            capabilities: vec![
-                "permission-v2".to_string(),
-                "client-confidential-asymmetric".to_string(),
-            ],
+            token_endpoint_auth_methods_supported: config
+                .smart_token_auth_methods
+                .clone()
+                .unwrap_or_else(|| {
+                    owned(&["client_secret_basic", "client_secret_post", "private_key_jwt"])
+                }),
+            code_challenge_methods_supported: owned(&["S256"]),
+            token_endpoint_auth_signing_alg_values_supported: owned(&["RS384", "ES384"]),
+            capabilities,
         }
     }
 
@@ -141,5 +194,49 @@ mod tests {
         );
         // Fields that are None should be omitted
         assert!(json.get("authorization_endpoint").is_none());
+    }
+
+    #[test]
+    fn interactive_deployments_advertise_launch_and_patient_capabilities() {
+        let config = AuthConfig {
+            smart_authorize_endpoint: Some("https://idp/auth".to_string()),
+            smart_token_endpoint: Some("https://idp/token".to_string()),
+            ..AuthConfig::default()
+        };
+        let smart = SmartConfiguration::from_config(&config);
+        for cap in [
+            "launch-standalone",
+            "permission-patient",
+            "permission-v1",
+            "permission-v2",
+            "sso-openid-connect",
+        ] {
+            assert!(smart.capabilities.contains(&cap.to_string()), "{cap}");
+        }
+        assert_eq!(smart.response_types_supported, vec!["code"]);
+        assert!(smart.grant_types_supported.contains(&"refresh_token".to_string()));
+        assert!(!smart.code_challenge_methods_supported.contains(&"plain".to_string()));
+    }
+
+    #[test]
+    fn backend_only_deployments_do_not_claim_a_launch() {
+        let smart = SmartConfiguration::from_config(&AuthConfig::default());
+        assert!(!smart.capabilities.contains(&"launch-standalone".to_string()));
+        assert_eq!(smart.grant_types_supported, vec!["client_credentials"]);
+        assert!(smart.response_types_supported.is_empty());
+    }
+
+    #[test]
+    fn lists_are_overridable() {
+        let config = AuthConfig {
+            smart_capabilities: Some(vec!["launch-ehr".to_string()]),
+            smart_scopes_supported: Some(vec!["system/*.rs".to_string()]),
+            smart_token_auth_methods: Some(vec!["private_key_jwt".to_string()]),
+            ..AuthConfig::default()
+        };
+        let smart = SmartConfiguration::from_config(&config);
+        assert_eq!(smart.capabilities, vec!["launch-ehr"]);
+        assert_eq!(smart.scopes_supported, vec!["system/*.rs"]);
+        assert_eq!(smart.token_endpoint_auth_methods_supported, vec!["private_key_jwt"]);
     }
 }

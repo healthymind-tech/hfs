@@ -19,6 +19,7 @@ pub struct JwksBearerAuthProvider {
     expected_issuer: Option<String>,
     tenant_claim: String,
     allowed_algorithms: Vec<Algorithm>,
+    leeway_secs: u64,
 }
 
 impl JwksBearerAuthProvider {
@@ -36,6 +37,7 @@ impl JwksBearerAuthProvider {
             expected_issuer: config.expected_issuer.clone(),
             tenant_claim: config.tenant_claim.clone(),
             allowed_algorithms,
+            leeway_secs: config.clock_skew_secs,
         }
     }
 }
@@ -78,11 +80,12 @@ impl AuthProvider for JwksBearerAuthProvider {
         let decoding_key = self.jwks_cache.get_key(&kid).await?;
 
         // 5. Build validation
-        let validation = build_validation(
+        let mut validation = build_validation(
             alg,
             self.expected_audience.as_deref(),
             self.expected_issuer.as_deref(),
         );
+        validation.leeway = self.leeway_secs;
 
         // 6. Decode and validate
         let token_data =
@@ -90,6 +93,9 @@ impl AuthProvider for JwksBearerAuthProvider {
                 .kind()
             {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                jsonwebtoken::errors::ErrorKind::ImmatureSignature => {
+                    AuthError::ValidationError("Token not yet valid (nbf)".to_string())
+                }
                 jsonwebtoken::errors::ErrorKind::InvalidSignature => AuthError::InvalidSignature,
                 jsonwebtoken::errors::ErrorKind::InvalidAudience => {
                     AuthError::ValidationError("Invalid audience".to_string())

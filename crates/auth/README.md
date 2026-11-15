@@ -64,6 +64,20 @@ The authentication flow follows the [SMART Backend Services](https://hl7.org/fhi
    - Extracts the tenant ID from the configured claim
 5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
 
+## Modes, patient context and production setup
+
+The operator guide is [`docs/ops/auth.md`](../../docs/ops/auth.md): auth modes
+(`HFS_AUTH_MODE=off|write-protect|full`), clock skew, JWKS cache lifetime,
+patient-compartment enforcement for `patient/` scopes, SMART v2 granular
+scopes, rate limiting, the administrator credential alongside tokens, HTS
+terminology writes with tokens, Keycloak setup, nginx/TLS and the rollout plan.
+
+In this crate: [`ScopeSet::access`] answers how far a token reaches for one
+type and permission (`Access::Full`, `Access::Restricted(grants)` for
+patient-compartment / granular grants, `Access::Denied`);
+[`Principal::launch_patient`] is the SMART `patient` launch context. SMART v1
+permissions (`read`, `write`, `*`) are parsed alongside v2 (`cruds`).
+
 ## SMART v2 Scopes
 
 Scopes follow the SMART v2 syntax: `context/resourceType.permissions`
@@ -98,7 +112,10 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_ENABLED` | `false` | Master switch for authentication |
+| `HFS_AUTH_ENABLED` | `false` | Master switch for authentication (`true` = `HFS_AUTH_MODE=full`) |
+| `HFS_AUTH_MODE` | `off` | `off`, `write-protect` (anonymous reads, authenticated writes) or `full`; wins over `HFS_AUTH_ENABLED` |
+| `HFS_AUTH_CLOCK_SKEW_SECONDS` | `60` | Leeway for `exp`/`nbf` |
+| `HFS_AUTH_PATIENT_NON_COMPARTMENT` | `allow` | Whether `patient/` scopes may read types outside the Patient compartment |
 | `HFS_AUTH_JWKS_URL` | *(required)* | JWKS endpoint URL |
 | `HFS_AUTH_ISSUER` | *(none)* | Expected JWT `iss` claim |
 | `HFS_AUTH_AUDIENCE` | *(none)* | Expected JWT `aud` claim (**recommended for production** — prevents accepting tokens intended for other services) |
@@ -110,6 +127,7 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
+| `HFS_AUTH_JWKS_MAX_AGE_SECONDS` | `300` | Max seconds a fetched JWKS is trusted before refetching |
 
 ### SMART Discovery Endpoint
 

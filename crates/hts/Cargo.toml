@@ -48,6 +48,8 @@ helios-hts-ui = { path = "../hts-ui", version = "0.2.4", default-features = fals
 # Password sign-in for `/admin` and the console's management pages
 # (`HTS_ADMIN_PASSWORD`), shared with HFS.
 helios-admin-auth = { path = "../admin-auth", version = "0.2.4" }
+# SMART/OIDC bearer tokens as an alternative credential for terminology writes.
+helios-auth = { path = "../auth", version = "0.2.4" }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }

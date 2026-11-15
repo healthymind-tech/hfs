@@ -341,7 +341,15 @@ where
     // Authorization — every requested type needs read scope; Group also needs Group read.
     if let Some(p) = principal {
         let types_to_check = if resource_types.is_empty() {
-            // Whole-scope export — require a wildcard read or accept (best effort).
+            // Whole-scope export: every type is exported, so the token must
+            // read every type.
+            if !p.scopes.reads_everything() {
+                return Err(RestError::Forbidden {
+                    message: "an export without _type needs a system/*.r or user/*.r scope; \
+                              name the types you may read with _type"
+                        .to_string(),
+                });
+            }
             vec![]
         } else {
             resource_types.clone()

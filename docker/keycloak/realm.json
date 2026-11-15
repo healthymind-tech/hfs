@@ -71,7 +71,10 @@
           "protocol": "openid-connect",
           "protocolMapper": "oidc-sub-mapper",
           "consentRequired": false,
-          "config": { "access.token.claim": "true", "introspection.token.claim": "true" }
+          "config": {
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
         },
         {
           "name": "auth_time",
@@ -197,6 +200,69 @@
           }
         }
       ]
+    },
+    {
+      "name": "patient/*.rs",
+      "description": "SMART v2: read and search the launch patient's compartment",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "patient/*.read",
+      "description": "SMART v1: read the launch patient's compartment",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory",
+      "description": "SMART v2 granular: the launch patient's laboratory Observations only",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "user/*.rs",
+      "description": "SMART v2: read and search everything the user may see",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "system/*.rs",
+      "description": "SMART v2: backend read and search on every type",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "launch/patient",
+      "description": "SMART: ask for a patient launch context",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "offline_access",
+      "description": "OAuth: refresh token that outlives the session",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
     }
   ],
   "clients": [
@@ -215,8 +281,13 @@
       "directAccessGrantsEnabled": false,
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["system/*.cruds"],
-      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"],
+      "defaultClientScopes": [
+        "system/*.cruds"
+      ],
+      "optionalClientScopes": [
+        "system/Patient.rs",
+        "system/Observation.r"
+      ],
       "protocolMappers": [
         {
           "name": "hfs-audience",
@@ -245,8 +316,12 @@
       "directAccessGrantsEnabled": false,
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
-      "defaultClientScopes": ["system/Patient.rs"],
-      "optionalClientScopes": ["system/Observation.r"],
+      "defaultClientScopes": [
+        "system/Patient.rs"
+      ],
+      "optionalClientScopes": [
+        "system/Observation.r"
+      ],
       "protocolMappers": [
         {
           "name": "hfs-audience",
@@ -274,12 +349,116 @@
         "http://localhost:8080/ui/callback",
         "http://localhost:8080/*"
       ],
-      "webOrigins": ["http://localhost:8080"],
-      "defaultClientScopes": ["basic", "profile", "email", "user/*.cruds", "system/bulk-submit"],
+      "webOrigins": [
+        "http://localhost:8080"
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "user/*.cruds",
+        "system/bulk-submit"
+      ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "http://localhost:8080/*"
       }
+    },
+    {
+      "clientId": "smart-patient-app",
+      "name": "SMART patient-facing app (standalone launch)",
+      "description": "Patient-facing SMART app: standalone launch, launch patient from the user's patient attribute. Direct access grants only for tests; off in production.",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "smart-patient-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:4567/*",
+        "http://localhost:19304/*",
+        "https://inferno.healthit.gov/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "patient/*.rs"
+      ],
+      "optionalClientScopes": [
+        "patient/*.read",
+        "launch/patient",
+        "offline_access",
+        "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        },
+        {
+          "name": "patient",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "patient",
+            "claim.name": "patient",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "smart-clinician-app",
+      "name": "SMART clinician app (user context, read-only)",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "smart-clinician-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:4567/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "user/*.rs"
+      ],
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
     }
   ],
   "users": [
@@ -291,8 +470,36 @@
       "lastName": "User",
       "email": "demo@example.org",
       "credentials": [
-        { "type": "password", "value": "demo", "temporary": false }
+        {
+          "type": "password",
+          "value": "demo",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Patient",
+      "email": "alice@example.org",
+      "attributes": {
+        "patient": [
+          "p1"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "offline_access"
       ]
     }
-  ]
+  ],
+  "attributes": {}
 }

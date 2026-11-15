@@ -239,7 +239,7 @@ where
         + Sync
         + 'static,
 {
-    create_fhir_router()
+    let fhir = create_fhir_router()
         // This router is mounted behind `fallback_service` (tenant-prefix
         // rewrite), so the outer metrics middleware cannot see which route
         // matched; publish the template on the response for it.
@@ -250,7 +250,18 @@ where
             state.clone(),
             reject_unknown_resource_type::<S>,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    // SMART access control finer than a resource type (patient compartment,
+    // granular scopes, bundle filtering). In front of route matching, so a
+    // search it rewrites into a compartment search is routed as one; a
+    // `Router::layer` on a router whose only route is the fallback wraps that
+    // fallback, which is the whole FHIR router.
+    Router::new()
+        .fallback_service(fhir)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::middleware::smart_access::smart_access_middleware::<S>,
+        ))
 }
 
 /// Creates the core FHIR router with all endpoints.

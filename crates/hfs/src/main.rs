@@ -978,7 +978,7 @@ async fn serve(
             protects: is_admin_api_path,
             style: helios_admin_auth::Style::Api { fhir: true },
         },
-        helios_admin_auth::guard,
+        admin_guard_unless_jwt,
     ));
 
     let addr = config.socket_addr();
@@ -1056,18 +1056,28 @@ async fn serve(
 /// sign-in, and `HFS_ADMIN_UI=true` without one locks every admin endpoint
 /// (`503`) instead of leaving it open.
 fn admin_gate(config: &ServerConfig) -> helios_admin_auth::AdminGate {
+    // One gate per process: its in-memory session table is shared by the
+    // admin guard, the console and the FHIR auth layer (which accepts the
+    // admin credential alongside SMART tokens).
+    static GATE: std::sync::OnceLock<helios_admin_auth::AdminGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| build_admin_gate(config)).clone()
+}
+
+fn build_admin_gate(config: &ServerConfig) -> helios_admin_auth::AdminGate {
     // The public base URL's origin is accepted on cookie-authenticated writes
     // even when a proxy rewrote `Host`.
     let settings =
         helios_admin_auth::AdminSettings::from_env("HFS").allow_origin_of(&config.base_url);
-    if AuthConfig::from_env().enabled {
-        if settings.password.is_some() || settings.error.is_some() {
-            warn!(
-                "HFS_ADMIN_PASSWORD is ignored: authentication is enabled, so the admin API \
-                 requires a system-scope token and the console its own sign-in"
-            );
-        }
+    let auth_on = AuthConfig::from_env().enabled;
+    if auth_on && settings.password.is_none() && settings.error.is_none() {
+        // SMART/OIDC alone: the admin tier requires a system-scope token.
         return helios_admin_auth::AdminGate::Open;
+    }
+    if auth_on {
+        info!(
+            "HFS_ADMIN_PASSWORD is set alongside SMART/OIDC authentication: the administrator \
+             credential is accepted on the admin API and the FHIR API, as is a system-scope token"
+        );
     }
     #[cfg(feature = "ui")]
     let cookie = helios_ui::ADMIN_COOKIE;
@@ -1077,6 +1087,29 @@ fn admin_gate(config: &ServerConfig) -> helios_admin_auth::AdminGate {
         path: "/",
     };
     helios_admin_auth::AdminGate::configure("HFS", settings, config.packages.admin_ui, cookie)
+}
+
+/// With SMART/OIDC on, a request to the admin API that carries a bearer JWT
+/// skips the password guard: the admin tier's own layer requires a
+/// system-scope token of it. Anything else (Basic, a bearer password, the
+/// admin cookie, nothing) meets the password guard as before.
+async fn admin_guard_unless_jwt(
+    axum::extract::State(guard): axum::extract::State<helios_admin_auth::Guard>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    static AUTH_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let jwt = *AUTH_ON.get_or_init(|| AuthConfig::from_env().enabled)
+        && request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| t.starts_with("eyJ") && t.split('.').count() == 3 && !t.contains(' '));
+    if jwt {
+        return next.run(request).await;
+    }
+    helios_admin_auth::guard(axum::extract::State(guard), request, next).await
 }
 
 /// The administrative API: package and tenant administration, and the
@@ -1261,8 +1294,9 @@ async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
     tenant_url_routing: bool,
     public_base_url: &str,
+    admin: helios_admin_auth::AdminGate,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
-    let auth_config = AuthConfig::from_env();
+    let mut auth_config = AuthConfig::from_env();
 
     if !auth_config.enabled {
         info!("Authentication is DISABLED");
@@ -1295,11 +1329,41 @@ async fn init_auth_with_audit(
     }
 
     // Create JWKS cache
-    let jwks_cache = Arc::new(JwksCache::new(
-        jwks_url,
-        auth_config.jwks_min_refresh_interval,
-    ));
-    jwks_cache.initial_fetch().await?;
+    let jwks_cache = Arc::new(
+        JwksCache::new(jwks_url, auth_config.jwks_min_refresh_interval)
+            .with_max_ttl(auth_config.jwks_max_age_secs),
+    );
+    // Come up even when the IdP is unreachable right now: tokens are refused
+    // (503) until the keys are fetched, instead of the FHIR server staying down.
+    jwks_cache.start().await;
+
+    // SMART discovery needs the token (and, for app launch, the authorize)
+    // endpoint. Fill unset ones from the issuer's OpenID configuration.
+    if auth_config.smart_token_endpoint.is_none() || auth_config.smart_authorize_endpoint.is_none()
+    {
+        let issuer = auth_config.expected_issuer.clone().unwrap_or_default();
+        match helios_auth::discover_endpoints(
+            &issuer,
+            auth_config.smart_authorize_endpoint.clone(),
+            auth_config.smart_token_endpoint.clone(),
+            auth_config.smart_end_session_endpoint.clone(),
+        )
+        .await
+        {
+            Ok((authorize, token, end_session)) => {
+                auth_config.smart_authorize_endpoint.get_or_insert(authorize);
+                auth_config.smart_token_endpoint.get_or_insert(token);
+                if auth_config.smart_end_session_endpoint.is_none() {
+                    auth_config.smart_end_session_endpoint = end_session;
+                }
+            }
+            Err(err) => warn!(
+                error = %err,
+                "OIDC discovery failed; /.well-known/smart-configuration lacks the endpoints \
+                 not set with HFS_SMART_TOKEN_ENDPOINT / HFS_SMART_AUTHORIZE_ENDPOINT"
+            ),
+        }
+    }
 
     // Create auth provider
     let provider = JwksBearerAuthProvider::new(jwks_cache, &auth_config);
@@ -1308,6 +1372,8 @@ async fn init_auth_with_audit(
         jwks_url = %jwks_url,
         issuer = ?auth_config.expected_issuer,
         audience = ?auth_config.expected_audience,
+        mode = auth_config.effective_mode().as_str(),
+        clock_skew_secs = auth_config.clock_skew_secs,
         "Authentication ENABLED"
     );
 
@@ -1324,7 +1390,9 @@ async fn init_auth_with_audit(
         });
     }
     #[cfg(feature = "ui")]
-    helios_ui::set_bearer_only_auth(sessions.is_none());
+    helios_ui::set_bearer_only_auth(
+        sessions.is_none() && auth_config.effective_mode() == helios_auth::AuthMode::Full,
+    );
 
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
@@ -1334,6 +1402,7 @@ async fn init_auth_with_audit(
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
         tenant_url_routing,
         sessions,
+        admin: Some(admin).filter(|gate| gate.auth().is_some()),
     });
 
     Ok((auth_config, Some(auth_state)))
@@ -1606,6 +1675,7 @@ async fn run() -> anyhow::Result<()> {
         audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
         &config.base_url,
+        admin_gate(&config),
     )
     .await?;
 

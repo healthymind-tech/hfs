@@ -53,6 +53,7 @@ fn server() -> TestServer {
         audit_exclusion_filter: ExclusionFilter::new(vec![]),
         tenant_url_routing: false,
         sessions: None,
+        admin: None,
     });
     let app = helios_rest::create_app_with_auth(
         backend,

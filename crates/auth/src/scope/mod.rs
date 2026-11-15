@@ -4,6 +4,50 @@ pub mod smart_v2;
 pub use permissions::SmartPermissions;
 pub use smart_v2::{ResourceTypeSpec, ScopeContext, SmartScope};
 
+/// One way a token may reach resources of a type: optionally only inside the
+/// launch patient's compartment, and optionally only resources matching every
+/// granular-scope constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// Only resources in the launch patient's compartment (a `patient/` scope).
+    pub patient_compartment: bool,
+    /// SMART v2 granular constraints (`param`, `value`), all of which must match.
+    pub constraints: Vec<(String, String)>,
+}
+
+impl Grant {
+    /// Whether every resource this grant admits is also admitted by `self`.
+    fn subsumes(&self, other: &Grant) -> bool {
+        (!self.patient_compartment || other.patient_compartment)
+            && self.constraints.iter().all(|c| other.constraints.contains(c))
+    }
+}
+
+/// How far a token reaches for one resource type and permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// No scope covers the request.
+    Denied,
+    /// A `system/` or `user/` scope without constraints covers it: no
+    /// restriction beyond the type-level check.
+    Full,
+    /// Only the union of these grants is reachable. Never empty, and never
+    /// contains an unrestricted grant (that would be [`Access::Full`]).
+    Restricted(Vec<Grant>),
+}
+
+impl Access {
+    /// Whether the request is allowed at all.
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, Access::Denied)
+    }
+
+    /// Whether any grant confines access to the patient compartment.
+    pub fn needs_patient(&self) -> bool {
+        matches!(self, Access::Restricted(grants) if grants.iter().any(|g| g.patient_compartment))
+    }
+}
+
 /// A set of parsed SMART v2 scopes from a JWT token.
 ///
 /// Retains the original raw scope tokens alongside the parsed resource scopes so
@@ -47,6 +91,66 @@ impl ScopeSet {
         self.scopes
             .iter()
             .any(|scope| scope.permits(resource_type, permission))
+    }
+
+    /// How far this token reaches for `permission` on `resource_type`,
+    /// taking patient context and SMART v2 granular constraints into account.
+    ///
+    /// [`is_permitted`](Self::is_permitted) is the coarse, type-level answer;
+    /// this one says what a permitted request may actually see.
+    pub fn access(&self, resource_type: &str, permission: SmartPermissions) -> Access {
+        let mut grants: Vec<Grant> = Vec::new();
+        for scope in self.scopes.iter().filter(|s| s.covers(resource_type, permission)) {
+            let grant = Grant {
+                patient_compartment: scope.context == ScopeContext::Patient,
+                constraints: scope.constraints.clone(),
+            };
+            if !grant.patient_compartment && grant.constraints.is_empty() {
+                return Access::Full;
+            }
+            if grants.iter().any(|g| g.subsumes(&grant)) {
+                continue;
+            }
+            grants.retain(|g| !grant.subsumes(g));
+            grants.push(grant);
+        }
+        if grants.is_empty() {
+            Access::Denied
+        } else {
+            Access::Restricted(grants)
+        }
+    }
+
+    /// Whether any scope is a `patient/` scope.
+    pub fn has_patient_scopes(&self) -> bool {
+        self.scopes.iter().any(|s| s.context == ScopeContext::Patient)
+    }
+
+    /// Whether any scope is a SMART v2 granular scope.
+    pub fn has_constrained_scopes(&self) -> bool {
+        self.scopes.iter().any(|s| s.is_constrained())
+    }
+
+    /// Whether an unconstrained `system/*` or `user/*` scope grants every
+    /// permission (`*.cruds`, `*.*`): nothing this token does is confined.
+    pub fn writes_and_reads_everything(&self) -> bool {
+        self.scopes.iter().any(|s| {
+            s.context != ScopeContext::Patient
+                && matches!(s.resource_type, ResourceTypeSpec::Wildcard)
+                && s.permissions == SmartPermissions::all()
+                && s.constraints.is_empty()
+        })
+    }
+
+    /// Whether this token reads every resource type without restriction: a
+    /// `system/*` or `user/*` scope with read, and no constraints.
+    pub fn reads_everything(&self) -> bool {
+        self.scopes.iter().any(|s| {
+            s.context != ScopeContext::Patient
+                && matches!(s.resource_type, ResourceTypeSpec::Wildcard)
+                && s.permissions.contains(SmartPermissions::READ)
+                && s.constraints.is_empty()
+        })
     }
 
     /// Check whether this set holds a **system-context, all-resource** scope
@@ -210,6 +314,74 @@ mod tests {
     fn test_has_system_scope_rejects_non_wildcard_system() {
         // System context but scoped to a single resource type is not system-wide.
         assert!(!ScopeSet::parse("system/Patient.rs").has_system_scope(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn access_is_full_for_system_and_user_scopes() {
+        assert_eq!(
+            ScopeSet::parse("system/*.rs").access("Observation", SmartPermissions::READ),
+            Access::Full
+        );
+        assert_eq!(
+            ScopeSet::parse("user/Observation.read").access("Observation", SmartPermissions::SEARCH),
+            Access::Full
+        );
+    }
+
+    #[test]
+    fn access_is_denied_without_a_covering_scope() {
+        let set = ScopeSet::parse("patient/Patient.rs");
+        assert_eq!(set.access("Observation", SmartPermissions::READ), Access::Denied);
+        assert_eq!(set.access("Patient", SmartPermissions::CREATE), Access::Denied);
+    }
+
+    #[test]
+    fn patient_scope_is_restricted_to_the_compartment() {
+        let access = ScopeSet::parse("patient/*.rs").access("Observation", SmartPermissions::READ);
+        assert_eq!(
+            access,
+            Access::Restricted(vec![Grant {
+                patient_compartment: true,
+                constraints: vec![]
+            }])
+        );
+        assert!(access.needs_patient());
+    }
+
+    #[test]
+    fn an_unrestricted_scope_wins_over_a_patient_scope() {
+        let set = ScopeSet::parse("patient/*.rs user/Observation.rs");
+        assert_eq!(set.access("Observation", SmartPermissions::READ), Access::Full);
+        assert!(set.access("Condition", SmartPermissions::READ).needs_patient());
+    }
+
+    #[test]
+    fn granular_scopes_are_or_ed_and_subsumed() {
+        let set = ScopeSet::parse(
+            "patient/Observation.rs?category=laboratory patient/Observation.rs?category=vital-signs",
+        );
+        match set.access("Observation", SmartPermissions::SEARCH) {
+            Access::Restricted(grants) => assert_eq!(grants.len(), 2),
+            other => panic!("expected restricted, got {other:?}"),
+        }
+        // A plain patient scope subsumes the granular ones.
+        let set = ScopeSet::parse("patient/Observation.rs?category=laboratory patient/Observation.rs");
+        assert_eq!(
+            set.access("Observation", SmartPermissions::SEARCH),
+            Access::Restricted(vec![Grant {
+                patient_compartment: true,
+                constraints: vec![]
+            }])
+        );
+    }
+
+    #[test]
+    fn reads_everything_needs_an_unconstrained_wildcard_read() {
+        assert!(ScopeSet::parse("system/*.rs").reads_everything());
+        assert!(ScopeSet::parse("user/*.read").reads_everything());
+        assert!(!ScopeSet::parse("patient/*.rs").reads_everything());
+        assert!(!ScopeSet::parse("system/*.s").reads_everything());
+        assert!(!ScopeSet::parse("system/Patient.rs").reads_everything());
     }
 
     #[test]

@@ -101,6 +101,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
 futures = "0.3"
 dashmap = "6"
+# The SMART access layer holds the tenant's search-parameter registry, which
+# `SearchProvider::search_param_registry` hands out behind a `parking_lot` lock.
+parking_lot = "0.12"
 
 # SQL-query-run: DDL validation
 sqlparser = "0.54"
