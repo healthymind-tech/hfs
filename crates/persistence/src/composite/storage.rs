@@ -981,6 +981,12 @@ impl ResourceStorage for CompositeStorage {
         self.primary.cluster_job_store()
     }
 
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        self.primary.cluster_change_feed()
+    }
+
     fn subscription_state_store(
         &self,
     ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {

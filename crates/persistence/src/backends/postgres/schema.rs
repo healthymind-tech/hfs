@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -446,6 +446,7 @@ async fn migrate_schema(
             46 => migrate_v46_to_v47(client).await?,
             47 => migrate_v47_to_v48(client).await?,
             48 => migrate_v48_to_v49(client).await?,
+            49 => migrate_v49_to_v50(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4952,6 +4953,58 @@ async fn migrate_v47_to_v48(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
 
+    Ok(())
+}
+
+/// v49 -> v50: the cross-instance change feed for definition resources.
+///
+/// Each HFS instance compiles stored StructureDefinitions into its own
+/// validation profile registry; a write served by one instance must reach the
+/// others (`crate::core::cluster_change_feed`). The trigger records every
+/// write to a watched type with the writing transaction's id, for every write
+/// path that touches the row — CRUD, bundles, package installs, bulk submit,
+/// purge, maintenance SQL. `WHEN` keeps it free for every other type.
+async fn migrate_v49_to_v50(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS resource_change_feed (
+                 seq           BIGSERIAL PRIMARY KEY,
+                 txid          xid8 NOT NULL DEFAULT pg_current_xact_id(),
+                 tenant_id     TEXT NOT NULL,
+                 resource_type TEXT NOT NULL,
+                 resource_id   TEXT NOT NULL,
+                 changed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE INDEX IF NOT EXISTS idx_resource_change_feed_txid
+                 ON resource_change_feed (txid);
+             CREATE INDEX IF NOT EXISTS idx_resource_change_feed_changed_at
+                 ON resource_change_feed (changed_at);
+             CREATE OR REPLACE FUNCTION hfs_record_resource_change() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF TG_OP = 'DELETE' THEN
+                     INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id)
+                     VALUES (OLD.tenant_id, OLD.resource_type, OLD.id);
+                 ELSE
+                     INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id)
+                     VALUES (NEW.tenant_id, NEW.resource_type, NEW.id);
+                 END IF;
+                 RETURN NULL;
+             END
+             $$;
+             DROP TRIGGER IF EXISTS trg_resource_change_feed_write ON resources;
+             CREATE TRIGGER trg_resource_change_feed_write
+                 AFTER INSERT OR UPDATE ON resources FOR EACH ROW
+                 WHEN (NEW.resource_type = 'StructureDefinition')
+                 EXECUTE FUNCTION hfs_record_resource_change();
+             DROP TRIGGER IF EXISTS trg_resource_change_feed_delete ON resources;
+             CREATE TRIGGER trg_resource_change_feed_delete
+                 AFTER DELETE ON resources FOR EACH ROW
+                 WHEN (OLD.resource_type = 'StructureDefinition')
+                 EXECUTE FUNCTION hfs_record_resource_change();",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v49->v50 failed: {e}")))?;
     Ok(())
 }
 

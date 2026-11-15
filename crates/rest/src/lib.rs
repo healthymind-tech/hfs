@@ -168,6 +168,7 @@ pub mod routing;
 pub mod state;
 pub mod tenant;
 pub mod terminology;
+pub mod cluster_sync;
 pub mod validation;
 pub mod validation_cache;
 
@@ -1307,14 +1308,47 @@ fn spawn_profile_rehydration<S>(
     }
     let default_tenant = config.default_tenant.clone();
     let batch_size = config.validation.rehydrate_batch_size;
+    // Cluster mode: follow the shared change feed so StructureDefinitions
+    // written through other instances (CRUD, IG installs, deletes) reach this
+    // instance's registry within one sync interval.
+    let feed = (config.cluster && config.cluster_sync_interval_ms > 0)
+        .then(|| storage.cluster_change_feed())
+        .flatten();
+    if config.cluster && feed.is_none() {
+        warn!(
+            backend = storage.backend_name(),
+            "HFS_CLUSTER=true but this backend has no change feed: StructureDefinitions written \
+             through another instance reach this one's validator only after a restart"
+        );
+    }
+    let sync_interval = std::time::Duration::from_millis(config.cluster_sync_interval_ms.max(1));
     // Announced before the spawn, so no request can observe the empty
     // registry between the port opening and the task starting.
     validation.begin_rehydration();
     validation.spawn_profile_cache_writer();
     tokio::spawn(async move {
+        // The cursor is taken before the full pass reads storage, so nothing
+        // committed between that read and the first poll can be missed.
+        let cursor = match &feed {
+            Some(feed) => match feed.start().await {
+                Ok(cursor) => Some(cursor),
+                Err(e) => {
+                    warn!(error = %e, "cluster profile sync disabled: cannot open the change feed");
+                    None
+                }
+            },
+            None => None,
+        };
         validation
             .rehydrate_stored_profiles(storage.as_ref(), &default_tenant, batch_size)
             .await;
+        if let (Some(feed), Some(cursor)) = (feed, cursor) {
+            info!(
+                interval_ms = sync_interval.as_millis() as u64,
+                "cluster profile sync ENABLED (shared change feed)"
+            );
+            cluster_sync::run_profile_sync(feed, cursor, validation, storage, sync_interval).await;
+        }
     });
 }
 

@@ -104,6 +104,7 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod cluster_change_feed;
 pub mod cluster_job_store;
 pub mod event_fanout;
 pub mod history;
@@ -168,6 +169,7 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use cluster_change_feed::{ChangeCursor, ClusterChangeFeed, ResourceChange};
 pub use cluster_job_store::{
     ClusterJobId, ClusterJobLease, ClusterJobRecord, ClusterJobState, ClusterJobStore,
     ClusterLeaseError, JobKind,

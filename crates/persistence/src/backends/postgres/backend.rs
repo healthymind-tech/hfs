@@ -1090,6 +1090,29 @@ impl PostgresBackend {
         self.reload_stored_cache().await
     }
 
+    /// Sum of every tenant's SearchParameter epoch (migration v47's
+    /// trigger-maintained counters). Changes whenever any instance — or any
+    /// other writer — creates, updates or deletes a stored SearchParameter, so
+    /// a cluster instance can poll it and refresh its query-side registry
+    /// instead of waiting for the `HFS_SEARCH_PARAM_CACHE_TTL` sweep.
+    pub async fn search_parameter_epoch_sum(&self) -> StorageResult<i64> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(epoch), 0)::BIGINT FROM search_parameter_epochs",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to query SearchParameter epochs: {e}"),
+                    source: None,
+                })
+            })?;
+        Ok(row.get(0))
+    }
+
     /// Get a client from the pool.
     ///
     /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate

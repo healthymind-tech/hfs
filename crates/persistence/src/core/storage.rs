@@ -718,6 +718,18 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the cross-instance change feed for definition resources (see
+    /// [`crate::core::cluster_change_feed`]), if this backend can back one
+    /// (a shared database that records writes by trigger).
+    ///
+    /// The default `None` leaves per-process caches built from stored
+    /// resources (the validation profile registry) instance-local.
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        None
+    }
+
     /// Returns the unified cluster job store for this backend, if it can back
     /// one (a shared database — see [`crate::core::cluster_job_store`]).
     ///

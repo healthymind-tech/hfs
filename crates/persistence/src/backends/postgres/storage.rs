@@ -848,6 +848,13 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(self.clone()))
     }
 
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        use super::cluster_change_feed::PgClusterChangeFeed;
+        Some(std::sync::Arc::new(PgClusterChangeFeed::new(self.pool())))
+    }
+
     fn cluster_job_store(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {

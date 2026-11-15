@@ -32168,4 +32168,113 @@ mod postgres_integration {
             );
         }
     }
+
+    // ========================================================================
+    // T2 cluster suite — definition-resource change feed (fork, migration v50).
+    //
+    // Two independently constructed backend handles share the database the
+    // way two HFS instances do: a StructureDefinition written through one
+    // must be reported by the other's feed, and the feed must never skip a
+    // transaction that commits after a later one.
+    // ========================================================================
+    mod change_feed_suite {
+        use helios_fhir::FhirVersion;
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::cluster_change_feed::{ChangeCursor, ClusterChangeFeed};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        use super::{create_backend, create_tenant, reindex_test_client_for};
+
+        async fn changes_for(
+            feed: &Arc<dyn ClusterChangeFeed>,
+            cursor: &mut ChangeCursor,
+            tenant: &str,
+        ) -> Vec<String> {
+            feed.poll(cursor)
+                .await
+                .expect("poll the change feed")
+                .into_iter()
+                .filter(|c| c.tenant_id == tenant)
+                .map(|c| format!("{}/{}", c.resource_type, c.resource_id))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn postgres_integration_cluster_change_feed_reports_writes_from_another_handle() {
+            let a = create_backend().await;
+            let b = create_backend().await;
+            let tenant = create_tenant("feed");
+            let tid = tenant.tenant_id().as_str().to_string();
+            let feed = b.cluster_change_feed().expect("postgres backs a change feed");
+            let mut cursor = feed.start().await.unwrap();
+
+            let sd = json!({
+                "resourceType": "StructureDefinition",
+                "id": "feed-sd",
+                "url": "http://example.org/StructureDefinition/feed-sd",
+                "name": "FeedSd", "status": "active", "kind": "resource",
+                "abstract": false, "type": "Patient",
+                "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+                "derivation": "constraint"
+            });
+            a.create(&tenant, "StructureDefinition", sd, FhirVersion::default())
+                .await
+                .unwrap();
+            // A non-watched type never enters the feed.
+            a.create(&tenant, "Patient", json!({"resourceType": "Patient", "id": "p"}), FhirVersion::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                changes_for(&feed, &mut cursor, &tid).await,
+                vec!["StructureDefinition/feed-sd".to_string()]
+            );
+            assert!(
+                changes_for(&feed, &mut cursor, &tid).await.is_empty(),
+                "a delivered change is not delivered twice"
+            );
+
+            a.delete(&tenant, "StructureDefinition", "feed-sd").await.unwrap();
+            assert_eq!(
+                changes_for(&feed, &mut cursor, &tid).await,
+                vec!["StructureDefinition/feed-sd".to_string()],
+                "a delete is a change too"
+            );
+        }
+
+        /// The ordering hazard the transaction-id cursor exists for: a slow
+        /// transaction takes its feed row first but commits after a fast one.
+        #[tokio::test]
+        async fn postgres_integration_cluster_change_feed_never_skips_a_slow_transaction() {
+            let b = create_backend().await;
+            let tenant = create_tenant("feed-slow");
+            let tid = tenant.tenant_id().as_str().to_string();
+            let feed = b.cluster_change_feed().expect("postgres backs a change feed");
+            let mut cursor = feed.start().await.unwrap();
+
+            let insert = "INSERT INTO resources
+                              (tenant_id, resource_type, id, version_id, data, last_updated)
+                          VALUES ($1, 'StructureDefinition', $2, '1', '{}'::jsonb, NOW())";
+            let slow = reindex_test_client_for("postgres").await;
+            let fast = reindex_test_client_for("postgres").await;
+            slow.batch_execute("BEGIN").await.unwrap();
+            slow.execute(insert, &[&tid, &"slow"]).await.unwrap();
+            fast.execute(insert, &[&tid, &"fast"]).await.unwrap();
+
+            assert_eq!(
+                changes_for(&feed, &mut cursor, &tid).await,
+                vec!["StructureDefinition/fast".to_string()],
+                "the uncommitted row is invisible"
+            );
+            slow.batch_execute("COMMIT").await.unwrap();
+            assert_eq!(
+                changes_for(&feed, &mut cursor, &tid).await,
+                vec!["StructureDefinition/slow".to_string()],
+                "the slow transaction's row is delivered once it commits, not skipped"
+            );
+            assert!(changes_for(&feed, &mut cursor, &tid).await.is_empty());
+
+            assert!(feed.prune(std::time::Duration::from_secs(3600)).await.is_ok());
+        }
+    }
 }

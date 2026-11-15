@@ -1847,6 +1847,45 @@ fn spawn_s3_search_param_refresh(
     config: &ServerConfig,
 ) {
     let ttl = config.search_param_cache_ttl;
+    // Cluster mode: follow the trigger-maintained SearchParameter epochs so a
+    // SearchParameter written through another instance takes effect for
+    // searches here within one sync interval, not one TTL.
+    if config.cluster && config.cluster_sync_interval_ms > 0 {
+        let interval = std::time::Duration::from_millis(config.cluster_sync_interval_ms);
+        let sweep = (ttl > 0).then(|| std::time::Duration::from_secs(ttl));
+        tokio::spawn(async move {
+            let mut seen: Option<i64> = None;
+            let mut last_refresh = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(interval).await;
+                let epoch = match backend.search_parameter_epoch_sum().await {
+                    Ok(epoch) => epoch,
+                    Err(e) => {
+                        tracing::warn!("SearchParameter epoch poll failed: {e}");
+                        continue;
+                    }
+                };
+                let moved = seen.is_some_and(|prev| prev != epoch);
+                let swept = sweep.is_some_and(|s| last_refresh.elapsed() >= s);
+                seen = Some(epoch);
+                if !(moved || swept) {
+                    continue;
+                }
+                last_refresh = std::time::Instant::now();
+                match backend.refresh_stored_search_parameters().await {
+                    Ok(stored) => tracing::debug!(
+                        stored,
+                        epoch,
+                        "SearchParameter registry refreshed (cluster sync)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                    ),
+                }
+            }
+        });
+        return;
+    }
     if ttl == 0 {
         return;
     }

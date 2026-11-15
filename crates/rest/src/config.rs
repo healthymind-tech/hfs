@@ -1692,6 +1692,15 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_JOB_STORE_BACKEND", default_value = "")]
     pub job_store_backend: String,
 
+    /// How often (milliseconds) a cluster instance (`HFS_CLUSTER=true`) polls
+    /// the shared database for definition changes written by other instances:
+    /// stored StructureDefinitions (the validation profile registry) and
+    /// SearchParameters (the search registry). Bounds how long a profile or
+    /// SearchParameter installed through one instance is unknown to the
+    /// others. `0` disables the sync.
+    #[arg(long, env = "HFS_CLUSTER_SYNC_INTERVAL_MS", default_value = "1000")]
+    pub cluster_sync_interval_ms: u64,
+
     /// Enables the topic-based Subscriptions engine.
     ///
     /// Kept as a raw string for backward-compatible truthiness ("false"/"0"
@@ -2169,6 +2178,7 @@ impl Default for ServerConfig {
             storage_backend: "sqlite".to_string(),
             cluster: false,
             job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
             subscriptions_enabled: String::new(),
             subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
@@ -2470,6 +2480,7 @@ impl ServerConfig {
             storage_backend: "sqlite".to_string(),
             cluster: false,
             job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
             subscriptions_enabled: String::new(),
             subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),

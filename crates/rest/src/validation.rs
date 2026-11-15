@@ -538,6 +538,66 @@ impl ValidationService {
         removed
     }
 
+    /// Re-applies one stored StructureDefinition after a write that another
+    /// cluster instance (or any other writer) committed — the cluster change
+    /// feed's consumer. `current` is the row as it is now (`None` when it was
+    /// deleted). Idempotent: applying the same state twice changes nothing.
+    ///
+    /// Returns `true` when the registry changed.
+    pub fn apply_profile_change(
+        &self,
+        tenant: &str,
+        id: &str,
+        current: Option<(FhirVersion, &Value)>,
+    ) -> bool {
+        if self.tenant_profiles.is_none() {
+            return false;
+        }
+        let previous = self
+            .stored_index
+            .lock()
+            .expect("stored profile index lock")
+            .entries
+            .get(&(tenant.to_string(), id.to_string()))
+            .map(|p| (p.fhir_version, p.url.clone()));
+        let mut changed = false;
+        let new_url = current
+            .as_ref()
+            .and_then(|(_, sd)| sd.get("url").and_then(Value::as_str));
+        if let Some((old_version, Some(old_url))) = &previous
+            && (current.is_none() || new_url != Some(old_url.as_str()))
+        {
+            changed |= self.remove_stored_profile(tenant, *old_version, old_url);
+            self.stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .entries
+                .remove(&(tenant.to_string(), id.to_string()));
+            // Another stored row may carry the same canonical (one release of
+            // several): put it back now that this one is gone.
+            let survivor = self
+                .stored_index
+                .lock()
+                .expect("stored profile index lock")
+                .entries
+                .values()
+                .filter(|p| {
+                    p.tenant == tenant
+                        && p.fhir_version == *old_version
+                        && p.url.as_deref() == Some(old_url.as_str())
+                })
+                .max_by_key(|p| p.seq)
+                .and_then(|p| p.schema.clone());
+            if let Some(schema) = survivor {
+                self.install_profile(tenant, *old_version, schema);
+            }
+        }
+        if let Some((version, sd)) = current {
+            changed |= self.upsert_stored_profile(tenant, version, sd);
+        }
+        changed
+    }
+
     /// Announce that a startup rehydration pass is about to run. Until
     /// [`Self::rehydrate_stored_profiles`] has registered the stored
     /// profiles (from the compiled-profile cache when there is one, else
@@ -2353,5 +2413,75 @@ mod remote_provider_tests {
             .kind(),
             TerminologyErrorKind::Unavailable
         );
+    }
+}
+
+#[cfg(test)]
+mod cluster_profile_change_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sd(id: &str, url: &str) -> Value {
+        json!({
+            "resourceType": "StructureDefinition",
+            "id": id,
+            "meta": {"versionId": "1", "lastUpdated": "2026-11-15T00:00:00Z"},
+            "url": url,
+            "name": "ClusterProfile",
+            "status": "active",
+            "kind": "resource",
+            "abstract": false,
+            "type": "Patient",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "derivation": "constraint",
+            "differential": {"element": [
+                {"id": "Patient", "path": "Patient"},
+                {"id": "Patient.birthDate", "path": "Patient.birthDate", "min": 1}
+            ]}
+        })
+    }
+
+    fn resolves(svc: &ValidationService, tenant: &str, url: &str) -> bool {
+        svc.tenant_overlay(Some(tenant), FhirVersion::default())
+            .is_some_and(|r| r.resolve(url).is_some())
+    }
+
+    /// The change-feed consumer: a profile another instance created appears,
+    /// a canonical change drops the old URL, and a delete removes it.
+    #[test]
+    fn remote_profile_changes_follow_the_stored_row() {
+        let svc = ValidationService::new();
+        let (a, b) = (
+            "http://example.org/StructureDefinition/cluster-a",
+            "http://example.org/StructureDefinition/cluster-b",
+        );
+        let v = FhirVersion::default();
+
+        assert!(svc.apply_profile_change("t1", "p1", Some((v, &sd("p1", a)))));
+        assert!(resolves(&svc, "t1", a));
+        assert!(!resolves(&svc, "t2", a), "tenant isolation");
+
+        // Same row, new canonical: the old URL must not linger.
+        svc.apply_profile_change("t1", "p1", Some((v, &sd("p1", b))));
+        assert!(resolves(&svc, "t1", b));
+        assert!(!resolves(&svc, "t1", a), "renamed canonical is dropped");
+
+        // Deleted on another instance.
+        svc.apply_profile_change("t1", "p1", None);
+        assert!(!resolves(&svc, "t1", b));
+        // Applying the same deletion again is a no-op.
+        assert!(!svc.apply_profile_change("t1", "p1", None));
+    }
+
+    /// Two rows sharing a canonical: deleting one re-exposes the other.
+    #[test]
+    fn deleting_one_of_two_rows_with_one_canonical_keeps_the_other() {
+        let svc = ValidationService::new();
+        let url = "http://example.org/StructureDefinition/shared";
+        let v = FhirVersion::default();
+        svc.apply_profile_change("t1", "x1", Some((v, &sd("x1", url))));
+        svc.apply_profile_change("t1", "x2", Some((v, &sd("x2", url))));
+        svc.apply_profile_change("t1", "x2", None);
+        assert!(resolves(&svc, "t1", url), "the surviving row still resolves");
     }
 }
