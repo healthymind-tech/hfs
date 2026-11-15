@@ -640,6 +640,10 @@ pub struct SqlFragment {
     pub params: Vec<SqlParam>,
 }
 
+/// A token OR-list of at least this many values is sent as arrays; see
+/// `PostgresQueryBuilder::token_list_array_predicate`.
+pub(crate) const TOKEN_LIST_ARRAY_MIN: usize = 10;
+
 /// A SQL parameter value.
 #[derive(Debug, Clone)]
 pub enum SqlParam {
@@ -2277,6 +2281,20 @@ impl PostgresQueryBuilder {
         // must be sequential and gap-free because the caller advances the global
         // offset by `params.len()`; a fixed 2-slot stride once produced a placeholder
         // past the end of the bound params, which Postgres rejects.
+        // A long list (`code:in=<ValueSet>` after expansion, or an explicit
+        // `code=a,b,…`) binds two arrays instead of one OR arm per value.
+        if let Some((predicate, params)) = Self::token_list_array_predicate(param, offset) {
+            let mut combined = SqlFragment::with_params(
+                Self::index_membership(&param.name, &predicate),
+                params,
+            );
+            if let Some(SearchModifier::Not) = param.modifier {
+                let sql = format!("NOT ({})", combined.sql);
+                combined = SqlFragment::with_params(sql, combined.params);
+            }
+            return Some(combined);
+        }
+
         let mut predicates: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
         let mut next = offset;
@@ -2402,6 +2420,77 @@ impl PostgresQueryBuilder {
                 vec![SqlParam::text(&value.value)],
             )
         }
+    }
+
+    /// The array form of a long token OR-list, or `None` to keep the per-value
+    /// OR.
+    ///
+    /// `code:in=<ValueSet>` reaches the backend as the expansion's codes, often
+    /// hundreds or thousands of `system|code` values. One OR arm per value
+    /// (`(value_token_system IN ($s, marker) AND value_token_code = $c) OR …`)
+    /// binds two parameters per code, makes PostgreSQL plan a BitmapOr of
+    /// hundreds of index scans and evaluate every arm against the extended
+    /// statistics, and gives every list length its own statement text:
+    /// `Condition?subject=…&code:in=<451 codes>` took ~380 ms, nearly all of it
+    /// planning (line G, CQL against HFS).
+    ///
+    /// The array form is one `value_token_code = ANY($codes)` — a single
+    /// ScalarArrayOp scan of `idx_search_token_code` — and an exact
+    /// system-and-code check against `$pairs` (`system|code` strings, which
+    /// PostgreSQL hashes for a large constant array). It keeps the per-value
+    /// semantics: a value matches its own system or the implicit-system marker
+    /// of a `code` element (#1379), and a code-only value matches any system.
+    /// Lists that mix forms, use `|code` or `system|`, or are shorter than
+    /// [`TOKEN_LIST_ARRAY_MIN`] keep the OR form.
+    fn token_list_array_predicate(
+        param: &SearchParameter,
+        offset: usize,
+    ) -> Option<(String, Vec<SqlParam>)> {
+        if param.values.len() < TOKEN_LIST_ARRAY_MIN
+            || !matches!(param.modifier, None | Some(SearchModifier::Not))
+        {
+            return None;
+        }
+        let mut codes: Vec<String> = Vec::with_capacity(param.values.len());
+        let mut pairs: Vec<String> = Vec::with_capacity(param.values.len());
+        let mut code_only = None;
+        for value in &param.values {
+            let this_code_only = match value.value.split_once('|') {
+                Some((system, code)) if !system.is_empty() && !code.is_empty() => {
+                    codes.push(code.to_string());
+                    pairs.push(format!("{system}|{code}"));
+                    false
+                }
+                Some(_) => return None,
+                None => {
+                    codes.push(value.value.clone());
+                    true
+                }
+            };
+            if *code_only.get_or_insert(this_code_only) != this_code_only {
+                return None;
+            }
+        }
+        codes.sort_unstable();
+        codes.dedup();
+        if code_only == Some(true) {
+            return Some((
+                format!("value_token_code = ANY(${}::text[])", offset + 1),
+                vec![SqlParam::TextArray(codes)],
+            ));
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        Some((
+            format!(
+                "(value_token_code = ANY(${c}::text[]) AND (value_token_system = '{marker}' \
+                 OR value_token_system || '|' || value_token_code = ANY(${p}::text[])))",
+                c = offset + 1,
+                p = offset + 2,
+                marker = IMPLICIT_TOKEN_SYSTEM,
+            ),
+            vec![SqlParam::TextArray(codes), SqlParam::TextArray(pairs)],
+        ))
     }
 
     /// Builds an `:of-type` identifier condition (token modifier).
@@ -7167,6 +7256,122 @@ mod tests {
         assert!(frag.sql.contains("value_string = $3"), "{}", frag.sql);
         assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
         assert!(!frag.sql.contains("COALESCE"), "{}", frag.sql);
+    }
+
+    fn token_list(modifier: Option<SearchModifier>, values: &[String]) -> SearchParameter {
+        SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values
+                .iter()
+                .map(|v| SearchValue::new(SearchPrefix::Eq, v))
+                .collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn system_codes(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("http://snomed.info/sct|{i}")).collect()
+    }
+
+    /// A long `system|code` list binds two arrays and keeps one statement text
+    /// for every length.
+    #[test]
+    fn a_long_system_code_list_binds_two_arrays() {
+        let frag =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &system_codes(451)), 2)
+                .expect("built");
+        assert!(frag.sql.contains("value_token_code = ANY($3::text[])"), "{}", frag.sql);
+        assert!(
+            frag.sql
+                .contains("value_token_system || '|' || value_token_code = ANY($4::text[])"),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.sql.contains(IMPLICIT_TOKEN_SYSTEM), "{}", frag.sql);
+        assert!(!frag.sql.contains(" OR (value_token_system IN"), "{}", frag.sql);
+        match frag.params.as_slice() {
+            [SqlParam::TextArray(codes), SqlParam::TextArray(pairs)] => {
+                assert_eq!(codes.len(), 451);
+                assert_eq!(pairs.len(), 451);
+                assert!(pairs.contains(&"http://snomed.info/sct|450".to_string()));
+            }
+            other => panic!("unexpected params {other:?}"),
+        }
+        let other_len =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &system_codes(12)), 2)
+                .unwrap();
+        assert_eq!(other_len.sql, frag.sql, "statement text independent of length");
+    }
+
+    #[test]
+    fn duplicate_codes_and_pairs_are_bound_once() {
+        let mut values = system_codes(10);
+        values.push("http://loinc.org|1".to_string());
+        values.push("http://snomed.info/sct|1".to_string());
+        let frag = PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
+        match frag.params.as_slice() {
+            [SqlParam::TextArray(codes), SqlParam::TextArray(pairs)] => {
+                assert_eq!(codes.len(), 10, "{codes:?}");
+                assert_eq!(pairs.len(), 11, "{pairs:?}");
+            }
+            other => panic!("unexpected params {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_code_only_list_matches_any_system() {
+        let values: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
+        let frag = PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
+        assert!(frag.sql.contains("value_token_code = ANY($3::text[])"), "{}", frag.sql);
+        assert!(!frag.sql.contains("value_token_system"), "{}", frag.sql);
+        assert!(matches!(frag.params.as_slice(), [SqlParam::TextArray(c)] if c.len() == 20));
+    }
+
+    #[test]
+    fn not_wraps_the_array_membership() {
+        let frag = PostgresQueryBuilder::build_token_condition(
+            &token_list(Some(SearchModifier::Not), &system_codes(30)),
+            2,
+        )
+        .unwrap();
+        assert!(frag.sql.starts_with("NOT ("), "{}", frag.sql);
+        assert!(frag.sql.contains("= ANY($3::text[])"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn short_mixed_or_partial_lists_keep_the_or_form() {
+        // shorter than the threshold
+        let short = PostgresQueryBuilder::build_token_condition(
+            &token_list(None, &system_codes(TOKEN_LIST_ARRAY_MIN - 1)),
+            2,
+        )
+        .unwrap();
+        assert!(!short.sql.contains("ANY("), "{}", short.sql);
+        // a code-only value among system|code values
+        let mut mixed = system_codes(20);
+        mixed.push("bare".into());
+        let mixed = PostgresQueryBuilder::build_token_condition(&token_list(None, &mixed), 2).unwrap();
+        assert!(!mixed.sql.contains("ANY("), "{}", mixed.sql);
+        // `system|` and `|code` forms
+        let mut partial = system_codes(20);
+        partial.push("http://loinc.org|".into());
+        let partial =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &partial), 2).unwrap();
+        assert!(!partial.sql.contains("ANY("), "{}", partial.sql);
+        let mut nosys = system_codes(20);
+        nosys.push("|x".into());
+        let nosys = PostgresQueryBuilder::build_token_condition(&token_list(None, &nosys), 2).unwrap();
+        assert!(!nosys.sql.contains("ANY("), "{}", nosys.sql);
+        // other modifiers
+        let text = PostgresQueryBuilder::build_token_condition(
+            &token_list(Some(SearchModifier::Text), &system_codes(20)),
+            2,
+        )
+        .unwrap();
+        assert!(!text.sql.contains("ANY("), "{}", text.sql);
     }
 
     /// Builds a token `SearchParameter` with an optional modifier.

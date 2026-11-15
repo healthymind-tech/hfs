@@ -5815,6 +5815,108 @@ mod postgres_integration {
         }
     }
 
+    /// A long token list (what `code:in=<ValueSet>` expands to) matches exactly
+    /// what the per-value OR matched: the code in its own system or with the
+    /// implicit-system marker, never the same code in another system; `:not`
+    /// is the complement; patient- and date-scoped forms agree.
+    #[tokio::test]
+    async fn postgres_integration_long_token_list_keeps_the_answer() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("long-token-list");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // 300 Conditions c-001..c-300: code g (mod 100) in snomed for g <= 200,
+        // the same code number in another system for 201..250, and the
+        // implicit-system marker for 251..300. Subject: patient p1 for odd g.
+        client
+            .batch_execute(&format!(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT '{tenant_id}', 'Condition', 'c-' || lpad(g::text, 3, '0'), '1',
+                        jsonb_build_object('resourceType', 'Condition', 'id', 'c-' || lpad(g::text, 3, '0')),
+                        '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 300) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code, last_updated)
+                 SELECT '{tenant_id}', 'Condition', 'c-' || lpad(g::text, 3, '0'), 'code',
+                        CASE WHEN g <= 200 THEN 'http://snomed.info/sct'
+                             WHEN g <= 250 THEN 'http://other.example/cs'
+                             ELSE '{marker}' END,
+                        (g % 100)::text, '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, 300) g;
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference, last_updated)
+                 SELECT '{tenant_id}', 'Condition', 'c-' || lpad(g::text, 3, '0'), 'patient', 'Patient/p1', '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, 300, 2) g;
+                 ANALYZE search_index;",
+                marker = helios_persistence::search::IMPLICIT_TOKEN_SYSTEM,
+            ))
+            .await
+            .unwrap();
+        drop(client);
+
+        // 40 listed codes: 0..19 (present) and 1000..1019 (absent).
+        let listed: Vec<u32> = (0..20).chain(1000..1020).collect();
+        let values: Vec<SearchValue> = listed
+            .iter()
+            .map(|c| SearchValue::new(SearchPrefix::Eq, format!("http://snomed.info/sct|{c}")))
+            .collect();
+        let code_param = |modifier| SearchParameter {
+            name: "code".into(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values.clone(),
+            chain: vec![],
+            components: vec![],
+        };
+        let matches = |g: u32| (g <= 200 || g > 250) && listed.contains(&(g % 100));
+        let all = |q: SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut ids: Vec<String> = backend
+                    .search(tenant, &q.with_count(1000))
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let expect = |keep: &dyn Fn(u32) -> bool| {
+            (1..=300u32)
+                .filter(|g| keep(*g))
+                .map(|g| format!("c-{g:03}"))
+                .collect::<Vec<_>>()
+        };
+
+        let q = SearchQuery::new("Condition").with_parameter(code_param(None));
+        assert_eq!(all(q).await, expect(&matches));
+
+        let q = SearchQuery::new("Condition").with_parameter(code_param(Some(SearchModifier::Not)));
+        assert_eq!(all(q).await, expect(&|g| !matches(g)));
+
+        let patient = SearchParameter {
+            name: "patient".into(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Patient/p1")],
+            chain: vec![],
+            components: vec![],
+        };
+        let q = SearchQuery::new("Condition")
+            .with_parameter(patient)
+            .with_parameter(code_param(None));
+        assert_eq!(all(q).await, expect(&|g| g % 2 == 1 && matches(g)));
+    }
+
     /// Broad token + date conjunctions take the broad walk driven by the token
     /// (the date estimate is low by the column's null fraction), including a
     /// repeated date parameter that the general plan folds into an
