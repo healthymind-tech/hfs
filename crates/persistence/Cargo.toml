@@ -74,6 +74,9 @@ tempfile = "3"
 # Decodes conditional-interaction criteria (`If-None-Exist`, `ifNoneExist`,
 # conditional URLs) with the parser helios-rest uses for a search query (#1322).
 form_urlencoded = "1"
+# Audit retention archives (gzip NDJSON) and audit-store metrics.
+flate2 = "1"
+helios-observability = { path = "../observability", version = "0.2.4" }
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }

@@ -176,6 +176,7 @@
 #![recursion_limit = "256"]
 
 pub mod advisor;
+pub mod audit_store;
 pub mod backends;
 pub mod composite;
 pub mod core;
