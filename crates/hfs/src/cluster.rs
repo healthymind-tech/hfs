@@ -333,7 +333,8 @@ mod tests {
             subscriptions_fanout: "",
         };
         let errors = validate_cluster_config(&view).unwrap_err();
-        assert_eq!(errors.len(), 6);
+        // sqlite, memory job store, two node-local outputs, file audit.
+        assert_eq!(errors.len(), 5, "{errors:?}");
     }
 
     #[test]
