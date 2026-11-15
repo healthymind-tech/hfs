@@ -1331,7 +1331,7 @@ mod tests {
 
         assert!(html.contains(r#"<section class="card capability-raw-card""#));
         assert!(!html.contains("<details class=\"card json-fold\""));
-        assert!(html.contains(r#"<h3 id="capability-json-heading">"#));
+        assert!(html.contains(r#"<h2 id="capability-json-heading">"#));
         assert!(html.contains(r#"data-capability-json-actions hidden"#));
         assert!(html.contains(r#"role="region""#));
         assert!(html.contains(r#"aria-labelledby="capability-json-heading""#));

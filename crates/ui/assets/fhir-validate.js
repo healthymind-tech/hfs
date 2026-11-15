@@ -258,7 +258,7 @@
       });
       if (!subset.length) return;
       var section = el("section", "validate-group validate-group--" + group);
-      var h = el("h4", "validate-group__title", (m["group" + group.charAt(0).toUpperCase() + group.slice(1)] || group) + " · " + subset.length);
+      var h = el("h3", "validate-group__title", (m["group" + group.charAt(0).toUpperCase() + group.slice(1)] || group) + " · " + subset.length);
       section.appendChild(h);
       section.appendChild(issueTable(subset, bundle, m));
       target.appendChild(section);
@@ -272,7 +272,7 @@
     container.textContent = "";
 
     var topCard = el("div", "validate-run");
-    topCard.appendChild(el("h4", "validate-run__title", options.resource && options.resource.resourceType === "Bundle" ? m.headingBundle : m.headingResource));
+    topCard.appendChild(el("h3", "validate-run__title", options.resource && options.resource.resourceType === "Bundle" ? m.headingBundle : m.headingResource));
     renderRun(topCard, result.top, bundle, m);
     container.appendChild(topCard);
 
@@ -295,7 +295,7 @@
       details.appendChild(body);
       list.appendChild(details);
     });
-    var heading = el("h4", "validate-run__title", m.headingEntries);
+    var heading = el("h3", "validate-run__title", m.headingEntries);
     var overall = el("p", "validate-verdict");
     overall.appendChild(badge(total, m));
     container.appendChild(heading);

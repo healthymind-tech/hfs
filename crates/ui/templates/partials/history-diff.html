@@ -19,10 +19,10 @@
 
 <div class="diff">
   <div class="diff__head">
-    <h3>
+    <h2>
       <span class="icon">{% include "icons/history.svg" %}</span>
       {{ i18n.t_arg("history-diff-heading", "from", from_label.clone()) }} → {{ to_label }}
-    </h3>
+    </h2>
     {% if !show_metadata && diff.metadata_hidden > 0 %}
     <span class="diff__meta-note">{{ i18n.t_arg("history-metadata-hidden", "count", diff.metadata_hidden) }}</span>
     {% endif %}

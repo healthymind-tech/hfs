@@ -44,7 +44,7 @@
        only inform. -->
   <section class="card" id="batch-upload">
     <div class="card-head">
-      <h3><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("batch-upload") }}</h3>
+      <h2><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("batch-upload") }}</h2>
     </div>
     <div class="batch-tabs batch-modes" role="tablist" aria-label="{{ i18n.t("batch-mode-label") }}">
       <button type="button" class="batch-tab" id="batch-mode-file" role="tab" aria-selected="true" aria-controls="batch-pane-file"><span class="icon">{% include "icons/import.svg" %}</span> {{ i18n.t("batch-mode-file") }}</button>
@@ -73,16 +73,16 @@
     <div class="batch-check" id="batch-check" aria-live="polite" hidden>
       <p class="batch-check__ok" id="batch-check-ok" hidden><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-check-ok") }}</p>
       <div class="batch-check__group batch-check__group--error" id="batch-check-errors" hidden>
-        <h4>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h4>
+        <h3>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h3>
         <ul></ul>
       </div>
       <div class="batch-check__group batch-check__group--warning" id="batch-check-warnings" hidden>
-        <h4>{{ i18n.t("batch-check-warnings") }} <span class="batch-check__count"></span></h4>
+        <h3>{{ i18n.t("batch-check-warnings") }} <span class="batch-check__count"></span></h3>
         <ul></ul>
       </div>
       <div class="batch-check__summary" id="batch-check-summary" hidden>
-        <div><h4>{{ i18n.t("batch-check-by-method") }}</h4><ul class="batch-check__chips" id="batch-check-methods"></ul></div>
-        <div><h4>{{ i18n.t("batch-check-by-type") }}</h4><ul class="batch-check__chips" id="batch-check-types"></ul></div>
+        <div><h3>{{ i18n.t("batch-check-by-method") }}</h3><ul class="batch-check__chips" id="batch-check-methods"></ul></div>
+        <div><h3>{{ i18n.t("batch-check-by-type") }}</h3><ul class="batch-check__chips" id="batch-check-types"></ul></div>
       </div>
     </div>
 
@@ -138,7 +138,7 @@
 
     <section class="card validate-card" id="batch-validation" tabindex="-1" hidden>
       <div class="card-head">
-        <h3><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h3>
+        <h2><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h2>
       </div>
       <p class="busy-status" id="batch-validation-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
       <div class="validate-results" id="batch-validation-results"></div>
@@ -146,7 +146,7 @@
 
     <div class="card">
       <div class="card-head">
-        <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("batch-plan-heading") }}</h3>
+        <h2><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("batch-plan-heading") }}</h2>
       </div>
       <div class="batch-tabs" role="tablist">
         <button type="button" class="batch-tab" id="batch-tab-actions" role="tab" aria-selected="true"><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("batch-tab-actions") }}</button>
@@ -162,7 +162,7 @@
   <section id="batch-response" hidden>
     <div class="card">
       <div class="card-head">
-        <h3><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-response-heading") }}</h3>
+        <h2><span class="icon">{% include "icons/check.svg" %}</span> {{ i18n.t("batch-response-heading") }}</h2>
         <!-- The created count reads at a glance next to the status (#729);
              the rest of the tally stays in the summary line below. -->
         <div class="card-head__meta">

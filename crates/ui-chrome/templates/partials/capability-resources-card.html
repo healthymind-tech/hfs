@@ -22,7 +22,7 @@
 #}
 <section class="card table-card cap-resource-card">
   <div class="card-head">
-    <h3>{{ i18n.t("cap-resources-heading") }}</h3>
+    <h2>{{ i18n.t("cap-resources-heading") }}</h2>
     {%- if let Some(filter) = filter %}
     <!-- Server-side narrowing: a plain GET form, so it works without JS. -->
     <form class="filter-rail__search cap-resource-filter" method="get" action="{{ filter.action }}" role="search">

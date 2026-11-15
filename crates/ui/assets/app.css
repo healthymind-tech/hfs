@@ -3096,7 +3096,7 @@ form.htmx-request .btn[type="submit"]::after,
   margin-bottom: 10px;
 }
 
-.diff__head h3 {
+.diff__head h2 {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -7285,7 +7285,7 @@ details.card > summary.card-head::-webkit-details-marker {
   gap: 10px;
 }
 
-.batch-check h4 {
+.batch-check h3 {
   margin: 0 0 6px;
   font-size: 13px;
 }
