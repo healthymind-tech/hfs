@@ -116,7 +116,8 @@ where
         config.admin_ui,
         helios_hts_ui::ADMIN_COOKIE,
     );
-    let writes_gate = writes_gate(&gate, config.require_auth_for_writes);
+    let bearer = crate::write_guard::bearer_provider_from_env();
+    let writes_gate = writes_gate(&gate, config.require_auth_for_writes, bearer.is_some());
     let admin = admin.map(|router| {
         router.layer(axum::middleware::from_fn_with_state(
             helios_admin_auth::Guard {
@@ -308,6 +309,7 @@ where
             crate::write_guard::WriteGuard {
                 gate: writes_gate,
                 max_body_size: config.max_body_size,
+                bearer,
             },
             crate::write_guard::guard,
         ));
@@ -367,10 +369,11 @@ where
 fn writes_gate(
     admin: &helios_admin_auth::AdminGate,
     require: Option<bool>,
+    bearer: bool,
 ) -> helios_admin_auth::AdminGate {
     use helios_admin_auth::AdminGate;
     let has_password = matches!(admin, AdminGate::Password(_));
-    if !require.unwrap_or(has_password) {
+    if !require.unwrap_or(has_password || bearer) {
         if has_password {
             tracing::warn!(
                 "HTS_REQUIRE_AUTH_FOR_WRITES=false: CodeSystem/ValueSet/ConceptMap create, \
@@ -386,6 +389,15 @@ fn writes_gate(
         return AdminGate::Open;
     }
     match admin {
+        AdminGate::Open if bearer => {
+            tracing::info!(
+                "terminology writes require a SMART/OIDC bearer token (no HTS_ADMIN_PASSWORD, so \
+                 the administrator credential is not available)"
+            );
+            AdminGate::Locked(std::sync::Arc::from(
+                "terminology writes need a bearer token with write scopes on the terminology types",
+            ))
+        }
         AdminGate::Open => {
             tracing::error!(
                 "HTS_REQUIRE_AUTH_FOR_WRITES=true but no HTS_ADMIN_PASSWORD is set: terminology \

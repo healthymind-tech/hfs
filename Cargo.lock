@@ -3582,6 +3582,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "helios-admin-auth",
+ "helios-auth",
  "helios-fhir",
  "helios-hts-ui",
  "helios-observability",
