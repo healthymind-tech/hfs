@@ -272,9 +272,30 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = helios_hts::state::AppState::new(backend.clone())
         .with_resource_store_pg(resource_store)
-        .with_terminology_importer(Arc::new(backend))
+        .with_terminology_importer(Arc::new(backend.clone()))
         .with_max_expansion_size(config.max_expansion_size)
         .with_auto_supplements(config.auto_supplements);
+
+    // Cluster cache coherence: drop every response cache when another replica
+    // (or `hts import`) moved the shared terminology epoch.
+    {
+        use helios_hts::traits::TerminologyCaches;
+        let st = state.clone();
+        helios_hts::backends::postgres::epoch::spawn_cache_sync(
+            backend,
+            std::time::Duration::from_millis(config.cache_sync_interval_ms),
+            Arc::new(move || {
+                st.clear_expand_cache();
+                st.backend().invalidate_caches();
+            }),
+        );
+        if config.cache_sync_interval_ms > 0 {
+            info!(
+                interval_ms = config.cache_sync_interval_ms,
+                "terminology cache sync ENABLED (shared terminology_epoch)"
+            );
+        }
+    }
 
     let app = helios_hts::server::create_app(&config, state);
 

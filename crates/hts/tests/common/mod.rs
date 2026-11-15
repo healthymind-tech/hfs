@@ -576,6 +576,40 @@ impl TestAppPg {
         }
     }
 
+    /// A second, independently constructed app (own pools, own caches) on
+    /// an existing database — one more replica of a cluster. With `sync` set
+    /// it runs the terminology cache-sync poller at that interval, the way
+    /// `hts` wires it for PostgreSQL.
+    #[allow(dead_code)]
+    pub async fn replica(url: &str, sync: Option<std::time::Duration>) -> Self {
+        use helios_hts::traits::TerminologyCaches;
+        use std::sync::Arc;
+
+        let slot = pg_test_slot().await;
+        let (backend, resource_store) = pg_test_backends(url).await;
+        let state = PgAppState::new(backend.clone())
+            .with_resource_store_pg(resource_store)
+            .with_terminology_importer(Arc::new(backend.clone()));
+        if let Some(interval) = sync {
+            let st = state.clone();
+            helios_hts::backends::postgres::epoch::spawn_cache_sync(
+                backend,
+                interval,
+                Arc::new(move || {
+                    st.clear_expand_cache();
+                    st.backend().invalidate_caches();
+                }),
+            );
+        }
+        let config = PgHtsConfig::default();
+        let router = helios_hts::server::create_app(&config, state);
+        TestAppPg {
+            router,
+            url: url.to_string(),
+            _slot: slot,
+        }
+    }
+
     /// Connection URL of this app's database.
     #[allow(dead_code)]
     pub fn database_url(&self) -> &str {

@@ -534,6 +534,42 @@ BEGIN
         EXECUTE format('ALTER TABLE %s %s', r.tbl, r.alters);
     END LOOP;
 END $$;
+
+-- ── Cross-instance cache coherence ─────────────────────────────────────────────
+-- Every HTS process keeps response caches ($expand, $lookup, $validate-code,
+-- $translate, $subsumes, CodeSystem/ValueSet metadata). A write served by one
+-- replica (or by `hts import`, or by hand-written SQL) must reach the others.
+-- `terminology_epoch` is a single counter: the triggers below bump it inside
+-- every transaction that touches a terminology header row, the server bumps it
+-- once more after each write it completes, and every server polls it
+-- (`HTS_CACHE_SYNC_INTERVAL_MS`) and drops its caches when it moves.
+-- Statement-level triggers on the three header tables only: concept rows are
+-- written in bulk, and a per-statement bump there would serialize parallel
+-- import writers on this one row.
+CREATE TABLE IF NOT EXISTS terminology_epoch (
+    id    SMALLINT PRIMARY KEY CHECK (id = 1),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO terminology_epoch (id, epoch) VALUES (1, 1) ON CONFLICT (id) DO NOTHING;
+CREATE OR REPLACE FUNCTION hts_bump_terminology_epoch() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE terminology_epoch SET epoch = epoch + 1 WHERE id = 1;
+    RETURN NULL;
+END
+$$;
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON code_systems;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON code_systems
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON value_sets;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON value_sets
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON concept_maps;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON concept_maps
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
 ";
 
 /// Advisory lock key guarding bootstrap terminology import

@@ -151,6 +151,15 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_BOOTSTRAP_DIR", default_value = "")]
     pub bootstrap_dir: String,
 
+    /// How often (milliseconds) a PostgreSQL-backed server polls the shared
+    /// `terminology_epoch` counter and drops its response caches when another
+    /// replica, a `hts import` run or a hand-written SQL change moved it.
+    /// Bounds cross-replica staleness of `$expand` / `$validate-code` /
+    /// `$lookup` / `$translate` / `$subsumes`. `0` disables the poller (a
+    /// single replica that is the only writer). Ignored for SQLite.
+    #[arg(long, env = "HTS_CACHE_SYNC_INTERVAL_MS", default_value = "1000")]
+    pub cache_sync_interval_ms: u64,
+
     /// Number of concepts per import batch during bootstrap sync. Each batch
     /// is one database transaction plus fixed per-batch bookkeeping (metadata
     /// upsert, cache invalidation), so larger batches amortize that overhead
@@ -278,6 +287,7 @@ impl Default for HtsConfig {
             max_expansion_size: 10_000,
             auto_supplements: true,
             bootstrap_dir: String::new(),
+            cache_sync_interval_ms: 1000,
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
             ui_enabled: true,
