@@ -212,6 +212,12 @@ impl Default for ExpansionLimits {
     }
 }
 
+/// Per-request timeout of the search terminology client when
+/// `HFS_TERMINOLOGY_TIMEOUT_SECS` is not set. It was a fixed 10 s, which the
+/// first (cold) expansion of a 4,000–6,000-code eCQM ValueSet exceeded on a
+/// loaded host, failing the search with 503 (line G, CQL against HFS).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Async HTTP client for FHIR terminology server operations.
 ///
 /// Used by the HFS REST layer to expand ValueSets when processing `:in`,
@@ -232,8 +238,10 @@ impl TerminologyServiceClient {
     /// [`ExpansionLimits`].
     ///
     /// Trailing slashes in `base_url` are trimmed automatically.
-    /// A 10-second timeout is applied to all requests, with a short connect
-    /// timeout so an unreachable server fails fast.
+    /// [`DEFAULT_REQUEST_TIMEOUT`] is applied to every request (configurable
+    /// with `HFS_TERMINOLOGY_TIMEOUT_SECS` through
+    /// [`SearchTerminology::from_config`]), with a short connect timeout so an
+    /// unreachable server fails fast.
     ///
     /// The client bypasses any proxy environment: the terminology server is a
     /// configured internal endpoint, and routing it through an egress proxy
@@ -248,8 +256,18 @@ impl TerminologyServiceClient {
 
     /// [`TerminologyServiceClient::new`] with explicit [`ExpansionLimits`].
     pub fn with_limits(base_url: String, limits: ExpansionLimits) -> Self {
+        Self::with_limits_and_timeout(base_url, limits, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// [`TerminologyServiceClient::with_limits`] with an explicit per-request
+    /// timeout (a whole `$expand` page, connect to last byte).
+    pub fn with_limits_and_timeout(
+        base_url: String,
+        limits: ExpansionLimits,
+        timeout: Duration,
+    ) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(timeout)
             .connect_timeout(Duration::from_secs(2))
             .no_proxy()
             .build()
@@ -549,7 +567,11 @@ impl SearchTerminology {
             max_codes: config.expansion_max_codes,
         };
         Self::new(
-            TerminologyServiceClient::with_limits(base_url.to_string(), limits),
+            TerminologyServiceClient::with_limits_and_timeout(
+                base_url.to_string(),
+                limits,
+                Duration::from_secs(config.timeout_secs.max(1)),
+            ),
             Duration::from_secs(config.expansion_cache_ttl_secs),
         )
     }
@@ -892,6 +914,51 @@ mod tests {
     fn test_client_no_trailing_slash() {
         let client = TerminologyServiceClient::new("http://localhost:8090".to_string());
         assert_eq!(client.base_url(), "http://localhost:8090");
+    }
+
+    /// A request that outlives the configured timeout fails at that timeout,
+    /// and one inside it succeeds: the timeout is the configured value, not a
+    /// fixed 10 s.
+    #[tokio::test]
+    async fn test_client_uses_the_configured_timeout() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/ValueSet/$expand",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                (
+                    [("content-type", "application/fhir+json")],
+                    r#"{"resourceType":"ValueSet","expansion":{"total":1,"contains":[{"system":"s","code":"c"}]}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let short = TerminologyServiceClient::with_limits_and_timeout(
+            base.clone(),
+            ExpansionLimits::default(),
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        assert!(short.expand_value_set("http://vs").await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1200));
+
+        let long = TerminologyServiceClient::with_limits_and_timeout(
+            base,
+            ExpansionLimits::default(),
+            Duration::from_secs(5),
+        );
+        let codes = long.expand_value_set("http://vs").await.expect("within timeout");
+        assert_eq!(codes.len(), 1);
+    }
+
+    #[test]
+    fn test_from_config_applies_timeout_and_default_is_thirty_seconds() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(30));
+        let config = crate::config::SearchTerminologyConfig::default();
+        assert_eq!(config.timeout_secs, 30);
     }
 
     // ─── SearchTerminology cache ────────────────────────────────────────────

@@ -315,3 +315,129 @@ site never queries (e.g. Claim/ExplanationOfBenefit financial parameters,
 a product decision. Lowering the token statistics target (above) removes the
 other hidden write-path cost: autovacuum's ANALYZE of `search_index` drops
 from 62–80 s to ~10 s per run.
+
+## 6. Long token lists (`code:in`)
+
+`code:in=<ValueSet>` is resolved by HFS (ValueSet expansion via HTS), and the
+search reaches PostgreSQL as a token list of every expanded code. Line G (CQL
+against HFS) measured `Condition?subject=&code:in=<451-code VS>` at ~380 ms
+against 3–6 ms on HAPI.
+
+Causes, measured on the 2.24M set (`pg_stat_statements`, track_planning):
+
+- one OR arm per code, two bind parameters each, a BitmapOr of N index scans,
+  and a new statement text for every list length;
+- planning grows with the list: PostgreSQL estimates `value_token_code =
+  ANY(<constant array>)` element by element against the column's MCV list
+  (1000 entries since hm-0006) — a 5,000-code list planned for 160 ms and
+  executed in 2 ms.
+
+Changes (`query_builder.rs`, `search_impl.rs`):
+
+1. A list of ≥ 10 values that are all `system|code` becomes one arm per
+   distinct system, `value_token_system IN ($system, marker) AND
+   value_token_code = ANY($codes)` (a ScalarArrayOp scan of
+   `idx_search_token_code`); all code-only becomes `value_token_code =
+   ANY($codes)`. Same semantics as the per-value form (own system or the
+   implicit-system marker, #1379), `:not` unchanged; mixed, `|code`, `system|`
+   and shorter lists keep the OR form. A first variant checked
+   `system || '|' || code = ANY($pairs)`; that expression has no statistics,
+   its default selectivity under-estimated a patient's 10-code membership 100×
+   and the planner drove the search from the codes (1.3 s) — rejected.
+2. A list of more than 1,000 values is first cut to the codes that have any
+   `search_index` row for the tenant, type and parameter (one correlated
+   probe per distinct code, ~7 µs each; 297 of 5,000 survive here). Absent
+   codes cannot change the match, with or without `:not`; a list left empty
+   keeps one value so it still matches nothing. Lowering the token statistics
+   target to 100 instead (planning 160 → 24 ms) was measured and **rejected**:
+   moderately frequent clinical codes fall out of the MCV list and a patient's
+   10-code Condition search went from 10 ms to 0.9–2.3 s.
+
+Benchmark (`scripts/ops/codelist-bench.py`; lists = the most frequent real codes
+up to half the list, padded with codes that occur nowhere, POSTed to
+`_search`), before = `hm/main` `1413d673a`, HTTP medians in ms, two runs each:
+
+| codes | shape | before (hm/main) run1 / run2 | after run1 / run2 | entries |
+|---|---|---|---|---|
+| 10 | condition_codes | 11.0 / 8.8 | 13.8 / 21.1 | 20/20 |
+| 10 | condition_patient_codes | 13.2 / 10.3 | 15.1 / 11.5 | 14/14 |
+| 10 | observation_codes_date | 9.2 / 13.3 | 19.5 / 7.1 | 20/20 |
+| 10 | observation_patient_codes_date | 50.2 / 49.9 | 57.8 / 35.9 | 50/50 |
+| 100 | condition_codes | 15.3 / 12.9 | 17.2 / 14.9 | 20/20 |
+| 100 | condition_patient_codes | 27.6 / 15.6 | 20.6 / 15.4 | 20/20 |
+| 100 | observation_codes_date | 44.7 / 27.0 | 30.4 / 12.6 | 20/20 |
+| 100 | observation_patient_codes_date | 51.0 / 50.4 | 58.1 / 66.4 | 50/50 |
+| 500 | condition_codes | 50.0 / 58.0 | 42.5 / 20.8 | 20/20 |
+| 500 | condition_patient_codes | 70.0 / 43.4 | 40.8 / 22.3 | 20/20 |
+| 500 | observation_codes_date | 178.6 / 133.7 | 67.2 / 45.7 | 20/20 |
+| 500 | observation_patient_codes_date | 142.6 / 104.5 | 67.8 / 76.7 | 50/50 |
+| 5000 | condition_codes | 465.1 / 431.7 | 113.9 / 94.8 | 20/20 |
+| 5000 | condition_patient_codes | 434.0 / 441.3 | 85.3 / 90.1 | 20/20 |
+| 5000 | observation_codes_date | 1155.2 / 1133.3 | 142.2 / 134.6 | 20/20 |
+| 5000 | observation_patient_codes_date | 604.9 / 473.6 | 125.1 / 80.6 | 50/50 |
+
+The 43-search benchmark on the same database (no search slower beyond noise,
+identical entry counts):
+
+| search | before run1 / run2 | after run1 / run2 | entries |
+|---|---|---|---|
+| patient_by_identifier | 16.0 / 3.8 | 15.8 / 3.4 | 1/1 |
+| patient_by_family | 5.5 / 3.0 | 3.7 / 2.9 | 1/1 |
+| patient_by_name | 3.4 / 3.1 | 2.8 / 3.0 | 1/1 |
+| patient_by_birthdate | 3.7 / 3.1 | 8.4 / 4.7 | 1/1 |
+| patient_by_birthdate_range | 63.2 / 32.5 | 59.3 / 31.3 | 6/6 |
+| patient_name_and_birthdate | 7.5 / 8.4 | 9.2 / 9.3 | 1/1 |
+| obs_patient_code_date | 7.5 / 7.6 | 7.7 / 7.7 | 1/1 |
+| obs_patient_sorted | 8.2 / 7.3 | 8.7 / 7.4 | 20/20 |
+| obs_patient_category | 6.1 / 6.1 | 7.1 / 6.4 | 7/7 |
+| obs_code_date_broad | 13.1 / 12.5 | 17.1 / 12.9 | 50/50 |
+| obs_code_count | 22.0 / 24.7 | 25.4 / 24.7 | 0/0 |
+| encounter_patient_date | 6.1 / 6.6 | 6.7 / 6.9 | 10/10 |
+| encounter_patient_include | 9.9 / 9.9 | 11.1 / 10.5 | 26/26 |
+| patient_revinclude_encounter | 7.1 / 6.3 | 7.6 / 7.4 | 21/21 |
+| patient_revinclude_obs | 7.5 / 6.7 | 9.2 / 7.4 | 24/24 |
+| obs_lastupdated | 4.9 / 4.9 | 6.5 / 5.3 | 50/50 |
+| obs_lastupdated_sorted | 4.4 / 4.6 | 6.8 / 5.7 | 50/50 |
+| obs_chain_patient_identifier | 13.2 / 11.4 | 14.0 / 11.5 | 23/23 |
+| obs_chain_patient_family | 8.8 / 8.8 | 13.5 / 9.6 | 23/23 |
+| patient_has_obs_code | 42.2 / 38.3 | 48.0 / 39.3 | 50/50 |
+| condition_patient | 5.0 / 5.0 | 7.2 / 3.0 | 20/20 |
+| medreq_patient_status | 5.7 / 5.0 | 8.1 / 2.4 | 7/7 |
+| patient_everything | 106.9 / 85.0 | 93.1 / 70.8 | 215/215 |
+| encounter_status_finished | 7.5 / 5.5 | 7.0 / 5.2 | 20/20 |
+| obs_category_laboratory | 6.2 / 4.7 | 6.8 / 5.6 | 20/20 |
+| obs_status_final_code | 12.2 / 8.9 | 13.0 / 7.5 | 20/20 |
+| obs_category_date | 13.6 / 8.8 | 13.6 / 5.9 | 20/20 |
+| condition_code | 4.6 / 5.0 | 7.2 / 2.7 | 20/20 |
+| obs_category_date_patient | 9.5 / 8.7 | 10.6 / 8.9 | 7/7 |
+| obs_status_date | 11.4 / 9.1 | 14.0 / 6.6 | 20/20 |
+| obs_status_date_patient | 11.6 / 10.3 | 13.6 / 6.8 | 20/20 |
+| obs_category_date_old | 13.7 / 11.6 | 15.4 / 5.8 | 20/20 |
+| obs_category_date_window | 267.5 / 233.9 | 284.5 / 278.8 | 20/20 |
+| obs_code_date_recent | 13.1 / 9.1 | 12.3 / 6.4 | 20/20 |
+| encounter_status_date | 10.2 / 8.7 | 12.5 / 4.4 | 20/20 |
+| encounter_class_date | 11.9 / 8.6 | 14.1 / 11.2 | 20/20 |
+| condition_status_onset | 10.5 / 8.3 | 15.0 / 6.2 | 20/20 |
+| report_category_date | 11.1 / 10.7 | 16.9 / 4.8 | 20/20 |
+| obs_category_value_quantity | 14.3 / 12.7 | 21.8 / 12.0 | 20/20 |
+| obs_code_value_quantity | 11.1 / 7.7 | 12.3 / 6.0 | 20/20 |
+| obs_category_date_ancient | 32.3 / 31.3 | 31.8 / 26.5 | 20/20 |
+| obs_category_quantity_none | 49.9 / 32.8 | 44.3 / 35.3 | 0/0 |
+| encounter_status_date_recent | 13.0 / 8.7 | 15.7 / 8.9 | 20/20 |
+| **sum** | 913 / 750 | 979 / 749 | |
+
+Line G's shape (`Condition?subject=&code:in=<451>`) corresponds to the
+500-code `condition_patient_codes` row: 43–70 ms → 22–41 ms here (the
+remaining time is HTTP parsing of the list and the per-system arm; the HTS
+expansion itself is cached by HFS for `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`).
+
+### Terminology timeout and warming
+
+- `HFS_TERMINOLOGY_TIMEOUT_SECS` (default **30**, was a fixed 10 s) is the
+  per-request timeout of HFS's terminology client (each `$expand` page). A
+  cold HTS expansion of a 4,000–6,000-code eCQM ValueSet exceeded 10 s on a
+  loaded host and the search failed closed with 503.
+- `scripts/ops/warm-valuesets.sh <HTS base> [url-file]` expands the ValueSets
+  `code:in` uses (default: every VSAC/eCQM ValueSet HTS holds) after an HTS
+  restart, terminology import or IG install, so the first clinical search or
+  measure run finds them in HTS's expansion cache.

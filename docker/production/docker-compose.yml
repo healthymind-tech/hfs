@@ -129,6 +129,7 @@ services:
       HFS_BULK_EXPORT_OUTPUT_DIR: /data/export
       HFS_TERMINOLOGY_SERVER: http://hts:8090
       HFS_TERMINOLOGY_SERVER_TOKEN: ${ADMIN_PASSWORD}
+      HFS_TERMINOLOGY_TIMEOUT_SECS: "30"     # per $expand page; cold eCQM ValueSets can exceed 10 s (docs/ops/index-strategy.md §6)
       HFS_VALIDATION_MODE: "off"
       HFS_VALIDATION_STORED_PROFILES: "true"
       HFS_VALIDATION_TERMINOLOGY: embedded
