@@ -468,6 +468,11 @@ pub struct EffectHandlers<'a> {
     /// Report internal narrative hyperlinks (`<a href="#x">`) that resolve
     /// to nothing in the resource (error, as the HL7 validator does).
     pub narrative_links: bool,
+    /// Resource-specific rules beyond any profile, as the HL7 validator
+    /// checks them: defining canonical URLs must be absolute, RFC 3986
+    /// Identifier values must be URIs, CodeSystem/ValueSet authoring rules
+    /// (counts, supplements, property definitions, include systems).
+    pub resource_rules: bool,
     /// The HL7 validator's best-practice warnings (an Observation without
     /// a subject or performer).
     pub best_practice: bool,
@@ -483,6 +488,7 @@ impl Default for EffectHandlers<'_> {
             display_issues: Severity::Warning,
             check_extensible: false,
             narrative_links: false,
+            resource_rules: false,
             best_practice: false,
         }
     }

@@ -373,6 +373,9 @@ impl ValidationService {
             // Unresolved internal narrative links are errors, as the HL7
             // validator reports them.
             narrative_links: true,
+            // CodeSystem/ValueSet authoring, canonical URL and RFC 3986
+            // Identifier rules, as the HL7 validator reports them.
+            resource_rules: true,
             best_practice: self.best_practice,
         };
         validator
@@ -2222,7 +2225,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         ErrorKind::UnknownCodeSystem
         | ErrorKind::Narrative
         | ErrorKind::BestPractice
-        | ErrorKind::DuplicateId => IssueType::Invalid,
+        | ErrorKind::DuplicateId
+        | ErrorKind::ResourceRule => IssueType::Invalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.

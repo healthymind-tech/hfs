@@ -15,6 +15,7 @@ mod narrative;
 mod path;
 mod primitives;
 mod references;
+mod resource_rules;
 pub(crate) mod slicing;
 mod walk;
 
@@ -353,6 +354,9 @@ impl Validator {
         } = self.validate_sync_with(resource, opts, invariants);
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
+        }
+        if effects.resource_rules {
+            errors.extend(resource_rules::resource_rule_errors(resource));
         }
         if effects.best_practice {
             errors.extend(narrative::best_practice_warnings(resource));
