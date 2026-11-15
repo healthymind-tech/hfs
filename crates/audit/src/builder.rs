@@ -38,6 +38,9 @@ pub struct AuditEventBuilder {
     extra_entities: Vec<AuditEventEntity>,
     event_type_system: Option<String>,
     event_type_code: Option<String>,
+    subtype_override: Option<(String, String)>,
+    agent_display: Option<String>,
+    agent_address: Option<String>,
 }
 
 impl AuditEventBuilder {
@@ -59,6 +62,9 @@ impl AuditEventBuilder {
             extra_entities: Vec::new(),
             event_type_system: None,
             event_type_code: None,
+            subtype_override: None,
+            agent_display: None,
+            agent_address: None,
         }
     }
 
@@ -130,6 +136,22 @@ impl AuditEventBuilder {
         self
     }
 
+    /// Override the subtype coding (default: the restful-interaction code of
+    /// the action).
+    pub fn subtype(mut self, system: &str, code: &str) -> Self {
+        self.subtype_override = Some((system.to_string(), code.to_string()));
+        self
+    }
+
+    /// Name the agent by display text (an actor without a FHIR reference,
+    /// such as `admin` or a client address) and, optionally, its network
+    /// address.
+    pub fn agent_display(mut self, display: impl Into<String>, address: Option<String>) -> Self {
+        self.agent_display = Some(display.into());
+        self.agent_address = address;
+        self
+    }
+
     /// Build the typed `AuditEvent`.
     pub fn build(self) -> AuditEvent {
         let has_patient = self.patient_reference.is_some();
@@ -185,6 +207,7 @@ impl AuditEventBuilder {
         entities.extend(self.extra_entities);
 
         // Build the subtype coding (maps action code to restful-interaction)
+        let subtype_override = self.subtype_override.clone();
         let subtype = self.action.map(|a| {
             let interaction = match a {
                 AuditAction::Create => "create",
@@ -198,6 +221,10 @@ impl AuditEventBuilder {
             };
             vec![coding(code_systems::RESTFUL_INTERACTION, interaction)]
         });
+        let subtype = match subtype_override {
+            Some((system, code)) => Some(vec![coding(&system, &code)]),
+            None => subtype,
+        };
 
         // Event type: use override if set, otherwise default to "rest"
         let type_system = self
@@ -219,7 +246,21 @@ impl AuditEventBuilder {
             outcome: self.outcome.map(code),
             outcome_desc: self.outcome_desc.map(fhir_string),
             agent: Some(vec![AuditEventAgent {
-                who: self.agent_who.as_deref().map(reference),
+                who: match (self.agent_who.as_deref(), self.agent_display.as_deref()) {
+                    (Some(who), _) => Some(reference(who)),
+                    (None, Some(display)) => Some(crate::fhir_model::Reference {
+                        display: Some(fhir_string(display)),
+                        ..Default::default()
+                    }),
+                    (None, None) => None,
+                },
+                network: self.agent_address.as_deref().map(|a| {
+                    crate::fhir_model::AuditEventAgentNetwork {
+                        address: Some(fhir_string(a)),
+                        r#type: Some(code("2")),
+                        ..Default::default()
+                    }
+                }),
                 name: self.agent_name.map(fhir_string),
                 requestor: boolean(self.agent_requestor),
                 ..Default::default()
@@ -241,6 +282,20 @@ impl AuditEventBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_subtype_and_display_agent() {
+        let e = AuditEventBuilder::new("Device/hts")
+            .action(AuditAction::Delete)
+            .subtype("urn:helios:hts:admin-action", "delete-code-system")
+            .agent_display("admin", Some("10.0.0.9".into()))
+            .build();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["subtype"][0]["code"], "delete-code-system");
+        assert_eq!(v["agent"][0]["who"]["display"], "admin");
+        assert!(v["agent"][0]["who"].get("reference").is_none());
+        assert_eq!(v["agent"][0]["network"]["address"], "10.0.0.9");
+    }
 
     #[test]
     fn test_minimal_build() {

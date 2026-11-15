@@ -145,6 +145,9 @@ pub async fn audit_middleware(
     if state.exclusion_filter.is_excluded(&path, &method) {
         return next.run(request).await;
     }
+    if !state.config.reads && is_read_request(&method, &path) {
+        return next.run(request).await;
+    }
 
     let query = request.uri().query().map(str::to_string);
     let client_address = client_address(&request, state.config.trust_forwarded_for);
@@ -185,7 +188,23 @@ pub async fn audit_middleware(
     } else {
         None
     };
-    let response_ctx = response.extensions().get::<AuditResponseContext>().cloned();
+    let mut response_ctx = response.extensions().get::<AuditResponseContext>().cloned();
+    // A create answered by a handler that sets no audit context still names
+    // what it created in `Location` (HTS, and any embedder).
+    if response_ctx
+        .as_ref()
+        .is_none_or(|c| c.resource_id.is_none())
+        && let Some((rt, id)) = response
+            .headers()
+            .get(header::LOCATION)
+            .or_else(|| response.headers().get(header::CONTENT_LOCATION))
+            .and_then(|v| v.to_str().ok())
+            .and_then(resource_from_location)
+    {
+        let ctx = response_ctx.get_or_insert_with(AuditResponseContext::default);
+        ctx.resource_type.get_or_insert(rt);
+        ctx.resource_id = Some(id);
+    }
 
     let mut captured = ctx.take();
     if captured.user.is_none()
@@ -301,6 +320,45 @@ fn client_address(request: &axum::extract::Request, trust_forwarded_for: bool) -
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip().to_string())
+}
+
+/// Read-only FHIR operations: invoking one changes nothing.
+const READ_ONLY_OPERATIONS: &[&str] = &[
+    "$expand",
+    "$lookup",
+    "$validate-code",
+    "$batch-validate-code",
+    "$translate",
+    "$subsumes",
+    "$validate",
+    "$everything",
+    "$meta",
+    "$versions",
+];
+
+/// Whether a request only reads: `GET`/`HEAD`, a `POST _search`, or a `POST`
+/// to a read-only operation. Used when reads are not audited
+/// (`*_AUDIT_READS=false`).
+pub fn is_read_request(method: &str, path: &str) -> bool {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" | "HEAD" => true,
+        "POST" => {
+            let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            last == "_search" || READ_ONLY_OPERATIONS.contains(&last)
+        }
+        _ => false,
+    }
+}
+
+/// `(type, id)` named by a `Location` header (`<base>/CodeSystem/x/_history/1`).
+fn resource_from_location(location: &str) -> Option<(String, String)> {
+    let path = location.split(['?', '#']).next()?;
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    (0..segs.len().saturating_sub(1)).rev().find_map(|i| {
+        let (rt, id) = (segs[i], segs[i + 1]);
+        (crate::interaction::is_resource_type(rt) && !id.starts_with(['_', '$']))
+            .then(|| (rt.to_string(), id.to_string()))
+    })
 }
 
 /// Keeps a client-supplied request id printable and bounded.
@@ -670,6 +728,85 @@ mod tests {
         assert_eq!(strip_tenant("/acme/Patient", &none, true), "/Patient");
         assert_eq!(strip_tenant("/Patient/1", &none, true), "/Patient/1");
         assert_eq!(strip_tenant("/acme/Patient", &none, false), "/acme/Patient");
+    }
+
+    #[test]
+    fn read_requests_are_told_apart() {
+        assert!(is_read_request("GET", "/CodeSystem/x"));
+        assert!(is_read_request("POST", "/ValueSet/$expand"));
+        assert!(is_read_request("POST", "/ValueSet/vs1/$validate-code"));
+        assert!(is_read_request("POST", "/Patient/_search"));
+        assert!(!is_read_request("POST", "/CodeSystem"));
+        assert!(!is_read_request("POST", "/import"));
+        assert!(
+            !is_read_request("POST", "/$closure"),
+            "$closure keeps state"
+        );
+        assert!(!is_read_request("DELETE", "/ValueSet/x"));
+    }
+
+    #[test]
+    fn location_names_the_created_resource() {
+        assert_eq!(
+            resource_from_location("http://h/fhir/CodeSystem/cs-1/_history/1"),
+            Some(("CodeSystem".into(), "cs-1".into()))
+        );
+        assert_eq!(
+            resource_from_location("/ValueSet/vs9"),
+            Some(("ValueSet".into(), "vs9".into()))
+        );
+        assert_eq!(resource_from_location("http://h/fhir/metadata"), None);
+    }
+
+    #[tokio::test]
+    async fn reads_can_be_left_unaudited() {
+        let sink = Arc::new(Collect::default());
+        let config = AuditConfig {
+            reads: false,
+            ..AuditConfig::default()
+        };
+        let state = Arc::new(AuditMiddlewareState::new(sink.clone(), config));
+        let app = Router::new()
+            .route("/CodeSystem/{id}", get(|| async { "{}" }))
+            .route(
+                "/CodeSystem",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::CREATED,
+                        [(header::LOCATION, "http://t/CodeSystem/new-cs/_history/1")],
+                        "{}",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                audit_middleware,
+            ));
+        call(
+            app.clone(),
+            axum::http::Request::get("/CodeSystem/a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(sink.json().is_empty(), "a read is not recorded");
+        call(
+            app,
+            axum::http::Request::post("/CodeSystem")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        let events = sink.json();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].1["meta"]["profile"][0],
+            crate::balp::profiles::CREATE
+        );
+        assert_eq!(
+            events[0].1["entity"][0]["what"]["reference"],
+            "CodeSystem/new-cs"
+        );
     }
 
     #[test]

@@ -73,6 +73,8 @@ pub use context::RequestAudit;
 pub use correlation::{AuditCorrelation, BundleAuditEntry};
 pub use error::{AuditError, AuditResult};
 pub use exclusion::ExclusionFilter;
+/// The FHIR `AuditEvent` model this crate builds (R4 structure).
+pub use fhir_model::AuditEvent;
 pub use interaction::{RestInteraction, classify};
 pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
 pub use rest_event::{AuditUser, RequestParties, RestEventSpec, build_rest_events};
