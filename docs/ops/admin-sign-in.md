@@ -30,9 +30,11 @@ page explains which variable to set; the server logs a warning at startup.
 It never runs open. A password configured with `*_ADMIN_UI=false` still
 guards whatever the server classifies as administrative.
 
-**HFS with SMART/OIDC on** (`HFS_AUTH_ENABLED=true`): the admin tier already
-requires a system-scope bearer token and the console its own IdP session, so
-the password is ignored (with a warning).
+**HFS with SMART/OIDC on** (`HFS_AUTH_MODE=write-protect|full`): a configured
+password keeps working alongside tokens — on the admin API (which also accepts
+a token with `system/*.r`) and on the FHIR API, where the admin credential
+acts as an administrator holding every scope. Without a password the admin
+tier requires a system-scope token. See [auth.md](auth.md).
 
 ## What is protected
 
