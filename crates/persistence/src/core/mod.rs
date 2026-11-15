@@ -109,6 +109,7 @@ pub mod package_registry;
 pub mod patch;
 pub mod patient_compartment;
 pub mod preconditions;
+pub mod retention;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
@@ -178,6 +179,7 @@ pub use preconditions::{
     if_match_field_satisfied, multiple_matches_entry, not_supported_entry,
     precondition_failed_entry,
 };
+pub use retention::{ExpiredResource, RetentionStorage};
 pub use search::{
     ChainedSearchProvider, DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID,
     IncludeProvider, MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider,
