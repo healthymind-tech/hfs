@@ -101,6 +101,13 @@ pub mod json_view;
 /// browser's own `toLocaleString` (`crates/ui/assets/number.js`).
 pub mod number;
 
+pub mod navigation;
+
+pub use navigation::{
+    Crumb, HFS_CONSOLE_COOKIE, HFS_CONSOLE_PATH, HTS_CONSOLE_PATH, Product, ProductLinks,
+    breadcrumb, has_hfs_console_cookie, hfs_console_set_cookie, product_switcher,
+};
+
 /// Name of the cookie the language switcher's `?lang=` persists its choice
 /// in. One cookie for both products: HFS and HTS present one console to an
 /// operator, so picking a language in one must carry over to the other.

@@ -2439,3 +2439,17 @@ admin-login-throttled = Too many failed attempts from your address. Try again in
 admin-login-cross-site = The sign-in form must be sent from this site. Reload the page and try again.
 admin-login-locked = Administration is locked: this server has no administrator password. Set { $var } (or { $var }_FILE) and restart it.
 admin-user-hint = Administrator
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = Switch console
+product-switch-fhir = FHIR Server
+product-switch-terminology = Terminology
+product-switch-new-tab = Opens in a new tab
+breadcrumb-label = Breadcrumb
+# The editor's heading before the resource has an id, e.g. "New Patient".
+editor-new-title = New { $type }
+editor-crumb-new = New
+# The history page's heading once an instance is chosen; $subject is "Patient/123".
+history-heading-for = History · { $subject }
+history-crumb = History

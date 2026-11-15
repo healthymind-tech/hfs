@@ -1,6 +1,6 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}{{ i18n.t("history-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block title %}{{ self.heading() }} — {{ i18n.t("app-title") }}{% endblock %}
 
 {% block content %}
 <!--
@@ -12,7 +12,8 @@
   posts them to /ui/history/diff.
 -->
 <section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("history-heading") }}</h1>
+  {{ self.breadcrumb()?|safe }}
+  <h1 class="page-head__title">{{ self.heading() }}</h1>
   <p class="page-head__lede">{{ i18n.t("history-lede") }}</p>
 </section>
 
@@ -21,13 +22,15 @@
      data-msg-current="{{ i18n.t("history-current") }}"
      data-msg-not-found="{{ i18n.t("history-not-found") }}">
 
-  <!-- Locate the instance. A plain form so it works without JavaScript. -->
-  <form class="history__locate" id="history-locate">
-    <input class="history__type" name="type" value="Patient" spellcheck="false"
+  <!-- Locate the instance. A plain GET form: loading an instance is a
+       navigation to /ui/history?type=…&id=…, so the URL, the breadcrumb and
+       the back button always describe what is on screen. -->
+  <form class="history__locate" id="history-locate" method="get" action="/ui/history">
+    <input class="history__type" name="type" value="{{ self.type_value() }}" spellcheck="false"
            aria-label="{{ i18n.t("history-type-label") }}">
     <span class="history__slash">/</span>
-    <input class="history__id" name="id" placeholder="{{ i18n.t("history-id-placeholder") }}"
-           spellcheck="false" aria-label="{{ i18n.t("history-id-label") }}">
+    <input class="history__id" name="id" value="{{ resource_id }}" placeholder="{{ i18n.t("history-id-placeholder") }}"
+           spellcheck="false" required aria-label="{{ i18n.t("history-id-label") }}">
     <button class="btn btn--primary" type="submit">{{ i18n.t("history-load") }}</button>
   </form>
 

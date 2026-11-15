@@ -1,0 +1,12 @@
+{#
+  SHARED CHROME -- the topbar product switcher (HFS <-> HTS), rendered by
+  `helios_ui_chrome::product_switcher()` for both consoles. Only rendered when
+  both products have a link; see `src/navigation.rs`.
+#}      <nav class="product-switch" aria-label="{{ i18n.t("product-switch-label") }}">
+{%- for item in items %}
+        <a class="product-switch__item" href="{{ item.href }}"
+          {%- if item.current %} aria-current="page"{% endif %}
+          {%- if item.new_tab %} target="_blank" rel="noopener noreferrer" title="{{ i18n.t("product-switch-new-tab") }}"{% endif %}>{{ item.label }}</a>
+{%- endfor %}
+      </nav>
+{#- -#}

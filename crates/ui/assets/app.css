@@ -516,7 +516,8 @@ a.nav-item:hover {
   color: var(--text-strong);
 }
 
-.nav-item[aria-current="page"] {
+.nav-item[aria-current="page"],
+.nav-item[aria-current="true"] {
   background: var(--surface);
   border-color: var(--surface-border);
   box-shadow: var(--surface-shadow);
@@ -789,6 +790,119 @@ button.menu__option {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+/* The product switcher (shared markup: helios-ui-chrome
+   product-switcher.html): FHIR Server | Terminology, the console in use
+   marked aria-current. Sits at the topbar's left, after the hamburger on
+   touch widths (UI/UX review §4.2). */
+.product-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: auto;
+  padding: 3px;
+  border: 1px solid var(--outline);
+  border-radius: 999px;
+  background: var(--bg-content);
+  min-width: 0;
+}
+
+.product-switch__item,
+.product-switch__item:visited {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted-text);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.product-switch__item:hover {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.product-switch__item[aria-current="page"] {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.product-switch__item:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1024px) {
+  .product-switch {
+    margin-left: 4px;
+  }
+}
+
+@media (max-width: 420px) {
+  .product-switch__item,
+  .product-switch__item:visited {
+    padding: 0 9px;
+    font-size: 12px;
+  }
+}
+
+/* Breadcrumb trail (shared markup: helios-ui-chrome breadcrumb.html). The
+   separator is drawn here so screen readers announce only the steps. */
+.breadcrumb {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.breadcrumb__list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.breadcrumb__item {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  color: var(--muted-text);
+}
+
+.breadcrumb__item + .breadcrumb__item::before {
+  content: "›";
+  padding: 0 8px;
+  color: var(--muted);
+}
+
+.breadcrumb__item a,
+.breadcrumb__item a:visited {
+  color: var(--accent-text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.breadcrumb__item a:hover {
+  text-decoration: underline;
+}
+
+.breadcrumb__item a:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.breadcrumb__item [aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 /* The theme switcher (shared markup: helios-ui-chrome theme-toggle.html):
@@ -2307,7 +2421,8 @@ form.htmx-request .btn[type="submit"]::after,
   width: 120px;
   font-weight: 500;
 }
-.history__id { width: 200px; }
+/* Wide enough for a whole UUID (36 characters) — the review found ids cut at 27. */
+.history__id { width: 38ch; max-width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .history__slash { color: var(--muted); }
 
 /* Tabs — one definition for both tab designs (history's underline feed
@@ -5588,6 +5703,7 @@ tr:hover .result-id__copy,
   border-bottom: 1px solid var(--surface-border);
 }
 
+.card-head h2,
 .card-head h3 {
   display: flex;
   align-items: center;

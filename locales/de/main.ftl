@@ -2324,3 +2324,15 @@ admin-login-throttled = Zu viele fehlgeschlagene Versuche von Ihrer Adresse. Ver
 admin-login-cross-site = Das Anmeldeformular muss von dieser Website gesendet werden. Laden Sie die Seite neu und versuchen Sie es erneut.
 admin-login-locked = Die Verwaltung ist gesperrt: Für diesen Server ist kein Administratorpasswort festgelegt. Setzen Sie { $var } (oder { $var }_FILE) und starten Sie ihn neu.
 admin-user-hint = Administrator
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = Konsole wechseln
+product-switch-fhir = FHIR-Server
+product-switch-terminology = Terminologie
+product-switch-new-tab = Öffnet in einem neuen Tab
+breadcrumb-label = Brotkrumen-Navigation
+editor-new-title = Neue Ressource: { $type }
+editor-crumb-new = Neu
+history-heading-for = Verlauf · { $subject }
+history-crumb = Verlauf

@@ -2436,3 +2436,15 @@ admin-login-throttled = 您的位址登入失敗次數過多，請於 { $minutes
 admin-login-cross-site = 登入表單必須從本站送出。請重新整理頁面後再試一次。
 admin-login-locked = 管理功能已鎖定：此伺服器未設定管理員密碼。請設定 { $var }（或 { $var }_FILE）後重新啟動。
 admin-user-hint = 管理員
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = 切換主控台
+product-switch-fhir = FHIR 伺服器
+product-switch-terminology = 術語服務
+product-switch-new-tab = 在新分頁開啟
+breadcrumb-label = 導覽路徑
+editor-new-title = 新增 { $type }
+editor-crumb-new = 新增
+history-heading-for = 歷程 · { $subject }
+history-crumb = 歷程

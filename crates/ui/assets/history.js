@@ -238,12 +238,9 @@
     renderDiff();
   });
 
-  locateForm.addEventListener("submit", function (event) {
-    event.preventDefault();
-    var type = locateForm.elements.type.value.trim();
-    var id = locateForm.elements.id.value.trim();
-    if (type && id) load(type, id);
-  });
+  /* The locate form submits natively (GET /ui/history?type=&id=): the page
+     comes back with that instance in its URL, heading and breadcrumb, and
+     the deep-link branch below loads it. */
 
   function shortTime(iso) {
     if (!iso) return "";
