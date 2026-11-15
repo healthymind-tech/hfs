@@ -8,12 +8,14 @@
 //! - [`conditional`] - Conditional request headers (If-Match, etc.)
 //! - [`prefer`] - Prefer header handling
 //! - [`resource_type`] - Refuses paths whose type segment is not a resource type
+//! - [`smart_access`] - Patient-compartment, granular-scope and bundle filtering for SMART tokens
 
 pub mod auth;
 pub mod conditional;
 pub mod content_type;
 pub mod prefer;
 pub mod resource_type;
+pub mod smart_access;
 pub mod tenant;
 pub mod tenant_prefix;
 
