@@ -193,16 +193,22 @@ impl SqliteTransaction {
         resource: Value,
         prepared: Option<PreparedIndex>,
     ) -> StorageResult<StoredResource> {
-        self.create_inner(resource_type, resource, prepared)
+        // Bulk submit: a soft-deleted id stays an entry error (its consumer
+        // contract), so no resurrection here.
+        self.create_inner(resource_type, resource, prepared, false)
     }
 }
 
 impl SqliteTransaction {
+    /// `restore_deleted`: a soft-deleted row with the same id is brought back
+    /// with the next version (transaction-bundle PUT, FHIR http.html#delete)
+    /// instead of failing as `AlreadyExists` (bulk submit keeps the error).
     fn create_inner(
         &mut self,
         resource_type: &str,
         resource: Value,
         prepared: Option<PreparedIndex>,
+        restore_deleted: bool,
     ) -> StorageResult<StoredResource> {
         let _create_span = perf::span(Phase::Create);
         self.tenant
@@ -244,8 +250,8 @@ impl SqliteTransaction {
         };
 
         let prior_deleted_version = match existing {
-            Some((true, version)) => Some(version.parse::<u64>().unwrap_or(0)),
-            Some((false, _)) => {
+            Some((true, version)) if restore_deleted => Some(version.parse::<u64>().unwrap_or(0)),
+            Some(_) => {
                 return Err(StorageError::Resource(ResourceError::AlreadyExists {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
@@ -368,7 +374,7 @@ impl Transaction for SqliteTransaction {
         resource_type: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        self.create_inner(resource_type, resource, None)
+        self.create_inner(resource_type, resource, None, true)
     }
 
     async fn read(
