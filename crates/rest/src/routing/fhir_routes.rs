@@ -240,6 +240,12 @@ where
         + 'static,
 {
     create_fhir_router()
+        // This router is mounted behind `fallback_service` (tenant-prefix
+        // rewrite), so the outer metrics middleware cannot see which route
+        // matched; publish the template on the response for it.
+        .route_layer(axum::middleware::from_fn(
+            helios_observability::middleware::expose_matched_path,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             reject_unknown_resource_type::<S>,
