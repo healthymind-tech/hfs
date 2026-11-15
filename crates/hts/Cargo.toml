@@ -27,7 +27,7 @@ path = "src/main.rs"
 [features]
 default = ["sqlite", "R4"]
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "helios-persistence/postgres"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "helios-persistence/postgres", "helios-admin-auth/postgres"]
 R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-hts-ui/R4"]
 R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-hts-ui/R4B"]
 R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-hts-ui/R5"]

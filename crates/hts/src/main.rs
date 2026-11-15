@@ -276,6 +276,22 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
         .with_max_expansion_size(config.max_expansion_size)
         .with_auto_supplements(config.auto_supplements);
 
+    // Administrator sessions shared by every replica (and kept across restarts).
+    match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
+        backend.pool().clone(),
+        "HTS",
+    )
+    .await
+    {
+        Ok(store) => {
+            let _ = helios_hts::server::ADMIN_SESSION_STORE.set(Arc::new(store));
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "admin session store unavailable; administrator sessions stay per instance"
+        ),
+    }
+
     // Cluster cache coherence: drop every response cache when another replica
     // (or `hts import`) moved the shared terminology epoch.
     {

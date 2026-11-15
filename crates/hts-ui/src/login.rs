@@ -207,7 +207,7 @@ async fn login_submit(
     let next = target(next.as_deref());
     let peer = connect.map(|c| c.0.0.ip());
     let i18n = I18n::new(locale);
-    match gate.login(&headers, peer, user.trim(), &password) {
+    match gate.login_shared(&headers, peer, user.trim(), &password).await {
         LoginOutcome::Success { set_cookie } => {
             let mut response = Redirect::to(&next).into_response();
             response
@@ -277,7 +277,7 @@ async fn logout(Extension(gate): Extension<AdminGate>, headers: HeaderMap) -> Re
     let mut response = Redirect::to("/ui/hts").into_response();
     response
         .headers_mut()
-        .append(header::SET_COOKIE, auth.logout(&headers));
+        .append(header::SET_COOKIE, auth.logout_shared(&headers).await);
     response
 }
 

@@ -39,7 +39,7 @@ xml = ["helios-rest/xml"]
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
-postgres = ["helios-rest/postgres"]
+postgres = ["helios-rest/postgres", "helios-admin-auth/postgres"]
 mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]

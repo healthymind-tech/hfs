@@ -1113,6 +1113,15 @@ impl PostgresBackend {
         Ok(row.get(0))
     }
 
+    /// A handle on this backend's connection pool, for process-level
+    /// services that keep their own small tables in the primary database
+    /// (the shared administrator session store of a cluster deployment).
+    /// Not stable API, like [`Self::get_client`].
+    #[doc(hidden)]
+    pub fn shared_pool(&self) -> deadpool_postgres::Pool {
+        self.pool()
+    }
+
     /// Get a client from the pool.
     ///
     /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate

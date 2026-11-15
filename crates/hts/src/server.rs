@@ -88,6 +88,13 @@ async fn root_redirect() -> Response {
 ///
 /// Does not panic.  Invalid CORS origin strings are silently dropped because
 /// [`CorsLayer`] validates origins lazily at request time.
+/// The cluster-shared administrator session store, set by the `hts` binary
+/// before [`create_app`] when it runs on PostgreSQL (see
+/// `helios_admin_auth::store`). Unset: sessions stay per process.
+pub static ADMIN_SESSION_STORE: std::sync::OnceLock<
+    std::sync::Arc<dyn helios_admin_auth::AdminSessionStore>,
+> = std::sync::OnceLock::new();
+
 pub fn create_app<B>(config: &HtsConfig, state: AppState<B>) -> Router
 where
     B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
@@ -116,6 +123,11 @@ where
         config.admin_ui,
         helios_hts_ui::ADMIN_COOKIE,
     );
+    // Multi-instance: share administrator sessions and the lockout through
+    // the database when the binary opened a store (PostgreSQL backend).
+    if let (Some(auth), Some(store)) = (gate.auth(), ADMIN_SESSION_STORE.get()) {
+        auth.attach_store(store.clone());
+    }
     let writes_gate = writes_gate(&gate, config.require_auth_for_writes);
     let admin = admin.map(|router| {
         router.layer(axum::middleware::from_fn_with_state(

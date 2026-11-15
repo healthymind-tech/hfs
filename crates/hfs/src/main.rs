@@ -929,6 +929,11 @@ async fn serve(
     // admin pages (installed into the UI before it is mounted) and the admin
     // API, which the IG Packages page calls with the same session cookie.
     let admin_gate = admin_gate(config);
+    // PostgreSQL primary: administrator sessions and the sign-in lockout are
+    // shared by every instance (and survive restarts).
+    if let (Some(auth), Some(store)) = (admin_gate.auth(), ADMIN_SESSION_STORE.get()) {
+        auth.attach_store(store.clone());
+    }
     #[cfg(feature = "ui")]
     helios_ui::set_admin_gate(admin_gate.clone());
 
@@ -1047,6 +1052,40 @@ fn admin_gate(config: &ServerConfig) -> helios_admin_auth::AdminGate {
         path: "/",
     };
     helios_admin_auth::AdminGate::configure("HFS", settings, config.packages.admin_ui, cookie)
+}
+
+/// The shared administrator session store, opened once the PostgreSQL primary
+/// is up and attached to the admin gate in [`serve`].
+static ADMIN_SESSION_STORE: std::sync::OnceLock<Arc<dyn helios_admin_auth::AdminSessionStore>> =
+    std::sync::OnceLock::new();
+
+/// Opens [`ADMIN_SESSION_STORE`] in the primary database. A failure leaves
+/// admin sessions in process (logged): sign-in still works, per instance.
+#[cfg(feature = "postgres")]
+async fn open_admin_session_store(
+    backend: &helios_persistence::backends::postgres::PostgresBackend,
+) {
+    match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
+        backend.shared_pool(),
+        "HFS",
+    )
+    .await
+    {
+        Ok(store) => {
+            let _ = ADMIN_SESSION_STORE.set(Arc::new(store));
+        }
+        Err(e) => warn!(
+            error = %e,
+            "admin session store unavailable; administrator sessions stay per instance"
+        ),
+    }
+}
+
+/// `true` for an environment variable set to `true`/`1`/`yes` (any case).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
 }
 
 /// The administrative API: package and tenant administration, and the
@@ -3148,6 +3187,7 @@ async fn start_postgres(
     backend.init_schema().await?;
     let backend = Arc::new(backend);
     attach_login_sessions(auth_state.as_ref(), backend.clone());
+    open_admin_session_store(&backend).await;
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -3239,6 +3279,7 @@ async fn start_postgres_elasticsearch(
     // skips the large local patient export index.
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
+    open_admin_session_store(&backend).await;
 
     // Offload search to Elasticsearch
     let pg = Arc::new(backend);
