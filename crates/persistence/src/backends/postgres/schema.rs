@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -447,6 +447,7 @@ async fn migrate_schema(
             47 => migrate_v47_to_v48(client).await?,
             48 => migrate_v48_to_v49(client).await?,
             49 => migrate_v49_to_v50(client).await?,
+            50 => migrate_v50_to_v51(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4953,6 +4954,32 @@ async fn migrate_v47_to_v48(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
 
+    Ok(())
+}
+
+/// v50 -> v51: the shared mirror of IG package jobs (fork,
+/// `crate::core::package_jobs`), so a job started on one instance can be
+/// polled and cancelled through any other.
+async fn migrate_v50_to_v51(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hfs_package_jobs (
+                 id               TEXT PRIMARY KEY,
+                 tenant_id        TEXT NOT NULL,
+                 kind             TEXT NOT NULL,
+                 status           TEXT NOT NULL,
+                 terminal         BOOLEAN NOT NULL DEFAULT FALSE,
+                 view             JSONB NOT NULL,
+                 cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                 owner            TEXT NOT NULL,
+                 created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE INDEX IF NOT EXISTS idx_hfs_package_jobs_created
+                 ON hfs_package_jobs (created_at DESC);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
     Ok(())
 }
 

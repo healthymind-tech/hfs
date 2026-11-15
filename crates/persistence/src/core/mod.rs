@@ -105,6 +105,7 @@ pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod cluster_change_feed;
+pub mod package_jobs;
 pub mod cluster_job_store;
 pub mod event_fanout;
 pub mod history;

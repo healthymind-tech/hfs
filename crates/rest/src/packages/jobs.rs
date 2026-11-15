@@ -8,12 +8,13 @@
 //! stops, leaving whatever it had already written recorded against the
 //! package (status `cancelled`) so an uninstall can clean it up.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use helios_persistence::core::package_jobs::{PackageJobCoordinator, PackageJobRecord};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Jobs remembered.
@@ -24,7 +25,7 @@ const MAX_LOG: usize = 400;
 const MAX_ERRORS: usize = 1000;
 
 /// Job kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobKind {
     /// Dry run: resolve and count.
@@ -36,7 +37,7 @@ pub enum JobKind {
 }
 
 /// Job lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobStatus {
     /// Waiting for the install lock.
@@ -61,7 +62,7 @@ impl JobStatus {
 }
 
 /// Per-type counters for one package.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeCount {
     /// Written (HFS) or imported (HTS).
     pub written: u64,
@@ -72,7 +73,7 @@ pub struct TypeCount {
 }
 
 /// One failure.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobError {
     /// `name#version`.
     pub package: String,
@@ -83,7 +84,7 @@ pub struct JobError {
 }
 
 /// The observable state of a job.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobView {
     /// Job id.
@@ -139,6 +140,9 @@ pub struct JobView {
 pub struct Job {
     state: Mutex<JobView>,
     cancel: AtomicBool,
+    /// Bumped on every state change; the cluster mirror writes a job only
+    /// when it moved since the last write.
+    version: AtomicU64,
 }
 
 impl Job {
@@ -165,6 +169,7 @@ impl Job {
     /// Mutates the state.
     pub fn update(&self, f: impl FnOnce(&mut JobView)) {
         f(&mut self.state.lock().expect("job state"));
+        self.version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Appends a log line (timestamped).
@@ -239,10 +244,39 @@ impl Job {
     }
 }
 
-/// The in-memory job table.
+/// The in-memory job table, optionally mirrored to the shared database so
+/// any instance of a cluster can report and cancel any job.
 #[derive(Default)]
 pub struct JobTable {
     jobs: Mutex<VecDeque<Arc<Job>>>,
+    /// Cluster mirror and this instance's id.
+    mirror: OnceLock<(Arc<dyn PackageJobCoordinator>, String)>,
+}
+
+/// How often the owner writes its jobs' progress to the shared mirror and
+/// reads their cancel flags.
+const MIRROR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn record_of(view: &JobView, owner: &str) -> PackageJobRecord {
+    let kind = serde_json::to_value(view.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let status = serde_json::to_value(view.status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    PackageJobRecord {
+        id: view.id.clone(),
+        tenant: view.tenant.clone(),
+        kind,
+        status,
+        terminal: view.status.is_terminal(),
+        view: serde_json::to_value(view).unwrap_or(Value::Null),
+        cancel_requested: false,
+        owner: owner.to_string(),
+        updated_at: Utc::now(),
+    }
 }
 
 impl JobTable {
@@ -280,6 +314,7 @@ impl JobTable {
                 request,
             }),
             cancel: AtomicBool::new(false),
+            version: AtomicU64::new(1),
         });
         let mut jobs = self.jobs.lock().expect("job table");
         jobs.push_front(Arc::clone(&job));
@@ -313,6 +348,115 @@ impl JobTable {
             .iter()
             .map(|j| j.view())
             .collect()
+    }
+
+    /// Mirrors every job to the shared database from now on, and starts the
+    /// task that writes progress and picks up cancels requested through other
+    /// instances. Only the first call takes effect.
+    pub fn attach_mirror(
+        self: &Arc<Self>,
+        coordinator: Arc<dyn PackageJobCoordinator>,
+        owner: String,
+    ) {
+        if self.mirror.set((coordinator, owner)).is_err() {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let table = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut written: HashMap<String, u64> = HashMap::new();
+            loop {
+                tokio::time::sleep(MIRROR_INTERVAL).await;
+                table.flush_mirror(&mut written).await;
+            }
+        });
+    }
+
+    /// One mirror pass: write jobs that changed, adopt remote cancels.
+    async fn flush_mirror(&self, written: &mut HashMap<String, u64>) {
+        let Some((coordinator, owner)) = self.mirror.get() else {
+            return;
+        };
+        let jobs: Vec<Arc<Job>> = self.jobs.lock().expect("job table").iter().cloned().collect();
+        for job in jobs {
+            let version = job.version.load(Ordering::SeqCst);
+            let view = job.view();
+            if written.get(&view.id) != Some(&version) {
+                match coordinator.save_job(&record_of(&view, owner)).await {
+                    Ok(()) => {
+                        written.insert(view.id.clone(), version);
+                    }
+                    Err(e) => tracing::warn!(job = %view.id, error = %e, "mirroring a package job failed"),
+                }
+            }
+            if !view.status.is_terminal()
+                && !job.cancelled()
+                && coordinator.cancel_requested(&view.id).await.unwrap_or(false)
+            {
+                job.cancel();
+                job.log("cancel requested through another instance");
+            }
+        }
+        let live: std::collections::HashSet<String> =
+            self.jobs.lock().expect("job table").iter().map(|j| j.view().id).collect();
+        written.retain(|id, _| live.contains(id));
+    }
+
+    /// One job's state, from this instance or — in a cluster — the shared
+    /// mirror (a job another instance runs).
+    pub async fn view_shared(&self, id: &str) -> Option<JobView> {
+        if let Some(job) = self.get(id) {
+            return Some(job.view());
+        }
+        let (coordinator, _) = self.mirror.get()?;
+        match coordinator.load_job(id).await {
+            Ok(Some(record)) => serde_json::from_value(record.view).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(job = %id, error = %e, "reading a mirrored package job failed");
+                None
+            }
+        }
+    }
+
+    /// Every job this instance or (in a cluster) any other knows, newest
+    /// first, at most [`MAX_JOBS`].
+    pub async fn list_shared(&self) -> Vec<JobView> {
+        let mut views = self.list();
+        if let Some((coordinator, _)) = self.mirror.get() {
+            match coordinator.list_jobs(MAX_JOBS).await {
+                Ok(records) => {
+                    let known: std::collections::HashSet<String> =
+                        views.iter().map(|v| v.id.clone()).collect();
+                    views.extend(
+                        records
+                            .into_iter()
+                            .filter(|r| !known.contains(&r.id))
+                            .filter_map(|r| serde_json::from_value::<JobView>(r.view).ok()),
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "listing mirrored package jobs failed"),
+            }
+        }
+        views.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        views.truncate(MAX_JOBS);
+        views
+    }
+
+    /// Requests cancellation of a job running here or on another instance.
+    /// `None` when the job is unknown; otherwise whether the request was
+    /// accepted (the job was still running) and its current state.
+    pub async fn cancel_shared(&self, id: &str) -> Option<(bool, JobView)> {
+        if let Some(job) = self.get(id) {
+            let accepted = job.cancel();
+            return Some((accepted, job.view()));
+        }
+        let (coordinator, _) = self.mirror.get()?;
+        let accepted = coordinator.request_cancel(id).await.unwrap_or(false);
+        let view = self.view_shared(id).await?;
+        Some((accepted, view))
     }
 
     /// Whether an install or uninstall is queued or running.
@@ -356,5 +500,106 @@ mod tests {
             j.finish(JobStatus::Succeeded, None);
         }
         assert_eq!(table.list().len(), MAX_JOBS);
+    }
+
+    /// In-memory stand-in for the shared database (two tables sharing one of
+    /// these behave like two instances sharing PostgreSQL).
+    #[derive(Default)]
+    struct FakeCoordinator {
+        jobs: Mutex<HashMap<String, PackageJobRecord>>,
+    }
+
+    struct NoGuard;
+    impl helios_persistence::core::package_jobs::InstallLockGuard for NoGuard {}
+
+    #[async_trait::async_trait]
+    impl PackageJobCoordinator for FakeCoordinator {
+        async fn lock_installs(
+            &self,
+            _key: i32,
+        ) -> helios_persistence::error::StorageResult<
+            Box<dyn helios_persistence::core::package_jobs::InstallLockGuard>,
+        > {
+            Ok(Box::new(NoGuard))
+        }
+        async fn save_job(
+            &self,
+            job: &PackageJobRecord,
+        ) -> helios_persistence::error::StorageResult<()> {
+            let mut jobs = self.jobs.lock().unwrap();
+            let cancel = jobs.get(&job.id).is_some_and(|j| j.cancel_requested);
+            let mut job = job.clone();
+            job.cancel_requested = cancel;
+            jobs.insert(job.id.clone(), job);
+            Ok(())
+        }
+        async fn load_job(
+            &self,
+            id: &str,
+        ) -> helios_persistence::error::StorageResult<Option<PackageJobRecord>> {
+            Ok(self.jobs.lock().unwrap().get(id).cloned())
+        }
+        async fn list_jobs(
+            &self,
+            _limit: usize,
+        ) -> helios_persistence::error::StorageResult<Vec<PackageJobRecord>> {
+            Ok(self.jobs.lock().unwrap().values().cloned().collect())
+        }
+        async fn request_cancel(&self, id: &str) -> helios_persistence::error::StorageResult<bool> {
+            Ok(match self.jobs.lock().unwrap().get_mut(id) {
+                Some(j) if !j.terminal => {
+                    j.cancel_requested = true;
+                    true
+                }
+                _ => false,
+            })
+        }
+        async fn cancel_requested(
+            &self,
+            id: &str,
+        ) -> helios_persistence::error::StorageResult<bool> {
+            Ok(self
+                .jobs
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|j| j.cancel_requested))
+        }
+    }
+
+    /// A job run by instance A is visible from instance B, and a cancel
+    /// requested through B reaches the job on A.
+    #[tokio::test]
+    async fn a_job_on_one_instance_is_seen_and_cancelled_through_another() {
+        let shared = Arc::new(FakeCoordinator::default());
+        let a = Arc::new(JobTable::default());
+        let b = Arc::new(JobTable::default());
+        a.mirror.set((shared.clone(), "a".into())).ok().unwrap();
+        b.mirror.set((shared.clone(), "b".into())).ok().unwrap();
+
+        let job = a.create(JobKind::Install, "pkg#1", "default", json!({}), None);
+        job.start();
+        job.count("pkg#1", "StructureDefinition", |c| c.written += 3);
+        let id = job.view().id;
+        assert!(b.view_shared(&id).await.is_none(), "not mirrored yet");
+
+        let mut written = HashMap::new();
+        a.flush_mirror(&mut written).await;
+        let seen = b.view_shared(&id).await.expect("B sees A's job");
+        assert_eq!(seen.status, JobStatus::Running);
+        assert_eq!(seen.counts["pkg#1"]["StructureDefinition"].written, 3);
+        assert_eq!(b.list_shared().await.len(), 1);
+
+        let (accepted, _) = b.cancel_shared(&id).await.expect("known job");
+        assert!(accepted);
+        assert!(!job.cancelled(), "A learns of it on its next mirror pass");
+        a.flush_mirror(&mut written).await;
+        assert!(job.cancelled(), "the remote cancel reached the running job");
+
+        job.finish(JobStatus::Cancelled, None);
+        a.flush_mirror(&mut written).await;
+        assert_eq!(b.view_shared(&id).await.unwrap().status, JobStatus::Cancelled);
+        let (accepted, _) = b.cancel_shared(&id).await.unwrap();
+        assert!(!accepted, "a finished job cannot be cancelled");
     }
 }

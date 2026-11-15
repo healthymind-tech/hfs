@@ -718,6 +718,15 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the cluster coordinator for IG package jobs (see
+    /// [`crate::core::package_jobs`]), if this backend can back one. The
+    /// default `None` keeps package jobs and their lock in process.
+    fn package_job_coordinator(
+        &self,
+    ) -> Option<Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
+        None
+    }
+
     /// Returns the cross-instance change feed for definition resources (see
     /// [`crate::core::cluster_change_feed`]), if this backend can back one
     /// (a shared database that records writes by trigger).

@@ -1056,7 +1056,7 @@ where
                 packages::manager::cache_dir(&config).join("registry.json"),
             )),
         };
-    let package_manager = Arc::new(packages::PackageManager::new(
+    let package_manager = packages::PackageManager::new(
         &config,
         packages::ManagerDeps {
             storage: Arc::clone(&storage_arc) as Arc<dyn ResourceStorage>,
@@ -1066,7 +1066,15 @@ where
             audit: state.audit_sink().cloned(),
             audit_source: state.audit_source_observer().to_string(),
         },
-    ));
+    );
+    // Shared database: one package install at a time across every instance,
+    // and every job visible and cancellable from every instance.
+    let package_manager = match storage_arc.package_job_coordinator() {
+        Some(coordinator) => package_manager
+            .with_coordinator(coordinator, cluster_sync::instance_id().to_string()),
+        None => package_manager,
+    };
+    let package_manager = Arc::new(package_manager);
     if config.packages.admin_ui {
         info!("Package administration is ENABLED (HFS_ADMIN_UI=true): /admin/packages");
     }

@@ -286,7 +286,8 @@ pub async fn jobs_handler(State(manager): State<Manager>) -> Response {
     // The list omits per-job plans/logs to stay small.
     let jobs: Vec<Value> = manager
         .jobs()
-        .list()
+        .list_shared()
+        .await
         .into_iter()
         .map(|v| {
             json!({
@@ -312,12 +313,35 @@ pub async fn job_handler(
     }
     match manager.jobs().get(&id) {
         Some(job) => job_response(job, query.wait).await,
-        None => outcome(
-            StatusCode::NOT_FOUND,
-            "not-found",
-            format!("no package job {id}"),
-        ),
+        // A job another cluster instance runs: report its mirrored state.
+        None => match shared_job_response(&manager, &id, query.wait).await {
+            Some(response) => response,
+            None => outcome(
+                StatusCode::NOT_FOUND,
+                "not-found",
+                format!("no package job {id}"),
+            ),
+        },
     }
+}
+
+/// [`job_response`] for a job owned by another instance (read from the
+/// shared mirror, which the owner updates about once a second).
+async fn shared_job_response(manager: &Manager, id: &str, wait: Option<u64>) -> Option<Response> {
+    let wait = Duration::from_secs(wait.unwrap_or(0).min(60));
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut view = manager.jobs().view_shared(id).await?;
+    while !view.status.is_terminal() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        view = manager.jobs().view_shared(id).await?;
+    }
+    let status = if view.status.is_terminal() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    let location = format!("admin/packages/jobs/{}", view.id);
+    Some((status, [(header::LOCATION, location)], Json(view)).into_response())
 }
 
 /// `DELETE /admin/packages/jobs/{id}` — cancel.
@@ -325,9 +349,8 @@ pub async fn cancel_handler(State(manager): State<Manager>, Path(id): Path<Strin
     if let Some(r) = gate(&manager) {
         return r;
     }
-    match manager.jobs().get(&id) {
-        Some(job) => {
-            let accepted = job.cancel();
+    match manager.jobs().cancel_shared(&id).await {
+        Some((accepted, view)) => {
             let status = if accepted {
                 StatusCode::ACCEPTED
             } else {
@@ -335,7 +358,7 @@ pub async fn cancel_handler(State(manager): State<Manager>, Path(id): Path<Strin
             };
             (
                 status,
-                Json(json!({"cancelRequested": accepted, "job": job.view()})),
+                Json(json!({"cancelRequested": accepted, "job": view})),
             )
                 .into_response()
         }
