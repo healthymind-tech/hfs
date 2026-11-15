@@ -567,12 +567,22 @@ impl ValidationService {
         if let Some((old_version, Some(old_url))) = &previous
             && (current.is_none() || new_url != Some(old_url.as_str()))
         {
-            changed |= self.remove_stored_profile(tenant, *old_version, old_url);
+            // Forget only this row (`remove_stored_profile` drops every row
+            // under the canonical, which would lose a sibling release).
             self.stored_index
                 .lock()
                 .expect("stored profile index lock")
                 .entries
                 .remove(&(tenant.to_string(), id.to_string()));
+            self.cache_dirty.notify_one();
+            if let Some(registries) = &self.tenant_profiles
+                && let Some(registry) = registries.get(&(tenant.to_string(), *old_version))
+            {
+                changed |= registry
+                    .write()
+                    .expect("tenant profile registry lock")
+                    .remove(old_url);
+            }
             // Another stored row may carry the same canonical (one release of
             // several): put it back now that this one is gone.
             let survivor = self
