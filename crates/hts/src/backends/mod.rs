@@ -259,6 +259,31 @@ pub(crate) fn ucum_grammar_from_compose(
     out
 }
 
+/// VSAC's compose filters carry the real operator in a modifier extension:
+/// `{"op": "is-a", "value": "2133-7", "modifierExtension": [{"url":
+/// "vsacOpModifier", "valueString": "childOf"}]}` means *child-of*
+/// (VSAC/US Core `detailed-ethnicity` excludes the two OMB categories this
+/// way). Read as plain `is-a`, that exclude removed every ethnicity code.
+/// Rewrites `op` for the modifiers VSAC uses; leaves other filters alone.
+pub(crate) fn apply_vsac_op_modifier(filter: &mut serde_json::Value) {
+    let modifier = filter
+        .get("modifierExtension")
+        .and_then(|m| m.as_array())
+        .and_then(|exts| {
+            exts.iter().find_map(|e| {
+                (e.get("url").and_then(|u| u.as_str()) == Some("vsacOpModifier"))
+                    .then(|| e.get("valueString").and_then(|v| v.as_str()))
+                    .flatten()
+            })
+        });
+    let op = match modifier {
+        Some("childOf") => "child-of",
+        Some("descendantOf") => "descendent-of",
+        _ => return,
+    };
+    filter["op"] = serde_json::Value::String(op.to_string());
+}
+
 /// Re-sort `out` into the order the codes are listed in `explicit_codes`
 /// (codes appended after the concept-table join keep the compose order).
 pub(crate) fn sort_by_compose_order(

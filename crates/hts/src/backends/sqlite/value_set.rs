@@ -4295,6 +4295,7 @@ fn apply_compose_filters(
                     f["op"] = serde_json::Value::String(code);
                 }
             }
+            crate::backends::apply_vsac_op_modifier(&mut f);
             f
         })
         .collect();

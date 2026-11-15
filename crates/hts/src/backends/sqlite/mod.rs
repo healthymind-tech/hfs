@@ -1453,7 +1453,9 @@ mod tests {
               "concept": [{"code": "1000-9"}, {"code": "2028-9"}, {"code": "2039-6"}]}},
             {"resource": {"resourceType": "ValueSet", "id": "dr", "url": "http://t/vs/dr",
               "compose": {"include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
-                "filter": [{"property": "concept", "op": "descendent-of", "value": "1000-9"}]}]}}}
+                "filter": [{"property": "concept", "op": "descendent-of", "value": "1000-9"}]}]}}},
+            {"resource": {"resourceType": "ValueSet", "id": "dr7", "url": "http://t/vs/dr7",
+              "compose": {"include": [{"valueSet": ["http://t/vs/dr"]}]}}}
         ]});
         b.import_bundle(
             &helios_persistence::tenant::TenantContext::system(),
@@ -1487,12 +1489,23 @@ mod tests {
             [&vs_id],
         )
         .unwrap();
+        // A value set built from other value sets (US Core 7 detailed-race)
+        // holds only the null-flavor part of a stale expansion.
+        let vs7: String = conn
+            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr7'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
+             VALUES (?1, 'http://terminology.hl7.org/CodeSystem/v3-NullFlavor', 'UNK')",
+            [&vs7],
+        )
+        .unwrap();
         schema::migrate_p25_data(&conn).unwrap();
         assert_eq!(edges(&conn), 2);
         let cached: i64 = conn
             .query_row("SELECT COUNT(*) FROM value_set_expansions", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cached, 0, "stale expansion over CDCREC dropped");
+        assert_eq!(cached, 0, "stale expansions over CDCREC and of value-set-built sets dropped");
         // Runs once.
         conn.execute_batch("DELETE FROM concept_hierarchy").unwrap();
         schema::migrate_p25_data(&conn).unwrap();

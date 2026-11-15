@@ -1131,8 +1131,22 @@ async fn flat_cdcrec_expands_descendants() {
             {"code": "2028-9", "display": "Asian"},
             {"code": "2039-6", "display": "Japanese"},
             {"code": "2133-7", "display": "Ethnicity"},
-            {"code": "2135-2", "display": "Hispanic or Latino"}
+            {"code": "2135-2", "display": "Hispanic or Latino"},
+            {"code": "2148-5", "display": "Mexican"}
         ]
+    });
+    // VSAC's detailed ethnicity: the exclude's real operator is in a
+    // `vsacOpModifier` modifier extension (child-of, not is-a).
+    let ethnicity = json!({
+        "resourceType": "ValueSet", "id": "detailed-eth", "url": "http://u.test/vs/detailed-eth",
+        "status": "active",
+        "compose": {
+            "include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "filter": [{"property": "concept", "op": "descendent-of", "value": "2133-7"}]}],
+            "exclude": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "filter": [{"modifierExtension": [{"url": "vsacOpModifier", "valueString": "childOf"}],
+                                     "property": "concept", "op": "is-a", "value": "2133-7"}]}]
+        }
     });
     let detailed = json!({
         "resourceType": "ValueSet", "id": "detailed-race", "url": "http://u.test/vs/detailed-race",
@@ -1145,7 +1159,7 @@ async fn flat_cdcrec_expands_descendants() {
         }
     });
     for (_, b, _) in &bs {
-        import(b, &bundle(vec![cdcrec.clone(), detailed.clone()])).await;
+        import(b, &bundle(vec![cdcrec.clone(), detailed.clone(), ethnicity.clone()])).await;
     }
     let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-race"))
         .await
@@ -1162,6 +1176,8 @@ async fn flat_cdcrec_expands_descendants() {
         validates(b, "http://u.test/vs/detailed-race", Some("urn:oid:2.16.840.1.113883.6.238"), "2135-2").await,
     ));
     assert_eq!(v, (true, false));
+    let eth = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-eth")).await);
+    assert_eq!(eth, Ok((vec!["2148-5".to_string()], Some(1))));
 }
 
 /// Same `url|version`, different content: a smaller copy whose codes the

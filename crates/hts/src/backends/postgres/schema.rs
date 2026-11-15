@@ -651,7 +651,8 @@ async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_p
 /// flat CDCREC rows (no `concept_hierarchy`) get the embedded race/ethnicity
 /// edges between codes they define — `migrate_concept_closure_pg`, run next,
 /// builds their closure — and cached expansions of value sets over CDCREC or
-/// UCUM are dropped: they were computed while `descendent-of 1000-9` was empty
+/// UCUM, and of every value set built from other value sets (US Core 7
+/// `detailed-race` is VSAC's race value set plus null flavors), are dropped: they were computed while `descendent-of 1000-9` was empty
 /// and enumerated UCUM units were dropped, and a cached expansion is never
 /// recomputed on its own (an empty include leaves no row a later
 /// CodeSystem re-import would invalidate).
@@ -698,7 +699,8 @@ pub async fn migrate_p25_data_pg(
                      WHERE system_url = ANY($1::text[])
                         OR value_set_id IN (SELECT id FROM value_sets
                                              WHERE compose_json LIKE '%' || $2 || '%'
-                                                OR compose_json LIKE '%' || $3 || '%')
+                                                OR compose_json LIKE '%' || $3 || '%'
+                                                OR compose_json LIKE '%\"valueSet\"%')
                        FOR UPDATE SKIP LOCKED)",
             &[&systems, &systems[0], &systems[1]],
         )

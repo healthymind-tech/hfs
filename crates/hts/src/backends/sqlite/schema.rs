@@ -926,7 +926,8 @@ pub fn migrate_p25_data(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         cleared += conn.execute(
             "DELETE FROM value_set_expansions WHERE system_url = ?1
                 OR value_set_id IN (SELECT id FROM value_sets
-                                     WHERE compose_json LIKE '%' || ?1 || '%')",
+                                     WHERE compose_json LIKE '%' || ?1 || '%'
+                                        OR compose_json LIKE '%\"valueSet\"%')",
             [system],
         )?;
         cleared += conn.execute(
