@@ -36,7 +36,7 @@ pub fn format_resource_response(
     // parameter the handler set is kept.
     let mut headers = headers;
     let (mime, token) = match format {
-        FhirFormat::Xml => ("application/fhir+xml", "xml"),
+        FhirFormat::Xml => ("application/fhir+xml; charset=utf-8", "xml"),
         FhirFormat::Json | FhirFormat::NdJson => ("application/fhir+json", "json"),
     };
     let current = headers
