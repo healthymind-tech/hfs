@@ -367,7 +367,7 @@
     {
       "clientId": "smart-patient-app",
       "name": "SMART patient-facing app (standalone launch)",
-      "description": "Confidential client for a patient-facing SMART app: standalone launch with Authorization Code + PKCE; the launch patient comes from the signed-in user's `patient` attribute. Direct access grants are on only so the p3-auth test script can sign a test user in without a browser - turn them off in production.",
+      "description": "Patient-facing SMART app: standalone launch, launch patient from the user's patient attribute. Direct access grants only for tests; off in production.",
       "enabled": true,
       "publicClient": false,
       "clientAuthenticatorType": "client-secret",
