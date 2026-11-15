@@ -1004,19 +1004,14 @@ where
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
-    // Apply audit middleware if enabled (inner layer = runs after auth)
-    let router = if let Some(audit) = audit_state {
-        router.layer(axum::middleware::from_fn_with_state(
-            audit,
-            helios_audit::middleware::audit_middleware,
-        ))
-    } else {
-        router
-    };
-
-    // Apply auth middleware if enabled (outermost = runs first)
+    // Apply auth middleware if enabled. Just inside it, the authenticated
+    // principal is reported to the audit context (the audit layer itself sits
+    // outside auth, see below).
     let router = if let Some(ref auth) = auth_state {
         router
+            .layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::authz_middleware,
@@ -1081,6 +1076,9 @@ where
         ));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
+            .route_layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
+            ))
             .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::admin_authz_middleware,
@@ -1093,6 +1091,19 @@ where
         admin_console
     };
     let router = router.merge(admin_console);
+
+    // Audit: outermost of the API's own layers, so that requests refused by
+    // authentication (401) or authorization (403) are recorded too, with the
+    // same request context as everything else. Not recursive: audit events
+    // are written to storage directly, never through this router.
+    let router = if let Some(audit) = audit_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            audit,
+            helios_audit::middleware::audit_middleware,
+        ))
+    } else {
+        router
+    };
 
     // Build middleware stack
     let service_builder = ServiceBuilder::new()

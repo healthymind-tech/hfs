@@ -9,6 +9,7 @@
 //! - [`prefer`] - Prefer header handling
 //! - [`resource_type`] - Refuses paths whose type segment is not a resource type
 
+pub mod audit;
 pub mod auth;
 pub mod conditional;
 pub mod content_type;

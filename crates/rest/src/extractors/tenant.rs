@@ -178,6 +178,8 @@ where
     ) -> Result<Self, Self::Rejection> {
         let extractor = Self::resolve(parts, state).await?;
         enforce_provisioned(state, &extractor).await?;
+        // The audit trail of this request belongs to the tenant it addressed.
+        helios_audit::context::set_tenant(extractor.tenant_id(), extractor.is_url_based());
         Ok(extractor)
     }
 }
