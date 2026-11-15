@@ -99,7 +99,7 @@
         nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
         /ui/history, /ui/queries); they are just not in the menu.
       -->
-      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
+      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% else if active_page == "editor" || active_page == "history" || active_page == "queries" || active_page == "search" %} aria-current="true"{% endif %} title="{{ i18n.t("nav-resources") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
@@ -242,6 +242,11 @@
       <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ i18n.t("nav-menu-open") }}">
         {% include "icons/menu.svg" %}
       </button>
+      <!-- FHIR Server | Terminology (UI/UX review §4.2): the same switcher
+           HTS renders, so an operator moves between the two consoles from
+           the same place in either. Absent when no terminology server is
+           configured. -->
+{{ status.product_switcher(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/product-switcher.html #}
       <div class="topbar__tools">
         <!-- The theme toggle stays in the topbar (#725): it is a one-click,
              instant-feedback control, and a click deeper behind the menu

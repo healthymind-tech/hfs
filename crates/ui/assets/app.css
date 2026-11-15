@@ -516,7 +516,8 @@ a.nav-item:hover {
   color: var(--text-strong);
 }
 
-.nav-item[aria-current="page"] {
+.nav-item[aria-current="page"],
+.nav-item[aria-current="true"] {
   background: var(--surface);
   border-color: var(--surface-border);
   box-shadow: var(--surface-shadow);
@@ -789,6 +790,119 @@ button.menu__option {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+/* The product switcher (shared markup: helios-ui-chrome
+   product-switcher.html): FHIR Server | Terminology, the console in use
+   marked aria-current. Sits at the topbar's left, after the hamburger on
+   touch widths (UI/UX review §4.2). */
+.product-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: auto;
+  padding: 3px;
+  border: 1px solid var(--outline);
+  border-radius: 999px;
+  background: var(--bg-content);
+  min-width: 0;
+}
+
+.product-switch__item,
+.product-switch__item:visited {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted-text);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.product-switch__item:hover {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.product-switch__item[aria-current="page"] {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.product-switch__item:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1024px) {
+  .product-switch {
+    margin-left: 4px;
+  }
+}
+
+@media (max-width: 420px) {
+  .product-switch__item,
+  .product-switch__item:visited {
+    padding: 0 9px;
+    font-size: 12px;
+  }
+}
+
+/* Breadcrumb trail (shared markup: helios-ui-chrome breadcrumb.html). The
+   separator is drawn here so screen readers announce only the steps. */
+.breadcrumb {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.breadcrumb__list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.breadcrumb__item {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  color: var(--muted-text);
+}
+
+.breadcrumb__item + .breadcrumb__item::before {
+  content: "›";
+  padding: 0 8px;
+  color: var(--muted);
+}
+
+.breadcrumb__item a,
+.breadcrumb__item a:visited {
+  color: var(--accent-text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.breadcrumb__item a:hover {
+  text-decoration: underline;
+}
+
+.breadcrumb__item a:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.breadcrumb__item [aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 /* The theme switcher (shared markup: helios-ui-chrome theme-toggle.html):
@@ -1551,6 +1665,32 @@ button.pill {
   margin: 0 auto;
 }
 
+/* Phones (UI/UX review §3.1, §3.14): a 1060-unit-wide chart squeezed into
+   ~310px rendered 90px tall with 3px axis labels. Below 640px the chart keeps
+   a readable minimum width and its frame scrolls sideways, and the labels
+   grow so they land near 9px. */
+@media (max-width: 640px) {
+  .chart-wrap,
+  .chart-scroll {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .chart-wrap > .chart,
+  .chart-scroll > .chart {
+    min-width: 640px;
+  }
+
+  .chart .axis-label {
+    font-size: 15px;
+  }
+}
+
+.chart-scroll:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+
 .chart-tip {
   position: absolute;
   pointer-events: none;
@@ -2105,13 +2245,15 @@ form.htmx-request .btn[type="submit"]::after,
    same no-JS <details> mechanics, presented as a modal. While open, the
    summary itself stretches over the viewport as the backdrop, so clicking
    outside the panel closes the dialog without any script. */
-.addbox--modal[open] > summary.btn {
+.addbox--modal[open] > summary.btn,
+.addbox--modal[open] > summary.icon-button {
   position: fixed;
   inset: 0;
   z-index: var(--z-dialog-backdrop);
   /* The summary doubles as the button (.btn/.btn--primary), whose fixed
      height would beat the inset stretch and shrink the backdrop to a bar
      across the top of the viewport. */
+  width: auto;
   height: auto;
   padding: 0;
   border: 0;
@@ -2127,6 +2269,8 @@ form.htmx-request .btn[type="submit"]::after,
 }
 
 .addbox--modal[open] > .addbox__panel {
+  text-align: start;
+  white-space: normal;
   position: fixed;
   top: 50%;
   left: 50%;
@@ -2206,6 +2350,24 @@ form.htmx-request .btn[type="submit"]::after,
 .tag--muted {
   background: var(--accent-soft);
   color: var(--muted);
+}
+
+/* The tenant Delete dialog (UI/UX review §3.8): its trigger is the row's
+   trash icon-button; open, that summary becomes the modal backdrop. */
+.tenant-delete > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.tenant-delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tenant-delete__impact {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
 }
 
 /* Failed provisioning job row (#581), matching .btn--danger's tokens. */
@@ -2307,7 +2469,8 @@ form.htmx-request .btn[type="submit"]::after,
   width: 120px;
   font-weight: 500;
 }
-.history__id { width: 200px; }
+/* Wide enough for a whole UUID (36 characters) — the review found ids cut at 27. */
+.history__id { width: 38ch; max-width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .history__slash { color: var(--muted); }
 
 /* Tabs — one definition for both tab designs (history's underline feed
@@ -2933,7 +3096,7 @@ form.htmx-request .btn[type="submit"]::after,
   margin-bottom: 10px;
 }
 
-.diff__head h3 {
+.diff__head h2 {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -5294,7 +5457,7 @@ tr:hover .result-id__copy,
    how-to. An operator who has never heard of it can turn it on from here. */
 .nl-setup {
   margin-top: 14px;
-  padding: 18px;
+  padding: 10px 18px;
   background: var(--input-bg);
   border: 1px solid var(--surface-border);
   border-radius: 12px;
@@ -5304,11 +5467,38 @@ tr:hover .result-id__copy,
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
+  min-height: 32px;
   color: var(--accent);
+  list-style: none;
+  cursor: pointer;
+}
+
+.nl-setup__head::-webkit-details-marker {
+  display: none;
+}
+
+.nl-setup[open] > .nl-setup__head {
+  margin-bottom: 8px;
+}
+
+.nl-setup__chevron {
+  display: inline-flex;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.nl-setup[open] .nl-setup__chevron {
+  transform: rotate(180deg);
+}
+
+.nl-setup__head:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
 .nl-setup__head h2 {
+  flex: 1;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
@@ -5588,6 +5778,7 @@ tr:hover .result-id__copy,
   border-bottom: 1px solid var(--surface-border);
 }
 
+.card-head h2,
 .card-head h3 {
   display: flex;
   align-items: center;
@@ -7094,7 +7285,7 @@ details.card > summary.card-head::-webkit-details-marker {
   gap: 10px;
 }
 
-.batch-check h4 {
+.batch-check h3 {
   margin: 0 0 6px;
   font-size: 13px;
 }
@@ -8073,6 +8264,15 @@ body.app-shell .pane {
   .content--app .filter-center,
   .content--app .queries-main {
     overflow: visible;
+  }
+
+  /* Stacked above the work area (UI/UX review §3.2): the whole type list
+     (146 rows on Resources) used to push the search builder ~4,500px down
+     on a phone. The list keeps scrolling inside the rail instead, so the
+     builder starts within the first screen. */
+  .content--app .filter-rail__list {
+    flex: none;
+    max-height: min(40vh, 300px);
   }
 }
 }

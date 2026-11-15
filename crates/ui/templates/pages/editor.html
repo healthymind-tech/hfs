@@ -1,6 +1,6 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}{{ i18n.t("editor-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block title %}{{ self.heading() }} — {{ i18n.t("editor-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
 {% block content %}
 <!--
@@ -14,7 +14,8 @@
   to /ui/editor/render — the UI crate never touches storage.
 -->
 <section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("editor-heading") }}</h1>
+  {{ self.breadcrumb()?|safe }}
+  <h1 class="page-head__title">{{ self.heading() }}</h1>
   <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
 </section>
 

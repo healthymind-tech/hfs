@@ -75,6 +75,10 @@ struct TenantRow {
     /// The background job for this id failed; carries the error message shown
     /// as the row's tooltip.
     failed: Option<String>,
+    /// The server's default tenant (`HFS_DEFAULT_TENANT`): every request
+    /// without a tenant lands here, so the page offers no Delete for it and
+    /// [`delete`] refuses it (UI/UX review §3.8).
+    is_default: bool,
 }
 
 impl TenantRow {
@@ -227,6 +231,7 @@ async fn load_rows(
     storage: &Arc<dyn ResourceStorage>,
     q: &str,
     jobs: &HashMap<String, Provisioning>,
+    default_tenant: &str,
 ) -> Result<Vec<TenantRow>, String> {
     let registered = storage
         .list_tenants()
@@ -267,6 +272,7 @@ async fn load_rows(
                 resources: 0,
                 provisioning: true,
                 failed: None,
+                is_default: false,
             }),
             Provisioning::Failed {
                 display_name,
@@ -281,6 +287,7 @@ async fn load_rows(
                         resources: 0,
                         provisioning: false,
                         failed: Some(message.clone()),
+                        is_default: false,
                     });
                 }
             }
@@ -302,6 +309,7 @@ async fn load_rows(
             id: rec.id,
             provisioning: false,
             failed: None,
+            is_default: false,
         });
     }
     // Data-only tenants (have rows but never registered), excluding the system tenant.
@@ -319,7 +327,12 @@ async fn load_rows(
             resources: n,
             provisioning: false,
             failed: None,
+            is_default: false,
         });
+    }
+
+    for row in &mut rows {
+        row.is_default = row.id == default_tenant;
     }
 
     let needle = q.trim().to_lowercase();
@@ -362,10 +375,11 @@ pub async fn page(
     };
 
     let jobs = state.provisioning.lock().unwrap().clone();
-    let (rows, error) = match load_rows(&i18n, storage, &query.q, &jobs).await {
-        Ok(rows) => (rows, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
+    let (rows, error) =
+        match load_rows(&i18n, storage, &query.q, &jobs, &state.default_tenant).await {
+            Ok(rows) => (rows, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
     let registered_count = rows.iter().filter(|r| r.registered).count();
     let resources_total = rows.iter().map(|r| r.resources).sum();
     let polling = rows.iter().any(|r| r.provisioning);
@@ -401,10 +415,11 @@ pub async fn rows(
         });
     };
     let jobs = state.provisioning.lock().unwrap().clone();
-    let (rows, error) = match load_rows(&i18n, storage, &query.q, &jobs).await {
-        Ok(rows) => (rows, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
+    let (rows, error) =
+        match load_rows(&i18n, storage, &query.q, &jobs, &state.default_tenant).await {
+            Ok(rows) => (rows, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
     rows_response(i18n, rows, error)
 }
 
@@ -490,7 +505,7 @@ pub async fn create(
     // using the ordinary banner.
     let load = |err: Option<String>| async {
         let jobs = state.provisioning.lock().unwrap().clone();
-        match load_rows(&i18n, storage, "", &jobs).await {
+        match load_rows(&i18n, storage, "", &jobs, &state.default_tenant).await {
             Ok(rows) => create_response(i18n, rows, None, err),
             Err(e) => create_response(i18n, Vec::new(), Some(e), err),
         }
@@ -626,7 +641,7 @@ pub async fn delete(
 
     let load = |err: Option<String>| async {
         let jobs = state.provisioning.lock().unwrap().clone();
-        match load_rows(&i18n, storage, "", &jobs).await {
+        match load_rows(&i18n, storage, "", &jobs, &state.default_tenant).await {
             Ok(rows) => rows_response(i18n, rows, err),
             Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
         }
@@ -644,6 +659,18 @@ pub async fn delete(
     // regardless of how the route is reached.
     if let Err(message) = validate_id(&i18n, &id) {
         return load(Some(message)).await;
+    }
+
+    // The default tenant is where every request without a tenant lands;
+    // deregistering it from the console is refused like a reserved id (the
+    // page offers no Delete for it either — UI/UX review §3.8).
+    if id == state.default_tenant {
+        return load(Some(i18n.t_arg(
+            "tenants-error-delete-default",
+            "id",
+            id.clone(),
+        )))
+        .await;
     }
 
     // A provisioning job owns this id (#581): an in-flight job is refused
@@ -756,9 +783,15 @@ mod provisioning_row_tests {
             },
         );
 
-        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs)
-            .await
-            .expect("rows");
+        let rows = load_rows(
+            &I18n::new(RequestLocale::default()),
+            &storage,
+            "",
+            &jobs,
+            "default",
+        )
+        .await
+        .expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1, "one row per tenant, not one per source");
         assert!(acme[0].provisioning, "the provisioning row wins");
@@ -771,9 +804,15 @@ mod provisioning_row_tests {
                 message: "boom".to_string(),
             },
         );
-        let rows = load_rows(&I18n::new(RequestLocale::default()), &storage, "", &jobs)
-            .await
-            .expect("rows");
+        let rows = load_rows(
+            &I18n::new(RequestLocale::default()),
+            &storage,
+            "",
+            &jobs,
+            "default",
+        )
+        .await
+        .expect("rows");
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1);
         assert!(!acme[0].provisioning);

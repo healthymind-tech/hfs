@@ -168,6 +168,78 @@ pub struct EditorPage {
     pub resource_id: String,
 }
 
+/// `?type=…` (and `&id=…`) as a query string, values form-encoded.
+fn type_query(resource_type: &str, id: Option<&str>) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if let Some(id) = id {
+        query.append_pair("id", id);
+    }
+    query.finish()
+}
+
+/// The trail shared by the editor and history pages (UI/UX review §4.2):
+/// Resources › {type} › {id}, every step a link back into the Resources
+/// workspace. `tail` is what follows the id (History on the history page);
+/// without one the id itself is the current page.
+pub(crate) fn resource_crumbs(
+    i18n: &I18n,
+    resource_type: &str,
+    resource_id: &str,
+    tail: Option<String>,
+) -> Vec<helios_ui_chrome::Crumb> {
+    use helios_ui_chrome::Crumb;
+    let mut crumbs = vec![Crumb::link(i18n.t("nav-resources"), "/ui/resources")];
+    if resource_type.is_empty() {
+        if let Some(tail) = tail {
+            crumbs.push(Crumb::here(tail));
+        }
+        return crumbs;
+    }
+    crumbs.push(Crumb::link(
+        resource_type,
+        format!("/ui/resources?{}", type_query(resource_type, None)),
+    ));
+    match (resource_id.is_empty(), tail) {
+        (true, None) => crumbs.push(Crumb::here(i18n.t("editor-crumb-new"))),
+        (true, Some(tail)) => crumbs.push(Crumb::here(tail)),
+        (false, None) => crumbs.push(Crumb::here(resource_id)),
+        (false, Some(tail)) => {
+            crumbs.push(Crumb::link(
+                resource_id,
+                format!(
+                    "/ui/editor?{}",
+                    type_query(resource_type, Some(resource_id))
+                ),
+            ));
+            crumbs.push(Crumb::here(tail));
+        }
+    }
+    crumbs
+}
+
+impl EditorPage {
+    /// The page's `<h1>` and the head of its `<title>`: the resource it edits,
+    /// `Patient/123` — or `New Patient` before there is an id — instead of
+    /// the generic "Resource Editor" every editor tab used to share.
+    pub fn heading(&self) -> String {
+        if self.resource_id.is_empty() {
+            self.i18n
+                .t_arg("editor-new-title", "type", self.resource_type.clone())
+        } else {
+            format!("{}/{}", self.resource_type, self.resource_id)
+        }
+    }
+
+    /// Resources › Patient › 123.
+    pub fn breadcrumb(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::breadcrumb(
+            &self.i18n,
+            &resource_crumbs(&self.i18n, &self.resource_type, &self.resource_id, None),
+        )
+    }
+}
+
 #[derive(Template)]
 #[template(path = "partials/editor-body.html")]
 pub struct EditorBody {

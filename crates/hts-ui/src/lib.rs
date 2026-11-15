@@ -213,6 +213,9 @@ pub fn router_with_admin(
         // Inner to the guard: exposes the signed-in administrator it stamped
         // to page rendering (the account menu's Sign out).
         .layer(axum::middleware::from_fn(login::scope_signed_in))
+        // Whether an HFS console shares this origin, for the topbar product
+        // switcher (UI/UX review §4.2).
+        .layer(axum::middleware::from_fn(scope_hfs_console))
         .layer(axum::middleware::from_fn_with_state(
             helios_admin_auth::Guard {
                 gate: gate.clone(),
@@ -226,6 +229,34 @@ pub fn router_with_admin(
         .layer(axum::Extension(gate))
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
         .layer(AutoVaryLayer)
+}
+
+tokio::task_local! {
+    static HFS_CONSOLE: bool;
+}
+
+/// Middleware: remember, for page rendering, whether the browser carries the
+/// cookie an HFS console sets on every page it serves
+/// ([`helios_ui_chrome::HFS_CONSOLE_COOKIE`]). Only an HFS console on this
+/// same origin can have set it, so only then does the product switcher link
+/// to it — a stand-alone HTS shows no dead "FHIR Server" entry.
+async fn scope_hfs_console(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let known = helios_ui_chrome::has_hfs_console_cookie(
+        request
+            .headers()
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    HFS_CONSOLE.scope(known, next.run(request)).await
+}
+
+/// Whether an HFS console shares this origin (see [`scope_hfs_console`]).
+fn hfs_console_known() -> bool {
+    HFS_CONSOLE.try_with(|known| *known).unwrap_or(false)
 }
 
 /// The generic "not found" page, `404` inside the full chrome.
@@ -300,6 +331,19 @@ impl Chrome<'_> {
     /// The topbar theme switcher, shared with HFS (`helios-ui-chrome`).
     pub(crate) fn theme_toggle(&self) -> Result<String, askama::Error> {
         helios_ui_chrome::theme_toggle(&self.i18n)
+    }
+
+    /// The topbar product switcher, shared with HFS (UI/UX review §4.2):
+    /// rendered only when an HFS console on this origin has announced itself.
+    pub(crate) fn product_switcher(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::product_switcher(
+            &self.i18n,
+            helios_ui_chrome::ProductLinks {
+                current: helios_ui_chrome::Product::Terminology,
+                fhir: hfs_console_known().then_some(helios_ui_chrome::HFS_CONSOLE_PATH),
+                terminology: Some(helios_ui_chrome::HTS_CONSOLE_PATH),
+            },
+        )
     }
 
     /// The inline first-paint theme stamp for `<head>` (shared with HFS).

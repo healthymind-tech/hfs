@@ -2321,3 +2321,25 @@ admin-login-throttled = Demasiados intentos fallidos desde su dirección. Vuelva
 admin-login-cross-site = El formulario de inicio de sesión debe enviarse desde este sitio. Recargue la página e inténtelo de nuevo.
 admin-login-locked = La administración está bloqueada: este servidor no tiene contraseña de administrador. Defina { $var } (o { $var }_FILE) y reinícielo.
 admin-user-hint = Administrador
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = Cambiar de consola
+product-switch-fhir = Servidor FHIR
+product-switch-terminology = Terminología
+product-switch-new-tab = Se abre en una pestaña nueva
+breadcrumb-label = Ruta de navegación
+editor-new-title = Nuevo recurso { $type }
+editor-crumb-new = Nuevo
+history-heading-for = Historial · { $subject }
+history-crumb = Historial
+tenants-default-tag = Predeterminado
+tenants-default-hint = El tenant predeterminado del servidor: las solicitudes que no indican tenant llegan aquí, por lo que no se puede eliminar.
+tenants-error-delete-default = «{ $id }» es el tenant predeterminado del servidor y no se puede dar de baja aquí.
+tenants-delete-title = ¿Dar de baja el tenant «{ $id }»?
+tenants-delete-impact = { $count ->
+    [one] El tenant «{ $id }» contiene un recurso.
+   *[other] El tenant «{ $id }» contiene { $count } recursos.
+    } Al darlo de baja se quita del registro de tenants; sus datos almacenados se conservan salvo que se purguen vía API.
+tenants-delete-type-id = Escriba { $id } para confirmar
+tenants-delete-submit = Dar de baja

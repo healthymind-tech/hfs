@@ -2324,3 +2324,25 @@ admin-login-throttled = Zu viele fehlgeschlagene Versuche von Ihrer Adresse. Ver
 admin-login-cross-site = Das Anmeldeformular muss von dieser Website gesendet werden. Laden Sie die Seite neu und versuchen Sie es erneut.
 admin-login-locked = Die Verwaltung ist gesperrt: Für diesen Server ist kein Administratorpasswort festgelegt. Setzen Sie { $var } (oder { $var }_FILE) und starten Sie ihn neu.
 admin-user-hint = Administrator
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = Konsole wechseln
+product-switch-fhir = FHIR-Server
+product-switch-terminology = Terminologie
+product-switch-new-tab = Öffnet in einem neuen Tab
+breadcrumb-label = Brotkrumen-Navigation
+editor-new-title = Neue Ressource: { $type }
+editor-crumb-new = Neu
+history-heading-for = Verlauf · { $subject }
+history-crumb = Verlauf
+tenants-default-tag = Standard
+tenants-default-hint = Der Standardmandant des Servers: Anfragen ohne Mandantenangabe landen hier, daher kann er nicht gelöscht werden.
+tenants-error-delete-default = „{ $id }" ist der Standardmandant des Servers und kann hier nicht abgemeldet werden.
+tenants-delete-title = Mandant „{ $id }" abmelden?
+tenants-delete-impact = { $count ->
+    [one] Mandant „{ $id }" enthält eine Ressource.
+   *[other] Mandant „{ $id }" enthält { $count } Ressourcen.
+    } Beim Abmelden wird er aus dem Mandantenregister entfernt; die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
+tenants-delete-type-id = Zur Bestätigung { $id } eingeben
+tenants-delete-submit = Abmelden

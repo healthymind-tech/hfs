@@ -24,7 +24,7 @@
      data-msg-sign-in-required="{{ i18n.t("batch-sign-in-required") }}">
   <section class="card">
     <div class="card-head">
-      <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("validate-input") }}</h3>
+      <h2><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("validate-input") }}</h2>
     </div>
     <form class="validate-form" id="validate-form" novalidate>
       <div class="validate-form__row">
@@ -40,7 +40,7 @@
 
       <div class="batch-check" id="validate-check" aria-live="polite" hidden>
         <div class="batch-check__group batch-check__group--error" id="validate-check-errors" hidden>
-          <h4>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h4>
+          <h3>{{ i18n.t("batch-check-errors") }} <span class="batch-check__count"></span></h3>
           <ul></ul>
         </div>
       </div>
@@ -66,7 +66,7 @@
 
   <section class="card validate-card" id="validate-result" tabindex="-1" hidden>
     <div class="card-head">
-      <h3><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h3>
+      <h2><span class="icon">{% include "icons/check-circle.svg" %}</span> {{ i18n.t("validate-result-heading") }}</h2>
     </div>
     <p class="busy-status" id="validate-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
     <div class="validate-results" id="validate-results"></div>

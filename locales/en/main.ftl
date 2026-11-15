@@ -2439,3 +2439,29 @@ admin-login-throttled = Too many failed attempts from your address. Try again in
 admin-login-cross-site = The sign-in form must be sent from this site. Reload the page and try again.
 admin-login-locked = Administration is locked: this server has no administrator password. Set { $var } (or { $var }_FILE) and restart it.
 admin-user-hint = Administrator
+
+## Navigation between and within the consoles (UI/UX review §4.2): the
+## topbar product switcher both consoles share, and the breadcrumb trail.
+product-switch-label = Switch console
+product-switch-fhir = FHIR Server
+product-switch-terminology = Terminology
+product-switch-new-tab = Opens in a new tab
+breadcrumb-label = Breadcrumb
+# The editor's heading before the resource has an id, e.g. "New Patient".
+editor-new-title = New { $type }
+editor-crumb-new = New
+# The history page's heading once an instance is chosen; $subject is "Patient/123".
+history-heading-for = History · { $subject }
+history-crumb = History
+# Tenants page (UI/UX review §3.8): the default tenant cannot be deleted, and
+# Delete opens a dialog that states the impact and asks for the id.
+tenants-default-tag = Default
+tenants-default-hint = The server's default tenant: requests that name no tenant land here, so it cannot be deleted.
+tenants-error-delete-default = "{ $id }" is the server's default tenant and cannot be deregistered here.
+tenants-delete-title = Deregister tenant "{ $id }"?
+tenants-delete-impact = { $count ->
+    [one] Tenant "{ $id }" holds one resource.
+   *[other] Tenant "{ $id }" holds { $count } resources.
+    } Deregistering removes it from the tenant registry; its stored data is kept unless it is purged through the API.
+tenants-delete-type-id = Type { $id } to confirm
+tenants-delete-submit = Deregister

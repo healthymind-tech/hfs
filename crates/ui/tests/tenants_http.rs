@@ -816,3 +816,79 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         [("removed", TenantId::new("beta"))]
     );
 }
+
+/// UI/UX review §3.8: Delete opens a dialog that states what is at stake and
+/// asks for the id to be typed, instead of the browser's one-click confirm().
+#[tokio::test]
+async fn delete_asks_for_the_typed_id_in_a_dialog() {
+    let store = store();
+    let router = app(&store);
+    post_form(&router, "id=acme&display_name=Acme").await;
+    let html = wait_settled(&router).await;
+
+    assert!(html.contains(r#"data-tenant-delete="acme""#), "{html}");
+    assert!(html.contains(r#"role="dialog" aria-modal="true""#));
+    assert!(html.contains(r#"<form hx-delete="/ui/tenants/acme""#));
+    assert!(html.contains(r#"name="confirm" type="text" required"#));
+    assert!(html.contains(r#"pattern="acme""#));
+    assert!(html.contains("Type acme to confirm"));
+    assert!(html.contains("its stored data is kept"));
+    assert!(!html.contains("hx-confirm"), "no native confirm() any more");
+
+    // The typed confirmation rides along as a query parameter the handler
+    // tolerates.
+    let res = router
+        .clone()
+        .oneshot(
+            Request::delete("/ui/tenants/acme?confirm=acme&purge=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let (_, rows) = get(&router, "/ui/tenants/rows").await;
+    assert!(!rows.contains(r#"data-tenant-delete="acme""#));
+}
+
+/// The default tenant gets no Delete, and the handler refuses it anyway.
+#[tokio::test]
+async fn the_default_tenant_cannot_be_deleted() {
+    let store = store();
+    store
+        .register_tenant("default", Some("Default"))
+        .await
+        .expect("register default");
+    let router = app(&store);
+
+    let (_, html) = get(&router, "/ui/tenants/rows").await;
+    assert!(!html.contains(r#"data-tenant-delete="default""#), "{html}");
+    assert!(
+        html.contains(r#"<span class="tag tag--muted" title="The server&#39;s default tenant"#)
+            || html.contains("tag tag--muted\" title=\"The server"),
+        "{html}"
+    );
+
+    let res = router
+        .clone()
+        .oneshot(
+            Request::delete("/ui/tenants/default?confirm=default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
+    assert!(
+        body.contains("is the server&#39;s default tenant")
+            || body.contains("is the server's default tenant")
+            || body.contains("is the server&#x27;s default tenant"),
+        "{body}"
+    );
+    let tenants = store.list_tenants().await.expect("list");
+    assert!(
+        tenants.iter().any(|t| t.id == "default"),
+        "still registered"
+    );
+}
