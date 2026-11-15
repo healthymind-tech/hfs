@@ -2,6 +2,9 @@
 
 FHIR `AuditEvent` logging for the Helios FHIR Server, with [IHE BALP](https://profiles.ihe.net/ITI/BALP/) profile selection for REST, authentication, and persistence-layer events.
 
+> Operators: see [`docs/ops/audit.md`](../../docs/ops/audit.md) for what is recorded,
+> configuration, retention and the recommended production setup.
+
 ## Overview
 
 This crate records security, privacy, and operational activity as typed FHIR `AuditEvent` resources. It plugs into HFS at four layers:
@@ -196,27 +199,17 @@ The crate is split into six core pieces:
 
 ### REST Interactions
 
-The middleware uses interaction-aware detection (`detect_interaction`) instead of mapping by HTTP method alone:
-
-| Request Pattern | Audit Action |
-|-----------------|--------------|
-| `GET`/`HEAD` type search or history (`/Patient`, `/Patient/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` system history (`/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` instance history (`/Patient/123/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` instance read (`/Patient/123`) | `Read` (`R`) |
-| `POST` with `/_search` | `Query` (`E`) |
-| `POST /[type]` create | `Create` (`C`) |
-| `POST /` batch/transaction envelope | `Execute` (`E`) |
-| `PUT`/`PATCH` | `Update` (`U`) |
-| `DELETE` | `Delete` (`D`) |
-| Other methods | `Execute` (`E`) |
-
-Response status is translated into a coarse outcome:
-
-- `status < 400` -> outcome `0`
-- `status >= 400` -> outcome `8`
-
-For query events, BALP profile selection uses query profiles (`IHE.BasicAudit.Query` / `IHE.BasicAudit.PatientQuery`) and RESTful interaction subtype `search`.
+`interaction::classify` maps each request to a FHIR restful-interaction
+(`read`, `vread`, `create`, `update`, `patch`, `delete`, `history-*`,
+`search-type`, `search-system` incl. compartment searches, `operation`,
+`batch`/`transaction`), and `rest_event::build_rest_events` turns it into
+IHE BALP events (Read/Create/Update/Delete/Query and Patient* variants) with
+client, server and user agents, the query entity, the patient and the
+`X-Request-Id`. Outcome: `0` for < 400, `4` for 4xx, `8` for 5xx; failures
+carry `outcomeDesc` and claim no BALP profile (BALP fixes outcome `0`).
+Batch/transaction requests are recorded per entry (the envelope only when it
+fails as a whole). The middleware sits outside authentication, so 401/403
+are recorded too. Full mapping table: `docs/ops/audit.md`.
 
 ### Write Context Enrichment (`AuditResponseContext`)
 
@@ -400,7 +393,7 @@ The [FHIR AuditEvent specification](https://hl7.org/fhir/auditevent.html) identi
 
 ## Current Limitations
 
-- Dedicated database audit stores are not automatically exposed through the primary REST API (they are intentionally separate storage targets)
-- Middleware records events after the handler runs and does not directly inspect response bodies (enrichment comes from response extensions)
-- Audit recording is intentionally infallible; write failures are logged, not surfaced to API clients
-- Persistence-layer audit functions (bulk export, purge, reindex) exist in `helios-persistence` but are not yet called — REST endpoints for these operations have not been implemented yet
+- Dedicated database audit stores (`HFS_AUDIT_DATABASE_URL`) are not exposed through the primary REST API (they are intentionally separate storage targets); events in the shared store live in the request's tenant and are searchable there
+- Patient attribution of searches comes from the request (path and parameters), not from the result set
+- Audit recording is intentionally infallible; write failures are retried, then spilled to the fallback file, never surfaced to API clients
+- Retention (`HFS_AUDIT_RETENTION_*`) is implemented for the SQLite and PostgreSQL stores only
