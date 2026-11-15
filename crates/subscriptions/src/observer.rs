@@ -214,7 +214,7 @@ mod tests {
 
         let engine = engine();
         let topic_url = "http://example.org/topic/patient-create";
-        engine.topic_registry().add_topic(TopicDefinition {
+        engine.topic_registry().add_topic("acme", TopicDefinition {
             canonical_url: topic_url.to_string(),
             title: None,
             resource_triggers: vec![ResourceTrigger {
