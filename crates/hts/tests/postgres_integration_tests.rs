@@ -1,8 +1,9 @@
 //! Integration tests for the PostgreSQL terminology backend.
 //!
 //! Requires Docker — uses `testcontainers` to spin up a real PostgreSQL
-//! instance. These tests are gated by `#[cfg(feature = "postgres")]` and
-//! are not run in the default test suite.
+//! instance, or a server named by `HTS_TEST_PG_URL` (see `external_db_url`).
+//! These tests are gated by `#[cfg(feature = "postgres")]` and are not run
+//! in the default test suite.
 //!
 //! Run with:
 //!   `cargo test -p helios-hts --features postgres --test postgres_integration_tests`
@@ -83,6 +84,9 @@ async fn start_postgres_for_test() -> ContainerAsync<Postgres> {
 async fn db_url() -> &'static str {
     DB_URL
         .get_or_init(|| async {
+            if let Some(url) = external_db_url("shared").await {
+                return url;
+            }
             let container = start_postgres_for_test().await;
 
             let host = container
@@ -102,6 +106,39 @@ async fn db_url() -> &'static str {
             url
         })
         .await
+}
+
+/// With `HTS_TEST_PG_URL` (a server the tests may create databases on, as
+/// the HTTP tests in `common` accept) the suite runs without Docker in a
+/// database of its own, `hts_pgint_<pid>_<name>`, created fresh for this run.
+async fn external_db_url(name: &str) -> Option<String> {
+    let url = std::env::var("HTS_TEST_PG_URL")
+        .ok()
+        .filter(|u| !u.is_empty())?;
+    let base = match url.rfind('/') {
+        Some(i) if i > "postgres://".len() => url[..i].to_owned(),
+        _ => url,
+    };
+    let db = format!("hts_pgint_{}_{name}", std::process::id());
+    let (client, conn) =
+        tokio_postgres::connect(&format!("{base}/postgres"), tokio_postgres::NoTls)
+            .await
+            .expect("connect to HTS_TEST_PG_URL");
+    let driver = tokio::spawn(conn);
+    // Two statements: CREATE DATABASE cannot run in the implicit transaction
+    // of a multi-statement query.
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        client
+            .batch_execute(&sql)
+            .await
+            .expect("create the test database");
+    }
+    drop(client);
+    let _ = driver.await;
+    Some(format!("{base}/{db}"))
 }
 
 /// Return a fresh `PostgresTerminologyBackend` connected to the shared
@@ -162,11 +199,17 @@ async fn backend_name_is_postgres() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supported_systems_empty_initially() {
-    // Use a dedicated container to guarantee a truly empty DB.
-    let container = start_postgres_for_test().await;
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    // Use a dedicated container (or database) to guarantee a truly empty DB.
+    let (url, _container) = match external_db_url("empty").await {
+        Some(url) => (url, None),
+        None => {
+            let container = start_postgres_for_test().await;
+            let host = container.get_host().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+            (url, Some(container))
+        }
+    };
 
     let backend = PostgresTerminologyBackend::with_pool_size(&url, 4)
         .await
