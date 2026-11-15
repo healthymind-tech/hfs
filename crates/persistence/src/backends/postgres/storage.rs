@@ -4232,6 +4232,13 @@ impl ConditionalStorage for PostgresBackend {
         search_params: &str,
         fhir_version: FhirVersion,
     ) -> StorageResult<ConditionalCreateResult> {
+        // Search-then-create is atomic only under the criteria lock: without
+        // it, concurrent requests (on one instance or several) all find no
+        // match and all create — duplicate patients from a retried
+        // `If-None-Exist` POST.
+        let _criteria_lock = self
+            .lock_condition(tenant, resource_type, search_params)
+            .await?;
         // Find matching resources based on search parameters
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
@@ -4269,6 +4276,11 @@ impl ConditionalStorage for PostgresBackend {
         fhir_version: FhirVersion,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
+        // Same check-then-act as conditional create (an upsert creates on no
+        // match): serialize on the criteria.
+        let _criteria_lock = self
+            .lock_condition(tenant, resource_type, search_params)
+            .await?;
         // Find matching resources based on search parameters
         let matches = self
             .find_matching_resources(tenant, resource_type, search_params)
@@ -7989,4 +8001,93 @@ impl PostgresBackend {
         }
     }
 
+}
+
+/// Held while a conditional interaction checks and writes; dropping it
+/// releases the session advisory lock (on a background task) and returns the
+/// connection to the pool.
+pub(crate) struct ConditionLock {
+    client: Option<deadpool_postgres::Client>,
+    key: i32,
+}
+
+impl Drop for ConditionLock {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let key = self.key;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = client
+                        .execute(
+                            "SELECT pg_advisory_unlock($1, $2)",
+                            &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
+                        )
+                        .await;
+                });
+            }
+            Err(_) => {
+                // Discard the session so the lock cannot leak into the pool.
+                let _ = deadpool_postgres::Object::take(client);
+            }
+        }
+    }
+}
+
+impl PostgresBackend {
+    /// Takes the advisory lock serializing conditional creates / upserts on
+    /// `criteria` across every connection of every instance. Waiters poll
+    /// with `pg_try_advisory_lock` and give their connection back between
+    /// tries, so a queue of waiters cannot exhaust the pool the holder needs
+    /// for its own write.
+    async fn lock_condition(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<ConditionLock> {
+        let key = super::lock_protocol::condition_key(
+            tenant.tenant_id().as_str(),
+            resource_type,
+            criteria,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut backoff = std::time::Duration::from_millis(2);
+        loop {
+            let client = self.get_client().await?;
+            let acquired: bool = client
+                .query_one(
+                    "SELECT pg_try_advisory_lock($1, $2)",
+                    &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
+                )
+                .await
+                .map_err(|e| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("conditional interaction lock: {e}"),
+                        source: None,
+                    })
+                })?
+                .get(0);
+            if acquired {
+                return Ok(ConditionLock {
+                    client: Some(client),
+                    key,
+                });
+            }
+            drop(client);
+            if std::time::Instant::now() >= deadline {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "postgres".to_string(),
+                    message: "timed out waiting for a concurrent conditional write on the same \
+                              criteria"
+                        .to_string(),
+                }));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
 }

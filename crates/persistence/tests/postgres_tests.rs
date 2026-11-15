@@ -32314,4 +32314,105 @@ mod postgres_integration {
             assert!(feed.prune(std::time::Duration::from_secs(3600)).await.is_ok());
         }
     }
+
+    // ========================================================================
+    // T2 cluster suite — conditional create / upsert races (fork).
+    // ========================================================================
+    mod conditional_race_suite {
+        use helios_fhir::FhirVersion;
+        use helios_persistence::core::{
+            ConditionalCreateResult, ConditionalStorage, ConditionalUpdateResult,
+        };
+        use serde_json::json;
+        use std::sync::Arc;
+
+        use super::{create_backend, create_tenant};
+
+        /// Twelve conditional creates with one identifier, raced over three
+        /// independent handles (three instances): exactly one creates.
+        #[tokio::test]
+        async fn postgres_integration_cluster_conditional_create_race_creates_once() {
+            let handles = [
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+            ];
+            let tenant = create_tenant("cond-race");
+            let value = uuid::Uuid::new_v4().to_string();
+            let criteria = format!("identifier=urn:race|{value}");
+            let mut tasks = Vec::new();
+            for i in 0..12 {
+                let backend = handles[i % 3].clone();
+                let (tenant, criteria, value) = (tenant.clone(), criteria.clone(), value.clone());
+                tasks.push(tokio::spawn(async move {
+                    backend
+                        .conditional_create(
+                            &tenant,
+                            "Patient",
+                            json!({"resourceType": "Patient",
+                                   "identifier": [{"system": "urn:race", "value": value}]}),
+                            &criteria,
+                            FhirVersion::default(),
+                        )
+                        .await
+                        .expect("conditional create")
+                }));
+            }
+            let mut created = 0;
+            let mut exists = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    ConditionalCreateResult::Created(_) => created += 1,
+                    ConditionalCreateResult::Exists(_) => exists += 1,
+                    ConditionalCreateResult::MultipleMatches(n) => {
+                        panic!("duplicates were created: {n} matches")
+                    }
+                }
+            }
+            assert_eq!((created, exists), (1, 11));
+        }
+
+        /// Conditional upserts (PUT with criteria, no match) raced over three
+        /// handles: one creates, the rest update it.
+        #[tokio::test]
+        async fn postgres_integration_cluster_conditional_upsert_race_creates_once() {
+            let handles = [
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+            ];
+            let tenant = create_tenant("cond-upsert");
+            let value = uuid::Uuid::new_v4().to_string();
+            let criteria = format!("identifier=urn:upsert|{value}");
+            let mut tasks = Vec::new();
+            for i in 0..9 {
+                let backend = handles[i % 3].clone();
+                let (tenant, criteria, value) = (tenant.clone(), criteria.clone(), value.clone());
+                tasks.push(tokio::spawn(async move {
+                    backend
+                        .conditional_update(
+                            &tenant,
+                            "Patient",
+                            json!({"resourceType": "Patient",
+                                   "identifier": [{"system": "urn:upsert", "value": value}]}),
+                            &criteria,
+                            true,
+                            FhirVersion::default(),
+                            &Default::default(),
+                        )
+                        .await
+                        .expect("conditional upsert")
+                }));
+            }
+            let mut created = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    ConditionalUpdateResult::Created(_) => created += 1,
+                    ConditionalUpdateResult::Updated(_) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(created, 1);
+        }
+    }
 }
