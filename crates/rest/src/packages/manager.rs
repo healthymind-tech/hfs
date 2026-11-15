@@ -945,6 +945,7 @@ impl PackageManager {
                  resources written from now on; run $reindex to index existing data"
             ));
         }
+        self.refresh_binding_pins(job, tenant).await;
         job.finish(
             status,
             Some(json!({
@@ -1468,6 +1469,7 @@ impl PackageManager {
                     job.error(&key, "registry", e.to_string());
                 }
                 job.update(|s| s.packages_done = 1);
+                self.refresh_binding_pins(job, tenant).await;
                 let failed = !job.view().errors.is_empty();
                 self.audit(
                     tenant,
@@ -1500,6 +1502,15 @@ impl PackageManager {
                 .await;
                 job.finish(JobStatus::Failed, Some(json!({"error": e})));
             }
+        }
+    }
+
+    /// Recomputes the binding version pins of `tenant`'s installed profiles
+    /// (see [`super::pins`]) and re-registers its profiles under them.
+    async fn refresh_binding_pins(&self, job: &Job, tenant: &str) {
+        match super::pins::compute(self.deps.store.as_ref(), tenant).await {
+            Ok(pins) => self.deps.validation.set_binding_pins(tenant, pins),
+            Err(e) => job.log(format!("binding version pins not refreshed: {e}")),
         }
     }
 

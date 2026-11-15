@@ -984,6 +984,27 @@ where
                 packages::manager::cache_dir(&config).join("registry.json"),
             )),
         };
+    // Binding version pins of the installed profiles (see `packages::pins`):
+    // set as soon as the registry is read, and once more when the startup
+    // rehydration is over, so profiles registered in between get them too.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let store = Arc::clone(&package_store);
+        let validation = state.validation_shared();
+        let tenant = config.default_tenant.clone();
+        tokio::spawn(async move {
+            match packages::pins::compute(store.as_ref(), &tenant).await {
+                Ok(pins) => {
+                    info!(profiles = pins.len(), "binding version pins of installed profiles loaded");
+                    validation.set_binding_pins(&tenant, pins);
+                    while validation.is_rehydrating() {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    validation.reapply_binding_pins(&tenant);
+                }
+                Err(e) => warn!(error = %e, "reading the package registry for binding pins failed"),
+            }
+        });
+    }
     let package_manager = Arc::new(packages::PackageManager::new(
         &config,
         packages::ManagerDeps {
