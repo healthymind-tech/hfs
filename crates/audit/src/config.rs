@@ -82,7 +82,8 @@ pub struct AuditConfig {
     /// Concurrent writer tasks (`HFS_AUDIT_WRITERS`).
     pub writers: usize,
     /// Longest wait for the queue to drain on shutdown, in seconds
-    /// (`HFS_AUDIT_SHUTDOWN_TIMEOUT`).
+    /// (`HFS_AUDIT_SHUTDOWN_TIMEOUT`, default 5); what is still queued then is
+    /// written to the fallback file. Keep it below `HFS_SHUTDOWN_TIMEOUT`.
     pub shutdown_timeout_secs: u64,
     /// NDJSON file events are spilled to when the database cannot take them
     /// (`HFS_AUDIT_FALLBACK_FILE`); replayed on the next start.
@@ -196,7 +197,7 @@ impl AuditConfig {
             queue_capacity: env_parse("HFS_AUDIT_QUEUE_CAPACITY", 10_000usize).max(1),
             batch_size: env_parse("HFS_AUDIT_BATCH_SIZE", 64usize).max(1),
             writers: env_parse("HFS_AUDIT_WRITERS", 4usize).max(1),
-            shutdown_timeout_secs: env_parse("HFS_AUDIT_SHUTDOWN_TIMEOUT", 30u64),
+            shutdown_timeout_secs: env_parse("HFS_AUDIT_SHUTDOWN_TIMEOUT", 5u64),
             fallback_file: env::var("HFS_AUDIT_FALLBACK_FILE")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
@@ -212,6 +213,7 @@ impl AuditConfig {
             batch_size: self.batch_size,
             workers: self.writers,
             flush_timeout: std::time::Duration::from_secs(self.shutdown_timeout_secs),
+            spill_file: self.fallback_file.as_ref().map(std::path::PathBuf::from),
         }
     }
 }
@@ -237,7 +239,7 @@ impl Default for AuditConfig {
             queue_capacity: 10_000,
             batch_size: 64,
             writers: 4,
-            shutdown_timeout_secs: 30,
+            shutdown_timeout_secs: 5,
             fallback_file: None,
             auth_events: false,
             retention: RetentionConfig {

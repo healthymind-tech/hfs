@@ -30,6 +30,26 @@ pub trait AuditStorage: Send + Sync + 'static {
         resource: serde_json::Value,
         fhir_version: FhirVersion,
     ) -> Result<(), String>;
+
+    /// Persist several resources of one type in `tenant`; one result per
+    /// resource, in order. The default writes them one by one; stores with a
+    /// batch write override it.
+    async fn create_resources(
+        &self,
+        tenant: Option<&str>,
+        resource_type: &str,
+        resources: Vec<serde_json::Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<Result<(), String>> {
+        let mut out = Vec::with_capacity(resources.len());
+        for r in resources {
+            out.push(
+                self.create_resource(tenant, resource_type, r, fhir_version)
+                    .await,
+            );
+        }
+        out
+    }
 }
 
 /// How often a failed write is attempted before the event is spilled to the
@@ -96,6 +116,11 @@ impl DatabaseSink {
         }
         match &self.fallback {
             Some(path) => {
+                let mut value = value;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.entry("resourceType")
+                        .or_insert_with(|| "AuditEvent".into());
+                }
                 let line = serde_json::json!({ "tenant": tenant, "resource": value });
                 let _guard = self.fallback_lock.lock().await;
                 match append_line(path, &line.to_string()).await {
@@ -148,6 +173,17 @@ impl DatabaseSink {
     }
 }
 
+/// The event as a FHIR resource (the typed struct serializes without
+/// `resourceType`, which the stored copy and the archives must carry).
+fn to_resource(event: &AuditEvent) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(event)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.entry("resourceType")
+            .or_insert_with(|| "AuditEvent".into());
+    }
+    Ok(value)
+}
+
 async fn append_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     if let Some(parent) = path.parent()
@@ -172,7 +208,7 @@ impl AuditSink for DatabaseSink {
     }
 
     async fn record_in(&self, tenant: Option<&str>, event: AuditEvent) {
-        let value = match serde_json::to_value(&event) {
+        let value = match to_resource(&event) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to serialize audit event to JSON Value");
@@ -180,6 +216,42 @@ impl AuditSink for DatabaseSink {
             }
         };
         self.write(tenant, value).await;
+    }
+
+    /// Writes a batch with one storage call per tenant; an event the batch
+    /// write refused goes through the retrying single write (and from there,
+    /// if need be, to the fallback file).
+    async fn record_records(&self, records: Vec<crate::sink::AuditRecord>) {
+        let mut groups: Vec<(Option<String>, Vec<serde_json::Value>)> = Vec::new();
+        for r in records {
+            let value = match to_resource(&r.event) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to serialize audit event to JSON Value");
+                    continue;
+                }
+            };
+            match groups.iter_mut().find(|(t, _)| *t == r.tenant) {
+                Some((_, values)) => values.push(value),
+                None => groups.push((r.tenant, vec![value])),
+            }
+        }
+        for (tenant, values) in groups {
+            let results = self
+                .storage
+                .create_resources(
+                    tenant.as_deref(),
+                    "AuditEvent",
+                    values.clone(),
+                    self.fhir_version,
+                )
+                .await;
+            for (value, result) in values.into_iter().zip(results) {
+                if result.is_err() {
+                    self.write(tenant.as_deref(), value).await;
+                }
+            }
+        }
     }
 
     async fn flush(&self) {
@@ -243,6 +315,7 @@ mod tests {
         // Verify it's a valid AuditEvent by checking for key fields
         assert!(events[0]["id"].is_string());
         assert!(events[0]["recorded"].is_string());
+        assert_eq!(events[0]["resourceType"], "AuditEvent");
     }
 
     #[tokio::test]
@@ -372,5 +445,23 @@ mod tests {
         let storage = Arc::new(MockStorage::new());
         let sink = DatabaseSink::new(storage, FhirVersion::default());
         assert_eq!(sink.name(), "database");
+    }
+
+    #[tokio::test]
+    async fn test_batches_are_grouped_by_tenant() {
+        let storage = Arc::new(FlakyStorage {
+            up: true.into(),
+            events: Mutex::new(Vec::new()),
+        });
+        let sink = DatabaseSink::new(Arc::clone(&storage) as _, FhirVersion::default());
+        let rec = |t: &str| crate::sink::AuditRecord {
+            tenant: Some(t.to_string()),
+            event: AuditEventBuilder::new("Device/hfs").build(),
+        };
+        sink.record_records(vec![rec("a"), rec("b"), rec("a")])
+            .await;
+        let events = storage.events.lock().await;
+        let tenants: Vec<_> = events.iter().map(|e| e.0.clone().unwrap()).collect();
+        assert_eq!(tenants, vec!["a", "a", "b"]);
     }
 }

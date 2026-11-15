@@ -32,6 +32,10 @@ pub struct QueueConfig {
     pub workers: usize,
     /// Longest [`AuditSink::flush`] waits for the queue to drain.
     pub flush_timeout: Duration,
+    /// Where events still queued when the flush times out are written
+    /// (NDJSON, the database sink's fallback format, replayed on the next
+    /// start). `None`: they are lost.
+    pub spill_file: Option<std::path::PathBuf>,
 }
 
 impl Default for QueueConfig {
@@ -40,7 +44,8 @@ impl Default for QueueConfig {
             capacity: 10_000,
             batch_size: 64,
             workers: 4,
-            flush_timeout: Duration::from_secs(30),
+            flush_timeout: Duration::from_secs(5),
+            spill_file: None,
         }
     }
 }
@@ -54,6 +59,8 @@ pub struct QueueStats {
     pub written: AtomicU64,
     /// Calls that had to wait because the queue was full.
     pub waited_for_room: AtomicU64,
+    /// Events written to the spill file at a flush timeout.
+    pub spilled: AtomicU64,
 }
 
 /// A bounded queue in front of another sink, drained by background workers.
@@ -63,6 +70,8 @@ pub struct QueuedSink {
     pending: Arc<AtomicU64>,
     stats: Arc<QueueStats>,
     flush_timeout: Duration,
+    rx: Arc<Mutex<mpsc::Receiver<AuditRecord>>>,
+    spill_file: Option<std::path::PathBuf>,
 }
 
 impl QueuedSink {
@@ -74,7 +83,7 @@ impl QueuedSink {
         let pending = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(QueueStats::default());
         for _ in 0..config.workers.max(1) {
-            let rx = Arc::clone(&rx);
+            let rx: Arc<Mutex<mpsc::Receiver<AuditRecord>>> = Arc::clone(&rx);
             let inner = Arc::clone(&inner);
             let pending = Arc::clone(&pending);
             let stats = Arc::clone(&stats);
@@ -109,6 +118,8 @@ impl QueuedSink {
             pending,
             stats,
             flush_timeout: config.flush_timeout,
+            rx,
+            spill_file: config.spill_file,
         }
     }
 
@@ -121,6 +132,85 @@ impl QueuedSink {
     pub fn stats(&self) -> &QueueStats {
         &self.stats
     }
+
+    /// Takes everything still queued off the queue and appends it to the
+    /// spill file, so a flush that runs out of time loses nothing (the
+    /// batches the writers are already storing complete on their own).
+    async fn spill(&self) {
+        let mut taken = Vec::new();
+        {
+            // Writers hold the lock only while they take a batch.
+            let mut rx = self.rx.lock().await;
+            while let Ok(r) = rx.try_recv() {
+                taken.push(r);
+            }
+        }
+        if taken.is_empty() {
+            return;
+        }
+        let n = taken.len() as u64;
+        let Some(path) = &self.spill_file else {
+            tracing::error!(
+                lost = n,
+                timeout_secs = self.flush_timeout.as_secs(),
+                "Audit queue did not drain before the flush timeout and no spill file is \
+                 configured; queued events are lost"
+            );
+            self.pending.fetch_sub(n, Ordering::AcqRel);
+            return;
+        };
+        let mut buf = String::new();
+        for r in &taken {
+            match serde_json::to_value(&r.event) {
+                Ok(mut resource) => {
+                    if let Some(obj) = resource.as_object_mut() {
+                        obj.entry("resourceType")
+                            .or_insert_with(|| "AuditEvent".into());
+                    }
+                    buf.push_str(
+                        &serde_json::json!({ "tenant": r.tenant, "resource": resource })
+                            .to_string(),
+                    );
+                    buf.push('\n');
+                }
+                Err(e) => tracing::error!(error = %e, "Failed to serialize a queued audit event"),
+            }
+        }
+        match append(path, buf.as_bytes()).await {
+            Ok(()) => {
+                self.stats.spilled.fetch_add(n, Ordering::Relaxed);
+                tracing::warn!(
+                    spilled = n,
+                    file = %path.display(),
+                    "Audit queue did not drain before the flush timeout; queued events were \
+                     written to the spill file and are replayed at the next start"
+                );
+            }
+            Err(e) => tracing::error!(
+                lost = n,
+                error = %e,
+                file = %path.display(),
+                "Audit queue did not drain and the spill file could not be written; queued events are lost"
+            ),
+        }
+        self.pending.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+async fn append(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    f.write_all(bytes).await?;
+    f.sync_data().await
 }
 
 #[async_trait]
@@ -154,21 +244,30 @@ impl AuditSink for QueuedSink {
 
     async fn flush(&self) {
         let deadline = Instant::now() + self.flush_timeout;
-        while self.pending() > 0 {
-            if Instant::now() >= deadline {
-                tracing::error!(
-                    pending = self.pending(),
-                    timeout_secs = self.flush_timeout.as_secs(),
-                    "Audit queue did not drain before the flush timeout; pending events are lost"
-                );
-                break;
-            }
+        while self.pending() > 0 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if self.pending() > 0 {
+            self.spill().await;
+            // What is left is in the writers' hands; let those batches land
+            // (a batch is one transaction — it commits or it is spilled by the
+            // database sink's own fallback).
+            let landing = Instant::now() + Duration::from_secs(2);
+            while self.pending() > 0 && Instant::now() < landing {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if self.pending() > 0 {
+                tracing::error!(
+                    in_flight = self.pending(),
+                    "Audit batches still being written at shutdown were abandoned"
+                );
+            }
         }
         self.inner.flush().await;
         tracing::info!(
             enqueued = self.stats.enqueued.load(Ordering::Relaxed),
             written = self.stats.written.load(Ordering::Relaxed),
+            spilled = self.stats.spilled.load(Ordering::Relaxed),
             waited_for_room = self.stats.waited_for_room.load(Ordering::Relaxed),
             "Audit queue flushed"
         );
@@ -221,6 +320,7 @@ mod tests {
                 batch_size: 8,
                 workers: 2,
                 flush_timeout: Duration::from_secs(10),
+                spill_file: None,
             },
         );
         for i in 0..200 {
@@ -258,5 +358,51 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(2));
         sink.flush().await;
         assert_eq!(inner.got.lock().unwrap().len(), 1);
+    }
+
+    /// A sink that never finishes a write.
+    struct Stuck;
+
+    #[async_trait]
+    impl AuditSink for Stuck {
+        async fn record(&self, _event: AuditEvent) {}
+        async fn record_records(&self, _records: Vec<AuditRecord>) {
+            std::future::pending::<()>().await;
+        }
+        async fn flush(&self) {}
+        fn name(&self) -> &str {
+            "stuck"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_times_out_spills_the_queue_to_the_fallback_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("audit-fallback.ndjson");
+        let sink = QueuedSink::new(
+            Arc::new(Stuck),
+            QueueConfig {
+                capacity: 100,
+                batch_size: 1,
+                workers: 1,
+                flush_timeout: Duration::from_millis(50),
+                spill_file: Some(spill.clone()),
+            },
+        );
+        for _ in 0..10 {
+            sink.record_in(Some("t"), AuditEventBuilder::new("Device/hfs").build())
+                .await;
+        }
+        sink.flush().await;
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&spill)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // One event is stuck inside the writer; the other nine are spilled.
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[0]["tenant"], "t");
+        assert_eq!(lines[0]["resource"]["resourceType"], "AuditEvent");
+        assert_eq!(sink.stats().spilled.load(Ordering::Relaxed), 9);
     }
 }
