@@ -19720,16 +19720,14 @@ mod postgres_integration {
         ids
     }
 
-    /// System export pages walk a type in primary-key order with the last id
-    /// as the cursor, so every page is one index range scan from where the
-    /// previous one stopped (paging on `last_updated` re-read the type from
-    /// its start for every page). Ties and out-of-order timestamps change
-    /// nothing: every row comes out once, in id order.
+    /// System export pages through timestamp ties and out-of-order
+    /// timestamps without losing or repeating a row: the `(last_updated, id)`
+    /// cursor breaks ties on the id.
     #[tokio::test]
-    async fn postgres_integration_export_pages_in_key_order_with_id_cursor() {
+    async fn postgres_integration_export_pages_through_ties_once() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
-        let tenant = create_tenant("export-keyset");
+        let tenant = create_tenant("export-ties");
         let prefix = uuid::Uuid::new_v4().simple().to_string();
         let mut ids: Vec<String> = (0..7).map(|i| format!("{prefix}-{i}")).collect();
         for (i, id) in ids.iter().enumerate() {
@@ -19742,27 +19740,19 @@ mod postgres_integration {
                 )
                 .await
                 .unwrap();
-            // Newest first, with a tie in the middle: the opposite of key order.
+            // Newest first, with a three-way tie in the middle.
             let at = match i {
                 2 | 3 | 4 => "2026-01-10T00:00:00Z".to_string(),
                 _ => format!("2026-01-{:02}T00:00:00Z", 20 - i),
             };
             pin_last_updated(&backend, id, instant(&at)).await;
         }
-        let got =
+        let mut got =
             drain_export_type(&backend, &tenant, &ExportRequest::system(), "Patient", 2).await;
+        assert_eq!(got.len(), ids.len(), "no row repeated: {got:?}");
+        got.sort();
         ids.sort();
-        assert_eq!(got, ids, "every row once, in primary-key order");
-
-        let first = backend
-            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 3)
-            .await
-            .unwrap();
-        assert_eq!(
-            first.next_cursor.as_deref(),
-            Some(format!("id:{}", ids[2]).as_str()),
-            "the cursor is the last exported id"
-        );
+        assert_eq!(got, ids, "every row once");
     }
 
     /// `compartment_member_types` names the types that hold a member of the

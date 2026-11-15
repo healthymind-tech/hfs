@@ -1234,23 +1234,32 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Keyset paging on the primary key `(tenant_id, resource_type, id)`:
-        // every page is one index range scan that starts where the last one
-        // stopped. Paging on `(last_updated, id)` had no index to seek on —
-        // each page re-read the whole type from its start, so a type of n rows
-        // cost O(n²/batch) row visits and a million Observations never
-        // finished (see `export_keyset_cursor`).
         let mut sql = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
         let param_idx = push_export_window(&mut sql, &mut params, request, 3);
-        if let Some(after) = cursor.and_then(parse_export_keyset_cursor) {
-            sql.push_str(&format!(" AND id > ${param_idx}"));
-            params.push(Box::new(after.to_string()));
+
+        if let Some(cursor) = cursor {
+            let parts: Vec<&str> = cursor.splitn(2, '|').collect();
+            if parts.len() == 2 {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
+                    sql.push_str(&format!(
+                        " AND (last_updated, id) > (${}, ${})",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    params.push(Box::new(dt.with_timezone(&Utc)));
+                    params.push(Box::new(parts[1].to_string()));
+                }
+            }
         }
-        sql.push_str(&format!(" ORDER BY id LIMIT {}", batch_size + 1));
+
+        sql.push_str(&format!(
+            " ORDER BY last_updated, id LIMIT {}",
+            batch_size + 1
+        ));
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -1269,8 +1278,8 @@ impl ExportDataProvider for PostgresBackend {
             &rows[..]
         };
 
-        let mut lines = Vec::with_capacity(rows_to_process.len());
-        let mut last_id = None;
+        let mut lines = Vec::new();
+        let mut last_cursor = None;
 
         for row in rows_to_process {
             let id: String = row.get(0);
@@ -1283,41 +1292,49 @@ impl ExportDataProvider for PostgresBackend {
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
             lines.push(line);
-            last_id = Some(id);
+            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
         }
 
         Ok(NdjsonBatch {
             lines,
-            next_cursor: if has_more {
-                last_id.as_deref().map(export_keyset_cursor)
-            } else {
-                None
-            },
+            next_cursor: if has_more { last_cursor } else { None },
             is_last: !has_more,
         })
     }
 }
 
-/// Prefix of the PostgreSQL export page cursor: the last exported `id`.
-const EXPORT_KEYSET_CURSOR_PREFIX: &str = "id:";
-
-/// Encodes the export page cursor after `id`.
-///
-/// Export pages are walked in primary-key order, `(tenant_id, resource_type,
-/// id)`, so the cursor is just the last id. A cursor in any other form —
-/// the former `last_updated|id` one — never reaches a worker: a reclaimed
-/// job's progress rows are deleted at claim time and the type restarts.
-fn export_keyset_cursor(id: &str) -> String {
-    format!("{EXPORT_KEYSET_CURSOR_PREFIX}{id}")
+/// Appends the `(last_updated, id)` keyset predicate of an export page
+/// cursor (`<rfc3339>|<id>`, the form every PostgreSQL export path uses) and
+/// returns the next free parameter index. Walked with `idx_resources_search`
+/// `(tenant_id, resource_type, last_updated DESC, id)`.
+fn push_export_cursor(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    cursor: Option<&str>,
+    param_idx: usize,
+) -> usize {
+    if let Some((ts, id)) = cursor.and_then(|c| c.split_once('|')) {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+            sql.push_str(&format!(
+                " AND (last_updated, id) > (${}, ${})",
+                param_idx,
+                param_idx + 1
+            ));
+            params.push(Box::new(dt.with_timezone(&Utc)));
+            params.push(Box::new(id.to_string()));
+            return param_idx + 2;
+        }
+    }
+    param_idx
 }
 
-fn parse_export_keyset_cursor(cursor: &str) -> Option<&str> {
-    cursor.strip_prefix(EXPORT_KEYSET_CURSOR_PREFIX)
+fn export_cursor(last_updated: &DateTime<Utc>, id: &str) -> String {
+    format!("{}|{}", last_updated.to_rfc3339(), id)
 }
 
 /// A patient set this large a share of the tenant's patients is exported by
-/// walking the type in key order instead of through the patient-reference
-/// index (see `fetch_patient_compartment_batch`).
+/// walking the type in `(last_updated, id)` order instead of through the
+/// patient-reference index (see `fetch_patient_compartment_batch`).
 const LARGE_PATIENT_SET_SHARE: usize = 20; // 1/20 = 5 %
 
 #[async_trait]
@@ -1406,16 +1423,13 @@ impl PatientExportProvider for PostgresBackend {
             .map(|id| format!("Patient/{id}"))
             .collect();
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
-        let after = cursor
-            .and_then(parse_export_keyset_cursor)
-            .map(str::to_string);
         let selected: HashSet<&str> = patient_ids.iter().map(String::as_str).collect();
 
         let mut client = self.get_client().await?;
         let indexed = self.has_patient_export_index() && !(is_patient && matcher.is_empty());
 
-        // Three plans, all paging in primary-key order with the last id as
-        // the cursor, all feeding the same exact compartment matcher below:
+        // Three plans, all paging on `(last_updated, id)` like system export,
+        // all feeding the same exact compartment matcher below:
         //
         // * a small patient set goes through the patient-reference GIN index.
         //   The candidates are materialized as keys only — never the
@@ -1423,11 +1437,12 @@ impl PatientExportProvider for PostgresBackend {
         //   which keeps PostgreSQL from walking a whole type evaluating the
         //   JSON expression; only the page's rows are then read in full.
         // * a large set (a Group of a sizable share of the patients) walks the
-        //   type in key order and tests each row. Its candidates are most of
-        //   the database, and re-materializing them for every page made a
-        //   group export quadratic in the group's size.
+        //   type along `idx_resources_search` and tests each row. Its candidates are most of
+        //   the database, and re-materializing them for every page made each
+        //   page cost a full scan: a 14,000-patient Group hit the 30 s
+        //   statement timeout on its first page and the export failed.
         // * without the index (search offloaded) the JSON predicate is
-        //   evaluated in a key-ordered walk.
+        //   evaluated in the same ordered walk.
         let large = indexed
             && self
                 .is_large_patient_set(&client, tenant_id, patient_ids.len())
@@ -1468,22 +1483,17 @@ impl PatientExportProvider for PostgresBackend {
             params.push(Box::new(patient_ref_list));
             sql.push_str(
                 "), page AS (
-                     SELECT id FROM candidates WHERE tenant_id = $1 AND resource_type = $2",
+                     SELECT id, last_updated FROM candidates WHERE tenant_id = $1 AND resource_type = $2",
             );
-            let mut idx = push_export_window(&mut sql, &mut params, request, refs_idx + 1);
-            if let Some(after) = &after {
-                sql.push_str(&format!(" AND id > ${idx}"));
-                params.push(Box::new(after.clone()));
-                idx += 1;
-            }
-            let _ = idx;
+            let idx = push_export_window(&mut sql, &mut params, request, refs_idx + 1);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
             sql.push_str(&format!(
-                " ORDER BY id LIMIT {}
+                " ORDER BY last_updated, id LIMIT {}
                  )
                  SELECT r.id, r.data, r.last_updated, r.version_id
                  FROM page JOIN resources r
                    ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = page.id
-                 ORDER BY r.id",
+                 ORDER BY page.last_updated, page.id",
                 batch_size + 1
             ));
             sql
@@ -1520,11 +1530,11 @@ impl PatientExportProvider for PostgresBackend {
                 4
             };
             let idx = push_export_window(&mut sql, &mut params, request, next_idx);
-            if let Some(after) = &after {
-                sql.push_str(&format!(" AND id > ${idx}"));
-                params.push(Box::new(after.clone()));
-            }
-            sql.push_str(&format!(" ORDER BY id LIMIT {}", batch_size + 1));
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
             sql
         };
 
@@ -1533,7 +1543,7 @@ impl PatientExportProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // The key-ordered walks must stay key-ordered: a bitmap plan over the
+        // The ordered walk must stay an ordered walk: a bitmap plan over the
         // patient-reference index would collect and sort the whole candidate
         // set again for every page, which is the cost the walk exists to avoid.
         let rows = if large {
@@ -1570,7 +1580,7 @@ impl PatientExportProvider for PostgresBackend {
         };
 
         let mut lines = Vec::new();
-        let mut last_id = None;
+        let mut last_cursor = None;
 
         for row in rows_slice {
             let id: String = row.get(0);
@@ -1587,16 +1597,12 @@ impl PatientExportProvider for PostgresBackend {
                     .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
                 lines.push(line);
             }
-            last_id = Some(id);
+            last_cursor = Some(export_cursor(&last_updated, &id));
         }
 
         Ok(NdjsonBatch {
             lines,
-            next_cursor: if has_more {
-                last_id.as_deref().map(export_keyset_cursor)
-            } else {
-                None
-            },
+            next_cursor: if has_more { last_cursor } else { None },
             is_last: !has_more,
         })
     }
