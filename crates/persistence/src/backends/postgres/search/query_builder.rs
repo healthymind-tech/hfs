@@ -2434,12 +2434,17 @@ impl PostgresQueryBuilder {
     /// `Condition?subject=…&code:in=<451 codes>` took ~380 ms, nearly all of it
     /// planning (line G, CQL against HFS).
     ///
-    /// The array form is one `value_token_code = ANY($codes)` — a single
-    /// ScalarArrayOp scan of `idx_search_token_code` — and an exact
-    /// system-and-code check against `$pairs` (`system|code` strings, which
-    /// PostgreSQL hashes for a large constant array). It keeps the per-value
-    /// semantics: a value matches its own system or the implicit-system marker
-    /// of a `code` element (#1379), and a code-only value matches any system.
+    /// The array form groups the codes by system: one arm per distinct system,
+    /// `value_token_system IN ($system, marker) AND value_token_code =
+    /// ANY($codes)`, each a ScalarArrayOp scan of `idx_search_token_code`.
+    /// That is exactly the per-value predicate — a value matches its own
+    /// system or the implicit-system marker of a `code` element (#1379) — with
+    /// one arm per system instead of per code, and it keeps the estimates the
+    /// per-value form had. (An earlier variant checked `system || '|' || code
+    /// = ANY($pairs)`; that expression has no statistics, its default
+    /// selectivity under-estimated a patient's code membership 100x and the
+    /// planner drove a 10-code `Condition?patient=&code=` from the codes:
+    /// 1.3 s.) A code-only list is one `value_token_code = ANY($codes)`.
     /// Lists that mix forms, use `|code` or `system|`, or are shorter than
     /// [`TOKEN_LIST_ARRAY_MIN`] keep the OR form.
     fn token_list_array_predicate(
@@ -2451,46 +2456,47 @@ impl PostgresQueryBuilder {
         {
             return None;
         }
-        let mut codes: Vec<String> = Vec::with_capacity(param.values.len());
-        let mut pairs: Vec<String> = Vec::with_capacity(param.values.len());
-        let mut code_only = None;
+        let mut by_system: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut bare: Vec<String> = Vec::new();
         for value in &param.values {
-            let this_code_only = match value.value.split_once('|') {
-                Some((system, code)) if !system.is_empty() && !code.is_empty() => {
-                    codes.push(code.to_string());
-                    pairs.push(format!("{system}|{code}"));
-                    false
-                }
+            match value.value.split_once('|') {
+                Some((system, code)) if !system.is_empty() && !code.is_empty() => by_system
+                    .entry(system.to_string())
+                    .or_default()
+                    .push(code.to_string()),
                 Some(_) => return None,
-                None => {
-                    codes.push(value.value.clone());
-                    true
-                }
-            };
-            if *code_only.get_or_insert(this_code_only) != this_code_only {
-                return None;
+                None => bare.push(value.value.clone()),
             }
         }
-        codes.sort_unstable();
-        codes.dedup();
-        if code_only == Some(true) {
+        if !bare.is_empty() && !by_system.is_empty() {
+            return None;
+        }
+        if !bare.is_empty() {
+            bare.sort_unstable();
+            bare.dedup();
             return Some((
                 format!("value_token_code = ANY(${}::text[])", offset + 1),
-                vec![SqlParam::TextArray(codes)],
+                vec![SqlParam::TextArray(bare)],
             ));
         }
-        pairs.sort_unstable();
-        pairs.dedup();
-        Some((
-            format!(
-                "(value_token_code = ANY(${c}::text[]) AND (value_token_system = '{marker}' \
-                 OR value_token_system || '|' || value_token_code = ANY(${p}::text[])))",
-                c = offset + 1,
-                p = offset + 2,
+        let mut arms = Vec::with_capacity(by_system.len());
+        let mut params = Vec::with_capacity(by_system.len() * 2);
+        let mut next = offset;
+        for (system, mut codes) in by_system {
+            codes.sort_unstable();
+            codes.dedup();
+            arms.push(format!(
+                "(value_token_system IN (${s}, '{marker}') AND value_token_code = ANY(${c}::text[]))",
+                s = next + 1,
+                c = next + 2,
                 marker = IMPLICIT_TOKEN_SYSTEM,
-            ),
-            vec![SqlParam::TextArray(codes), SqlParam::TextArray(pairs)],
-        ))
+            ));
+            params.push(SqlParam::text(&system));
+            params.push(SqlParam::TextArray(codes));
+            next += 2;
+        }
+        Some((format!("({})", arms.join(" OR ")), params))
     }
 
     /// Builds an `:of-type` identifier condition (token modifier).
@@ -7276,27 +7282,25 @@ mod tests {
         (0..n).map(|i| format!("http://snomed.info/sct|{i}")).collect()
     }
 
-    /// A long `system|code` list binds two arrays and keeps one statement text
-    /// for every length.
+    /// A long `system|code` list binds one system and one code array per
+    /// distinct system, and keeps one statement text for every length.
     #[test]
-    fn a_long_system_code_list_binds_two_arrays() {
+    fn a_long_system_code_list_binds_one_array_per_system() {
         let frag =
             PostgresQueryBuilder::build_token_condition(&token_list(None, &system_codes(451)), 2)
                 .expect("built");
-        assert!(frag.sql.contains("value_token_code = ANY($3::text[])"), "{}", frag.sql);
         assert!(
-            frag.sql
-                .contains("value_token_system || '|' || value_token_code = ANY($4::text[])"),
+            frag.sql.contains(&format!(
+                "(value_token_system IN ($3, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = ANY($4::text[]))"
+            )),
             "{}",
             frag.sql
         );
-        assert!(frag.sql.contains(IMPLICIT_TOKEN_SYSTEM), "{}", frag.sql);
-        assert!(!frag.sql.contains(" OR (value_token_system IN"), "{}", frag.sql);
+        assert!(!frag.sql.contains("$5"), "{}", frag.sql);
         match frag.params.as_slice() {
-            [SqlParam::TextArray(codes), SqlParam::TextArray(pairs)] => {
+            [SqlParam::Text(system), SqlParam::TextArray(codes)] => {
+                assert_eq!(system, "http://snomed.info/sct");
                 assert_eq!(codes.len(), 451);
-                assert_eq!(pairs.len(), 451);
-                assert!(pairs.contains(&"http://snomed.info/sct|450".to_string()));
             }
             other => panic!("unexpected params {other:?}"),
         }
@@ -7307,15 +7311,21 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_codes_and_pairs_are_bound_once() {
+    fn codes_are_grouped_per_system_and_deduplicated() {
         let mut values = system_codes(10);
         values.push("http://loinc.org|1".to_string());
         values.push("http://snomed.info/sct|1".to_string());
         let frag = PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
+        assert!(frag.sql.contains(" OR "), "{}", frag.sql);
         match frag.params.as_slice() {
-            [SqlParam::TextArray(codes), SqlParam::TextArray(pairs)] => {
-                assert_eq!(codes.len(), 10, "{codes:?}");
-                assert_eq!(pairs.len(), 11, "{pairs:?}");
+            [
+                SqlParam::Text(s1),
+                SqlParam::TextArray(c1),
+                SqlParam::Text(s2),
+                SqlParam::TextArray(c2),
+            ] => {
+                assert_eq!((s1.as_str(), c1.len()), ("http://loinc.org", 1));
+                assert_eq!((s2.as_str(), c2.len()), ("http://snomed.info/sct", 10));
             }
             other => panic!("unexpected params {other:?}"),
         }
@@ -7338,7 +7348,7 @@ mod tests {
         )
         .unwrap();
         assert!(frag.sql.starts_with("NOT ("), "{}", frag.sql);
-        assert!(frag.sql.contains("= ANY($3::text[])"), "{}", frag.sql);
+        assert!(frag.sql.contains("= ANY($4::text[])"), "{}", frag.sql);
     }
 
     #[test]
