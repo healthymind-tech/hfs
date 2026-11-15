@@ -1004,17 +1004,19 @@ where
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
-    // Apply auth middleware if enabled. Just inside it, the authenticated
-    // principal is reported to the audit context (the audit layer itself sits
+    // Apply auth middleware if enabled. Just inside authentication, the
+    // authenticated principal is reported to the audit context (the audit layer itself sits
     // outside auth, see below).
     let router = if let Some(ref auth) = auth_state {
         router
-            .layer(axum::middleware::from_fn(
-                middleware::audit::capture_principal,
-            ))
             .layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::authz_middleware,
+            ))
+            // Between authentication and authorization, so a request
+            // authorization refuses (403) is still attributed to its user.
+            .layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
             ))
             .layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
@@ -1076,12 +1078,14 @@ where
         ));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
-            .route_layer(axum::middleware::from_fn(
-                middleware::audit::capture_principal,
-            ))
             .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::admin_authz_middleware,
+            ))
+            // Between authentication and authorization, so a request
+            // authorization refuses (403) is still attributed to its user.
+            .route_layer(axum::middleware::from_fn(
+                middleware::audit::capture_principal,
             ))
             .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
