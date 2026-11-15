@@ -26,8 +26,8 @@ use crate::core::bulk_submit_publication::{
 };
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -2438,6 +2438,101 @@ impl SubmitClaimStrategy for PostgresBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for PostgresBackend {
+    /// #1125: the marker that this manifest still owes a search-index
+    /// rebuild, on the manifest row so it survives a restart.
+    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = TRUE
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = FALSE
+                 WHERE tenant_id = $1 AND manifest_id = $2",
+                &[&tenant.tenant_id().as_str(), &manifest_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    /// The resource types come from what the manifest ingested
+    /// (`bulk_entry_results`), as on SQLite.
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id,
+                        COALESCE(ARRAY(
+                            SELECT DISTINCT e.resource_type FROM bulk_entry_results e
+                            WHERE e.tenant_id = m.tenant_id AND e.submitter = m.submitter
+                              AND e.submission_id = m.submission_id AND e.manifest_id = m.manifest_id
+                              AND e.resource_type IS NOT NULL
+                            ORDER BY e.resource_type
+                        ), ARRAY[]::text[])
+                 FROM bulk_manifests m
+                 WHERE m.index_pending ORDER BY m.added_at LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .await
+            .map_err(|e| internal_error(format!("list pending reindex: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| PendingReindex {
+                tenant: TenantContext::new(
+                    TenantId::new(row.get::<_, String>(0)),
+                    TenantPermissions::full_access(),
+                ),
+                submission: SubmissionId::new(row.get::<_, String>(1), row.get::<_, String>(2)),
+                manifest_id: row.get(3),
+                resource_types: row.get(4),
+            })
+            .collect())
+    }
+
+    async fn submission_index_pending(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND index_pending)",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("submission index pending: {e}")))?;
+        Ok(row.get(0))
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,

@@ -1173,6 +1173,14 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     ) -> StorageResult<Vec<PendingReindex>> {
         self.primary.list_manifests_awaiting_reindex(limit).await
     }
+
+    async fn submission_index_pending(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<bool> {
+        self.primary.submission_index_pending(tenant, id).await
+    }
 }
 
 #[cfg(test)]

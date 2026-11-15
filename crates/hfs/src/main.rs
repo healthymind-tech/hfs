@@ -3048,7 +3048,9 @@ fn postgres_reindex_selection(
         .bulk_submit
         .effective_file_concurrency(BackendKind::Postgres) as usize;
     let width = if mode == Some(StorageBackendMode::Postgres) {
-        n.min(pool_max_connections.max(1))
+        n.max(config.reindex_concurrency as usize)
+            .min(pool_max_connections.max(1))
+            .max(1)
     } else {
         1
     };
@@ -3095,10 +3097,13 @@ async fn start_postgres(
         audit_state.as_ref(),
         observability.clone(),
     );
+    // The manifest row carries the "owes a rebuild" marker on PostgreSQL too:
+    // the rebuild clears it, the status poll waits on it, and a restart
+    // resumes what it still lists (#1125).
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook_with_ledger(op, &config, None));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(backend.clone())));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -4595,7 +4600,10 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[test]
     fn test_postgres_reindex_groups_selection() {
-        let mut config = ServerConfig::default();
+        let mut config = ServerConfig {
+            reindex_concurrency: 1,
+            ..ServerConfig::default()
+        };
         config.bulk_submit.file_concurrency = 4;
         for mode in [
             StorageBackendMode::Sqlite,
@@ -4628,6 +4636,15 @@ mod tests {
         assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
         config.storage_backend = "invalid".to_string();
         assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+
+        // HFS_REINDEX_CONCURRENCY widens the rebuild without file concurrency,
+        // and the pool still caps it.
+        config.storage_backend = "postgres".to_string();
+        config.bulk_submit.file_concurrency = 1;
+        config.reindex_concurrency = 8;
+        assert_eq!(postgres_reindex_selection(&config, 32).2, 8);
+        assert_eq!(postgres_reindex_selection(&config, 6).2, 6);
+        assert_eq!(ServerConfig::default().reindex_concurrency, 4);
     }
 
     #[cfg(feature = "ui")]

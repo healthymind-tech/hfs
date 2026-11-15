@@ -1128,6 +1128,15 @@ pub struct BulkSubmitConfig {
     /// replaying a manifest writes no new versions (#1127). Off by default.
     /// Set with `HFS_BULK_SUBMIT_SKIP_UNCHANGED`.
     pub skip_unchanged: bool,
+    /// Keep a submission's status poll at `202` ("Indexing") until the
+    /// search-index rebuild that deferred indexing postponed has finished, so
+    /// the `200` manifest means "written and searchable". Measured on
+    /// PostgreSQL the rebuild outlasted the ingest itself by ~4x, and a `200`
+    /// right after ingest told the provider its data was queryable minutes
+    /// before it was. `false` restores the old "200 once written" answer.
+    /// Only backends that record the rebuild marker (SQLite, PostgreSQL) can
+    /// hold the poll. Set with `HFS_BULK_SUBMIT_STATUS_WAITS_FOR_INDEX`.
+    pub status_waits_for_index: bool,
     /// Batches each index-during-ingest writer may hold queued before the
     /// ingest waits for it. Set with `HFS_BULK_SUBMIT_INDEX_QUEUE`.
     pub index_queue: u32,
@@ -1213,6 +1222,7 @@ impl Default for BulkSubmitConfig {
             batch_size: 100,
             fetch_read_timeout_secs: 60,
             skip_unchanged: false,
+            status_waits_for_index: true,
             index_queue: 16,
             index_concurrency: 4,
             index_coalesce: 4,
@@ -1350,6 +1360,10 @@ impl BulkSubmitConfig {
                 d.fetch_read_timeout_secs,
             ),
             skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
+            status_waits_for_index: env_bool(
+                "HFS_BULK_SUBMIT_STATUS_WAITS_FOR_INDEX",
+                d.status_waits_for_index,
+            ),
             index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
             index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
             index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
@@ -1768,6 +1782,17 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Search-index rebuild writers on standalone PostgreSQL: how many
+    /// 128-resource write groups of a rebuild page run at once, shared by
+    /// `POST $reindex` and the automatic rebuild after a deferred-indexing
+    /// bulk submit. The effective width is the larger of this and
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, capped by the connection pool.
+    /// It used to follow the file concurrency alone, whose default of 1 made
+    /// the rebuild a single writer (~900 resources/s, four times the ingest
+    /// it followed). `1` restores that.
+    #[arg(long, env = "HFS_REINDEX_CONCURRENCY", default_value = "4")]
+    pub reindex_concurrency: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -2071,6 +2096,7 @@ impl Default for ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_concurrency: 4,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2360,6 +2386,7 @@ impl ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_concurrency: 4,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,

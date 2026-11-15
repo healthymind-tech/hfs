@@ -972,6 +972,106 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1125 on PostgreSQL: the marker that a manifest still owes a
+    /// search-index rebuild lives on the manifest row; it is listed with the
+    /// types the manifest ingested, it makes the submission report
+    /// `submission_index_pending` (which holds the status poll at 202), and
+    /// clearing it releases both.
+    #[tokio::test]
+    async fn postgres_manifest_index_pending_marks_lists_and_clears() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+            SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("manifest-index-pending");
+        let submission = SubmissionId::generate("manifest-index-pending");
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "index-pending-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient"})),
+                    NdjsonEntry::new(
+                        2,
+                        "Provenance",
+                        json!({"resourceType": "Provenance",
+                        "recorded": "2026-01-01T00:00:00Z",
+                        "target": [{"reference": "Patient/x"}],
+                        "agent": [{"who": {"display": "x"}}]}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let ours = |pending: Vec<helios_persistence::core::bulk_submit_worker::PendingReindex>| {
+            pending
+                .into_iter()
+                .filter(|p| p.manifest_id == manifest.manifest_id)
+                .collect::<Vec<_>>()
+        };
+        assert!(ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap()).is_empty());
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+
+        backend.mark_manifest_index_pending(&lease).await.unwrap();
+        let pending = ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].submission, submission);
+        assert_eq!(pending[0].tenant.tenant_id(), tenant.tenant_id());
+        assert_eq!(
+            pending[0].resource_types,
+            vec!["Patient".to_string(), "Provenance".to_string()],
+            "the types come from what the manifest ingested"
+        );
+        assert!(
+            backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+
+        backend
+            .clear_manifest_index_pending(&tenant, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert!(ours(backend.list_manifests_awaiting_reindex(1000).await.unwrap()).is_empty());
+        assert!(
+            !backend
+                .submission_index_pending(&tenant, &submission)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_publication_exact_contract() {
         use helios_persistence::core::{

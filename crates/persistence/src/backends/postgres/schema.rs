@@ -54,6 +54,7 @@ pub async fn initialize_schema_with_patient_export_index(
 
     let result = async {
         run_migrations(client).await?;
+        ensure_bulk_manifest_index_pending(client).await?;
         if build_patient_export_index {
             ensure_patient_export_index(client).await
         } else {
@@ -4191,6 +4192,23 @@ async fn migrate_v46_to_v47(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| pg_error(format!("Migration v46->v47 failed: {e}")))?;
     Ok(())
+}
+
+/// `bulk_manifests.index_pending` (#1125 on PostgreSQL): set when a manifest
+/// was ingested with indexing deferred, cleared when its search-index rebuild
+/// finishes. Added idempotently at every startup rather than as a numbered
+/// migration: a nullable-free boolean with a constant default is a catalog-only
+/// change, and keeping it out of the version sequence leaves that sequence to
+/// the schema work running in parallel.
+async fn ensure_bulk_manifest_index_pending(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .await
+        .map_err(|e| pg_error(format!("add bulk_manifests.index_pending: {e}")))
 }
 
 const PATIENT_EXPORT_INDEX_NAME: &str = "idx_resources_patient_refs_v1";

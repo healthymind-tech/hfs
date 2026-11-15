@@ -1095,6 +1095,37 @@ where
             });
     }
 
+    // Written is not yet searchable: under deferred indexing every manifest
+    // owes a search-index rebuild that runs after it reaches its terminal
+    // state, and the 200 manifest would otherwise go out while queries still
+    // miss the submitted resources.
+    if !stopped
+        && cfg.status_waits_for_index
+        && jobs
+            .submission_index_pending(ctx, sub_id)
+            .await
+            .map_err(RestError::from)?
+    {
+        let entries: u64 = manifests.iter().map(|m| m.processed_entries).sum();
+        return Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .header(
+                "X-Progress",
+                format!(
+                    "Indexing - {} Resources written, search index rebuild in progress",
+                    group_thousands(entries)
+                ),
+            )
+            .header(
+                "Retry-After",
+                cfg.effective_pre_ingest_retry_after_secs().to_string(),
+            )
+            .body(Body::empty())
+            .map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            });
+    }
+
     // Build the status manifest from recorded artifacts.
     let transaction_time = jobs
         .ensure_transaction_time(ctx, sub_id)
