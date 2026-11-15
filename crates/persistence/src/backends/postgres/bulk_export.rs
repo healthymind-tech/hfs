@@ -1303,6 +1303,40 @@ impl ExportDataProvider for PostgresBackend {
     }
 }
 
+/// Appends the `(last_updated, id)` keyset predicate of an export page
+/// cursor (`<rfc3339>|<id>`, the form every PostgreSQL export path uses) and
+/// returns the next free parameter index. Walked with `idx_resources_search`
+/// `(tenant_id, resource_type, last_updated DESC, id)`.
+fn push_export_cursor(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    cursor: Option<&str>,
+    param_idx: usize,
+) -> usize {
+    if let Some((ts, id)) = cursor.and_then(|c| c.split_once('|')) {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+            sql.push_str(&format!(
+                " AND (last_updated, id) > (${}, ${})",
+                param_idx,
+                param_idx + 1
+            ));
+            params.push(Box::new(dt.with_timezone(&Utc)));
+            params.push(Box::new(id.to_string()));
+            return param_idx + 2;
+        }
+    }
+    param_idx
+}
+
+fn export_cursor(last_updated: &DateTime<Utc>, id: &str) -> String {
+    format!("{}|{}", last_updated.to_rfc3339(), id)
+}
+
+/// A patient set this large a share of the tenant's patients is exported by
+/// walking the type in `(last_updated, id)` order instead of through the
+/// patient-reference index (see `fetch_patient_compartment_batch`).
+const LARGE_PATIENT_SET_SHARE: usize = 20; // 1/20 = 5 %
+
 #[async_trait]
 impl PatientExportProvider for PostgresBackend {
     async fn list_patient_ids(
@@ -1389,50 +1423,30 @@ impl PatientExportProvider for PostgresBackend {
             .map(|id| format!("Patient/{id}"))
             .collect();
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
+        let selected: HashSet<&str> = patient_ids.iter().map(String::as_str).collect();
 
-        // Candidate selection reads the JSONB payload rather than search_index,
-        // which can be empty when search is offloaded. Materializing the GIN
-        // matches before applying the tenant, type and ordering predicates keeps
-        // PostgreSQL from choosing the chronological index and evaluating the
-        // JSON expression across the whole resources table. `matcher` still
-        // applies the exact compartment rules to each candidate.
         let client = self.get_client().await?;
-        let indexed_candidates =
-            self.has_patient_export_index() && !(is_patient && matcher.is_empty());
-        let mut sql = if indexed_candidates {
-            let refs_idx = if is_patient { 4 } else { 3 };
-            let mut sql = format!(
-                "WITH candidates AS MATERIALIZED (
-                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
-                     FROM resources
-                     WHERE is_deleted = FALSE
-                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
-            );
-            if is_patient {
-                // A Patient may be in its own compartment by ID even without a
-                // reference. Exclude rows already selected by the GIN branch so
-                // a self-referencing Patient cannot appear twice in the export.
-                sql.push_str(
-                    " UNION ALL
-                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
-                     FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2
-                       AND is_deleted = FALSE AND id = ANY($3::text[])
-                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
-                );
-            }
-            sql.push_str(
-                ") SELECT id, data, last_updated, version_id FROM candidates
-                   WHERE tenant_id = $1 AND resource_type = $2",
-            );
-            sql
-        } else {
-            "SELECT id, data, last_updated, version_id FROM resources
-             WHERE tenant_id = $1
-                AND resource_type = $2
-                AND is_deleted = FALSE"
-                .to_string()
-        };
+        let indexed = self.has_patient_export_index() && !(is_patient && matcher.is_empty());
+
+        // Three plans, all paging on `(last_updated, id)` like system export,
+        // all feeding the same exact compartment matcher below:
+        //
+        // * a small patient set goes through the patient-reference GIN index.
+        //   The candidates are materialized as keys only — never the
+        //   payloads — before the type, window and cursor predicates apply,
+        //   which keeps PostgreSQL from walking a whole type evaluating the
+        //   JSON expression; only the page's rows are then read in full.
+        // * a large set (a Group of a sizable share of the patients) walks the
+        //   type along `idx_resources_search`, like system export, and the
+        //   matcher tests each row. Its candidates are most of
+        //   the database, and re-materializing them for every page made each
+        //   page cost a full scan: a 14,000-patient Group hit the 30 s
+        //   statement timeout on its first page and the export failed.
+        // * a small set without the index (search offloaded) evaluates the
+        //   JSON predicate in the same ordered walk.
+        let large = self
+            .is_large_patient_set(&client, tenant_id, patient_ids.len())
+            .await?;
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1443,51 +1457,90 @@ impl PatientExportProvider for PostgresBackend {
                  WHERE split_part(r #>> '{{}}', '/_history/', 1) = ANY(${idx}::text[]))"
             )
         };
-        let next_idx = if indexed_candidates && is_patient {
-            params.push(Box::new(patient_ids.to_vec()));
-            params.push(Box::new(patient_ref_list));
-            5
-        } else if indexed_candidates {
-            params.push(Box::new(patient_ref_list));
-            4
-        } else if is_patient && matcher.is_empty() {
-            sql.push_str(" AND id = ANY($3::text[])");
-            params.push(Box::new(patient_ids.to_vec()));
-            4
-        } else if is_patient {
-            sql.push_str(&format!(
-                " AND (id = ANY($3::text[]) OR {})",
-                mentions_a_patient(4)
-            ));
-            params.push(Box::new(patient_ids.to_vec()));
-            params.push(Box::new(patient_ref_list));
-            5
-        } else {
-            sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
-            params.push(Box::new(patient_ref_list));
-            4
-        };
-        let param_idx = push_export_window(&mut sql, &mut params, request, next_idx);
-
-        if let Some(cursor) = cursor {
-            let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-            if parts.len() == 2 {
-                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
-                    sql.push_str(&format!(
-                        " AND (last_updated, id) > (${}, ${})",
-                        param_idx,
-                        param_idx + 1
-                    ));
-                    params.push(Box::new(dt.with_timezone(&Utc)));
-                    params.push(Box::new(parts[1].to_string()));
-                }
+        let sql = if indexed && !large {
+            let refs_idx = if is_patient { 4 } else { 3 };
+            let mut sql = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT tenant_id, resource_type, id, last_updated
+                     FROM resources
+                     WHERE is_deleted = FALSE
+                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
+            );
+            if is_patient {
+                // A Patient may be in its own compartment by ID even without a
+                // reference. Exclude rows already selected by the GIN branch so
+                // a self-referencing Patient cannot appear twice in the export.
+                sql.push_str(
+                    " UNION ALL
+                     SELECT tenant_id, resource_type, id, last_updated
+                     FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2
+                       AND is_deleted = FALSE AND id = ANY($3::text[])
+                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
+                );
+                params.push(Box::new(patient_ids.to_vec()));
             }
-        }
-
-        sql.push_str(&format!(
-            " ORDER BY last_updated, id LIMIT {}",
-            batch_size + 1
-        ));
+            params.push(Box::new(patient_ref_list));
+            sql.push_str(
+                "), page AS (
+                     SELECT id, last_updated FROM candidates WHERE tenant_id = $1 AND resource_type = $2",
+            );
+            let idx = push_export_window(&mut sql, &mut params, request, refs_idx + 1);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}
+                 )
+                 SELECT r.id, r.data, r.last_updated, r.version_id
+                 FROM page JOIN resources r
+                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = page.id
+                 ORDER BY page.last_updated, page.id",
+                batch_size + 1
+            ));
+            sql
+        } else if large {
+            // No reference predicate at all: overlapping each row's references
+            // with an array of thousands of patients costs PostgreSQL ~2 ms a
+            // row (the overlap is a nested loop), and nearly every row matches
+            // anyway. The matcher below, with a hash set, decides.
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
+                .to_string();
+            let idx = push_export_window(&mut sql, &mut params, request, 3);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
+            sql
+        } else {
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
+                .to_string();
+            let next_idx = if is_patient && matcher.is_empty() {
+                sql.push_str(" AND id = ANY($3::text[])");
+                params.push(Box::new(patient_ids.to_vec()));
+                4
+            } else if is_patient {
+                sql.push_str(&format!(
+                    " AND (id = ANY($3::text[]) OR {})",
+                    mentions_a_patient(4)
+                ));
+                params.push(Box::new(patient_ids.to_vec()));
+                params.push(Box::new(patient_ref_list));
+                5
+            } else {
+                sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
+                params.push(Box::new(patient_ref_list));
+                4
+            };
+            let idx = push_export_window(&mut sql, &mut params, request, next_idx);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
+            sql
+        };
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -1517,18 +1570,17 @@ impl PatientExportProvider for PostgresBackend {
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
             let version_id: String = row.get(3);
-            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
 
-            let in_compartment = (is_patient && patient_ids.contains(&id))
+            let in_compartment = (is_patient && selected.contains(id.as_str()))
                 || matcher.is_member(&resource, &patient_refs);
-            if !in_compartment {
-                continue;
+            if in_compartment {
+                // The blob carries no server meta; merge it from the row (#1273).
+                let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
+                let line = serde_json::to_string(&resource)
+                    .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
+                lines.push(line);
             }
-            // The blob carries no server meta; merge it from the row (#1273).
-            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
-            let line = serde_json::to_string(&resource)
-                .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
-            lines.push(line);
+            last_cursor = Some(export_cursor(&last_updated, &id));
         }
 
         Ok(NdjsonBatch {
@@ -1536,6 +1588,33 @@ impl PatientExportProvider for PostgresBackend {
             next_cursor: if has_more { last_cursor } else { None },
             is_last: !has_more,
         })
+    }
+}
+
+impl PostgresBackend {
+    /// Whether `n` patients are at least 1/[`LARGE_PATIENT_SET_SHARE`] of the
+    /// tenant's live patients. Counts at most `n * LARGE_PATIENT_SET_SHARE`
+    /// index entries, so a small set never pays for counting a big tenant.
+    async fn is_large_patient_set(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        n: usize,
+    ) -> StorageResult<bool> {
+        let probe = (n.saturating_mul(LARGE_PATIENT_SET_SHARE)).min(i64::MAX as usize) as i64;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM (
+                     SELECT 1 FROM resources
+                     WHERE tenant_id = $1 AND resource_type = 'Patient' AND is_deleted = FALSE
+                     LIMIT $2
+                 ) AS probe",
+                &[&tenant_id, &probe],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to size the patient set: {e}")))?;
+        let patients: i64 = row.get(0);
+        Ok(patients < probe)
     }
 }
 

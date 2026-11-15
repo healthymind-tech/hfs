@@ -1,5 +1,8 @@
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{ResourceStorage, SearchProvider};
+use std::collections::HashMap;
+
+use futures::StreamExt;
+use helios_persistence::core::{ResourceStorage, SearchProvider, SearchResult};
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchQuery, StoredResource};
 
@@ -59,11 +62,71 @@ async fn walk_segments<S>(
     mut pos: Position,
     target: usize,
     per_query: usize,
+    prefetch: bool,
     matches: &mut Vec<StoredResource>,
 ) -> RestResult<Step>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    // Segments the backend says cannot hold a member of this patient's
+    // compartment are skipped without a query. `None` walks them all.
+    let present = state
+        .storage()
+        .compartment_member_types(
+            tenant,
+            &format!("Patient/{patient_id}"),
+            &segment_members(version, segments, pos.seg.max(1)),
+        )
+        .await
+        .map_err(RestError::from)?;
+    // Unpaged, the first page of every segment still to walk is fetched up
+    // front, a few at a time, instead of one search after another; the walk
+    // below then consumes them in segment order. A prefetched page is used
+    // only where the sequential walk would have read the same rows — it fits
+    // under the target — so paging, the ceiling and the cursor are unchanged.
+    let mut prefetched: HashMap<usize, SearchResult> = HashMap::new();
+    if prefetch {
+        let first = pos.seg.max(1);
+        let pending: Vec<usize> = (first..segments.len())
+            .filter(|&i| !(i == pos.seg && pos.inner.is_some()))
+            .filter(|&i| {
+                present
+                    .as_ref()
+                    .is_none_or(|types| types.contains(&segments[i]))
+            })
+            .collect();
+        let count = target.min(per_query).max(1) as u32;
+        let queries: Vec<(usize, SearchQuery)> = {
+            let reg = state.storage().search_param_registry(tenant);
+            let registry = reg.read();
+            pending
+                .into_iter()
+                .map(|i| {
+                    (
+                        i,
+                        build_segment_query(
+                            &registry,
+                            version,
+                            &segments[i],
+                            patient_id,
+                            params,
+                            count,
+                            None,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        let mut pages =
+            futures::stream::iter(queries.into_iter().map(|(i, q)| async move {
+                state.storage().search(tenant, &q).await.map(|r| (i, r))
+            }))
+            .buffer_unordered(PREFETCH_CONCURRENCY);
+        while let Some(page) = pages.next().await {
+            let (i, result) = page.map_err(RestError::from)?;
+            prefetched.insert(i, result);
+        }
+    }
     if pos.seg == 0 {
         let patient = state
             .storage()
@@ -81,28 +144,41 @@ where
     }
 
     while pos.seg < segments.len() {
+        if pos.inner.is_none()
+            && present
+                .as_ref()
+                .is_some_and(|types| !types.contains(&segments[pos.seg]))
+        {
+            pos = Position {
+                seg: pos.seg + 1,
+                inner: None,
+            };
+            continue;
+        }
         if matches.len() >= target {
             return Ok(Step::Paused(pos));
         }
-        let remaining = (target - matches.len()).min(per_query).max(1) as u32;
-        let query: SearchQuery = {
-            let reg = state.storage().search_param_registry(tenant);
-            let registry = reg.read();
-            build_segment_query(
-                &registry,
+        let usable = pos.inner.is_none()
+            && prefetched
+                .get(&pos.seg)
+                .is_some_and(|r| matches.len() + r.resources.items.len() <= target);
+        let result = if usable {
+            prefetched.remove(&pos.seg).expect("checked above")
+        } else {
+            segment_page(
+                state,
+                tenant,
                 version,
-                &segments[pos.seg],
                 patient_id,
                 params,
-                remaining,
-                pos.inner.take(),
+                segments,
+                &mut pos,
+                target,
+                per_query,
+                matches.len(),
             )
+            .await?
         };
-        let result = state
-            .storage()
-            .search(tenant, &query)
-            .await
-            .map_err(RestError::from)?;
         let (items, page_info) = (result.resources.items, result.resources.page_info);
         let has_next = page_info.has_next;
         let next_cursor = page_info.next_cursor;
@@ -123,6 +199,69 @@ where
         }
     }
     Ok(Step::Done)
+}
+
+/// Segment first pages fetched at once by an unpaged walk.
+const PREFETCH_CONCURRENCY: usize = 8;
+
+/// One page of segment `pos.seg`, from `pos.inner`, sized to what is left of
+/// `target` (and at most `per_query`). Takes the inner cursor out of `pos`.
+#[allow(clippy::too_many_arguments)]
+async fn segment_page<S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    version: FhirVersion,
+    patient_id: &str,
+    params: &EverythingParams,
+    segments: &[String],
+    pos: &mut Position,
+    target: usize,
+    per_query: usize,
+    have: usize,
+) -> RestResult<SearchResult>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    let remaining = (target - have).min(per_query).max(1) as u32;
+    let query: SearchQuery = {
+        let reg = state.storage().search_param_registry(tenant);
+        let registry = reg.read();
+        build_segment_query(
+            &registry,
+            version,
+            &segments[pos.seg],
+            patient_id,
+            params,
+            remaining,
+            pos.inner.take(),
+        )
+    };
+    state
+        .storage()
+        .search(tenant, &query)
+        .await
+        .map_err(RestError::from)
+}
+
+/// `(type, compartment params)` for the member segments from `from` on.
+fn segment_members(
+    version: FhirVersion,
+    segments: &[String],
+    from: usize,
+) -> Vec<(String, Vec<String>)> {
+    segments
+        .iter()
+        .skip(from)
+        .map(|t| {
+            (
+                t.clone(),
+                helios_fhir::get_compartment_params(version, "Patient", t)
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// Resolves the supporting resources referenced by `matches`, stopping after
@@ -199,6 +338,7 @@ where
         pos,
         limits.target(),
         limits.per_query,
+        limits.page.is_none(),
         &mut matches,
     )
     .await?;
@@ -295,6 +435,7 @@ where
             pos,
             target,
             limits.per_query,
+            limits.page.is_none(),
             &mut matches,
         )
         .await?

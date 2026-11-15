@@ -884,6 +884,54 @@ impl SearchProvider for PostgresBackend {
         self.search_with_client(&client, tenant, query, total).await
     }
 
+    /// One statement answers for every candidate type: an index probe per
+    /// type that stops at its first `search_index` row referencing the
+    /// compartment through any of the candidates' parameters. Matching on the
+    /// union of all parameter names can only add types (a superset is allowed),
+    /// and the rows are the same ones the compartment search reads, so a type
+    /// it would find is never left out. A database whose search is offloaded
+    /// holds no such rows and answers `None`.
+    async fn compartment_member_types(
+        &self,
+        tenant: &TenantContext,
+        compartment_ref: &str,
+        members: &[(String, Vec<String>)],
+    ) -> StorageResult<Option<HashSet<String>>> {
+        if self.is_search_offloaded() {
+            return Ok(None);
+        }
+        if members.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let types: Vec<String> = members.iter().map(|(t, _)| t.clone()).collect();
+        let mut params: Vec<String> = members
+            .iter()
+            .flat_map(|(_, p)| p.iter().cloned())
+            .collect();
+        params.sort();
+        params.dedup();
+        let reference = compartment_ref
+            .split("/_history/")
+            .next()
+            .unwrap_or(compartment_ref)
+            .to_string();
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT t.resource_type FROM unnest($2::text[]) AS t(resource_type)
+                 WHERE EXISTS (
+                     SELECT 1 FROM search_index si
+                     WHERE si.tenant_id = $1 AND si.resource_type = t.resource_type
+                       AND si.param_name = ANY($3::text[]) AND si.value_reference = $4
+                 )",
+                &[&tenant_id, &types, &params, &reference],
+            )
+            .await
+            .or_query_error("Failed to find compartment member types")?;
+        Ok(Some(rows.iter().map(|row| row.get(0)).collect()))
+    }
+
     async fn search_ids(
         &self,
         tenant: &TenantContext,
