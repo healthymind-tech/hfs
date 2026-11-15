@@ -30881,7 +30881,6 @@ mod postgres_integration {
 
     use crate::cluster_harness as harness;
     use helios_persistence::core::bulk_export::{ExportJobId, ExportProgress};
-    use helios_persistence::error::BulkExportError;
 
     /// Maps `get_export_status` to the harness's `Option` shape: a job that
     /// doesn't exist *for this tenant* is `None`; any other error is a bug.
@@ -30904,7 +30903,7 @@ mod postgres_integration {
     async fn drain_export_queue(backend: &PostgresBackend) {
         let reaper = WorkerId::new(format!("cluster-drain-{}", uuid::Uuid::new_v4()));
         while let Some(lease) = backend
-            .claim_next(&reaper, StdDuration::from_secs(60))
+            .claim_next(&reaper, StdDuration::from_secs(60), u32::MAX)
             .await
             .unwrap()
         {
@@ -30969,12 +30968,12 @@ mod postgres_integration {
         let (a, b) = (handles.a, handles.b);
         let (lease_a, lease_b) = harness::race2(
             async move {
-                a.claim_next(&worker_a, StdDuration::from_secs(60))
+                a.claim_next(&worker_a, StdDuration::from_secs(60), u32::MAX)
                     .await
                     .unwrap()
             },
             async move {
-                b.claim_next(&worker_b, StdDuration::from_secs(60))
+                b.claim_next(&worker_b, StdDuration::from_secs(60), u32::MAX)
                     .await
                     .unwrap()
             },
