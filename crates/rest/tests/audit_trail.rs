@@ -173,7 +173,7 @@ fn entity_refs(e: &Value) -> Vec<String> {
         .collect()
 }
 
-fn find<'a>(events: &'a [Value], pred: impl Fn(&Value) -> bool) -> &'a Value {
+fn find(events: &[Value], pred: impl Fn(&Value) -> bool) -> &Value {
     events
         .iter()
         .find(|e| pred(e))

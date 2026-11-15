@@ -88,6 +88,8 @@ Protection:
   recursion.
 - `HFS_AUDIT_TENANT=<tenant>` puts **all** events into one tenant instead
   (e.g. a dedicated `audit` tenant that only auditors' tokens can address).
+  A reserved id (`__system__`) makes the trail unreachable through the API —
+  the pre-P3 behaviour; only do that with an external reader.
 
 ## Writing path, overhead and durability
 

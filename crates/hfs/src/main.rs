@@ -596,6 +596,7 @@ where
     }
 }
 
+#[cfg(any(feature = "mongodb", feature = "s3"))]
 struct HfsAuditStorageAdapter {
     storage: Arc<dyn ResourceStorage>,
     /// `HFS_AUDIT_TENANT`: every event goes to this tenant.
@@ -604,6 +605,7 @@ struct HfsAuditStorageAdapter {
     default_tenant: String,
 }
 
+#[cfg(any(feature = "mongodb", feature = "s3"))]
 impl HfsAuditStorageAdapter {
     fn new(
         storage: Arc<dyn ResourceStorage>,
@@ -629,6 +631,7 @@ impl HfsAuditStorageAdapter {
     }
 }
 
+#[cfg(any(feature = "mongodb", feature = "s3"))]
 #[async_trait::async_trait]
 impl helios_audit::sinks::database::AuditStorage for HfsAuditStorageAdapter {
     async fn create_resource(
