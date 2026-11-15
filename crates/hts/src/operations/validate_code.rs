@@ -3436,7 +3436,7 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match dispatch_tx!(state, params, process_validate_code) {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => match invalid_display_language_response(&e) {
             Some(resp) => Ok(resp),
             None => Err(e),
@@ -3456,12 +3456,33 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => match invalid_display_language_response(&e) {
             Some(resp) => Ok(resp),
             None => Err(e),
         },
     }
+}
+
+/// Moves the `result` parameter to the front of a `$validate-code` response.
+///
+/// Parameter order carries no meaning in FHIR, but widely deployed clients
+/// read the answer positionally: the cqf CQL engine's
+/// `R4FhirTerminologyProvider.in()` (HAPI/cqf-ruler, cql-workbench) takes
+/// `parameter[0]` as the boolean. The spec's examples and tx.fhir.org put
+/// `result` first; the HL7 tx-ecosystem runner sorts parameters before
+/// comparing, so the order elsewhere is unchanged.
+pub(crate) fn result_first(mut response: Value) -> Value {
+    if let Some(params) = response.get_mut("parameter").and_then(Value::as_array_mut) {
+        if let Some(i) = params
+            .iter()
+            .position(|p| p.get("name").and_then(Value::as_str) == Some("result"))
+        {
+            let result = params.remove(i);
+            params.insert(0, result);
+        }
+    }
+    response
 }
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
@@ -7381,7 +7402,7 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match dispatch_tx!(state, params, process_vs_validate_code) {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => {
             if let Some(resp) = invalid_display_language_response(&e) {
                 return Ok(resp);
@@ -7406,7 +7427,7 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_vs_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => {
             if let Some(resp) = invalid_display_language_response(&e) {
                 return Ok(resp);
@@ -7453,7 +7474,7 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     let mut params = inject_url(raw_params, url);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        dispatch_tx!(state, params, process_vs_validate_code)?,
+        result_first(dispatch_tx!(state, params, process_vs_validate_code)?),
         format,
     ))
 }
@@ -7477,7 +7498,7 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
     let mut params = inject_url(params, url);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        result_first(process_vs_validate_code(&state, params).await?),
         format,
     ))
 }

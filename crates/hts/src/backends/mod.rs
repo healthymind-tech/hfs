@@ -188,6 +188,23 @@ static CM_ORDER_BY_CONCEPT_MAPS: LazyLock<String> =
 
 /// `expansion.contains` entries built straight from `compose.include.concept[]`
 /// (code + embedded display), skipping codes already in `skip`.
+/// Extension HTS puts on the includes it derives from a stored `expansion`
+/// (a ValueSet published without `compose`, see
+/// `import::bundle_parser::compose_from_expansion`). Such an include lists
+/// the ValueSet's members as published: its codes are kept as listed even
+/// when the loaded CodeSystem (another edition or version) lacks them.
+pub const STORED_EXPANSION_INCLUDE_EXT: &str =
+    "http://helios-software.com/fhir/StructureDefinition/hts-include-from-stored-expansion";
+
+/// Whether `include` was derived from a stored expansion (see
+/// [`STORED_EXPANSION_INCLUDE_EXT`]).
+pub(crate) fn include_is_stored_expansion(include: &serde_json::Value) -> bool {
+    include["extension"].as_array().is_some_and(|exts| {
+        exts.iter()
+            .any(|e| e["url"].as_str() == Some(STORED_EXPANSION_INCLUDE_EXT))
+    })
+}
+
 pub(crate) fn enumerated_from_compose(
     system_url: &str,
     version: Option<&str>,

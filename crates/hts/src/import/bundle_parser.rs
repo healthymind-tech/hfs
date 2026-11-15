@@ -743,11 +743,14 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let compose_json = vs["compose"].as_object().map(|_| {
-        let mut compose = vs["compose"].clone();
-        strip_advisory_versions(&mut compose);
-        serde_json::to_string(&compose).unwrap_or_default()
-    });
+    let compose_json = vs["compose"]
+        .as_object()
+        .map(|_| {
+            let mut compose = vs["compose"].clone();
+            strip_advisory_versions(&mut compose);
+            serde_json::to_string(&compose).unwrap_or_default()
+        })
+        .or_else(|| compose_from_expansion(vs).map(|c| c.to_string()));
 
     Some(ParsedValueSet {
         id,
@@ -760,6 +763,56 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         resource_json: vs.clone(),
         authority_rank: AUTHORITY_UNKNOWN,
     })
+}
+
+/// The membership of a ValueSet published with only an `expansion` (VSAC /
+/// eCQM content, cqf-tooling output) as an enumerated compose: one include
+/// per system, in expansion order, nested `contains` flattened, abstract
+/// groupers left out. The expansion's code system versions are not pinned:
+/// the stored expansion already names its members, and pinning e.g. a SNOMED
+/// US edition or LOINC 2.72 would make the ValueSet unexpandable on a server
+/// that loaded other editions. `None` when there is no expansion to use.
+fn compose_from_expansion(vs: &Value) -> Option<Value> {
+    fn collect(contains: &[Value], includes: &mut Vec<(String, Vec<Value>)>) {
+        for c in contains {
+            if let (Some(system), Some(code)) = (c["system"].as_str(), c["code"].as_str()) {
+                if c["abstract"].as_bool() != Some(true) {
+                    let mut concept = serde_json::json!({ "code": code });
+                    if let Some(display) = c["display"].as_str() {
+                        concept["display"] = Value::String(display.to_owned());
+                    }
+                    match includes.iter_mut().find(|(s, _)| s == system) {
+                        Some((_, concepts)) => concepts.push(concept),
+                        None => includes.push((system.to_owned(), vec![concept])),
+                    }
+                }
+            }
+            if let Some(nested) = c["contains"].as_array() {
+                collect(nested, includes);
+            }
+        }
+    }
+    let contains = vs["expansion"]["contains"].as_array()?;
+    let mut includes: Vec<(String, Vec<Value>)> = Vec::new();
+    collect(contains, &mut includes);
+    if includes.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "include": includes
+            .into_iter()
+            .map(|(system, concept)| {
+                serde_json::json!({
+                    "extension": [{
+                        "url": crate::backends::STORED_EXPANSION_INCLUDE_EXT,
+                        "valueBoolean": true
+                    }],
+                    "system": system,
+                    "concept": concept
+                })
+            })
+            .collect::<Vec<_>>()
+    }))
 }
 
 // ── ConceptMap parsing ────────────────────────────────────────────────────────
@@ -1029,6 +1082,67 @@ mod tests {
         let compose: serde_json::Value =
             serde_json::from_str(vs.compose_json.as_ref().unwrap()).unwrap();
         assert!(compose["include"].is_array());
+    }
+
+    /// VSAC-style ValueSets (the eCQM content, cqf tooling output) carry
+    /// only an `expansion` — no `compose`. Their membership is that stored
+    /// expansion; without a compose it used to expand to nothing, so a CQL
+    /// retrieve `[Condition: "Diabetes"]` (via HFS `code:in`) found nothing.
+    #[test]
+    fn value_set_expansion_only_derives_enumerated_compose() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113883.3.464.1003.103.12.1001",
+            "version": "20190315",
+            "expansion": {
+                "timestamp": "2019-03-15T00:00:00Z",
+                "contains": [
+                    {"system": "http://hl7.org/fhir/sid/icd-10-cm", "version": "2019",
+                     "code": "E11.9", "display": "Type 2 diabetes mellitus without complications"},
+                    {"system": "http://snomed.info/sct",
+                     "version": "http://snomed.info/sct/731000124108/version/20190301",
+                     "code": "44054006", "display": "Diabetes mellitus type 2"},
+                    {"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "E10", "abstract": true,
+                     "contains": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "E10.9"}]}
+                ]
+            }
+        });
+        let parsed = parse_value_set_value(&vs).unwrap();
+        let compose: Value = serde_json::from_str(parsed.compose_json.as_deref().unwrap()).unwrap();
+        let includes = compose["include"].as_array().unwrap();
+        assert_eq!(includes.len(), 2, "one include per system: {compose}");
+        let icd = includes
+            .iter()
+            .find(|i| i["system"] == "http://hl7.org/fhir/sid/icd-10-cm")
+            .unwrap();
+        let codes: Vec<&str> = icd["concept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["code"].as_str().unwrap())
+            .collect();
+        // nested contains flattened; the abstract grouper is not a member
+        assert_eq!(codes, vec!["E11.9", "E10.9"]);
+        // the expansion's code system versions are not pinned: the stored
+        // expansion already names its members, whatever editions are loaded
+        assert!(includes.iter().all(|i| i.get("version").is_none()));
+        assert_eq!(icd["concept"][0]["display"], "Type 2 diabetes mellitus without complications");
+        // the stored resource itself is untouched
+        assert!(parsed.resource_json.get("compose").is_none());
+    }
+
+    /// A ValueSet with a compose keeps it, even when it also has an expansion.
+    #[test]
+    fn value_set_compose_wins_over_expansion() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet", "url": "http://example.org/vs",
+            "compose": {"include": [{"system": "http://example.org/cs", "concept": [{"code": "A"}]}]},
+            "expansion": {"contains": [{"system": "http://example.org/cs", "code": "B"}]}
+        });
+        let parsed = parse_value_set_value(&vs).unwrap();
+        assert!(parsed.compose_json.unwrap().contains("\"A\""));
+        let empty = serde_json::json!({"resourceType": "ValueSet", "url": "http://example.org/e"});
+        assert!(parse_value_set_value(&empty).unwrap().compose_json.is_none());
     }
 
     #[test]
