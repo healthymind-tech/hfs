@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::fhir_model::AuditEvent;
 use crate::sink::{AuditRecord, AuditSink};
+use helios_observability::audit_metrics as m;
 
 /// Tuning of a [`QueuedSink`].
 #[derive(Debug, Clone)]
@@ -106,9 +107,13 @@ impl QueuedSink {
                         batch
                     };
                     let n = batch.len() as u64;
+                    let started = Instant::now();
                     inner.record_records(batch).await;
+                    m::observe_batch_write(started.elapsed());
+                    m::record_written(n);
                     stats.written.fetch_add(n, Ordering::Relaxed);
-                    pending.fetch_sub(n, Ordering::AcqRel);
+                    let left = pending.fetch_sub(n, Ordering::AcqRel) - n;
+                    m::set_queue_depth(left);
                 }
             });
         }
@@ -156,6 +161,7 @@ impl QueuedSink {
                 "Audit queue did not drain before the flush timeout and no spill file is \
                  configured; queued events are lost"
             );
+            m::record_dropped(n, m::DropReason::NoFallback);
             self.pending.fetch_sub(n, Ordering::AcqRel);
             return;
         };
@@ -179,6 +185,7 @@ impl QueuedSink {
         match append(path, buf.as_bytes()).await {
             Ok(()) => {
                 self.stats.spilled.fetch_add(n, Ordering::Relaxed);
+                m::record_spilled(n, m::SpillReason::Shutdown);
                 tracing::warn!(
                     spilled = n,
                     file = %path.display(),
@@ -186,14 +193,18 @@ impl QueuedSink {
                      written to the spill file and are replayed at the next start"
                 );
             }
-            Err(e) => tracing::error!(
+            Err(e) => {
+                m::record_dropped(n, m::DropReason::FallbackFailed);
+                tracing::error!(
                 lost = n,
                 error = %e,
                 file = %path.display(),
                 "Audit queue did not drain and the spill file could not be written; queued events are lost"
-            ),
+                );
+            }
         }
-        self.pending.fetch_sub(n, Ordering::AcqRel);
+        let left = self.pending.fetch_sub(n, Ordering::AcqRel) - n;
+        m::set_queue_depth(left);
     }
 }
 
@@ -224,12 +235,15 @@ impl AuditSink for QueuedSink {
             tenant: tenant.map(str::to_string),
             event,
         };
-        self.pending.fetch_add(1, Ordering::AcqRel);
+        let depth = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
         self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+        m::record_enqueued(1);
+        m::set_queue_depth(depth);
         let record = match self.tx.try_send(record) {
             Ok(()) => return,
             Err(mpsc::error::TrySendError::Full(r)) => {
                 self.stats.waited_for_room.fetch_add(1, Ordering::Relaxed);
+                m::record_queue_full_wait();
                 r
             }
             Err(mpsc::error::TrySendError::Closed(r)) => r,
@@ -238,6 +252,7 @@ impl AuditSink for QueuedSink {
             // No worker left (runtime shutting down): write it ourselves.
             self.inner.record_records(vec![r]).await;
             self.stats.written.fetch_add(1, Ordering::Relaxed);
+            m::record_written(1);
             self.pending.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -404,5 +419,41 @@ mod tests {
         assert_eq!(lines[0]["tenant"], "t");
         assert_eq!(lines[0]["resource"]["resourceType"], "AuditEvent");
         assert_eq!(sink.stats().spilled.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn the_write_path_is_visible_in_prometheus_metrics() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            // Current-thread runtime: the writer tasks record on this thread.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let inner = Arc::new(Slow::default());
+                let sink = QueuedSink::new(Arc::clone(&inner) as _, QueueConfig::default());
+                for _ in 0..3 {
+                    sink.record(AuditEventBuilder::new("Device/hfs").build())
+                        .await;
+                }
+                sink.flush().await;
+            });
+        });
+        let text = handle.render();
+        let value = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(name) && !l.starts_with(&format!("{name}_")))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse::<f64>().ok())
+        };
+        assert_eq!(value("audit_events_enqueued_total"), Some(3.0), "{text}");
+        assert_eq!(value("audit_events_written_total"), Some(3.0), "{text}");
+        assert_eq!(value("audit_queue_depth"), Some(0.0), "{text}");
+        assert!(
+            text.contains("audit_batch_write_duration_seconds"),
+            "{text}"
+        );
     }
 }

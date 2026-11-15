@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 
 use crate::sink::AuditSink;
+use helios_observability::audit_metrics as m;
 
 /// Trait for the subset of storage operations the database sink needs.
 ///
@@ -124,19 +125,26 @@ impl DatabaseSink {
                 let line = serde_json::json!({ "tenant": tenant, "resource": value });
                 let _guard = self.fallback_lock.lock().await;
                 match append_line(path, &line.to_string()).await {
-                    Ok(()) => tracing::error!(
+                    Ok(()) => {
+                        m::record_spilled(1, m::SpillReason::WriteFailure);
+                        tracing::error!(
                         error = %last_error,
                         fallback = %path.display(),
                         "Failed to persist audit event to database; spilled to fallback file"
-                    ),
-                    Err(fe) => tracing::error!(
+                        )
+                    }
+                    Err(fe) => {
+                        m::record_dropped(1, m::DropReason::FallbackFailed);
+                        tracing::error!(
                         error = %last_error,
                         fallback_error = %fe,
                         "Failed to persist audit event to database and to the fallback file; event lost"
-                    ),
+                        )
+                    }
                 }
             }
             None => {
+                m::record_dropped(1, m::DropReason::NoFallback);
                 tracing::error!(error = %last_error, "Failed to persist audit event to database; event lost")
             }
         }
@@ -169,6 +177,7 @@ impl DatabaseSink {
                 replayed += 1;
             }
         }
+        m::record_replayed(replayed as u64);
         Ok(replayed)
     }
 }
@@ -211,6 +220,7 @@ impl AuditSink for DatabaseSink {
         let value = match to_resource(&event) {
             Ok(v) => v,
             Err(e) => {
+                m::record_dropped(1, m::DropReason::Serialization);
                 tracing::error!(error = %e, "Failed to serialize audit event to JSON Value");
                 return;
             }
@@ -227,6 +237,7 @@ impl AuditSink for DatabaseSink {
             let value = match to_resource(&r.event) {
                 Ok(v) => v,
                 Err(e) => {
+                    m::record_dropped(1, m::DropReason::Serialization);
                     tracing::error!(error = %e, "Failed to serialize audit event to JSON Value");
                     continue;
                 }
