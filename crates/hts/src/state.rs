@@ -265,6 +265,9 @@ pub struct AppState<B: TerminologyBackend> {
 
     /// `$closure` tables by name (see [`crate::operations::closure`]).
     pub closure_tables: crate::operations::closure::ClosureTables,
+
+    /// The FHIR `AuditEvent` trail (`HTS_AUDIT_*`), when enabled.
+    pub audit: Option<crate::audit::HtsAudit>,
 }
 
 impl<B: TerminologyBackend> AppState<B> {
@@ -294,7 +297,14 @@ impl<B: TerminologyBackend> AppState<B> {
             is_tx_overlay: false,
             auto_supplements_skip: Arc::new(HashSet::new()),
             closure_tables: Default::default(),
+            audit: None,
         }
+    }
+
+    /// Record terminology requests and admin actions as `AuditEvent`s.
+    pub fn with_audit(mut self, audit: Option<crate::audit::HtsAudit>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Evict all cached `$expand` results and negative-cache entries, plus the

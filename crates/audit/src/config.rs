@@ -95,6 +95,10 @@ pub struct AuditConfig {
     pub auth_events: bool,
     /// Retention policy (`HFS_AUDIT_RETENTION_*`).
     pub retention: RetentionConfig,
+    /// Audit read-only requests too (`<prefix>_AUDIT_READS`; default `true`
+    /// on HFS, `false` on HTS). When off, `GET`/`HEAD` and read-only
+    /// operations are not recorded.
+    pub reads: bool,
 }
 
 /// How long stored audit events are kept (database backend).
@@ -113,15 +117,16 @@ pub struct RetentionConfig {
 }
 
 impl RetentionConfig {
-    fn from_env() -> Self {
+    fn from_env(prefix: &str) -> Self {
+        let k = |name: &str| format!("{prefix}_AUDIT_{name}");
         Self {
-            days: env::var("HFS_AUDIT_RETENTION_DAYS")
+            days: env::var(k("RETENTION_DAYS"))
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .filter(|d| *d > 0),
-            interval_hours: env_parse("HFS_AUDIT_RETENTION_INTERVAL_HOURS", 24u64).max(1),
-            batch: env_parse("HFS_AUDIT_RETENTION_BATCH", 1000usize).max(1),
-            archive_dir: env::var("HFS_AUDIT_RETENTION_ARCHIVE_DIR")
+            interval_hours: env_parse(&k("RETENTION_INTERVAL_HOURS"), 24u64).max(1),
+            batch: env_parse(&k("RETENTION_BATCH"), 1000usize).max(1),
+            archive_dir: env::var(k("RETENTION_ARCHIVE_DIR"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
         }
@@ -149,7 +154,17 @@ fn env_bool(key: &str) -> bool {
 impl AuditConfig {
     /// Load configuration from `HFS_AUDIT_*` environment variables.
     pub fn from_env() -> Self {
-        let backend = match env::var("HFS_AUDIT_BACKEND")
+        Self::from_env_prefixed("HFS")
+    }
+
+    /// Load configuration from `<prefix>_AUDIT_*` environment variables
+    /// (`HFS`, `HTS`). Defaults differ by server: the observer is
+    /// `Device/<prefix lowercase>`, and reads are audited by default only on
+    /// HFS (patient data) — HTS reads (`$expand`, `$lookup`, ...) are
+    /// high-volume and carry no patient data.
+    pub fn from_env_prefixed(prefix: &str) -> Self {
+        let k = |name: &str| format!("{prefix}_AUDIT_{name}");
+        let backend = match env::var(k("BACKEND"))
             .unwrap_or_else(|_| "none".to_string())
             .to_lowercase()
             .as_str()
@@ -160,7 +175,7 @@ impl AuditConfig {
             _ => AuditBackend::None,
         };
 
-        let exclusions = env::var("HFS_AUDIT_EXCLUDE_PATHS")
+        let exclusions = env::var(k("EXCLUDE_PATHS"))
             .ok()
             .map(|paths| {
                 paths
@@ -173,36 +188,45 @@ impl AuditConfig {
 
         Self {
             backend,
-            file_path: env::var("HFS_AUDIT_FILE_PATH").ok(),
-            database_url: env::var("HFS_AUDIT_DATABASE_URL").ok(),
-            mongodb_database: env::var("HFS_AUDIT_MONGODB_DATABASE").ok(),
-            s3_bucket: env::var("HFS_AUDIT_S3_BUCKET").ok(),
-            s3_prefix: env::var("HFS_AUDIT_S3_PREFIX").ok(),
-            s3_region: env::var("HFS_AUDIT_S3_REGION").ok(),
-            s3_validate_buckets: env::var("HFS_AUDIT_S3_VALIDATE_BUCKETS").ok().map(|v| {
+            file_path: env::var(k("FILE_PATH")).ok(),
+            database_url: env::var(k("DATABASE_URL")).ok(),
+            mongodb_database: env::var(k("MONGODB_DATABASE")).ok(),
+            s3_bucket: env::var(k("S3_BUCKET")).ok(),
+            s3_prefix: env::var(k("S3_PREFIX")).ok(),
+            s3_region: env::var(k("S3_REGION")).ok(),
+            s3_validate_buckets: env::var(k("S3_VALIDATE_BUCKETS")).ok().map(|v| {
                 let normalized = v.trim().to_ascii_lowercase();
                 !(normalized == "false" || normalized == "0")
             }),
             exclusions,
-            source_observer: env::var("HFS_AUDIT_SOURCE_OBSERVER")
-                .unwrap_or_else(|_| "Device/hfs".to_string()),
-            cloudwatch_log_group: env::var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP").ok(),
-            cloudwatch_log_stream: env::var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM").ok(),
-            cloudwatch_region: env::var("HFS_AUDIT_CLOUDWATCH_REGION").ok(),
-            trust_forwarded_for: env_bool("HFS_AUDIT_TRUST_FORWARDED_FOR"),
-            tenant: env::var("HFS_AUDIT_TENANT")
+            source_observer: env::var(k("SOURCE_OBSERVER"))
+                .unwrap_or_else(|_| format!("Device/{}", prefix.to_ascii_lowercase())),
+            cloudwatch_log_group: env::var(k("CLOUDWATCH_LOG_GROUP")).ok(),
+            cloudwatch_log_stream: env::var(k("CLOUDWATCH_LOG_STREAM")).ok(),
+            cloudwatch_region: env::var(k("CLOUDWATCH_REGION")).ok(),
+            trust_forwarded_for: env_bool(&k("TRUST_FORWARDED_FOR")),
+            tenant: env::var(k("TENANT"))
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
-            queue_capacity: env_parse("HFS_AUDIT_QUEUE_CAPACITY", 10_000usize).max(1),
-            batch_size: env_parse("HFS_AUDIT_BATCH_SIZE", 64usize).max(1),
-            writers: env_parse("HFS_AUDIT_WRITERS", 4usize).max(1),
-            shutdown_timeout_secs: env_parse("HFS_AUDIT_SHUTDOWN_TIMEOUT", 5u64),
-            fallback_file: env::var("HFS_AUDIT_FALLBACK_FILE")
+            queue_capacity: env_parse(&k("QUEUE_CAPACITY"), 10_000usize).max(1),
+            batch_size: env_parse(&k("BATCH_SIZE"), 64usize).max(1),
+            writers: env_parse(&k("WRITERS"), 4usize).max(1),
+            shutdown_timeout_secs: env_parse(&k("SHUTDOWN_TIMEOUT"), 5u64),
+            fallback_file: env::var(k("FALLBACK_FILE"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
-            auth_events: env_bool("HFS_AUDIT_AUTH_EVENTS"),
-            retention: RetentionConfig::from_env(),
+            auth_events: env_bool(&k("AUTH_EVENTS")),
+            retention: RetentionConfig::from_env(prefix),
+            reads: env::var(k("READS"))
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(prefix == "HFS"),
         }
     }
 
@@ -242,6 +266,7 @@ impl Default for AuditConfig {
             shutdown_timeout_secs: 5,
             fallback_file: None,
             auth_events: false,
+            reads: true,
             retention: RetentionConfig {
                 days: None,
                 interval_hours: 24,
@@ -286,6 +311,10 @@ mod tests {
         "HFS_AUDIT_RETENTION_BATCH",
         "HFS_AUDIT_RETENTION_ARCHIVE_DIR",
         "HFS_AUDIT_EXCLUDE_PATHS",
+        "HFS_AUDIT_READS",
+        "HTS_AUDIT_BACKEND",
+        "HTS_AUDIT_READS",
+        "HTS_AUDIT_SOURCE_OBSERVER",
     ];
 
     fn clear_audit_env() {
@@ -419,6 +448,27 @@ mod tests {
         assert_eq!(c.exclusions.len(), 2);
         assert_eq!(c.exclusions[1].method.as_deref(), Some("GET"));
         assert_eq!(c.exclusions[1].path, "/Basic/*");
+        clear_audit_env();
+    }
+
+    #[test]
+    fn test_hts_prefix_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
+        unsafe {
+            env::set_var("HTS_AUDIT_BACKEND", "database");
+        }
+        let hts = AuditConfig::from_env_prefixed("HTS");
+        assert_eq!(hts.backend, AuditBackend::Database);
+        assert_eq!(hts.source_observer, "Device/hts");
+        assert!(!hts.reads, "HTS reads are off by default");
+        let hfs = AuditConfig::from_env();
+        assert_eq!(hfs.backend, AuditBackend::None, "prefixes do not leak");
+        assert!(hfs.reads, "HFS reads are on by default");
+        unsafe {
+            env::set_var("HTS_AUDIT_READS", "true");
+        }
+        assert!(AuditConfig::from_env_prefixed("HTS").reads);
         clear_audit_env();
     }
 

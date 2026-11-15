@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::RetentionStorage;
 use chrono::{DateTime, Utc};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use helios_audit::{AuditAction, AuditEventBuilder, AuditSink, RetentionConfig};
-use helios_persistence::core::RetentionStorage;
 use tracing::{error, info, warn};
 
 const RESOURCE_TYPE: &str = "AuditEvent";
@@ -27,7 +27,9 @@ const RESOURCE_TYPE: &str = "AuditEvent";
 /// Outcome of one retention run.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetentionReport {
+    /// Events removed.
     pub purged: u64,
+    /// The archive written by the run, if any.
     pub archive: Option<PathBuf>,
 }
 
@@ -75,7 +77,7 @@ pub async fn run_once(
     store: &dyn RetentionStorage,
     config: &RetentionConfig,
     now: DateTime<Utc>,
-) -> anyhow::Result<RetentionReport> {
+) -> Result<RetentionReport, Box<dyn std::error::Error + Send + Sync>> {
     let Some(days) = config.days else {
         return Ok(RetentionReport::default());
     };
@@ -150,12 +152,14 @@ pub fn spawn(
             let started = Utc::now();
             match run_once(store.as_ref(), &config, started).await {
                 Ok(report) => {
+                    helios_observability::audit_metrics::record_retention_run(report.purged, true);
                     if report.purged > 0 {
                         info!(purged = report.purged, archive = ?report.archive, "Audit retention run purged expired AuditEvents");
                         record(&*sink, &source_observer, &config, &report, "0", None).await;
                     }
                 }
                 Err(e) => {
+                    helios_observability::audit_metrics::record_retention_run(0, false);
                     error!(error = %e, "Audit retention run failed");
                     record(
                         &*sink,
@@ -213,8 +217,8 @@ pub fn warn_unsupported(config: &RetentionConfig, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helios_persistence::core::ExpiredResource;
-    use helios_persistence::error::StorageResult;
+    use crate::core::ExpiredResource;
+    use crate::error::StorageResult;
     use std::sync::Mutex;
 
     /// In-memory store: (tenant, id, last_updated).

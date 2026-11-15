@@ -31,6 +31,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::RequestDecompressionLayer,
@@ -100,6 +101,7 @@ where
     B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
     let cors = build_cors(config);
+    let audit = state.audit.clone();
 
     // Terminology management (`HTS_ADMIN_UI=true`): the `/admin` API and its
     // background job worker. Built before the UI so the console can mount the
@@ -131,14 +133,17 @@ where
     let bearer = crate::write_guard::bearer_provider_from_env();
     let writes_gate = writes_gate(&gate, config.require_auth_for_writes, bearer.is_some());
     let admin = admin.map(|router| {
-        router.layer(axum::middleware::from_fn_with_state(
-            helios_admin_auth::Guard {
-                gate: gate.clone(),
-                protects: |_, _| true,
-                style: helios_admin_auth::Style::Api { fhir: false },
-            },
-            helios_admin_auth::guard,
-        ))
+        router
+            // Inside the admin gate: who the administrator is, for the audit trail.
+            .layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+            .layer(axum::middleware::from_fn_with_state(
+                helios_admin_auth::Guard {
+                    gate: gate.clone(),
+                    protects: |_, _| true,
+                    style: helios_admin_auth::Style::Api { fhir: false },
+                },
+                helios_admin_auth::guard,
+            ))
     });
 
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
@@ -314,6 +319,7 @@ where
                 .delete(delete_concept_map::<B>),
         )
         .with_state(state)
+        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
         // Terminology writes need the administrator (`HTS_REQUIRE_AUTH_FOR_WRITES`).
         // A route layer, so only matched routes are guarded, and inside the
         // decompression layer below, so a batch body is classified decompressed.
@@ -342,6 +348,44 @@ where
     // routers on the same path.
     let router = match admin {
         Some(admin) => router.nest("/admin", admin),
+        None => router,
+    };
+
+    // The audit trail (`HTS_AUDIT_*`): `GET /AuditEvent` over the store, for
+    // the administrator only, and the recording layer around the terminology
+    // API and `/admin` (not the console's pages).
+    let router = match &audit {
+        Some(audit) => {
+            // The trail is sensitive: without an administrator password it is
+            // locked rather than open (unlike reads of the terminology).
+            let trail_gate = match &gate {
+                helios_admin_auth::AdminGate::Open => {
+                    helios_admin_auth::AdminGate::Locked(Arc::from(
+                        "the audit trail needs HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+                    ))
+                }
+                other => other.clone(),
+            };
+            let router = match &audit.search {
+                Some(search) => router.merge(
+                    crate::audit::router(Arc::clone(search))
+                        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+                        .route_layer(axum::middleware::from_fn_with_state(
+                            helios_admin_auth::Guard {
+                                gate: trail_gate,
+                                protects: |_, _| true,
+                                style: helios_admin_auth::Style::Api { fhir: true },
+                            },
+                            helios_admin_auth::guard,
+                        )),
+                ),
+                None => router,
+            };
+            router.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&audit.middleware),
+                helios_audit::middleware::audit_middleware,
+            ))
+        }
         None => router,
     };
     let router = if let Some(ui) = hts_ui {
@@ -435,7 +479,6 @@ fn build_admin<B>(config: &HtsConfig, state: &AppState<B>) -> Option<Router>
 where
     B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
-    use std::sync::Arc;
     let admin_config = crate::admin::AdminConfig::from_hts(config);
     let ops: Arc<dyn crate::admin::TerminologyAdmin> = state.backend.clone();
     let importer: Arc<dyn BundleImportBackend> = state.backend.clone();
@@ -459,6 +502,12 @@ where
             return None;
         }
     };
+    if let Some(audit) = &state.audit {
+        core.audit.attach_sink(
+            Arc::clone(&audit.middleware.sink),
+            audit.middleware.config.source_observer.clone(),
+        );
+    }
     if tokio::runtime::Handle::try_current().is_ok() {
         crate::admin::jobs::start_worker(core.clone());
         let c = core.clone();

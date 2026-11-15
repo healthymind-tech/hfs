@@ -38,6 +38,9 @@ async-trait = "0.1"
 # Time
 chrono.workspace = true
 
+# Prometheus metrics of the write path (audit_metrics)
+helios-observability = { path = "../observability", version = "0.2.4" }
+
 # Logging
 tracing = "0.1"
 
@@ -64,3 +67,5 @@ aws-config = { version = "1", optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }

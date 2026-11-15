@@ -58,6 +58,7 @@
 //! - OTLP *metrics* are expected to be produced by an OpenTelemetry Collector
 //!   scraping `/metrics`; the app itself only pushes OTLP *traces*.
 
+pub mod audit_metrics;
 pub mod build_info;
 pub mod composite_metrics;
 pub mod dashboard;

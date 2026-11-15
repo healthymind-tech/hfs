@@ -153,6 +153,74 @@ safe (deletes are idempotent) but produces one archive per instance — enable
 
 The `file` backend is never purged by HFS; rotate it with `logrotate`.
 
+## Terminology server (HTS)
+
+HTS records its own trail with the same machinery (`HTS_AUDIT_*`, same
+variables as `HFS_AUDIT_*` with the `HTS_` prefix, observer `Device/hts`):
+
+- **Terminology writes** — `POST/PUT/DELETE` on `CodeSystem`, `ValueSet`,
+  `ConceptMap` are BALP `Create` / `Update` / `Delete` events on the resource
+  (`Location` names a created one); write batches are recorded per request;
+  `POST /import` (IG terminology loads pushed by HFS's package manager, and
+  any bundle import) and `/admin` writes are recorded unprofiled with the
+  request line. Refusals (401 without the administrator credential) are
+  recorded with outcome `4`.
+- **Admin actions** — every action of the terminology admin API and its
+  background jobs (uploads, imports of SNOMED/LOINC/ICD-10 releases, package
+  installs, deletes, set-current) also records an application-activity event
+  (DICOM `110100`, subtype `urn:helios:hts:admin-action|<action>`, the
+  affected entity as a detail, the job outcome). The console's
+  `audit.ndjson` view is unchanged.
+- **Who** — the administrator authenticated by `HTS_ADMIN_PASSWORD` (user
+  agent `admin`); requests without credentials carry only the client agent.
+- **Reads** (`GET`, `$expand`, `$lookup`, `$validate-code`, `$translate`,
+  `$subsumes`, `$batch-validate-code`) are **not** recorded by default — they
+  are the bulk of terminology traffic and carry no patient data. Set
+  `HTS_AUDIT_READS=true` to record them (BALP `Read` / `Query`).
+  (`HFS_AUDIT_READS` exists too and defaults to `true`; keep it on for HFS.)
+
+**Where HTS events go** (`HTS_AUDIT_BACKEND=database`):
+
+1. Default: HTS's own database, in the FHIR resource store HTS already keeps
+   next to its terminology tables (tenant `default`). Search it at
+   `GET <hts>/AuditEvent?date=&entity=&agent=&type=&subtype=&action=&outcome=&_count=`
+   and `GET <hts>/AuditEvent/{id}` — **administrator only** (same credential
+   as `/admin`; without `HTS_ADMIN_PASSWORD` the trail answers `503` rather
+   than being open).
+2. `HTS_AUDIT_DATABASE_URL=<HFS's database URL>`: HTS writes into HFS's audit
+   store, so `GET <hfs>/AuditEvent` covers both servers and HFS's retention
+   job purges both. Use this when HFS and HTS share a PostgreSQL server (they
+   do in the reference deployment). HTS then needs credentials for HFS's
+   database and runs the same schema initialisation — deploy both from the
+   same build.
+
+`HTS_AUDIT_RETENTION_*` works as on HFS when HTS keeps its own store (leave it
+unset with option 2; HFS's job covers it). The fallback file defaults to
+`<HTS_ADMIN_DATA_DIR>/audit-fallback.ndjson`.
+
+## Metrics
+
+Both servers export the audit write path on `/metrics` (Prometheus, labelled
+`service="hfs"` / `service="hts"`, never by tenant):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `audit_events_enqueued_total` | counter | events accepted onto the queue |
+| `audit_events_written_total` | counter | events handed to the store — `rate(...[5m])` is events/s |
+| `audit_queue_depth` | gauge | accepted but not yet written (queued + in flight) |
+| `audit_queue_full_waits_total` | counter | requests that waited for room (backpressure) |
+| `audit_batch_write_duration_seconds` | histogram | wall time of one batch write |
+| `audit_events_spilled_total{reason}` | counter | written to the fallback file instead (`shutdown`, `write_failure`) |
+| `audit_events_replayed_total` | counter | fallback events stored at start-up |
+| `audit_events_dropped_total{reason}` | counter | events lost (`serialization`, `no_fallback`, `fallback_failed`) |
+| `audit_retention_purged_total` | counter | events removed by retention |
+| `audit_retention_runs_total{outcome}` | counter | retention runs (`ok`, `error`) |
+
+Suggested alerts: `audit_events_dropped_total` increases (any loss);
+`audit_events_spilled_total{reason="write_failure"}` increases (the database
+refuses audit writes); `audit_queue_depth > 5000` for 5 minutes (the writer
+does not keep up); `histogram_quantile(0.95, rate(audit_batch_write_duration_seconds_bucket[5m])) > 1`.
+
 ## Configuration reference
 
 | Variable | Default | Description |
@@ -169,11 +237,14 @@ The `file` backend is never purged by HFS; rotate it with `logrotate`.
 | `HFS_AUDIT_WRITERS` | `4` | concurrent writer tasks (database connections in use) |
 | `HFS_AUDIT_SHUTDOWN_TIMEOUT` | `5` | seconds to drain the queue on shutdown before spilling the rest to the fallback file |
 | `HFS_AUDIT_FALLBACK_FILE` | `<data dir>/audit-fallback.ndjson` | spill file while the database is down |
+| `HFS_AUDIT_READS` | `true` (HTS: `false`) | record read-only requests (`GET`, `_search`, read-only operations) |
 | `HFS_AUDIT_AUTH_EVENTS` | `false` | also record the auth layer's per-request authentication/authorization events (the REST events already carry the user and the 401/403) |
 | `HFS_AUDIT_RETENTION_DAYS` | *(keep forever)* | purge events older than N days |
 | `HFS_AUDIT_RETENTION_ARCHIVE_DIR` | — | archive purged events (gzip NDJSON) first |
 | `HFS_AUDIT_RETENTION_INTERVAL_HOURS` | `24` | hours between purge runs |
 | `HFS_AUDIT_RETENTION_BATCH` | `1000` | rows deleted per transaction |
+
+Every variable exists for HTS with the `HTS_AUDIT_` prefix.
 
 ## Recommended production configuration
 
@@ -196,6 +267,8 @@ HFS_AUDIT_WRITERS=4
   frees space for reuse rather than shrinking files.
 - Give auditors a role/scope with `AuditEvent` read; nobody needs write.
 - Keep `/metrics`, `/health` probes excluded (default).
+- HTS: `HTS_AUDIT_BACKEND=database`, `HTS_AUDIT_DATABASE_URL=<HFS DB URL>`,
+  `HTS_AUDIT_TENANT=default`, `HTS_AUDIT_TRUST_FORWARDED_FOR=true`, reads off.
 
 ## Privacy notes
 

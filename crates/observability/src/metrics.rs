@@ -48,8 +48,12 @@ pub fn init(service_name: &str) {
 /// explicit histogram buckets. Split out so tests can build an identical,
 /// thread-local recorder without installing a global one.
 pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
-    let histograms: [(&str, &[f64]); 4] = [
+    let histograms: [(&str, &[f64]); 5] = [
         ("http_request_duration_seconds", LATENCY_BUCKETS),
+        (
+            crate::audit_metrics::BATCH_WRITE_DURATION,
+            crate::audit_metrics::BATCH_BUCKETS,
+        ),
         (
             dashboard_metrics::RECONCILE_PASS_DURATION,
             dashboard_metrics::DURATION_BUCKETS,

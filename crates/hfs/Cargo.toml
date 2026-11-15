@@ -111,8 +111,6 @@ async-trait = "0.1"
 chrono = "0.4"
 serde_json = "1"
 
-# Audit retention archives (gzip NDJSON)
-flate2 = "1"
 
 [dev-dependencies]
 # Drive the assembled router end-to-end (`oneshot`) so the UI-mount tests
