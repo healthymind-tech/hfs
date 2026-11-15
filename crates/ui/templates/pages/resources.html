@@ -104,11 +104,15 @@
         <div class="nl-answer" id="nl-answer" hidden></div>
       </div>
       {% else %}
-      <div class="nl-setup" id="nl-setup">
-        <div class="nl-setup__head">
+      <!-- Collapsed by default (UI/UX review §3.2): the setup notes are for
+           whoever configures the server, not for every visit to the
+           workspace, so they no longer take the top of the card. -->
+      <details class="nl-setup" id="nl-setup">
+        <summary class="nl-setup__head">
           <span class="icon">{% include "icons/sparkle.svg" %}</span>
           <h2>{{ i18n.t("search-setup-heading") }}</h2>
-        </div>
+          <span class="nl-setup__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+        </summary>
         <p>{{ i18n.t("search-setup-body") }}</p>
         <pre class="nl-setup__env"><code>HFS_NL_SEARCH_API_KEY=&lt;{{ i18n.t("search-setup-key-placeholder") }}&gt;
 HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
@@ -116,7 +120,7 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <a class="btn btn--primary" href="{{ docs_url }}" target="_blank" rel="noopener">
           {{ i18n.t("search-setup-docs") }}
         </a>
-      </div>
+      </details>
       {% endif %}
 
       {% include "partials/search-builder.html" %}

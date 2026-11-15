@@ -175,3 +175,17 @@ async fn pages_announce_the_console_to_a_same_origin_hts() {
             .any(|c| c.to_str().unwrap_or("").starts_with("helios_hfs_console"))
     );
 }
+
+/// UI/UX review §3.2: the natural-language setup notes are for whoever
+/// configures the server; they start collapsed instead of taking the top of
+/// the Resources card on every visit.
+#[tokio::test]
+async fn resources_natural_language_setup_notes_start_collapsed() {
+    let (status, _, html) = page(app(), "/ui/resources").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"<details class="nl-setup" id="nl-setup">"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"<details class="nl-setup" id="nl-setup" open"#));
+}

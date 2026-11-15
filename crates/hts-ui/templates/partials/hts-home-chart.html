@@ -79,6 +79,9 @@
     but keeping the accessible name on a group matches HFS and leaves room
     for future in-chart links without tripping axe's nested-interactive rule.
   -#}
+  {#- Scrolls sideways on a phone instead of shrinking the axis labels to
+      nothing (UI/UX review §3.14 / §3.1); see `.chart-scroll` in app.css. -#}
+  <div class="chart-scroll" tabindex="0" role="region" aria-labelledby="hts-home-chart-heading">
   <svg class="chart" viewBox="0 0 1060 {{ cards.chart.view.height }}" role="group"
        aria-labelledby="hts-home-chart-heading">
     {% for tick in cards.chart.view.y_ticks %}
@@ -97,6 +100,7 @@
     <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
     {% endfor %}
   </svg>
+  </div>
 
   {#-
     Legend doubles as the status-class selector: All / 2xx / 4xx / 5xx. The
