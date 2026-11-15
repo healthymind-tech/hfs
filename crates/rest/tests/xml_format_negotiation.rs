@@ -209,5 +209,55 @@ async fn every_xml_request_answers_xml_when_xml_is_built() {
             "{}: the body is XML: {text}",
             case.label
         );
+        // HAPI's generic client (the cqf CQL engine's REST retrieve provider)
+        // refuses a body whose Content-Type is not a FHIR media type: search
+        // answered XML as `text/plain`.
+        let content_type = response.header(CONTENT_TYPE);
+        assert!(
+            content_type
+                .to_str()
+                .unwrap_or("")
+                .starts_with("application/fhir+xml"),
+            "{}: Content-Type {content_type:?}",
+            case.label
+        );
+    }
+}
+
+/// The default HAPI client `Accept` (XML and JSON at equal weight) and plain
+/// FHIR JSON both get a FHIR media type back on every path.
+#[tokio::test]
+async fn every_response_carries_a_fhir_content_type() {
+    let server = server();
+    seed(&server).await;
+    let hapi_accept = HeaderValue::from_static(
+        "application/fhir+xml;q=1.0, application/fhir+json;q=1.0, \
+         application/xml+fhir;q=0.9, application/json+fhir;q=0.9",
+    );
+    for accept in [FHIR_JSON, hapi_accept] {
+        for case in cases() {
+            let mut request = server
+                .method(case.method.clone(), case.path)
+                .add_header(ACCEPT, accept.clone());
+            if let Some(prefer) = case.prefer {
+                request = request.add_header(PREFER, HeaderValue::from_static(prefer));
+            }
+            if let Some(body) = case.body {
+                request = request
+                    .add_header(CONTENT_TYPE, FHIR_JSON)
+                    .bytes(body.into());
+            }
+            let response = request.await;
+            if response.status_code() == StatusCode::NOT_ACCEPTABLE {
+                continue; // XML asked of a build without it (covered above)
+            }
+            let content_type = response.header(CONTENT_TYPE);
+            let ct = content_type.to_str().unwrap_or("");
+            assert!(
+                ct.starts_with("application/fhir+json") || ct.starts_with("application/fhir+xml"),
+                "{} with Accept {accept:?}: Content-Type {ct:?}",
+                case.label
+            );
+        }
     }
 }

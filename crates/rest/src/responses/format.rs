@@ -25,6 +25,42 @@ pub fn format_resource_response(
     content: &Value,
     format: FhirFormat,
 ) -> Result<Response, RestError> {
+    // A handler that did not set a Content-Type (search, history, delete,
+    // ...) still answers a FHIR media type: the XML string body otherwise went
+    // out as `text/plain` and the JSON one as `application/json`, and HAPI's
+    // generic client — the cqf CQL engine's REST retrieve provider among its
+    // users — rejects `text/plain` outright.
+    // Nor may a handler's Content-Type contradict the body: `ResourceHeaders`
+    // defaults to `application/fhir+json`, so create / update answered FHIR XML
+    // labelled as JSON. The media type follows the body; a `fhirVersion`
+    // parameter the handler set is kept.
+    let mut headers = headers;
+    let (mime, token) = match format {
+        FhirFormat::Xml => ("application/fhir+xml", "xml"),
+        FhirFormat::Json | FhirFormat::NdJson => ("application/fhir+json", "json"),
+    };
+    let current = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let agrees = current.as_deref().is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .is_some_and(|media| media.contains(token))
+    });
+    if !agrees {
+        let params = current
+            .as_deref()
+            .and_then(|ct| ct.split_once(';').map(|(_, p)| p.trim().to_owned()))
+            .filter(|p| p.starts_with("fhirversion="));
+        let value = match params {
+            Some(p) => format!("{mime}; {}", p.replacen("fhirversion", "fhirVersion", 1)),
+            None => mime.to_owned(),
+        };
+        if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+            headers.insert(axum::http::header::CONTENT_TYPE, v);
+        }
+    }
     match format {
         // `Json` borrows: `&Value` is `Serialize`, so the body is written
         // straight out of the caller's value. Cloning here copied the whole
