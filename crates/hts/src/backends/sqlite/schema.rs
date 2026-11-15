@@ -172,6 +172,17 @@ CREATE TABLE IF NOT EXISTS value_set_expansions (
     PRIMARY KEY (value_set_id, system_url, code)
 );
 
+-- What a cached expansion was computed from: every code system and value set
+-- canonical its compose names, transitively through `include.valueSet`. A
+-- CodeSystem or ValueSet write drops the cached expansions that depend on its
+-- url, including ones in which that system contributed no row at all.
+CREATE TABLE IF NOT EXISTS value_set_dependencies (
+    value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
+    dep_url      TEXT NOT NULL,
+    PRIMARY KEY (value_set_id, dep_url)
+);
+CREATE INDEX IF NOT EXISTS idx_value_set_dependencies_url ON value_set_dependencies(dep_url);
+
 -- ── Implicit expansion cache ───────────────────────────────────────────────────
 -- Caches expansions for implicit ValueSet URLs (e.g. ?fhir_vs patterns) that
 -- have no corresponding row in value_sets. Keyed by the full URL string.
@@ -879,6 +890,84 @@ pub fn migrate_property_hierarchy(conn: &rusqlite::Connection) -> rusqlite::Resu
         "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
         [MARKER],
     )?;
+    Ok(())
+}
+
+/// One-time repair for the p25-data2 fixes; see the PostgreSQL twin
+/// `migrate_p25_data2_pg`.
+pub fn migrate_p25_data2(conn: &rusqlite::Connection) -> Result<(), crate::error::HtsError> {
+    use crate::import::bundle_parser::{
+        ADVISORY_VERSION_SYSTEMS, P25_DATA2_MIGRATION_MARKER, strip_advisory_versions,
+    };
+    use rusqlite::OptionalExtension;
+    let db = |e: rusqlite::Error| crate::error::HtsError::StorageError(e.to_string());
+    let done: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [P25_DATA2_MIGRATION_MARKER],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db)?
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for system in ADVISORY_VERSION_SYSTEMS {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, compose_json FROM value_sets
+                  WHERE compose_json LIKE '%' || ?1 || '%' AND compose_json LIKE '%\"version\"%'",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([system], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(db)?;
+        for row in rows {
+            let (id, compose) = row.map_err(db)?;
+            if let Some(c) = compose
+                && !candidates.iter().any(|(i, _)| *i == id)
+            {
+                candidates.push((id, c));
+            }
+        }
+    }
+    for (id, text) in candidates {
+        let Ok(mut compose) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if strip_advisory_versions(&mut compose) {
+            conn.execute(
+                "UPDATE value_sets SET compose_json = ?2 WHERE id = ?1",
+                rusqlite::params![id, compose.to_string()],
+            )
+            .map_err(db)?;
+            conn.execute("DELETE FROM value_set_expansions WHERE value_set_id = ?1", [&id])
+                .map_err(db)?;
+        }
+    }
+    let cached: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT e.value_set_id FROM value_set_expansions e
+                  WHERE NOT EXISTS (SELECT 1 FROM value_set_dependencies d
+                                     WHERE d.value_set_id = e.value_set_id)",
+            )
+            .map_err(db)?;
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?
+    };
+    for id in &cached {
+        crate::backends::sqlite::record_value_set_dependencies(conn, id)?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [P25_DATA2_MIGRATION_MARKER],
+    )
+    .map_err(db)?;
     Ok(())
 }
 

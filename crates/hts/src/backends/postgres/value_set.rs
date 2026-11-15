@@ -3792,6 +3792,75 @@ fn build_subtree(
     item
 }
 
+/// Replace the `value_set_dependencies` rows of `vs_id`: every code system
+/// and value set canonical its compose names, transitively through
+/// `include.valueSet` (depth 4). A CodeSystem or ValueSet write then drops the
+/// cached expansions that depend on it (`invalidate_dependents`).
+pub(crate) async fn record_dependencies(
+    client: &impl tokio_postgres::GenericClient,
+    vs_id: &str,
+) -> Result<(), HtsError> {
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
+    let parse = |rows: Vec<tokio_postgres::Row>| -> Vec<serde_json::Value> {
+        rows.into_iter()
+            .filter_map(|r| r.get::<_, Option<String>>(0))
+            .filter_map(|c| serde_json::from_str(&c).ok())
+            .collect()
+    };
+    let own = parse(
+        client
+            .query("SELECT compose_json FROM value_sets WHERE id = $1", &[&vs_id])
+            .await
+            .map_err(db)?,
+    );
+    let mut deps: Vec<String> = Vec::new();
+    let mut frontier = own;
+    for _depth in 0..5 {
+        let mut refs: Vec<String> = Vec::new();
+        for c in &frontier {
+            let (systems, value_sets) = crate::backends::compose_dependencies(c);
+            for s in systems {
+                if !deps.contains(&s) {
+                    deps.push(s);
+                }
+            }
+            for v in value_sets {
+                if !deps.contains(&v) {
+                    deps.push(v.clone());
+                    refs.push(v);
+                }
+            }
+        }
+        if refs.is_empty() {
+            break;
+        }
+        frontier = parse(
+            client
+                .query(
+                    "SELECT compose_json FROM value_sets WHERE url = ANY($1::text[])",
+                    &[&refs],
+                )
+                .await
+                .map_err(db)?,
+        );
+    }
+    client
+        .execute("DELETE FROM value_set_dependencies WHERE value_set_id = $1", &[&vs_id])
+        .await
+        .map_err(db)?;
+    if !deps.is_empty() {
+        client
+            .execute(
+                "INSERT INTO value_set_dependencies (value_set_id, dep_url)
+                 SELECT $1, d FROM UNNEST($2::text[]) AS d ON CONFLICT DO NOTHING",
+                &[&vs_id, &deps],
+            )
+            .await
+            .map_err(db)?;
+    }
+    Ok(())
+}
+
 /// Write computed expansion entries into the `value_set_expansions` cache.
 ///
 /// Uses a transaction so the DELETE+INSERTs are atomic: without it, another
@@ -3846,6 +3915,7 @@ async fn populate_cache(
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     }
+    record_dependencies(&tx, vs_id).await?;
 
     tx.commit()
         .await

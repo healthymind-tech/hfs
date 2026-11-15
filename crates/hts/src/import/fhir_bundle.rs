@@ -704,6 +704,13 @@ fn write_value_set(
         rusqlite::params![storage_id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // Value sets built from this one (`include.valueSet`) are stale too.
+    conn.execute(
+        "DELETE FROM value_set_expansions WHERE value_set_id IN \
+         (SELECT value_set_id FROM value_set_dependencies WHERE dep_url = ?1)",
+        rusqlite::params![vs.url],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     // Upsert keyed on (url, version): a re-import refreshes the existing row
     // for the same version without disturbing sibling versions. The composite
@@ -964,7 +971,9 @@ pub(crate) fn invalidate_expansion_cache_for_system(
     system_url: &str,
 ) -> Result<(), HtsError> {
     conn.execute(
-        "DELETE FROM value_set_expansions WHERE system_url = ?1",
+        "DELETE FROM value_set_expansions WHERE system_url = ?1
+            OR value_set_id IN (SELECT value_set_id FROM value_set_dependencies
+                                 WHERE dep_url = ?1)",
         rusqlite::params![system_url],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;

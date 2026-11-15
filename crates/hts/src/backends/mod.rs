@@ -284,6 +284,74 @@ pub(crate) fn apply_vsac_op_modifier(filter: &mut serde_json::Value) {
     filter["op"] = serde_json::Value::String(op.to_string());
 }
 
+/// The canonicals a ValueSet compose names directly: code system urls
+/// (`include/exclude.system`) and value set urls (`include/exclude.valueSet`,
+/// version suffix dropped). Feeds the `value_set_dependencies` table.
+pub(crate) fn compose_dependencies(compose: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut systems = Vec::new();
+    let mut value_sets = Vec::new();
+    for key in ["include", "exclude"] {
+        for inc in compose
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(s) = inc.get("system").and_then(|v| v.as_str())
+                && !systems.iter().any(|x| x == s)
+            {
+                systems.push(s.to_string());
+            }
+            for vs in inc
+                .get("valueSet")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+            {
+                let url = vs.split('|').next().unwrap_or(vs).to_string();
+                if !value_sets.contains(&url) {
+                    value_sets.push(url);
+                }
+            }
+        }
+    }
+    (systems, value_sets)
+}
+
+/// Every canonical a compose depends on, following `valueSet` references
+/// through `lookup` (value set url → its stored composes, any version) to
+/// depth 4.
+pub(crate) fn transitive_dependencies(
+    compose: &serde_json::Value,
+    mut lookup: impl FnMut(&str) -> Vec<serde_json::Value>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![compose.clone()];
+    for _depth in 0..5 {
+        let mut next = Vec::new();
+        for c in &frontier {
+            let (systems, value_sets) = compose_dependencies(c);
+            for s in systems {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            for vs in value_sets {
+                if !out.contains(&vs) {
+                    out.push(vs.clone());
+                    next.extend(lookup(&vs));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
 /// Re-sort `out` into the order the codes are listed in `explicit_codes`
 /// (codes appended after the concept-table join keep the compose order).
 pub(crate) fn sort_by_compose_order(

@@ -222,6 +222,15 @@ ALTER TABLE value_set_expansions ADD COLUMN IF NOT EXISTS version TEXT;
 -- Re-importing or deleting a CodeSystem drops the cached expansions over it.
 CREATE INDEX IF NOT EXISTS idx_value_set_expansions_system ON value_set_expansions(system_url);
 
+-- What a cached expansion was computed from (code system and value set
+-- canonicals its compose names, transitively); see the SQLite schema.
+CREATE TABLE IF NOT EXISTS value_set_dependencies (
+    value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
+    dep_url      TEXT NOT NULL,
+    PRIMARY KEY (value_set_id, dep_url)
+);
+CREATE INDEX IF NOT EXISTS idx_value_set_dependencies_url ON value_set_dependencies(dep_url);
+
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id            TEXT PRIMARY KEY,
@@ -644,6 +653,97 @@ async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_p
     }
     client.batch_execute(SCHEMA).await?;
     record_fingerprint(client).await
+}
+
+/// One-time repair for the p25-data2 fixes (marker
+/// [`P25_DATA2_MIGRATION_MARKER`](crate::import::bundle_parser::P25_DATA2_MIGRATION_MARKER)):
+/// stored composes drop the advisory versions of native `current` systems
+/// (`strip_advisory_versions`; their cached expansions are dropped), and every
+/// remaining cached expansion gets its `value_set_dependencies` rows so later
+/// CodeSystem / ValueSet writes invalidate it.
+pub async fn migrate_p25_data2_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), crate::error::HtsError> {
+    use crate::import::bundle_parser::{
+        ADVISORY_VERSION_SYSTEMS, P25_DATA2_MIGRATION_MARKER, strip_advisory_versions,
+    };
+    let db = |e: tokio_postgres::Error| crate::error::HtsError::StorageError(e.to_string());
+    if client
+        .query_opt(
+            "SELECT 1 FROM bootstrap_imports WHERE path = $1",
+            &[&P25_DATA2_MIGRATION_MARKER],
+        )
+        .await
+        .map_err(db)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let patterns: Vec<String> = ADVISORY_VERSION_SYSTEMS
+        .iter()
+        .map(|s| format!("%{s}%"))
+        .collect();
+    let rows = client
+        .query(
+            "SELECT id, compose_json FROM value_sets
+              WHERE compose_json LIKE ANY($1::text[]) AND compose_json LIKE '%\"version\"%'",
+            &[&patterns],
+        )
+        .await
+        .map_err(db)?;
+    let mut stripped = 0u64;
+    for row in rows {
+        let id: String = row.get(0);
+        let Some(text) = row.get::<_, Option<String>>(1) else {
+            continue;
+        };
+        let Ok(mut compose) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if strip_advisory_versions(&mut compose) {
+            client
+                .execute(
+                    "UPDATE value_sets SET compose_json = $2 WHERE id = $1",
+                    &[&id, &compose.to_string()],
+                )
+                .await
+                .map_err(db)?;
+            client
+                .execute("DELETE FROM value_set_expansions WHERE value_set_id = $1", &[&id])
+                .await
+                .map_err(db)?;
+            stripped += 1;
+        }
+    }
+    let cached: Vec<String> = client
+        .query(
+            "SELECT DISTINCT e.value_set_id FROM value_set_expansions e
+              WHERE NOT EXISTS (SELECT 1 FROM value_set_dependencies d
+                                 WHERE d.value_set_id = e.value_set_id)",
+            &[],
+        )
+        .await
+        .map_err(db)?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    for id in &cached {
+        super::value_set::record_dependencies(client, id).await?;
+    }
+    client
+        .execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES ($1, '', 0) \
+             ON CONFLICT (path) DO NOTHING",
+            &[&P25_DATA2_MIGRATION_MARKER],
+        )
+        .await
+        .map_err(db)?;
+    tracing::info!(
+        stripped_composes = stripped,
+        cached_value_sets = cached.len(),
+        "p25-data2 migration: advisory compose versions, expansion dependencies"
+    );
+    Ok(())
 }
 
 /// One-time repair for the p25-data fixes (marker
