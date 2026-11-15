@@ -19,6 +19,14 @@ mod concept_map;
 pub(crate) mod fhir_ids;
 mod value_set;
 
+/// See `value_set::record_dependencies` (used by the schema migrations).
+pub(crate) fn record_value_set_dependencies(
+    conn: &rusqlite::Connection,
+    vs_id: &str,
+) -> Result<(), HtsError> {
+    value_set::record_dependencies(conn, vs_id)
+}
+
 pub(crate) use code_system::invalidate_cs_language_cache;
 pub(crate) use value_set::drop_implicit_fts;
 pub(crate) use value_set::invalidate_cs_id_cache;
@@ -604,6 +612,7 @@ impl SqliteTerminologyBackend {
             schema::migrate_p25_data(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
             })?;
+            schema::migrate_p25_data2(&conn)?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
@@ -827,6 +836,7 @@ impl SqliteTerminologyBackend {
             schema::migrate_p25_data(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
             })?;
+            schema::migrate_p25_data2(&conn)?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;

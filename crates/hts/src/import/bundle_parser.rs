@@ -408,6 +408,48 @@ pub fn truncated_copy_warning(
     ))
 }
 
+/// Code systems HTS loads from their publisher's current release under the
+/// version `current` (native importers: NUCC, NDC, RxNorm, ICD-10-CM), whose
+/// codes are stable across releases.
+///
+/// Value sets (VSAC above all) pin the release they were authored against —
+/// `{"system": "http://nucc.org/provider-taxonomy", "version": "23.1"}` —
+/// and HTS answered UNKNOWN_CODESYSTEM_VERSION for every code because only
+/// `current` is stored (CARIN's `EOB-careteam-qualification` invariant
+/// failed under remote terminology). For these systems a compose
+/// `include.version` / `exclude.version` is advisory: it is dropped from the
+/// stored compose (the resource JSON keeps it), so the include resolves to the
+/// stored release, as tx.fhir.org effectively does for these systems.
+pub const ADVISORY_VERSION_SYSTEMS: [&str; 4] = [
+    "http://nucc.org/provider-taxonomy",
+    "http://hl7.org/fhir/sid/ndc",
+    "http://www.nlm.nih.gov/research/umls/rxnorm",
+    "http://hl7.org/fhir/sid/icd-10-cm",
+];
+
+/// Drop the advisory `version` of compose includes / excludes over
+/// [`ADVISORY_VERSION_SYSTEMS`]. Returns whether anything changed.
+pub fn strip_advisory_versions(compose: &mut Value) -> bool {
+    let mut changed = false;
+    for key in ["include", "exclude"] {
+        if let Some(items) = compose.get_mut(key).and_then(Value::as_array_mut) {
+            for inc in items {
+                let advisory = inc
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| ADVISORY_VERSION_SYSTEMS.contains(&s));
+                if advisory
+                    && let Some(obj) = inc.as_object_mut()
+                    && obj.remove("version").is_some()
+                {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// CDC Race & Ethnicity (CDCREC).
 pub const CDCREC_URL: &str = "urn:oid:2.16.840.1.113883.6.238";
 
@@ -441,6 +483,11 @@ pub fn cdcrec_edges() -> Vec<(&'static str, &'static str)> {
 /// hierarchy, and cached expansions over CDCREC and UCUM (computed when
 /// enumerated UCUM units and CDCREC descendants were dropped) are cleared.
 pub const P25_DATA_MIGRATION_MARKER: &str = "#migration:cdcrec-hierarchy-ucum-enum-p25data";
+
+/// One-time repair marker of the p25-data2 fixes: stored composes lose the
+/// advisory versions of [`ADVISORY_VERSION_SYSTEMS`], and cached expansions
+/// get their `value_set_dependencies` rows.
+pub const P25_DATA2_MIGRATION_MARKER: &str = "#migration:advisory-versions-vs-dependencies-p25data2";
 
 /// URLs whose cached expansions the p25-data migration clears.
 pub const P25_DATA_SYSTEMS: [&str; 2] = [CDCREC_URL, "http://unitsofmeasure.org"];
@@ -696,9 +743,11 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let compose_json = vs["compose"]
-        .as_object()
-        .map(|_| serde_json::to_string(&vs["compose"]).unwrap_or_default());
+    let compose_json = vs["compose"].as_object().map(|_| {
+        let mut compose = vs["compose"].clone();
+        strip_advisory_versions(&mut compose);
+        serde_json::to_string(&compose).unwrap_or_default()
+    });
 
     Some(ParsedValueSet {
         id,
@@ -833,6 +882,26 @@ mod tests {
         assert_eq!(parent_of(&cs, "2133-7"), None);
         assert_eq!(parent_of(&cs, "2135-2"), Some("2133-7"));
         assert_eq!(parent_of(&cs, "2148-5"), Some("2135-2"));
+    }
+
+    #[test]
+    fn advisory_versions_are_dropped_from_the_stored_compose_only() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet", "url": "http://cts/vs/1066", "compose": {
+                "include": [
+                    {"system": "http://nucc.org/provider-taxonomy", "version": "23.1"},
+                    {"system": "http://loinc.org", "version": "2.77", "concept": [{"code": "1-8"}]}
+                ],
+                "exclude": [{"system": "http://hl7.org/fhir/sid/ndc", "version": "x",
+                             "concept": [{"code": "0777-3105-02"}]}]
+            }
+        });
+        let parsed = parse_value_set(&vs).unwrap();
+        let compose: Value = serde_json::from_str(parsed.compose_json.as_deref().unwrap()).unwrap();
+        assert!(compose["include"][0].get("version").is_none());
+        assert_eq!(compose["include"][1]["version"], "2.77", "other systems keep their pin");
+        assert!(compose["exclude"][0].get("version").is_none());
+        assert_eq!(parsed.resource_json["compose"]["include"][0]["version"], "23.1");
     }
 
     #[test]

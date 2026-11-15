@@ -7068,8 +7068,62 @@ fn populate_cache(
         }
     }
 
+    if let Err(e) = record_dependencies(conn, vs_id) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+
     conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Replace the `value_set_dependencies` rows of `vs_id` (see the PostgreSQL
+/// twin `record_dependencies`).
+pub(crate) fn record_dependencies(conn: &Connection, vs_id: &str) -> Result<(), HtsError> {
+    let db = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let compose_of = |sql: &str, key: &str| -> Result<Vec<serde_json::Value>, HtsError> {
+        let mut stmt = conn.prepare_cached(sql).map_err(db)?;
+        let rows = stmt
+            .query_map([key], |r| r.get::<_, Option<String>>(0))
+            .map_err(db)?
+            .filter_map(|r| r.ok().flatten())
+            .filter_map(|c| serde_json::from_str(&c).ok())
+            .collect();
+        Ok(rows)
+    };
+    let own = compose_of("SELECT compose_json FROM value_sets WHERE id = ?1", vs_id)?;
+    let mut deps: Vec<String> = Vec::new();
+    for compose in &own {
+        let mut failed = None;
+        let found = crate::backends::transitive_dependencies(compose, |url| {
+            match compose_of("SELECT compose_json FROM value_sets WHERE url = ?1", url) {
+                Ok(v) => v,
+                Err(e) => {
+                    failed = Some(e);
+                    Vec::new()
+                }
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        for d in found {
+            if !deps.contains(&d) {
+                deps.push(d);
+            }
+        }
+    }
+    conn.execute("DELETE FROM value_set_dependencies WHERE value_set_id = ?1", [vs_id])
+        .map_err(db)?;
+    let mut insert = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO value_set_dependencies (value_set_id, dep_url) VALUES (?1, ?2)",
+        )
+        .map_err(db)?;
+    for d in deps {
+        insert.execute(rusqlite::params![vs_id, d]).map_err(db)?;
+    }
+    Ok(())
 }
 
 /// Build a [`ValidateCodeResponse`] from an optional matching concept.

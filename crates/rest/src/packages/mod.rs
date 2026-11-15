@@ -23,6 +23,7 @@
 pub mod hts;
 pub mod jobs;
 pub mod manager;
+pub mod pins;
 pub mod registry;
 pub mod resolver;
 pub mod store;

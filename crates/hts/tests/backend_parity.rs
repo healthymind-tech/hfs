@@ -1300,3 +1300,92 @@ async fn bundle_reimport_drops_cached_expansions_over_the_system() {
     assert_eq!(after.0.unwrap().1, Some(3));
     assert!(after.1);
 }
+
+/// Cached expansions are refreshed when anything they were computed from
+/// changes — including a code system that contributed no row (the include
+/// matched nothing) and a value set referenced through `include.valueSet`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_expansions_follow_their_dependencies() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let cs = |codes: &[(&str, &str)]| {
+        json!({
+            "resourceType": "CodeSystem", "id": "dep-cs", "url": "http://dep.test/cs",
+            "version": "1", "status": "active", "content": "complete",
+            "property": [{"code": "p", "type": "string"}],
+            "concept": codes.iter().map(|(c, p)| json!({"code": c,
+                "property": [{"code": "p", "valueString": p}]})).collect::<Vec<_>>()
+        })
+    };
+    let inner = json!({
+        "resourceType": "ValueSet", "id": "dep-inner", "url": "http://dep.test/vs/inner",
+        "status": "active",
+        "compose": {"include": [{"system": "http://dep.test/cs",
+                                 "filter": [{"property": "p", "op": "=", "value": "1"}]}]}
+    });
+    let outer = json!({
+        "resourceType": "ValueSet", "id": "dep-outer", "url": "http://dep.test/vs/outer",
+        "status": "active",
+        "compose": {"include": [{"valueSet": ["http://dep.test/vs/inner"]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&[("a", "0")]), inner.clone(), outer.clone()])).await;
+    }
+    let before = same_on_all!(bs, |b| (
+        expand(b, url_req("http://dep.test/vs/inner")).await,
+        expand(b, url_req("http://dep.test/vs/outer")).await,
+    ));
+    assert_eq!(before.0, Ok((vec![], Some(0))));
+    assert_eq!(before.1, Ok((vec![], Some(0))));
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&[("a", "0"), ("b", "1")])])).await;
+    }
+    let after = same_on_all!(bs, |b| (
+        expand(b, url_req("http://dep.test/vs/inner")).await,
+        expand(b, url_req("http://dep.test/vs/outer")).await,
+    ));
+    assert_eq!(after.0, Ok((vec!["b".to_string()], Some(1))));
+    assert_eq!(after.1, Ok((vec!["b".to_string()], Some(1))));
+    // A changed inner value set reaches the outer one too.
+    let inner2 = json!({
+        "resourceType": "ValueSet", "id": "dep-inner", "url": "http://dep.test/vs/inner",
+        "status": "active",
+        "compose": {"include": [{"system": "http://dep.test/cs",
+                                 "filter": [{"property": "p", "op": "=", "value": "0"}]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![inner2.clone()])).await;
+    }
+    let outer_after = same_on_all!(bs, |b| expand(b, url_req("http://dep.test/vs/outer")).await);
+    assert_eq!(outer_after, Ok((vec!["a".to_string()], Some(1))));
+}
+
+/// VSAC pins the NUCC release it was authored against (`23.1`); HTS loads
+/// NUCC's current release as version `current`. The pin is advisory for the
+/// natively loaded `current` systems: the code validates.
+#[tokio::test(flavor = "multi_thread")]
+async fn advisory_compose_versions_resolve_to_the_stored_release() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let nucc = json!({
+        "resourceType": "CodeSystem", "id": "nucc", "url": "http://nucc.org/provider-taxonomy",
+        "version": "current", "status": "active", "content": "complete",
+        "concept": [{"code": "364SX0200X", "display": "Oncology Clinical Nurse Specialist"}]
+    });
+    let vs = json!({
+        "resourceType": "ValueSet", "id": "taxonomy", "url": "http://cts.test/vs/1066",
+        "version": "20240606", "status": "active",
+        "compose": {"include": [{"system": "http://nucc.org/provider-taxonomy", "version": "23.1"}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![nucc.clone(), vs.clone()])).await;
+    }
+    let v = same_on_all!(bs, |b| validates(
+        b,
+        "http://cts.test/vs/1066",
+        Some("http://nucc.org/provider-taxonomy"),
+        "364SX0200X"
+    )
+    .await);
+    assert!(v);
+}

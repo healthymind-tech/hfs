@@ -372,3 +372,121 @@ mod tests {
         );
     }
 }
+
+/// Pin unversioned binding value sets to the versions in `pins`
+/// (value set url → version).
+///
+/// A profile binds `…/ValueSet/x` without a version, meaning "the version in
+/// my package's dependency context" — the IG publisher and the HL7 validator
+/// resolve it that way. A terminology server holding several versions (IPS
+/// 1.1.0 from an installed IG and IPS 2.0.0 from a bundled package) would
+/// otherwise answer from its newest one, which for IPS replaced the LOINC
+/// answers with SNOMED codes. Bindings that already name a version, and value
+/// sets without a pin, are left alone. Returns `None` when nothing changed.
+pub fn pin_binding_versions(
+    schema: &FhirSchema,
+    pins: &std::collections::HashMap<String, String>,
+) -> Option<FhirSchema> {
+    fn walk(s: &mut FhirSchema, pins: &std::collections::HashMap<String, String>) -> bool {
+        let mut changed = false;
+        if let Some(b) = s.binding.as_mut()
+            && !b.value_set.contains('|')
+            && let Some(v) = pins.get(&b.value_set)
+        {
+            b.value_set = format!("{}|{v}", b.value_set);
+            changed = true;
+        }
+        let mut each = |map: &mut IndexMap<String, Arc<FhirSchema>>| {
+            for child in map.values_mut() {
+                let mut c = (**child).clone();
+                if walk(&mut c, pins) {
+                    *child = Arc::new(c);
+                    changed = true;
+                }
+            }
+        };
+        if let Some(m) = s.elements.as_mut() {
+            each(m);
+        }
+        if let Some(m) = s.extensions.as_mut() {
+            each(m);
+        }
+        if let Some(slicing) = s.slicing.as_mut() {
+            for slice in slicing.slices.values_mut() {
+                if let Some(child) = slice.schema.as_mut() {
+                    let mut c = (**child).clone();
+                    if walk(&mut c, pins) {
+                        *child = Arc::new(c);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+    if pins.is_empty() {
+        return None;
+    }
+    let mut out = schema.clone();
+    walk(&mut out, pins).then_some(out)
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn unversioned_bindings_are_pinned_everywhere_and_versioned_ones_kept() {
+        let leaf = |vs: &str| {
+            Arc::new(FhirSchema {
+                binding: Some(Binding {
+                    value_set: vs.to_string(),
+                    strength: Some("required".into()),
+                }),
+                ..Default::default()
+            })
+        };
+        let mut elements = IndexMap::new();
+        elements.insert("smoking".to_string(), leaf("http://ips/ValueSet/smoking"));
+        elements.insert("status".to_string(), leaf("http://hl7.org/fhir/ValueSet/obs|4.0.1"));
+        elements.insert("other".to_string(), leaf("http://x/ValueSet/unpinned"));
+        let mut slices = IndexMap::new();
+        slices.insert(
+            "s".to_string(),
+            Slice {
+                match_: None,
+                min: None,
+                max: None,
+                order: None,
+                reslice: None,
+                slice_is_constraining: None,
+                schema: Some(leaf("http://ips/ValueSet/smoking")),
+            },
+        );
+        let schema = FhirSchema {
+            elements: Some(elements),
+            slicing: Some(Slicing {
+                slices,
+                rules: None,
+                ordered: None,
+            }),
+            ..Default::default()
+        };
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("http://ips/ValueSet/smoking".to_string(), "1.1.0".to_string());
+        pins.insert("http://hl7.org/fhir/ValueSet/obs".to_string(), "9".to_string());
+        let pinned = pin_binding_versions(&schema, &pins).expect("changed");
+        let vs = |s: &FhirSchema, k: &str| {
+            s.elements.as_ref().unwrap()[k].binding.as_ref().unwrap().value_set.clone()
+        };
+        assert_eq!(vs(&pinned, "smoking"), "http://ips/ValueSet/smoking|1.1.0");
+        assert_eq!(vs(&pinned, "status"), "http://hl7.org/fhir/ValueSet/obs|4.0.1");
+        assert_eq!(vs(&pinned, "other"), "http://x/ValueSet/unpinned");
+        let slice = pinned.slicing.as_ref().unwrap().slices["s"].schema.clone().unwrap();
+        assert_eq!(
+            slice.binding.as_ref().unwrap().value_set,
+            "http://ips/ValueSet/smoking|1.1.0"
+        );
+        assert!(pin_binding_versions(&schema, &Default::default()).is_none());
+    }
+}

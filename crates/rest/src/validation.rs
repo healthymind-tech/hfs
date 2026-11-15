@@ -155,6 +155,9 @@ pub struct ValidationService {
     stored_index: std::sync::Mutex<crate::validation_cache::StoredIndex>,
     /// Signalled when `stored_index` changed and the cache file is stale.
     cache_dirty: tokio::sync::Notify,
+    /// Tenant → binding version pins of its installed profiles
+    /// ([`crate::packages::pins`]), applied when a profile is registered.
+    binding_pins: RwLock<std::collections::HashMap<String, Arc<crate::packages::pins::ProfilePins>>>,
 }
 
 impl Default for ValidationService {
@@ -179,6 +182,7 @@ impl Default for ValidationService {
             profile_cache: None,
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
+            binding_pins: Default::default(),
         }
     }
 }
@@ -264,6 +268,7 @@ impl ValidationService {
             profile_cache: None,
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
+            binding_pins: Default::default(),
         }
     }
 
@@ -495,6 +500,67 @@ impl ValidationService {
         registered
     }
 
+    /// `schema` with its unversioned binding value sets pinned to the
+    /// versions its package context names (see [`crate::packages::pins`]).
+    fn pin_bindings(
+        &self,
+        tenant: &str,
+        schema: helios_fhir_validator::FhirSchema,
+    ) -> helios_fhir_validator::FhirSchema {
+        let Some(url) = schema.url.as_deref() else {
+            return schema;
+        };
+        let pins = {
+            let all = self.binding_pins.read().expect("binding pins lock");
+            all.get(tenant).and_then(|t| {
+                t.get(&crate::packages::pins::profile_key(url, schema.version.as_deref()))
+                    .or_else(|| t.get(url))
+                    .cloned()
+            })
+        };
+        match pins {
+            Some(pins) => {
+                helios_fhir_validator::schema::pin_binding_versions(&schema, &pins).unwrap_or(schema)
+            }
+            None => schema,
+        }
+    }
+
+    /// Replace `tenant`'s binding version pins and re-register its stored
+    /// profiles under them (after a package install or uninstall; at start
+    /// the pins are set before the profiles are registered).
+    pub fn set_binding_pins(&self, tenant: &str, pins: crate::packages::pins::ProfilePins) {
+        let changed = {
+            let mut all = self.binding_pins.write().expect("binding pins lock");
+            let new = Arc::new(pins);
+            let changed = all.get(tenant).is_none_or(|old| **old != *new);
+            all.insert(tenant.to_string(), new);
+            changed
+        };
+        if changed {
+            self.reapply_binding_pins(tenant);
+        }
+    }
+
+    /// Re-register `tenant`'s stored profiles under the current pins.
+    pub fn reapply_binding_pins(&self, tenant: &str) {
+        let mut entries: Vec<(u64, FhirVersion, helios_fhir_validator::FhirSchema)> = self
+            .stored_index
+            .lock()
+            .expect("stored profile index lock")
+            .entries
+            .values()
+            .filter(|p| p.tenant == tenant)
+            .filter_map(|p| p.schema.clone().map(|s| (p.seq, p.fhir_version, s)))
+            .collect();
+        entries.sort_by_key(|(seq, _, _)| *seq);
+        let n = entries.len();
+        for (_, version, schema) in entries {
+            self.install_profile(tenant, version, schema);
+        }
+        debug!(tenant = %tenant, profiles = n, "binding version pins updated; stored profiles re-registered");
+    }
+
     /// Insert a converted stored definition into the tenant registry under
     /// the registration rules of [`Self::upsert_stored_profile`]. Returns
     /// `false` when the schema has no URL.
@@ -507,6 +573,7 @@ impl ValidationService {
         let Some(registries) = &self.tenant_profiles else {
             return false;
         };
+        let schema = self.pin_bindings(tenant, schema);
         let core = helios_fhir_validator::packs::core_registry(version);
         let url = schema.url.clone();
         let is_constraint = schema.derivation.as_deref() == Some("constraint")
@@ -2726,5 +2793,68 @@ mod cluster_profile_change_tests {
         svc.apply_profile_change("t1", "x2", Some((v, &sd("x2", url))));
         svc.apply_profile_change("t1", "x2", None);
         assert!(resolves(&svc, "t1", url), "the surviving row still resolves");
+    }
+}
+
+#[cfg(test)]
+mod binding_pin_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn binding_of(service: &ValidationService, url: &str) -> Option<String> {
+        let resolver = service.tenant_overlay(Some("default"), FhirVersion::R4)?;
+        let schema = resolver.resolve(url)?;
+        let code = schema.elements.as_ref()?.get("code")?.clone();
+        code.binding.as_ref().map(|b| b.value_set.clone())
+    }
+
+    /// A stored profile's unversioned binding is sent with the version its
+    /// package context names, whether the pins arrive before or after the
+    /// profile is registered.
+    #[test]
+    fn stored_profiles_get_their_package_binding_versions() {
+        let service = ValidationService::new();
+        let sd = json!({
+            "resourceType": "StructureDefinition", "id": "tobacco",
+            "url": "http://ips.test/StructureDefinition/tobacco", "version": "1.1.0",
+            "name": "Tobacco", "status": "active", "kind": "resource", "abstract": false,
+            "type": "Observation",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+            "derivation": "constraint",
+            "differential": {"element": [
+                {"id": "Observation", "path": "Observation"},
+                {"id": "Observation.code", "path": "Observation.code",
+                 "binding": {"strength": "required",
+                             "valueSet": "http://ips.test/ValueSet/smoking"}}
+            ]}
+        });
+        assert!(service.upsert_stored_profile("default", FhirVersion::R4, &sd));
+        let url = "http://ips.test/StructureDefinition/tobacco";
+        assert_eq!(
+            binding_of(&service, url).as_deref(),
+            Some("http://ips.test/ValueSet/smoking")
+        );
+        let mut pins = crate::packages::pins::Pins::new();
+        pins.insert("http://ips.test/ValueSet/smoking".into(), "1.1.0".into());
+        let mut profile_pins = crate::packages::pins::ProfilePins::new();
+        profile_pins.insert(format!("{url}|1.1.0"), Arc::new(pins));
+        service.set_binding_pins("default", profile_pins);
+        assert_eq!(
+            binding_of(&service, url).as_deref(),
+            Some("http://ips.test/ValueSet/smoking|1.1.0"),
+            "re-registered under the new pins"
+        );
+        // A later write of the same profile keeps the pin.
+        assert!(service.upsert_stored_profile("default", FhirVersion::R4, &sd));
+        assert_eq!(
+            binding_of(&service, url).as_deref(),
+            Some("http://ips.test/ValueSet/smoking|1.1.0")
+        );
+        // Pins removed (package uninstalled): back to unversioned.
+        service.set_binding_pins("default", Default::default());
+        assert_eq!(
+            binding_of(&service, url).as_deref(),
+            Some("http://ips.test/ValueSet/smoking")
+        );
     }
 }

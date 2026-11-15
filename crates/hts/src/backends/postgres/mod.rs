@@ -574,6 +574,8 @@ impl PostgresTerminologyBackend {
                 ))
             })?;
 
+            schema::migrate_p25_data2_pg(&client).await?;
+
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
             // closures aren't rebuilt. For a fresh CI database, this is a no-op
@@ -1911,7 +1913,9 @@ async fn write_code_system(
     // of a CodeSystem kept serving the old expansions from the DB cache).
     client
         .cexec(
-            "DELETE FROM value_set_expansions WHERE system_url = $1",
+            "DELETE FROM value_set_expansions WHERE system_url = $1
+                OR value_set_id IN (SELECT value_set_id FROM value_set_dependencies
+                                     WHERE dep_url = $1)",
             &[&cs.url],
         )
         .await
@@ -2067,6 +2071,15 @@ async fn write_value_set(
              (SELECT id FROM value_sets \
               WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, ''))",
             &[&vs.url, &vs.version],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    // Value sets built from this one (`include.valueSet`) are stale too.
+    client
+        .cexec(
+            "DELETE FROM value_set_expansions WHERE value_set_id IN \
+             (SELECT value_set_id FROM value_set_dependencies WHERE dep_url = $1)",
+            &[&vs.url],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
