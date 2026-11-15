@@ -11,8 +11,42 @@ use crate::core::bulk_submit_legacy::{
 };
 use crate::error::{BackendError, StorageResult};
 
-/// Current schema version.
-pub const SCHEMA_VERSION: i32 = 47;
+/// Current schema version on the **upstream** migration ladder.
+///
+/// This number belongs to upstream HeliosSoftware/hfs: every `vN -> vN+1` step
+/// below is an upstream migration with upstream's number. The healthymind fork
+/// must never take a number on this ladder, because upstream will assign the
+/// same number to a different migration in a later release and a database
+/// stamped with the fork's meaning would then silently skip upstream's step
+/// after a rebase. That already happened once: the fork shipped its
+/// SearchParameter-epoch migration as v47 while upstream v0.2.5 made v47
+/// `idx_resources_reindex_id`. Fork-only schema changes are applied by name
+/// from [`FORK_MIGRATIONS`] instead, after the upstream ladder; see
+/// `docs/ops/database-migrations.md`.
+pub const SCHEMA_VERSION: i32 = 46;
+
+/// The upstream-ladder number the fork's SearchParameter-epoch migration was
+/// shipped under before fork migrations got their own track. Databases created
+/// or upgraded by fork builds up to `hm/p25-z` record this version. They are
+/// recognised by [`is_fork_stamped_v47`] and re-stamped to upstream v46 with
+/// [`FORK_SEARCH_PARAMETER_EPOCHS`] recorded as applied.
+const FORK_DIVERGED_VERSION: i32 = 47;
+
+/// Name of the fork migration that used to be "v47": the per-tenant
+/// SearchParameter epoch table and its triggers.
+pub const FORK_SEARCH_PARAMETER_EPOCHS: &str = "hm-0001-search-parameter-epochs";
+
+/// Fork-only migrations, applied in order after the upstream ladder and
+/// recorded by name in `hm_schema_migrations`. Append only; never renumber or
+/// reorder, and every body must be idempotent (it may run against a schema
+/// where an earlier build already created its objects).
+pub const FORK_MIGRATIONS: &[&str] = &[FORK_SEARCH_PARAMETER_EPOCHS];
+
+/// Environment switch that lets this binary start against a database whose
+/// upstream schema version is newer than [`SCHEMA_VERSION`]. Off by default:
+/// an older binary does not maintain the columns and indexes a newer migration
+/// added, so serving writes from it corrupts search results silently.
+pub const ALLOW_NEWER_SCHEMA_ENV: &str = "HFS_PG_ALLOW_NEWER_SCHEMA";
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -89,9 +123,39 @@ async fn acquire_migration_lock(client: &deadpool_postgres::Client) -> StorageRe
 }
 
 async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
-    let current_version = get_schema_version(client).await?;
+    let allow_newer = std::env::var(ALLOW_NEWER_SCHEMA_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    run_migrations_with(client, allow_newer).await
+}
 
-    if current_version == 0 {
+async fn run_migrations_with(
+    client: &mut deadpool_postgres::Client,
+    allow_newer: bool,
+) -> StorageResult<()> {
+    let mut current_version = get_schema_version(client).await?;
+
+    if current_version == FORK_DIVERGED_VERSION && is_fork_stamped_v47(client).await? {
+        restamp_fork_v47(client).await?;
+        current_version = SCHEMA_VERSION;
+    }
+
+    if current_version > SCHEMA_VERSION {
+        if !allow_newer {
+            return Err(pg_error(format!(
+                "Database schema version {current_version} is newer than this build supports \
+                 ({SCHEMA_VERSION}). Refusing to start: an older HFS does not maintain what \
+                 the newer migrations added. Run the newer image, or restore the pre-upgrade \
+                 backup to roll back (docs/ops/upgrade.md). Set {ALLOW_NEWER_SCHEMA_ENV}=true \
+                 only if the release notes state the newer schema is backward compatible."
+            )));
+        }
+        tracing::warn!(
+            database = current_version,
+            binary = SCHEMA_VERSION,
+            "Starting against a newer PostgreSQL schema because {ALLOW_NEWER_SCHEMA_ENV} is set"
+        );
+    } else if current_version == 0 {
         create_schema_v1(client).await?;
         set_schema_version(client, 1).await?;
         migrate_schema(client, 1).await?;
@@ -99,7 +163,123 @@ async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult
         migrate_schema(client, current_version).await?;
     }
 
+    run_fork_migrations(client).await
+}
+
+/// True when a database stamped v47 carries the fork's old "v47" (the
+/// SearchParameter epoch table) and not upstream's v47 (the
+/// `idx_resources_reindex_id` index).
+async fn is_fork_stamped_v47(client: &deadpool_postgres::Client) -> StorageResult<bool> {
+    let row = client
+        .query_one(
+            "SELECT to_regclass('search_parameter_epochs') IS NOT NULL,
+                    to_regclass('idx_resources_reindex_id') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to inspect a v47 schema: {e}")))?;
+    let has_epochs: bool = row.get(0);
+    let has_upstream_v47: bool = row.get(1);
+    Ok(has_epochs && !has_upstream_v47)
+}
+
+/// Moves a fork-stamped v47 database onto the upstream ladder at v46 and
+/// records the epoch migration as applied, in one transaction, so the next
+/// upstream step (a real v46 -> v47) will run after a rebase.
+async fn restamp_fork_v47(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("Failed to begin fork v47 re-stamp: {e}")))?;
+    ensure_fork_migrations_table(&tx).await?;
+    tx.execute(
+        "INSERT INTO hm_schema_migrations (name, note) VALUES ($1, $2)
+         ON CONFLICT (name) DO NOTHING",
+        &[
+            &FORK_SEARCH_PARAMETER_EPOCHS,
+            &"re-stamped from upstream-ladder v47 (fork builds up to hm/p25-z)",
+        ],
+    )
+    .await
+    .map_err(|e| pg_error(format!("Failed to record fork migration: {e}")))?;
+    set_schema_version(&tx, SCHEMA_VERSION).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("Failed to commit fork v47 re-stamp: {e}")))?;
+    tracing::info!(
+        from = FORK_DIVERGED_VERSION,
+        to = SCHEMA_VERSION,
+        migration = FORK_SEARCH_PARAMETER_EPOCHS,
+        "Moved fork-stamped schema version back onto the upstream migration ladder"
+    );
     Ok(())
+}
+
+async fn ensure_fork_migrations_table<C>(client: &C) -> StorageResult<()>
+where
+    C: GenericClient + ?Sized,
+{
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hm_schema_migrations (
+                 name TEXT PRIMARY KEY,
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 note TEXT
+             )",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create hm_schema_migrations: {e}")))
+}
+
+/// Applies every entry of [`FORK_MIGRATIONS`] not yet recorded, in order.
+async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    ensure_fork_migrations_table(&*client).await?;
+    for name in FORK_MIGRATIONS {
+        let applied = client
+            .query_opt("SELECT 1 FROM hm_schema_migrations WHERE name = $1", &[name])
+            .await
+            .map_err(|e| pg_error(format!("Failed to read hm_schema_migrations: {e}")))?
+            .is_some();
+        if applied {
+            continue;
+        }
+        match *name {
+            FORK_SEARCH_PARAMETER_EPOCHS => fork_search_parameter_epochs(client).await?,
+            other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
+        }
+        client
+            .execute(
+                "INSERT INTO hm_schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+                &[name],
+            )
+            .await
+            .map_err(|e| pg_error(format!("Failed to record fork migration {name}: {e}")))?;
+        tracing::info!(migration = *name, "Applied fork schema migration");
+    }
+    Ok(())
+}
+
+/// The applied fork migrations, oldest first. Used by tests and the
+/// operational schema report.
+pub async fn applied_fork_migrations(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<Vec<String>> {
+    let exists: bool = client
+        .query_one("SELECT to_regclass('hm_schema_migrations') IS NOT NULL", &[])
+        .await
+        .map_err(|e| pg_error(format!("Failed to inspect hm_schema_migrations: {e}")))?
+        .get(0);
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query(
+            "SELECT name FROM hm_schema_migrations ORDER BY applied_at, name",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to read hm_schema_migrations: {e}")))?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
 }
 
 /// Get the current schema version.
@@ -443,7 +623,6 @@ async fn migrate_schema(
                 continue;
             }
             45 => migrate_v45_to_v46(client).await?,
-            46 => migrate_v46_to_v47(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4134,7 +4313,8 @@ async fn migrate_v45_to_v46(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v46 -> v47: a per-tenant SearchParameter epoch, bumped by trigger.
+/// Fork migration `hm-0001-search-parameter-epochs` (formerly shipped as
+/// upstream-ladder "v47"): a per-tenant SearchParameter epoch, bumped by trigger.
 ///
 /// Every indexed write needs the tenant's SearchParameter overlay, and it must
 /// be the persisted one: another HFS process may have changed it. Until now
@@ -4150,7 +4330,7 @@ async fn migrate_v45_to_v46(client: &deadpool_postgres::Client) -> StorageResult
 /// other resource type: the condition is evaluated without calling the
 /// function. TRUNCATE has no rows to test, so it bumps the row of the empty
 /// tenant id, which every reader adds to its own.
-async fn migrate_v46_to_v47(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn fork_search_parameter_epochs(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS search_parameter_epochs (
@@ -4189,7 +4369,7 @@ async fn migrate_v46_to_v47(client: &deadpool_postgres::Client) -> StorageResult
                  EXECUTE FUNCTION hfs_bump_search_parameter_epoch();",
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v46->v47 failed: {e}")))?;
+        .map_err(|e| pg_error(format!("Fork migration {FORK_SEARCH_PARAMETER_EPOCHS} failed: {e}")))?;
     Ok(())
 }
 
@@ -5104,6 +5284,147 @@ mod postgres_integration_migrations {
             .await
             .expect("read statement_timeout")
             .get(0)
+    }
+
+    async fn fresh_backend(prefix: &str) -> PostgresBackend {
+        create_database(
+            shared_pg().await,
+            &format!("{prefix}_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+    }
+
+    async fn regclass_exists(client: &deadpool_postgres::Client, name: &str) -> bool {
+        client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&name])
+            .await
+            .expect("to_regclass")
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_fresh_schema_records_fork_migrations_by_name() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("fork_fresh").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 46, "the fork must not take upstream numbers");
+        assert_eq!(
+            applied_fork_migrations(&client).await.unwrap(),
+            FORK_MIGRATIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(regclass_exists(&client, "search_parameter_epochs").await);
+
+        // A restart applies nothing twice.
+        initialize_schema(&mut client).await.expect("reinitialize");
+        assert_eq!(
+            applied_fork_migrations(&client).await.unwrap().len(),
+            FORK_MIGRATIONS.len()
+        );
+    }
+
+    /// The production database (fork builds up to hm/p25-z) is stamped v47
+    /// with the fork's epoch table. It must come back on the upstream ladder
+    /// at v46 with its data intact and the epoch migration recorded.
+    #[tokio::test]
+    async fn postgres_integration_fork_stamped_v47_is_restamped_without_data_loss() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("fork_v47").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+        client
+            .batch_execute(
+                "DROP TABLE hm_schema_migrations;
+                 INSERT INTO search_parameter_epochs (tenant_id, epoch) VALUES ('t1', 41)
+                 ON CONFLICT (tenant_id) DO UPDATE SET epoch = 41;
+                 INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated)
+                 VALUES ('t1', 'Patient', 'keep-me', '1', '{\"resourceType\":\"Patient\",\"id\":\"keep-me\"}', now());",
+            )
+            .await
+            .expect("shape the fork-v47 fixture");
+        set_schema_version(&client, FORK_DIVERGED_VERSION)
+            .await
+            .unwrap();
+        // The resources insert above bumps no epoch (not a SearchParameter).
+        initialize_schema(&mut client).await.expect("upgrade fork v47");
+
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            applied_fork_migrations(&client).await.unwrap(),
+            vec![FORK_SEARCH_PARAMETER_EPOCHS.to_string()]
+        );
+        let epoch: i64 = client
+            .query_one(
+                "SELECT epoch FROM search_parameter_epochs WHERE tenant_id = 't1'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(epoch, 41, "the re-stamp must not re-run or reset the epochs");
+        let kept: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = 't1' AND id = 'keep-me'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(kept, 1);
+    }
+
+    /// A v47 stamped by upstream (its reindex index, no fork epoch table) is a
+    /// genuinely newer schema for this build and must not be re-stamped.
+    #[tokio::test]
+    async fn postgres_integration_upstream_v47_is_not_mistaken_for_the_fork() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("upstream_v47").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+        client
+            .batch_execute(
+                "DROP TABLE search_parameter_epochs CASCADE;
+                 CREATE INDEX idx_resources_reindex_id
+                 ON resources (tenant_id, resource_type, id COLLATE \"C\")
+                 WHERE is_deleted = FALSE;",
+            )
+            .await
+            .unwrap();
+        set_schema_version(&client, 47).await.unwrap();
+
+        let err = run_migrations_with(&mut client, false)
+            .await
+            .expect_err("an upstream v47 is newer than this build");
+        assert!(err.to_string().contains("newer"), "{err}");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 47);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_newer_schema_is_refused_unless_allowed() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("newer_schema").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+        set_schema_version(&client, SCHEMA_VERSION + 10).await.unwrap();
+
+        let err = run_migrations_with(&mut client, false)
+            .await
+            .expect_err("refuse a newer schema");
+        assert!(err.to_string().contains(ALLOW_NEWER_SCHEMA_ENV), "{err}");
+
+        run_migrations_with(&mut client, true)
+            .await
+            .expect("allowed explicitly");
+        assert_eq!(
+            get_schema_version(&client).await.unwrap(),
+            SCHEMA_VERSION + 10,
+            "an allowed newer schema is never downgraded"
+        );
     }
 
     #[tokio::test]

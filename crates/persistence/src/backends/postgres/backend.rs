@@ -965,7 +965,7 @@ impl PostgresBackend {
         }
 
         let epoch = if cacheable {
-            // The empty tenant id is the TRUNCATE row (see migration v47):
+            // The empty tenant id is the TRUNCATE row (see fork migration hm-0001-search-parameter-epochs):
             // summing the two keeps the key monotonic for either kind of bump.
             let statement = client
                 .prepare_cached(
