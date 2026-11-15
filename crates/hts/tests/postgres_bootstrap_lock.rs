@@ -49,7 +49,14 @@ async fn db_url() -> &'static str {
     DB_URL
         .get_or_init(|| async {
             use testcontainers::{ImageExt, runners::AsyncRunner};
+            // An existing server (the same variable the shared HTS harness reads).
+            if let Ok(url) = std::env::var("HTS_TEST_PG_URL") {
+                return url;
+            }
+            // PostgreSQL 16 like production: the module's default (11) cannot
+            // apply the fork's HTS schema.
             let container = Postgres::default()
+                .with_tag("16-alpine")
                 .with_label(LABEL_KEY, LABEL_VALUE)
                 .start()
                 .await
