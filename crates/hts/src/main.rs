@@ -67,6 +67,10 @@ async fn run() -> anyhow::Result<()> {
             helios_observability::uptime::init();
             helios_observability::telemetry::init("hts", &config.log_level);
             helios_observability::metrics::init("hts");
+            helios_observability::build_info::set(
+                env!("CARGO_PKG_VERSION"),
+                option_env!("HFS_GIT_SHA").unwrap_or("unknown"),
+            );
             info!(
                 port = config.port,
                 host = %config.host,
@@ -269,6 +273,22 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     })?;
 
     info!("PostgreSQL resource store (helios-persistence) initialized");
+
+    // `postgres_pool_*{pool="terminology"|"resources"}` on /metrics, sampled
+    // at scrape time like HFS's `primary` / `audit` pools (#1907).
+    {
+        use helios_observability::pool_metrics::{PoolGauges, register_postgres_pool};
+        let gauges = |s: deadpool_postgres::Status| PoolGauges {
+            max_size: s.max_size,
+            size: s.size,
+            available: s.available,
+            waiting: s.waiting,
+        };
+        let terminology_pool = backend.pool().clone();
+        register_postgres_pool("terminology", move || gauges(terminology_pool.status()));
+        let resources = resource_store.clone();
+        register_postgres_pool("resources", move || gauges(resources.pool_status()));
+    }
 
     let state = helios_hts::state::AppState::new(backend.clone())
         .with_resource_store_pg(resource_store)

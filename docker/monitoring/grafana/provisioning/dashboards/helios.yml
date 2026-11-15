@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: helios
+    folder: Helios
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

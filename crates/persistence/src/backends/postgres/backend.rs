@@ -965,7 +965,7 @@ impl PostgresBackend {
         }
 
         let epoch = if cacheable {
-            // The empty tenant id is the TRUNCATE row (see migration v47):
+            // The empty tenant id is the TRUNCATE row (see fork migration hm-0001-search-parameter-epochs):
             // summing the two keeps the key monotonic for either kind of bump.
             let statement = client
                 .prepare_cached(
@@ -1154,6 +1154,19 @@ impl PostgresBackend {
     /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
     pub(crate) fn pool(&self) -> Pool {
         self.pool.clone()
+    }
+
+    /// A point-in-time snapshot of the connection pool: the configured ceiling
+    /// (`max_size`), the connections currently open (`size`), the open ones
+    /// that are idle (`available`) and the callers parked waiting for one
+    /// (`waiting`). Read by the server's `/metrics` scrape (#1907).
+    ///
+    /// `size` grows lazily up to `max_size`. A caller still opening a new
+    /// connection below `max_size` counts as `waiting` until it is open; a
+    /// [`get_client`](Self::get_client) caller sleeping between connect
+    /// retries is not counted.
+    pub fn pool_status(&self) -> super::PoolStatus {
+        self.pool.status()
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.

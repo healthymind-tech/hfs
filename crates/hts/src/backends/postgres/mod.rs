@@ -864,10 +864,61 @@ fn default_pool_size() -> usize {
         .unwrap_or(DEFAULT_POOL_SIZE)
 }
 
+/// Optional pool timeouts and session settings read from the environment.
+///
+/// All three are opt-in so an upgrade changes nothing by default:
+///
+/// - `HTS_PG_POOL_WAIT_TIMEOUT_SECS` — how long a request waits for a free
+///   connection before failing (deadpool's default is forever, which turns a
+///   saturated database into an unbounded latency tail).
+/// - `HTS_PG_CONNECT_TIMEOUT_SECS` — bound on opening a new connection.
+/// - `HTS_PG_STATEMENT_TIMEOUT_MS` — server-side `statement_timeout` for every
+///   pooled session. Leave unset if the server also runs large imports
+///   (`hts import`, IG terminology batches): those run long statements.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolTuning {
+    pub wait_timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    pub statement_timeout_ms: Option<u64>,
+}
+
+impl PoolTuning {
+    pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let num = |k: &str| {
+            get(k)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        };
+        Self {
+            wait_timeout_secs: num("HTS_PG_POOL_WAIT_TIMEOUT_SECS"),
+            connect_timeout_secs: num("HTS_PG_CONNECT_TIMEOUT_SECS"),
+            statement_timeout_ms: num("HTS_PG_STATEMENT_TIMEOUT_MS"),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    fn apply(&self, cfg: &mut Config, size: usize) {
+        let mut pool = deadpool_postgres::PoolConfig::new(size.max(1));
+        pool.timeouts.wait = self.wait_timeout_secs.map(std::time::Duration::from_secs);
+        pool.timeouts.create = self
+            .connect_timeout_secs
+            .map(std::time::Duration::from_secs);
+        cfg.pool = Some(pool);
+        if let Some(ms) = self.statement_timeout_ms {
+            // Startup-packet option, so every connection the pool opens later
+            // carries it too (a post-connect SET binds one session only).
+            cfg.options = Some(format!("-c statement_timeout={ms}"));
+        }
+    }
+}
+
 fn build_pool(database_url: &str, size: usize) -> Result<Pool, HtsError> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
-    cfg.pool = Some(deadpool_postgres::PoolConfig::new(size.max(1)));
+    PoolTuning::from_env().apply(&mut cfg, size);
     cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
         HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
     })
@@ -2151,4 +2202,56 @@ async fn write_concept_map(
 
     stats.concept_maps += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod pool_tuning_tests {
+    use super::*;
+
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn unset_tuning_changes_nothing() {
+        let t = PoolTuning::from_lookup(lookup(&[]));
+        assert_eq!(t, PoolTuning::default());
+        let mut cfg = Config::new();
+        t.apply(&mut cfg, 32);
+        let pool = cfg.pool.unwrap();
+        assert_eq!(pool.max_size, 32);
+        assert_eq!(pool.timeouts.wait, None);
+        assert_eq!(pool.timeouts.create, None);
+        assert_eq!(cfg.options, None);
+    }
+
+    #[test]
+    fn tuning_sets_timeouts_and_statement_timeout_option() {
+        let t = PoolTuning::from_lookup(lookup(&[
+            ("HTS_PG_POOL_WAIT_TIMEOUT_SECS", "30"),
+            ("HTS_PG_CONNECT_TIMEOUT_SECS", " 5 "),
+            ("HTS_PG_STATEMENT_TIMEOUT_MS", "60000"),
+        ]));
+        let mut cfg = Config::new();
+        t.apply(&mut cfg, 0);
+        let pool = cfg.pool.unwrap();
+        assert_eq!(pool.max_size, 1, "a zero size is clamped to one");
+        assert_eq!(pool.timeouts.wait, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(pool.timeouts.create, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(cfg.options.as_deref(), Some("-c statement_timeout=60000"));
+    }
+
+    #[test]
+    fn invalid_or_zero_values_are_ignored() {
+        let t = PoolTuning::from_lookup(lookup(&[
+            ("HTS_PG_POOL_WAIT_TIMEOUT_SECS", "soon"),
+            ("HTS_PG_STATEMENT_TIMEOUT_MS", "0"),
+        ]));
+        assert_eq!(t, PoolTuning::default());
+    }
 }

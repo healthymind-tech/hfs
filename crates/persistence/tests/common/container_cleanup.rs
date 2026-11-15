@@ -35,9 +35,21 @@ static OWNER_LABEL_VALUE: LazyLock<String> = LazyLock::new(|| {
 static CONTAINER_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Labels a container request so it is force-removed when this process exits.
+///
+/// When `HELIOS_TEST_CONTAINER_PREFIX` is set, the container is also given a
+/// predictable name, `<prefix>-<pid>-<n>`, so shared Docker hosts whose
+/// policy requires owner-prefixed container names can run these tests.
 pub fn with_cleanup_label<I: Image>(request: impl ImageExt<I>) -> ContainerRequest<I> {
     CONTAINER_REQUESTED.store(true, Ordering::SeqCst);
-    request.with_label(OWNER_LABEL_KEY, OWNER_LABEL_VALUE.as_str())
+    let request = request.with_label(OWNER_LABEL_KEY, OWNER_LABEL_VALUE.as_str());
+    match std::env::var("HELIOS_TEST_CONTAINER_PREFIX") {
+        Ok(prefix) if !prefix.trim().is_empty() => {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            request.with_container_name(format!("{}-{}-{n}", prefix.trim(), std::process::id()))
+        }
+        _ => request,
+    }
 }
 
 #[ctor::dtor]

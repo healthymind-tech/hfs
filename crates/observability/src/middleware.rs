@@ -24,6 +24,14 @@
 //! concrete IDs. The tenant is recorded as a *span attribute* only (useful for
 //! per-tenant latency in traces) and is never a metric label, to avoid
 //! unbounded Prometheus series.
+//!
+//! A router mounted as a **fallback service** (HFS mounts its whole FHIR API
+//! that way, behind the tenant-prefix rewrite) matches its route only after
+//! [`track`] has looked at the request, so `MatchedPath` is not there yet.
+//! Such routers add [`expose_matched_path`] as a `route_layer`; it copies the
+//! template onto the response as [`MatchedRoute`], and [`track`] uses it when
+//! the request itself carried none. Without it every FHIR interaction was
+//! counted as `route="<unmatched>"`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -166,6 +174,26 @@ fn status_label(status: u16) -> Cow<'static, str> {
     }
 }
 
+/// The route template an inner router matched, carried on the response so an
+/// outer [`track`] can label the request with it (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchedRoute(pub Arc<str>);
+
+/// `route_layer` middleware for routers mounted behind a fallback service:
+/// publishes the matched route template on the response as [`MatchedRoute`].
+/// Only the template is copied (e.g. `/{resource_type}/{id}`), never the URI.
+pub async fn expose_matched_path(req: Request, next: Next) -> Response {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| MatchedRoute(Arc::from(m.as_str())));
+    let mut response = next.run(req).await;
+    if let Some(route) = route {
+        response.extensions_mut().insert(route);
+    }
+    response
+}
+
 /// Tower/axum middleware (`axum::middleware::from_fn`) that instruments every
 /// request. State-free, so it composes with any server's router.
 pub async fn track(req: Request, next: Next) -> Response {
@@ -184,10 +212,12 @@ pub async fn track(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     // `Arc<str>` (not `String`): the metric-handle cache key holds a clone of the
     // route, and an `Arc` clone is a refcount bump rather than a fresh allocation.
-    let route: Arc<str> = req
+    let outer_route: Option<Arc<str>> = req
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| Arc::from(m.as_str()))
+        .map(|m| Arc::from(m.as_str()));
+    let route_for_span: Arc<str> = outer_route
+        .clone()
         .unwrap_or_else(|| Arc::from("<unmatched>"));
     // Only the span and the reqlog rollup use the tenant; skip the header scan
     // and its allocation when neither is active.
@@ -206,16 +236,19 @@ pub async fn track(req: Request, next: Next) -> Response {
         let span = tracing::info_span!(
             "http.request",
             http.method = %method,
-            http.route = %route,
+            http.route = tracing::field::Empty,
             tenant = %tenant,
             http.status_code = tracing::field::Empty,
         );
         let response = next.run(req).instrument(span.clone()).await;
         span.record("http.status_code", response.status().as_u16());
+        let route = resolve_route(outer_route.as_ref(), &response, &route_for_span);
+        span.record("http.route", &*route);
         response
     } else {
         next.run(req).await
     };
+    let route = resolve_route(outer_route.as_ref(), &response, &route_for_span);
     let elapsed = start.elapsed().as_secs_f64();
     let status = response.status().as_u16();
 
@@ -232,6 +265,98 @@ pub async fn track(req: Request, next: Next) -> Response {
     }
 
     response
+}
+
+/// The outer router's template if it matched, else the inner router's
+/// [`MatchedRoute`], else `<unmatched>`.
+fn resolve_route(outer: Option<&Arc<str>>, response: &Response, unmatched: &Arc<str>) -> Arc<str> {
+    match outer {
+        Some(route) => route.clone(),
+        None => response
+            .extensions()
+            .get::<MatchedRoute>()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| unmatched.clone()),
+    }
+}
+
+#[cfg(test)]
+mod matched_route_tests {
+    use super::*;
+    use axum::{Router, body::Body, routing::get};
+    use tower::ServiceExt;
+
+    /// The shape HFS uses: the FHIR router behind `fallback_service`, `track`
+    /// outside it. The inner template must reach the outer middleware.
+    #[tokio::test]
+    async fn fallback_service_routes_are_labelled_with_the_inner_template() {
+        let inner = Router::new()
+            .route("/{resource_type}/{id}", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn(expose_matched_path));
+        let app = Router::new()
+            .route("/metrics", get(|| async { "m" }))
+            .fallback_service(inner)
+            .layer(axum::middleware::from_fn(
+                |req: Request, next: Next| async move {
+                    let outer = req
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map(|m| Arc::<str>::from(m.as_str()));
+                    let response = next.run(req).await;
+                    let route = resolve_route(outer.as_ref(), &response, &Arc::from("<unmatched>"));
+                    let mut response = response;
+                    response
+                        .headers_mut()
+                        .insert("x-route", route.parse().unwrap());
+                    response
+                },
+            ));
+        let route_of = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                resp.headers()["x-route"].to_str().unwrap().to_string()
+            }
+        };
+        assert_eq!(route_of("/Patient/123").await, "/{resource_type}/{id}");
+        assert_eq!(route_of("/metrics").await, "/metrics");
+        assert_eq!(route_of("/a/b/c/d").await, "<unmatched>");
+    }
+
+    /// End to end through `track` itself: the metric carries the template.
+    #[tokio::test(flavor = "current_thread")]
+    async fn track_counts_fallback_service_requests_under_the_inner_template() {
+        let recorder = crate::metrics::builder("test").build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let inner = Router::new()
+            .route("/{resource_type}/{id}/_p3_route_test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn(expose_matched_path));
+        let app = Router::new()
+            .fallback_service(inner)
+            .layer(axum::middleware::from_fn(track));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Patient/42/_p3_route_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = handle.render();
+        assert!(
+            text.lines().any(|l| l.starts_with("http_requests_total")
+                && l.contains("route=\"/{resource_type}/{id}/_p3_route_test\"")
+                && l.ends_with(" 1")),
+            "{text}"
+        );
+        assert!(!text.contains("Patient/42"), "no concrete ids in labels: {text}");
+    }
 }
 
 #[cfg(test)]

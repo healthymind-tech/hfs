@@ -1,0 +1,69 @@
+# HFS. replicas: 1 until Phase 3 item 4 (clustering: Subscriptions and export
+# job state externalised) is done -- several instances can share the database
+# (schema migration is serialised by an advisory lock) but subscription and
+# bulk-export workers are per process today.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hfs
+  labels: {app: hfs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}           # migrations run at startup; avoid old+new side by side
+  selector: {matchLabels: {app: hfs}}
+  template:
+    metadata:
+      labels: {app: hfs}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, runAsNonRoot: true}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: hfs
+          image: healthymind/hfs
+          ports: [{name: http, containerPort: 8080}]
+          envFrom: [{configMapRef: {name: hfs-config}}]
+          env:
+            - name: HFS_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: hfs-secrets, key: hfs-db-url}}
+            - name: HFS_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: hfs-secrets, key: admin-password}}
+            - name: HFS_TERMINOLOGY_SERVER_TOKEN
+              valueFrom: {secretKeyRef: {name: hfs-secrets, key: admin-password}}
+          resources:
+            requests: {cpu: "2", memory: 1Gi}
+            limits: {memory: 6Gi}          # large transaction Bundles peak at ~3-5 GB
+          startupProbe:                    # first start seeds 1,372 SearchParameters (~60 s); migrations can take longer
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 180
+          readinessProbe:
+            httpGet: {path: /metadata, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: hfs-data}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: hfs-data}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 50Gi}}   # bulk export output + package cache
+---
+apiVersion: v1
+kind: Service
+metadata: {name: hfs, labels: {app: hfs}}
+spec:
+  selector: {app: hfs}
+  ports: [{name: http, port: 8080, targetPort: http}]

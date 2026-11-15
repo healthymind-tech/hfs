@@ -1,0 +1,78 @@
+# PostgreSQL via the CloudNativePG operator (https://cloudnative-pg.io): it
+# provides streaming replicas, automated failover, continuous WAL archiving and
+# base backups to an object store, and point-in-time recovery -- the things
+# docker/production does with scripts/ops/*.sh. Install the operator first.
+# Two databases (hfs, hts) with their own owners; hts is created by the
+# post-init SQL below.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hfs-db
+spec:
+  instances: 2                       # primary + 1 synchronous-capable replica
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.10
+  storage:
+    size: 200Gi
+    storageClass: fast-ssd           # site specific
+  walStorage:
+    size: 50Gi
+    storageClass: fast-ssd
+  bootstrap:
+    initdb:
+      database: hfs
+      owner: hfs
+      postInitSQL:
+        - CREATE ROLE hts LOGIN
+        - CREATE DATABASE hts OWNER hts
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS pg_trgm
+        - CREATE EXTENSION IF NOT EXISTS btree_gin
+        - CREATE EXTENSION IF NOT EXISTS pg_stat_statements
+  managed:
+    roles:
+      - name: hts
+        ensure: present
+        login: true
+        passwordSecret: {name: hts-db-credentials}   # kubernetes.io/basic-auth secret
+  postgresql:
+    shared_preload_libraries: [pg_stat_statements]
+    parameters:
+      shared_buffers: 6GB
+      effective_cache_size: 18GB
+      work_mem: 32MB
+      maintenance_work_mem: 1GB
+      max_connections: "200"
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      max_wal_size: 8GB
+      checkpoint_timeout: 15min
+      wal_compression: lz4
+      log_min_duration_statement: "1000"
+      track_io_timing: "on"
+      idle_in_transaction_session_timeout: 10min
+      autovacuum_vacuum_scale_factor: "0.05"
+      autovacuum_analyze_scale_factor: "0.02"
+      jit: "off"
+  resources:
+    requests: {cpu: "4", memory: 24Gi}
+    limits: {memory: 24Gi}
+  monitoring:
+    enablePodMonitor: true           # needs the Prometheus operator
+  backup:
+    retentionPolicy: 30d
+    barmanObjectStore:
+      destinationPath: s3://hospital-backups/hfs-db   # site specific
+      s3Credentials:
+        accessKeyId: {name: backup-s3, key: ACCESS_KEY_ID}
+        secretAccessKey: {name: backup-s3, key: ACCESS_SECRET_KEY}
+      wal: {compression: gzip}
+      data: {compression: gzip}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: hfs-db-nightly
+spec:
+  schedule: "0 0 2 * * *"            # 02:00 every day (seconds field first)
+  backupOwnerReference: self
+  cluster: {name: hfs-db}

@@ -1,0 +1,23 @@
+# Minimal Kubernetes deployment of HFS + HTS on PostgreSQL.
+#   kubectl create namespace hfs
+#   kubectl -n hfs create secret generic hfs-secrets \
+#     --from-literal=hfs-db-url='postgres://hfs:...@hfs-db-rw:5432/hfs' \
+#     --from-literal=hts-db-url='postgresql://hts:...@hfs-db-rw:5432/hts' \
+#     --from-literal=admin-password='...'
+#   kubectl apply -k docker/kubernetes
+# See docs/ops/deployment.md#kubernetes for prerequisites (CloudNativePG
+# operator, an object store for WAL/base backups, an ingress controller).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hfs
+resources:
+  - postgres-cluster.yaml
+  - config.yaml
+  - hts.yaml
+  - hfs.yaml
+  - ingress.yaml
+images:
+  - name: healthymind/hfs
+    newTag: REPLACE_WITH_TAG
+  - name: healthymind/hts
+    newTag: REPLACE_WITH_TAG
