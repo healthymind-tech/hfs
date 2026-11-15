@@ -104,6 +104,13 @@ SEARCHES = [
     ("condition_patient", f"/Condition?patient=Patient/{P}"),
     ("medreq_patient_status", f"/MedicationRequest?patient=Patient/{P}&status=active"),
     ("patient_everything", f"/Patient/{P}/$everything?_count=1000"),
+    # broad, highly correlated token memberships: the shapes the search_index
+    # extended statistics were introduced for (schema v15 / v16)
+    ("encounter_status_finished", "/Encounter?status=finished&_count=20"),
+    ("obs_category_laboratory", "/Observation?category=laboratory&_count=20"),
+    ("obs_status_final_code", f"/Observation?status=final&code={q(CS + '|' + CD)}&_count=20"),
+    ("obs_category_date", "/Observation?category=vital-signs&date=ge2020-01-01&_count=20"),
+    ("condition_code", "/Condition?code=http://snomed.info/sct|44054006&_count=20"),
 ]
 if a.only:
     keep = set(a.only.split(","))
