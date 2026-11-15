@@ -4897,6 +4897,15 @@ impl PostgresBackend {
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
+                        // A deleted resource is brought back to life by an
+                        // update (FHIR http.html#delete), continuing its
+                        // version chain; inserting it afresh would collide
+                        // with the soft-deleted row.
+                        if let Some(restored) =
+                            tx.restore_deleted(&resource_type, &id, resource.clone()).await?
+                        {
+                            return Ok(BundleEntryResult::created(restored));
+                        }
                         // Create new resource with specified ID
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);

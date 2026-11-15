@@ -10084,6 +10084,60 @@ mod postgres_integration {
         }
     }
 
+    /// A transaction-bundle `PUT` to a deleted id brings the resource back
+    /// with the next version (FHIR http.html#delete) instead of conflicting
+    /// with the soft-deleted row.
+    #[tokio::test]
+    async fn postgres_integration_transaction_put_resurrects_a_deleted_resource() {
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-put-after-delete");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "lazarus"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "lazarus").await.unwrap();
+
+        let put = BundleEntry {
+            method: BundleMethod::Put,
+            url: "Patient/lazarus".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "id": "lazarus",
+                                  "name": [{"family": "Back"}]})),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        let result = backend
+            .process_transaction(&tenant, vec![put], FhirVersion::default())
+            .await
+            .expect("transaction PUT to a deleted id");
+        assert_eq!(result.entries[0].status, 201, "{:?}", result.entries[0]);
+
+        let stored = backend.read(&tenant, "Patient", "lazarus").await.unwrap().unwrap();
+        assert_eq!(stored.version_id(), "3", "create 1, delete 2, resurrect 3");
+        assert_eq!(stored.content()["name"][0]["family"], "Back");
+        let history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "lazarus",
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 3);
+        // Searchable again.
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
     fn if_none_exist_entry(family: &str, full_url: &str) -> helios_persistence::core::BundleEntry {
         use helios_persistence::core::{BundleEntry, BundleMethod};
         BundleEntry {

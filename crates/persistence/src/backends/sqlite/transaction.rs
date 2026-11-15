@@ -224,24 +224,35 @@ impl SqliteTransaction {
             .map(|s| s.to_string())
             .unwrap_or_else(Self::generate_id);
 
-        // Check if resource already exists
-        let exists: bool = {
+        // Check if resource already exists. A soft-deleted row is not a live
+        // resource: a PUT to a deleted id inside a transaction bundle reaches
+        // here (the transaction read reports the row as absent) and must bring
+        // the resource back with the next version (FHIR http.html#delete),
+        // not fail as a duplicate.
+        let existing: Option<(bool, String)> = {
             let _span = perf::span(Phase::CreateExists);
             conn.prepare_cached(
-                "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                "SELECT is_deleted, version_id FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             )
             .and_then(|mut stmt| {
-                stmt.query_row(params![tenant_id, resource_type, id], |_| Ok(true))
+                stmt.query_row(params![tenant_id, resource_type, id], |row| {
+                    Ok((row.get::<_, i32>(0)? != 0, row.get::<_, String>(1)?))
+                })
             })
-            .unwrap_or(false)
+            .ok()
         };
 
-        if exists {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
+        let prior_deleted_version = match existing {
+            Some((true, version)) => Some(version.parse::<u64>().unwrap_or(0)),
+            Some((false, _)) => {
+                return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            None => None,
+        };
 
         // Build the resource with id and resourceType
         let mut data = {
@@ -265,12 +276,28 @@ impl SqliteTransaction {
 
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
-        let version_id = "1";
+        let version_string = match prior_deleted_version {
+            Some(deleted_at_version) => (deleted_at_version + 1).to_string(),
+            None => "1".to_string(),
+        };
+        let version_id = version_string.as_str();
 
         let fhir_version_str = self.fhir_version.as_mime_param();
 
-        // Insert the resource
-        {
+        if prior_deleted_version.is_some() {
+            // Resurrect the soft-deleted row in place, continuing its
+            // version chain.
+            let _span = perf::span(Phase::ResourceInsert);
+            conn.prepare_cached(
+                "UPDATE resources SET version_id = ?4, data = ?5, last_updated = ?6,
+                     is_deleted = 0, deleted_at = NULL, fhir_version = ?7
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare resource restore: {}", e)))?
+            .execute(params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str])
+            .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
+        } else {
+            // Insert the resource
             let _span = perf::span(Phase::ResourceInsert);
             conn.prepare_cached(
                 "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
@@ -293,9 +320,19 @@ impl SqliteTransaction {
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
         }
 
-        // Index the resource for search. Nothing to clear: the existence
-        // probe above established there is no row for this id.
-        self.index_resource(&conn, tenant_id, resource_type, &id, &data, false, prepared)?;
+        // Index the resource for search. Nothing to clear on a plain create:
+        // the existence probe established there is no row for this id. A
+        // resurrected row may still have index rows from before its delete.
+        let clear_stale_rows = prior_deleted_version.is_some();
+        self.index_resource(
+            &conn,
+            tenant_id,
+            resource_type,
+            &id,
+            &data,
+            clear_stale_rows,
+            prepared,
+        )?;
         drop(conn);
 
         // Mirrors the storage path: an overlay-affecting SearchParameter
