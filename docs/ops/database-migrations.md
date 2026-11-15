@@ -47,6 +47,7 @@ Fork migrations in this build:
 | `hm-0003-subscription-cluster-delivery` | `subscription_state`, `subscription_notification_events`, `subscription_delivery_outbox`, `subscription_ws_tokens` | same upstream branch (v16→v17) |
 | `hm-0004-resource-change-feed` | `resource_change_feed` + StructureDefinition triggers | fork (hm/p3-cluster) |
 | `hm-0005-package-jobs` | `hfs_package_jobs` | fork (hm/p3-cluster) |
+| `hm-0006-search-index-statistics` | dependency-only extended statistics on `search_index`, token statistics target 1000, ANALYZE ([index-strategy.md §4](index-strategy.md#4-planning-cost-and-extended-statistics-hm-0006)) | fork (hm/p3-pgops2) |
 
 hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
 this track when it was merged with hm/p3-pgops (upstream has its own v48+). No

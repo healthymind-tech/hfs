@@ -61,7 +61,19 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_SUBSCRIPTION_CLUSTER,
     FORK_RESOURCE_CHANGE_FEED,
     FORK_PACKAGE_JOBS,
+    FORK_SEARCH_INDEX_STATISTICS,
 ];
+
+/// Fork migration replacing the `search_index` extended statistics with
+/// dependency-only objects and lowering the token column's statistics
+/// target. Numbered after line F's `hm-0002`..`hm-0005`; fork migrations
+/// are applied by name, so the gap on branches without them is harmless.
+pub const FORK_SEARCH_INDEX_STATISTICS: &str = "hm-0006-search-index-statistics";
+
+/// Statistics target for `search_index.value_token_code` after
+/// [`FORK_SEARCH_INDEX_STATISTICS`] (was 4000 since v16). See
+/// [`fork_search_index_statistics`].
+pub const TOKEN_CODE_STATISTICS_TARGET: i32 = 1000;
 
 /// Environment switch that lets this binary start against a database whose
 /// upstream schema version is newer than [`SCHEMA_VERSION`]. Off by default:
@@ -270,6 +282,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_SUBSCRIPTION_CLUSTER => fork_subscription_cluster_delivery(client).await?,
             FORK_RESOURCE_CHANGE_FEED => fork_resource_change_feed(client).await?,
             FORK_PACKAGE_JOBS => fork_package_jobs(client).await?,
+            FORK_SEARCH_INDEX_STATISTICS => fork_search_index_statistics(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client
@@ -4399,6 +4412,71 @@ async fn fork_search_parameter_epochs(client: &deadpool_postgres::Client) -> Sto
     Ok(())
 }
 
+/// Fork migration `hm-0006-search-index-statistics`: keep the extended
+/// statistics on `search_index` that change plans, drop the ones that only
+/// cost planning time.
+///
+/// v15/v16/v43 created three `(mcv, dependencies)` objects —
+/// `(resource_type, param_name, value_token_code)`, `(…, value_date)` and
+/// `(…, value_date_end)` — and raised `value_token_code`'s statistics target to
+/// 4000, so the token object's MCV list was built at 4000 items. PostgreSQL
+/// deserialises an MCV list and tests every item against the clauses on every
+/// planning of every statement over `search_index`; it is not cached between
+/// queries. Measured on 2.24M Synthea resources / 30.9M `search_index` rows
+/// (PostgreSQL 16.10, `EXPLAIN (SUMMARY)` median of 22 warm runs):
+///
+/// | predicate | before | after |
+/// |---|---|---|
+/// | `code=` token membership | 1.46 ms | 0.22 ms |
+/// | `Encounter?status=` | 1.42 ms | 0.18 ms |
+/// | 35-way chained reference `IN` | 17.2 ms | 3.1 ms |
+/// | code + date membership | 2.47 ms | 0.62 ms |
+///
+/// Execution stayed the same or improved across the 28-search benchmark
+/// (sum of medians 1,204 → 971 ms). The *dependencies* part is what fixes the
+/// estimates the v15 commentary describes (`Encounter?status=finished`,
+/// `Observation?patient=&category=`: 6.8 ms with it, 3,381 ms with no extended
+/// statistics at all); the MCV lists added nothing measurable — at statistics
+/// target 100 they made `code&date` and `status&code` ~40x slower than either
+/// no MCV or the full 4000-item list. The date objects' dependencies are
+/// implied by `stx_search_type_param` and their MCV lists cannot help range
+/// predicates, so they go entirely.
+///
+/// `value_token_code` drops to [`TOKEN_CODE_STATISTICS_TARGET`]: `ANALYZE
+/// search_index` samples 300 × the largest column target, so 4000 meant 1.2M
+/// sampled rows and 62–80 s per analyze at this size (autovacuum pays that
+/// too); 1000 takes ~10 s with the same plans.
+///
+/// Every statement is idempotent, so the migration is safe to re-run and safe
+/// after an upstream migration that already changed these objects. The closing
+/// `ANALYZE` runs without a statement timeout: the replacement object has no
+/// data until it is analysed, and a `search_index` without dependency
+/// statistics turns `Observation?patient=&category=` into a multi-second scan.
+async fn fork_search_index_statistics(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let statements = [
+        "DROP STATISTICS IF EXISTS stx_search_type_param_date".to_string(),
+        "DROP STATISTICS IF EXISTS stx_search_type_param_date_end".to_string(),
+        "DROP STATISTICS IF EXISTS stx_search_type_param_token".to_string(),
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_token_dep (dependencies)
+         ON resource_type, param_name, value_token_code FROM search_index"
+            .to_string(),
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param (dependencies)
+         ON resource_type, param_name FROM search_index"
+            .to_string(),
+        format!(
+            "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS {TOKEN_CODE_STATISTICS_TARGET}"
+        ),
+    ];
+    for sql in &statements {
+        client.execute(sql.as_str(), &[]).await.map_err(|e| {
+            pg_error(format!(
+                "Fork migration {FORK_SEARCH_INDEX_STATISTICS} failed: {e}"
+            ))
+        })?;
+    }
+    analyze_search_index_with_timeout(client, "0").await
+}
+
 const PATIENT_EXPORT_INDEX_NAME: &str = "idx_resources_patient_refs_v1";
 
 /// Verify the exact expression and live-row predicate before the export path
@@ -5522,7 +5600,7 @@ mod postgres_integration_migrations {
             .expect("initialize current schema fixture");
         client
             .batch_execute(
-                "DROP STATISTICS stx_search_type_param_date_end;
+                "DROP STATISTICS IF EXISTS stx_search_type_param_date_end;
                  DROP INDEX idx_search_date_end;
                  DROP INDEX idx_search_date;
                  DROP INDEX idx_search_date_recent;
@@ -5693,6 +5771,119 @@ mod postgres_integration_migrations {
             .unwrap()
             .get(0);
         assert_eq!(kept, 1);
+    }
+
+    /// `(name, kinds, has dependency data)` of every extended statistics
+    /// object on `search_index`, by name.
+    async fn search_index_extended_statistics(
+        client: &deadpool_postgres::Client,
+    ) -> Vec<(String, String, bool)> {
+        client
+            .query(
+                "SELECT s.stxname::text, array_to_string(s.stxkind, ''),
+                        d.stxddependencies IS NOT NULL
+                 FROM pg_statistic_ext s
+                 LEFT JOIN pg_statistic_ext_data d ON d.stxoid = s.oid
+                 WHERE s.stxrelid = 'search_index'::regclass
+                 ORDER BY 1",
+                &[],
+            )
+            .await
+            .expect("read extended statistics")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect()
+    }
+
+    async fn token_code_statistics_target(client: &deadpool_postgres::Client) -> i32 {
+        client
+            .query_one(
+                "SELECT attstattarget::int FROM pg_attribute
+                 WHERE attrelid = 'search_index'::regclass AND attname = 'value_token_code'",
+                &[],
+            )
+            .await
+            .expect("read statistics target")
+            .get(0)
+    }
+
+    /// hm-0006: only dependency statistics remain on `search_index`, they are
+    /// analysed (usable by the planner right away), and the token column's
+    /// target is lowered.
+    #[tokio::test]
+    async fn postgres_integration_search_index_statistics_are_dependency_only() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("stx_fresh").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+
+        let stats = search_index_extended_statistics(&client).await;
+        assert_eq!(
+            stats
+                .iter()
+                .map(|s| (s.0.as_str(), s.1.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("stx_search_type_param", "f"),
+                ("stx_search_type_param_token_dep", "f"),
+            ]
+        );
+        assert_eq!(
+            token_code_statistics_target(&client).await,
+            TOKEN_CODE_STATISTICS_TARGET
+        );
+        assert!(
+            applied_fork_migrations(&client)
+                .await
+                .unwrap()
+                .contains(&FORK_SEARCH_INDEX_STATISTICS.to_string())
+        );
+    }
+
+    /// A database built before hm-0006 (the v15/v16/v43 MCV objects and the
+    /// 4000 target) is converted, and a second start changes nothing.
+    #[tokio::test]
+    async fn postgres_integration_search_index_statistics_upgrade_is_idempotent() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("stx_upgrade").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+        client
+            .batch_execute(
+                "DROP STATISTICS stx_search_type_param_token_dep;
+                 ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 4000;
+                 CREATE STATISTICS stx_search_type_param_token (mcv, dependencies)
+                   ON resource_type, param_name, value_token_code FROM search_index;
+                 CREATE STATISTICS stx_search_type_param_date (mcv, dependencies)
+                   ON resource_type, param_name, value_date FROM search_index;
+                 CREATE STATISTICS stx_search_type_param_date_end (mcv, dependencies)
+                   ON resource_type, param_name, value_date_end FROM search_index;
+                 DELETE FROM hm_schema_migrations WHERE name = 'hm-0006-search-index-statistics';
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 't', CASE WHEN g % 2 = 0 THEN 'Encounter' ELSE 'Observation' END, 'r' || g,
+                        CASE WHEN g % 2 = 0 THEN 'status' ELSE 'category' END,
+                        CASE WHEN g % 2 = 0 THEN 'finished' ELSE 'laboratory' END, now()
+                 FROM generate_series(1, 2000) g;",
+            )
+            .await
+            .expect("rebuild the pre-hm-0006 statistics");
+        assert_eq!(search_index_extended_statistics(&client).await.len(), 4);
+
+        initialize_schema(&mut client).await.expect("upgrade");
+        let after = search_index_extended_statistics(&client).await;
+        assert_eq!(
+            after.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(),
+            vec!["stx_search_type_param", "stx_search_type_param_token_dep"]
+        );
+        // dependency-only, and analysed by the migration itself
+        assert!(after.iter().all(|s| s.1 == "f" && s.2), "{after:?}");
+        assert_eq!(
+            token_code_statistics_target(&client).await,
+            TOKEN_CODE_STATISTICS_TARGET
+        );
+
+        initialize_schema(&mut client).await.expect("restart");
+        assert_eq!(search_index_extended_statistics(&client).await, after);
     }
 
     /// A v47 stamped by upstream (its reindex index, no fork epoch table) is a

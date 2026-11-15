@@ -132,3 +132,101 @@ build `a3a0f9f88`) measured `code=…&date=ge…` at 314 ms p50 and
 - Run `scripts/ops/search-bench.py` after loading the hospital's real data
   (HAPI export) and after every upstream merge; compare against this table.
 
+
+## 4. Planning cost and extended statistics (hm-0006)
+
+Line E found every search spending 8–17 ms in planning and < 0.3 ms executing
+at 3.17M resources. Re-measured on 2,243,604 Synthea resources (line E's 25k
+set, first 10,000 patients) / 30.9M `search_index` rows / 26 GB (search_index
+16 GB = 61%), native PostgreSQL 16.10, `pg_stat_statements.track_planning`.
+
+**Cause.** `search_index` carried three `(mcv, dependencies)` extended
+statistics objects — `(resource_type, param_name, value_token_code)` from v15,
+`(…, value_date)` from v16 and `(…, value_date_end)` from v43 — with
+`value_token_code` at statistics target 4000. The planner deserialises each
+applicable MCV list and tests every item on *every* planning; nothing caches
+it between statements. A statement with many clauses (a chained search's
+35-way reference `IN`) multiplies that.
+
+**Configurations tried** (planning: `EXPLAIN (SUMMARY)` median of 22 warm
+runs; execution: sum of the 28 benchmark medians in ms, HTTP wall time):
+
+| config | token `code=` plan | `status=` plan | 35-way `IN` plan | code+date plan | ANALYZE search_index | 28-search sum | worst regressions |
+|---|---|---|---|---|---|---|---|
+| hm/main (3 MCV+deps objects, target 4000) | 1.46 ms | 1.42 ms | 17.2 ms | 2.47 ms | 62–80 s | 1,204–1,228 | — |
+| no extended statistics | 0.35 | 0.17 | 2.47 | 0.57 | 25 s | 4,678 | `patient=&category=` 3,381 ms, code+date 512 ms, status+code 417 ms |
+| same objects, statistics target 100 | 0.56 | 0.30 | 4.64 | 1.20 | 160 s | — | code+date 341 ms, status+code 298 ms |
+| token MCV(100)+deps, no date objects | — | — | — | — | 41 s | — | code+date 329 ms, status+code 334 ms |
+| **dependencies only (token + type/param), token target 1000** | **0.22** | **0.18** | **3.05** | **0.62** | **10 s** | **971** | none |
+| dependencies only, token target 4000 | 0.22 | 0.17 | 2.33 | 0.63 | 36 s | 1,012 | none |
+| dependencies only, all targets 100 | 0.17 | 0.12 | 2.42 | 0.64 | 0.7 s | 1,076 | none (chain identifier 18 ms vs 11) |
+
+The dependency statistics are what fix the correlated estimates the v15
+notes describe; the MCV lists contribute nothing measurable and at a small
+target actively mislead (`code=&date=`, `status=&code=` ~40× slower).
+
+**Change.** Fork migration `hm-0006-search-index-statistics` (schema.rs
+`fork_search_index_statistics`): drop the three MCV objects, keep
+`stx_search_type_param (dependencies)`, add
+`stx_search_type_param_token_dep (dependencies)` on
+`(resource_type, param_name, value_token_code)`, set `value_token_code`'s
+target to 1000, then `ANALYZE search_index` without a statement timeout so the
+new object has data before the first search (without it,
+`Observation?patient=&category=` is a 3-second scan). On the 2.2M database the
+first start after the upgrade took 8.4 s to the first `/metadata` 200 (the ANALYZE included); production (8.7k
+resources) is sub-second.
+
+Verified end to end (hm/main statistics restored, then this branch's binary
+started on the same database): `hm_schema_migrations` gained
+`hm-0006-search-index-statistics`; `search_index` kept exactly
+`stx_search_type_param {f}` and `stx_search_type_param_token_dep {f}`;
+`value_token_code` target 1000. Planning on the same database (box load ~20)
+before → after: token 1.02 → 0.58 ms, `status=` 0.83 → 0.34, reference 0.59 →
+0.18, 35-way `IN` 10.9 → 1.9, code+date 1.82 → 0.56. All 28 searches returned
+the same entry counts; transcripts in
+`hfs-eval/eval/results-p3-pgops/round2/`.
+
+**Unchanged and still slow:** `Observation?category=vital-signs&date=ge2020-01-01`
+(no patient) takes 520–735 ms with *any* extended statistics and 7 ms with
+none. The date membership is estimated ~10× low (45k vs 485k rows — the date
+predicate's `OR` hides the range from the index and the per-(type, param)
+date distribution is not modelled), so the selectivity probe in
+`search_impl.rs` picks the date as the driver once the category estimate is
+accurate. It is not a regression of hm-0006 (hm/main: 684–735 ms) and is left
+as a follow-up: rewriting the `ge` date predicate as a sargable range, or
+estimating the date membership with a count bounded by a `LIMIT`.
+
+## 5. search_index write amplification
+
+At 2.24M resources `search_index` holds 30.9M rows (13.8 per resource) in
+5.3 GB of heap and 11 GB of indexes. Largest contributors: Provenance
+`target` 2.2M rows (Synthea writes one Provenance per patient targeting every
+resource — data-specific), Observation `combo-code` 931k, `code`/`category`/
+`date`/`encounter`/`status`/`subject`/`patient` ~655k each, `_profile` 631k,
+the quantity and composite parameters ~2.9M together. Every row is a spec
+search parameter; the writer already deduplicates identical rows per resource
+and skips `_id`/`_lastUpdated` (answered from `resources`).
+
+Where load time goes (500 patients, 107,775 resources, 8 clients, 37 s,
+`pg_stat_statements`): database execution 123 s of ~296 client-seconds (42%);
+of that `INSERT INTO search_index` 79.5 s (65%, 72 ms and ~19k buffers per
+batched statement), `resource_fts` 22 s (18%), the `resources` insert 18 s
+(15%). The rest of each request is HFS-side (parsing, extraction).
+
+Index removal was tested and rejected:
+
+| index (size, scans during the benchmark) | dropped → | verdict |
+|---|---|---|
+| `idx_search_token_code_recent` (3.1 GB, 3,277) | load 3,027 → 3,072 res/s (+1.5%); the 28 searches unchanged, but OR-lists and system-only tokens 7 ms → 194–487 ms (`category=laboratory,vital-signs`, `status=final,amended`, `code=http://loinc.org\|`, `code=a,b`, `clinical-status=active,recurrence`) | **keep** |
+| quantity / composite / canonical indexes (1.5 GB, 0 scans) | not dropped: they serve `value-quantity`, `code-value-quantity` and composite searches the benchmark does not issue (lab thresholds) | keep |
+
+Conclusion: no index on `search_index` is redundant, and dropping the
+largest one buys 1.5% load speed — the index count is not the load-speed
+limiter on NVMe. Levers that are left, none safe enough to switch on by
+default: an opt-out of `resource_fts` for deployments that never use
+`_text`/`_content` (18% of load-time DB work), and skipping search parameters a
+site never queries (e.g. Claim/ExplanationOfBenefit financial parameters,
+`_profile`) via a configurable denylist — both change search behaviour and need
+a product decision. Lowering the token statistics target (above) removes the
+other hidden write-path cost: autovacuum's ANALYZE of `search_index` drops
+from 62–80 s to ~10 s per run.
