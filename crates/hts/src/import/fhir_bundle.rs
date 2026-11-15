@@ -220,6 +220,13 @@ pub(crate) fn write_parsed_bundle(
     stats.errors.extend(parsed.parse_errors.iter().cloned());
     for cs in &parsed.code_systems {
         let url = cs.url.as_str();
+        if !parsed.chunked && !parsed.fresh_load {
+            if let Some(w) = truncated_copy_check(conn, cs)? {
+                tracing::warn!("{w}");
+                stats.warnings.push(w);
+                continue;
+            }
+        }
         if let Err(e) = write_code_system(conn, cs, stats, parsed.fresh_load) {
             stats
                 .errors
@@ -243,6 +250,58 @@ pub(crate) fn write_parsed_bundle(
         }
     }
     Ok(())
+}
+
+/// [`bundle_parser::truncated_copy_warning`] against the stored row with the
+/// same `url|version`, if any.
+#[cfg(feature = "sqlite")]
+fn truncated_copy_check(
+    conn: &Connection,
+    cs: &ParsedCodeSystem,
+) -> Result<Option<String>, HtsError> {
+    let stored: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, COALESCE(content, 'complete') FROM code_systems \
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![cs.url, cs.version],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let Some((system_id, content)) = stored else {
+        return Ok(None);
+    };
+    if content != "complete" {
+        return Ok(None);
+    }
+    let stored_concepts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+            rusqlite::params![system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if cs.concepts.len() as i64 >= stored_concepts {
+        return Ok(None);
+    }
+    let codes = serde_json::to_string(
+        &cs.concepts.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+    )
+    .map_err(|e| HtsError::Internal(e.to_string()))?;
+    let missing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM json_each(?1) je \
+             WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = ?2 AND c.code = je.value)",
+            rusqlite::params![codes, system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(bundle_parser::truncated_copy_warning(
+        cs,
+        &content,
+        stored_concepts,
+        missing,
+    ))
 }
 
 // ── CodeSystem write ──────────────────────────────────────────────────────────

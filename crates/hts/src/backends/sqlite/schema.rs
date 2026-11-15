@@ -882,6 +882,70 @@ pub fn migrate_property_hierarchy(conn: &rusqlite::Connection) -> rusqlite::Resu
     Ok(())
 }
 
+/// One-time repair for the p25-data fixes; see the PostgreSQL twin
+/// `migrate_p25_data_pg`. Must run before [`migrate_concept_closure`].
+pub fn migrate_p25_data(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use crate::import::bundle_parser::{
+        CDCREC_URL, P25_DATA_MIGRATION_MARKER, P25_DATA_SYSTEMS, cdcrec_edges,
+    };
+    use rusqlite::OptionalExtension;
+    let done: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [P25_DATA_MIGRATION_MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    let flat: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1
+               AND NOT EXISTS (SELECT 1 FROM concept_hierarchy h WHERE h.system_id = cs.id)
+               AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id)",
+        )?;
+        stmt.query_map([CDCREC_URL], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut edges = 0usize;
+    for sid in &flat {
+        let mut insert = conn.prepare_cached(
+            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT ?1, ?2, ?3
+              WHERE EXISTS (SELECT 1 FROM concepts WHERE system_id = ?1 AND code = ?2)
+                AND EXISTS (SELECT 1 FROM concepts WHERE system_id = ?1 AND code = ?3)",
+        )?;
+        for (child, parent) in cdcrec_edges() {
+            edges += insert.execute(rusqlite::params![sid, parent, child])?;
+        }
+    }
+    let mut cleared = 0usize;
+    for system in P25_DATA_SYSTEMS {
+        cleared += conn.execute(
+            "DELETE FROM value_set_expansions WHERE system_url = ?1
+                OR value_set_id IN (SELECT id FROM value_sets
+                                     WHERE compose_json LIKE '%' || ?1 || '%')",
+            [system],
+        )?;
+        cleared += conn.execute(
+            "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
+            [system],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [P25_DATA_MIGRATION_MARKER],
+    )?;
+    tracing::info!(
+        cdcrec_edges = edges,
+        cleared_expansion_rows = cleared,
+        "p25-data migration: CDCREC hierarchy, CDCREC/UCUM expansion cache"
+    );
+    Ok(())
+}
+
 /// One-time backfill for issue #802: the ICD-9-CM importer previously
 /// required a pipe delimiter that the real bundled CMS file never has, so
 /// every code silently failed to parse and the file was still recorded as a

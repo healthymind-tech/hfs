@@ -35,6 +35,11 @@ pub struct ImportResponse {
     /// non-empty; the caller should inspect this field to detect partial failures.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Resources deliberately not written (HTTP status unaffected), e.g. a
+    /// truncated copy of a complete CodeSystem already stored under the same
+    /// `url|version`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Handler for `POST /import`.
@@ -74,6 +79,7 @@ where
                 concept_maps: stats.concept_maps,
                 concepts: stats.concepts,
                 errors: stats.errors,
+                warnings: stats.warnings,
             };
             (status, Json(response)).into_response()
         }

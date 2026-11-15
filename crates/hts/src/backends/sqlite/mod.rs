@@ -601,6 +601,9 @@ impl SqliteTerminologyBackend {
             schema::migrate_property_hierarchy(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
             })?;
+            schema::migrate_p25_data(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
+            })?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
@@ -820,6 +823,9 @@ impl SqliteTerminologyBackend {
             // closure migration once more afterwards.
             schema::migrate_property_hierarchy(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
+            })?;
+            schema::migrate_p25_data(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
             })?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
@@ -1433,6 +1439,65 @@ fn write_refset_members(
 mod tests {
     use super::*;
     use crate::traits::TerminologyMetadata;
+
+    /// A database written before the p25-data fixes: a flat CDCREC and a
+    /// cached expansion over it. The one-time migration adds the hierarchy and
+    /// drops the cache, once.
+    #[tokio::test]
+    async fn p25_data_migration_repairs_flat_cdcrec_and_drops_stale_expansions() {
+        use crate::import::BundleImportBackend;
+        let b = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "CDCREC",
+              "url": "urn:oid:2.16.840.1.113883.6.238", "version": "1.2", "content": "complete",
+              "concept": [{"code": "1000-9"}, {"code": "2028-9"}, {"code": "2039-6"}]}},
+            {"resource": {"resourceType": "ValueSet", "id": "dr", "url": "http://t/vs/dr",
+              "compose": {"include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                "filter": [{"property": "concept", "op": "descendent-of", "value": "1000-9"}]}]}}}
+        ]});
+        b.import_bundle(
+            &helios_persistence::tenant::TenantContext::system(),
+            &serde_json::to_vec(&bundle).unwrap(),
+        )
+        .await
+        .unwrap();
+        let conn = b.pool().get().unwrap();
+        let edges = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM concept_hierarchy h JOIN code_systems cs ON cs.id = h.system_id \
+                 WHERE cs.url = 'urn:oid:2.16.840.1.113883.6.238'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(edges(&conn), 2, "the importer supplies the hierarchy");
+        // Simulate the old state.
+        conn.execute_batch(
+            "DELETE FROM concept_hierarchy; DELETE FROM concept_closure;
+             DELETE FROM bootstrap_imports WHERE path LIKE '#migration:cdcrec%';",
+        )
+        .unwrap();
+        let vs_id: String = conn
+            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
+             VALUES (?1, 'http://terminology.hl7.org/CodeSystem/v3-NullFlavor', 'UNK')",
+            [&vs_id],
+        )
+        .unwrap();
+        schema::migrate_p25_data(&conn).unwrap();
+        assert_eq!(edges(&conn), 2);
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM value_set_expansions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0, "stale expansion over CDCREC dropped");
+        // Runs once.
+        conn.execute_batch("DELETE FROM concept_hierarchy").unwrap();
+        schema::migrate_p25_data(&conn).unwrap();
+        assert_eq!(edges(&conn), 0);
+    }
 
     fn backend() -> SqliteTerminologyBackend {
         SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise")

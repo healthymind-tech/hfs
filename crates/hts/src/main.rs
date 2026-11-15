@@ -1070,6 +1070,12 @@ fn print_import_summary(result: &helios_hts::import::ImportResult, dry_run: bool
             eprintln!("  - {e}");
         }
     }
+    if !result.stats.warnings.is_empty() {
+        eprintln!("Warnings ({}):", result.stats.warnings.len());
+        for w in result.stats.warnings.iter().take(20) {
+            eprintln!("  - {w}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "sqlite"))]
