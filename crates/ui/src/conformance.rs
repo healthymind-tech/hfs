@@ -677,7 +677,7 @@ impl ConformanceSource for HttpConformanceSource {
                 // The advertised link carries the server's own idea of its base
                 // URL, which need not be the loopback this client targets —
                 // keep the path + query, swap in our base.
-                Some(next) => url = rebase_link(&next, &self.base_url),
+                Some(next) => url = rebase_link(&next, &self.base_url, resource_type),
                 None => break,
             }
         }
@@ -1182,15 +1182,37 @@ fn next_link(bundle: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Points a server-advertised link at `base_url`, keeping its path and query.
-fn rebase_link(link: &str, base_url: &str) -> String {
-    match link.find("://").and_then(|i| link[i + 3..].find('/')) {
-        Some(slash) => {
-            let i = link.find("://").unwrap() + 3;
-            format!("{}{}", base_url, &link[i + slash..])
-        }
-        None => link.to_string(),
-    }
+/// Points a server-advertised link at `base_url`, keeping the part of its
+/// path from `/{resource_type}` on, plus the query.
+///
+/// The server advertises its *public* base (`HFS_BASE_URL`), which behind a
+/// reverse proxy carries a prefix the loopback does not have —
+/// `https://host/fhir/SearchParameter?_cursor=…`. Keeping the whole path
+/// sent the second page to `{loopback}/fhir/SearchParameter`, a 404 that
+/// failed the fetch, so the Search Parameters page showed its "could not be
+/// loaded" banner and no parameters on every proxied deployment with more
+/// than one page of them (UI/UX review §3.10). Cutting at the resource type
+/// drops whatever prefix the public base had.
+fn rebase_link(link: &str, base_url: &str, resource_type: &str) -> String {
+    let Some(path_start) = link
+        .find("://")
+        .and_then(|i| link[i + 3..].find('/').map(|slash| i + 3 + slash))
+    else {
+        return link.to_string();
+    };
+    let path = &link[path_start..];
+    let needle = format!("/{resource_type}");
+    let from = path
+        .match_indices(&needle)
+        .map(|(at, _)| at)
+        .find(|&at| {
+            matches!(
+                path[at + needle.len()..].chars().next(),
+                None | Some('?') | Some('/')
+            )
+        })
+        .unwrap_or(0);
+    format!("{}{}", base_url, &path[from..])
 }
 
 /// Pulls `entry[].resource` out of a searchset Bundle.
@@ -1644,9 +1666,43 @@ mod tests {
         assert_eq!(
             rebase_link(
                 "http://localhost:8080/SearchParameter?_offset=1000",
-                "http://127.0.0.1:9999"
+                "http://127.0.0.1:9999",
+                "SearchParameter"
             ),
             "http://127.0.0.1:9999/SearchParameter?_offset=1000"
+        );
+    }
+
+    /// Behind a reverse proxy the advertised base carries a path prefix the
+    /// loopback does not: it must not survive the rebase (UI/UX review §3.10).
+    #[test]
+    fn rebase_link_drops_the_public_base_path_prefix() {
+        assert_eq!(
+            rebase_link(
+                "https://hfs.example.org/fhir/SearchParameter?_count=10000&_cursor=abc",
+                "http://127.0.0.1:8080",
+                "SearchParameter"
+            ),
+            "http://127.0.0.1:8080/SearchParameter?_count=10000&_cursor=abc"
+        );
+        // A tenant-path prefix and a resource type that is a prefix of
+        // another segment name are both handled.
+        assert_eq!(
+            rebase_link(
+                "https://h/fhir/t/acme/SearchParameterX/SearchParameter?_offset=2",
+                "http://127.0.0.1:1",
+                "SearchParameter"
+            ),
+            "http://127.0.0.1:1/SearchParameter?_offset=2"
+        );
+        // No resource type in the path: keep the old whole-path behaviour.
+        assert_eq!(
+            rebase_link(
+                "https://h/fhir?_offset=2",
+                "http://127.0.0.1:1",
+                "SearchParameter"
+            ),
+            "http://127.0.0.1:1/fhir?_offset=2"
         );
     }
 

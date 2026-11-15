@@ -94,6 +94,11 @@ pub enum ErrorKind {
     BestPractice,
     /// Two contained resources of one resource share an id.
     DuplicateId,
+    /// A resource-specific rule beyond any profile: a defining canonical
+    /// URL that is not absolute, an RFC 3986 Identifier value that is not a
+    /// URI, CodeSystem/ValueSet authoring rules (HL7 validator
+    /// `CodeSystemValidator` / `ValueSetValidator`).
+    ResourceRule,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the

@@ -691,6 +691,21 @@ impl Status {
         helios_ui_chrome::theme_toggle(i18n)
     }
 
+    /// The topbar product switcher (FHIR Server | Terminology), shared with
+    /// HTS through `helios-ui-chrome` (UI/UX review §4.2). The Terminology
+    /// entry is the same browser-safe destination as the sidebar's
+    /// Terminology link; with none configured the switcher is not rendered.
+    pub(crate) fn product_switcher(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::product_switcher(
+            i18n,
+            helios_ui_chrome::ProductLinks {
+                current: helios_ui_chrome::Product::Fhir,
+                fhir: Some(helios_ui_chrome::HFS_CONSOLE_PATH),
+                terminology: self.terminology_url(),
+            },
+        )
+    }
+
     /// The inline first-paint theme stamp for `<head>` (shared with HTS).
     pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
         helios_ui_chrome::theme_boot()
@@ -1499,6 +1514,64 @@ struct HistoryPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// `?type=` of a deep link (`/ui/history?type=Patient&id=a12`), else
+    /// empty. The locate form is a plain GET form, so loading another
+    /// instance is a navigation that lands here with both set.
+    resource_type: String,
+    /// `?id=` of a deep link, else empty.
+    resource_id: String,
+}
+
+impl HistoryPage {
+    /// `History · Patient/a12`, or just the page name before an instance is
+    /// chosen — the `<h1>` and the head of the `<title>`.
+    fn heading(&self) -> String {
+        if self.resource_type.is_empty() || self.resource_id.is_empty() {
+            self.i18n.t("history-heading")
+        } else {
+            self.i18n.t_arg(
+                "history-heading-for",
+                "subject",
+                format!("{}/{}", self.resource_type, self.resource_id),
+            )
+        }
+    }
+
+    /// Resources › Patient › a12 › History (UI/UX review §4.2).
+    fn breadcrumb(&self) -> Result<String, askama::Error> {
+        let (resource_type, resource_id) = if self.resource_id.is_empty() {
+            ("", "")
+        } else {
+            (self.resource_type.as_str(), self.resource_id.as_str())
+        };
+        helios_ui_chrome::breadcrumb(
+            &self.i18n,
+            &editor::resource_crumbs(
+                &self.i18n,
+                resource_type,
+                resource_id,
+                Some(self.i18n.t("history-crumb")),
+            ),
+        )
+    }
+
+    /// The locate form's type field: the deep link's type, else `Patient`.
+    fn type_value(&self) -> &str {
+        if self.resource_type.is_empty() {
+            "Patient"
+        } else {
+            &self.resource_type
+        }
+    }
+}
+
+/// `?type=&id=` on `/ui/history`.
+#[derive(serde::Deserialize, Default)]
+struct HistoryQuery {
+    #[serde(rename = "type", default)]
+    resource_type: String,
+    #[serde(default)]
+    id: String,
 }
 
 /// The rendered diff fragment, swapped in when the version selection changes.
@@ -2141,6 +2214,9 @@ pub fn mount_with_conformance_source_and_runtime(
         // One negotiated locale per request, in request extensions; every
         // handler and template reads this same value.
         .layer(middleware::from_fn(i18n::negotiate_locale))
+        // Lets a HTS console on the same origin offer the way back here in
+        // its product switcher (UI/UX review §4.2).
+        .layer(middleware::from_fn(advertise_console))
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
@@ -2180,6 +2256,43 @@ pub fn mount_with_conformance_source_and_runtime(
             .fallback_service(fhir_app.clone()),
         )
         .fallback_service(fhir_app)
+}
+
+/// Middleware: tell a HTS console served from the same origin that this
+/// console exists, so its topbar product switcher can link back to `/ui`
+/// (UI/UX review §4.2 — before this, HTS had no way back to HFS at all).
+/// HTS cannot know otherwise: it is configured independently and may well
+/// run on another host. A `Path=/` cookie carrying nothing but "there is
+/// one" is the smallest signal that is only ever true on a shared origin.
+/// Sent on successful `GET`s of HTML pages only (never beside a sign-in
+/// response's own cookies), and only until the browser has it.
+async fn advertise_console(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let is_get = request.method() == axum::http::Method::GET;
+    let known = !is_get
+        || helios_ui_chrome::has_hfs_console_cookie(
+            request
+                .headers()
+                .get_all(axum::http::header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+    let mut response = next.run(request).await;
+    let is_html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if !known
+        && is_html
+        && response.status() == StatusCode::OK
+        && let Ok(value) =
+            axum::http::HeaderValue::from_str(&helios_ui_chrome::hfs_console_set_cookie())
+    {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+    response
 }
 
 /// The UI routes whose handlers act on storage themselves — the tenant
@@ -8453,11 +8566,14 @@ async fn history_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<HistoryQuery>,
 ) -> Response {
     render(HistoryPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "history",
+        resource_type: query.resource_type.trim().to_string(),
+        resource_id: query.id.trim().to_string(),
     })
 }
 

@@ -143,13 +143,13 @@ where
         .update(tenant.context(), &existing, patched_content)
         .await?;
 
-    if resource_type == "StructureDefinition" {
-        state.validation().upsert_stored_profile(
-            tenant.tenant_id(),
-            stored.fhir_version(),
-            stored.content(),
-        );
-    }
+    // Stored StructureDefinitions and ImplementationGuides feed the
+    // tenant's profile registry and global profiles.
+    state.validation().record_stored_resource(
+        tenant.tenant_id(),
+        stored.fhir_version(),
+        stored.content(),
+    );
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
 
@@ -310,13 +310,13 @@ where
                 .update(tenant.context(), &current, patched)
                 .await
                 .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
-            if resource_type == "StructureDefinition" {
-                state.validation().upsert_stored_profile(
-                    tenant.tenant_id(),
-                    stored.fhir_version(),
-                    stored.content(),
-                );
-            }
+            // Stored StructureDefinitions and ImplementationGuides feed the
+            // tenant's profile registry and global profiles.
+            state.validation().record_stored_resource(
+                tenant.tenant_id(),
+                stored.fhir_version(),
+                stored.content(),
+            );
             // Conditional writes announce nothing.
             super::write_event::report(
                 &state,

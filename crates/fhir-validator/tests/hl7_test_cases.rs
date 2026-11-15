@@ -1999,3 +1999,71 @@ async fn resolved_discriminator_values_from_target_profiles() {
     assert_eq!(missing.len(), 1, "{issues:#?}");
     assert!(missing[0].contains("hasMember:b"), "{missing:?}");
 }
+
+/// `patient-ig-bad`, `patient-ig-good`: an ImplementationGuide's `global`
+/// profile (`Patient` → patient-ig-sd, name 1..*) holds every Patient to it
+/// — the root resource and Patients nested in a Bundle — and leaves other
+/// resource types alone.
+#[tokio::test]
+async fn implementation_guide_global_profiles_apply_by_type() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://hl7.org/fhir/test/StructureDefinition/patient-ig-sd",
+        "name": "PatientIgSd", "status": "active", "fhirVersion": "4.0.1",
+        "kind": "resource", "abstract": false, "type": "Patient",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "derivation": "constraint",
+        "differential": {"element": [{"id": "Patient.name", "path": "Patient.name", "min": 1}]}
+    });
+    let mut overlay = SchemaRegistry::new();
+    assert!(overlay.insert(convert(&sd).expect("profile converts").schema));
+    let resolver: Arc<dyn SchemaResolver> = Arc::new(CompositeResolver::new(vec![
+        Arc::new(overlay),
+        core_registry(FhirVersion::R4),
+    ]));
+    let run = |resource: Value, globals: Vec<(String, String)>| {
+        let resolver = Arc::clone(&resolver);
+        async move {
+            let opts = ValidationOptions {
+                global_profiles: globals,
+                ..Default::default()
+            };
+            Validator::new(resolver)
+                .validate(
+                    &resource,
+                    FhirVersion::R4,
+                    &opts,
+                    &EffectHandlers::default(),
+                )
+                .await
+                .into_iter()
+                .filter(|e| e.severity == Severity::Error)
+                .map(|e| format!("{} {}", e.path, e.message))
+                .collect::<Vec<_>>()
+        }
+    };
+    let global = vec![(
+        "Patient".to_string(),
+        "http://hl7.org/fhir/test/StructureDefinition/patient-ig-sd".to_string(),
+    )];
+    let bad = json!({"resourceType": "Patient", "id": "pat-bad", "active": true});
+    let good = json!({"resourceType": "Patient", "id": "pat-good", "active": true,
+        "name": [{"family": "Doe"}]});
+
+    assert!(run(bad.clone(), Vec::new()).await.is_empty());
+    let errs = run(bad.clone(), global.clone()).await;
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(errs[0].contains("name"), "{errs:#?}");
+    assert!(run(good, global.clone()).await.is_empty());
+
+    // Nested in a Bundle: the entry is held to it too.
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"fullUrl": "http://example.org/fhir/Patient/pat-bad", "resource": bad}]});
+    let errs = run(bundle, global.clone()).await;
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+    assert!(errs[0].contains("entry"), "{errs:#?}");
+
+    // Another type is not.
+    let org = json!({"resourceType": "Organization", "id": "o", "name": "Acme"});
+    assert!(run(org, global).await.is_empty());
+}

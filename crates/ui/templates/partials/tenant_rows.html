@@ -69,17 +69,41 @@
       <td class="col-num" data-label="{{ i18n.t("tenants-col-resources") }}">{{ row.resources_human(i18n) }}</td>
       <td data-label="{{ i18n.t("tenants-col-created") }}">{{ row.created_date() }}</td>
       <td class="col-actions" data-label="{{ i18n.t("tenants-col-actions") }}">
-        <button
-          type="button"
-          class="icon-button icon-button--danger"
-          aria-label="{{ i18n.t("tenants-delete") }}"
-          hx-delete="/ui/tenants/{{ row.id }}"
-          hx-target="#tenant-rows"
-          hx-swap="innerHTML"
-          hx-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
-        >
-          {% include "icons/trash.svg" %}
-        </button>
+        {% if row.is_default %}
+        <span class="tag tag--muted" title="{{ i18n.t("tenants-default-hint") }}">{{ i18n.t("tenants-default-tag") }}</span>
+        {% else %}
+        <!--
+          Deregister confirmation (UI/UX review §3.8): a dialog that says what
+          is at stake — how many resources the tenant holds, and that they are
+          kept — and asks for the tenant id to be typed, in place of the
+          browser's one-click confirm(). The same <details> modal as Add
+          Tenant; the trash button is its trigger and, while open, its
+          backdrop. The form only submits once the typed id matches.
+        -->
+        <details class="addbox addbox--modal tenant-delete" data-tenant-delete="{{ row.id }}">
+          <summary class="icon-button icon-button--danger" aria-label="{{ i18n.t("tenants-delete") }}" title="{{ i18n.t("tenants-delete") }}">
+            {% include "icons/trash.svg" %}
+          </summary>
+          <div class="addbox__panel" role="dialog" aria-modal="true" aria-labelledby="tenant-delete-title-{{ loop.index }}">
+            <div class="addbox__head">
+              <div class="addbox__title" id="tenant-delete-title-{{ loop.index }}">{{ i18n.t_arg("tenants-delete-title", "id", row.id.clone()) }}</div>
+              <button type="button" class="addbox__x" data-addbox-close aria-label="{{ i18n.t("ui-close") }}">×</button>
+            </div>
+            <form hx-delete="/ui/tenants/{{ row.id }}" hx-target="#tenant-rows" hx-swap="innerHTML">
+              <p class="tenant-delete__impact">{{ i18n.t_arg2("tenants-delete-impact", "id", row.id.clone(), "count", row.resources.clone()) }}</p>
+              <label class="field">
+                <span class="field__label">{{ i18n.t_arg("tenants-delete-type-id", "id", row.id.clone()) }}</span>
+                <input class="field__input" name="confirm" type="text" required autocomplete="off" spellcheck="false"
+                       pattern="{{ row.id }}" title="{{ i18n.t_arg("tenants-delete-type-id", "id", row.id.clone()) }}" data-addbox-initial-focus>
+              </label>
+              <div class="addbox__actions">
+                <button type="button" class="btn" data-addbox-close>{{ i18n.t("batch-cancel") }}</button>
+                <button type="submit" class="btn btn--danger">{{ i18n.t("tenants-delete-submit") }}</button>
+              </div>
+            </form>
+          </div>
+        </details>
+        {% endif %}
       </td>
       {% endif %}
     </tr>

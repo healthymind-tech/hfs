@@ -1128,13 +1128,13 @@ impl PackageManager {
             {
                 Ok((stored, created)) => {
                     let preexisting = !created && foreign;
-                    if e.resource_type == "StructureDefinition" {
-                        self.deps.validation.upsert_stored_profile(
-                            tenant,
-                            stored.fhir_version(),
-                            stored.content(),
-                        );
-                    }
+                    // Stored StructureDefinitions and ImplementationGuides feed the
+                    // tenant's profile registry and global profiles.
+                    self.deps.validation.record_stored_resource(
+                        tenant,
+                        stored.fhir_version(),
+                        stored.content(),
+                    );
                     if e.resource_type == "SearchParameter" {
                         search_parameters += 1;
                     }
@@ -1630,6 +1630,15 @@ impl PackageManager {
             Err(e) => return Err(e.to_string()),
         }
         self.report_write(ctx, &r.resource_type, -1);
+        // An uninstalled package's ImplementationGuide takes its global
+        // profiles with it.
+        if r.resource_type == "ImplementationGuide" {
+            self.deps.validation.remove_implementation_guide(
+                tenant,
+                existing.fhir_version(),
+                existing.id(),
+            );
+        }
         if r.resource_type == "StructureDefinition"
             && let Some(url) = existing.content().get("url").and_then(Value::as_str)
         {

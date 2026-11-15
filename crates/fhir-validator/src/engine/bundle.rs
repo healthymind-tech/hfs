@@ -462,6 +462,20 @@ pub(super) fn bundle_rules_with(
     }
     if bundle_type == Some("searchset") {
         searchset_rules(bundle, &mut out);
+    } else if matches!(
+        bundle_type,
+        Some(
+            "document"
+                | "message"
+                | "collection"
+                | "subscription-notification"
+                | "transaction"
+                | "transaction-response"
+                | "batch"
+                | "batch-response"
+        )
+    ) {
+        paging_link_rules(bundle, &mut out);
     }
     if !matches!(bundle_type, Some("document" | "message")) || list.is_empty() {
         return out;
@@ -585,6 +599,38 @@ fn searched_types(self_link: &str) -> Option<Vec<String>> {
         let types = p.strip_prefix("_type=")?;
         Some(types.split(',').map(str::to_string).collect())
     })
+}
+
+/// Bundles other than searchset/history (HL7 validator
+/// `BUNDLE_LINK_SEARCH_PROHIBITED`): the paging relations `first`,
+/// `previous`, `next`, `last` belong to search results; `self` occurs once.
+fn paging_link_rules(bundle: &Value, out: &mut Vec<ValidationError>) {
+    let links = bundle.get("link").and_then(Value::as_array);
+    let mut self_seen = false;
+    for (index, link) in links.into_iter().flatten().enumerate() {
+        let Some(relation) = link.get("relation").and_then(Value::as_str) else {
+            continue;
+        };
+        if matches!(relation, "first" | "previous" | "next" | "last") {
+            out.push(error(
+                ErrorKind::BundleEntryMismatch,
+                format!("Bundle.link.{index}.relation"),
+                format!(
+                    "The link relationship type '{relation}' used in search sets is prohibited in this context"
+                ),
+            ));
+        }
+        if relation == "self" {
+            if self_seen {
+                out.push(error(
+                    ErrorKind::BundleEntryMismatch,
+                    format!("Bundle.link.{index}.relation"),
+                    "The link relationship type 'self' can only occur once".to_string(),
+                ));
+            }
+            self_seen = true;
+        }
+    }
 }
 
 /// `searchset` Bundles (HL7 validator): a link relation occurs once;
@@ -725,6 +771,26 @@ mod tests {
         let bare = [entry(None, &patient), entry(None, &obs)];
         assert_eq!(resolve(&bare, "Patient/p1", None), Resolution::Found(0));
         assert_eq!(resolve(&bare, "#x", None), Resolution::NotFound);
+    }
+
+    /// `bundle-duplicate-ids-not`: paging links outside search results.
+    #[test]
+    fn paging_links_are_prohibited_outside_search_results() {
+        let messages =
+            |b: Value| -> Vec<String> { bundle_rules(&b).into_iter().map(|e| e.message).collect() };
+        let link = |rel: &str| json!({"relation": rel, "url": "http://x/fhir/Bundle/b"});
+        let b = json!({"resourceType": "Bundle", "type": "collection",
+            "link": [link("self"), link("first"), link("self")]});
+        assert_eq!(
+            messages(b),
+            vec![
+                "The link relationship type 'first' used in search sets is prohibited in this context",
+                "The link relationship type 'self' can only occur once"
+            ]
+        );
+        let b = json!({"resourceType": "Bundle", "type": "history",
+            "link": [link("self"), link("next")]});
+        assert!(messages(b).is_empty());
     }
 
     #[test]

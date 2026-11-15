@@ -140,15 +140,13 @@ where
                     1,
                     None,
                 );
-                // Stored StructureDefinitions feed the tenant's profile
-                // registry.
-                if resource_type == "StructureDefinition" {
-                    state.validation().upsert_stored_profile(
-                        tenant.tenant_id(),
-                        fhir_version,
-                        stored.content(),
-                    );
-                }
+                // Stored StructureDefinitions and ImplementationGuides feed the
+                // tenant's profile registry and global profiles.
+                state.validation().record_stored_resource(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    stored.content(),
+                );
                 let headers = ResourceHeaders::from_stored(&stored, &state);
                 let location =
                     state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
@@ -231,14 +229,11 @@ where
         )),
     );
 
-    // Stored StructureDefinitions feed the tenant's profile registry.
-    if resource_type == "StructureDefinition" {
-        state.validation().upsert_stored_profile(
-            tenant.tenant_id(),
-            fhir_version,
-            stored.content(),
-        );
-    }
+    // Stored StructureDefinitions and ImplementationGuides feed the
+    // tenant's profile registry and global profiles.
+    state
+        .validation()
+        .record_stored_resource(tenant.tenant_id(), fhir_version, stored.content());
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let location = state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);

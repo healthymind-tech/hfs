@@ -2823,11 +2823,15 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     code: Option<&str>,
     request_path: RequestPath,
 ) -> Option<Value> {
-    let info = match backend.supplement_target(ctx, system_url).await {
-        Ok(Some(i)) => i,
-        _ => return None,
+    let canonical = match backend.supplement_target(ctx, system_url).await {
+        Ok(Some(info)) => info.supplement_canonical,
+        // A CodeSystem that names the code system it supplements is a
+        // supplement whatever its `content` says (the HL7 validator judges
+        // it by `supplements`; `content` other than `supplement` is its own
+        // authoring error): its codes are not Coding.system values either.
+        _ => declared_supplement_canonical(backend, ctx, system_url).await?,
     };
-    let canonical = &info.supplement_canonical;
+    let canonical = &canonical;
     let text = format!(
         "CodeSystem {canonical} is a supplement, so can't be used as a value in Coding.system"
     );
@@ -2864,6 +2868,40 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
         None,
         request_path,
     ))
+}
+
+/// `url|version` of the stored CodeSystem at `system_url` when it declares
+/// `supplements` (with a `content` other than `supplement`, which
+/// `supplement_target` does not treat as one).
+async fn declared_supplement_canonical<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system_url: &str,
+) -> Option<String> {
+    let (bare, version) = match system_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (system_url, None),
+    };
+    let cs = CodeSystemOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(bare.to_string()),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    cs.get("supplements")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    Some(match cs.get("version").and_then(Value::as_str) {
+        Some(v) => format!("{bare}|{v}"),
+        None => bare.to_string(),
+    })
 }
 
 /// True when `url` is an implicit ValueSet URL (e.g.
@@ -8735,6 +8773,49 @@ mod tests {
 
         let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    /// fhir-test-cases `supplement-1`, `supplement-1b`: a CodeSystem that
+    /// declares `supplements` is a supplement even with `content: complete`,
+    /// and its codes are not valid with it as Coding.system.
+    #[tokio::test]
+    async fn declared_supplement_with_complete_content_is_not_a_coding_system() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('supp', 'http://hl7.org/fhir/test/CodeSystem/supplement-cs', '1.0',
+                         'SupplementCS', 'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://hl7.org/fhir/test/CodeSystem/supplement-cs\",\"version\":\"1.0\",\"content\":\"complete\",\"supplements\":\"http://loinc.org\"}');
+                 INSERT INTO concepts (id, system_id, code, display) VALUES (1, 'supp', 'test', 'Test');",
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "coding", "valueCoding": {
+                "system": "http://hl7.org/fhir/test/CodeSystem/supplement-cs", "code": "test"}}
+        ]});
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let result = v["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "result")
+            .and_then(|p| p["valueBoolean"].as_bool());
+        assert_eq!(result, Some(false), "{v:#}");
+        assert!(v.to_string().contains("is a supplement"), "{v:#}");
     }
 
     // ── Supplement-aware display matching (IG `parameters-validate-supplement-good`) ──
