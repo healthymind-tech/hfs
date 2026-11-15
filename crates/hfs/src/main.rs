@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+mod audit_retention;
 mod worker_shutdown;
 
 use helios_audit::{
@@ -446,17 +447,46 @@ fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Res
     Ok(())
 }
 
+/// The audit store and, when its backend supports it, the retention handle.
+type AuditStores = (
+    Arc<dyn ResourceStorage>,
+    Option<Arc<dyn helios_persistence::core::RetentionStorage>>,
+);
+
 struct HfsAuditStorageAdapter {
     storage: Arc<dyn ResourceStorage>,
-    tenant: TenantContext,
+    /// `HFS_AUDIT_TENANT`: every event goes to this tenant.
+    fixed_tenant: Option<String>,
+    /// Tenant of events outside any request (the server's default tenant).
+    default_tenant: String,
 }
 
 impl HfsAuditStorageAdapter {
-    fn new(storage: Arc<dyn ResourceStorage>) -> Self {
+    fn new(
+        storage: Arc<dyn ResourceStorage>,
+        fixed_tenant: Option<String>,
+        default_tenant: String,
+    ) -> Self {
         Self {
             storage,
-            tenant: TenantContext::system(),
+            fixed_tenant,
+            default_tenant,
         }
+    }
+
+    /// The tenant an event is stored in: the configured audit tenant, else
+    /// the tenant of the audited request, else the default tenant — so that
+    /// the events are searchable through the REST API of that tenant.
+    fn tenant_for(&self, request_tenant: Option<&str>) -> TenantContext {
+        let id = self
+            .fixed_tenant
+            .as_deref()
+            .or(request_tenant)
+            .unwrap_or(&self.default_tenant);
+        TenantContext::new(
+            helios_persistence::tenant::TenantId::new(id),
+            helios_persistence::tenant::TenantPermissions::full_access(),
+        )
     }
 }
 
@@ -464,12 +494,18 @@ impl HfsAuditStorageAdapter {
 impl helios_audit::sinks::database::AuditStorage for HfsAuditStorageAdapter {
     async fn create_resource(
         &self,
+        tenant: Option<&str>,
         resource_type: &str,
         resource: serde_json::Value,
         fhir_version: helios_fhir::FhirVersion,
     ) -> Result<(), String> {
         self.storage
-            .create(&self.tenant, resource_type, resource, fhir_version)
+            .create(
+                &self.tenant_for(tenant),
+                resource_type,
+                resource,
+                fhir_version,
+            )
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -480,7 +516,7 @@ async fn create_database_audit_storage(
     server_config: &ServerConfig,
     backend_mode: StorageBackendMode,
     audit_config: &AuditConfig,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     let backend_kind = backend_mode.primary_backend_kind();
     let dedicated = is_database_audit_dedicated(audit_config, backend_kind);
 
@@ -514,7 +550,7 @@ async fn create_audit_sqlite_storage(
     server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     let database_url = if dedicated {
         audit_config.database_url.as_deref().ok_or_else(|| {
             anyhow::anyhow!("Dedicated SQLite audit mode requires HFS_AUDIT_DATABASE_URL to be set")
@@ -529,7 +565,11 @@ async fn create_audit_sqlite_storage(
     sqlite_config.database_url = Some(database_url.to_string());
     let backend = create_sqlite_backend(&sqlite_config)?;
 
-    Ok(Arc::new(backend))
+    let backend = Arc::new(backend);
+    Ok((
+        backend.clone() as Arc<dyn ResourceStorage>,
+        Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
+    ))
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -537,7 +577,7 @@ async fn create_audit_sqlite_storage(
     _server_config: &ServerConfig,
     _audit_config: &AuditConfig,
     _dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     anyhow::bail!(
         "Database audit backend with sqlite storage requires the 'sqlite' feature. \
          Build with: cargo build -p helios-hfs --features sqlite"
@@ -549,7 +589,7 @@ async fn create_audit_postgres_storage(
     server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     use helios_persistence::backends::postgres::PostgresBackend;
 
     let backend = if dedicated {
@@ -572,7 +612,11 @@ async fn create_audit_postgres_storage(
     };
 
     backend.init_schema_without_patient_export_index().await?;
-    Ok(Arc::new(backend))
+    let backend = Arc::new(backend);
+    Ok((
+        backend.clone() as Arc<dyn ResourceStorage>,
+        Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
+    ))
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -580,7 +624,7 @@ async fn create_audit_postgres_storage(
     _server_config: &ServerConfig,
     _audit_config: &AuditConfig,
     _dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     anyhow::bail!(
         "Database audit backend with postgres storage requires the 'postgres' feature. \
          Build with: cargo build -p helios-hfs --features postgres"
@@ -592,7 +636,7 @@ async fn create_audit_mongodb_storage(
     server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     let backend = if dedicated {
         let connection_string = match audit_config.database_url.as_deref() {
             Some(url) => {
@@ -667,7 +711,7 @@ async fn create_audit_mongodb_storage(
     };
 
     backend.init_schema().await?;
-    Ok(Arc::new(backend))
+    Ok((Arc::new(backend) as Arc<dyn ResourceStorage>, None))
 }
 
 #[cfg(not(feature = "mongodb"))]
@@ -675,7 +719,7 @@ async fn create_audit_mongodb_storage(
     _server_config: &ServerConfig,
     _audit_config: &AuditConfig,
     _dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     anyhow::bail!(
         "Database audit backend with mongodb storage requires the 'mongodb' feature. \
          Build with: cargo build -p helios-hfs --features mongodb"
@@ -687,7 +731,7 @@ async fn create_audit_s3_storage(
     _server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
 
     if audit_config.database_url.is_some() {
@@ -742,7 +786,7 @@ async fn create_audit_s3_storage(
         )
     })?;
 
-    Ok(Arc::new(backend))
+    Ok((Arc::new(backend) as Arc<dyn ResourceStorage>, None))
 }
 
 #[cfg(not(feature = "s3"))]
@@ -750,7 +794,7 @@ async fn create_audit_s3_storage(
     _server_config: &ServerConfig,
     _audit_config: &AuditConfig,
     _dedicated: bool,
-) -> anyhow::Result<Arc<dyn ResourceStorage>> {
+) -> anyhow::Result<AuditStores> {
     anyhow::bail!(
         "Database audit backend with s3 storage requires the 's3' feature. \
          Build with: cargo build -p helios-hfs --features s3"
@@ -1410,27 +1454,57 @@ async fn init_audit(
     backend_mode: StorageBackendMode,
 ) -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
     let config = AuditConfig::from_env();
+    let mut retention_store = None;
 
     let sink: Arc<dyn AuditSink> = match config.backend {
         AuditBackend::None => {
             info!("Audit logging is DISABLED");
-            Arc::new(helios_audit::NullSink)
+            audit_retention::warn_unsupported(&config.retention, "audit logging is disabled");
+            return Ok((Arc::new(helios_audit::NullSink), None));
         }
         AuditBackend::File => {
             let path = config.file_path.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("HFS_AUDIT_FILE_PATH is required when HFS_AUDIT_BACKEND=file")
             })?;
             info!(path = %path, "Audit logging to file");
+            audit_retention::warn_unsupported(
+                &config.retention,
+                "the file backend is not purged; rotate the file with logrotate",
+            );
             Arc::new(helios_audit::FileSink::new(path).await?)
         }
         AuditBackend::Database => {
-            let storage =
+            let (storage, retention) =
                 create_database_audit_storage(server_config, backend_mode, &config).await?;
-            let adapter = Arc::new(HfsAuditStorageAdapter::new(storage));
-            Arc::new(helios_audit::DatabaseSink::new(
-                adapter,
-                server_config.default_fhir_version,
-            ))
+            retention_store = retention;
+            let adapter = Arc::new(HfsAuditStorageAdapter::new(
+                storage,
+                config.tenant.clone(),
+                server_config.default_tenant.clone(),
+            ));
+            let fallback = config
+                .fallback_file
+                .clone()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    server_config
+                        .data_dir
+                        .as_ref()
+                        .map(|d| d.join("audit-fallback.ndjson"))
+                });
+            let mut db =
+                helios_audit::DatabaseSink::new(adapter, server_config.default_fhir_version);
+            if let Some(path) = &fallback {
+                info!(path = %path.display(), "Audit fallback file (used while the database is unavailable)");
+                db = db.with_fallback(path);
+            }
+            match db.replay_fallback().await {
+                Ok(0) => {}
+                Ok(n) => info!(events = n, "Replayed audit events from the fallback file"),
+                Err(e) => warn!(error = %e, "Could not replay the audit fallback file"),
+            }
+            info!(tenant = ?config.tenant, "Audit logging to the database (AuditEvent resources)");
+            Arc::new(db)
         }
         #[cfg(feature = "cloudwatch")]
         AuditBackend::CloudWatch => {
@@ -1462,17 +1536,32 @@ async fn init_audit(
         }
     };
 
-    let audit_state = if config.backend != AuditBackend::None {
-        Some(Arc::new(AuditMiddlewareState {
-            sink: Arc::clone(&sink),
-            config: config.clone(),
-            exclusion_filter: ExclusionFilter::default_exclusions(),
-        }))
-    } else {
-        None
-    };
+    // Requests only enqueue; writer tasks drain the queue in batches, and the
+    // graceful shutdown flushes it (see `serve`).
+    let sink: Arc<dyn AuditSink> =
+        Arc::new(helios_audit::QueuedSink::new(sink, config.queue_config()));
 
-    Ok((sink, audit_state))
+    match retention_store {
+        Some(store) => {
+            audit_retention::spawn(
+                store,
+                config.retention.clone(),
+                Arc::clone(&sink),
+                config.source_observer.clone(),
+            );
+        }
+        None if config.backend == AuditBackend::Database => audit_retention::warn_unsupported(
+            &config.retention,
+            "retention is implemented for the SQLite and PostgreSQL audit stores only",
+        ),
+        None => {}
+    }
+
+    let state = AuditMiddlewareState::new(Arc::clone(&sink), config)
+        .with_server_address(server_config.base_url.clone())
+        .with_url_tenant_routing(server_config.multitenancy.routing_mode.supports_url_path());
+
+    Ok((sink, Some(Arc::new(state))))
 }
 
 /// The stop-signal guard (see [`helios_observability::shutdown::StopGuard`]),
@@ -1565,9 +1654,18 @@ async fn run() -> anyhow::Result<()> {
     // Initialize audit subsystem
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
+    // The REST audit events carry the authenticated user and record the
+    // requests auth refuses, so the auth layer's own per-request events are
+    // off unless asked for (`HFS_AUDIT_AUTH_EVENTS=true`).
+    let auth_audit_sink: Arc<dyn AuditSink> = if AuditConfig::from_env().auth_events {
+        audit_sink
+    } else {
+        Arc::new(helios_audit::NullSink)
+    };
+
     // Initialize authentication (with audit bridge if audit is enabled)
     let (auth_config, auth_state) = init_auth_with_audit(
-        audit_sink,
+        auth_audit_sink,
         config.multitenancy.routing_mode.supports_url_path(),
         &config.base_url,
     )
