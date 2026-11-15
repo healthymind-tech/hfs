@@ -30,6 +30,8 @@ use crate::search::{
 type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// Tenant id -> (SearchParameter epoch, registry built at that epoch).
+pub(super) type ValueNullFractions =
+    Arc<RwLock<Option<(std::time::Instant, HashMap<String, f64>)>>>;
 type WriteRegistryCache = Arc<RwLock<HashMap<String, (i64, Arc<RwLock<SearchParameterRegistry>>)>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
@@ -65,6 +67,9 @@ pub struct PostgresBackend {
     /// SearchParameter epoch it was read at. See
     /// [`PostgresBackend::authoritative_extractor`].
     write_registry_cache: WriteRegistryCache,
+    /// `pg_stats.null_frac` of the range-typed `search_index` value columns,
+    /// with the time it was read; see `search_impl::range_estimate_correction`.
+    pub(super) value_null_fractions: ValueNullFractions,
     #[cfg(test)]
     pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
     #[cfg(test)]
@@ -498,6 +503,7 @@ impl PostgresBackend {
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
             write_registry_cache: Arc::new(RwLock::new(HashMap::new())),
             subscription_fanout: std::sync::OnceLock::new(),
+            value_null_fractions: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]

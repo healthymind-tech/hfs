@@ -111,6 +111,24 @@ SEARCHES = [
     ("obs_status_final_code", f"/Observation?status=final&code={q(CS + '|' + CD)}&_count=20"),
     ("obs_category_date", "/Observation?category=vital-signs&date=ge2020-01-01&_count=20"),
     ("condition_code", "/Condition?code=http://snomed.info/sct|44054006&_count=20"),
+    # token + range conjunctions, with and without a patient: the broad-walk
+    # driver choice depends on the range membership's row estimate
+    ("obs_category_date_patient", f"/Observation?patient={P}&category=vital-signs&date=ge2020-01-01&_count=20"),
+    ("obs_status_date", "/Observation?status=final&date=ge2020-01-01&_count=20"),
+    ("obs_status_date_patient", f"/Observation?patient={P}&status=final&date=ge2020-01-01&_count=20"),
+    ("obs_category_date_old", "/Observation?category=laboratory&date=le2012-01-01&_count=20"),
+    ("obs_category_date_window", "/Observation?category=vital-signs&date=ge2021-01-01&date=lt2021-02-01&_count=20"),
+    ("obs_code_date_recent", f"/Observation?code={q(CS + '|' + CD)}&date=ge2022-01-01&_count=20"),
+    ("encounter_status_date", "/Encounter?status=finished&date=ge2020-01-01&_count=20"),
+    ("encounter_class_date", "/Encounter?class=AMB&date=ge2020-01-01&_count=20"),
+    ("condition_status_onset", "/Condition?clinical-status=active&onset-date=ge2015-01-01&_count=20"),
+    ("report_category_date", "/DiagnosticReport?category=LAB&date=ge2020-01-01&_count=20"),
+    ("obs_category_value_quantity", "/Observation?category=vital-signs&value-quantity=gt100&_count=20"),
+    ("obs_code_value_quantity", f"/Observation?code={q(CS + '|' + CD)}&value-quantity=gt20&_count=20"),
+    # adversarial: both memberships broad, the intersection small or empty
+    ("obs_category_date_ancient", "/Observation?category=vital-signs&date=le1975-01-01&_count=20"),
+    ("obs_category_quantity_none", "/Observation?category=survey&value-quantity=gt1000&_count=20"),
+    ("encounter_status_date_recent", "/Encounter?status=finished&date=ge2026-10-01&_count=20"),
 ]
 if a.only:
     keep = set(a.only.split(","))

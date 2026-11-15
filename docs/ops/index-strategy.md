@@ -186,15 +186,100 @@ before → after: token 1.02 → 0.58 ms, `status=` 0.83 → 0.34, reference 0.5
 the same entry counts; transcripts in
 `hfs-eval/eval/results-p3-pgops/round2/`.
 
-**Unchanged and still slow:** `Observation?category=vital-signs&date=ge2020-01-01`
-(no patient) takes 520–735 ms with *any* extended statistics and 7 ms with
-none. The date membership is estimated ~10× low (45k vs 485k rows — the date
-predicate's `OR` hides the range from the index and the per-(type, param)
-date distribution is not modelled), so the selectivity probe in
-`search_impl.rs` picks the date as the driver once the category estimate is
-accurate. It is not a regression of hm-0006 (hm/main: 684–735 ms) and is left
-as a follow-up: rewriting the `ge` date predicate as a sargable range, or
-estimating the date membership with a count bounded by a `LIMIT`.
+**Token + date conjunctions without a patient** (fixed in the follow-up
+commit `perf(persistence): drive broad token+range searches …`).
+`Observation?category=vital-signs&date=ge2020-01-01` took 430–790 ms with any
+extended statistics. Cause, measured on the same database:
+
+- the planner estimates the date membership at 37k rows for 485k real:
+  `value_date` is NULL on 91.5% of `search_index` rows (every non-date
+  parameter), and the range selectivity is multiplied by that null fraction as
+  if it were independent of `param_name` — no extended statistics object can
+  express this (dependencies are equality-only);
+- the broad-conjunction walk (`search_impl.rs`, first page of a conjunction of
+  broad memberships) drove from the smallest estimate — the date — and an
+  upward-open date predicate (`value_date_end > $a OR (value_date >= $b AND …)`)
+  cannot be walked in `last_updated` order by any index, so PostgreSQL scanned
+  and sorted all 485k rows;
+- probes written as plain `EXISTS` were turned into hash semi-joins that read
+  the whole probed range (66k onset rows for `Condition?clinical-status=active&
+  onset-date=ge2015`, 251k quantity rows for `code=…&value-quantity=gt20`).
+
+Fix: range estimates are corrected by `1 / (1 − null_frac)` (from `pg_stats`,
+cached 5 min); the driver is the smallest token-like or index-walkable range
+membership and an upward-open date never drives while anything else can;
+probes are `EXISTS (… OFFSET 0)`, per-row correlated subplans that stop with
+the page; repeated parameters and the code/value-quantity pair (`INTERSECT`
+forms #1416/#1580) use the walk when a token drives it. Driver experiments
+(per-row probes, ms):
+
+| shape | token rows | range rows | token drives | range drives |
+|---|---|---|---|---|
+| `status=final&date=ge2020` | 655k | 485k (open) | 0.4 | 3,626 |
+| `clinical-status=active&onset-date=ge2015` | 93k | 66k (open) | 0.5 | 549 |
+| `category=vital-signs&value-quantity=gt100` | 139k | 99k | 4.8 | 2.6 |
+| `category=laboratory&date=le2012` | 452k | 117k | 14 | 1.7 |
+| `category=vital-signs&date=le1975` | 139k | 8.9k | 57 | 14 |
+| `category=survey&value-quantity=gt1000` | 43k | 1.4k | 586 | 13 |
+
+Result on the 2.24M set — all 43 searches (the 28 above plus token+range
+shapes with and without a patient and three adversarial small-intersection
+ones), HTTP medians in ms, before = median of five runs of the previous build
+interleaved with two runs of the new one:
+
+| search | before (median of 5 runs) | after run 1 | after run 2 | entries |
+|---|---|---|---|---|
+| patient_by_identifier | 3.3 | 3.1 | 3.4 | 1/1 |
+| patient_by_family | 11.2 | 11.5 | 12.9 | 26/26 |
+| patient_by_name | 11.9 | 11.2 | 13.6 | 26/26 |
+| patient_by_birthdate | 3.1 | 3.3 | 3.6 | 1/1 |
+| patient_by_birthdate_range | 37.5 | 35.7 | 47.1 | 6/6 |
+| patient_name_and_birthdate | 7.6 | 7.3 | 7.5 | 1/1 |
+| obs_patient_code_date | 7.0 | 7.5 | 7.2 | 1/1 |
+| obs_patient_sorted | 6.7 | 7.0 | 6.4 | 20/20 |
+| obs_patient_category | 5.8 | 5.7 | 5.8 | 9/9 |
+| obs_code_date_broad | 41.5 | 13.6 | 14.4 | 50/50 |
+| obs_code_count | 20.5 | 21.9 | 20.1 | 0/0 |
+| encounter_patient_date | 6.8 | 7.4 | 7.3 | 16/16 |
+| encounter_patient_include | 11.5 | 11.2 | 10.1 | 20/20 |
+| patient_revinclude_encounter | 7.6 | 7.2 | 7.8 | 17/17 |
+| patient_revinclude_obs | 7.2 | 7.8 | 7.7 | 24/24 |
+| obs_lastupdated | 6.4 | 6.0 | 6.8 | 50/50 |
+| obs_lastupdated_sorted | 6.3 | 6.0 | 5.5 | 50/50 |
+| obs_chain_patient_identifier | 10.1 | 11.4 | 11.4 | 23/23 |
+| obs_chain_patient_family | 45.9 | 47.3 | 45.9 | 50/50 |
+| patient_has_obs_code | 34.9 | 42.4 | 38.9 | 50/50 |
+| condition_patient | 3.5 | 3.8 | 2.9 | 7/7 |
+| medreq_patient_status | 3.7 | 3.9 | 3.0 | 0/0 |
+| patient_everything | 166.5 | 175.6 | 130.7 | 197/197 |
+| encounter_status_finished | 6.3 | 6.2 | 4.9 | 20/20 |
+| obs_category_laboratory | 5.2 | 5.0 | 4.2 | 20/20 |
+| obs_status_final_code | 9.8 | 10.0 | 7.4 | 20/20 |
+| obs_category_date | 626.4 | 9.7 | 7.6 | 20/20 |
+| condition_code | 5.6 | 5.0 | 3.6 | 20/20 |
+| obs_category_date_patient | 8.2 | 7.9 | 6.7 | 9/9 |
+| obs_status_date | 604.7 | 9.4 | 7.5 | 20/20 |
+| obs_status_date_patient | 8.7 | 9.2 | 8.2 | 20/20 |
+| obs_category_date_old | 12.3 | 11.5 | 9.6 | 20/20 |
+| obs_category_date_window | 1242.5 | 197.4 | 178.6 | 20/20 |
+| obs_code_date_recent | 38.4 | 9.1 | 8.1 | 20/20 |
+| encounter_status_date | 266.1 | 9.7 | 9.2 | 20/20 |
+| encounter_class_date | 514.9 | 10.0 | 10.9 | 20/20 |
+| condition_status_onset | 383.8 | 10.3 | 9.5 | 20/20 |
+| report_category_date | 360.7 | 11.8 | 11.6 | 20/20 |
+| obs_category_value_quantity | 11.9 | 14.4 | 11.8 | 20/20 |
+| obs_code_value_quantity | 322.6 | 9.5 | 9.8 | 20/20 |
+| obs_category_date_ancient | 30.3 | 31.4 | 25.5 | 20/20 |
+| obs_category_quantity_none | 48.5 | 33.6 | 33.5 | 0/0 |
+| encounter_status_date_recent | 36.2 | 12.0 | 9.4 | 20/20 |
+| **sum** | 5010 | | 778 (best of 2) | |
+
+No search got slower beyond noise and every entry count is unchanged.
+Still the slowest broad shape: a one-month window on a broad category
+(`category=vital-signs&date=ge2021-01-01&date=lt2021-02-01`, 179 ms; 1,243 ms
+before) — 1.7% of vital-signs rows fall in the window, so the walk probes ~1,250
+rows; a same-row range for single-valued date parameters would make it a
+direct range scan (upstream issue candidate, see §3 finding 3).
 
 ## 5. search_index write amplification
 

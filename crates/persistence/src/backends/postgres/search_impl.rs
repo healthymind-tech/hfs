@@ -9,7 +9,7 @@
 //! - Full-text search using tsvector/tsquery
 
 use crate::backends::sql_literal::sql_string_literal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -311,6 +311,104 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     })
 }
 
+/// The `search_index` value column a range-capable membership of this type
+/// filters on, when the planner's estimate for it needs
+/// [`range_estimate_correction`].
+fn range_value_column(param_type: crate::types::SearchParamType) -> Option<&'static str> {
+    use crate::types::SearchParamType;
+    match param_type {
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        _ => None,
+    }
+}
+
+/// Factor that undoes the planner's independent null-fraction penalty on a
+/// range membership's row estimate.
+///
+/// `search_index` keeps every parameter type in one table, so a value column
+/// such as `value_date` is NULL on every row that is not a date (91% of rows
+/// on the 2.2M-resource benchmark). For `param_name = 'date' AND value_date_end
+/// > $x` the planner multiplies the range selectivity by `1 - null_frac` as if
+/// the NULLs were independent of `param_name`, when in fact a date
+/// parameter's rows are never NULL there. The estimate comes out low by
+/// exactly `1 / (1 - null_frac)` — 45k for 485k real rows — and that made the
+/// broad-conjunction walk pick the date as its driver for
+/// `Observation?category=vital-signs&date=ge2020-01-01` (720 ms instead of
+/// ~10 ms). Extended statistics cannot express the correlation (functional
+/// dependencies are equality-only). Token memberships are equalities covered
+/// by the dependency statistics and need no correction.
+pub(super) fn range_estimate_correction(null_frac: Option<f64>) -> f64 {
+    match null_frac {
+        // Guard against a column that is almost entirely NULL in a tiny
+        // table: never scale an estimate by more than 1000x.
+        Some(f) if f.is_finite() && (0.0..1.0).contains(&f) => (1.0 / (1.0 - f)).min(1000.0),
+        _ => 1.0,
+    }
+}
+
+/// How a membership may take part in the broad walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkRole {
+    /// Token, reference, string, uri: an equality PostgreSQL walks in
+    /// `last_updated` order reliably and estimates well.
+    TokenLike,
+    /// A date, number or quantity range that maps to an index range
+    /// (`le`/`lt` dates, quantity and number comparisons).
+    Range,
+    /// An upward-open date (`ge`/`gt`/`sa`): its predicate is
+    /// `value_date_end > $a OR (value_date >= $b AND …)`, which no index can
+    /// walk in `last_updated` order, so PostgreSQL scans and sorts every
+    /// matching row — 485k for `date=ge2020` (0.5–3.6 s). It is only ever
+    /// probed while another membership can drive.
+    OpenRange,
+}
+
+fn walk_role(param_type: crate::types::SearchParamType, predicate_sql: &str) -> WalkRole {
+    if range_value_column(param_type).is_none() {
+        WalkRole::TokenLike
+    } else if predicate_sql.contains("value_date_end >") {
+        WalkRole::OpenRange
+    } else {
+        WalkRole::Range
+    }
+}
+
+/// Which membership the broad-conjunction walk drives from.
+///
+/// The walk visits the driver's rows newest first and probes the others, so
+/// it should start from a membership PostgreSQL can walk in order and that is
+/// not much larger than the alternatives. Measured on 2.24M resources (token
+/// driver vs range driver, both with per-row probes):
+///
+/// | shape | token rows | range rows | token drives | range drives |
+/// |---|---|---|---|---|
+/// | `status=final&date=ge2020` | 655k | 485k (open) | 0.4 ms | 3,626 ms |
+/// | `clinical-status=active&onset-date=ge2015` | 93k | 66k (open) | 0.5 ms | 549 ms |
+/// | `category=vital-signs&value-quantity=gt100` | 139k | 99k | 4.8 ms | 2.6 ms |
+/// | `category=laboratory&date=le2012` | 452k | 117k | 14 ms | 1.7 ms |
+/// | `category=vital-signs&date=le1975` | 139k | 8.9k | 57 ms | 14 ms |
+/// | `category=survey&value-quantity=gt1000` | 43k | 1.4k | 586 ms | 13 ms |
+///
+/// So the smallest token-like or walkable-range membership drives (with the
+/// range estimate corrected by [`range_estimate_correction`]); an
+/// upward-open date ([`WalkRole::OpenRange`]) drives only when nothing else
+/// can.
+fn choose_walk_driver(estimates: &[f64], roles: &[WalkRole]) -> usize {
+    let smallest = |accept: &dyn Fn(WalkRole) -> bool| {
+        (0..estimates.len())
+            .filter(|&i| accept(roles[i]))
+            .min_by(|&a, &b| estimates[a].total_cmp(&estimates[b]))
+    };
+    smallest(&|r| r != WalkRole::OpenRange)
+        .or_else(|| smallest(&|_| true))
+        .unwrap_or(0)
+}
+
+/// How long the null fractions read from `pg_stats` are reused.
+const VALUE_NULL_FRACTION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A membership the planner expects to match at most this many index rows is
 /// selective: the general plan, which PostgreSQL drives from it, is already
 /// cheap.
@@ -361,9 +459,18 @@ fn broad_conjunction_sql(predicates: &[SqlFragment], driver: usize, limit: usize
     let mut probes = String::new();
     for (i, other) in predicates.iter().enumerate() {
         if i != driver {
+            // `OFFSET 0` keeps the probe a correlated subplan, run once per
+            // walked row until the page is full. Without it PostgreSQL may turn
+            // the `EXISTS` into a hash semi-join and read the whole probed
+            // membership first; it does exactly that for a range membership,
+            // whose estimate is low (see `range_estimate_correction`):
+            // `Condition?clinical-status=active&onset-date=ge2015` hashed 66k
+            // onset rows (385 ms) for a 21-row page that ~50 probes fill
+            // (0.3 ms), and `code=…&value-quantity=gt20` hashed 251k quantity
+            // rows (313 ms vs 0.5 ms).
             probes.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM search_index o \
-                   WHERE o.resource_id = search_index.resource_id AND {})",
+                   WHERE o.resource_id = search_index.resource_id AND {} OFFSET 0)",
                 other.sql
             ));
         }
@@ -398,15 +505,18 @@ impl PostgresBackend {
         has_cursor: bool,
         general_filter: Option<&str>,
     ) -> StorageResult<Option<(Vec<SqlFragment>, usize)>> {
-        // Shapes the builder already plans with a measured special form —
-        // repeated names and the code/value-quantity pair folded into an
-        // `INTERSECT` (#1416, #1580), the patient-scoped composite and
-        // quantity probes (#1579) — keep that form.
-        if general_filter
-            .is_some_and(|sql| sql.contains(" INTERSECT ") || sql.contains("EXISTS (WITH scoped_"))
-        {
+        // The patient-scoped composite and quantity probes (#1579) keep their
+        // measured special form. Repeated names and the code/value-quantity
+        // pair folded into an `INTERSECT` (#1416, #1580) keep theirs unless a
+        // token-like membership can drive the walk (decided below): the
+        // `INTERSECT` evaluates every arm in full, so `category=X&date=ge…&
+        // date=lt…` read 657k date rows for a one-month window (1.3 s), while
+        // walking `category` and probing each date occurrence is bounded by
+        // the page.
+        if general_filter.is_some_and(|sql| sql.contains("EXISTS (WITH scoped_")) {
             return Ok(None);
         }
+        let set_form = general_filter.is_some_and(|sql| sql.contains(" INTERSECT "));
         if query.parameters.len() < 2
             || has_cursor
             || query.offset.is_some()
@@ -470,7 +580,14 @@ impl PostgresBackend {
                 .await
                 .or_query_error("Failed to estimate a search membership")?;
             let plan: serde_json::Value = row.get(0);
-            estimates.push(plan[0]["Plan"]["Plan Rows"].as_f64().unwrap_or(0.0));
+            let rows = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap_or(0.0);
+            let factor = match range_value_column(param.param_type) {
+                Some(column) => range_estimate_correction(
+                    self.value_null_fraction(client, column).await,
+                ),
+                None => 1.0,
+            };
+            estimates.push(rows * factor);
         }
         if estimates
             .iter()
@@ -478,10 +595,48 @@ impl PostgresBackend {
         {
             return Ok(None);
         }
-        let driver = (0..estimates.len())
-            .min_by(|&a, &b| estimates[a].total_cmp(&estimates[b]))
-            .unwrap_or(0);
+        let roles: Vec<WalkRole> = query
+            .parameters
+            .iter()
+            .zip(&predicates)
+            .map(|(p, pred)| walk_role(p.param_type, &pred.sql))
+            .collect();
+        let driver = choose_walk_driver(&estimates, &roles);
+        if set_form && roles[driver] != WalkRole::TokenLike {
+            return Ok(None);
+        }
         Ok(Some((predicates, driver)))
+    }
+
+    /// `pg_stats.null_frac` of a `search_index` value column, cached for
+    /// [`VALUE_NULL_FRACTION_TTL`]. `None` before the table is analysed or
+    /// when the statistics cannot be read; the estimate is then used as is.
+    async fn value_null_fraction(
+        &self,
+        client: &deadpool_postgres::Client,
+        column: &str,
+    ) -> Option<f64> {
+        if let Some((read_at, fractions)) = self.value_null_fractions.read().as_ref()
+            && read_at.elapsed() < VALUE_NULL_FRACTION_TTL
+        {
+            return fractions.get(column).copied();
+        }
+        let rows = client
+            .query(
+                "SELECT attname::text, null_frac::float8 FROM pg_stats
+                 WHERE schemaname = current_schema() AND tablename = 'search_index'
+                   AND attname IN ('value_date', 'value_number', 'value_quantity_value')",
+                &[],
+            )
+            .await
+            .ok()?;
+        let fractions: HashMap<String, f64> = rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))
+            .collect();
+        let value = fractions.get(column).copied();
+        *self.value_null_fractions.write() = Some((std::time::Instant::now(), fractions));
+        value
     }
 
     fn search_filter(
@@ -2293,5 +2448,86 @@ mod cursor_tests {
             PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, false, &ok)
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod range_estimate_tests {
+    use super::{
+        WalkRole, choose_walk_driver, range_estimate_correction, range_value_column, walk_role,
+    };
+    use crate::types::SearchParamType;
+
+    #[test]
+    fn the_driver_follows_the_measured_shapes() {
+        use WalkRole::{OpenRange as O, Range as R, TokenLike as T};
+        // status=final & date=ge2020: an open date never drives
+        assert_eq!(choose_walk_driver(&[655_000.0, 437_000.0], &[T, O]), 0);
+        assert_eq!(choose_walk_driver(&[655_000.0, 4_000.0], &[T, O]), 0);
+        // category=vital-signs & value-quantity=gt100: the smaller range
+        assert_eq!(choose_walk_driver(&[139_000.0, 99_000.0], &[T, R]), 1);
+        // code (13k) & value-quantity=gt20 (251k): the token
+        assert_eq!(choose_walk_driver(&[13_000.0, 251_000.0], &[T, R]), 0);
+        // category=laboratory & date=le2012
+        assert_eq!(choose_walk_driver(&[452_000.0, 117_000.0], &[T, R]), 1);
+        // category=survey & value-quantity=gt1000
+        assert_eq!(choose_walk_driver(&[43_000.0, 1_400.0], &[T, R]), 1);
+        // two tokens: the smaller, as before
+        assert_eq!(choose_walk_driver(&[50_000.0, 9_000.0], &[T, T]), 1);
+        // only ranges: the smallest walkable one, else the smallest
+        assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, R]), 1);
+        assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, O]), 0);
+        // token + ge date + lt date (a window): the smaller of token and lt
+        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 191_000.0], &[T, O, R]), 0);
+        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 20_000.0], &[T, O, R]), 2);
+    }
+
+    #[test]
+    fn open_dates_are_recognised_from_the_predicate() {
+        let ge = "param_name = 'date' AND (value_date_end > $3 OR (value_date >= $4 AND value_date < $5 AND value_date_end <= $5))";
+        let le = "param_name = 'date' AND (value_date < $3 OR (value_date >= $3 AND value_date < $4))";
+        assert_eq!(walk_role(SearchParamType::Date, ge), WalkRole::OpenRange);
+        assert_eq!(walk_role(SearchParamType::Date, le), WalkRole::Range);
+        assert_eq!(
+            walk_role(SearchParamType::Quantity, "value_quantity_value > $3"),
+            WalkRole::Range
+        );
+        assert_eq!(walk_role(SearchParamType::Token, ge), WalkRole::TokenLike);
+    }
+
+    #[test]
+    fn only_range_typed_memberships_are_corrected() {
+        assert_eq!(range_value_column(SearchParamType::Date), Some("value_date"));
+        assert_eq!(range_value_column(SearchParamType::Number), Some("value_number"));
+        assert_eq!(
+            range_value_column(SearchParamType::Quantity),
+            Some("value_quantity_value")
+        );
+        for t in [
+            SearchParamType::Token,
+            SearchParamType::Reference,
+            SearchParamType::String,
+            SearchParamType::Uri,
+        ] {
+            assert_eq!(range_value_column(t), None);
+        }
+    }
+
+    /// The benchmark's case: `value_date` NULL on 91.4% of rows turns a 45k
+    /// estimate back into the ~485k rows the date membership really has.
+    #[test]
+    fn correction_undoes_the_null_fraction() {
+        let f = range_estimate_correction(Some(0.914));
+        assert!((45_000.0 * f - 523_000.0).abs() < 2_000.0, "{f}");
+        assert_eq!(range_estimate_correction(Some(0.0)), 1.0);
+    }
+
+    #[test]
+    fn missing_or_degenerate_statistics_leave_the_estimate_alone() {
+        assert_eq!(range_estimate_correction(None), 1.0);
+        assert_eq!(range_estimate_correction(Some(1.0)), 1.0);
+        assert_eq!(range_estimate_correction(Some(f64::NAN)), 1.0);
+        assert_eq!(range_estimate_correction(Some(-0.1)), 1.0);
+        assert_eq!(range_estimate_correction(Some(0.99999)), 1000.0);
     }
 }
