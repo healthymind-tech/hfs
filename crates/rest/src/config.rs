@@ -32,6 +32,7 @@
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in`/`:above`/`:below` search and FHIRPath terminology functions |
+//! | `HFS_TERMINOLOGY_TIMEOUT_SECS` | 30 | Per-request timeout of the search terminology client (`$expand` pages) |
 //! | `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: closed (error), empty (match nothing) or open (drop the parameter) |
 //! | `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used for search modifiers |
 //! | `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else 422 `too-costly`) |
@@ -987,6 +988,10 @@ pub struct SearchTerminologyConfig {
     /// How long a successful expansion is reused for identical searches,
     /// in seconds; `0` disables the cache.
     pub expansion_cache_ttl_secs: u64,
+    /// Per-request timeout of the terminology client, in seconds
+    /// (`HFS_TERMINOLOGY_TIMEOUT_SECS`). A cold expansion of a several-thousand-
+    /// code ValueSet can take more than 10 s on a loaded terminology server.
+    pub timeout_secs: u64,
 }
 
 impl Default for SearchTerminologyConfig {
@@ -996,6 +1001,7 @@ impl Default for SearchTerminologyConfig {
             expansion_page_size: 1000,
             expansion_max_codes: 10_000,
             expansion_cache_ttl_secs: 60,
+            timeout_secs: 30,
         }
     }
 }
@@ -1027,12 +1033,16 @@ impl SearchTerminologyConfig {
                 "HFS_SEARCH_EXPANSION_CACHE_TTL_SECS",
                 d.expansion_cache_ttl_secs,
             ),
+            timeout_secs: env_u64("HFS_TERMINOLOGY_TIMEOUT_SECS", d.timeout_secs),
         }
     }
 
     /// Validates the configuration, returning every problem found.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if self.timeout_secs == 0 {
+            errors.push("HFS_TERMINOLOGY_TIMEOUT_SECS must be at least 1".to_string());
+        }
         if !matches!(self.fail.as_str(), "closed" | "empty" | "open") {
             errors.push(format!(
                 "HFS_SEARCH_TERMINOLOGY_FAIL '{}' invalid (expected closed|empty|open)",
