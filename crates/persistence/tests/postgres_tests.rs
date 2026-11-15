@@ -19764,6 +19764,74 @@ mod postgres_integration {
         );
     }
 
+    /// `compartment_member_types` names the types that hold a member of the
+    /// compartment and leaves out the ones that cannot — `$everything` skips
+    /// those segments — and an offloaded search index answers `None`.
+    #[tokio::test]
+    async fn postgres_integration_compartment_member_types_names_populated_types() {
+        use helios_persistence::core::SearchProvider;
+        let backend = create_backend().await;
+        let tenant = create_tenant("compartment-member-types");
+        for resource in [
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "Patient", "id": "p2"}),
+            json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Condition", "id": "c1",
+                "subject": {"reference": "Patient/p2"}}),
+            json!({"resourceType": "AllergyIntolerance", "id": "a1",
+                "patient": {"reference": "Patient/p2"},
+                "recorder": {"reference": "Patient/p1/_history/1"}}),
+        ] {
+            let rt = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let members = |t: &str| {
+            (
+                t.to_string(),
+                helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", t)
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let candidates = vec![
+            members("Observation"),
+            members("Condition"),
+            members("AllergyIntolerance"),
+            members("Encounter"),
+        ];
+        let got = backend
+            .compartment_member_types(&tenant, "Patient/p1", &candidates)
+            .await
+            .unwrap()
+            .expect("an indexed backend answers");
+        let mut got: Vec<String> = got.into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["AllergyIntolerance", "Observation"]);
+
+        let other_tenant = create_tenant("compartment-member-types-other");
+        let none = backend
+            .compartment_member_types(&other_tenant, "Patient/p1", &candidates)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(none.is_empty(), "another tenant's rows never count");
+
+        let mut offloaded = create_backend().await;
+        offloaded.set_search_offloaded(true);
+        assert!(
+            offloaded
+                .compartment_member_types(&tenant, "Patient/p1", &candidates)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Drains `fetch_patient_compartment_batch` for one type.
     async fn drain_compartment_type(
         backend: &PostgresBackend,

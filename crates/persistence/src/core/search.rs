@@ -614,6 +614,30 @@ pub trait SearchProvider: ResourceStorage {
         let _ = (tenant, resource_types);
         Ok(())
     }
+
+    /// Which of `members` can hold a resource in the compartment named by
+    /// `compartment_ref` (`Patient/123`).
+    ///
+    /// `members` pairs each candidate resource type with the search
+    /// parameters through which it joins the compartment. The answer may be a
+    /// superset — a type it names can still turn out empty — but never omits
+    /// a type that has a member: callers use it to skip compartment queries
+    /// that would certainly return nothing, so a missing type would silently
+    /// drop resources. `Patient/$everything` walks every Patient-compartment
+    /// type (about sixty in R4), and on a patient with data in a dozen of them
+    /// the empty queries were most of its latency.
+    ///
+    /// `Ok(None)` means the backend cannot answer cheaply and the caller must
+    /// query every type, which is the default.
+    async fn compartment_member_types(
+        &self,
+        tenant: &TenantContext,
+        compartment_ref: &str,
+        members: &[(String, Vec<String>)],
+    ) -> StorageResult<Option<HashSet<String>>> {
+        let _ = (tenant, compartment_ref, members);
+        Ok(None)
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.

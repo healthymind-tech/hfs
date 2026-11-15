@@ -64,6 +64,17 @@ async fn walk_segments<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    // Segments the backend says cannot hold a member of this patient's
+    // compartment are skipped without a query. `None` walks them all.
+    let present = state
+        .storage()
+        .compartment_member_types(
+            tenant,
+            &format!("Patient/{patient_id}"),
+            &segment_members(version, segments, pos.seg.max(1)),
+        )
+        .await
+        .map_err(RestError::from)?;
     if pos.seg == 0 {
         let patient = state
             .storage()
@@ -81,6 +92,17 @@ where
     }
 
     while pos.seg < segments.len() {
+        if pos.inner.is_none()
+            && present
+                .as_ref()
+                .is_some_and(|types| !types.contains(&segments[pos.seg]))
+        {
+            pos = Position {
+                seg: pos.seg + 1,
+                inner: None,
+            };
+            continue;
+        }
         if matches.len() >= target {
             return Ok(Step::Paused(pos));
         }
@@ -123,6 +145,27 @@ where
         }
     }
     Ok(Step::Done)
+}
+
+/// `(type, compartment params)` for the member segments from `from` on.
+fn segment_members(
+    version: FhirVersion,
+    segments: &[String],
+    from: usize,
+) -> Vec<(String, Vec<String>)> {
+    segments
+        .iter()
+        .skip(from)
+        .map(|t| {
+            (
+                t.clone(),
+                helios_fhir::get_compartment_params(version, "Patient", t)
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// Resolves the supporting resources referenced by `matches`, stopping after

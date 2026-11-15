@@ -39,7 +39,7 @@ mod patient_everything_postgres_tests {
         port: u16,
         /// Kept alive for the duration of the test binary; the
         /// `container_cleanup` exit hook removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -47,6 +47,16 @@ mod patient_everything_postgres_tests {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                // `HFS_TEST_PG_PORT`: use an externally managed PostgreSQL 16
+                // on localhost (user/password/db `postgres`) instead of a
+                // Testcontainers one.
+                if let Ok(port) = std::env::var("HFS_TEST_PG_PORT") {
+                    return SharedPg {
+                        host: "127.0.0.1".to_string(),
+                        port: port.parse().expect("HFS_TEST_PG_PORT must be a TCP port"),
+                        _container: None,
+                    };
+                }
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // Pin the major version. testcontainers-modules defaults to
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
@@ -77,7 +87,7 @@ mod patient_everything_postgres_tests {
                 SharedPg {
                     host,
                     port,
-                    _container: container,
+                    _container: Some(container),
                 }
             })
             .await
