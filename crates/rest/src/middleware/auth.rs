@@ -55,6 +55,81 @@ pub struct AuthMiddlewareState {
     /// authenticated with no change to the validation, scope or audit path.
     /// `None` when the interactive login is not configured.
     pub sessions: Option<Arc<helios_auth::SessionStore>>,
+    /// The administrator sign-in (`HFS_ADMIN_PASSWORD`), when configured.
+    /// Its credential — `Authorization: Basic`, a non-JWT `Bearer <password>`,
+    /// or the admin session cookie (same-site writes only) — authenticates as
+    /// an administrator principal holding every scope, so the password keeps
+    /// working for the console and scripts alongside SMART tokens.
+    pub admin: Option<helios_admin_auth::AdminGate>,
+}
+
+/// Issuer stamped on the principal an administrator credential produces.
+pub const ADMIN_ISSUER: &str = "urn:helios:admin";
+
+/// Scopes granted to the administrator principal: every resource permission
+/// and every operation scope.
+const ADMIN_SCOPES: &str = "system/*.cruds system/purge system/reindex system/bulk-submit";
+
+fn admin_principal(user: &str) -> Principal {
+    let mut claims = serde_json::Map::new();
+    claims.insert("admin".to_string(), serde_json::Value::Bool(true));
+    Principal {
+        subject: user.to_string(),
+        issuer: ADMIN_ISSUER.to_string(),
+        tenant_id: None,
+        scopes: helios_auth::ScopeSet::parse(ADMIN_SCOPES),
+        jti: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        custom_claims: claims,
+    }
+}
+
+/// Whether an `Authorization` value is a bearer JWT (three base64url parts,
+/// the first a JSON object, so `eyJ…`), as opposed to Basic or a bearer
+/// password.
+fn is_jwt_bearer(value: &str) -> bool {
+    value
+        .strip_prefix("Bearer ")
+        .is_some_and(|t| t.starts_with("eyJ") && t.split('.').count() == 3 && !t.contains(' '))
+}
+
+/// Whether an anonymous request may proceed in write-protect mode: reads and
+/// searches, `$validate` and `$everything` (also in their POST forms) — but
+/// not bulk export, job status/output, or per-user settings, which act for
+/// or on behalf of someone.
+pub fn anonymous_read_allowed(method: &str, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let needs_identity = segments.iter().any(|s| {
+        matches!(
+            *s,
+            "$export"
+                | "export"
+                | "export-status"
+                | "export-file"
+                | "$bulk-submit"
+                | "$bulk-submit-status"
+                | "bulk-submit-status"
+                | "bulk-submit-file"
+                | "$reindex"
+                | "$reindex-status"
+                | "$purge"
+                | "_user"
+                | "$sql-run"
+                | "$sql-export"
+                | "$nl-search"
+                | "$get-ws-binding-token"
+        )
+    });
+    if needs_identity {
+        return false;
+    }
+    match method {
+        "GET" | "HEAD" | "OPTIONS" => true,
+        "POST" => segments
+            .last()
+            .is_some_and(|last| matches!(*last, "_search" | "$validate" | "$everything")),
+        _ => false,
+    }
 }
 
 /// Paths that are exempt from authentication.
@@ -142,9 +217,68 @@ pub async fn auth_middleware(
         },
     };
 
+    // The administrator credential (`HFS_ADMIN_PASSWORD`) authenticates as an
+    // administrator: Basic or a bearer password, or the admin session cookie
+    // when no `Authorization` was sent. A bearer JWT always goes to the IdP
+    // validation below.
+    if let Some(auth) = auth_state.admin.as_ref().and_then(|gate| gate.auth()) {
+        let credential = auth_header.as_deref().is_some_and(|h| !is_jwt_bearer(h));
+        let cookie = auth_header.is_none() && auth.session_user(request.headers()).is_some();
+        if credential || cookie {
+            let peer = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip());
+            match auth.authorize(request.method(), request.headers(), peer) {
+                Ok(granted) => {
+                    debug!(user = %granted.user, "Authenticated with the administrator credential");
+                    let principal = admin_principal(&granted.user);
+                    request
+                        .extensions_mut()
+                        .insert(AuditAgent(principal.subject().to_string()));
+                    request.extensions_mut().insert(principal);
+                    return next.run(request).await;
+                }
+                Err(helios_admin_auth::Denial::CrossOrigin) => {
+                    return forbidden_response("cross-site request refused");
+                }
+                Err(helios_admin_auth::Denial::RateLimited(left)) => {
+                    let mut response = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "throttled",
+                                       "diagnostics": "too many failed sign-in attempts"}]
+                        })),
+                    )
+                        .into_response();
+                    if let Ok(v) = left.as_secs().max(1).to_string().parse() {
+                        response.headers_mut().insert(header::RETRY_AFTER, v);
+                    }
+                    return response;
+                }
+                Err(_) if credential => {
+                    return unauthorized_response_with(
+                        "invalid administrator credentials",
+                        Some("invalid_token"),
+                    );
+                }
+                // A cookie whose session just lapsed: carry on as anonymous.
+                Err(_) => {}
+            }
+        }
+    }
+
     let auth_header = match auth_header {
         Some(h) => h,
         None => {
+            // Write-protect mode: anonymous reads pass with no principal (the
+            // authorization layers then have nothing to check).
+            if auth_state.config.effective_mode() == helios_auth::AuthMode::WriteProtect
+                && anonymous_read_allowed(&method, &path)
+            {
+                return next.run(request).await;
+            }
             if !auth_state
                 .audit_exclusion_filter
                 .is_excluded(&path, &method)
@@ -198,7 +332,14 @@ pub async fn auth_middleware(
                     .build();
                 auth_state.audit_sink.record(event).await;
             }
-            unauthorized_response(&err.to_string())
+            if let AuthError::JwksFetchError(_) = err {
+                // The IdP's keys are unreachable: the token may be fine, so
+                // do not tell the client to throw it away.
+                return service_unavailable_response(
+                    "the identity provider's signing keys are unavailable; retry shortly",
+                );
+            }
+            unauthorized_response_with(&err.to_string(), Some("invalid_token"))
         }
     }
 }
@@ -223,6 +364,25 @@ pub async fn authz_middleware(
 
     let path = request.uri().path().to_string();
     let method = request.method().clone();
+
+    // System-level reads that span every type (`/_history`, `$export`,
+    // SQL-on-FHIR, natural-language search, `/$meta`) need a token that reads
+    // every type; per-type classification below returns `None` for them.
+    if let Some(what) = system_wide_read(&path, auth_state.tenant_url_routing)
+        && !principal.scopes.reads_everything()
+    {
+        warn!(sub = %principal.subject(), path = %path, "System-wide read denied");
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!("Forbidden: {what} needs a scope that reads every type"))
+            .agent(principal.subject(), None, true)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(&format!(
+            "{what} needs a system/*.r or user/*.r scope (it reads every resource type)"
+        ));
+    }
 
     // Determine the FHIR operation and resource type from the path. Under
     // URL-path tenant routing the tenant prefix has not been stripped yet (that
@@ -374,6 +534,32 @@ fn extract_operation_for_routing(
     extract_operation(path, method)
 }
 
+/// The system-level endpoints that read across every resource type, by the
+/// (tenant-stripped) path; `None` for anything else.
+fn system_wide_read(path: &str, tenant_url_routing: bool) -> Option<&'static str> {
+    let stripped;
+    let path = if tenant_url_routing {
+        match extract_tenant_from_path(path, &FhirVersion::default_enabled()) {
+            Some((_tenant, remaining)) => {
+                stripped = remaining;
+                stripped.as_str()
+            }
+            None => path,
+        }
+    } else {
+        path
+    };
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        ["_history", ..] => Some("system history"),
+        ["$export"] => Some("system-level $export"),
+        ["$sql-run"] | ["$sql-export"] => Some("SQL-on-FHIR across the server"),
+        ["$nl-search"] => Some("natural-language search"),
+        ["$meta"] => Some("system-level $meta"),
+        _ => None,
+    }
+}
+
 /// Operation endpoints whose handlers run their own scope check, so the
 /// middleware defers to them instead of classifying them by HTTP method.
 ///
@@ -399,7 +585,10 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 /// forms already are, so kicking one off with `POST` needs the same read scope,
 /// not a write one (#1123). System-level `/$export` is `$`-first and so is
 /// already method-agnostic (handled by the system-path guard below).
-const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+///
+/// `$validate` persists nothing and returns only an OperationOutcome, so a
+/// token that may read the type may validate an instance of it.
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export", "$validate"];
 
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
@@ -515,6 +704,20 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
 }
 
 fn unauthorized_response(message: &str) -> Response {
+    unauthorized_response_with(message, None)
+}
+
+/// Quotes a value for an RFC 6750 `WWW-Authenticate` auth-param.
+fn challenge_param(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '"' && *c != '\\')
+        .collect()
+}
+
+/// `401` with an RFC 6750 challenge: `Bearer realm="hfs"` for a missing
+/// credential, plus `error="invalid_token"` and a description for a rejected one.
+pub(crate) fn unauthorized_response_with(message: &str, error: Option<&str>) -> Response {
     let body = serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -523,13 +726,36 @@ fn unauthorized_response(message: &str) -> Response {
             "details": { "text": message }
         }]
     });
+    let challenge = match error {
+        Some(error) => format!(
+            "Bearer realm=\"hfs\", error=\"{error}\", error_description=\"{}\"",
+            challenge_param(message)
+        ),
+        None => "Bearer realm=\"hfs\"".to_string(),
+    };
+    let challenge = axum::http::HeaderValue::from_str(&challenge)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer realm=\"hfs\""));
 
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            axum::http::HeaderValue::from_static("Bearer"),
-        )],
+        [(header::WWW_AUTHENTICATE, challenge)],
+        Json(body),
+    )
+        .into_response()
+}
+
+fn service_unavailable_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "transient",
+            "details": { "text": message }
+        }]
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, axum::http::HeaderValue::from_static("5"))],
         Json(body),
     )
         .into_response()
@@ -544,8 +770,19 @@ fn forbidden_response(message: &str) -> Response {
             "details": { "text": message }
         }]
     });
-
-    (StatusCode::FORBIDDEN, Json(body)).into_response()
+    let challenge = format!(
+        "Bearer realm=\"hfs\", error=\"insufficient_scope\", error_description=\"{}\"",
+        challenge_param(message)
+    );
+    match axum::http::HeaderValue::from_str(&challenge) {
+        Ok(challenge) => (
+            StatusCode::FORBIDDEN,
+            [(header::WWW_AUTHENTICATE, challenge)],
+            Json(body),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::FORBIDDEN, Json(body)).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -573,6 +810,52 @@ mod tests {
         assert!(!is_exempt_path("/Patient/.well-known/smart-configuration"));
         assert!(!is_exempt_path("/tenant/metadata"));
         assert!(!is_exempt_path("/tenant/$versions"));
+    }
+
+    #[test]
+    fn anonymous_reads_in_write_protect_mode() {
+        assert!(anonymous_read_allowed("GET", "/Patient"));
+        assert!(anonymous_read_allowed("GET", "/Patient/1/_history"));
+        assert!(anonymous_read_allowed("POST", "/Patient/_search"));
+        assert!(anonymous_read_allowed("POST", "/Patient/$validate"));
+        assert!(anonymous_read_allowed("POST", "/Patient/1/$everything"));
+        assert!(!anonymous_read_allowed("POST", "/Patient"));
+        assert!(!anonymous_read_allowed("PUT", "/Patient/1"));
+        assert!(!anonymous_read_allowed("DELETE", "/Patient/1"));
+        assert!(!anonymous_read_allowed("PATCH", "/Patient/1"));
+        assert!(!anonymous_read_allowed("POST", "/"));
+        assert!(!anonymous_read_allowed("GET", "/$export"));
+        assert!(!anonymous_read_allowed("GET", "/Patient/$export"));
+        assert!(!anonymous_read_allowed("GET", "/export-status/1"));
+        assert!(!anonymous_read_allowed("GET", "/_user/settings"));
+        assert!(!anonymous_read_allowed("POST", "/ViewDefinition/$sql-run"));
+    }
+
+    #[test]
+    fn jwt_bearers_are_told_apart_from_passwords() {
+        assert!(is_jwt_bearer("Bearer eyJhbGciOi.eyJzdWIi.sig"));
+        assert!(!is_jwt_bearer("Bearer aaa.bbb.ccc"));
+        assert!(!is_jwt_bearer("Bearer correct horse battery"));
+        assert!(!is_jwt_bearer("Bearer secret"));
+        assert!(!is_jwt_bearer("Basic YWRtaW46eA=="));
+    }
+
+    #[test]
+    fn system_wide_reads_are_recognised() {
+        assert!(system_wide_read("/_history", false).is_some());
+        assert!(system_wide_read("/$export", false).is_some());
+        assert!(system_wide_read("/$sql-run", false).is_some());
+        assert!(system_wide_read("/acme/_history", true).is_some());
+        assert!(system_wide_read("/Patient/_history", false).is_none());
+        assert!(system_wide_read("/Patient/$export", false).is_none());
+        assert!(system_wide_read("/metadata", false).is_none());
+    }
+
+    #[test]
+    fn validate_is_read_shaped() {
+        let (rt, op) = extract_operation("/Patient/$validate", "POST").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
     }
 
     #[test]
