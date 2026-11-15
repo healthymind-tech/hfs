@@ -84,6 +84,7 @@ fn app(reads: bool, password: bool) -> App {
         database_url: db.to_string_lossy().into_owned(),
         admin_auth: Some(auth),
         admin_data_dir: dir.path().join("admin").to_string_lossy().into_owned(),
+        admin_ui: true,
         ..HtsConfig::default()
     };
     App {
@@ -260,6 +261,13 @@ async fn terminology_writes_are_balp_events_and_reads_are_not_by_default() {
 }
 
 #[tokio::test]
+async fn without_a_password_the_trail_is_locked() {
+    let app = app(false, false);
+    let (status, _) = send(&app, "GET", "/AuditEvent", None, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn the_trail_is_for_the_administrator_only() {
     let app = app(false, true);
     let (status, _) = send(&app, "GET", "/AuditEvent", None, None).await;
@@ -272,15 +280,17 @@ async fn the_trail_is_for_the_administrator_only() {
 
 #[tokio::test]
 async fn reads_are_recorded_when_enabled() {
-    let app = app(true, false);
-    send(
+    let app = app(true, true);
+    let (_, created) = send(
         &app,
         "POST",
         "/CodeSystem",
-        None,
+        Some(&admin()),
         Some(code_system("cs-r", "1")),
     )
     .await;
+    let id = created["id"].as_str().unwrap().to_string();
+    send(&app, "GET", &format!("/CodeSystem/{id}"), None, None).await;
     send(
         &app,
         "GET",
@@ -289,11 +299,13 @@ async fn reads_are_recorded_when_enabled() {
         None,
     )
     .await;
-    let events = trail(&app, "subtype=operation", None).await;
-    assert_eq!(events.len(), 1, "{events:#?}");
-    assert_eq!(events[0]["meta"]["profile"][0], format!("{BALP}Query"));
+    let reads = trail(&app, "subtype=read", Some(&admin())).await;
+    assert_eq!(reads.len(), 1, "{reads:#?}");
+    assert_eq!(reads[0]["meta"]["profile"][0], format!("{BALP}Read"));
+    let ops = trail(&app, "subtype=operation", Some(&admin())).await;
+    assert_eq!(ops.len(), 1, "{ops:#?}");
     assert!(
-        events[0]["entity"][0]["description"]
+        ops[0]["entity"][0]["description"]
             .as_str()
             .unwrap()
             .contains("$lookup?system=")
@@ -302,14 +314,14 @@ async fn reads_are_recorded_when_enabled() {
 
 #[tokio::test]
 async fn imports_are_recorded() {
-    let app = app(false, false);
+    let app = app(false, true);
     let bundle = json!({
         "resourceType": "Bundle", "type": "collection",
         "entry": [{"resource": code_system("cs-imp", "1")}]
     });
-    let (status, body) = send(&app, "POST", "/import", None, Some(bundle)).await;
+    let (status, body) = send(&app, "POST", "/import", Some(&admin()), Some(bundle)).await;
     assert!(status.is_success(), "{status} {body}");
-    let events = trail(&app, "_count=50", None).await;
+    let events = trail(&app, "_count=50", Some(&admin())).await;
     let import = events
         .iter()
         .find(|e| {
@@ -320,4 +332,47 @@ async fn imports_are_recorded() {
         .expect("import event");
     assert_eq!(import["action"], "E");
     assert_eq!(import["outcome"], "0");
+}
+
+#[tokio::test]
+async fn admin_actions_are_recorded() {
+    let app = app(false, true);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/admin/uploads",
+        Some(&admin()),
+        Some(json!({"filename": "snomed.zip", "size": 1024})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // The admin action reaches the trail asynchronously (queue-free sink here,
+    // but recorded from a spawned task).
+    let mut found = Vec::new();
+    for _ in 0..50 {
+        found = trail(
+            &app,
+            "subtype=urn:helios:hts:admin-action%7Cupload",
+            Some(&admin()),
+        )
+        .await;
+        if !found.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(found.len(), 1, "admin action event");
+    assert_eq!(found[0]["type"]["code"], "110100");
+    assert_eq!(found[0]["action"], "C");
+    // And the HTTP request itself, with the administrator as user.
+    let http = trail(&app, "_count=100", Some(&admin())).await;
+    let req = http
+        .iter()
+        .find(|e| {
+            e["entity"][0]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("/admin/uploads"))
+        })
+        .expect("request event");
+    assert_eq!(req["agent"][2]["who"]["identifier"]["value"], "admin");
 }

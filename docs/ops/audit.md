@@ -185,7 +185,8 @@ variables as `HFS_AUDIT_*` with the `HTS_` prefix, observer `Device/hts`):
    next to its terminology tables (tenant `default`). Search it at
    `GET <hts>/AuditEvent?date=&entity=&agent=&type=&subtype=&action=&outcome=&_count=`
    and `GET <hts>/AuditEvent/{id}` — **administrator only** (same credential
-   as `/admin`).
+   as `/admin`; without `HTS_ADMIN_PASSWORD` the trail answers `503` rather
+   than being open).
 2. `HTS_AUDIT_DATABASE_URL=<HFS's database URL>`: HTS writes into HFS's audit
    store, so `GET <hfs>/AuditEvent` covers both servers and HFS's retention
    job purges both. Use this when HFS and HTS share a PostgreSQL server (they

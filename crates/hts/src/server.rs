@@ -342,13 +342,23 @@ where
     // API and `/admin` (not the console's pages).
     let router = match &audit {
         Some(audit) => {
+            // The trail is sensitive: without an administrator password it is
+            // locked rather than open (unlike reads of the terminology).
+            let trail_gate = match &gate {
+                helios_admin_auth::AdminGate::Open => {
+                    helios_admin_auth::AdminGate::Locked(Arc::from(
+                        "the audit trail needs HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+                    ))
+                }
+                other => other.clone(),
+            };
             let router = match &audit.search {
                 Some(search) => router.merge(
                     crate::audit::router(Arc::clone(search))
                         .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
                         .route_layer(axum::middleware::from_fn_with_state(
                             helios_admin_auth::Guard {
-                                gate: gate.clone(),
+                                gate: trail_gate,
                                 protects: |_, _| true,
                                 style: helios_admin_auth::Style::Api { fhir: true },
                             },
