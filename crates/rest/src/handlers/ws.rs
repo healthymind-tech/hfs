@@ -55,6 +55,7 @@ enum BindingTokenRejection {
     TenantMismatch { token_tenant_id: String },
 }
 
+#[cfg(test)]
 fn validate_binding_token_for_request(
     manager: &helios_subscriptions::WsBindingTokenManager,
     token: &str,
