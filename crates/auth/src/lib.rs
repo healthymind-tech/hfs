@@ -39,7 +39,7 @@ pub mod scope;
 pub mod session;
 
 // Re-export commonly used types
-pub use config::AuthConfig;
+pub use config::{AuthConfig, AuthMode, NonCompartmentPolicy};
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
 pub use jwks::JwksCache;
@@ -50,7 +50,7 @@ pub use outbound::{
 pub use policy::SmartScopePolicy;
 pub use principal::Principal;
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};
-pub use scope::{ScopeSet, SmartPermissions};
+pub use scope::{Access, Grant, ScopeSet, SmartPermissions};
 pub use session::{
     AccessOutcome, LoginConfig, PENDING_COOKIE, PersistedPending, PersistedSession, SESSION_COOKIE,
     SaveOutcome, Session, SessionPersistence, SessionPrincipal, SessionStore, cookie_value,

@@ -3,11 +3,81 @@ use std::sync::Arc;
 
 use crate::outbound::{OutboundAuthProvider, provider_from_token};
 
+/// How much of the FHIR API needs a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// No authentication: every request is anonymous and allowed.
+    Off,
+    /// Anonymous reads, authenticated writes. A request without credentials
+    /// may read and search; anything that changes data needs a valid token
+    /// (or the administrator credential). A request that *does* present a
+    /// token is validated and scope-checked exactly as in [`AuthMode::Full`].
+    WriteProtect,
+    /// Every request except discovery and health needs a valid token.
+    #[default]
+    Full,
+}
+
+impl AuthMode {
+    /// Parses `off`, `write-protect` (also `write_protect`, `writes`) or
+    /// `full` (also `on`, `true`), case-insensitively.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "off" | "false" | "none" | "disabled" => Some(Self::Off),
+            "write-protect" | "writes" | "write" => Some(Self::WriteProtect),
+            "full" | "on" | "true" | "required" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    /// The canonical spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WriteProtect => "write-protect",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// What a `patient/` scope may read outside the Patient compartment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonCompartmentPolicy {
+    /// Types that are not members of the Patient compartment at all
+    /// (Medication, Practitioner, Organization, Location, …) may be read and
+    /// searched under a `patient/` scope that names them (or `*`). They carry
+    /// no patient data by definition, and patient-facing apps (US Core) need
+    /// them to render medications and care teams. Writes stay refused.
+    #[default]
+    Allow,
+    /// `patient/` scopes reach nothing outside the compartment.
+    Deny,
+}
+
 /// Configuration for the authentication and authorization subsystem.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Master switch — when false, all auth is bypassed.
     pub enabled: bool,
+    /// What needs a credential when [`enabled`](Self::enabled) is true
+    /// (`HFS_AUTH_MODE`). See [`AuthConfig::effective_mode`].
+    pub mode: AuthMode,
+    /// Allowed clock skew, in seconds, when checking `exp` and `nbf`
+    /// (`HFS_AUTH_CLOCK_SKEW_SECONDS`, default 60).
+    pub clock_skew_secs: u64,
+    /// What `patient/` scopes may read outside the Patient compartment
+    /// (`HFS_AUTH_PATIENT_NON_COMPARTMENT`, `allow` or `deny`).
+    pub patient_non_compartment: NonCompartmentPolicy,
+    /// `capabilities` advertised in `/.well-known/smart-configuration`
+    /// (`HFS_SMART_CAPABILITIES`, comma-separated). `None` uses the default.
+    pub smart_capabilities: Option<Vec<String>>,
+    /// `scopes_supported` advertised in discovery (`HFS_SMART_SCOPES_SUPPORTED`).
+    pub smart_scopes_supported: Option<Vec<String>>,
+    /// `token_endpoint_auth_methods_supported` advertised in discovery
+    /// (`HFS_SMART_TOKEN_AUTH_METHODS`).
+    pub smart_token_auth_methods: Option<Vec<String>>,
+    /// `grant_types_supported` advertised in discovery (`HFS_SMART_GRANT_TYPES`).
+    pub smart_grant_types: Option<Vec<String>>,
     /// JWKS endpoint URL. Required when `enabled` is true.
     pub jwks_url: Option<String>,
     /// Expected JWT issuer (`iss` claim). Validated if set.
@@ -25,6 +95,10 @@ pub struct AuthConfig {
     pub allowed_algorithms: Vec<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
     pub jwks_min_refresh_interval: u64,
+    /// Longest time (seconds) a fetched JWKS is trusted before it is fetched
+    /// again (`HFS_AUTH_JWKS_MAX_AGE_SECONDS`, default 300). Bounds how long a
+    /// key the IdP retired keeps validating tokens.
+    pub jwks_max_age_secs: u64,
 
     // SMART discovery endpoint fields
     /// Token endpoint URL for `/.well-known/smart-configuration`.
@@ -72,10 +146,43 @@ pub struct AuthConfig {
 impl AuthConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
+        let legacy_enabled = env::var("HFS_AUTH_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        // `HFS_AUTH_MODE` wins; without it `HFS_AUTH_ENABLED=true` means full.
+        let mode = match env::var("HFS_AUTH_MODE").ok().filter(|v| !v.trim().is_empty()) {
+            Some(raw) => AuthMode::parse(&raw).unwrap_or_else(|| {
+                tracing::error!(
+                    value = %raw,
+                    "HFS_AUTH_MODE is not one of off, write-protect, full; using full"
+                );
+                AuthMode::Full
+            }),
+            None if legacy_enabled => AuthMode::Full,
+            None => AuthMode::Off,
+        };
         Self {
-            enabled: env::var("HFS_AUTH_ENABLED")
-                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-                .unwrap_or(false),
+            enabled: mode != AuthMode::Off,
+            mode: if mode == AuthMode::Off {
+                AuthMode::Full
+            } else {
+                mode
+            },
+            clock_skew_secs: env::var("HFS_AUTH_CLOCK_SKEW_SECONDS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(60),
+            patient_non_compartment: match env::var("HFS_AUTH_PATIENT_NON_COMPARTMENT")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Ok("deny") => NonCompartmentPolicy::Deny,
+                _ => NonCompartmentPolicy::Allow,
+            },
+            smart_capabilities: list_env("HFS_SMART_CAPABILITIES"),
+            smart_scopes_supported: list_env("HFS_SMART_SCOPES_SUPPORTED"),
+            smart_token_auth_methods: list_env("HFS_SMART_TOKEN_AUTH_METHODS"),
+            smart_grant_types: list_env("HFS_SMART_GRANT_TYPES"),
             jwks_url: env::var("HFS_AUTH_JWKS_URL").ok(),
             expected_issuer: env::var("HFS_AUTH_ISSUER").ok(),
             expected_audience: env::var("HFS_AUTH_AUDIENCE").ok(),
@@ -90,6 +197,10 @@ impl AuthConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            jwks_max_age_secs: env::var("HFS_AUTH_JWKS_MAX_AGE_SECONDS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(300),
             smart_token_endpoint: env::var("HFS_SMART_TOKEN_ENDPOINT").ok(),
             smart_authorize_endpoint: env::var("HFS_SMART_AUTHORIZE_ENDPOINT").ok(),
             smart_jwks_url: env::var("HFS_SMART_JWKS_URL").ok(),
@@ -116,6 +227,12 @@ impl AuthConfig {
                 .unwrap_or(true),
             smart_end_session_endpoint: env::var("HFS_SMART_END_SESSION_ENDPOINT").ok(),
         }
+    }
+
+    /// The mode in force: [`AuthMode::Off`] when disabled, else
+    /// [`mode`](Self::mode).
+    pub fn effective_mode(&self) -> AuthMode {
+        if self.enabled { self.mode } else { AuthMode::Off }
     }
 
     /// Build an outbound auth provider from this config.
@@ -182,6 +299,13 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: AuthMode::Full,
+            clock_skew_secs: 60,
+            patient_non_compartment: NonCompartmentPolicy::Allow,
+            smart_capabilities: None,
+            smart_scopes_supported: None,
+            smart_token_auth_methods: None,
+            smart_grant_types: None,
             jwks_url: None,
             expected_issuer: None,
             expected_audience: None,
@@ -193,6 +317,7 @@ impl Default for AuthConfig {
                 "ES384".to_string(),
             ],
             jwks_min_refresh_interval: 10,
+            jwks_max_age_secs: 300,
             smart_token_endpoint: None,
             smart_authorize_endpoint: None,
             smart_jwks_url: None,
@@ -211,6 +336,19 @@ impl Default for AuthConfig {
     }
 }
 
+/// A comma- or space-separated list from the environment; `None` when unset
+/// or blank.
+fn list_env(name: &str) -> Option<Vec<String>> {
+    let raw = env::var(name).ok()?;
+    let items: Vec<String> = raw
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!items.is_empty()).then_some(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +358,10 @@ mod tests {
 
     const AUTH_ENV_KEYS: &[&str] = &[
         "HFS_AUTH_ENABLED",
+        "HFS_AUTH_MODE",
+        "HFS_AUTH_CLOCK_SKEW_SECONDS",
+        "HFS_AUTH_PATIENT_NON_COMPARTMENT",
+        "HFS_SMART_CAPABILITIES",
         "HFS_AUTH_JWKS_URL",
         "HFS_AUTH_ISSUER",
         "HFS_AUTH_AUDIENCE",
@@ -234,6 +376,9 @@ mod tests {
         "HFS_SMART_REGISTRATION_ENDPOINT",
         "HFS_SMART_REVOCATION_ENDPOINT",
         "HFS_OUTBOUND_BEARER_TOKEN",
+        "HFS_SMART_SCOPES_SUPPORTED",
+        "HFS_SMART_TOKEN_AUTH_METHODS",
+        "HFS_SMART_GRANT_TYPES",
     ];
 
     fn clear_auth_env() {
@@ -255,6 +400,59 @@ mod tests {
             config.allowed_algorithms,
             vec!["RS256", "RS384", "ES256", "ES384"]
         );
+    }
+
+    #[test]
+    fn mode_defaults_to_off_and_legacy_enabled_means_full() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+        assert_eq!(AuthConfig::from_env().effective_mode(), AuthMode::Off);
+        unsafe { env::set_var("HFS_AUTH_ENABLED", "true") };
+        let config = AuthConfig::from_env();
+        assert!(config.enabled);
+        assert_eq!(config.effective_mode(), AuthMode::Full);
+        clear_auth_env();
+    }
+
+    #[test]
+    fn mode_write_protect_enables_auth() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+        unsafe { env::set_var("HFS_AUTH_MODE", "write-protect") };
+        let config = AuthConfig::from_env();
+        assert!(config.enabled);
+        assert_eq!(config.effective_mode(), AuthMode::WriteProtect);
+        // An explicit mode wins over the legacy switch.
+        unsafe { env::set_var("HFS_AUTH_ENABLED", "true") };
+        unsafe { env::set_var("HFS_AUTH_MODE", "off") };
+        let config = AuthConfig::from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.effective_mode(), AuthMode::Off);
+        clear_auth_env();
+    }
+
+    #[test]
+    fn clock_skew_and_lists_parse() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+        assert_eq!(AuthConfig::from_env().clock_skew_secs, 60);
+        unsafe { env::set_var("HFS_AUTH_CLOCK_SKEW_SECONDS", "15") };
+        unsafe { env::set_var("HFS_SMART_CAPABILITIES", "launch-standalone, permission-v2") };
+        let config = AuthConfig::from_env();
+        assert_eq!(config.clock_skew_secs, 15);
+        assert_eq!(
+            config.smart_capabilities,
+            Some(vec!["launch-standalone".to_string(), "permission-v2".to_string()])
+        );
+        clear_auth_env();
+    }
+
+    #[test]
+    fn auth_mode_parses_spellings() {
+        assert_eq!(AuthMode::parse("WRITE_PROTECT"), Some(AuthMode::WriteProtect));
+        assert_eq!(AuthMode::parse("full"), Some(AuthMode::Full));
+        assert_eq!(AuthMode::parse("off"), Some(AuthMode::Off));
+        assert_eq!(AuthMode::parse("maybe"), None);
     }
 
     #[test]
