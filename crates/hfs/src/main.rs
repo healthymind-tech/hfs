@@ -449,9 +449,152 @@ fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Res
 
 /// The audit store and, when its backend supports it, the retention handle.
 type AuditStores = (
-    Arc<dyn ResourceStorage>,
+    Arc<dyn helios_audit::sinks::database::AuditStorage>,
     Option<Arc<dyn helios_persistence::core::RetentionStorage>>,
 );
+
+/// The tenant an audit event is stored in: the configured audit tenant, else
+/// the tenant of the audited request, else the default tenant — so that the
+/// events are searchable through the REST API of that tenant.
+fn audit_tenant(fixed: Option<&str>, request: Option<&str>, default: &str) -> TenantContext {
+    TenantContext::new(
+        helios_persistence::tenant::TenantId::new(fixed.or(request).unwrap_or(default)),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    )
+}
+
+/// How a transactional backend opens the transaction for a batch of audit
+/// events (creates under ids this server just generated).
+#[async_trait::async_trait]
+trait AuditBatchTransaction: helios_persistence::core::TransactionProvider {
+    async fn begin_audit_batch(
+        &self,
+        tenant: &TenantContext,
+        options: helios_persistence::core::TransactionOptions,
+        ids: Vec<(String, String)>,
+    ) -> helios_persistence::error::StorageResult<Self::Transaction>;
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl AuditBatchTransaction for helios_persistence::backends::postgres::PostgresBackend {
+    async fn begin_audit_batch(
+        &self,
+        tenant: &TenantContext,
+        options: helios_persistence::core::TransactionOptions,
+        ids: Vec<(String, String)>,
+    ) -> helios_persistence::error::StorageResult<Self::Transaction> {
+        // Shared tenant lock only: a plain transaction would hold the tenant's
+        // exclusive write gate and stall every clinical write meanwhile.
+        self.begin_fresh_create_transaction(tenant, options, ids)
+            .await
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[async_trait::async_trait]
+impl AuditBatchTransaction for SqliteBackend {
+    async fn begin_audit_batch(
+        &self,
+        tenant: &TenantContext,
+        options: helios_persistence::core::TransactionOptions,
+        _ids: Vec<(String, String)>,
+    ) -> helios_persistence::error::StorageResult<Self::Transaction> {
+        // SQLite has one writer at a time either way.
+        helios_persistence::core::TransactionProvider::begin_transaction(self, tenant, options)
+            .await
+    }
+}
+
+/// Audit store on a transactional backend (SQLite, PostgreSQL): a batch of
+/// events is written in **one** transaction, so the commit (and its WAL
+/// flush) is paid once per batch rather than once per event.
+struct TxAuditStorage<B> {
+    backend: Arc<B>,
+    fixed_tenant: Option<String>,
+    default_tenant: String,
+}
+
+impl<B> TxAuditStorage<B> {
+    fn new(backend: Arc<B>, server_config: &ServerConfig, audit_config: &AuditConfig) -> Self {
+        Self {
+            backend,
+            fixed_tenant: audit_config.tenant.clone(),
+            default_tenant: server_config.default_tenant.clone(),
+        }
+    }
+
+    fn tenant_for(&self, request_tenant: Option<&str>) -> TenantContext {
+        audit_tenant(
+            self.fixed_tenant.as_deref(),
+            request_tenant,
+            &self.default_tenant,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl<B> helios_audit::sinks::database::AuditStorage for TxAuditStorage<B>
+where
+    B: AuditBatchTransaction + Send + Sync + 'static,
+{
+    async fn create_resource(
+        &self,
+        tenant: Option<&str>,
+        resource_type: &str,
+        resource: serde_json::Value,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> Result<(), String> {
+        self.backend
+            .create(
+                &self.tenant_for(tenant),
+                resource_type,
+                resource,
+                fhir_version,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn create_resources(
+        &self,
+        tenant: Option<&str>,
+        resource_type: &str,
+        resources: Vec<serde_json::Value>,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> Vec<Result<(), String>> {
+        use helios_persistence::core::{Transaction, TransactionOptions};
+        let n = resources.len();
+        let fail = |e: String| (0..n).map(|_| Err(e.clone())).collect::<Vec<_>>();
+        let mut options = TransactionOptions::new();
+        options.fhir_version = Some(fhir_version);
+        let ids = resources
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+            .map(|id| (resource_type.to_string(), id.to_string()))
+            .collect();
+        let mut tx = match self
+            .backend
+            .begin_audit_batch(&self.tenant_for(tenant), options, ids)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(e) => return fail(e.to_string()),
+        };
+        for r in resources {
+            if let Err(e) = tx.create(resource_type, r).await {
+                let _ = Box::new(tx).rollback().await;
+                // Every event of the batch is retried on its own.
+                return fail(e.to_string());
+            }
+        }
+        match Box::new(tx).commit().await {
+            Ok(()) => (0..n).map(|_| Ok(())).collect(),
+            Err(e) => fail(e.to_string()),
+        }
+    }
+}
 
 struct HfsAuditStorageAdapter {
     storage: Arc<dyn ResourceStorage>,
@@ -478,14 +621,10 @@ impl HfsAuditStorageAdapter {
     /// the tenant of the audited request, else the default tenant — so that
     /// the events are searchable through the REST API of that tenant.
     fn tenant_for(&self, request_tenant: Option<&str>) -> TenantContext {
-        let id = self
-            .fixed_tenant
-            .as_deref()
-            .or(request_tenant)
-            .unwrap_or(&self.default_tenant);
-        TenantContext::new(
-            helios_persistence::tenant::TenantId::new(id),
-            helios_persistence::tenant::TenantPermissions::full_access(),
+        audit_tenant(
+            self.fixed_tenant.as_deref(),
+            request_tenant,
+            &self.default_tenant,
         )
     }
 }
@@ -509,6 +648,28 @@ impl helios_audit::sinks::database::AuditStorage for HfsAuditStorageAdapter {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    async fn create_resources(
+        &self,
+        tenant: Option<&str>,
+        resource_type: &str,
+        resources: Vec<serde_json::Value>,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> Vec<Result<(), String>> {
+        // `create_many` writes with the backend's bulk concurrency (or its
+        // native batch write) instead of one round trip at a time.
+        self.storage
+            .create_many(
+                &self.tenant_for(tenant),
+                resource_type,
+                resources,
+                fhir_version,
+            )
+            .await
+            .into_iter()
+            .map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+            .collect()
     }
 }
 
@@ -567,7 +728,11 @@ async fn create_audit_sqlite_storage(
 
     let backend = Arc::new(backend);
     Ok((
-        backend.clone() as Arc<dyn ResourceStorage>,
+        Arc::new(TxAuditStorage::new(
+            Arc::clone(&backend),
+            server_config,
+            audit_config,
+        )),
         Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
     ))
 }
@@ -614,7 +779,11 @@ async fn create_audit_postgres_storage(
     backend.init_schema_without_patient_export_index().await?;
     let backend = Arc::new(backend);
     Ok((
-        backend.clone() as Arc<dyn ResourceStorage>,
+        Arc::new(TxAuditStorage::new(
+            Arc::clone(&backend),
+            server_config,
+            audit_config,
+        )),
         Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
     ))
 }
@@ -711,7 +880,14 @@ async fn create_audit_mongodb_storage(
     };
 
     backend.init_schema().await?;
-    Ok((Arc::new(backend) as Arc<dyn ResourceStorage>, None))
+    Ok((
+        Arc::new(HfsAuditStorageAdapter::new(
+            Arc::new(backend),
+            audit_config.tenant.clone(),
+            server_config.default_tenant.clone(),
+        )),
+        None,
+    ))
 }
 
 #[cfg(not(feature = "mongodb"))]
@@ -728,7 +904,7 @@ async fn create_audit_mongodb_storage(
 
 #[cfg(feature = "s3")]
 async fn create_audit_s3_storage(
-    _server_config: &ServerConfig,
+    server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
 ) -> anyhow::Result<AuditStores> {
@@ -786,7 +962,14 @@ async fn create_audit_s3_storage(
         )
     })?;
 
-    Ok((Arc::new(backend) as Arc<dyn ResourceStorage>, None))
+    Ok((
+        Arc::new(HfsAuditStorageAdapter::new(
+            Arc::new(backend),
+            audit_config.tenant.clone(),
+            server_config.default_tenant.clone(),
+        )),
+        None,
+    ))
 }
 
 #[cfg(not(feature = "s3"))]
@@ -1455,6 +1638,7 @@ async fn init_audit(
 ) -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
     let config = AuditConfig::from_env();
     let mut retention_store = None;
+    let mut fallback_file = None;
 
     let sink: Arc<dyn AuditSink> = match config.backend {
         AuditBackend::None => {
@@ -1474,14 +1658,9 @@ async fn init_audit(
             Arc::new(helios_audit::FileSink::new(path).await?)
         }
         AuditBackend::Database => {
-            let (storage, retention) =
+            let (adapter, retention) =
                 create_database_audit_storage(server_config, backend_mode, &config).await?;
             retention_store = retention;
-            let adapter = Arc::new(HfsAuditStorageAdapter::new(
-                storage,
-                config.tenant.clone(),
-                server_config.default_tenant.clone(),
-            ));
             let fallback = config
                 .fallback_file
                 .clone()
@@ -1498,6 +1677,7 @@ async fn init_audit(
                 info!(path = %path.display(), "Audit fallback file (used while the database is unavailable)");
                 db = db.with_fallback(path);
             }
+            fallback_file = fallback;
             match db.replay_fallback().await {
                 Ok(0) => {}
                 Ok(n) => info!(events = n, "Replayed audit events from the fallback file"),
@@ -1538,8 +1718,11 @@ async fn init_audit(
 
     // Requests only enqueue; writer tasks drain the queue in batches, and the
     // graceful shutdown flushes it (see `serve`).
-    let sink: Arc<dyn AuditSink> =
-        Arc::new(helios_audit::QueuedSink::new(sink, config.queue_config()));
+    let mut queue_config = config.queue_config();
+    if queue_config.spill_file.is_none() {
+        queue_config.spill_file = fallback_file;
+    }
+    let sink: Arc<dyn AuditSink> = Arc::new(helios_audit::QueuedSink::new(sink, queue_config));
 
     match retention_store {
         Some(store) => {
