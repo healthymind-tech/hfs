@@ -113,7 +113,11 @@ async fn shared_pg() -> &'static SharedPg {
             }
 
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+            // Pin 16 like the persistence suites: the module default is
+            // postgres:11, which rejects the `plan_cache_mode` startup option
+            // the backend sends, so every connection failed ("db error").
             let container = testcontainers_modules::postgres::Postgres::default()
+                .with_tag("16-alpine")
                 .with_label("github.run_id", &run_id)
                 .start()
                 .await
