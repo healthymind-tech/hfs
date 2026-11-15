@@ -894,6 +894,7 @@ impl PackageManager {
             }
         };
         job.update(|s| s.packages_total = plan.install_order.len() as u64);
+        surface_plan_warnings(job, &plan);
         let mut installed = Vec::new();
         let mut failed = Vec::new();
         let mut search_parameters = 0u64;
@@ -952,6 +953,7 @@ impl PackageManager {
                 "failed": failed,
                 "searchParameters": search_parameters,
                 "notes": notes,
+                "warnings": job.view().warnings,
             })),
         );
     }
@@ -1334,6 +1336,9 @@ impl PackageManager {
                         format!("{resource_type} (terminology server)"),
                         err.clone(),
                     );
+                }
+                for w in &outcome.warnings {
+                    job.warn(key, format!("{resource_type} (terminology server)"), w.clone());
                 }
                 let ok = chunk.len() as u64 - failed;
                 job.count(key, &resource_type, |c| {
@@ -2086,6 +2091,42 @@ fn is_oversized_batch(message: &str) -> bool {
     message.contains("HTTP 413") || message.contains("HTTP 408")
 }
 
+/// Records the plan's non-fatal notes as job warnings (and log lines). A
+/// dependency the registry no longer serves (`us.nlm.vsac#0.18.0`, needed by
+/// US Core 7.0.0, is gone from packages.fhir.org) used to show up only inside
+/// `result.plan`: the install "succeeded" and the IG's value sets from that
+/// dependency were silently missing.
+fn surface_plan_warnings(job: &Job, plan: &super::resolver::Plan) {
+    let mut missing: HashSet<String> = HashSet::new();
+    for node in &plan.nodes {
+        if let super::resolver::NodeAction::Missing { error } = &node.action {
+            missing.insert(node.key());
+            let parents: Vec<&str> = node.required.iter().map(|r| r.parent.as_str()).collect();
+            job.warn(
+                &plan.root,
+                node.key(),
+                format!(
+                    "dependency not installed (required by {}): {error}; resources and \
+                     terminology from it are missing",
+                    if parents.is_empty() {
+                        "?".to_string()
+                    } else {
+                        parents.join(", ")
+                    }
+                ),
+            );
+        }
+    }
+    for w in &plan.warnings {
+        // Missing nodes already have their own warning (the plan repeats
+        // the lookup error as `key: error`).
+        if missing.iter().any(|k| w.starts_with(&format!("{k}:")) || w.starts_with(&format!("{k} ("))) {
+            continue;
+        }
+        job.warn(&plan.root, "plan", w.clone());
+    }
+}
+
 /// Imports into the terminology server, retrying transient failures with
 /// backoff: the whole batch when the request fails, otherwise only the
 /// resources whose own error was transient. A batch refused for its size is
@@ -2098,6 +2139,7 @@ fn import_with_retry(
     Box::pin(async move {
         const DELAYS: [u64; 4] = [5, 15, 30, 60];
         let mut kept_errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         let mut imported = 0;
         let mut status = 200;
         for delay in DELAYS.into_iter().map(Some).chain([None]) {
@@ -2111,6 +2153,7 @@ fn import_with_retry(
                             Ok(outcome) => {
                                 imported += outcome.imported;
                                 kept_errors.extend(outcome.errors);
+                                warnings.extend(outcome.warnings);
                             }
                             Err(err) => kept_errors.extend(
                                 labels
@@ -2130,6 +2173,7 @@ fn import_with_retry(
                 Ok(outcome) => {
                     status = outcome.status;
                     imported += outcome.imported;
+                    warnings.extend(outcome.warnings);
                     let (transient, permanent): (Vec<String>, Vec<String>) = outcome
                         .errors
                         .into_iter()
@@ -2158,6 +2202,7 @@ fn import_with_retry(
             status,
             imported,
             errors: kept_errors,
+            warnings,
         })
     })
 }
@@ -2214,6 +2259,83 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         // 5 -> 2 + 3 -> 3 splits into 1 + 2.
         assert_eq!(*sizes.lock().unwrap(), vec![5, 2, 3, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn terminology_server_warnings_reach_the_outcome() {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/import",
+            post(|| async {
+                Json(json!({"code_systems": 0, "warnings": ["CodeSystem http://x|1 not replaced"]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let outcome = import_with_retry(
+            &HtsClient::new(&base),
+            vec![json!({"resourceType": "CodeSystem", "url": "http://x"})],
+        )
+        .await
+        .unwrap();
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.warnings, ["CodeSystem http://x|1 not replaced"]);
+    }
+
+    #[test]
+    fn missing_dependencies_become_job_warnings() {
+        use super::super::resolver::{NodeAction, Plan, PlanNode, Requirement};
+        let node = |name: &str, version: &str, action: NodeAction, parent: Option<&str>| PlanNode {
+            name: name.into(),
+            version: Some(version.into()),
+            required: parent
+                .map(|p| {
+                    vec![Requirement {
+                        parent: p.into(),
+                        range: version.into(),
+                    }]
+                })
+                .unwrap_or_default(),
+            action,
+            depth: usize::from(parent.is_some()),
+            dependencies: Vec::new(),
+            title: None,
+            fhir_versions: Vec::new(),
+        };
+        let plan = Plan {
+            root: "hl7.fhir.us.core#7.0.0".into(),
+            nodes: vec![
+                node("hl7.fhir.us.core", "7.0.0", NodeAction::Install, None),
+                node(
+                    "us.nlm.vsac",
+                    "0.18.0",
+                    NodeAction::Missing {
+                        error: "us.nlm.vsac#0.18.0 not found".into(),
+                    },
+                    Some("hl7.fhir.us.core#7.0.0"),
+                ),
+            ],
+            install_order: vec!["hl7.fhir.us.core#7.0.0".into()],
+            warnings: vec![
+                "us.nlm.vsac#0.18.0: us.nlm.vsac#0.18.0 not found".into(),
+                "hl7.fhir.us.core#7.0.0 is for FHIR 4.0.1; this server is R5".into(),
+            ],
+        };
+        let table = JobTable::default();
+        let job = table.create(JobKind::Install, "hl7.fhir.us.core#7.0.0", "default", json!({}), None);
+        surface_plan_warnings(&job, &plan);
+        let view = job.view();
+        assert_eq!(view.warnings.len(), 2, "{:?}", view.warnings);
+        assert_eq!(view.warnings[0].resource, "us.nlm.vsac#0.18.0");
+        assert!(
+            view.warnings[0].message.contains("required by hl7.fhir.us.core#7.0.0"),
+            "{}",
+            view.warnings[0].message
+        );
+        assert_eq!(view.warnings[1].resource, "plan");
+        assert!(view.errors.is_empty(), "warnings do not fail the job");
+        assert!(view.log.iter().any(|l| l.contains("warning: ") && l.contains("us.nlm.vsac")));
     }
 
     #[test]

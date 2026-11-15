@@ -20,6 +20,22 @@ pub struct ImportOutcome {
     pub imported: u64,
     /// Non-fatal errors the server reported (207).
     pub errors: Vec<String>,
+    /// Resources the server deliberately did not write (e.g. a truncated
+    /// copy of a complete CodeSystem it already has).
+    pub warnings: Vec<String>,
+}
+
+/// The string array `doc[key]` (empty when absent).
+fn strings(doc: &Value, key: &str) -> Vec<String> {
+    doc.get(key)
+        .and_then(Value::as_array)
+        .map(|e| {
+            e.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// HTS client.
@@ -103,16 +119,8 @@ impl HtsClient {
         Ok(ImportOutcome {
             status,
             imported: count("code_systems") + count("value_sets") + count("concept_maps"),
-            errors: doc
-                .get("errors")
-                .and_then(Value::as_array)
-                .map(|e| {
-                    e.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            errors: strings(&doc, "errors"),
+            warnings: strings(&doc, "warnings"),
         })
     }
 

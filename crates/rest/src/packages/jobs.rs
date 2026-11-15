@@ -115,6 +115,10 @@ pub struct JobView {
     pub errors: Vec<JobError>,
     /// Errors beyond the cap.
     pub errors_dropped: u64,
+    /// Non-fatal problems: a dependency that could not be installed, a
+    /// terminology resource the terminology server kept its own copy of, …
+    /// (capped like `errors`).
+    pub warnings: Vec<JobError>,
     /// Recent log lines.
     pub log: VecDeque<String>,
     /// Who asked.
@@ -201,6 +205,23 @@ impl Job {
         });
     }
 
+    /// Records a warning: kept in `warnings`, logged on the job and in the
+    /// server log.
+    pub fn warn(&self, package: &str, resource: impl Into<String>, message: impl Into<String>) {
+        let (resource, message) = (resource.into(), message.into());
+        tracing::warn!(package, resource = %resource, "package job warning: {message}");
+        self.log(format!("warning: {package} {resource}: {message}"));
+        self.update(|s| {
+            if s.warnings.len() < MAX_ERRORS {
+                s.warnings.push(JobError {
+                    package: package.to_string(),
+                    resource,
+                    message,
+                });
+            }
+        });
+    }
+
     /// Bumps one counter.
     pub fn count(&self, package: &str, resource_type: &str, f: impl FnOnce(&mut TypeCount)) {
         self.update(|s| {
@@ -271,6 +292,7 @@ impl JobTable {
                 counts: BTreeMap::new(),
                 errors: Vec::new(),
                 errors_dropped: 0,
+                warnings: Vec::new(),
                 log: VecDeque::new(),
                 requested_by,
                 created_at: Utc::now(),
