@@ -80,6 +80,8 @@ impl Outcome {
 pub struct AuditLog {
     path: PathBuf,
     lock: Mutex<()>,
+    /// The FHIR audit trail (`HTS_AUDIT_*`) the events also go to.
+    sink: std::sync::OnceLock<(std::sync::Arc<dyn helios_audit::AuditSink>, String)>,
 }
 
 impl AuditLog {
@@ -87,7 +89,47 @@ impl AuditLog {
         Self {
             path,
             lock: Mutex::new(()),
+            sink: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Also send every recorded action to the FHIR audit trail, observed as
+    /// `observer`.
+    pub fn attach_sink(&self, sink: std::sync::Arc<dyn helios_audit::AuditSink>, observer: String) {
+        let _ = self.sink.set((sink, observer));
+    }
+
+    /// The `AuditEvent` the FHIR audit trail records for an admin action:
+    /// an application-activity event (DICOM 110100; BALP has no profile for
+    /// administration), subtype the HTS action, the actor by display and
+    /// address, the affected entity as a detail.
+    pub fn trail_event(
+        observer: &str,
+        actor: &Actor,
+        action: &str,
+        entity: &str,
+        outcome: Outcome,
+        detail: Option<&str>,
+    ) -> helios_audit::AuditEvent {
+        use helios_audit::{AuditAction, AuditEventBuilder};
+        let fhir_action = match action {
+            a if a.starts_with("delete") => AuditAction::Delete,
+            a if a.starts_with("set-") => AuditAction::Update,
+            "upload" => AuditAction::Create,
+            _ => AuditAction::Execute,
+        };
+        let mut b = AuditEventBuilder::new(observer)
+            .event_type("http://dicom.nema.org/resources/ontology/DCM", "110100")
+            .subtype("urn:helios:hts:admin-action", action)
+            .action(fhir_action)
+            .outcome(outcome.code())
+            .agent_display(actor.label(), actor.address.clone())
+            .detail("hts-admin-action", action)
+            .detail("entity", entity);
+        if let Some(d) = detail {
+            b = b.outcome_desc(d);
+        }
+        b.build()
     }
 
     /// Record `action` (`import`, `delete-code-system`, `set-current`, …) on
@@ -140,6 +182,13 @@ impl AuditLog {
             "entity": [{ "what": { "display": entity } }]
         });
         let event = strip_nulls(event);
+        if let Some((sink, observer)) = self.sink.get()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let trail = Self::trail_event(observer, actor, action, entity, outcome, detail);
+            let sink = std::sync::Arc::clone(sink);
+            handle.spawn(async move { sink.record(trail).await });
+        }
         tracing::info!(
             target: "hts::audit",
             action,
@@ -196,6 +245,32 @@ fn strip_nulls(v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_actions_become_trail_events() {
+        let actor = Actor {
+            user: Some("admin".into()),
+            address: Some("10.0.0.7".into()),
+            user_agent: None,
+        };
+        let e = AuditLog::trail_event(
+            "Device/hts",
+            &actor,
+            "delete-code-system",
+            "http://x|1",
+            Outcome::Success,
+            None,
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["action"], "D");
+        assert_eq!(v["type"]["code"], "110100");
+        assert_eq!(v["subtype"][0]["code"], "delete-code-system");
+        assert_eq!(v["agent"][0]["who"]["display"], "admin");
+        assert_eq!(v["agent"][0]["network"]["address"], "10.0.0.7");
+        assert_eq!(v["source"]["observer"]["reference"], "Device/hts");
+        let details = v["entity"][0]["detail"].as_array().unwrap();
+        assert!(details.iter().any(|d| d["valueString"] == "http://x|1"));
+    }
 
     #[test]
     fn records_audit_events_as_ndjson() {

@@ -202,6 +202,9 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
         .with_hts_pool(hts_pool)
         .with_max_expansion_size(config.max_expansion_size)
         .with_auto_supplements(config.auto_supplements);
+    let audit = helios_hts::audit::init(&config, state.resource_store.clone()).await?;
+    audit_startup(&audit, "sqlite").await;
+    let state = state.with_audit(audit.clone());
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -220,6 +223,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
         info!(signal, "Shutdown signal received, draining connections");
     })
     .await?;
+    audit_shutdown(&audit).await;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())
@@ -275,6 +279,9 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
         .with_terminology_importer(Arc::new(backend))
         .with_max_expansion_size(config.max_expansion_size)
         .with_auto_supplements(config.auto_supplements);
+    let audit = helios_hts::audit::init(&config, state.resource_store_pg.clone()).await?;
+    audit_startup(&audit, "postgres").await;
+    let state = state.with_audit(audit.clone());
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -293,9 +300,41 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
         info!(signal, "Shutdown signal received, draining connections");
     })
     .await?;
+    audit_shutdown(&audit).await;
     // After the drain, so spans from the draining requests are exported too.
     helios_observability::telemetry::shutdown();
     Ok(())
+}
+
+/// Records the start-up `AuditEvent` (storage backend, audit settings).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn audit_startup(audit: &Option<helios_hts::audit::HtsAudit>, storage: &str) {
+    if let Some(a) = audit {
+        helios_audit::lifecycle::record_startup(
+            &*a.middleware.sink,
+            &a.middleware.config.source_observer,
+            vec![
+                ("storage-backend", storage.to_string()),
+                ("audit-backend", a.middleware.config.backend.to_string()),
+                ("audit-reads", a.middleware.config.reads.to_string()),
+            ],
+        )
+        .await;
+    }
+}
+
+/// After the HTTP drain: records the shutdown event and drains the audit
+/// queue (spilling what does not fit in `HTS_AUDIT_SHUTDOWN_TIMEOUT`).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn audit_shutdown(audit: &Option<helios_hts::audit::HtsAudit>) {
+    if let Some(a) = audit {
+        helios_audit::lifecycle::record_shutdown(
+            &*a.middleware.sink,
+            &a.middleware.config.source_observer,
+        )
+        .await;
+        a.middleware.sink.flush().await;
+    }
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

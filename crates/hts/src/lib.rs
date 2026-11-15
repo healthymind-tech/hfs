@@ -56,6 +56,7 @@ macro_rules! dispatch_tx {
 }
 
 pub mod admin;
+pub mod audit;
 pub mod backends;
 pub(crate) mod bcp13;
 pub mod config;
@@ -70,8 +71,8 @@ pub mod migrate;
 pub(crate) mod mimetypes;
 pub mod operations;
 pub(crate) mod resource_ids;
-pub mod snomed;
 pub mod server;
+pub mod snomed;
 pub mod state;
 pub mod string_search;
 pub mod traits;
