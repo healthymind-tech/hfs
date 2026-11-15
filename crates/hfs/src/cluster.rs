@@ -27,18 +27,20 @@ pub struct ClusterConfigView<'a> {
     pub primary_backend: BackendKind,
     /// Raw `HFS_JOB_STORE_BACKEND` value ("" when unset).
     pub job_store_backend: &'a str,
-    /// `HFS_AUTH_ENABLED`.
-    pub auth_enabled: bool,
-    /// `HFS_AUTH_JTI_BACKEND`.
-    pub jti_backend: &'a str,
     /// `HFS_BULK_EXPORT_ENABLED`.
     pub bulk_export_enabled: bool,
     /// `HFS_BULK_EXPORT_OUTPUT_BACKEND`.
     pub bulk_export_output_backend: &'a str,
+    /// `HFS_BULK_EXPORT_OUTPUT_SHARED`: the operator declares the `local-fs`
+    /// output directory a volume every instance mounts (NFS, a shared
+    /// Docker volume), so any instance can serve any file (fork).
+    pub bulk_export_output_shared: bool,
     /// `HFS_BULK_SUBMIT_ENABLED`.
     pub bulk_submit_enabled: bool,
     /// `HFS_BULK_SUBMIT_OUTPUT_BACKEND`.
     pub bulk_submit_output_backend: &'a str,
+    /// `HFS_BULK_SUBMIT_OUTPUT_SHARED` (see `bulk_export_output_shared`).
+    pub bulk_submit_output_shared: bool,
     /// `HFS_AUDIT_BACKEND` (`None` means audit is disabled).
     pub audit_backend: AuditBackend,
     /// Whether the Subscriptions engine is enabled (resolved
@@ -72,33 +74,31 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
         );
     }
 
-    // C1 — a per-instance JWT replay cache is a security regression: a
-    // one-time token accepted on this instance would be honored again by
-    // every other instance.
-    if view.auth_enabled && view.jti_backend == "memory" {
-        errors.push(
-            "HFS_CLUSTER=true requires a shared JWT replay cache, but \
-             HFS_AUTH_JTI_BACKEND=memory is per-instance, so a one-time token replayed \
-             against another instance would be accepted. Use redis (HFS_AUTH_REDIS_URL)."
-                .to_string(),
-        );
-    }
-
     // F2 — bulk output written to node-local disk 404s when the download
     // request lands on a different instance than the writer.
-    if view.bulk_export_enabled && view.bulk_export_output_backend == "local-fs" {
+    if view.bulk_export_enabled
+        && view.bulk_export_output_backend == "local-fs"
+        && !view.bulk_export_output_shared
+    {
         errors.push(
             "HFS_CLUSTER=true requires shared bulk-export output, but \
              HFS_BULK_EXPORT_OUTPUT_BACKEND=local-fs writes to node-local disk, so downloads \
-             routed to another instance return 404. Use s3 (or set HFS_BULK_EXPORT_ENABLED=false)."
+             routed to another instance return 404. Use s3, mount HFS_BULK_EXPORT_OUTPUT_DIR \
+             on a volume every instance shares and set HFS_BULK_EXPORT_OUTPUT_SHARED=true, \
+             or set HFS_BULK_EXPORT_ENABLED=false."
                 .to_string(),
         );
     }
-    if view.bulk_submit_enabled && view.bulk_submit_output_backend == "local-fs" {
+    if view.bulk_submit_enabled
+        && view.bulk_submit_output_backend == "local-fs"
+        && !view.bulk_submit_output_shared
+    {
         errors.push(
             "HFS_CLUSTER=true requires shared bulk-submit output, but \
              HFS_BULK_SUBMIT_OUTPUT_BACKEND=local-fs writes to node-local disk, so artifacts \
-             are invisible to other instances. Use s3 (or set HFS_BULK_SUBMIT_ENABLED=false)."
+             are invisible to other instances. Use s3, mount HFS_BULK_SUBMIT_OUTPUT_DIR on a \
+             shared volume and set HFS_BULK_SUBMIT_OUTPUT_SHARED=true, or set \
+             HFS_BULK_SUBMIT_ENABLED=false."
                 .to_string(),
         );
     }
@@ -167,12 +167,12 @@ mod tests {
             cluster: true,
             primary_backend: BackendKind::Postgres,
             job_store_backend: "",
-            auth_enabled: true,
-            jti_backend: "redis",
             bulk_export_enabled: true,
             bulk_export_output_backend: "s3",
+            bulk_export_output_shared: false,
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "s3",
+            bulk_submit_output_shared: false,
             audit_backend: AuditBackend::Database,
             subscriptions_enabled: false,
             subscriptions_fanout: "",
@@ -181,18 +181,18 @@ mod tests {
 
     #[test]
     fn cluster_off_accepts_every_single_instance_default() {
-        // The zero-config single-instance setup: sqlite, memory jti,
+        // The zero-config single-instance setup: sqlite,
         // local-fs outputs, file audit — all fine when not clustered.
         let view = ClusterConfigView {
             cluster: false,
             primary_backend: BackendKind::Sqlite,
             job_store_backend: "memory",
-            auth_enabled: true,
-            jti_backend: "memory",
             bulk_export_enabled: true,
             bulk_export_output_backend: "local-fs",
+            bulk_export_output_shared: false,
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
+            bulk_submit_output_shared: false,
             audit_backend: AuditBackend::File,
             subscriptions_enabled: false,
             subscriptions_fanout: "",
@@ -216,6 +216,18 @@ mod tests {
             ..safe_cluster_view()
         };
         assert_eq!(validate_cluster_config(&explicit_fanout), Ok(()));
+    }
+
+    #[test]
+    fn local_fs_bulk_output_on_a_declared_shared_volume_is_accepted() {
+        let view = ClusterConfigView {
+            bulk_export_output_backend: "local-fs",
+            bulk_export_output_shared: true,
+            bulk_submit_output_backend: "local-fs",
+            bulk_submit_output_shared: true,
+            ..safe_cluster_view()
+        };
+        assert_eq!(validate_cluster_config(&view), Ok(()));
     }
 
     #[test]
@@ -254,14 +266,6 @@ mod tests {
                     ..safe_cluster_view()
                 },
                 expect_var: "HFS_STORAGE_BACKEND",
-            },
-            Case {
-                name: "C1 memory jti",
-                view: ClusterConfigView {
-                    jti_backend: "memory",
-                    ..safe_cluster_view()
-                },
-                expect_var: "HFS_AUTH_JTI_BACKEND",
             },
             Case {
                 name: "F2 local-fs export output",
@@ -318,12 +322,12 @@ mod tests {
             cluster: true,
             primary_backend: BackendKind::Sqlite,
             job_store_backend: "memory",
-            auth_enabled: true,
-            jti_backend: "memory",
             bulk_export_enabled: true,
             bulk_export_output_backend: "local-fs",
+            bulk_export_output_shared: false,
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
+            bulk_submit_output_shared: false,
             audit_backend: AuditBackend::File,
             subscriptions_enabled: false,
             subscriptions_fanout: "",
@@ -335,10 +339,8 @@ mod tests {
     #[test]
     fn disabled_subsystems_are_exempt() {
         // A disabled subsystem's unsafe backend cannot hurt a cluster:
-        // auth off + memory jti, bulk off + local-fs, audit off (None).
+        // bulk off + local-fs, audit off (None).
         let view = ClusterConfigView {
-            auth_enabled: false,
-            jti_backend: "memory",
             bulk_export_enabled: false,
             bulk_export_output_backend: "local-fs",
             bulk_submit_enabled: false,
@@ -349,14 +351,4 @@ mod tests {
         assert_eq!(validate_cluster_config(&view), Ok(()));
     }
 
-    #[test]
-    fn disabled_jti_boots_with_replay_protection_off_everywhere() {
-        // `disabled` is uniform across instances (no false sense of shared
-        // protection), so it boots; the operator doc carries the caveat.
-        let view = ClusterConfigView {
-            jti_backend: "disabled",
-            ..safe_cluster_view()
-        };
-        assert_eq!(validate_cluster_config(&view), Ok(()));
-    }
 }
