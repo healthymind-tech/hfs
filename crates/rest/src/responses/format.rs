@@ -36,6 +36,15 @@ pub fn format_resource_response(
             let xml = value_to_xml(content).map_err(|e| RestError::InternalError {
                 message: format!("Failed to serialize to XML: {}", e),
             })?;
+            // A bare `String` body is `text/plain`; say what it is unless the
+            // handler already did.
+            let mut headers = headers;
+            if !headers.contains_key(axum::http::header::CONTENT_TYPE) {
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/fhir+xml; charset=utf-8"),
+                );
+            }
             Ok((status, headers, xml).into_response())
         }
         #[cfg(not(feature = "xml"))]
@@ -140,5 +149,26 @@ fn detect_fhir_version(_value: &Value) -> helios_fhir::FhirVersion {
     #[allow(unreachable_code)]
     {
         helios_fhir::FhirVersion::default()
+    }
+}
+
+#[cfg(all(test, feature = "xml"))]
+mod xml_content_type_tests {
+    use super::*;
+
+    #[test]
+    fn an_xml_body_is_labelled_fhir_xml() {
+        let bundle = serde_json::json!({"resourceType": "Bundle", "type": "searchset"});
+        let response = format_resource_response(
+            StatusCode::OK,
+            axum::http::HeaderMap::new(),
+            &bundle,
+            FhirFormat::Xml,
+        )
+        .unwrap();
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/fhir+xml; charset=utf-8"
+        );
     }
 }
