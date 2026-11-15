@@ -223,6 +223,12 @@ where
             .validation()
             .remove_stored_profile(tenant.tenant_id(), fhir_version, url);
     }
+    // A deleted ImplementationGuide's global profiles stop applying.
+    if resource_type == "ImplementationGuide" {
+        state
+            .validation()
+            .remove_implementation_guide(tenant.tenant_id(), fhir_version, &id);
+    }
 
     // Compartment reference for the audit record, taken from the pre-delete
     // content while it is still in hand. `update_handler` and `patch_handler`
@@ -415,8 +421,9 @@ where
     }
 }
 
-/// Drops a deleted StructureDefinition from the tenant's profile registry.
-/// Shared by the conditional delete here and the bundle DELETE entries.
+/// Drops a deleted StructureDefinition from the tenant's profile registry,
+/// and a deleted ImplementationGuide's global profiles. Shared by the
+/// conditional delete here and the bundle DELETE entries.
 pub(crate) fn unregister_deleted_profile<S>(
     state: &AppState<S>,
     tenant_id: &str,
@@ -434,6 +441,13 @@ pub(crate) fn unregister_deleted_profile<S>(
         state
             .validation()
             .remove_stored_profile(tenant_id, deleted.fhir_version(), url);
+    }
+    if resource_type == "ImplementationGuide" {
+        state.validation().remove_implementation_guide(
+            tenant_id,
+            deleted.fhir_version(),
+            deleted.id(),
+        );
     }
 }
 

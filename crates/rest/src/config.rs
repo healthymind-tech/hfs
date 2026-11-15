@@ -46,6 +46,7 @@
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
+//! | `HFS_VALIDATION_IG_GLOBAL` | true | Hold every resource to the `ImplementationGuide.global` profiles of the stored ImplementationGuides |
 //!
 //! # Example
 //!
@@ -750,6 +751,13 @@ pub struct ValidationConfig {
     /// `hl7.fhir.r4.core` package must not replace the base types the
     /// validator was built with.
     pub shadow_core: bool,
+    /// Apply the profiles stored ImplementationGuides declare in
+    /// `ImplementationGuide.global` to every resource of the named type
+    /// (`HFS_VALIDATION_IG_GLOBAL`, default `true`), as the HL7 validator
+    /// applies the global profiles of the IGs it has loaded. Installing a
+    /// package stores its ImplementationGuide, so its global profiles take
+    /// effect on install and stop on uninstall. Needs `stored_profiles`.
+    pub ig_global: bool,
     /// Replay stored StructureDefinitions into the profile registries at
     /// startup (`HFS_VALIDATION_REHYDRATE`, default `true`). Without it the
     /// registries are empty after every restart until each profile is
@@ -786,6 +794,7 @@ impl Default for ValidationConfig {
             unknown_extensions: "lenient".to_string(),
             stored_profiles: true,
             shadow_core: false,
+            ig_global: true,
             rehydrate: true,
             rehydrate_batch_size: 100,
             rehydrate_wait_ms: 60_000,
@@ -848,6 +857,7 @@ impl ValidationConfig {
                 .unwrap_or(d.unknown_extensions),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
             shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
+            ig_global: env_bool("HFS_VALIDATION_IG_GLOBAL", d.ig_global),
             rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
             rehydrate_batch_size: env_u64(
                 "HFS_VALIDATION_REHYDRATE_BATCH_SIZE",

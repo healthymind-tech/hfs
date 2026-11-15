@@ -95,6 +95,8 @@ pub(super) struct WalkCtx<'a> {
     /// What an unresolvable `meta.profile` claim reports.
     unknown_profile: UnknownProfilePolicy,
     unknown_extensions: UnknownExtensionPolicy,
+    /// `ImplementationGuide.global` profiles, `(resource type, canonical)`.
+    global_profiles: Vec<(String, String)>,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -240,6 +242,7 @@ impl<'a> WalkCtx<'a> {
             unknown_profile: UnknownProfilePolicy::Ignore,
             check_extension_context: false,
             unknown_extensions: self.unknown_extensions,
+            global_profiles: Vec::new(),
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
@@ -255,6 +258,7 @@ impl<'a> WalkCtx<'a> {
             use_meta_profiles: false,
             unknown_profile: UnknownProfilePolicy::Ignore,
             unknown_extensions: self.unknown_extensions,
+            global_profiles: Vec::new(),
             emitted: HashSet::new(),
             deferred_bindings: HashSet::new(),
             contained: Vec::new(),
@@ -366,6 +370,7 @@ pub(super) fn validate<'a>(
         use_meta_profiles: opts.use_meta_profiles,
         unknown_profile: opts.unknown_profile,
         unknown_extensions: opts.unknown_extensions,
+        global_profiles: opts.global_profiles.clone(),
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
@@ -426,6 +431,7 @@ fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions)
 /// (`meta.profile[i]`), as the HL7 validator reports it.
 fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Value) {
     if !ctx.use_meta_profiles {
+        add_global_profiles(ctx, set, resource);
         return;
     }
     let policy = ctx.unknown_profile;
@@ -447,6 +453,30 @@ fn add_meta_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Valu
             UnknownProfilePolicy::Ignore,
             false,
         );
+    }
+    add_global_profiles(ctx, set, resource);
+}
+
+/// Layer the `ImplementationGuide.global` profiles declared for the
+/// resource's type onto `set`. Independent of `meta.profile` handling: an IG
+/// that declares a global profile holds every resource of that type to it,
+/// whatever the resource claims.
+fn add_global_profiles(ctx: &mut WalkCtx<'_>, set: &mut SchemaSet, resource: &Value) {
+    if ctx.global_profiles.is_empty() {
+        return;
+    }
+    let Some(resource_type) = resource.get("resourceType").and_then(Value::as_str) else {
+        return;
+    };
+    let profiles: Vec<String> = ctx
+        .global_profiles
+        .iter()
+        .filter(|(ty, _)| ty == resource_type)
+        .map(|(_, profile)| profile.clone())
+        .collect();
+    let policy = ctx.unknown_profile;
+    for profile in profiles {
+        add_profile(ctx, set, &profile, Some(resource), policy, false);
     }
 }
 

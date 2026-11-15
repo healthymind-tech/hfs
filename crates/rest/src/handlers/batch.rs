@@ -248,8 +248,9 @@ fn batch_concurrency<S>(state: &AppState<S>, entries: &[Value]) -> usize
 where
     S: ResourceStorage + Send + Sync,
 {
-    // A StructureDefinition written by entry i is folded into the tenant
-    // profile registry by `upsert_stored_profile` (the POST and PUT arms of
+    // A StructureDefinition (or ImplementationGuide, whose `global` profiles
+    // apply from then on) written by entry i is folded into the tenant
+    // profile registry by `record_stored_resource` (the POST and PUT arms of
     // `process_batch_entry`) before entry i+1's `check_write` resolves against
     // it. That read-your-writes is the only cross-entry dependency on this
     // path, and it is a server-side conformance side effect rather than a
@@ -291,8 +292,10 @@ where
         let Ok((resource_type, id)) = parse_bundle_request_url(&method, url) else {
             return false;
         };
-        resource_type == "StructureDefinition"
-            || (!matches!(method, BundleMethod::Get) && conditional_criteria(url, &id).is_some())
+        matches!(
+            resource_type.as_str(),
+            "StructureDefinition" | "ImplementationGuide"
+        ) || (!matches!(method, BundleMethod::Get) && conditional_criteria(url, &id).is_some())
     });
     if needs_serial {
         return 1;
@@ -778,22 +781,21 @@ where
                         super::delete::unregister_deleted_profile(
                             state,
                             tenant.tenant_id(),
-                            "StructureDefinition",
+                            stored.resource_type(),
                             stored,
                         );
                     }
                 }
             }
 
-            // Stored StructureDefinitions feed the tenant's profile registry.
+            // Stored StructureDefinitions and ImplementationGuides feed the
+            // tenant's profile registry and global profiles.
             for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
             {
                 if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
                     && let Some(resource) = &result.resource
-                    && resource.get("resourceType").and_then(Value::as_str)
-                        == Some("StructureDefinition")
                 {
-                    state.validation().upsert_stored_profile(
+                    state.validation().record_stored_resource(
                         tenant.tenant_id(),
                         fhir_version,
                         resource,
@@ -801,7 +803,10 @@ where
                 }
                 if entry.method == BundleMethod::Patch
                     && let Ok((resource_type, id)) = parse_request_url(&entry.url)
-                    && resource_type == "StructureDefinition"
+                    && matches!(
+                        resource_type.as_str(),
+                        "StructureDefinition" | "ImplementationGuide"
+                    )
                 {
                     match state
                         .storage()
@@ -809,7 +814,7 @@ where
                         .await
                     {
                         Ok(Some(stored)) => {
-                            state.validation().upsert_stored_profile(
+                            state.validation().record_stored_resource(
                                 tenant.tenant_id(),
                                 stored.fhir_version(),
                                 stored.content(),
@@ -1678,7 +1683,10 @@ where
             // A StructureDefinition leaves the profile registry with its
             // delete; the registry is keyed by canonical url, so read the
             // current content first.
-            let profile_to_unregister = if resource_type == "StructureDefinition" {
+            let profile_to_unregister = if matches!(
+                resource_type.as_str(),
+                "StructureDefinition" | "ImplementationGuide"
+            ) {
                 match state
                     .storage()
                     .read(tenant.context(), &resource_type, &id)
@@ -1898,7 +1906,10 @@ where
         let Ok((resource_type, id)) = parse_request_url(&entry.url) else {
             continue;
         };
-        if resource_type != "StructureDefinition" {
+        if !matches!(
+            resource_type.as_str(),
+            "StructureDefinition" | "ImplementationGuide"
+        ) {
             continue;
         }
         let found = if entry.criteria.is_some() {
@@ -1943,13 +1954,11 @@ fn record_stored_profile<S>(
 ) where
     S: ResourceStorage + Send + Sync,
 {
-    if stored.resource_type() == "StructureDefinition" {
-        state.validation().upsert_stored_profile(
-            tenant.tenant_id(),
-            fhir_version,
-            stored.content(),
-        );
-    }
+    // Stored StructureDefinitions and ImplementationGuides feed the
+    // tenant's profile registry and global profiles.
+    state
+        .validation()
+        .record_stored_resource(tenant.tenant_id(), fhir_version, stored.content());
 }
 
 /// The entity a batch entry acted on, when neither its URL nor its response

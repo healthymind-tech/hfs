@@ -77,6 +77,13 @@ pub struct ValidationOptions {
     pub check_extension_context: bool,
     /// How an extension whose url resolves to no definition is reported.
     pub unknown_extensions: UnknownExtensionPolicy,
+    /// Profiles that loaded ImplementationGuides declare in
+    /// `ImplementationGuide.global`, as `(resource type, profile canonical)`:
+    /// every resource of that type — the root and every nested resource
+    /// (Bundle entries, contained, parameters) — is held to the profile, as
+    /// the HL7 validator applies the global profiles of its loaded IGs.
+    /// An unresolvable one follows [`Self::unknown_profile`].
+    pub global_profiles: Vec<(String, String)>,
 }
 
 /// Policy for extensions whose url resolves to no StructureDefinition.
@@ -102,6 +109,7 @@ impl Default for ValidationOptions {
             check_extension_context: false,
             unknown_profile: UnknownProfilePolicy::default(),
             unknown_extensions: UnknownExtensionPolicy::default(),
+            global_profiles: Vec::new(),
         }
     }
 }

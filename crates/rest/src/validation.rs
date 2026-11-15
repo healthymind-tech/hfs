@@ -38,6 +38,32 @@ use tracing::{debug, info, warn};
 /// StructureDefinitions.
 type TenantProfileMap = DashMap<(String, FhirVersion), Arc<RwLock<SchemaRegistry>>>;
 
+/// Per-tenant, per-version `ImplementationGuide.global` declarations of the
+/// stored ImplementationGuides, keyed by the IG's logical id:
+/// `(resource type, profile canonical)` pairs.
+type GlobalProfileMap =
+    DashMap<(String, FhirVersion), std::collections::BTreeMap<String, Vec<(String, String)>>>;
+
+/// The `global` entries of an ImplementationGuide resource, as
+/// `(resource type, profile canonical)`. Entries missing either part are
+/// skipped.
+pub fn implementation_guide_globals(ig: &Value) -> Vec<(String, String)> {
+    ig.get("global")
+        .and_then(Value::as_array)
+        .map(|globals| {
+            globals
+                .iter()
+                .filter_map(|g| {
+                    let ty = g.get("type").and_then(Value::as_str)?.trim();
+                    let profile = g.get("profile").and_then(Value::as_str)?.trim();
+                    (!ty.is_empty() && !profile.is_empty())
+                        .then(|| (ty.to_string(), profile.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Outcome of a startup profile rehydration pass
 /// ([`ValidationService::rehydrate_stored_profiles`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +72,8 @@ pub struct ProfileRehydrationReport {
     pub tenants: usize,
     /// StructureDefinitions folded into a registry.
     pub registered: usize,
+    /// Stored ImplementationGuides that declare `global` profiles.
+    pub implementation_guides: usize,
     /// StructureDefinitions read but not registered (conversion failure, or
     /// a core canonical with `HFS_VALIDATION_SHADOW_CORE=false`).
     pub skipped: usize,
@@ -109,6 +137,9 @@ pub struct ValidationService {
     /// Per-tenant profile overlays, fed from stored StructureDefinition
     /// writes. `None` disables the feature.
     tenant_profiles: Option<TenantProfileMap>,
+    /// `ImplementationGuide.global` profiles of the stored IGs
+    /// (`HFS_VALIDATION_IG_GLOBAL`). `None` disables the feature.
+    global_profiles: Option<GlobalProfileMap>,
     /// Allow stored StructureDefinitions to override embedded core
     /// definitions with the same canonical URL (`HFS_VALIDATION_SHADOW_CORE`).
     shadow_core: bool,
@@ -141,6 +172,7 @@ impl Default for ValidationService {
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
+            global_profiles: Some(DashMap::new()),
             shadow_core: false,
             rehydrating: tokio::sync::watch::Sender::new(false),
             rehydrate_wait: Duration::from_millis(60_000),
@@ -225,6 +257,7 @@ impl ValidationService {
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
+            global_profiles: (config.stored_profiles && config.ig_global).then(DashMap::new),
             shadow_core: config.shadow_core,
             rehydrating: tokio::sync::watch::Sender::new(false),
             rehydrate_wait: Duration::from_millis(config.rehydrate_wait_ms),
@@ -325,6 +358,7 @@ impl ValidationService {
             // the HL7 validator reports it (warning on canonical resources).
             check_extension_context: true,
             unknown_extensions: self.unknown_extensions,
+            global_profiles: self.global_profiles_for(tenant, version),
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -538,6 +572,80 @@ impl ValidationService {
         removed
     }
 
+    /// Keep the validation registries current after a successful write of
+    /// `resource`: a StructureDefinition goes into the tenant's profile
+    /// registry, an ImplementationGuide's `global` profiles into its global
+    /// profile list. Any other resource type is ignored.
+    pub fn record_stored_resource(&self, tenant: &str, version: FhirVersion, resource: &Value) {
+        match resource.get("resourceType").and_then(Value::as_str) {
+            Some("StructureDefinition") => {
+                self.upsert_stored_profile(tenant, version, resource);
+            }
+            Some("ImplementationGuide") => {
+                self.upsert_implementation_guide(tenant, version, resource);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record the `global` profiles of a stored ImplementationGuide (replacing
+    /// what an earlier version of the same logical id declared). Returns the
+    /// number of global profiles now recorded for it.
+    pub fn upsert_implementation_guide(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        ig: &Value,
+    ) -> usize {
+        let Some(map) = &self.global_profiles else {
+            return 0;
+        };
+        let Some(id) = ig.get("id").and_then(Value::as_str) else {
+            return 0;
+        };
+        let globals = implementation_guide_globals(ig);
+        let count = globals.len();
+        let mut entry = map.entry((tenant.to_string(), version)).or_default();
+        if globals.is_empty() {
+            entry.remove(id);
+        } else {
+            debug!(tenant = %tenant, ig = %id, globals = count, "ImplementationGuide global profiles recorded");
+            entry.insert(id.to_string(), globals);
+        }
+        count
+    }
+
+    /// Forget the `global` profiles of a deleted ImplementationGuide.
+    pub fn remove_implementation_guide(&self, tenant: &str, version: FhirVersion, id: &str) {
+        if let Some(map) = &self.global_profiles
+            && let Some(mut entry) = map.get_mut(&(tenant.to_string(), version))
+        {
+            entry.remove(id);
+        }
+    }
+
+    /// The `(resource type, profile)` pairs the tenant's stored
+    /// ImplementationGuides declare global, deduplicated, in IG id order.
+    pub fn global_profiles_for(
+        &self,
+        tenant: Option<&str>,
+        version: FhirVersion,
+    ) -> Vec<(String, String)> {
+        let (Some(map), Some(tenant)) = (&self.global_profiles, tenant) else {
+            return Vec::new();
+        };
+        let Some(entry) = map.get(&(tenant.to_string(), version)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for pair in entry.values().flatten() {
+            if !out.contains(pair) {
+                out.push(pair.clone());
+            }
+        }
+        out
+    }
+
     /// Announce that a startup rehydration pass is about to run. Until
     /// [`Self::rehydrate_stored_profiles`] has registered the stored
     /// profiles (from the compiled-profile cache when there is one, else
@@ -651,6 +759,8 @@ impl ValidationService {
         for tenant_id in &tenants {
             self.rehydrate_tenant_profiles(storage, tenant_id, batch_size, &mut report)
                 .await;
+            self.rehydrate_tenant_globals(storage, tenant_id, batch_size, &mut report)
+                .await;
         }
         // Rows that are gone are only known for certain after a clean scan.
         if report.storage_errors == 0 {
@@ -674,6 +784,7 @@ impl ValidationService {
                 cached = report.cached,
                 converted = report.converted,
                 removed = report.removed,
+                implementation_guides = report.implementation_guides,
                 ready_ms = report.ready_after.as_millis() as u64,
                 elapsed_ms = report.elapsed.as_millis() as u64,
                 "stored StructureDefinitions rehydrated into the profile registry"
@@ -978,6 +1089,80 @@ impl ValidationService {
                     }
                     Err(e) => {
                         warn!(tenant = %tenant_id, error = %e, "reading stored StructureDefinitions failed");
+                        report.storage_errors += 1;
+                        return;
+                    }
+                }
+            }
+            match batch.next_cursor {
+                Some(next) if !batch.is_last => cursor = Some(next),
+                _ => return,
+            }
+        }
+    }
+
+    /// Read the tenant's stored ImplementationGuides and record their
+    /// `global` profiles (a handful of rows, read in full every start).
+    async fn rehydrate_tenant_globals<S>(
+        &self,
+        storage: &S,
+        tenant_id: &str,
+        batch_size: u32,
+        report: &mut ProfileRehydrationReport,
+    ) where
+        S: ResourceStorage + ExportDataProvider + ?Sized,
+    {
+        const TYPE: &str = "ImplementationGuide";
+        if self.global_profiles.is_none() {
+            return;
+        }
+        let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+        let mut request = ExportRequest::system();
+        request.resource_types = vec![TYPE.to_string()];
+        request.batch_size = batch_size;
+        let mut cursor: Option<String> = None;
+        for page in 0.. {
+            if page >= MAX_REHYDRATION_PAGES {
+                report.storage_errors += 1;
+                return;
+            }
+            let batch = match storage
+                .fetch_export_batch(&tenant, &request, TYPE, cursor.as_deref(), batch_size)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    warn!(tenant = %tenant_id, error = %e, "paging stored ImplementationGuides failed");
+                    report.storage_errors += 1;
+                    return;
+                }
+            };
+            // Only IGs that declare `global` need their FHIR version, which
+            // the export line does not carry: read those rows.
+            let ids: Vec<String> = batch
+                .lines
+                .iter()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|ig| !implementation_guide_globals(ig).is_empty())
+                .filter_map(|ig| ig.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            if !ids.is_empty() {
+                let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                match storage.read_batch(&tenant, TYPE, &id_refs).await {
+                    Ok(stored) => {
+                        for ig in stored {
+                            if self.upsert_implementation_guide(
+                                tenant_id,
+                                ig.fhir_version(),
+                                ig.content(),
+                            ) > 0
+                            {
+                                report.implementation_guides += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(tenant = %tenant_id, error = %e, "reading stored ImplementationGuides failed");
                         report.storage_errors += 1;
                         return;
                     }
