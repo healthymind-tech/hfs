@@ -1791,6 +1791,21 @@ impl RemoteTerminologyProvider {
         )
     }
 
+    /// The `operationoutcome-message-id` of an issue, when present.
+    fn message_id(issue: &Value) -> Option<&str> {
+        issue
+            .get("extension")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|e| {
+                e.get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| u.ends_with("/operationoutcome-message-id"))
+            })
+            .and_then(|e| e.get("valueString"))
+            .and_then(Value::as_str)
+    }
+
     /// Read the verdict out of a successful `$validate-code` answer.
     ///
     /// A wrong display never makes the code itself invalid: a `false` whose
@@ -1840,7 +1855,9 @@ impl RemoteTerminologyProvider {
                     .then(|| {
                         issues.iter().find(|i| {
                             i.get("severity").and_then(Value::as_str) == Some("error")
-                                && Self::tx_issue_type(i) == Some("invalid-code")
+                                && (Self::tx_issue_type(i) == Some("invalid-code")
+                                    // a supplement used as Coding.system
+                                    || Self::message_id(i) == Some("CODESYSTEM_CS_NO_SUPPLEMENT"))
                         })
                     })
                     .flatten()
@@ -2370,6 +2387,33 @@ mod remote_provider_tests {
                 "valueString": id}]);
         }
         i
+    }
+
+    /// fhir-test-cases `supplement-1`: HTS refuses a supplement as
+    /// Coding.system (CODESYSTEM_CS_NO_SUPPLEMENT, tx type invalid-data);
+    /// the coding is reported like an unknown code.
+    #[test]
+    fn a_supplement_as_coding_system_is_reported() {
+        let coding =
+            json!({"system": "http://hl7.org/fhir/test/CodeSystem/supplement-cs", "code": "test"});
+        let check = TxCheck::Coding(&coding);
+        let text = "CodeSystem http://hl7.org/fhir/test/CodeSystem/supplement-cs|1.0 is a supplement, so can't be used as a value in Coding.system";
+        let verdict = RemoteTerminologyProvider::read_verdict(
+            &check,
+            &answer(
+                false,
+                vec![issue(
+                    "error",
+                    "invalid-data",
+                    text,
+                    Some("CODESYSTEM_CS_NO_SUPPLEMENT"),
+                )],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(verdict.unknown_code.as_deref(), Some(text));
+        assert!(!verdict.unknown_system);
     }
 
     /// A `false` whose only error is a wrong display is a valid code — the
