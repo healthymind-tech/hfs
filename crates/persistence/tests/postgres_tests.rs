@@ -2553,7 +2553,7 @@ mod postgres_integration {
         /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
         /// container-removal path — never runs. The `container_cleanup` exit
         /// hook removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -2563,6 +2563,40 @@ mod postgres_integration {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                // `HFS_TEST_PG_PORT` points the suite at an externally managed
+                // PostgreSQL 16 on localhost (user/password/db `postgres`)
+                // instead of starting a Testcontainers one — for hosts where
+                // test containers must be named and managed by the operator.
+                if let Ok(port) = std::env::var("HFS_TEST_PG_PORT") {
+                    let port: u16 = port.parse().expect("HFS_TEST_PG_PORT must be a TCP port");
+                    let host = "127.0.0.1".to_string();
+                    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.join("data"))
+                        .unwrap_or_else(|| PathBuf::from("data"));
+                    let backend = PostgresBackend::new(PostgresConfig {
+                        host: host.clone(),
+                        port,
+                        dbname: "postgres".to_string(),
+                        user: "postgres".to_string(),
+                        password: Some("postgres".to_string()),
+                        max_connections: 5,
+                        data_dir: Some(data_dir),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("Failed to create PostgresBackend");
+                    backend
+                        .init_schema()
+                        .await
+                        .expect("Failed to initialize schema");
+                    return SharedPg {
+                        host,
+                        port,
+                        _container: None,
+                    };
+                }
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // Pin the major version. testcontainers-modules defaults to
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
@@ -2620,7 +2654,7 @@ mod postgres_integration {
                 SharedPg {
                     host,
                     port,
-                    _container: container,
+                    _container: Some(container),
                 }
             })
             .await
@@ -19647,6 +19681,210 @@ mod postgres_integration {
         assert_eq!(count, 1);
         assert_eq!(batch.lines.len(), 1);
         assert!(batch.lines[0].contains(&inside));
+    }
+
+    fn line_ids(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Drains `fetch_export_batch` for one type with the given page size.
+    async fn drain_export_type(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        request: &ExportRequest,
+        resource_type: &str,
+        page: u32,
+    ) -> Vec<String> {
+        let mut cursor: Option<String> = None;
+        let mut ids = Vec::new();
+        loop {
+            let batch = backend
+                .fetch_export_batch(tenant, request, resource_type, cursor.as_deref(), page)
+                .await
+                .unwrap();
+            ids.extend(line_ids(&batch.lines));
+            if batch.is_last {
+                break;
+            }
+            cursor = batch.next_cursor;
+            assert!(cursor.is_some(), "a non-final page must carry a cursor");
+        }
+        ids
+    }
+
+    /// System export pages walk a type in primary-key order with the last id
+    /// as the cursor, so every page is one index range scan from where the
+    /// previous one stopped (paging on `last_updated` re-read the type from
+    /// its start for every page). Ties and out-of-order timestamps change
+    /// nothing: every row comes out once, in id order.
+    #[tokio::test]
+    async fn postgres_integration_export_pages_in_key_order_with_id_cursor() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-keyset");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let mut ids: Vec<String> = (0..7).map(|i| format!("{prefix}-{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            // Newest first, with a tie in the middle: the opposite of key order.
+            let at = match i {
+                2 | 3 | 4 => "2026-01-10T00:00:00Z".to_string(),
+                _ => format!("2026-01-{:02}T00:00:00Z", 20 - i),
+            };
+            pin_last_updated(&backend, id, instant(&at)).await;
+        }
+        let got = drain_export_type(&backend, &tenant, &ExportRequest::system(), "Patient", 2).await;
+        ids.sort();
+        assert_eq!(got, ids, "every row once, in primary-key order");
+
+        let first = backend
+            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some(format!("id:{}", ids[2]).as_str()),
+            "the cursor is the last exported id"
+        );
+    }
+
+    /// Drains `fetch_patient_compartment_batch` for one type.
+    async fn drain_compartment_type(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        patients: &[String],
+        page: u32,
+    ) -> Vec<String> {
+        let request = ExportRequest::patient();
+        let mut cursor: Option<String> = None;
+        let mut ids = Vec::new();
+        loop {
+            let batch = backend
+                .fetch_patient_compartment_batch(
+                    tenant,
+                    &request,
+                    resource_type,
+                    patients,
+                    cursor.as_deref(),
+                    page,
+                )
+                .await
+                .unwrap();
+            ids.extend(line_ids(&batch.lines));
+            if batch.is_last {
+                break;
+            }
+            cursor = batch.next_cursor;
+            assert!(cursor.is_some(), "a non-final page must carry a cursor");
+        }
+        ids.sort();
+        ids
+    }
+
+    /// A Group or patient list that is a large share of the tenant's patients
+    /// is exported by walking the type in key order (the patient-reference
+    /// index would hand back most of the database for every page); a small
+    /// one goes through the index. Both paths must export exactly the
+    /// compartment members of the selected patients, once each, and page
+    /// through rejected candidates.
+    #[tokio::test]
+    async fn postgres_integration_compartment_export_small_and_large_patient_sets_agree() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-large-group");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patients: Vec<String> = (0..24).map(|i| format!("{prefix}-p{i:02}")).collect();
+        for p in &patients {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": p}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Each patient: two Observations about them, and one that only
+        // mentions them outside the compartment parameters (`focus`).
+        let mut expected_obs: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (i, p) in patients.iter().enumerate() {
+            for k in 0..2 {
+                let id = format!("{prefix}-o{i:02}-{k}");
+                backend
+                    .create(
+                        &tenant,
+                        "Observation",
+                        json!({"resourceType": "Observation", "id": id, "status": "final",
+                            "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p}")}}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+                expected_obs.entry(p.clone()).or_default().push(id);
+            }
+            let other = &patients[(i + 1) % patients.len()];
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": format!("{prefix}-f{i:02}"),
+                        "status": "final", "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/{other}")},
+                        "focus": [{"reference": format!("Patient/{p}")}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let expect = |selected: &[String]| {
+            let mut ids: Vec<String> = selected
+                .iter()
+                .flat_map(|p| expected_obs[p].clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        // One patient of 24 is a small set (index path); all 24 is a large one.
+        for selected in [vec![patients[3].clone()], patients.clone()] {
+            for page in [1, 4, 1000] {
+                let obs = drain_compartment_type(&backend, &tenant, "Observation", &selected, page).await;
+                // Rows passing the reference prefilter but failing the exact
+                // compartment test (`focus` only) are skipped, not exported;
+                // a focus row is a member through its *subject*, the next
+                // patient in the list.
+                let mut want = expect(&selected);
+                for i in 0..patients.len() {
+                    if selected.contains(&patients[(i + 1) % patients.len()]) {
+                        want.push(format!("{prefix}-f{i:02}"));
+                    }
+                }
+                want.sort();
+                assert_eq!(obs, want, "{} patients, page {page}", selected.len());
+                let pats = drain_compartment_type(&backend, &tenant, "Patient", &selected, page).await;
+                let mut want_p = selected.clone();
+                want_p.sort();
+                assert_eq!(pats, want_p, "{} patients, page {page}", selected.len());
+            }
+        }
     }
 
     /// The patient-compartment path applies the bound too — it builds its own
