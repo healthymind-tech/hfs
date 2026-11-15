@@ -2406,7 +2406,8 @@ async fn compute_expansion_inner_body(
                         .await
                         .map(|r| r.get::<_, bool>(0))
                         .unwrap_or(false);
-                    if !has_concepts {
+                    let stored_expansion = crate::backends::include_is_stored_expansion(inc);
+                    if !has_concepts || stored_expansion {
                         let extra = crate::backends::enumerated_from_compose(
                             system_url,
                             cs_version.as_deref(),

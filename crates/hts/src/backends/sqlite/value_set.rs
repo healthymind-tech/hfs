@@ -3877,7 +3877,10 @@ fn expand_single_include_local(
         // fragment): nothing to refute the enumerated codes against, so keep
         // the ones the JOIN dropped, as listed. A CS WITH content still drops
         // unknown codes (IG `simple-expand-enum-bad`).
-        if seen_codes.len() < explicit_codes.len() && !system_has_concepts(conn, &system_id) {
+        if seen_codes.len() < explicit_codes.len()
+            && (crate::backends::include_is_stored_expansion(inc)
+                || !system_has_concepts(conn, &system_id))
+        {
             let extra = crate::backends::enumerated_from_compose(
                 system_url,
                 cs_version.as_deref(),
