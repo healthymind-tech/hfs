@@ -19857,6 +19857,110 @@ mod postgres_integration {
         ids
     }
 
+    /// A small patient set's candidate keys are scanned once and paged from
+    /// memory: a resource deleted between two pages is skipped (its row is
+    /// read by key and is gone), every other one comes out once, and a
+    /// different patient set — or another window — never reuses the keys.
+    #[tokio::test]
+    async fn postgres_integration_small_set_pages_from_one_candidate_scan() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-candidate-cache");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patients: Vec<String> = (0..30).map(|i| format!("{prefix}-p{i:02}")).collect();
+        for p in &patients {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": p}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let obs = |p: &str, k: usize| format!("{p}-o{k}");
+        for p in &patients[..2] {
+            for k in 0..5 {
+                backend
+                    .create(
+                        &tenant,
+                        "Observation",
+                        json!({"resourceType": "Observation", "id": obs(p, k), "status": "final",
+                            "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p}")}}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let request = ExportRequest::patient();
+        let one = vec![patients[0].clone()];
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &one, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.is_last);
+        let seen_first = line_ids(&first.lines);
+        // Delete one that has not been exported yet.
+        let victim = (0..5)
+            .map(|k| obs(&patients[0], k))
+            .find(|id| !seen_first.contains(id))
+            .unwrap();
+        backend
+            .delete(&tenant, "Observation", &victim)
+            .await
+            .unwrap();
+
+        let mut got = seen_first.clone();
+        let mut cursor = first.next_cursor;
+        loop {
+            let batch = backend
+                .fetch_patient_compartment_batch(
+                    &tenant,
+                    &request,
+                    "Observation",
+                    &one,
+                    cursor.as_deref(),
+                    2,
+                )
+                .await
+                .unwrap();
+            got.extend(line_ids(&batch.lines));
+            if batch.is_last {
+                break;
+            }
+            cursor = batch.next_cursor;
+        }
+        got.sort();
+        let mut want: Vec<String> = (0..5)
+            .map(|k| obs(&patients[0], k))
+            .filter(|id| *id != victim)
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "deleted mid-export is skipped, nothing repeats");
+
+        // Another patient set has its own candidates.
+        let other = vec![patients[1].clone()];
+        let mut got_other =
+            drain_compartment_type(&backend, &tenant, "Observation", &other, 3).await;
+        got_other.sort();
+        let mut want_other: Vec<String> = (0..5).map(|k| obs(&patients[1], k)).collect();
+        want_other.sort();
+        assert_eq!(got_other, want_other);
+
+        // And a window that excludes everything is not served from the keys
+        // scanned without one.
+        let future = ExportRequest::patient().with_since(instant("2999-01-01T00:00:00Z"));
+        let none = backend
+            .fetch_patient_compartment_batch(&tenant, &future, "Observation", &other, None, 10)
+            .await
+            .unwrap();
+        assert!(none.lines.is_empty() && none.is_last);
+    }
+
     /// A Group or patient list that is a large share of the tenant's patients
     /// is exported by walking the type in key order (the patient-reference
     /// index would hand back most of the database for every page); a small
