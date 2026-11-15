@@ -1014,19 +1014,39 @@ where
         router
     };
 
+    // Per-client rate limiting (`HFS_RATE_LIMIT_*`). Inside authentication,
+    // so a request is billed to its OAuth client when it has one, and outside
+    // authorization and the handlers.
+    let rate_limit = middleware::client_rate_limit::RateLimitConfig::from_env();
+    let rate_limiter = rate_limit
+        .enabled()
+        .then(|| middleware::client_rate_limit::ClientRateLimiter::new(rate_limit));
+
     // Apply auth middleware if enabled (outermost = runs first)
     let router = if let Some(ref auth) = auth_state {
-        router
-            .layer(axum::middleware::from_fn_with_state(
-                auth.clone(),
-                middleware::auth::authz_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                auth.clone(),
-                middleware::auth::auth_middleware,
-            ))
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            middleware::auth::authz_middleware,
+        ));
+        let router = match rate_limiter {
+            Some(limiter) => router.layer(axum::middleware::from_fn_with_state(
+                limiter,
+                middleware::client_rate_limit::client_rate_limit_middleware,
+            )),
+            None => router,
+        };
+        router.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            middleware::auth::auth_middleware,
+        ))
     } else {
-        router
+        match rate_limiter {
+            Some(limiter) => router.layer(axum::middleware::from_fn_with_state(
+                limiter,
+                middleware::client_rate_limit::client_rate_limit_middleware,
+            )),
+            None => router,
+        }
     };
 
     // Public console metrics — only the server-global `uptime` endpoint — are
