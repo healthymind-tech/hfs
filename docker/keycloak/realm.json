@@ -495,6 +495,9 @@
           "value": "alice",
           "temporary": false
         }
+      ],
+      "realmRoles": [
+        "offline_access"
       ]
     }
   ],
