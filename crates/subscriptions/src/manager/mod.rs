@@ -784,7 +784,7 @@ pub(crate) mod tests {
         let registry = Arc::new(InMemoryTopicRegistry::new());
         // Topics are tenant-scoped: seed the topic for every tenant these
         // tests register subscriptions under.
-        for tenant in ["t1", "tenant-1", "tenant-a", "tenant-b"] {
+        for tenant in ["t1", "t2", "tenant-1", "tenant-a", "tenant-b"] {
             registry.add_topic(
                 tenant,
                 TopicDefinition {
