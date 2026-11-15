@@ -2559,7 +2559,7 @@ mod postgres_integration {
         /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
         /// container-removal path — never runs. The `container_cleanup` exit
         /// hook removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -2573,6 +2573,43 @@ mod postgres_integration {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                // An existing server (`HFS_TEST_PG_HOST`/`HFS_TEST_PG_PORT`,
+                // user and password `postgres`, database `postgres`) instead of
+                // a testcontainer — for hosts whose Docker daemon is too slow
+                // to create containers within the client timeout.
+                if let Ok(host) = std::env::var("HFS_TEST_PG_HOST") {
+                    let port: u16 = std::env::var("HFS_TEST_PG_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(5432);
+                    let config = PostgresConfig {
+                        host: host.clone(),
+                        port,
+                        dbname: "postgres".to_string(),
+                        user: "postgres".to_string(),
+                        password: Some("postgres".to_string()),
+                        max_connections: 5,
+                        data_dir: Some(
+                            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                .parent()
+                                .and_then(|p| p.parent())
+                                .map(|p| p.join("data"))
+                                .unwrap_or_else(|| PathBuf::from("data")),
+                        ),
+                        ..Default::default()
+                    };
+                    PostgresBackend::new(config)
+                        .await
+                        .expect("Failed to create PostgresBackend")
+                        .init_schema()
+                        .await
+                        .expect("Failed to initialize schema");
+                    return SharedPg {
+                        host,
+                        port,
+                        _container: None,
+                    };
+                }
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // Pin the major version. testcontainers-modules defaults to
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
@@ -2630,7 +2667,7 @@ mod postgres_integration {
                 SharedPg {
                     host,
                     port,
-                    _container: container,
+                    _container: Some(container),
                 }
             })
             .await

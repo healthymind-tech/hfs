@@ -60,7 +60,7 @@ struct SharedPg {
     port: u16,
     /// Kept alive for the test binary; a `static` is never dropped, so the
     /// container is reaped in CI by its `github.run_id` label.
-    _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    _container: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
 }
 
 static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -92,6 +92,26 @@ async fn shared_pg() -> &'static SharedPg {
             use testcontainers::ImageExt;
             use testcontainers::runners::AsyncRunner;
 
+            // An existing server instead of a testcontainer (see the
+            // persistence suite's `HFS_TEST_PG_HOST`).
+            if let Ok(host) = std::env::var("HFS_TEST_PG_HOST") {
+                let port: u16 = std::env::var("HFS_TEST_PG_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(5432);
+                PostgresBackend::new(pg_config(&host, port))
+                    .await
+                    .expect("Failed to create PostgresBackend")
+                    .init_schema()
+                    .await
+                    .expect("Failed to initialize schema");
+                return SharedPg {
+                    host,
+                    port,
+                    _container: None,
+                };
+            }
+
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
             let container = testcontainers_modules::postgres::Postgres::default()
                 .with_label("github.run_id", &run_id)
@@ -119,7 +139,7 @@ async fn shared_pg() -> &'static SharedPg {
             SharedPg {
                 host,
                 port,
-                _container: container,
+                _container: Some(container),
             }
         })
         .await
