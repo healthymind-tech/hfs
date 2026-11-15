@@ -38,6 +38,14 @@ At startup:
 4. Fork migrations not yet in `hm_schema_migrations` run in list order
    (`FORK_MIGRATIONS` in `crates/persistence/src/backends/postgres/schema.rs`).
 
+Fork migrations so far (append-only; `FORK_MIGRATIONS` in `schema.rs`):
+
+| Name | What |
+|---|---|
+| `hm-0001-search-parameter-epochs` | per-tenant SearchParameter epoch table + triggers (formerly upstream-ladder "v47") |
+| `hm-0002` … `hm-0005` | reserved for line F (clustering), assigned by the integration merge |
+| `hm-0006-search-index-statistics` | dependency-only extended statistics on `search_index`, token statistics target 1000, ANALYZE ([index-strategy.md §4](index-strategy.md#4-planning-cost-and-extended-statistics-hm-0006)) |
+
 ```sql
 -- what a database is at
 SELECT version FROM schema_version;
