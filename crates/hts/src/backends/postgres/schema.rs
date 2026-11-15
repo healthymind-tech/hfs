@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS concepts (
 -- lookups.
 DROP INDEX IF EXISTS idx_concepts_system_code;
 CREATE INDEX IF NOT EXISTS idx_concepts_display_trgm ON concepts USING gin(display gin_trgm_ops);
+-- LOINC part names (`SCALE_TYP = DOC` names the part LP32888-7, see
+-- `loinc_filters`): one probe instead of reading all ~117 k LP rows of a
+-- LOINC version (8.8 s cold on the production HDD). Partial: LP codes only.
+CREATE INDEX IF NOT EXISTS idx_concepts_loinc_part_name
+    ON concepts (system_id, lower(display)) WHERE code >= 'LP' AND code < 'LQ';
 
 -- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
 CREATE TABLE IF NOT EXISTS concept_hierarchy (
@@ -140,6 +145,13 @@ CREATE TABLE IF NOT EXISTS concept_designations (
 -- equivalent idx_props_concept.)
 CREATE INDEX IF NOT EXISTS idx_designations_concept
     ON concept_designations(concept_id);
+-- Case-insensitive designation lookups: LOINC part names stored as
+-- designations (`PartName`, e.g. CLASS = DOC.ONTOLOGY) and supplement
+-- de-duplication. Without it the part-name lookup of a filtered LOINC
+-- expansion was a parallel sequential scan of every designation (5.4 M rows,
+-- 14.8 s cold on the production HDD).
+CREATE INDEX IF NOT EXISTS idx_designations_lower_value
+    ON concept_designations (lower(value));
 
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_sets (
