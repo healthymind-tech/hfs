@@ -304,6 +304,19 @@ pub trait BundleImportBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Replace the SNOMED CT concept model rows (`crate::snomed::store`) of
+    /// the CodeSystem `url` (at `version`); returns the rows stored. The
+    /// default stores nothing.
+    async fn import_snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        Ok(0)
+    }
+
     /// Add concept properties and designations to the already imported
     /// CodeSystem `url` (at `version`) without touching its concepts — the
     /// LOINC property backfill (`hts import --format loinc-properties`).

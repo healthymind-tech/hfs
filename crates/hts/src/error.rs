@@ -11,7 +11,8 @@
 //! |---------|-------------|-----------------|---------------|
 //! | [`NotFound`] | 404 | `not-found` | `not-found` |
 //! | [`NotSupported`] | 501 | `not-supported` | `not-supported` |
-//! | [`InvalidRequest`] | 400 | `invalid` | `invalid` |
+//! | [`InvalidRequest`] | 400 | `invalid` | `invalid-data` |
+//! | [`Coded`] | 400 | as given | as given |
 //! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
 //! | [`Internal`] | 500 | `exception` | `exception` |
 //! | [`StorageError`] | 500 | `exception` | `exception` |
@@ -26,6 +27,7 @@
 //! [`StorageError`]: HtsError::StorageError
 //! [`PreconditionFailed`]: HtsError::PreconditionFailed
 //! [`TooCostly`]: HtsError::TooCostly
+//! [`Coded`]: HtsError::Coded
 
 use axum::{
     Json,
@@ -38,7 +40,7 @@ use thiserror::Error;
 /// All errors that the HTS service can produce.
 ///
 /// Each variant carries a human-readable diagnostic message that is embedded
-/// verbatim in the `OperationOutcome.issue[0].diagnostics` field of the HTTP
+/// verbatim in the `OperationOutcome.issue[0].details.text` field of the HTTP
 /// response.  See the module-level documentation for the HTTP status code each
 /// variant maps to.
 #[derive(Debug, Error)]
@@ -87,29 +89,67 @@ pub enum HtsError {
     /// `too-costly`, per the FHIR `$expand` specification.
     #[error("Expansion too costly: {0}")]
     TooCostly(String),
+
+    /// A problem with the request whose OperationOutcome issue needs an
+    /// explicit classification — FHIR issue code, `tx-issue-type` code and
+    /// FHIRPath expression — e.g. an unknown code passed to `$subsumes`
+    /// (`code-invalid` / `invalid-code` at `codeA`). Maps to HTTP 400.
+    #[error("{}", .0.text)]
+    Coded(Box<CodedIssue>),
 }
 
-/// Converts an [`HtsError`] into an Axum HTTP response.
-///
-/// The response body is always a FHIR `OperationOutcome` JSON object with a
-/// single issue entry whose `diagnostics` field carries the error message.
-/// [`HtsError::TooCostly`] is handled first because it has a distinct FHIR
-/// issue code (`too-costly`) and HTTP status (422) that differ from the
-/// generic 500 path.
-impl IntoResponse for HtsError {
-    fn into_response(self) -> Response {
-        // `TooCostly` has its own tuple so we can't borrow `self` for the
-        // diagnostics string in the same `match`; handle it separately.
-        if let HtsError::TooCostly(ref msg) = self {
-            // The IG `big/expand-no-limit-outcome` fixture expects:
-            //   - `extension` with `operationoutcome-message-id` =
-            //     `VALUESET_TOO_COSTLY` (optional for tx.fhir.org)
-            //   - `details.text` only (no `details.coding`)
-            //   - `diagnostics` carrying the same message (optional in fixture)
-            // Other servers (e.g. tx.fhir.org) don't emit the message-id
-            // extension, but the IG marks it `$optional$ : "!tx.fhir.org"` so
-            // including it is fine for everyone else.
-            let body = json!({
+/// The issue carried by [`HtsError::Coded`].
+#[derive(Debug, Clone)]
+pub struct CodedIssue {
+    /// FHIR `OperationOutcome.issue.code`.
+    pub code: &'static str,
+    /// `http://hl7.org/fhir/tools/CodeSystem/tx-issue-type` code.
+    pub tx_code: &'static str,
+    /// Human-readable `details.text`.
+    pub text: String,
+    /// FHIRPath `expression` naming the offending request parameter.
+    pub expression: Option<String>,
+}
+
+impl HtsError {
+    /// An [`HtsError::Coded`] error.
+    pub fn coded(
+        code: &'static str,
+        tx_code: &'static str,
+        text: impl Into<String>,
+        expression: Option<&str>,
+    ) -> Self {
+        HtsError::Coded(Box::new(CodedIssue {
+            code,
+            tx_code,
+            text: text.into(),
+            expression: expression.map(str::to_owned),
+        }))
+    }
+
+    /// The HTTP status this error is reported with.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            HtsError::NotFound(_) => StatusCode::NOT_FOUND,
+            HtsError::NotSupported(_) => StatusCode::NOT_IMPLEMENTED,
+            HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) | HtsError::Coded(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            HtsError::Internal(_) | HtsError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            HtsError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            HtsError::TooCostly(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
+
+    /// The FHIR `OperationOutcome` this error is reported as — the response
+    /// body of a failed operation, and the resource of a failed batch entry.
+    pub fn to_operation_outcome(&self) -> serde_json::Value {
+        if let HtsError::TooCostly(msg) = self {
+            // The IG `big/expand-no-limit-outcome` fixture expects the
+            // `operationoutcome-message-id` extension `VALUESET_TOO_COSTLY`
+            // (optional for tx.fhir.org) and, like every issue, a
+            // `tx-issue-type` coding (`too-costly`) in `details`.
+            return json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
                     "extension": [{
@@ -119,83 +159,100 @@ impl IntoResponse for HtsError {
                     "severity": "error",
                     "code": "too-costly",
                     "details": {
+                        "coding": [{
+                            "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                            "code": "too-costly",
+                        }],
                         "text": msg,
                     },
-                    "diagnostics": msg,
                 }]
             });
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
 
-        // (status, FHIR-issue-code, tx-issue-type, diagnostics)
-        // The FHIR issue `code` and the `tx-issue-type` coding are usually
-        // identical, but VsInvalid splits them: FHIR code stays `invalid`
-        // (preserving the HTTP-level meaning) while tx-issue-type signals
-        // `vs-invalid` so the IG validator can route the failure to a
-        // ValueSet-definition diagnostic.
-        let (status, code, tx_issue_type, diagnostics) = match &self {
-            HtsError::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                "not-found",
-                "not-found",
-                msg.as_str(),
-            ),
-            HtsError::NotSupported(msg) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "not-supported",
-                "not-supported",
-                msg.as_str(),
-            ),
-            HtsError::InvalidRequest(msg) => {
-                (StatusCode::BAD_REQUEST, "invalid", "invalid", msg.as_str())
+        // (FHIR-issue-code, tx-issue-type, text, expression)
+        // The FHIR issue `code` and the `tx-issue-type` coding usually differ
+        // only in vocabulary: a malformed request is `invalid` / `invalid-data`
+        // (tx-issue-type has no `invalid` code), a bad ValueSet definition is
+        // `invalid` / `vs-invalid`.
+        let (code, tx_issue_type, text, expression): (&str, &str, &str, Option<&str>) = match self {
+            HtsError::NotFound(msg) => ("not-found", "not-found", msg.as_str(), None),
+            HtsError::NotSupported(msg) => ("not-supported", "not-supported", msg.as_str(), None),
+            HtsError::InvalidRequest(msg) => ("invalid", "invalid-data", msg.as_str(), None),
+            HtsError::VsInvalid(msg) => ("invalid", "vs-invalid", msg.as_str(), None),
+            HtsError::Internal(msg) | HtsError::StorageError(msg) => {
+                ("exception", "exception", msg.as_str(), None)
             }
-            HtsError::VsInvalid(msg) => (
-                StatusCode::BAD_REQUEST,
-                "invalid",
-                "vs-invalid",
-                msg.as_str(),
-            ),
-            HtsError::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "exception",
-                "exception",
-                msg.as_str(),
-            ),
-            HtsError::StorageError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "exception",
-                "exception",
-                msg.as_str(),
-            ),
-            HtsError::PreconditionFailed(msg) => (
-                StatusCode::PRECONDITION_FAILED,
-                "conflict",
-                "conflict",
-                msg.as_str(),
+            HtsError::PreconditionFailed(msg) => ("conflict", "conflict", msg.as_str(), None),
+            HtsError::Coded(issue) => (
+                issue.code,
+                issue.tx_code,
+                issue.text.as_str(),
+                issue.expression.as_deref(),
             ),
             HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
-        // The HL7 IG validator's TxTesterScrubbers strips OperationOutcome.issue
-        // entries that have `diagnostics` but no `details` — every such issue
-        // disappears from comparison. The IG fixtures additionally expect a
-        // tx-issue-type coding inside details.
-        let body = json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{
-                "severity": "error",
-                "code": code,
-                "details": {
-                    "coding": [{
-                        "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
-                        "code": tx_issue_type,
-                    }],
-                    "text": diagnostics,
-                },
-                "diagnostics": diagnostics,
-            }]
+        // The message goes in `details.text` only, with the tx-issue-type
+        // coding beside it. The HL7 IG validator strips issues that have
+        // `diagnostics` but no `details`, and on some operations
+        // (CodeSystem/$validate-code) rejects a `diagnostics` that
+        // duplicates `details.text`.
+        let mut issue = json!({
+            "severity": "error",
+            "code": code,
+            "details": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                    "code": tx_issue_type,
+                }],
+                "text": text,
+            },
         });
+        if let Some(expr) = expression {
+            issue["expression"] = json!([expr]);
+        }
+        json!({"resourceType": "OperationOutcome", "issue": [issue]})
+    }
+}
 
-        (status, Json(body)).into_response()
+/// Converts an [`HtsError`] into an Axum HTTP response: the
+/// [`HtsError::status`] with the [`HtsError::to_operation_outcome`] body.
+impl IntoResponse for HtsError {
+    fn into_response(self) -> Response {
+        (self.status(), Json(self.to_operation_outcome())).into_response()
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    fn tx_code(e: &HtsError) -> String {
+        e.to_operation_outcome()["issue"][0]["details"]["coding"][0]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Every error issue carries a tx-issue-type coding from that code
+    /// system (tx-ecosystem: "every issue is expected to carry both").
+    #[test]
+    fn every_error_carries_a_tx_issue_type() {
+        assert_eq!(
+            tx_code(&HtsError::InvalidRequest("x".into())),
+            "invalid-data"
+        );
+        assert_eq!(tx_code(&HtsError::VsInvalid("x".into())), "vs-invalid");
+        assert_eq!(tx_code(&HtsError::NotFound("x".into())), "not-found");
+        assert_eq!(tx_code(&HtsError::TooCostly("x".into())), "too-costly");
+        let coded = HtsError::coded("code-invalid", "invalid-code", "x", Some("codeA"));
+        assert_eq!(tx_code(&coded), "invalid-code");
+        assert_eq!(coded.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            coded.to_operation_outcome()["issue"][0]["expression"],
+            json!(["codeA"])
+        );
+        // The text is in details.text only (no duplicate `diagnostics`).
+        assert!(coded.to_operation_outcome()["issue"][0].get("diagnostics").is_none());
     }
 }

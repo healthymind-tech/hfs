@@ -1212,6 +1212,27 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         Ok(written)
     }
 
+    async fn import_snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        let written = tokio::task::spawn_blocking(move || -> Result<u64, HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            crate::snomed::store::write_sqlite(&mut conn, &url, version.as_deref(), &data)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        self.invalidate_caches();
+        Ok(written)
+    }
+
     async fn write_concept_properties(
         &self,
         _ctx: &TenantContext,

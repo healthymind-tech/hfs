@@ -49,7 +49,7 @@ async fn backends() -> Vec<(&'static str, Backend, Router, Option<tempfile::Temp
     #[cfg(feature = "postgres")]
     {
         let url = common::fresh_pg_database().await;
-        let pg = helios_hts::backends::PostgresTerminologyBackend::new(&url)
+        let pg = common::pg_hts_backend(&url)
             .await
             .unwrap();
         let router =

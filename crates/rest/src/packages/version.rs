@@ -9,6 +9,38 @@
 
 use std::cmp::Ordering;
 
+/// Packages whose releases are cumulative collections: a newer one carries
+/// what an older one had (terminology, the extension pack, tooling
+/// definitions, VSAC / PHIN VADS value sets, DICOM). Any newer release of
+/// them stands in for an older one.
+fn cumulative(name: &str) -> bool {
+    name.starts_with("hl7.terminology")
+        || name.starts_with("hl7.fhir.uv.extensions")
+        || name.starts_with("hl7.fhir.uv.tools")
+        || matches!(name, "us.nlm.vsac" | "us.cdc.phinvads" | "fhir.dicom")
+}
+
+/// Whether release `candidate` of package `name` can stand in for the
+/// required `required` under [`DependencyPolicy::Newer`]: a cumulative
+/// package's newer release always can; an implementation guide's only
+/// within the same major version (`0.x`: the same minor). A new major IG
+/// release drops or renames profiles (US Core 6 removed
+/// `us-core-observation-clinical-test`, which mCODE 3.0.0 still derives
+/// from US Core 5.0.1), so a package built on the older one gets it
+/// installed side by side, as the HL7 validator and HAPI load the declared
+/// version.
+pub fn interchangeable(name: &str, required: &str, candidate: &str) -> bool {
+    if cumulative(name) {
+        return true;
+    }
+    let (r, c) = (numeric_parts(required), numeric_parts(candidate));
+    if r[0] == 0 {
+        c[0] == 0 && c[1] == r[1]
+    } else {
+        c[0] == r[0]
+    }
+}
+
 /// Orders two package versions.
 pub fn compare(a: &str, b: &str) -> Ordering {
     let (a_main, a_pre) = split_pre(a);
@@ -177,8 +209,8 @@ impl Range {
     /// Whether an available `version` satisfies the requirement under
     /// `policy`: [`DependencyPolicy::Exact`] uses [`Range::matches`];
     /// [`DependencyPolicy::Newer`] also accepts any version at or above the
-    /// range's minimum.
-    pub fn satisfied_by(&self, version: &str, policy: DependencyPolicy) -> bool {
+    /// range's minimum that is [`interchangeable`] with it.
+    pub fn satisfied_by(&self, name: &str, version: &str, policy: DependencyPolicy) -> bool {
         if self.matches(version) {
             return true;
         }
@@ -186,7 +218,9 @@ impl Range {
             DependencyPolicy::Exact => false,
             DependencyPolicy::Newer => match self.minimum() {
                 None => true,
-                Some(min) => compare(version, &min) != Ordering::Less,
+                Some(min) => {
+                    compare(version, &min) != Ordering::Less && interchangeable(name, &min, version)
+                }
             },
         }
     }
@@ -282,11 +316,26 @@ mod tests {
     #[test]
     fn newer_policy_accepts_higher_versions_exact_does_not() {
         let r = Range::parse("7.0.0");
-        assert!(r.satisfied_by("7.4.0", DependencyPolicy::Newer));
-        assert!(!r.satisfied_by("6.5.0", DependencyPolicy::Newer));
-        assert!(!r.satisfied_by("7.4.0", DependencyPolicy::Exact));
-        assert!(Range::parse("0.3.2").satisfied_by("1.0.0", DependencyPolicy::Newer));
-        assert!(Range::Latest.satisfied_by("0.0.1", DependencyPolicy::Exact));
+        let tho = "hl7.terminology.r4";
+        assert!(r.satisfied_by(tho, "7.4.0", DependencyPolicy::Newer));
+        assert!(!r.satisfied_by(tho, "6.5.0", DependencyPolicy::Newer));
+        assert!(!r.satisfied_by(tho, "7.4.0", DependencyPolicy::Exact));
+        assert!(Range::Latest.satisfied_by(tho, "0.0.1", DependencyPolicy::Exact));
+        // Cumulative packages: any newer release, across majors.
+        assert!(Range::parse("5.3.0").satisfied_by(tho, "7.4.0", DependencyPolicy::Newer));
+        assert!(Range::parse("0.11.0").satisfied_by(
+            "us.nlm.vsac",
+            "0.19.0",
+            DependencyPolicy::Newer
+        ));
+        // Implementation guides: only within the major (0.x: the minor).
+        let core = "hl7.fhir.us.core";
+        assert!(Range::parse("6.1.0").satisfied_by(core, "6.2.1", DependencyPolicy::Newer));
+        assert!(!Range::parse("5.0.1").satisfied_by(core, "7.0.0", DependencyPolicy::Newer));
+        let tw = "tw.gov.mohw.twcore";
+        assert!(Range::parse("0.3.0").satisfied_by(tw, "0.3.2", DependencyPolicy::Newer));
+        assert!(!Range::parse("0.3.2").satisfied_by(tw, "1.0.0", DependencyPolicy::Newer));
+        assert!(!Range::parse("0.2.2").satisfied_by(tw, "0.3.2", DependencyPolicy::Newer));
     }
 
     #[test]

@@ -178,12 +178,28 @@ pub struct EvaluationContext {
     /// Opt-in memo of `%resource`-rooted navigation chains (see
     /// [`EvaluationContext::enable_root_memo`]); shared by clones.
     pub root_memo: Option<RootMemo>,
+    /// Answers `memberOf()` without a terminology server, when set.
+    pub member_of: Option<Arc<dyn MemberOfResolver>>,
 }
 
 /// Results of `%resource`/`%rootResource` navigation chains, keyed by the
 /// address of their AST node. Only sound while those ASTs stay alive and
 /// unchanged for as long as the context is used.
 pub type RootMemo = Arc<Mutex<HashMap<usize, EvaluationResult>>>;
+
+/// Answers `memberOf()` in place of a terminology server: the host (a
+/// validator) supplies membership from its own terminology. `None` means the
+/// answer is not known, and `memberOf()` then yields an empty result.
+pub trait MemberOfResolver: Send + Sync {
+    fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool>;
+
+    /// Answers `conformsTo(profile)`: whether the focus conforms to the
+    /// profile. `None` (the default) means unknown: an empty result.
+    fn conforms_to(&self, focus: &EvaluationResult, profile: &str) -> Option<bool> {
+        let _ = (focus, profile);
+        None
+    }
+}
 
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
@@ -203,6 +219,7 @@ impl Clone for EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(),
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
             root_memo: self.root_memo.clone(),
+            member_of: self.member_of.clone(),
         }
     }
 }
@@ -270,6 +287,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -306,6 +324,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -337,6 +356,7 @@ impl EvaluationContext {
             terminology_server_url: None,   // No terminology server by default
             debug_tracer: None,
             root_memo: None,
+            member_of: None,
         }
     }
 
@@ -596,6 +616,7 @@ impl EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
             root_memo: self.root_memo.clone(),
+            member_of: self.member_of.clone(),
         }
     }
 
@@ -1679,9 +1700,13 @@ fn evaluate_term(
                 if let Some(var_name) = name.strip_prefix('%') {
                     if var_name == "context" || var_name == "resource" || var_name == "rootResource"
                     {
-                        // Return %context / %resource / %rootResource value. In this
-                        // engine all three resolve to the resource(s) in scope: the
-                        // root resource being evaluated.
+                        // Return %context / %resource / %rootResource value: the
+                        // caller's binding when it set one (an invariant on a
+                        // nested element or resource), else the resource(s) in
+                        // scope — the root resource being evaluated.
+                        if let Some(bound) = context.lookup_variable(var_name) {
+                            return Ok(bound.clone());
+                        }
                         // Correctly wrap the entire conditional result in Ok()
                         return Ok(if context.resources.is_empty() {
                             EvaluationResult::Empty
@@ -1803,6 +1828,9 @@ fn evaluate_term(
             // Special handling for %context / %resource / %rootResource — all
             // resolve to the resource(s) currently in scope.
             if name == "context" || name == "resource" || name == "rootResource" {
+                if let Some(bound) = context.lookup_variable(name) {
+                    return Ok(bound.clone());
+                }
                 Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
@@ -3402,8 +3430,19 @@ fn extract_precision_keyword(expr: &Expression) -> Result<String, EvaluationErro
 /// accesses and argument-less, side-effect-free functions only.
 fn is_root_chain(expr: &Expression) -> bool {
     const PURE: &[&str] = &[
-        "first", "last", "tail", "single", "count", "exists", "empty", "distinct",
-        "isDistinct", "children", "descendants", "hasValue", "not",
+        "first",
+        "last",
+        "tail",
+        "single",
+        "count",
+        "exists",
+        "empty",
+        "distinct",
+        "isDistinct",
+        "children",
+        "descendants",
+        "hasValue",
+        "not",
     ];
     let mut current = expr;
     let mut steps = 0;
@@ -5056,6 +5095,23 @@ fn call_function(
                 )),
             }
         }
+        "conformsTo" => {
+            let Some(EvaluationResult::String(profile, _, _)) = args.first() else {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'conformsTo' expects 1 string argument (profile URL)".to_string(),
+                ));
+            };
+            let focus = match invocation_base {
+                EvaluationResult::Collection { items, .. } if items.len() == 1 => &items[0],
+                EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
+                other => other,
+            };
+            Ok(context
+                .member_of
+                .as_ref()
+                .and_then(|r| r.conforms_to(focus, profile))
+                .map_or(EvaluationResult::Empty, EvaluationResult::boolean))
+        }
         "memberOf" => {
             if args.len() != 1 {
                 return Err(EvaluationError::InvalidArity(
@@ -5073,6 +5129,15 @@ fn call_function(
                 }
             };
 
+            if let Some(resolver) = &context.member_of {
+                if invocation_base == &EvaluationResult::Empty {
+                    return Ok(EvaluationResult::Empty);
+                }
+                return Ok(match resolver.member_of(invocation_base, value_set_url) {
+                    Some(b) => EvaluationResult::boolean(b),
+                    None => EvaluationResult::Empty,
+                });
+            }
             // Use the member_of function from terminology_functions
             crate::terminology_functions::member_of(invocation_base, value_set_url, context)
         }
@@ -6532,8 +6597,28 @@ fn call_function(
                         }
                     }
                 }
-                // Primitive types have no children
-                _ => EvaluationResult::Empty,
+                // A FHIR primitive's children are its `id` and `extension`
+                // (carried from the JSON `_field` sibling); a bare value has
+                // none. dom-3 finds `#id` canonicals inside such extensions
+                // through `descendants()`.
+                primitive => {
+                    let mut children = Vec::new();
+                    if let Some(element) = primitive.primitive_element() {
+                        if let Some(id) = &element.id {
+                            children.push(EvaluationResult::fhir_string(id.clone(), "id"));
+                        }
+                        children.extend(element.extension.iter().cloned());
+                    }
+                    if children.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        EvaluationResult::Collection {
+                            items: children,
+                            has_undefined_order: true,
+                            type_info: None,
+                        }
+                    }
+                }
             })
         }
         "descendants" => {

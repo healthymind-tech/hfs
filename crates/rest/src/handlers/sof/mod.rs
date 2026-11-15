@@ -18,7 +18,10 @@ pub mod sqlquery;
 pub mod subject;
 pub(crate) mod view_sources;
 
-pub use capability::sof_operation_definition_handler;
+pub use capability::{
+    REINDEX_DEFINITION_ID, SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID,
+    sof_operation_definition_handler,
+};
 pub use export::{
     cancel_export_handler, download_export_file_handler, get_export_result_handler,
     get_export_status_handler, sql_export_handler,

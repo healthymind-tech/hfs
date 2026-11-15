@@ -5,10 +5,16 @@ ICD-10-CM / ICD-10-PCS (October), semi-annual LOINC (February / August), monthly
 SNOMED CT International, plus the Taiwanese zh-Hant supplements and the lab
 ObservationDefinitions that depend on them.
 
-Reference deployment: compose project `hfs-eval` (`/home/brian/projects/hfs-eval`),
-service `hts`, container `hfs-eval-hts`, SQLite file `/data/hts.db` on the
-`hts-data` volume, public base `https://hfs.gugulu.tw/tx/`. Source files are
-bind-mounted read-only at `/import` from `/home/brian/projects/test_datas`.
+Reference deployment: compose project `hfs-eval` (`/home/brian/projects/hfs-workspace/hfs-eval`),
+service `hts`, container `hfs-eval-hts`, public base `https://hfs.gugulu.tw/tx/`.
+Since 2026-10-16 the HTS store is PostgreSQL 16 (database `hts` in container
+`hfs-eval-hfs-pg`, `HTS_STORAGE_BACKEND=postgres`); the old SQLite file
+`/data/hts.db` on the `hts-data` volume is kept only as a backup. `hts import`
+inside the container reads `HTS_STORAGE_BACKEND` / `HTS_DATABASE_URL` from the
+container environment, so the commands below write to PostgreSQL unchanged; the
+SQLite-specific notes (WAL, busy timeout, `.backup`) apply only to SQLite
+deployments. Source files are
+bind-mounted read-only at `/import` from `/home/brian/projects/hfs-workspace/test_datas`.
 
 ## 1. What is loaded and how versions coexist
 
@@ -42,7 +48,7 @@ Pinned requests (`system=…&version=…`, `url|version`) resolve the exact row.
 ## 2. Pre-flight (every update)
 
 ```bash
-cd /home/brian/projects/hfs-eval
+cd /home/brian/projects/hfs-workspace/hfs-eval
 df -h /                                   # need ≥ 15 GB free AFTER the import (see table in §7)
 docker compose ps                         # hts Up
 docker exec hfs-eval-hts du -sh /data     # current DB size
@@ -50,11 +56,19 @@ docker exec hfs-eval-hts ls /import/…     # the new release is visible (read-o
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/tx/metadata
 ```
 
-**Backup first** (the only universal rollback, see §6):
+**Backup first** (the only universal rollback, see §6). PostgreSQL (production):
+
+```bash
+docker exec hfs-eval-hfs-pg pg_dump -U hfs -Fc -d hts \
+  > /home/brian/projects/hfs-workspace/backups/hts-pre-<change>-$(date +%F).dump
+# restore: docker exec -i hfs-eval-hfs-pg pg_restore -U hfs -d hts --clean --if-exists < <dump>
+```
+
+SQLite deployments:
 
 ```bash
 docker compose stop hts
-docker run --rm -v hfs-eval_hts-data:/data -v /home/brian/backups:/bak debian:trixie-slim \
+docker run --rm -v hfs-eval_hts-data:/data -v /home/brian/projects/hfs-workspace/backups:/bak debian:trixie-slim \
   sh -c 'cp /data/hts.db /bak/hts.db.$(date +%F) && ls -l /bak'
 docker compose start hts
 ```
@@ -178,11 +192,11 @@ validation (§6.2) — each release is several GB of DB.
 ### 4.5 zh-Hant supplements (MOHW ICD-10-CM/PCS 中文版, Taiwan LOINC names)
 
 ```bash
-cd /home/brian/projects/hfs            # fork checkout
+cd /home/brian/projects/hfs-workspace/hfs          # fork checkout
 python3 -I tools/terminology/make_zh_hant_supplements.py \
-  --mohw-xlsx '/home/brian/projects/test_datas/icd/10/<MOHW xlsx>' \
+  --mohw-xlsx '/home/brian/projects/hfs-workspace/test_datas/icd/10/<MOHW xlsx>' \
   --loinc-csv examples/tw/taiwan-loinc-mapping.csv \
-  --version 2024-11-18 --out-dir /home/brian/projects/test_datas/generated
+  --version 2024-11-18 --out-dir /home/brian/projects/hfs-workspace/test_datas/generated
 docker exec hfs-eval-hts /app/hts import --format fhir-bundle /import/generated/icd10cm-zh-hant.bundle.json
 docker exec hfs-eval-hts /app/hts import --format fhir-bundle /import/generated/icd10pcs-zh-hant.bundle.json
 docker exec hfs-eval-hts /app/hts import --format fhir-bundle /import/generated/loinc-zh-hant.bundle.json
@@ -248,9 +262,9 @@ Expected (20250601): `result=true`, ECL `<< 73211009` total = 124, `isa/40468400
 ### 6.1 Whole-database restore (any situation)
 
 ```bash
-cd /home/brian/projects/hfs-eval
+cd /home/brian/projects/hfs-workspace/hfs-eval
 docker compose stop hts
-docker run --rm -v hfs-eval_hts-data:/data -v /home/brian/backups:/bak debian:trixie-slim \
+docker run --rm -v hfs-eval_hts-data:/data -v /home/brian/projects/hfs-workspace/backups:/bak debian:trixie-slim \
   sh -c 'rm -f /data/hts.db-wal /data/hts.db-shm && cp /bak/hts.db.<date> /data/hts.db && chown 1000:1000 /data/hts.db'
 docker compose start hts
 ```
@@ -266,7 +280,7 @@ re-import is an in-place replacement for ICD-10-CM).
 
 ### 6.3 Image rollback
 
-`HTS_IMAGE` in `/home/brian/projects/hfs-eval/.env` selects the image;
+`HTS_IMAGE` in `/home/brian/projects/hfs-workspace/hfs-eval/.env` selects the image;
 `docker compose up -d hts` applies it. The DB schema is forward-compatible
 within Phase 1 builds; keep the previous tag in the image store
 (`docker image ls healthymind/hts`).

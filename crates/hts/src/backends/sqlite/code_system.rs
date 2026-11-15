@@ -195,6 +195,49 @@ impl SqliteTerminologyBackend {
 
 #[async_trait]
 impl CodeSystemOperations for SqliteTerminologyBackend {
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::load_sqlite(&conn, &id),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version, codes) = (url.to_string(), version.map(str::to_string), codes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::concepts_sqlite(&conn, &id, &codes),
+                None => Ok(std::collections::HashMap::new()),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     /// Look up a concept by system URL + code.
     ///
     /// Returns the concept display, all (or filtered) properties, and all
@@ -486,7 +529,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // fixtures expect ONE warning issue, result=true, and the
                     // `UNKNOWN_CODE_IN_FRAGMENT` message-id with the
                     // "...labeled as a fragment..." text.
-                    if cs_content.as_deref() == Some("fragment") {
+                    // A code system whose content is not present is treated
+                    // the same way (as tx.fhir.org does).
+                    if crate::types::may_hold_unlisted_codes(cs_content.as_deref(), Some(&*system)) {
                         let text = match cs_version_str.as_deref() {
                             Some(v) => format!(
                                 "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",

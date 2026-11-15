@@ -142,6 +142,31 @@ pub trait CodeSystemOperations: Send + Sync {
         Ok(false)
     }
 
+    /// The in-memory SNOMED CT concept model of `url` (at `version`, the
+    /// latest when unpinned), built on first use; `None` when the system has
+    /// no stored concept model. The default has none.
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        Ok(None)
+    }
+
+    /// The stored SNOMED CT concept rows of `codes` (status, definition
+    /// status, effective time, module, description terms). The default has
+    /// none.
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Batch-fetch designations for a list of concept codes in the given
     /// CodeSystem URL. Returns a map from code → list of designations. Codes
     /// with no designations may be omitted from the result. Used by `$expand`

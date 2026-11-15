@@ -29,12 +29,17 @@
 //! Parsed expression ASTs are memoized per evaluator instance — core
 //! invariants repeat across every resource of a type.
 //!
-//! Known limitation (documented in the plan): helios-fhirpath resolves
-//! `%resource`/`%rootResource` to the root resource, so constraints that
-//! depend on nested-resource `%resource` semantics may misfire; and the
-//! `.all()` wrapping makes `%context` the root rather than the node.
+//! Environment variables (FHIR invariant semantics): `%context` is the node
+//! the invariant is evaluated on; `%resource` the resource that node belongs
+//! to — the node itself for a resource definition's own invariants on a
+//! contained or entry resource, else the innermost resource containing it;
+//! `%rootResource` the container of `%resource` when that is a contained
+//! resource, else `%resource`. helios-fhirpath resolves all three to the root
+//! resource unless bound, so they are bound whenever they differ from it.
 
-use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
+use crate::effects::{
+    CodedValue, ConstraintEvaluator, ConstraintOutcome, DeferredConstraint, MemberOfAnswers,
+};
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath::parser::{Expression, Invocation, Term};
 use helios_fhirpath::{EvaluationContext, EvaluationResult};
@@ -88,6 +93,129 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         version: FhirVersion,
         constraints: &[DeferredConstraint<'_>],
     ) -> Vec<ConstraintOutcome> {
+        self.evaluate(resource, version, constraints, None)
+    }
+
+    fn evaluate_all_with_members(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: &Arc<MemberOfAnswers>,
+    ) -> Vec<ConstraintOutcome> {
+        self.evaluate(resource, version, constraints, Some(members))
+    }
+}
+
+/// `memberOf()` and `conformsTo()` answered from [`MemberOfAnswers`]; the
+/// resource's JSON locates a `conformsTo()` focus.
+struct Members(Arc<MemberOfAnswers>, Arc<Value>);
+
+impl helios_fhirpath::MemberOfResolver for Members {
+    fn member_of(&self, coded: &EvaluationResult, value_set: &str) -> Option<bool> {
+        self.0.lookup(value_set, coded_value(coded)?)
+    }
+
+    fn conforms_to(&self, focus: &EvaluationResult, profile: &str) -> Option<bool> {
+        let json = resource_json(&self.1, focus)?;
+        self.0.conforms(json, profile)
+    }
+}
+
+/// The JSON of a resource focus: the resource with that type and id in
+/// `raw` (the root itself when it matches and has no id).
+fn resource_json<'v>(raw: &'v Value, focus: &EvaluationResult) -> Option<&'v Value> {
+    let EvaluationResult::Object { map, type_info } = focus else {
+        return None;
+    };
+    let text = |e: &EvaluationResult| match e {
+        EvaluationResult::String(s, _, _) => Some(s.clone()),
+        _ => None,
+    };
+    let rt = map
+        .get("resourceType")
+        .and_then(text)
+        .or_else(|| type_info.as_ref().map(|t| t.name.clone()))?;
+    let id = map.get("id").and_then(text);
+    fn find<'v>(v: &'v Value, rt: &str, id: Option<&str>) -> Option<&'v Value> {
+        match v {
+            Value::Object(o) => {
+                if o.get("resourceType").and_then(Value::as_str) == Some(rt)
+                    && o.get("id").and_then(Value::as_str) == id
+                {
+                    return Some(v);
+                }
+                o.values().find_map(|c| find(c, rt, id))
+            }
+            Value::Array(a) => a.iter().find_map(|c| find(c, rt, id)),
+            _ => None,
+        }
+    }
+    find(raw, &rt, id.as_deref())
+}
+
+/// A FHIRPath code, Coding or CodeableConcept as a [`CodedValue`].
+fn coded_value(item: &EvaluationResult) -> Option<CodedValue> {
+    fn text(e: &EvaluationResult) -> Option<String> {
+        match e {
+            EvaluationResult::String(s, _, _) => Some(s.clone()),
+            EvaluationResult::Collection { items, .. } if items.len() == 1 => text(&items[0]),
+            _ => None,
+        }
+    }
+    fn coding(map: &HashMap<String, EvaluationResult>) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in ["system", "version", "code", "display"] {
+            if let Some(t) = map.get(key).and_then(text) {
+                out.insert(key.to_string(), Value::String(t));
+            }
+        }
+        Value::Object(out)
+    }
+    match item {
+        EvaluationResult::Collection { items, .. } if items.len() == 1 => coded_value(&items[0]),
+        EvaluationResult::String(s, _, _) => Some(CodedValue::Code(s.clone())),
+        EvaluationResult::Object { map, .. } => {
+            if let Some(codings) = map.get("coding") {
+                let list: Vec<Value> = match codings {
+                    EvaluationResult::Collection { items, .. } => items
+                        .iter()
+                        .filter_map(|i| match i {
+                            EvaluationResult::Object { map, .. } => Some(coding(map)),
+                            _ => None,
+                        })
+                        .collect(),
+                    EvaluationResult::Object { map, .. } => vec![coding(map)],
+                    _ => Vec::new(),
+                };
+                let mut cc = serde_json::Map::new();
+                cc.insert("coding".into(), Value::Array(list));
+                if let Some(t) = map.get("text").and_then(text) {
+                    cc.insert("text".into(), Value::String(t));
+                }
+                Some(CodedValue::CodeableConcept(Value::Object(cc)))
+            } else if map.contains_key("code") {
+                Some(CodedValue::Coding(coding(map)))
+            } else if map.contains_key("text") {
+                Some(CodedValue::CodeableConcept(
+                    serde_json::json!({"text": map.get("text").and_then(text)}),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+impl FhirPathConstraintEvaluator {
+    fn evaluate(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        constraints: &[DeferredConstraint<'_>],
+        members: Option<&Arc<MemberOfAnswers>>,
+    ) -> Vec<ConstraintOutcome> {
         if constraints.is_empty() {
             return Vec::new();
         }
@@ -104,6 +232,9 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
             }
         };
         let mut context = EvaluationContext::new(vec![typed]);
+        if let Some(m) = members {
+            context.member_of = Some(Arc::new(Members(Arc::clone(m), Arc::new(resource.clone()))));
+        }
         // Sound: every AST evaluated here is held by `self.asts` for the
         // life of the evaluator, which outlives this context.
         context.enable_root_memo();
@@ -114,7 +245,17 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
             .map(|c| {
                 let expression = effective_expression(c.id, c.expression);
                 match self.ast(&expression) {
-                    Ok(ast) => evaluate_at(&ast, c.path, &context, &mut nodes),
+                    Ok(ast) => evaluate_at(
+                        &ast,
+                        &Scope {
+                            path: c.path,
+                            own_resource: c.own_resource,
+                            expression: &expression,
+                            raw: resource,
+                        },
+                        &context,
+                        &mut nodes,
+                    ),
                     Err(e) => ConstraintOutcome::NotEvaluable(format!("parse error: {e}")),
                 }
             })
@@ -191,12 +332,90 @@ fn step(
 /// as focus — the same semantics as the combined expression
 /// `<relative path>.all((<expr>).allTrue())` (see the module docs), without
 /// parsing a path-specific expression or re-navigating from the root.
+/// Where one invariant runs: its node, and what decides the environment
+/// variables there (see the module docs).
+struct Scope<'a> {
+    path: &'a str,
+    own_resource: bool,
+    expression: &'a str,
+    raw: &'a Value,
+}
+
+/// `context` with `%resource` / `%rootResource` bound for a node below the
+/// root, or `None` when both are the root resource (the evaluator's default).
+fn scoped_context(
+    scope: &Scope<'_>,
+    relative: &str,
+    context: &EvaluationContext,
+    nodes: &mut NodeCache,
+) -> Result<Option<EvaluationContext>, String> {
+    let segments: Vec<&str> = relative.split('.').collect();
+    // Resources along the path: (number of leading segments, contained?).
+    let mut resources: Vec<(usize, bool)> = vec![(0, false)];
+    let mut current = scope.raw;
+    let mut last_key = "";
+    for (i, segment) in segments.iter().enumerate() {
+        let next = match current {
+            Value::Object(map) => map.get(*segment),
+            Value::Array(items) => segment.parse::<usize>().ok().and_then(|n| items.get(n)),
+            _ => None,
+        };
+        let Some(next) = next else { break };
+        current = next;
+        if !segment.chars().all(|c| c.is_ascii_digit()) {
+            last_key = segment;
+        }
+        if current
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            resources.push((i + 1, last_key == "contained"));
+        }
+    }
+    let focus_is_resource = resources
+        .last()
+        .is_some_and(|(len, _)| *len == segments.len());
+    let resource_at = if focus_is_resource && !scope.own_resource {
+        resources.len() - 2
+    } else {
+        resources.len() - 1
+    };
+    let root_at = if resources[resource_at].1 && resource_at > 0 {
+        resource_at - 1
+    } else {
+        resource_at
+    };
+    if resource_at == 0 {
+        return Ok(None);
+    }
+    let mut node = |len: usize| -> Result<EvaluationResult, String> {
+        if len == 0 {
+            return Ok(context
+                .this
+                .as_deref()
+                .cloned()
+                .unwrap_or(EvaluationResult::Empty));
+        }
+        Ok(nodes.focus(&segments[..len].join("."), context)?.clone())
+    };
+    let resource = node(resources[resource_at].0)?;
+    let root = node(resources[root_at].0)?;
+    let mut scoped = context.clone();
+    // The memo caches `%resource`-rooted chains for the root resource.
+    scoped.root_memo = None;
+    scoped.set_variable_result("resource", resource);
+    scoped.set_variable_result("rootResource", root);
+    Ok(Some(scoped))
+}
+
 fn evaluate_at(
     ast: &Expression,
-    path: &str,
+    scope: &Scope<'_>,
     context: &EvaluationContext,
     nodes: &mut NodeCache,
 ) -> ConstraintOutcome {
+    let path = scope.path;
     let relative = path.split_once('.').map(|(_, rest)| rest).unwrap_or("");
     if relative.is_empty() {
         return match helios_fhirpath::evaluator::evaluate(ast, context, None) {
@@ -204,6 +423,15 @@ fn evaluate_at(
             Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
         };
     }
+    let scoped =
+        if scope.expression.contains("%resource") || scope.expression.contains("%rootResource") {
+            match scoped_context(scope, relative, context, nodes) {
+                Ok(scoped) => scoped,
+                Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
+            }
+        } else {
+            None
+        };
     let focus = match nodes.focus(relative, context) {
         Ok(focus) => focus,
         Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
@@ -213,7 +441,18 @@ fn evaluate_at(
         EvaluationResult::Empty => &[],
         single => std::slice::from_ref(single),
     };
+    let base_context = scoped.as_ref().unwrap_or(context);
+    let binds_context = scope.expression.contains("%context");
     for item in items {
+        let item_context;
+        let context = if binds_context {
+            let mut c = base_context.clone();
+            c.set_variable_result("context", item.clone());
+            item_context = c;
+            &item_context
+        } else {
+            base_context
+        };
         let result = match helios_fhirpath::evaluator::evaluate(ast, context, Some(item)) {
             Ok(result) => result,
             Err(e) => return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
@@ -393,7 +632,8 @@ mod tests {
     /// invariant the core pack attaches, at every node path).
     #[test]
     fn node_cached_evaluation_matches_combined_expressions() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/tests/data/json/R4");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/tests/data/json/R4");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             eprintln!("spec corpus not present at {}; skipping", dir.display());
             return;
@@ -413,8 +653,12 @@ mod tests {
             if !full && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 12_000 {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else { continue };
-            let Ok(resource) = serde_json::from_str::<Value>(&text) else { continue };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(resource) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if resource.get("resourceType").is_none() {
                 continue;
             }
@@ -423,10 +667,17 @@ mod tests {
                 .deferred
                 .iter()
                 .filter_map(|d| match d {
-                    Deferred::Constraint { path, id, expression, .. } => Some(DeferredConstraint {
+                    Deferred::Constraint {
                         path,
                         id,
                         expression,
+                        own_resource,
+                        ..
+                    } => Some(DeferredConstraint {
+                        path,
+                        id,
+                        expression,
+                        own_resource: *own_resource,
                     }),
                     _ => None,
                 })
@@ -454,11 +705,22 @@ mod tests {
             diffs.is_empty(),
             "{} of {checked} outcomes differ ({failed} failures):\n{}",
             diffs.len(),
-            diffs.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+            diffs
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         // The cache is keyed by expression, not by node path.
-        assert!(evaluator.cached_expressions() < 2_000, "{}", evaluator.cached_expressions());
-        eprintln!("{resources} resources, {checked} constraint outcomes identical ({failed} failures)");
+        assert!(
+            evaluator.cached_expressions() < 2_000,
+            "{}",
+            evaluator.cached_expressions()
+        );
+        eprintln!(
+            "{resources} resources, {checked} constraint outcomes identical ({failed} failures)"
+        );
     }
 
     /// Per-invariant cost breakdown for one resource (diagnostics, not a
@@ -479,10 +741,17 @@ mod tests {
             .deferred
             .iter()
             .filter_map(|d| match d {
-                Deferred::Constraint { path, id, expression, .. } => Some(DeferredConstraint {
+                Deferred::Constraint {
                     path,
                     id,
                     expression,
+                    own_resource,
+                    ..
+                } => Some(DeferredConstraint {
+                    path,
+                    id,
+                    expression,
+                    own_resource: *own_resource,
                 }),
                 _ => None,
             })
@@ -490,7 +759,11 @@ mod tests {
         let evaluator = super::FhirPathConstraintEvaluator::new();
         let started = std::time::Instant::now();
         evaluator.evaluate_all(&resource, FhirVersion::R4, &constraints);
-        eprintln!("{} constraints, all at once: {:?}", constraints.len(), started.elapsed());
+        eprintln!(
+            "{} constraints, all at once: {:?}",
+            constraints.len(),
+            started.elapsed()
+        );
         // Per invariant id: all its occurrences in one call (one typed parse
         // and node navigation each, subtracted below).
         let mut groups: std::collections::BTreeMap<&str, Vec<DeferredConstraint<'_>>> =

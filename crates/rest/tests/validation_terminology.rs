@@ -31,6 +31,8 @@ struct MockHts {
     composes: Arc<HashMap<String, Value>>,
     /// Code systems a negative answer blames via `x-caused-by-unknown-system`.
     blame_unknown_system: Option<String>,
+    /// Code system a negative answer names via `x-unknown-system`.
+    name_unknown_system: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +77,36 @@ async fn search_value_sets(
     )
 }
 
+/// `CodeSystem/$validate-code`: `known` doubles as code system url → codes;
+/// an absent code is HTS's `invalid-code` answer.
+async fn validate_code_in_system(
+    State(state): State<MockHts>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // Not recorded: the request counts above are about value set checks.
+    let url = param(&body, "url")
+        .and_then(|p| p["valueUri"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let code = param(&body, "code")
+        .and_then(|p| p["valueCode"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let found = state
+        .known
+        .get(&url)
+        .is_some_and(|codes| codes.iter().any(|c| *c == code));
+    let mut parameter = vec![json!({ "name": "result", "valueBoolean": found })];
+    if !found {
+        parameter.push(json!({"name": "issues", "resource": {"resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "code-invalid",
+                "details": {"coding": [{"system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                                        "code": "invalid-code"}],
+                            "text": format!("Unknown code '{code}' in the CodeSystem '{url}'")}}]}}));
+    }
+    Json(json!({ "resourceType": "Parameters", "parameter": parameter }))
+}
+
 fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
     body["parameter"]
         .as_array()?
@@ -113,6 +145,9 @@ async fn validate_code(
     if let (false, Some(system)) = (result, &state.blame_unknown_system) {
         parameter.push(json!({ "name": "x-caused-by-unknown-system", "valueCanonical": system }));
     }
+    if let (false, Some(system)) = (result, &state.name_unknown_system) {
+        parameter.push(json!({ "name": "x-unknown-system", "valueCanonical": system }));
+    }
     (
         StatusCode::OK,
         Json(json!({ "resourceType": "Parameters", "parameter": parameter })),
@@ -146,6 +181,10 @@ async fn start_mock(mut state: MockHts) -> (String, Arc<Mutex<Vec<Value>>>) {
             axum::routing::post(validate_code),
         )
         .route("/CodeSystem", axum::routing::get(search_code_systems))
+        .route(
+            "/CodeSystem/$validate-code",
+            axum::routing::post(validate_code_in_system),
+        )
         .route("/ValueSet", axum::routing::get(search_value_sets))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -250,12 +289,17 @@ async fn remote_mode_checks_core_bindings_locally_and_splits_versioned_canonical
     let server = hfs(&ts_url, "remote", "open");
     upload_profile(&server).await;
 
-    // Core binding, bogus code: an error, and the server was never asked.
+    // Core binding, bogus code: an error (with the HL7 validator's "System
+    // URI could not be determined" for a bare code), and the server was
+    // never asked.
     let outcome = validate(&server, &patient("unknownx", "M"), false).await;
     let issues = binding_issues(&outcome);
-    assert_eq!(issues.len(), 1, "{outcome:#}");
-    assert_eq!(issues[0].0, "error");
-    assert_eq!(issues[0].1, "Patient.gender");
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(
+        issues
+            .iter()
+            .all(|i| i.0 == "error" && i.1 == "Patient.gender")
+    );
     assert!(
         requests.lock().unwrap().is_empty(),
         "core bindings never reach HTS"
@@ -311,8 +355,8 @@ async fn remote_only_sends_core_bindings_to_the_server() {
     )
     .await;
     let issues = binding_issues(&outcome);
-    assert_eq!(issues.len(), 1, "{outcome:#}");
-    assert_eq!(issues[0].0, "error");
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(issues.iter().all(|i| i.0 == "error"));
     let reqs = requests.lock().unwrap();
     assert_eq!(reqs.len(), 1, "{reqs:#?}");
     assert_eq!(
@@ -503,6 +547,7 @@ async fn start_batching_mock_hts(
         code_systems: Arc::new(HashMap::new()),
         composes: Arc::new(HashMap::new()),
         blame_unknown_system: None,
+        name_unknown_system: None,
     };
     let batch_log = Arc::clone(&batches);
     let batch = move |State(state): State<MockHts>, Json(bundle): Json<Value>| {
@@ -518,6 +563,7 @@ async fn start_batching_mock_hts(
                     code_systems: Arc::clone(&state.code_systems),
                     composes: Arc::clone(&state.composes),
                     blame_unknown_system: state.blame_unknown_system.clone(),
+                    name_unknown_system: state.name_unknown_system.clone(),
                 };
                 let (status, Json(resource)) =
                     validate_code(State(inner), Json(entry["resource"].clone())).await;
@@ -552,14 +598,22 @@ async fn remote_checks_of_one_resource_share_one_batch() {
     let other = "http://example.org/ValueSet/other";
     let (url, singles, batches) =
         start_batching_mock_hts(&[(IG_VS, &["M", "S"]), (other, &["x"])]).await;
-    let provider =
-        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_secs(5),
+    );
     let m = CodedValue::Code("M".into());
     let bad = CodedValue::Code("nope".into());
     let x = CodedValue::Code("x".into());
     let missing = "http://example.org/ValueSet/missing";
     let verdicts = provider
-        .validate_codes(&[(IG_VS, &m), (other, &x), (IG_VS, &m), (IG_VS, &bad), (missing, &x)])
+        .validate_codes(&[
+            (IG_VS, &m),
+            (other, &x),
+            (IG_VS, &m),
+            (IG_VS, &bad),
+            (missing, &x),
+        ])
         .await;
     assert!(singles.lock().unwrap().is_empty(), "no single requests");
     let sent = batches.lock().unwrap().clone();
@@ -592,12 +646,203 @@ async fn remote_checks_fall_back_to_single_requests() {
     use helios_fhir_validator::{CodedValue, TerminologyProvider};
     let other = "http://example.org/ValueSet/other";
     let (url, requests) = start_mock_hts(&[(IG_VS, &["M"]), (other, &["x"])]).await;
-    let provider =
-        helios_rest::validation::RemoteTerminologyProvider::new(url, std::time::Duration::from_secs(5));
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_secs(5),
+    );
     let m = CodedValue::Code("M".into());
     let x = CodedValue::Code("y".into());
     let verdicts = provider.validate_codes(&[(IG_VS, &m), (other, &x)]).await;
     assert!(matches!(verdicts[0], Ok(true)));
     assert!(matches!(verdicts[1], Ok(false)));
     assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+/// An unknown code is an error only when the server holds the code system
+/// completely: a fragment (or stub) proves nothing about a code it lacks.
+#[tokio::test]
+async fn unknown_codes_count_only_in_complete_code_systems() {
+    let complete = "http://example.org/CodeSystem/complete";
+    let fragment = "http://example.org/CodeSystem/fragment";
+    let (ts_url, _requests) = start_mock(MockHts {
+        known: Arc::new(HashMap::from([
+            (complete.to_string(), vec!["a".to_string()]),
+            (fragment.to_string(), vec!["a".to_string()]),
+        ])),
+        code_systems: Arc::new(HashMap::from([
+            (complete.to_string(), "complete".to_string()),
+            (fragment.to_string(), "fragment".to_string()),
+        ])),
+        ..MockHts::default()
+    })
+    .await;
+    let server = hfs(&ts_url, "remote", "open");
+    let unknown = |outcome: &Value| {
+        outcome["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| {
+                i["details"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("Unknown code"))
+            })
+            .count()
+    };
+    let obs = |system: &str, code: &str| {
+        json!({"resourceType": "Observation", "status": "final",
+               "code": {"coding": [{"system": system, "code": code}]}})
+    };
+    for (system, code, expected) in [(complete, "zz", 1), (complete, "a", 0), (fragment, "zz", 0)] {
+        let outcome: Value = server
+            .post("/Observation/$validate")
+            .json(&obs(system, code))
+            .await
+            .json();
+        assert_eq!(unknown(&outcome), expected, "{system}#{code}: {outcome:#}");
+    }
+}
+
+/// `mimic`: a code from an unknown code system the value set does not draw
+/// on is simply not in the value set (an error, as the HL7 validator says);
+/// only when the value set includes that system is membership unknowable.
+#[tokio::test]
+async fn unknown_systems_outside_the_value_set_are_not_members() {
+    const OTHER: &str = "http://example.org/other-cs";
+    let mock = |compose: Value| MockHts {
+        known: Arc::new(HashMap::from([(
+            IG_VS.to_string(),
+            vec!["HGNC:1".to_string()],
+        )])),
+        composes: Arc::new(HashMap::from([(IG_VS.to_string(), compose)])),
+        name_unknown_system: Some(OTHER.to_string()),
+        ..MockHts::default()
+    };
+    let patient = json!({
+        "resourceType": "Patient",
+        "maritalStatus": { "coding": [{ "system": OTHER, "code": "X" }] }
+    });
+    for (compose, severity) in [
+        (json!({ "include": [{ "system": GENES }] }), "error"),
+        (json!({ "include": [{ "system": OTHER }] }), "warning"),
+    ] {
+        let (ts_url, _) = start_mock(mock(compose)).await;
+        let server = hfs(&ts_url, "remote", "open");
+        upload_profile(&server).await;
+        let outcome = validate(&server, &patient, true).await;
+        let issues = binding_issues(&outcome);
+        assert_eq!(issues.len(), 1, "{outcome:#}");
+        assert_eq!(issues[0].0, severity, "{outcome:#}");
+    }
+}
+
+/// `Bundle-example-PMR`: a large resource's checks go out in chunked
+/// batches whose timeout scales with their size, so a server that needs
+/// longer than one check's timeout for a whole batch still answers every
+/// check — instead of the batch timing out and every check then being
+/// fired at the busy server at once.
+#[tokio::test]
+async fn large_resources_batch_in_chunks_with_scaled_timeouts() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let codes: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
+    let state = MockHts {
+        known: Arc::new(HashMap::from([(IG_VS.to_string(), codes.clone())])),
+        ..MockHts::default()
+    };
+    let singles = Arc::new(Mutex::new(0usize));
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let sizes = Arc::clone(&batch_sizes);
+    let batch = move |State(state): State<MockHts>, Json(bundle): Json<Value>| {
+        let sizes = Arc::clone(&sizes);
+        async move {
+            let entries_in = bundle["entry"].as_array().cloned().unwrap_or_default();
+            sizes.lock().unwrap().push(entries_in.len());
+            // 15 ms per check: a 60-check batch would take 900 ms.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                15 * entries_in.len() as u64,
+            ))
+            .await;
+            let mut entries = Vec::new();
+            for entry in entries_in {
+                let (status, Json(resource)) =
+                    validate_code(State(state.clone()), Json(entry["resource"].clone())).await;
+                entries.push(json!({"resource": resource, "response": {"status": status.as_u16().to_string()}}));
+            }
+            Json(json!({"resourceType": "Bundle", "type": "batch-response", "entry": entries}))
+        }
+    };
+    let counter = Arc::clone(&singles);
+    let single = move |State(state): State<MockHts>, Json(body): Json<Value>| {
+        let counter = Arc::clone(&counter);
+        async move {
+            *counter.lock().unwrap() += 1;
+            validate_code(State(state), Json(body)).await
+        }
+    };
+    let router = Router::new()
+        .route("/", axum::routing::post(batch))
+        .route("/ValueSet/$validate-code", axum::routing::post(single))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    // Per-check timeout 200 ms: below one 60-check batch, above one check.
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_millis(200),
+    );
+    let coded: Vec<CodedValue> = codes.iter().map(|c| CodedValue::Code(c.clone())).collect();
+    let checks: Vec<(&str, &CodedValue)> = coded.iter().map(|c| (IG_VS, c)).collect();
+    let verdicts = provider.validate_codes(&checks).await;
+    assert!(
+        verdicts.iter().all(|v| matches!(v, Ok(true))),
+        "{verdicts:?}"
+    );
+    assert_eq!(*singles.lock().unwrap(), 0, "no single requests");
+    let mut sizes = batch_sizes.lock().unwrap().clone();
+    sizes.sort();
+    assert_eq!(sizes, vec![10, 25, 25]);
+}
+
+/// A batch the server does not answer in time is reported per check as
+/// not performed (the validator turns it into a "could not be performed"
+/// issue) and is not re-sent check by check to the busy server.
+#[tokio::test]
+async fn a_timed_out_batch_is_reported_not_refired() {
+    use helios_fhir_validator::{CodedValue, TerminologyProvider};
+    let singles = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&singles);
+    let router = Router::new()
+        .route(
+            "/",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                Json(json!({"resourceType": "Bundle", "type": "batch-response", "entry": []}))
+            }),
+        )
+        .route(
+            "/ValueSet/$validate-code",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    *counter.lock().unwrap() += 1;
+                    Json(json!({"resourceType": "Parameters", "parameter": [{"name": "result", "valueBoolean": true}]}))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let provider = helios_rest::validation::RemoteTerminologyProvider::new(
+        url,
+        std::time::Duration::from_millis(100),
+    );
+    let (a, b) = (CodedValue::Code("a".into()), CodedValue::Code("b".into()));
+    let verdicts = provider.validate_codes(&[(IG_VS, &a), (IG_VS, &b)]).await;
+    for v in &verdicts {
+        let e = v.as_ref().expect_err("timed out");
+        assert!(e.to_string().contains("timed out"), "{e}");
+    }
+    assert_eq!(*singles.lock().unwrap(), 0);
 }

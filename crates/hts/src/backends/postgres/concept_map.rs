@@ -38,6 +38,43 @@ fn translate_cache_key(req: &TranslateRequest) -> String {
 
 #[async_trait]
 impl ConceptMapOperations for PostgresTerminologyBackend {
+    async fn concept_maps_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system: &str,
+        reverse: bool,
+    ) -> Result<Vec<(String, Option<String>)>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let col = if reverse {
+            "target_system"
+        } else {
+            "source_system"
+        };
+        // Per map (default version of each URL), an indexed probe on
+        // (map_id, source_system) — no scan of the elements table.
+        let sql = format!(
+            "SELECT cm.url, cm.version FROM concept_maps cm
+              WHERE cm.id = (SELECT c2.id FROM concept_maps c2 WHERE c2.url = cm.url
+                              ORDER BY {order} LIMIT 1)
+                AND EXISTS (SELECT 1 FROM concept_map_elements cme
+                             WHERE cme.map_id = cm.id AND cme.{col} = $1)
+              ORDER BY cm.url",
+            order = crate::backends::cm_precedence_order_by("c2")
+        );
+        let rows = client
+            .cq(&sql, &[&system])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+            .collect())
+    }
+
     async fn translate(
         &self,
         _ctx: &TenantContext,

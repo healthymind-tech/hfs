@@ -92,6 +92,8 @@ pub enum ErrorKind {
     /// Best-practice recommendations the HL7 validator warns about by
     /// default (e.g. an Observation without a performer).
     BestPractice,
+    /// Two contained resources of one resource share an id.
+    DuplicateId,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -383,7 +385,10 @@ pub(crate) fn msg_wrong_display(
 /// [helios] no coding of the value is in an `extensible` binding's value
 /// set (HL7 validator wording: Terminology_TX_NoValid_2_CC /
 /// Terminology_TX_NoValid_13 / Terminology_TX_Confirm_5).
-pub(crate) fn msg_extensible_binding(coded: &crate::effects::CodedValue, value_set: &str) -> String {
+pub(crate) fn msg_extensible_binding(
+    coded: &crate::effects::CodedValue,
+    value_set: &str,
+) -> String {
     use crate::effects::CodedValue;
     let token = |c: &Value| {
         format!(
@@ -418,8 +423,33 @@ pub(crate) fn msg_extensible_binding(coded: &crate::effects::CodedValue, value_s
 
 /// [helios] a uri in an HL7 namespace that names nothing known (HL7
 /// validator wording).
+/// A required-bound primitive present only as id/extension.
+pub(crate) fn msg_no_code_required(value_set: &str) -> String {
+    format!("No code provided, and a code is required from the value set '{value_set}'")
+}
+
+/// A Coding's code system is known, its stated version is not.
+pub(crate) fn msg_unknown_code_system_version(system: &str, version: &str) -> String {
+    format!(
+        "A definition for CodeSystem '{system}' version '{version}' could not be found, so the code cannot be validated"
+    )
+}
+
 pub(crate) fn msg_url_unresolved(url: &str) -> String {
     format!("No definition could be found for URL value '{url}'")
+}
+
+/// HL7 validator UNKNOWN_CODESYSTEM / UNKNOWN_CODESYSTEM_VERSION (warning):
+/// a Coding whose code system the terminology service does not have.
+pub(crate) fn msg_code_system_unknown(system: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!(
+            "A definition for CodeSystem '{system}' version '{v}' could not be found, so the code cannot be validated"
+        ),
+        None => format!(
+            "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
+        ),
+    }
 }
 
 /// [helios] an internal narrative hyperlink with no target (HL7 validator
@@ -465,7 +495,9 @@ pub(crate) fn msg_unknown_schema(reference: &str) -> String {
 /// A resource profile of another resource type (HL7:
 /// `VALIDATION_VAL_PROFILE_WRONGTYPE`).
 pub(crate) fn msg_profile_wrong_type(expected: &str, actual: &str, profile: &str) -> String {
-    format!("Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'")
+    format!(
+        "Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'"
+    )
 }
 
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {

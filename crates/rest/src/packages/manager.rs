@@ -1170,6 +1170,11 @@ impl PackageManager {
                 hts.len(),
                 client.base()
             ));
+            // Canonicals this install already sent: a later resource of the
+            // package with the same url|version (THO 6.1.0 ships two
+            // CodeSystems as http://hl7.org/fhir/sid/icd-9-cm|3.0.0) finds it
+            // on the server, but it is the package's own, not pre-existing.
+            let mut sent: HashSet<(String, String, String)> = HashSet::new();
             let mut start = 0;
             while start < hts.len() && !job.cancelled() {
                 let mut end = start;
@@ -1186,7 +1191,7 @@ impl PackageManager {
                 let chunk = &hts[start..end];
                 start = end;
                 let (ok, failed_n) = self
-                    .send_terminology(job, client, &key, chunk, &owners, &mut rows)
+                    .send_terminology(job, client, &key, chunk, &owners, &mut sent, &mut rows)
                     .await;
                 failures += failed_n;
                 *written.entry(chunk[0].resource_type.clone()).or_default() += ok;
@@ -1269,10 +1274,12 @@ impl PackageManager {
         key: &str,
         chunk: &[&PackageEntry],
         owners: &HashMap<(String, String, String), Vec<String>>,
+        sent: &mut HashSet<(String, String, String)>,
         rows: &mut Vec<PackageResourceRecord>,
     ) -> (u64, u64) {
-        // What is already on the terminology server (and not owned by any
-        // package) is recorded as pre-existing, so an uninstall leaves it.
+        // What is already on the terminology server (and neither owned by any
+        // package nor sent earlier by this install) is recorded as
+        // pre-existing, so an uninstall leaves it.
         let lookups: Vec<_> = chunk
             .iter()
             .map(|e| {
@@ -1316,8 +1323,9 @@ impl PackageManager {
                         resource_id,
                         url: e.url.clone(),
                         version: e.version.clone(),
-                        preexisting: existed && !owners.contains_key(&k),
+                        preexisting: existed && !owners.contains_key(&k) && !sent.contains(&k),
                     });
+                    sent.insert(k);
                 }
                 let failed = (outcome.errors.len() as u64).min(chunk.len() as u64);
                 for err in outcome.errors.iter().take(50) {
@@ -1385,7 +1393,7 @@ impl PackageManager {
         let parsed = Range::parse(range);
         let mut meeting: Vec<&String> = installed
             .iter()
-            .filter(|(n, v)| n == dep && parsed.satisfied_by(v, policy))
+            .filter(|(n, v)| n == dep && parsed.satisfied_by(dep, v, policy))
             .map(|(_, v)| v)
             .collect();
         meeting.sort_by(|a, b| super::version::compare(b, a));
@@ -1625,9 +1633,15 @@ impl PackageManager {
         if r.resource_type == "StructureDefinition"
             && let Some(url) = existing.content().get("url").and_then(Value::as_str)
         {
+            // `url|version`: an older release removed next to a newer one
+            // must not take the newer one's registration with it.
+            let reference = match existing.content().get("version").and_then(Value::as_str) {
+                Some(v) => format!("{url}|{v}"),
+                None => url.to_string(),
+            };
             self.deps
                 .validation
-                .remove_stored_profile(tenant, existing.fhir_version(), url);
+                .remove_stored_profile(tenant, existing.fhir_version(), &reference);
             // Another installed package still ships this canonical: put its
             // definition back in the registry.
             if let Some(other_id) = other_profiles.get(url)

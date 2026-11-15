@@ -47,9 +47,7 @@ async fn backends() -> Vec<(&'static str, Backend, Option<tempfile::TempDir>)> {
     #[cfg(feature = "postgres")]
     {
         let url = common::fresh_pg_database().await;
-        let pg = helios_hts::backends::PostgresTerminologyBackend::new(&url)
-            .await
-            .unwrap();
+        let pg = common::pg_hts_backend(&url).await.unwrap();
         out.push(("postgres", Arc::new(pg), None));
     }
     out
@@ -791,14 +789,9 @@ async fn inline_references_warnings_and_cycles() {
         vs(json!({"include": [{"valueSet": ["http://p.test/vs/cyc-a"]}]}))
     )
     .await);
-    let include_cycle = include_cycle.unwrap();
-    assert_eq!(include_cycle.0, ["A1"]);
-    assert_eq!(
-        include_cycle.2,
-        [
-            "Cyclic ValueSet reference detected for http://p.test/vs/cyc-a; excluded from expansion (vs-invalid)"
-        ]
-    );
+    assert!(include_cycle.unwrap_err().starts_with(
+        "vs-invalid: Cyclic reference detected when including http://p.test/vs/cyc-a"
+    ));
     let exclude_cycle = same_on_all!(bs, |b| {
         run(
         b,

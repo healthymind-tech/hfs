@@ -234,7 +234,136 @@ fn closed_slicing_with_undecidable_slices_rejects_nothing() {
         "subject": {"reference": "Patient/p"},
         "medicationCodeableConcept": {"coding": [{"system": "http://example.org/nhi", "code": "A1"}]}});
     let errors = validate(&r, &req, &[TREAT]);
-    assert!(errors_of(&errors, ErrorKind::SliceUnmatched).is_empty(), "{errors:#?}");
+    assert!(
+        errors_of(&errors, ErrorKind::SliceUnmatched).is_empty(),
+        "{errors:#?}"
+    );
+}
+
+/// TW Core `Condition.code.coding` (and NHI PAS on top of it): closed
+/// slicing by `pattern@$this` whose slices are defined only by required
+/// bindings, some prohibited (`max: 0`). The HL7 validator decides
+/// membership with `memberOf`; the effects pass asks the terminology
+/// service: a coding in none of the value sets breaks the closed rule, one
+/// in a prohibited slice breaks its maximum, and nothing is reported when
+/// the service cannot answer.
+#[tokio::test]
+async fn binding_sliced_codings_are_judged_by_value_set_membership() {
+    use async_trait::async_trait;
+    use helios_fhir_validator::{
+        CodedValue, EffectHandlers, TerminologyError, TerminologyProvider, TxCheck, TxVerdict,
+    };
+
+    /// Code `A1` is in `/nhi`, `O1` in `/old`; `fail: true` answers errors.
+    struct Members {
+        fail: bool,
+    }
+    #[async_trait]
+    impl TerminologyProvider for Members {
+        async fn validate_code(&self, _: &str, _: &CodedValue) -> Result<bool, TerminologyError> {
+            unreachable!("asked through check()")
+        }
+        async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+            checks
+                .iter()
+                .map(|c| match c {
+                    _ if self.fail => Err(TerminologyError::new("down")),
+                    TxCheck::InValueSet(vs, CodedValue::Coding(coding)) => {
+                        let code = coding["code"].as_str().unwrap_or_default();
+                        Ok(TxVerdict::member(
+                            (vs.ends_with("/nhi") && code == "A1")
+                                || (vs.ends_with("/old") && code == "O1"),
+                        ))
+                    }
+                    _ => Ok(TxVerdict::valid()),
+                })
+                .collect()
+        }
+    }
+
+    let r = resolver(&[sd(
+        TREAT,
+        "MedicationRequest",
+        vec![
+            ed("MedicationRequest", json!({"min": 0, "max": "*"})),
+            ed(
+                "MedicationRequest.medication[x]",
+                json!({"min": 1, "max": "1", "type": [{"code": "CodeableConcept"}]}),
+            ),
+            ed(
+                "MedicationRequest.medication[x].coding",
+                json!({"min": 1, "max": "*", "type": [{"code": "Coding"}],
+                       "slicing": {"discriminator": [{"type": "pattern", "path": "$this"}], "rules": "closed"}}),
+            ),
+            ed(
+                "MedicationRequest.medication[x].coding:nhi",
+                json!({"sliceName": "nhi", "min": 0, "max": "1", "type": [{"code": "Coding"}],
+                       "binding": {"strength": "required", "valueSet": "http://example.org/ValueSet/nhi"}}),
+            ),
+            ed(
+                "MedicationRequest.medication[x].coding:old",
+                json!({"sliceName": "old", "min": 0, "max": "0", "type": [{"code": "Coding"}],
+                       "binding": {"strength": "required", "valueSet": "http://example.org/ValueSet/old"}}),
+            ),
+        ],
+    )]);
+    let req = |code: &str| {
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+            "subject": {"reference": "Patient/p"},
+            "medicationCodeableConcept": {"coding": [{"system": "http://example.org/nhi", "code": code}]}})
+    };
+    let opts = ValidationOptions {
+        profiles: vec![TREAT.to_string()],
+        ..Default::default()
+    };
+    let run = |code: &'static str, fail: bool| {
+        let r = Arc::clone(&r);
+        let opts = opts.clone();
+        async move {
+            let tx = Members { fail };
+            let handlers = EffectHandlers {
+                terminology: Some(&tx),
+                ..Default::default()
+            };
+            Validator::new(r)
+                .validate(&req(code), FhirVersion::R4, &opts, &handlers)
+                .await
+        }
+    };
+    let slicing = |errors: &[ValidationError]| {
+        let mut out = errors_of(errors, ErrorKind::SliceUnmatched);
+        out.extend(errors_of(errors, ErrorKind::SliceCardinality));
+        out
+    };
+
+    let errors = run("A1", false).await;
+    assert!(slicing(&errors).is_empty(), "{errors:#?}");
+
+    let errors = run("X9", false).await;
+    assert_eq!(
+        errors_of(&errors, ErrorKind::SliceUnmatched),
+        vec![
+            "MedicationRequest.medicationCodeableConcept.coding.0: item does not match any slice in closed slicing"
+        ],
+        "{errors:#?}"
+    );
+    let unmatched = errors
+        .iter()
+        .find(|e| e.kind == ErrorKind::SliceUnmatched)
+        .unwrap();
+    assert_eq!(unmatched.source.as_deref(), Some(TREAT));
+
+    let errors = run("O1", false).await;
+    assert_eq!(
+        slicing(&errors),
+        vec![
+            "MedicationRequest.medicationCodeableConcept.coding: MedicationRequest.medicationCodeableConcept.coding:old: max allowed = 0, but found 1"
+        ],
+        "{errors:#?}"
+    );
+
+    let errors = run("X9", true).await;
+    assert!(slicing(&errors).is_empty(), "{errors:#?}");
 }
 
 const STRICT_OBS: &str = "http://example.org/StructureDefinition/strict-obs";

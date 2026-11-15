@@ -183,7 +183,7 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
             return Err(HtsError::NotFound(format!("Concept not found: {code}")));
         }
     }
-    let result = process_lookup_inner(state, params).await;
+    let result = snomed_lookup(state, params).await;
     match (&result, cache_key) {
         (Ok(value), Some(key)) => {
             lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
@@ -196,6 +196,245 @@ pub(crate) async fn process_lookup<B: TerminologyBackend>(
     result
 }
 
+/// `$lookup` with the SNOMED CT specifics: a post-coordinated expression is
+/// looked up as its focus concept, then described as itself (see
+/// [`crate::snomed::ops::lookup_response`]); every SNOMED CT response names
+/// the description types, the attribute and value terms, and the concept's
+/// effective time and module, and leaves the preferred-for-language
+/// designations to the display.
+async fn snomed_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    use crate::snomed::{SNOMED_URL, ops};
+    if find_str_param(&params, "system").as_deref() != Some(SNOMED_URL) {
+        return process_lookup_inner(state, params).await;
+    }
+    let code = find_str_param(&params, "code").unwrap_or_default();
+    let version = find_str_param(&params, "version");
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let is_expression = code
+        .contains(|c: char| matches!(c, ':' | '+' | '|' | '{' | '(' | '=') || c.is_whitespace());
+    if is_expression {
+        if let Some(model) = state
+            .backend()
+            .snomed_model(&ctx, SNOMED_URL, version.as_deref())
+            .await?
+        {
+            return match ops::check(&model, &code) {
+                ops::Checked::Invalid(reason) => {
+                    Err(HtsError::Coded(Box::new(crate::error::CodedIssue {
+                        code: "code-invalid",
+                        tx_code: "invalid-code",
+                        text: format!(
+                            "Unknown code '{code}' in the CodeSystem '{SNOMED_URL}' version '{}': {reason}",
+                            model.version.as_deref().unwrap_or_default()
+                        ),
+                        expression: Some("code".into()),
+                    })))
+                }
+                ops::Checked::Valid { expr, display, .. } => {
+                    let focus = expr.body.focus[0].id.clone();
+                    let mut focus_params = params.clone();
+                    focus_params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("code"));
+                    focus_params.push(json!({"name": "code", "valueCode": focus}));
+                    let looked_up = process_lookup_inner(state, focus_params.clone()).await?;
+                    let looked_up = snomed_lookup_details(state, &focus_params, looked_up).await;
+                    Ok(ops::lookup_response(
+                        &model, &code, &display, &expr, looked_up,
+                    ))
+                }
+            };
+        }
+    }
+    let looked_up = process_lookup_inner(state, params.clone()).await?;
+    Ok(snomed_lookup_details(state, &params, looked_up).await)
+}
+
+/// The SNOMED CT details of a `$lookup` response (see [`snomed_lookup`]).
+async fn snomed_lookup_details<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+    mut value: Value,
+) -> Value {
+    use crate::snomed::SNOMED_URL;
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let code = find_str_param(params, "code").unwrap_or_default();
+    let version = find_str_param(params, "version");
+    let requested = collect_str_params(params, "property");
+    let wanted = |p: &str| requested.is_empty() || requested.iter().any(|r| r == p || r == "*");
+    let Some(list) = value.get_mut("parameter").and_then(|v| v.as_array_mut()) else {
+        return value;
+    };
+    // Codes whose terms the properties need.
+    let mut codes: Vec<String> = vec![code.clone()];
+    let part_str = |parts: &[Value], name: &str| -> Option<String> {
+        parts
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|p| {
+                ["valueCode", "valueString", "valueCoding"]
+                    .iter()
+                    .find_map(|k| p.get(*k))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+                    })
+            })
+    };
+    for p in list.iter() {
+        if p.get("name").and_then(|v| v.as_str()) != Some("property") {
+            continue;
+        }
+        let Some(parts) = p.get("part").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if let Some(c) = part_str(parts, "code") {
+            if c.bytes().all(|b| b.is_ascii_digit()) {
+                codes.push(c);
+            }
+        }
+        if let Some(v) = part_str(parts, "value") {
+            codes.push(v);
+        }
+    }
+    let rows = state
+        .backend()
+        .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &codes)
+        .await
+        .unwrap_or_default();
+    let module = rows.get(&code).and_then(|info| info.row.module.clone());
+    let module_display = match &module {
+        Some(m) => state
+            .backend()
+            .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &[m.clone()])
+            .await
+            .ok()
+            .and_then(|r| r.get(m).and_then(|i| i.display.clone())),
+        None => None,
+    };
+    let display_of = |c: &str| rows.get(c).and_then(|i| i.display.clone());
+    list.retain(|p| {
+        p.get("name").and_then(|v| v.as_str()) != Some("designation")
+            || !p
+                .get("part")
+                .and_then(|v| v.as_array())
+                .is_some_and(|parts| {
+                    parts.iter().any(|x| {
+                        x.get("valueCoding")
+                            .and_then(|c| c.get("code"))
+                            .and_then(|c| c.as_str())
+                            == Some("preferredForLanguage")
+                    })
+                })
+    });
+    // Designations in description id order.
+    if let Some(info) = rows.get(&code) {
+        let first = list
+            .iter()
+            .position(|p| p.get("name").and_then(|v| v.as_str()) == Some("designation"));
+        if let Some(first) = first {
+            let mut designations: Vec<Value> = Vec::new();
+            list.retain(|p| {
+                if p.get("name").and_then(|v| v.as_str()) == Some("designation") {
+                    designations.push(p.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let rank = |d: &Value| {
+                let value = d
+                    .get("part")
+                    .and_then(|v| v.as_array())
+                    .and_then(|parts| {
+                        parts
+                            .iter()
+                            .find(|x| x.get("name").and_then(|v| v.as_str()) == Some("value"))
+                    })
+                    .and_then(|x| x.get("valueString"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                info.row
+                    .terms
+                    .iter()
+                    .position(|t| t == value)
+                    .unwrap_or(usize::MAX)
+            };
+            designations.sort_by_key(|d| rank(d));
+            for (i, d) in designations.into_iter().enumerate() {
+                list.insert(first + i, d);
+            }
+        }
+    }
+    for p in list.iter_mut() {
+        let name = p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(parts) = p.get_mut("part").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        if name == "designation" {
+            for x in parts.iter_mut() {
+                if let Some(coding) = x.get_mut("valueCoding") {
+                    let use_code = coding
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    if let Some(n) = crate::snomed::description_type_name(use_code) {
+                        coding["display"] = json!(n);
+                    }
+                }
+            }
+            continue;
+        }
+        if name != "property" {
+            continue;
+        }
+        let prop = part_str(parts, "code").unwrap_or_default();
+        let has = |parts: &Vec<Value>, n: &str| {
+            parts
+                .iter()
+                .any(|x| x.get("name").and_then(|v| v.as_str()) == Some(n))
+        };
+        let attribute = prop.bytes().all(|b| b.is_ascii_digit()) && !prop.is_empty();
+        if attribute && !has(parts, "code-display") {
+            if let Some(d) = display_of(&prop) {
+                parts.push(json!({"name": "code-display", "valueString": d}));
+            }
+        }
+        if (attribute || prop == "parent" || prop == "child") && !has(parts, "description") {
+            if let Some(d) = part_str(parts, "value").and_then(|v| display_of(&v)) {
+                parts.push(json!({"name": "description", "valueString": d}));
+            }
+        }
+    }
+    if let Some(info) = rows.get(&code) {
+        if wanted("effectiveTime") {
+            if let Some(t) = info.row.effective_time.as_deref().filter(|t| t.len() == 8) {
+                list.push(json!({"name": "property", "part": [
+                    {"name": "code", "valueCode": "effectiveTime"},
+                    {"name": "value", "valueDateTime": format!("{}-{}-{}", &t[..4], &t[4..6], &t[6..])},
+                ]}));
+            }
+        }
+        if wanted("module") {
+            if let Some(m) = &module {
+                let mut parts = vec![json!({"name": "code", "valueCode": "module"})];
+                if let Some(d) = &module_display {
+                    parts.push(json!({"name": "description", "valueString": d}));
+                }
+                parts.push(json!({"name": "value", "valueCode": m}));
+                list.push(json!({"name": "property", "part": parts}));
+            }
+        }
+    }
+    value
+}
+
 async fn process_lookup_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -206,13 +445,33 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
+    // UCUM: any well-formed unit expression, described from its atoms.
+    if system == crate::ucum_validate::UCUM_URL {
+        return ucum_lookup(state, &code).await;
+    }
+
+    // `property` names what to return; `*` (or nothing) means everything.
+    // `abstract` is reported whatever was asked for, so the backend is also
+    // asked for `notSelectable`.
+    let requested_properties = collect_str_params(&params, "property");
+    let want_all_properties = requested_properties.iter().any(|p| p == "*");
+    let property_filter: Option<Vec<String>> =
+        if requested_properties.is_empty() || want_all_properties {
+            None
+        } else {
+            Some(requested_properties.clone())
+        };
+    let mut backend_properties = requested_properties.clone();
+    if property_filter.is_some() && !backend_properties.iter().any(|p| p == "notSelectable") {
+        backend_properties.push("notSelectable".into());
+    }
     let req = LookupRequest {
         system: system.clone(),
         code: code.clone(),
         version: find_str_param(&params, "version"),
         display_language: find_str_param(&params, "displayLanguage"),
         expression: find_str_param(&params, "expression"),
-        properties: collect_str_params(&params, "property"),
+        properties: backend_properties,
         date: find_str_param(&params, "date"),
         use_supplements: collect_str_params(&params, "useSupplement"),
     };
@@ -260,6 +519,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             if supplement_inputs
                 .iter()
                 .any(|s| s.split('|').next() == Some(bare.as_str()))
+                || state.auto_supplements_skip.contains(&bare)
             {
                 continue;
             }
@@ -414,12 +674,59 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     // when set.
     parameter.push(json!({"name": "system", "valueUri": system}));
     parameter.push(json!({"name": "code", "valueCode": code}));
-    if resp
+    let is_abstract = resp
         .properties
         .iter()
-        .any(|p| p.code == "notSelectable" && p.value == "true")
-    {
-        parameter.push(json!({"name": "abstract", "valueBoolean": true}));
+        .any(|p| p.code == "notSelectable" && p.value == "true");
+    // `abstract` when the concept is abstract, or when every property was
+    // asked for — then also as the `notSelectable` property (IG
+    // `simple/simple-lookup-1`, `simple-lookup-zxx`).
+    if is_abstract || want_all_properties {
+        parameter.push(json!({"name": "abstract", "valueBoolean": is_abstract}));
+    }
+    if want_all_properties && !resp.properties.iter().any(|p| p.code == "notSelectable") {
+        resp.properties.push(PropertyValue {
+            code: "notSelectable".into(),
+            value_type: "boolean".into(),
+            value: "false".into(),
+            description: None,
+        });
+    }
+    if let Some(filter) = property_filter.as_ref() {
+        // Only what was asked for, plus the notSelectable flag of an
+        // abstract concept; designations are a property too.
+        resp.properties.retain(|p| {
+            filter.contains(&p.code) || (p.code == "notSelectable" && p.value == "true")
+        });
+        if !filter.iter().any(|p| p == "designation") {
+            resp.designations.clear();
+        }
+    }
+    // A single requested display language the code system has nothing in.
+    if let Some(lang) = display_language.as_deref().filter(|l| {
+        !l.contains(',')
+            && l.split('-').next().is_some_and(|p| {
+                (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic())
+            })
+    }) {
+        let has_lang = base_lang_matched
+            || cs_language
+                .as_deref()
+                .is_some_and(|cl| crate::language::lang_matches(lang, cl))
+            || resp.designations.iter().any(|d| {
+                d.language
+                    .as_deref()
+                    .is_some_and(|dl| crate::language::lang_matches(lang, dl))
+            });
+        if !has_lang {
+            parameter.push(json!({
+                "name": "warning",
+                "valueString": format!(
+                    "The code system {system} has no display or designation in the requested \
+                     language '{lang}'"
+                ),
+            }));
+        }
     }
 
     for prop in resp.properties {
@@ -482,6 +789,56 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     }))
 }
 
+/// `$lookup` of a UCUM unit expression (see [`crate::ucum`]): the code is its
+/// own display, with its description (`(milligram) / (deciliter)`) and the
+/// common units value set's name for it as designations.
+async fn ucum_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    code: &str,
+) -> Result<Value, HtsError> {
+    use crate::ucum_validate::{UCUM_URL, is_valid_ucum_code};
+    if !is_valid_ucum_code(code) {
+        return Err(HtsError::coded(
+            "code-invalid",
+            "invalid-code",
+            format!(
+                "Unknown code '{code}' in the CodeSystem '{UCUM_URL}': {}",
+                crate::ucum::error_message(code)
+            ),
+            Some("code"),
+        ));
+    }
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let (common, _) = crate::ucum::common_units(state.backend()).await;
+    let mut parameter = vec![
+        json!({"name": "name", "valueString": "UCUM"}),
+        json!({"name": "version", "valueString": version}),
+        json!({"name": "display", "valueString": code}),
+        json!({"name": "system", "valueUri": UCUM_URL}),
+        json!({"name": "code", "valueCode": code}),
+        json!({"name": "property", "part": [
+            {"name": "code", "valueCode": "inactive"},
+            {"name": "value", "valueBoolean": false}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": code}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": crate::ucum::description(code)}]}),
+    ];
+    if let Some(name) = common
+        .iter()
+        .find(|(c, _)| c == code)
+        .and_then(|(_, d)| d.as_deref())
+    {
+        parameter.push(json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "use", "valueCoding": {"system": "http://snomed.info/sct", "code": "900000000000013009"}},
+            {"name": "value", "valueString": name}]}));
+    }
+    Ok(json!({"resourceType": "Parameters", "parameter": parameter}))
+}
+
 /// `POST /CodeSystem/$lookup`
 ///
 /// Accepts a FHIR `Parameters` body.  The `system` (CodeSystem URL) and `code`
@@ -498,7 +855,10 @@ pub async fn lookup_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/$lookup?system=<url>&code=<code>`
@@ -566,7 +926,10 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
         .unwrap_or_default();
     let mut params = inject_system(raw_params, system);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/{id}/$lookup?code=<code>`

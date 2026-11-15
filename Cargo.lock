@@ -3470,14 +3470,17 @@ name = "helios-fhir-validator"
 version = "0.2.4"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "flate2",
  "helios-fhir",
  "helios-fhirpath",
  "indexmap 2.14.0",
  "regex",
+ "roxmltree",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
 ]
 

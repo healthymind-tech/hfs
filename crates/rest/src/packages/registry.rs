@@ -279,23 +279,46 @@ impl Registry {
     }
 
     fn cache_file(&self, name: &str, version: &str) -> Option<PathBuf> {
-        (valid_package_name(name) && valid_package_version(version))
-            .then(|| self.cache_dir.join(format!("{name}#{version}.tgz")))
+        if !(valid_package_name(name) && valid_package_version(version)) {
+            return None;
+        }
+        let exact = self.cache_dir.join(format!("{name}#{version}.tgz"));
+        if exact.exists() {
+            return Some(exact);
+        }
+        // Package names are case-insensitive (`kbv.basis` is cached as
+        // `KBV.Basis#1.1.3.tgz`).
+        let wanted = format!("{name}#{version}.tgz").to_ascii_lowercase();
+        std::fs::read_dir(&self.cache_dir)
+            .ok()
+            .and_then(|dir| {
+                dir.filter_map(Result::ok)
+                    .find(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|f| f.to_ascii_lowercase() == wanted)
+                    })
+                    .map(|e| e.path())
+            })
+            .or(Some(exact))
     }
 
-    /// Versions of `name` present in the cache.
+    /// Versions of `name` present in the cache (names compared without
+    /// regard to case).
     pub fn cached_versions(&self, name: &str) -> Vec<String> {
-        let prefix = format!("{name}#");
+        let prefix = format!("{name}#").to_ascii_lowercase();
         let Ok(dir) = std::fs::read_dir(&self.cache_dir) else {
             return Vec::new();
         };
         dir.filter_map(Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
             .filter_map(|f| {
-                f.strip_prefix(&prefix)
-                    .and_then(|rest| rest.strip_suffix(".tgz"))
+                let lower = f.to_ascii_lowercase();
+                lower
+                    .starts_with(&prefix)
+                    .then(|| f[prefix.len()..].to_string())
+                    .and_then(|rest| rest.strip_suffix(".tgz").map(str::to_string))
                     .filter(|v| valid_package_version(v))
-                    .map(str::to_string)
             })
             .collect()
     }
@@ -817,5 +840,24 @@ mod tests {
         );
         // Names that are not file-name safe never reach the filesystem.
         assert!(registry.read_cached("../x", "1").is_none());
+    }
+
+    /// `condition-with-extensions-on-pattern`: a dependency on `kbv.basis`
+    /// is met by a cached `KBV.Basis#1.1.3.tgz` (package names ignore case).
+    #[tokio::test]
+    async fn cached_package_names_ignore_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(
+            RegistryMode::Off,
+            None,
+            dir.path().to_path_buf(),
+            Limits::default(),
+        );
+        let bytes = super::super::tarball::test_support::package("KBV.Basis", "1.1.3", &[], &[]);
+        registry.store(&bytes).unwrap();
+        assert_eq!(registry.cached_versions("kbv.basis"), ["1.1.3"]);
+        let (fetched, info) = registry.fetch("kbv.basis", "1.1.3").await.unwrap();
+        assert_eq!(fetched, bytes);
+        assert_eq!(info.source, "cache");
     }
 }

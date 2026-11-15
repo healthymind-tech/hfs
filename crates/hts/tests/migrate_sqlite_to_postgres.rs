@@ -5,7 +5,7 @@
 
 mod common;
 
-use helios_hts::backends::{PostgresTerminologyBackend, SqliteTerminologyBackend};
+use helios_hts::backends::SqliteTerminologyBackend;
 use helios_hts::import::BundleImportBackend;
 use helios_hts::migrate::{MigrateOptions, migrate_sqlite_to_postgres};
 use helios_hts::traits::{CodeSystemOperations, ConceptMapOperations, ValueSetOperations};
@@ -133,7 +133,7 @@ async fn migrated_database_answers_like_the_source() {
     .unwrap();
     assert!(replaced.mismatches().is_empty());
 
-    let pg = PostgresTerminologyBackend::new(&url).await.unwrap();
+    let pg = common::pg_hts_backend(&url).await.unwrap();
     let expand = ExpandRequest {
         url: Some("http://mig.test/vs".into()),
         ..Default::default()

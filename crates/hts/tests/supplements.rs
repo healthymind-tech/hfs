@@ -196,3 +196,70 @@ async fn expand_display_language_and_designations_use_supplement() {
         "{body}"
     );
 }
+
+/// A display from a stored translation supplement validates when the
+/// request asks for that language (`zh-TW` is served by `zh-Hant`), as the
+/// HL7 validator accepts any designation in the requested language — the
+/// same display `$lookup ... displayLanguage=zh-TW` hands out. Without a
+/// `displayLanguage` an unrequested supplement does not count (tx.fhir.org:
+/// `parameters-validate-supplement-none`), and another language does not
+/// pick it up either.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_code_accepts_supplement_display_in_the_requested_language() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&bundle()).await;
+    let display = "%E6%9C%AC%E6%85%8B%E6%80%A7%EF%BC%88%E5%8E%9F%E7%99%BC%E6%80%A7%EF%BC%89%E9%AB%98%E8%A1%80%E5%A3%93";
+    let result = |body: &Value| {
+        params(body)
+            .iter()
+            .find(|p| p["name"] == "result")
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+    for (lang, expected) in [
+        ("&displayLanguage=zh-TW", true),
+        ("&displayLanguage=zh-Hant", true),
+        ("", false),
+        ("&displayLanguage=de", false),
+    ] {
+        let (status, body) = app
+            .get_fhir(&format!(
+                "/CodeSystem/$validate-code?url={CS_URL}&code=I10&display={display}{lang}"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{lang}: {body}");
+        assert_eq!(result(&body), Some(expected), "{lang}: {body}");
+        let (_, body) = app
+            .get_fhir(&format!(
+                "/ValueSet/$validate-code?url={VS_URL}&system={CS_URL}&code=I10&display={display}{lang}"
+            ))
+            .await;
+        assert_eq!(result(&body), Some(expected), "VS {lang}: {body}");
+    }
+}
+
+/// A concept without any display (IPS's ATC fragment) gives nothing to
+/// judge a supplied display against, also when the request names a
+/// language (a resource in fr-LU): no "Valid display is unknown" error.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concept_without_displays_accepts_any_display_in_any_language() {
+    let app = TestApp::new().await;
+    let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "atc-frag", "url": "http://hts.test/atc",
+            "status": "active", "content": "fragment", "concept": [{"code": "J07CA02"}]}}
+    ]});
+    app.import_bundle_ok(&bundle.to_string()).await;
+    for lang in ["", "&displayLanguage=fr-LU"] {
+        let (status, body) = app
+            .get_fhir(&format!(
+                "/CodeSystem/$validate-code?url=http://hts.test/atc&code=J07CA02&display=diphtheria-pertussis{lang}"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.to_string().contains("invalid-display"),
+            "{lang}: {body}"
+        );
+    }
+}

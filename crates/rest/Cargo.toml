@@ -21,7 +21,7 @@ R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serd
 R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6", "helios-fhir-validator/R6"]
 
 # Serialization format features
-xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml"]
+xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml", "helios-fhir-validator/xml"]
 
 # Database backends (pass through to helios-persistence)
 sqlite = ["helios-persistence/sqlite"]

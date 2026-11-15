@@ -81,6 +81,39 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         return;
     }
 
+    // FHIR JSON has no empty strings: a primitive without a value is
+    // absent (or carried by its `_name` sidecar).
+    if data.as_str() == Some("") {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            "value cannot be empty".to_string(),
+        );
+        if ctx.empty_primitive_breaks_ele1() {
+            // Neither a value nor children (`url=""` in XML): ele-1 too,
+            // as the HL7 validator reports it.
+            ctx.error(
+                ErrorKind::FhirpathConstraint,
+                "Constraint failed: ele-1: 'All FHIR elements must have a @value or children'"
+                    .to_string(),
+            );
+        }
+        return;
+    }
+
+    // FHIR caps strings at 1 MB (`base64Binary` and `xhtml` excepted).
+    if let Some(s) = data.as_str()
+        && s.len() > MAX_STRING_BYTES
+        && !matches!(type_name, "base64Binary" | "xhtml")
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            format!(
+                "value is longer than permitted maximum length of 1 MB ({MAX_STRING_BYTES} bytes)"
+            ),
+        );
+        return;
+    }
+
     if let Some(pattern) = &schema.regex
         && let Some(s) = data.as_str()
         && let Some(re) = compiled(pattern)
@@ -92,6 +125,9 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         );
     }
 }
+
+/// The HL7 validator's limit on a string value (FHIR: 1,048,576).
+const MAX_STRING_BYTES: usize = 1024 * 1024;
 
 /// The JSON type class a FHIR primitive requires.
 #[derive(Clone, Copy)]

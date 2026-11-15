@@ -264,3 +264,35 @@ async fn exists_filter_selects_by_property_presence() {
         .await;
     assert!(st.is_client_error(), "{st} {body}");
 }
+
+// ── is-not-a (tx-ecosystem tho/validate-isnota-*) ────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn is_not_a_filter_is_the_complement_of_is_a() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(&fixture_bundle()).await;
+
+    let filter = json!([{"property": "concept", "op": "is-not-a", "value": "A2"}]);
+    // A2 and its descendant A2.1 are out; the parent and the other branch are in.
+    assert_eq!(
+        expand_inline(&app, filter.clone()).await,
+        ["A1", "B", "_Abstract"]
+    );
+
+    // Intersected with a property filter (bounded-candidate path).
+    let codes = expand_inline(
+        &app,
+        json!([
+            {"property": "side", "op": "exists", "value": "true"},
+            {"property": "concept", "op": "is-not-a", "value": "A2"}
+        ]),
+    )
+    .await;
+    assert_eq!(codes, ["A1"]);
+
+    assert!(validate_inline(&app, filter.clone(), "_Abstract").await);
+    assert!(validate_inline(&app, filter.clone(), "B").await);
+    assert!(!validate_inline(&app, filter.clone(), "A2").await);
+    assert!(!validate_inline(&app, filter, "A2.1").await);
+}

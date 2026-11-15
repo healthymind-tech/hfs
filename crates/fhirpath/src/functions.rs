@@ -191,6 +191,11 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: Other,
         },
         FunctionInfo {
+            name: "conformsTo",
+            signature: "conformsTo(profile)",
+            category: Terminology,
+        },
+        FunctionInfo {
             name: "contains",
             signature: "contains(substring)",
             category: String,

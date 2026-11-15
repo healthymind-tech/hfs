@@ -823,3 +823,54 @@ mod mixed_format {
         assert_eq!(body["active"], true);
     }
 }
+
+// =============================================================================
+// Lossless XML parsing (HL7 validator test cases patient-extension-bad*)
+// =============================================================================
+
+mod lossless_parsing {
+    use super::*;
+
+    /// `$validate` judges the XML as sent: an unknown element and an
+    /// extension without a url are reported instead of vanishing in the
+    /// typed model, and a value the model cannot hold is a validation issue,
+    /// not a parse failure.
+    #[tokio::test]
+    async fn validate_sees_unknown_elements_and_bad_values() {
+        let (server, _backend) = create_test_server().await;
+        let xml = r#"<Patient xmlns="http://hl7.org/fhir">
+              <extension><valueString value="no url"/></extension>
+              <active value="yes"/>
+              <bogus value="1"/>
+            </Patient>"#;
+        let response = server
+            .post("/Patient/$validate")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+xml"),
+            )
+            .add_header(ACCEPT, HeaderValue::from_static("application/fhir+json"))
+            .bytes(Bytes::from(xml))
+            .await;
+        response.assert_status_ok();
+        let outcome: Value = response.json();
+        let errors: Vec<String> = outcome["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["severity"] == "error")
+            .map(|i| i["expression"][0].as_str().unwrap_or_default().to_string())
+            .collect();
+        for expected in [
+            "Patient.bogus",
+            "Patient.active",
+            "Patient.extension[0].url",
+        ] {
+            assert!(
+                errors.iter().any(|e| e == expected),
+                "{expected} not reported: {outcome:#}"
+            );
+        }
+    }
+}
