@@ -415,7 +415,8 @@ pub async fn import_snomed_rf2(
         .unwrap_or(true);
 
     // Seed empty CodeSystem.
-    let seed = build_parsed_code_system(&meta, &[]);
+    let mut seed = build_parsed_code_system(&meta, &[]);
+    seed.chunked = true;
     let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);

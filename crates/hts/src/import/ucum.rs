@@ -35,7 +35,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ pub async fn import_ucum(
         definition: Some("header"),
         ..Default::default()
     };
-    let seed_bytes = build_code_system_bundle(
+    let seed_bytes = build_native_batch(
         &CodeSystemMeta {
             id: UCUM_ID,
             url: UCUM_URL,
@@ -134,7 +134,7 @@ pub async fn import_ucum(
         },
         std::slice::from_ref(&root),
     );
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed_stats = backend.import_parsed(ctx, seed_bytes).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -149,7 +149,7 @@ pub async fn import_ucum(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(
+        let bytes = build_native_batch(
             &CodeSystemMeta {
                 id: UCUM_ID,
                 url: UCUM_URL,
@@ -162,7 +162,7 @@ pub async fn import_ucum(
             &builder_concepts,
         );
 
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let chunk_stats = backend.import_parsed(ctx, bytes).await?;
         stats.errors.extend(chunk_stats.errors);
 
         eprintln!(

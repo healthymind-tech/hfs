@@ -43,7 +43,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ pub async fn import_nucc(
         });
     }
 
-    let bytes = build_code_system_bundle(
+    let bytes = build_native_batch(
         &CodeSystemMeta {
             id: NUCC_ID,
             url: NUCC_URL,
@@ -166,7 +166,7 @@ pub async fn import_nucc(
         &builder_concepts,
     );
 
-    let imported = backend.import_bundle(ctx, &bytes).await?;
+    let imported = backend.import_parsed(ctx, bytes).await?;
     stats.code_systems = imported.code_systems;
     stats.concepts = concepts.len() as u32;
     stats.errors.extend(imported.errors);
