@@ -1847,6 +1847,17 @@ async fn write_code_system(
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
+    // Cached expansions over this system are stale now (the CRUD path did
+    // this already; a bundle import did not, so re-importing a fuller copy
+    // of a CodeSystem kept serving the old expansions from the DB cache).
+    client
+        .cexec(
+            "DELETE FROM value_set_expansions WHERE system_url = $1",
+            &[&cs.url],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
     stats.code_systems += 1;
     Ok(())
 }

@@ -592,6 +592,9 @@ fn write_code_system(
     // The implicit_expansion_cache is otherwise persistent across restarts; stale
     // entries from a previous version of this system must be evicted on re-import.
     invalidate_implicit_expansions(conn, &cs.url)?;
+    // Cached ValueSet expansions over this system are stale too (the CRUD
+    // path already did this; a bundle re-import did not).
+    invalidate_expansion_cache_for_system(conn, &cs.url)?;
 
     // The process-wide URL→system_id cache may have memoised a now-stale row
     // (e.g. an empty stub that this import is about to replace, or a

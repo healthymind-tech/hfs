@@ -1261,3 +1261,42 @@ async fn truncated_copy_does_not_replace_complete_code_system() {
     assert_eq!(steps.6, ("complete".to_string(), Some(2)));
     assert_eq!(steps.7, (1, 0), "another version is independent");
 }
+
+/// Re-importing a fuller copy of a CodeSystem (the TW ICD full tables over
+/// TW Core 1.0.0's samples) must not keep serving the expansion cached from
+/// the sample: a bundle import drops the cached expansions over the system,
+/// as a CRUD update already did.
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_reimport_drops_cached_expansions_over_the_system() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let cs = |codes: &[&str]| {
+        json!({
+            "resourceType": "CodeSystem", "id": "pcs-tw", "url": "http://tw.test/CodeSystem/pcs",
+            "version": "2024", "status": "active", "content": "complete",
+            "property": [{"code": "USE", "type": "string"}],
+            "concept": codes.iter().map(|c| json!({"code": c,
+                "property": [{"code": "USE", "valueString": "1"}]})).collect::<Vec<_>>()
+        })
+    };
+    let vs = json!({
+        "resourceType": "ValueSet", "id": "pcs-vs", "url": "http://tw.test/ValueSet/pcs",
+        "status": "active",
+        "compose": {"include": [{"system": "http://tw.test/CodeSystem/pcs",
+                                 "filter": [{"property": "USE", "op": "=", "value": "1"}]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&["A", "B"]), vs.clone()])).await;
+    }
+    let before = same_on_all!(bs, |b| expand(b, url_req("http://tw.test/ValueSet/pcs")).await);
+    assert_eq!(before.unwrap().1, Some(2));
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&["A", "B", "C"])])).await;
+    }
+    let after = same_on_all!(bs, |b| (
+        expand(b, url_req("http://tw.test/ValueSet/pcs")).await,
+        validates(b, "http://tw.test/ValueSet/pcs", Some("http://tw.test/CodeSystem/pcs"), "C").await,
+    ));
+    assert_eq!(after.0.unwrap().1, Some(3));
+    assert!(after.1);
+}
