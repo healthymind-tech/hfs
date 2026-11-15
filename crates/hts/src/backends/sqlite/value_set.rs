@@ -3898,6 +3898,23 @@ fn expand_single_include_local(
                 }
             }
         }
+        // UCUM is a grammar: enumerated units the stored atoms table lacks
+        // (`mm[Hg]`, `kg`) are still members when well-formed.
+        if seen_codes.len() < explicit_codes.len() {
+            let extra = crate::backends::ucum_grammar_from_compose(
+                system_url,
+                cs_version.as_deref(),
+                explicit_codes,
+                &seen_codes,
+            );
+            if !extra.is_empty() {
+                for c in extra {
+                    seen_codes.insert(c.code.clone());
+                    out.push(c);
+                }
+                crate::backends::sort_by_compose_order(&mut out, explicit_codes);
+            }
+        }
         // IG `parameters/parameters-expand-enum-*` semantics: when an
         // explicitly-enumerated concept is abstract (notSelectable=true), the
         // immediate children appear alongside it in the expansion. This isn't

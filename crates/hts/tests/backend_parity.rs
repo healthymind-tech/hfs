@@ -1047,3 +1047,69 @@ async fn supplements_reach_lookup_helpers_after_import() {
     );
     assert_eq!(after.4.as_deref(), Some("1"));
 }
+
+/// A stored UCUM code system holds atoms only (`ucum-essence`, imported by
+/// the bootstrap as `content=complete`): prefixes, base units and named units.
+/// UCUM is a grammar, so enumerated value sets over it (`ucum-vitals-common`)
+/// keep their well-formed composed units (`mm[Hg]`, `kg`, `/min`) — they used
+/// to drop out, and US Core vital-sign examples failed under remote
+/// terminology. Malformed units still drop, and other code systems still
+/// drop unknown enumerated codes (IG `simple-expand-enum-bad`).
+#[tokio::test(flavor = "multi_thread")]
+async fn enumerated_ucum_units_survive_a_stored_atom_table() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let ucum_atoms = json!({
+        "resourceType": "CodeSystem", "id": "ucum", "url": "http://unitsofmeasure.org",
+        "version": "2.2", "status": "active", "content": "complete",
+        "concept": [
+            {"code": "k", "display": "kilo"}, {"code": "m", "display": "meter"},
+            {"code": "g", "display": "gram"}, {"code": "%", "display": "percent"},
+            {"code": "m[Hg]", "display": "meter of mercury column"}
+        ]
+    });
+    let vitals = json!({
+        "resourceType": "ValueSet", "id": "vitals", "url": "http://u.test/vs/vitals",
+        "status": "active",
+        "compose": {"include": [{"system": "http://unitsofmeasure.org", "concept": [
+            {"code": "%", "display": "percent"},
+            {"code": "cm", "display": "centimeter"},
+            {"code": "kg", "display": "kilogram"},
+            {"code": "/min", "display": "per minute"},
+            {"code": "mm[Hg]", "display": "millimeter of mercury"},
+            {"code": "g"},
+            {"code": "not a unit"}
+        ]}]}
+    });
+    let other = json!({
+        "resourceType": "ValueSet", "id": "other", "url": "http://u.test/vs/other",
+        "status": "active",
+        "compose": {"include": [{"system": "http://p.test/cs", "concept": [
+            {"code": "A1"}, {"code": "mm[Hg]"}
+        ]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![ucum_atoms.clone(), property_cs(), vitals.clone(), other.clone()]))
+            .await;
+    }
+    let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/vitals")).await);
+    assert_eq!(
+        exp,
+        Ok((
+            ["%", "cm", "kg", "/min", "mm[Hg]", "g"].map(String::from).to_vec(),
+            Some(6)
+        )),
+        "compose order, malformed unit dropped"
+    );
+    let v = same_on_all!(bs, |b| (
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mm[Hg]").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "kg").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "g").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mg").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "not a unit")
+            .await,
+    ));
+    assert_eq!(v, (true, true, true, false, false));
+    let other_exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/other")).await);
+    assert_eq!(other_exp, Ok((vec!["A1".to_string()], Some(1))));
+}
