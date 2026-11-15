@@ -116,6 +116,7 @@ fn server(with_auth: bool) -> TestServer {
             audit_exclusion_filter: ExclusionFilter::new(vec![]),
             tenant_url_routing: false,
             sessions: None,
+            admin: None,
         })
     });
     let config = ServerConfig {
