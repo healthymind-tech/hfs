@@ -259,9 +259,10 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
     Ok(())
 }
 
-/// The applied fork migrations, oldest first. Used by tests and the
-/// operational schema report.
-pub async fn applied_fork_migrations(
+/// The applied fork migrations, oldest first. Operators query
+/// `hm_schema_migrations` directly (docs/ops/database-migrations.md).
+#[cfg(test)]
+async fn applied_fork_migrations(
     client: &deadpool_postgres::Client,
 ) -> StorageResult<Vec<String>> {
     let exists: bool = client
