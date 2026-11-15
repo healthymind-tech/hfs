@@ -63,10 +63,11 @@ dashmap = "6"
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Real SQLite backend for the rehydration integration test (issue #305), and
-# real Postgres for the T2 cluster suites (testcontainers), driving the engine
-# through the shared persistence seams.
-helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false, features = ["sqlite", "postgres"] }
+# Real SQLite backend for the rehydration integration test (issue #305). The
+# T2 cluster suites against Postgres run with this crate's `postgres` feature
+# (not a dev-dependency feature: that would switch PostgreSQL on for every
+# crate's tests in a workspace build).
+helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false, features = ["sqlite"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
