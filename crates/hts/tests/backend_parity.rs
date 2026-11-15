@@ -1047,3 +1047,256 @@ async fn supplements_reach_lookup_helpers_after_import() {
     );
     assert_eq!(after.4.as_deref(), Some("1"));
 }
+
+/// A stored UCUM code system holds atoms only (`ucum-essence`, imported by
+/// the bootstrap as `content=complete`): prefixes, base units and named units.
+/// UCUM is a grammar, so enumerated value sets over it (`ucum-vitals-common`)
+/// keep their well-formed composed units (`mm[Hg]`, `kg`, `/min`) — they used
+/// to drop out, and US Core vital-sign examples failed under remote
+/// terminology. Malformed units still drop, and other code systems still
+/// drop unknown enumerated codes (IG `simple-expand-enum-bad`).
+#[tokio::test(flavor = "multi_thread")]
+async fn enumerated_ucum_units_survive_a_stored_atom_table() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let ucum_atoms = json!({
+        "resourceType": "CodeSystem", "id": "ucum", "url": "http://unitsofmeasure.org",
+        "version": "2.2", "status": "active", "content": "complete",
+        "concept": [
+            {"code": "k", "display": "kilo"}, {"code": "m", "display": "meter"},
+            {"code": "g", "display": "gram"}, {"code": "%", "display": "percent"},
+            {"code": "m[Hg]", "display": "meter of mercury column"}
+        ]
+    });
+    let vitals = json!({
+        "resourceType": "ValueSet", "id": "vitals", "url": "http://u.test/vs/vitals",
+        "status": "active",
+        "compose": {"include": [{"system": "http://unitsofmeasure.org", "concept": [
+            {"code": "%", "display": "percent"},
+            {"code": "cm", "display": "centimeter"},
+            {"code": "kg", "display": "kilogram"},
+            {"code": "/min", "display": "per minute"},
+            {"code": "mm[Hg]", "display": "millimeter of mercury"},
+            {"code": "g"},
+            {"code": "not a unit"}
+        ]}]}
+    });
+    let other = json!({
+        "resourceType": "ValueSet", "id": "other", "url": "http://u.test/vs/other",
+        "status": "active",
+        "compose": {"include": [{"system": "http://p.test/cs", "concept": [
+            {"code": "A1"}, {"code": "mm[Hg]"}
+        ]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![ucum_atoms.clone(), property_cs(), vitals.clone(), other.clone()]))
+            .await;
+    }
+    let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/vitals")).await);
+    assert_eq!(
+        exp,
+        Ok((
+            ["%", "cm", "kg", "/min", "mm[Hg]", "g"].map(String::from).to_vec(),
+            Some(6)
+        )),
+        "compose order, malformed unit dropped"
+    );
+    let v = same_on_all!(bs, |b| (
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mm[Hg]").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "kg").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "g").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mg").await,
+        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "not a unit")
+            .await,
+    ));
+    assert_eq!(v, (true, true, true, false, false));
+    let other_exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/other")).await);
+    assert_eq!(other_exp, Ok((vec!["A1".to_string()], Some(1))));
+}
+
+/// The CDCREC CodeSystem HTS receives (VSAC / PHIN VADS 1.2) is flat; HTS
+/// supplies the race / ethnicity trees, so US Core `detailed-race`
+/// (`descendent-of 1000-9` minus the OMB categories) expands and validates.
+#[tokio::test(flavor = "multi_thread")]
+async fn flat_cdcrec_expands_descendants() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let cdcrec = json!({
+        "resourceType": "CodeSystem", "id": "CDCREC", "url": "urn:oid:2.16.840.1.113883.6.238",
+        "version": "1.2", "status": "active", "content": "complete",
+        "concept": [
+            {"code": "1000-9", "display": "Race"},
+            {"code": "1002-5", "display": "American Indian or Alaska Native"},
+            {"code": "1004-1", "display": "American Indian"},
+            {"code": "2028-9", "display": "Asian"},
+            {"code": "2039-6", "display": "Japanese"},
+            {"code": "2133-7", "display": "Ethnicity"},
+            {"code": "2135-2", "display": "Hispanic or Latino"},
+            {"code": "2148-5", "display": "Mexican"}
+        ]
+    });
+    // VSAC's detailed ethnicity: the exclude's real operator is in a
+    // `vsacOpModifier` modifier extension (child-of, not is-a).
+    let ethnicity = json!({
+        "resourceType": "ValueSet", "id": "detailed-eth", "url": "http://u.test/vs/detailed-eth",
+        "status": "active",
+        "compose": {
+            "include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "filter": [{"property": "concept", "op": "descendent-of", "value": "2133-7"}]}],
+            "exclude": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "filter": [{"modifierExtension": [{"url": "vsacOpModifier", "valueString": "childOf"}],
+                                     "property": "concept", "op": "is-a", "value": "2133-7"}]}]
+        }
+    });
+    let detailed = json!({
+        "resourceType": "ValueSet", "id": "detailed-race", "url": "http://u.test/vs/detailed-race",
+        "status": "active",
+        "compose": {
+            "include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "filter": [{"property": "concept", "op": "descendent-of", "value": "1000-9"}]}],
+            "exclude": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                         "concept": [{"code": "1002-5"}, {"code": "2028-9"}]}]
+        }
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cdcrec.clone(), detailed.clone(), ethnicity.clone()])).await;
+    }
+    let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-race"))
+        .await
+        .map(|(mut c, t)| {
+            c.sort();
+            (c, t)
+        }));
+    assert_eq!(
+        exp,
+        Ok((vec!["1004-1".to_string(), "2039-6".to_string()], Some(2)))
+    );
+    let v = same_on_all!(bs, |b| (
+        validates(b, "http://u.test/vs/detailed-race", Some("urn:oid:2.16.840.1.113883.6.238"), "2039-6").await,
+        validates(b, "http://u.test/vs/detailed-race", Some("urn:oid:2.16.840.1.113883.6.238"), "2135-2").await,
+    ));
+    assert_eq!(v, (true, false));
+    let eth = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-eth")).await);
+    assert_eq!(eth, Ok((vec!["2148-5".to_string()], Some(1))));
+}
+
+/// Same `url|version`, different content: a smaller copy whose codes the
+/// stored complete CodeSystem already defines (TW Core 1.0.0's 11-code
+/// sample of TW Core 0.3.2's 96 802-code ICD-10-CM table) is skipped with a
+/// warning instead of replacing the stored metadata; a copy with new codes
+/// is still written (concepts merge), and so is a new version.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_copy_does_not_replace_complete_code_system() {
+    use helios_hts::traits::CodeSystemOperations;
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let cs = |codes: &[&str], count: Option<usize>, version: &str| {
+        let mut r = json!({
+            "resourceType": "CodeSystem", "id": "icd-tw", "url": "http://tw.test/CodeSystem/icd",
+            "version": version, "status": "active", "content": "complete",
+            "concept": codes.iter().map(|c| json!({"code": c, "display": c})).collect::<Vec<_>>()
+        });
+        if let Some(n) = count {
+            r["count"] = json!(n);
+        }
+        r
+    };
+    let full = cs(&["A00", "A00.0", "A00.1", "A01", "A01.0"], None, "2024");
+    let sample = cs(&["A00", "A00.0"], Some(2), "2024");
+    let stub = json!({
+        "resourceType": "CodeSystem", "id": "icd-tw", "url": "http://tw.test/CodeSystem/icd",
+        "version": "2024", "status": "active", "content": "not-present"
+    });
+    let with_new = cs(&["A00", "B99"], Some(2), "2024");
+    let other_version = cs(&["A00"], Some(1), "2025");
+    let stored_count = |b: &Backend, version: &str| {
+        let b = b.clone();
+        let version = version.to_string();
+        async move {
+            let found = CodeSystemOperations::search(
+                &*b,
+                &ctx(),
+                helios_hts::types::ResourceSearchQuery {
+                    url: Some("http://tw.test/CodeSystem/icd".into()),
+                    version: Some(version),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let r = &found[0];
+            (
+                r["content"].as_str().unwrap_or_default().to_string(),
+                r["count"].as_u64(),
+            )
+        }
+    };
+    let imp = |b: &Backend, r: Value| {
+        let b = b.clone();
+        async move {
+            let s = b
+                .import_bundle(&ctx(), &serde_json::to_vec(&bundle(vec![r])).unwrap())
+                .await
+                .unwrap();
+            assert!(s.errors.is_empty(), "{:?}", s.errors);
+            (s.code_systems, s.warnings.len())
+        }
+    };
+    let steps = same_on_all!(bs, |b| (
+        imp(b, full.clone()).await,
+        imp(b, sample.clone()).await,
+        stored_count(b, "2024").await,
+        imp(b, stub.clone()).await,
+        stored_count(b, "2024").await,
+        imp(b, with_new.clone()).await,
+        stored_count(b, "2024").await,
+        imp(b, other_version.clone()).await,
+    ));
+    assert_eq!(steps.0, (1, 0), "full copy written");
+    assert_eq!(steps.1, (0, 1), "sample skipped with a warning");
+    assert_eq!(steps.2, ("complete".to_string(), None), "full copy's metadata kept");
+    assert_eq!(steps.3, (0, 1), "not-present stub skipped");
+    assert_eq!(steps.4, ("complete".to_string(), None));
+    assert_eq!(steps.5, (1, 0), "a copy with new codes is written");
+    assert_eq!(steps.6, ("complete".to_string(), Some(2)));
+    assert_eq!(steps.7, (1, 0), "another version is independent");
+}
+
+/// Re-importing a fuller copy of a CodeSystem (the TW ICD full tables over
+/// TW Core 1.0.0's samples) must not keep serving the expansion cached from
+/// the sample: a bundle import drops the cached expansions over the system,
+/// as a CRUD update already did.
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_reimport_drops_cached_expansions_over_the_system() {
+    let _serial = SERIAL.lock().await;
+    let bs = backends().await;
+    let cs = |codes: &[&str]| {
+        json!({
+            "resourceType": "CodeSystem", "id": "pcs-tw", "url": "http://tw.test/CodeSystem/pcs",
+            "version": "2024", "status": "active", "content": "complete",
+            "property": [{"code": "USE", "type": "string"}],
+            "concept": codes.iter().map(|c| json!({"code": c,
+                "property": [{"code": "USE", "valueString": "1"}]})).collect::<Vec<_>>()
+        })
+    };
+    let vs = json!({
+        "resourceType": "ValueSet", "id": "pcs-vs", "url": "http://tw.test/ValueSet/pcs",
+        "status": "active",
+        "compose": {"include": [{"system": "http://tw.test/CodeSystem/pcs",
+                                 "filter": [{"property": "USE", "op": "=", "value": "1"}]}]}
+    });
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&["A", "B"]), vs.clone()])).await;
+    }
+    let before = same_on_all!(bs, |b| expand(b, url_req("http://tw.test/ValueSet/pcs")).await);
+    assert_eq!(before.unwrap().1, Some(2));
+    for (_, b, _) in &bs {
+        import(b, &bundle(vec![cs(&["A", "B", "C"])])).await;
+    }
+    let after = same_on_all!(bs, |b| (
+        expand(b, url_req("http://tw.test/ValueSet/pcs")).await,
+        validates(b, "http://tw.test/ValueSet/pcs", Some("http://tw.test/CodeSystem/pcs"), "C").await,
+    ));
+    assert_eq!(after.0.unwrap().1, Some(3));
+    assert!(after.1);
+}

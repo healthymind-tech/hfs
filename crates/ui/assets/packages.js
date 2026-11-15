@@ -899,6 +899,13 @@
       if (installed) verdict.appendChild(h("p", { class: "muted", text: result.installed.join(", ") }));
 
       var notes = clear(document.getElementById("pkg-notes"));
+      // Non-fatal problems (a dependency the registry no longer serves, a
+      // terminology resource the terminology server kept its own copy of).
+      var warnings = job.warnings || [];
+      if (warnings.length && kind === "ok") verdict.className = "pkg-verdict pkg-verdict--warn";
+      warnings.slice(0, 50).forEach(function (w) {
+        notes.appendChild(h("p", { class: "pkg-warning", text: M("plan-warning", { detail: w.package + " · " + w.resource + ": " + w.message }) }));
+      });
       if (result.searchParameters) {
         notes.appendChild(h("p", { text: M("reindex-hint", { count: num(result.searchParameters) }) }));
         var reindex = h("button", { type: "button", class: "btn", text: M("reindex") });
@@ -913,7 +920,7 @@
         notes.appendChild(reindex);
         show(notes, true);
       } else {
-        show(notes, false);
+        show(notes, warnings.length > 0);
       }
 
       var tbody = clear(document.getElementById("pkg-error-rows"));

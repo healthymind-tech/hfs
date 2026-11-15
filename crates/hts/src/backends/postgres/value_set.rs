@@ -2426,6 +2426,23 @@ async fn compute_expansion_inner_body(
                         }
                     }
                 }
+                // UCUM is a grammar: enumerated units the stored atoms table
+                // lacks (`mm[Hg]`, `kg`) are still members when well-formed.
+                if seen_codes.len() < explicit_codes.len() {
+                    let extra = crate::backends::ucum_grammar_from_compose(
+                        system_url,
+                        cs_version.as_deref(),
+                        explicit_codes,
+                        &seen_codes,
+                    );
+                    if !extra.is_empty() {
+                        for c in extra {
+                            seen_codes.insert(c.code.clone());
+                            out.push(c);
+                        }
+                        crate::backends::sort_by_compose_order(&mut out, explicit_codes);
+                    }
+                }
                 // Skip when depth > 0: a contained-VS / nested ref (Cluster C)
                 // expansion is supposed to return EXACTLY the enumerated codes
                 // so that intersections with sibling refs are well-defined.
@@ -2913,6 +2930,7 @@ async fn apply_compose_filters_pg(
                     f["op"] = serde_json::Value::String(code);
                 }
             }
+            crate::backends::apply_vsac_op_modifier(&mut f);
             f
         })
         .collect();
@@ -3198,18 +3216,38 @@ async fn pg_filter_property_eq(
     // code/display. The previous `EXISTS`-correlated form let the planner
     // scan every concept in the system and probe per row — ~350k probes for
     // SNOMED, the dominant cost of cold EX05 property-filter expansions.
+    //
+    // Two statements, not one: in a single `IN (subquery)` the planner cannot
+    // know how many ids the pair matches (it guessed 761 for LOINC
+    // `SCALE_TYP = Doc`, which has 24 834 across two LOINC versions) and
+    // fetched each concept with a primary-key probe — ~100 k random page
+    // reads, the dominant cost of a cold filtered LOINC expansion on a disk
+    // that is not an SSD. Given the ids as an array parameter it sees the
+    // real count and reads the concept pages in physical order with a bitmap
+    // heap scan (4.7 k pages instead of 99 k for that filter).
+    let ids: Vec<i64> = client
+        .cq(
+            "SELECT DISTINCT cp.concept_id
+               FROM concept_properties cp
+              WHERE cp.property = ANY($1::text[])
+                AND cp.value = ANY($2::text[])",
+            &[&property_aliases, &values],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let rows = client
         .cq(
             "SELECT c.code, c.display
                FROM concepts c
-              WHERE c.system_id = $1
-                AND c.id IN (
-                    SELECT cp.concept_id
-                      FROM concept_properties cp
-                     WHERE cp.property = ANY($2::text[])
-                       AND cp.value = ANY($3::text[])
-                )",
-            &[&system_id, &property_aliases, &values],
+              WHERE c.id = ANY($2::bigint[])
+                AND c.system_id = $1",
+            &[&system_id, &ids],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -3240,14 +3278,20 @@ async fn pg_loinc_filter_values(
         return Ok(crate::loinc_filters::with_codes(value, codes));
     }
     let name = value.trim();
+    // Two indexed probes (`idx_concepts_loinc_part_name`,
+    // `idx_designations_lower_value`) instead of one `OR EXISTS`, which the
+    // planner ran as a sequential scan of every designation.
     let rows = client
         .cq(
             "SELECT c.code FROM concepts c
               WHERE c.system_id = $1 AND c.code >= 'LP' AND c.code < 'LQ'
-                AND (lower(c.display) = lower($2)
-                     OR EXISTS (SELECT 1 FROM concept_designations d
-                                 WHERE d.concept_id = c.id AND lower(d.value) = lower($2)))
-              ORDER BY c.code",
+                AND lower(c.display) = lower($2)
+             UNION
+             SELECT c.code FROM concept_designations d
+               JOIN concepts c ON c.id = d.concept_id
+              WHERE lower(d.value) = lower($2)
+                AND c.system_id = $1 AND c.code >= 'LP' AND c.code < 'LQ'
+             ORDER BY 1",
             &[&system_id, &name],
         )
         .await

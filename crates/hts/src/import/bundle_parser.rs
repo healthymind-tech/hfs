@@ -351,6 +351,7 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         flatten_concepts(top_level, None, &edges, &mut concepts);
     }
     edges.apply_child_edges(&mut concepts);
+    fill_known_hierarchy(url, &mut concepts);
 
     Some(ParsedCodeSystem {
         id,
@@ -364,6 +365,109 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         resource_json: cs.clone(),
         authority_rank: AUTHORITY_UNKNOWN,
     })
+}
+
+/// Same canonical `url|version`, different content: the replacement policy.
+///
+/// Returns the warning to record when the incoming CodeSystem must NOT be
+/// written over the stored row with the same `url|version`, `None` when it may.
+///
+/// A CodeSystem version is immutable content, so two different copies under
+/// one `url|version` mean one of them is wrong. The common wrong copy is a
+/// truncated sample: TW Core 1.0.0 ships every Taiwan ICD-10-CM/PCS code
+/// system with 5–18 example codes (still labelled `content=complete`) under
+/// the same `url|version` as TW Core 0.3.2's full tables (91–97 k codes).
+/// HTS merges concepts on re-import, but the smaller copy's metadata
+/// (`content`, `count`, resource JSON) replaced the stored one's, and on a
+/// server that only ever saw the sample the full table could not be loaded
+/// without being "replaced back" by a later package install.
+///
+/// Policy: when the stored row is `complete` and the incoming copy has fewer
+/// concepts, all of which the stored row already defines, the incoming copy
+/// is a subset — a fragment, sample or stub — and is skipped with a warning.
+/// A larger copy, or one with codes the stored row lacks, is written as
+/// before (concepts merge). Chunked bulk loads (one batch = a subset by
+/// design) never reach this check.
+pub fn truncated_copy_warning(
+    cs: &ParsedCodeSystem,
+    stored_content: &str,
+    stored_concepts: i64,
+    incoming_missing_from_stored: i64,
+) -> Option<String> {
+    let incoming = cs.concepts.len() as i64;
+    if stored_content != "complete" || incoming >= stored_concepts || incoming_missing_from_stored > 0
+    {
+        return None;
+    }
+    Some(format!(
+        "CodeSystem {}|{} not replaced: the stored copy is complete with {stored_concepts} \
+         concepts; the incoming copy (content={}) has {incoming}, all already present",
+        cs.url,
+        cs.version.as_deref().unwrap_or(""),
+        cs.content
+    ))
+}
+
+/// CDC Race & Ethnicity (CDCREC).
+pub const CDCREC_URL: &str = "urn:oid:2.16.840.1.113883.6.238";
+
+/// `<child>\t<parent>` edges of the CDCREC race and ethnicity trees.
+const CDCREC_HIERARCHY: &str = include_str!("../data/cdcrec-hierarchy.tsv");
+
+/// Supply the hierarchy of a code system known to be distributed flat.
+///
+/// The CDCREC CodeSystem that reaches HTS (VSAC / PHIN VADS 1.2, 966 codes;
+/// THO's own copy is `not-present`) lists its concepts without nesting or
+/// parent properties, so `is-a` / `descendent-of 1000-9` filters (US Core
+/// `detailed-race`, `detailed-ethnicity`) expanded to nothing and every
+/// detailed race code failed validation. The CDCREC trees are the same as
+/// THO's `v3-Race` and `v3-Ethnicity` code systems under the abstract roots
+/// `1000-9` (Race) and `2133-7` (Ethnicity); the edges are embedded from them.
+///
+/// Only applies when the incoming content carries no hierarchy at all — a
+/// CDCREC with its own nesting or parent properties is kept as published —
+/// and only links codes the code system itself defines.
+/// The embedded CDCREC `(child, parent)` edges.
+pub fn cdcrec_edges() -> Vec<(&'static str, &'static str)> {
+    CDCREC_HIERARCHY
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('\t'))
+        .collect()
+}
+
+/// One-time repair marker (`bootstrap_imports` sentinel row) for databases
+/// written before the fixes of the p25-data line: flat CDCREC rows get their
+/// hierarchy, and cached expansions over CDCREC and UCUM (computed when
+/// enumerated UCUM units and CDCREC descendants were dropped) are cleared.
+pub const P25_DATA_MIGRATION_MARKER: &str = "#migration:cdcrec-hierarchy-ucum-enum-p25data";
+
+/// URLs whose cached expansions the p25-data migration clears.
+pub const P25_DATA_SYSTEMS: [&str; 2] = [CDCREC_URL, "http://unitsofmeasure.org"];
+
+fn fill_known_hierarchy(url: &str, concepts: &mut [ParsedConcept]) {
+    if url != CDCREC_URL || concepts.is_empty() || concepts.iter().any(|c| c.parent_code.is_some())
+    {
+        return;
+    }
+    let present: std::collections::HashSet<String> =
+        concepts.iter().map(|c| c.code.clone()).collect();
+    let parents: std::collections::HashMap<&str, &str> = cdcrec_edges().into_iter().collect();
+    let mut linked = 0usize;
+    for c in concepts.iter_mut() {
+        if let Some(parent) = parents.get(c.code.as_str())
+            && present.contains(*parent)
+        {
+            c.parent_code = Some((*parent).to_owned());
+            linked += 1;
+        }
+    }
+    tracing::info!(
+        url,
+        linked,
+        concepts = concepts.len(),
+        "flat CDCREC CodeSystem: supplied the race/ethnicity hierarchy"
+    );
 }
 
 /// Which concept properties of a CodeSystem encode hierarchy edges.
@@ -697,6 +801,78 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parent_of<'a>(cs: &'a ParsedCodeSystem, code: &str) -> Option<&'a str> {
+        cs.concepts
+            .iter()
+            .find(|c| c.code == code)
+            .and_then(|c| c.parent_code.as_deref())
+    }
+
+    #[test]
+    fn flat_cdcrec_gets_the_race_and_ethnicity_hierarchy() {
+        let cs = parse_code_system(&serde_json::json!({
+            "resourceType": "CodeSystem", "url": CDCREC_URL, "version": "1.2",
+            "content": "complete",
+            "concept": [
+                {"code": "1000-9", "display": "Race"},
+                {"code": "1002-5", "display": "American Indian or Alaska Native"},
+                {"code": "1004-1", "display": "American Indian"},
+                {"code": "2028-9", "display": "Asian"},
+                {"code": "2039-6", "display": "Japanese"},
+                {"code": "2133-7", "display": "Ethnicity"},
+                {"code": "2135-2", "display": "Hispanic or Latino"},
+                {"code": "2148-5", "display": "Mexican"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&cs, "1000-9"), None);
+        assert_eq!(parent_of(&cs, "1002-5"), Some("1000-9"));
+        assert_eq!(parent_of(&cs, "1004-1"), Some("1002-5"));
+        assert_eq!(parent_of(&cs, "2039-6"), Some("2028-9"));
+        assert_eq!(parent_of(&cs, "2133-7"), None);
+        assert_eq!(parent_of(&cs, "2135-2"), Some("2133-7"));
+        assert_eq!(parent_of(&cs, "2148-5"), Some("2135-2"));
+    }
+
+    #[test]
+    fn cdcrec_table_covers_all_966_codes_in_two_trees() {
+        let edges: Vec<(&str, &str)> = CDCREC_HIERARCHY
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('\t'))
+            .collect();
+        assert_eq!(edges.len(), 964, "966 codes minus the two roots");
+        let parents: std::collections::HashMap<&str, &str> = edges.iter().copied().collect();
+        for (child, _) in &edges {
+            let mut cur = *child;
+            let mut steps = 0;
+            while let Some(p) = parents.get(cur) {
+                cur = p;
+                steps += 1;
+                assert!(steps < 10, "cycle at {child}");
+            }
+            assert!(cur == "1000-9" || cur == "2133-7", "{child} roots at {cur}");
+        }
+    }
+
+    #[test]
+    fn cdcrec_with_its_own_hierarchy_and_other_systems_are_untouched() {
+        let nested = parse_code_system(&serde_json::json!({
+            "url": CDCREC_URL, "concept": [
+                {"code": "1000-9", "concept": [{"code": "2028-9"}]},
+                {"code": "1002-5"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&nested, "2028-9"), Some("1000-9"));
+        assert_eq!(parent_of(&nested, "1002-5"), None);
+        let other = parse_code_system(&serde_json::json!({
+            "url": "http://example.org/cs", "concept": [{"code": "1000-9"}, {"code": "1002-5"}]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&other, "1002-5"), None);
+    }
 
     fn minimal_bundle() -> &'static [u8] {
         br#"{

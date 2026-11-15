@@ -1005,6 +1005,9 @@ async fn exec_import(
     for e in stats.errors.iter().take(20) {
         core.jobs.log(&job.id, &format!("  error: {e}"));
     }
+    for w in stats.warnings.iter().take(20) {
+        core.jobs.log(&job.id, &format!("  warning: {w}"));
+    }
 
     for step in ["closure", "fts", "analyze", "warm"] {
         live.set_phase(step);

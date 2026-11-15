@@ -18,7 +18,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -118,8 +118,8 @@ pub async fn import_ndc(
             ..Default::default()
         });
     }
-    let seed = build_code_system_bundle(&meta, &seed_concepts);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_native_batch(&meta, &seed_concepts);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -141,8 +141,8 @@ pub async fn import_ndc(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let bytes = build_native_batch(&meta, &builder);
+        let chunk = backend.import_parsed(ctx, bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(

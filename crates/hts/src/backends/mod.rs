@@ -219,6 +219,86 @@ pub(crate) fn enumerated_from_compose(
     out
 }
 
+/// Enumerated UCUM codes (`compose.include.concept[]` over
+/// `http://unitsofmeasure.org`) the stored UCUM code system does not list but
+/// the UCUM grammar accepts, as `expansion.contains` entries.
+///
+/// The stored UCUM content (`ucum-essence`, imported by the bootstrap as a
+/// `complete` code system) holds atoms only — prefixes, base units and named
+/// units — so `mm[Hg]`, `kg`, `cm` or `/min` never match a concept row. UCUM
+/// is a grammar system: a well-formed expression is a member of the code
+/// system whether or not a row exists for it. Without this, value sets such as
+/// `ucum-vitals-common` lose most of their codes as soon as a UCUM code system
+/// is stored (and US Core vital-sign examples fail validation). Non-UCUM
+/// systems and malformed units return nothing (IG `simple-expand-enum-bad`
+/// still drops unknown codes of enumerating code systems).
+pub(crate) fn ucum_grammar_from_compose(
+    system_url: &str,
+    version: Option<&str>,
+    explicit_codes: &[serde_json::Value],
+    skip: &std::collections::HashSet<String>,
+) -> Vec<crate::types::ExpansionContains> {
+    if !crate::ucum_validate::is_ucum_url(system_url) {
+        return Vec::new();
+    }
+    let valid: Vec<serde_json::Value> = explicit_codes
+        .iter()
+        .filter(|e| {
+            e["code"]
+                .as_str()
+                .is_some_and(crate::ucum_validate::is_valid_ucum_code)
+        })
+        .cloned()
+        .collect();
+    let mut out = enumerated_from_compose(system_url, version, &valid, skip);
+    for c in &mut out {
+        if c.display.is_none() {
+            c.display = Some(c.code.clone());
+        }
+    }
+    out
+}
+
+/// VSAC's compose filters carry the real operator in a modifier extension:
+/// `{"op": "is-a", "value": "2133-7", "modifierExtension": [{"url":
+/// "vsacOpModifier", "valueString": "childOf"}]}` means *child-of*
+/// (VSAC/US Core `detailed-ethnicity` excludes the two OMB categories this
+/// way). Read as plain `is-a`, that exclude removed every ethnicity code.
+/// Rewrites `op` for the modifiers VSAC uses; leaves other filters alone.
+pub(crate) fn apply_vsac_op_modifier(filter: &mut serde_json::Value) {
+    let modifier = filter
+        .get("modifierExtension")
+        .and_then(|m| m.as_array())
+        .and_then(|exts| {
+            exts.iter().find_map(|e| {
+                (e.get("url").and_then(|u| u.as_str()) == Some("vsacOpModifier"))
+                    .then(|| e.get("valueString").and_then(|v| v.as_str()))
+                    .flatten()
+            })
+        });
+    let op = match modifier {
+        Some("childOf") => "child-of",
+        Some("descendantOf") => "descendent-of",
+        _ => return,
+    };
+    filter["op"] = serde_json::Value::String(op.to_string());
+}
+
+/// Re-sort `out` into the order the codes are listed in `explicit_codes`
+/// (codes appended after the concept-table join keep the compose order).
+pub(crate) fn sort_by_compose_order(
+    out: &mut [crate::types::ExpansionContains],
+    explicit_codes: &[serde_json::Value],
+) {
+    let pos: std::collections::HashMap<&str, usize> = explicit_codes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e["code"].as_str().map(|c| (c, i)))
+        .rev()
+        .collect();
+    out.sort_by_key(|c| pos.get(c.code.as_str()).copied().unwrap_or(usize::MAX));
+}
+
 /// Warning issue for a code accepted through ValueSet enumeration while the
 /// CodeSystem has no loaded content to verify it against. Shared by both
 /// storage backends.

@@ -174,6 +174,12 @@ pub struct ImportStats {
     /// The import continues past these; fatal errors are returned as `Err`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<String>,
+    /// Non-fatal notes: resources deliberately not written (e.g. a smaller
+    /// copy of a complete CodeSystem that is already stored, see
+    /// [`bundle_parser::truncated_copy_warning`]). Unlike `errors` these do
+    /// not make the import partial (no 207).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 impl ImportStats {
@@ -192,6 +198,7 @@ impl ImportStats {
         self.concept_maps = self.concept_maps.saturating_add(other.concept_maps);
         self.concepts = self.concepts.saturating_add(other.concepts);
         self.errors.extend(other.errors);
+        self.warnings.extend(other.warnings);
     }
 }
 

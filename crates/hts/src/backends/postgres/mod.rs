@@ -567,6 +567,13 @@ impl PostgresTerminologyBackend {
             // versions still share one id (see `crate::resource_ids`).
             fhir_ids::repair(&mut client).await?;
 
+            schema::migrate_p25_data_pg(&client).await.map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply the CDCREC/UCUM repair migration: {}",
+                    error_chain(&e)
+                ))
+            })?;
+
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
             // closures aren't rebuilt. For a fresh CI database, this is a no-op
@@ -1153,13 +1160,31 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     async fn import_parsed(
         &self,
         _ctx: &TenantContext,
-        parsed: bundle_parser::ParsedBundle,
+        mut parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError> {
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+
+        // Same url|version replacement policy as SQLite
+        // (`bundle_parser::truncated_copy_warning`): a smaller subset copy of
+        // a stored complete CodeSystem is skipped with a warning.
+        let mut policy_warnings: Vec<String> = Vec::new();
+        if !parsed.chunked && !parsed.fresh_load {
+            let mut keep = Vec::with_capacity(parsed.code_systems.len());
+            for cs in std::mem::take(&mut parsed.code_systems) {
+                match truncated_copy_check(&client, &cs).await? {
+                    Some(w) => {
+                        tracing::warn!("{w}");
+                        policy_warnings.push(w);
+                    }
+                    None => keep.push(cs),
+                }
+            }
+            parsed.code_systems = keep;
+        }
 
         // Before the transaction: record which CodeSystems currently have zero
         // concepts in the DB so the post-commit closure build only touches
@@ -1230,10 +1255,11 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
         };
 
-        let stats = match optimistic {
+        let mut stats = match optimistic {
             Some(stats) => stats,
             None => self.import_guarded(&mut client, &parsed).await?,
         };
+        stats.warnings.extend(policy_warnings);
 
         // Unique reported ids across the versions sharing each written id.
         let cs_ids: Vec<String> = parsed.code_systems.iter().map(|cs| cs.id.clone()).collect();
@@ -1671,6 +1697,57 @@ fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// [`bundle_parser::truncated_copy_warning`] against the stored row with the
+/// same `url|version`, if any (SQLite twin in `import/fhir_bundle.rs`).
+async fn truncated_copy_check(
+    client: &impl GenericClient,
+    cs: &ParsedCodeSystem,
+) -> Result<Option<String>, HtsError> {
+    let Some(row) = client
+        .cquery_opt(
+            "SELECT id, COALESCE(content, 'complete') FROM code_systems \
+             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+            &[&cs.url, &cs.version],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+    else {
+        return Ok(None);
+    };
+    let system_id: String = row.get(0);
+    let content: String = row.get(1);
+    if content != "complete" {
+        return Ok(None);
+    }
+    let stored_concepts: i64 = client
+        .cquery_one(
+            "SELECT COUNT(*) FROM concepts WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+        .get(0);
+    if cs.concepts.len() as i64 >= stored_concepts {
+        return Ok(None);
+    }
+    let codes: Vec<&str> = cs.concepts.iter().map(|c| c.code.as_str()).collect();
+    let missing: i64 = client
+        .cquery_one(
+            "SELECT COUNT(*) FROM UNNEST($2::text[]) AS l(code) \
+             WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = $1 AND c.code = l.code)",
+            &[&system_id, &codes],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+        .get(0);
+    Ok(bundle_parser::truncated_copy_warning(
+        cs,
+        &content,
+        stored_concepts,
+        missing,
+    ))
+}
+
 async fn write_code_system(
     client: &impl GenericClient,
     cs: &ParsedCodeSystem,
@@ -1825,6 +1902,17 @@ async fn write_code_system(
         .cexec(
             "DELETE FROM concept_closure WHERE system_id = $1",
             &[&system_id],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    // Cached expansions over this system are stale now (the CRUD path did
+    // this already; a bundle import did not, so re-importing a fuller copy
+    // of a CodeSystem kept serving the old expansions from the DB cache).
+    client
+        .cexec(
+            "DELETE FROM value_set_expansions WHERE system_url = $1",
+            &[&cs.url],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;

@@ -18,9 +18,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{
-    BuilderConcept, CodeSystemMeta, build_code_system_bundle, build_parsed_code_system,
-};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── ICD-10-CM constants ───────────────────────────────────────────────────────
 
@@ -90,8 +88,8 @@ pub async fn import_icd10_cm(
     };
 
     // Seed with an empty CodeSystem to register metadata.
-    let seed_bytes = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed_bytes = build_native_batch(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed_bytes).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -115,8 +113,7 @@ pub async fn import_icd10_cm(
         // with the 7th-character extensions took over 30 min on PostgreSQL).
         // The closure is built once afterwards by the CLI, the admin import
         // job's `closure` step, or the next server start.
-        let mut parsed = build_parsed_code_system(&meta, &builder);
-        parsed.chunked = true;
+        let parsed = build_native_batch(&meta, &builder);
         let chunk = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk.errors);
 

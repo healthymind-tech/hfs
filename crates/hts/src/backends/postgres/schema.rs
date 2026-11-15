@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS concepts (
 -- lookups.
 DROP INDEX IF EXISTS idx_concepts_system_code;
 CREATE INDEX IF NOT EXISTS idx_concepts_display_trgm ON concepts USING gin(display gin_trgm_ops);
+-- LOINC part names (`SCALE_TYP = DOC` names the part LP32888-7, see
+-- `loinc_filters`): one probe instead of reading all ~117 k LP rows of a
+-- LOINC version (8.8 s cold on the production HDD). Partial: LP codes only.
+CREATE INDEX IF NOT EXISTS idx_concepts_loinc_part_name
+    ON concepts (system_id, lower(display)) WHERE code >= 'LP' AND code < 'LQ';
 
 -- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
 CREATE TABLE IF NOT EXISTS concept_hierarchy (
@@ -140,6 +145,13 @@ CREATE TABLE IF NOT EXISTS concept_designations (
 -- equivalent idx_props_concept.)
 CREATE INDEX IF NOT EXISTS idx_designations_concept
     ON concept_designations(concept_id);
+-- Case-insensitive designation lookups: LOINC part names stored as
+-- designations (`PartName`, e.g. CLASS = DOC.ONTOLOGY) and supplement
+-- de-duplication. Without it the part-name lookup of a filtered LOINC
+-- expansion was a parallel sequential scan of every designation (5.4 M rows,
+-- 14.8 s cold on the production HDD).
+CREATE INDEX IF NOT EXISTS idx_designations_lower_value
+    ON concept_designations (lower(value));
 
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_sets (
@@ -711,6 +723,82 @@ async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_p
     }
     client.batch_execute(SCHEMA).await?;
     record_fingerprint(client).await
+}
+
+/// One-time repair for the p25-data fixes (marker
+/// [`P25_DATA_MIGRATION_MARKER`](crate::import::bundle_parser::P25_DATA_MIGRATION_MARKER)):
+/// flat CDCREC rows (no `concept_hierarchy`) get the embedded race/ethnicity
+/// edges between codes they define — `migrate_concept_closure_pg`, run next,
+/// builds their closure — and cached expansions of value sets over CDCREC or
+/// UCUM, and of every value set built from other value sets (US Core 7
+/// `detailed-race` is VSAC's race value set plus null flavors), are dropped: they were computed while `descendent-of 1000-9` was empty
+/// and enumerated UCUM units were dropped, and a cached expansion is never
+/// recomputed on its own (an empty include leaves no row a later
+/// CodeSystem re-import would invalidate).
+pub async fn migrate_p25_data_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
+    use crate::import::bundle_parser::{
+        CDCREC_URL, P25_DATA_MIGRATION_MARKER, P25_DATA_SYSTEMS, cdcrec_edges,
+    };
+    let done = client
+        .query_opt(
+            "SELECT 1 FROM bootstrap_imports WHERE path = $1",
+            &[&P25_DATA_MIGRATION_MARKER],
+        )
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let (children, parents): (Vec<&str>, Vec<&str>) = cdcrec_edges().into_iter().unzip();
+    let edges = client
+        .execute(
+            "INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT cs.id, e.parent, e.child
+               FROM code_systems cs
+              CROSS JOIN UNNEST($1::text[], $2::text[]) AS e(child, parent)
+              WHERE cs.url = $3
+                AND NOT EXISTS (SELECT 1 FROM concept_hierarchy h WHERE h.system_id = cs.id)
+                AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id AND c.code = e.child)
+                AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id AND c.code = e.parent)
+             ON CONFLICT DO NOTHING",
+            &[&children, &parents, &CDCREC_URL],
+        )
+        .await?;
+    let systems: Vec<&str> = P25_DATA_SYSTEMS.to_vec();
+    let cleared = client
+        .execute(
+            // SKIP LOCKED: rows another session is (re)writing right now
+            // come from this binary's code and are current; waiting for
+            // them could deadlock against its DELETE + INSERT transaction.
+            "DELETE FROM value_set_expansions
+              WHERE ctid IN (
+                    SELECT ctid FROM value_set_expansions
+                     WHERE system_url = ANY($1::text[])
+                        OR value_set_id IN (SELECT id FROM value_sets
+                                             WHERE compose_json LIKE '%' || $2 || '%'
+                                                OR compose_json LIKE '%' || $3 || '%'
+                                                OR compose_json LIKE '%\"valueSet\"%')
+                       FOR UPDATE SKIP LOCKED)",
+            &[&systems, &systems[0], &systems[1]],
+        )
+        .await?;
+    client
+        .execute(
+            // Two backends may start at once on one database: the second
+            // finds the marker written (the steps above are idempotent).
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES ($1, '', 0) \
+             ON CONFLICT (path) DO NOTHING",
+            &[&P25_DATA_MIGRATION_MARKER],
+        )
+        .await?;
+    tracing::info!(
+        cdcrec_edges = edges,
+        cleared_expansion_rows = cleared,
+        "p25-data migration: CDCREC hierarchy, CDCREC/UCUM expansion cache"
+    );
+    Ok(())
 }
 
 /// Backfill `version_sort` for every versioned `code_systems` / `value_sets`
