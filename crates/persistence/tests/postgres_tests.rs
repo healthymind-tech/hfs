@@ -32372,6 +32372,55 @@ mod postgres_integration {
             assert_eq!((created, exists), (1, 11));
         }
 
+        /// Thirty unconditional PUTs of one existing resource over three
+        /// handles: every one succeeds (last writer wins) and the history is
+        /// contiguous 1..=31.
+        #[tokio::test]
+        async fn postgres_integration_cluster_unconditional_put_storm_keeps_every_version() {
+            use helios_persistence::core::{HistoryParams, InstanceHistoryProvider, ResourceStorage};
+            let handles = [
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+                Arc::new(create_backend().await),
+            ];
+            let tenant = create_tenant("put-storm");
+            let created = handles[0]
+                .create(&tenant, "Patient", json!({"resourceType": "Patient"}), FhirVersion::default())
+                .await
+                .unwrap();
+            let id = created.id().to_string();
+            let mut tasks = Vec::new();
+            for i in 0..30 {
+                let backend = handles[i % 3].clone();
+                let (tenant, id) = (tenant.clone(), id.clone());
+                tasks.push(tokio::spawn(async move {
+                    backend
+                        .create_or_update(
+                            &tenant,
+                            "Patient",
+                            &id,
+                            json!({"resourceType": "Patient", "name": [{"family": format!("w{i}")}]}),
+                            FhirVersion::default(),
+                        )
+                        .await
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap().expect("unconditional PUT must not lose its race");
+            }
+            let history = handles[1]
+                .history_instance(&tenant, "Patient", &id, &HistoryParams::new().count(100))
+                .await
+                .unwrap();
+            let mut versions: Vec<u64> = history
+                .items
+                .iter()
+                .map(|e| e.resource.version_id().parse().unwrap())
+                .collect();
+            versions.sort_unstable();
+            assert_eq!(versions, (1..=31).collect::<Vec<_>>());
+        }
+
         /// Conditional upserts (PUT with criteria, no match) raced over three
         /// handles: one creates, the rest update it.
         #[tokio::test]

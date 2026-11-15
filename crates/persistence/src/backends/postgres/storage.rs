@@ -1078,6 +1078,15 @@ impl ResourceStorage for PostgresBackend {
         // reports a version conflict, and two racing first PUTs make one
         // create fail as a duplicate. Both are transient for an unconditional
         // PUT: re-read and try again, a bounded number of times.
+        //
+        // Racing PUTs of one id are serialized on a per-id criteria lock
+        // first (the same lock a conditional write on `_id` takes), so under
+        // heavy contention — thirty instances' worth of PUTs to one resource
+        // — the read-then-write does not lose its race repeatedly; the retry
+        // stays as a backstop for writers that do not take the lock.
+        let _id_lock = self
+            .lock_condition(tenant, resource_type, &format!("_id={id}"))
+            .await?;
         const ATTEMPTS: usize = 8;
         let mut attempt = 0;
         loop {
