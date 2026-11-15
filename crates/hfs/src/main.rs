@@ -1555,6 +1555,10 @@ async fn run() -> anyhow::Result<()> {
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
+    helios_observability::build_info::set(
+        helios_rest::build_info::PKG_VERSION,
+        helios_rest::build_info::git_sha().unwrap_or("unknown"),
+    );
     // hfs is the one server that mounts the console traffic/tenants endpoints
     // backed by the reqlog ring buffer, so it opts into recording. Servers that
     // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.

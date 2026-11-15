@@ -27,6 +27,7 @@
 //!   PostgreSQL connection pools (ceiling, open, idle, waiting callers),
 //!   sampled at scrape time from sources the server registers (#1907). Only
 //!   a fixed `pool` label.
+//! - [`build_info`] — the constant `build_info{version, revision}` gauge.
 //! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
 //!
 //! ## Typical wiring
@@ -57,6 +58,7 @@
 //! - OTLP *metrics* are expected to be produced by an OpenTelemetry Collector
 //!   scraping `/metrics`; the app itself only pushes OTLP *traces*.
 
+pub mod build_info;
 pub mod composite_metrics;
 pub mod dashboard;
 pub mod dashboard_counters;
