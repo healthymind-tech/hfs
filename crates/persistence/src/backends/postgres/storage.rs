@@ -1072,34 +1072,31 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // An unconditional PUT is last-writer-wins at the API surface. The
+        // update below is version-guarded, so when another writer (another
+        // instance of a cluster) commits between our read and our write it
+        // reports a version conflict, and two racing first PUTs make one
+        // create fail as a duplicate. Both are transient for an unconditional
+        // PUT: re-read and try again, a bounded number of times.
+        const ATTEMPTS: usize = 8;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = self
+                .create_or_update_once(tenant, resource_type, id, resource.clone(), fhir_version)
+                .await;
+            match result {
+                Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }))
+                | Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))
+                    if attempt < ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (attempt as u64) * 5,
+                    ))
+                    .await;
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -7949,4 +7946,47 @@ mod standalone_reindex_classify_tests {
             "PoolExhausted must pass through, got {classified:?}"
         );
     }
+}
+
+impl PostgresBackend {
+    /// One read-then-write attempt of [`ResourceStorage::create_or_update`].
+    async fn create_or_update_once(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        // Check if exists
+        match self.read(tenant, resource_type, id).await {
+            // Update existing (preserves original FHIR version)
+            Ok(Some(current)) => {
+                let updated = self.update(tenant, &current, resource).await?;
+                Ok((updated, false))
+            }
+            // Create new with specific ID
+            Ok(None) => {
+                let mut resource = resource;
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                }
+                let created = self
+                    .create(tenant, resource_type, resource, fhir_version)
+                    .await?;
+                Ok((created, true))
+            }
+            // A deleted resource is brought back to life by a subsequent update
+            // (FHIR http.html#delete), continuing the existing version chain
+            // rather than being rejected with `Gone`.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let restored = self
+                    .restore_deleted(tenant, resource_type, id, resource)
+                    .await?;
+                Ok((restored, true))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
 }
