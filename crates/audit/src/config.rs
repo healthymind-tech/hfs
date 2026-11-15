@@ -120,13 +120,13 @@ impl RetentionConfig {
     fn from_env(prefix: &str) -> Self {
         let k = |name: &str| format!("{prefix}_AUDIT_{name}");
         Self {
-            days: env::var(&k("RETENTION_DAYS"))
+            days: env::var(k("RETENTION_DAYS"))
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .filter(|d| *d > 0),
             interval_hours: env_parse(&k("RETENTION_INTERVAL_HOURS"), 24u64).max(1),
             batch: env_parse(&k("RETENTION_BATCH"), 1000usize).max(1),
-            archive_dir: env::var(&k("RETENTION_ARCHIVE_DIR"))
+            archive_dir: env::var(k("RETENTION_ARCHIVE_DIR"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
         }
@@ -164,7 +164,7 @@ impl AuditConfig {
     /// high-volume and carry no patient data.
     pub fn from_env_prefixed(prefix: &str) -> Self {
         let k = |name: &str| format!("{prefix}_AUDIT_{name}");
-        let backend = match env::var(&k("BACKEND"))
+        let backend = match env::var(k("BACKEND"))
             .unwrap_or_else(|_| "none".to_string())
             .to_lowercase()
             .as_str()
@@ -175,7 +175,7 @@ impl AuditConfig {
             _ => AuditBackend::None,
         };
 
-        let exclusions = env::var(&k("EXCLUDE_PATHS"))
+        let exclusions = env::var(k("EXCLUDE_PATHS"))
             .ok()
             .map(|paths| {
                 paths
@@ -188,9 +188,9 @@ impl AuditConfig {
 
         Self {
             backend,
-            file_path: env::var(&k("FILE_PATH")).ok(),
-            database_url: env::var(&k("DATABASE_URL")).ok(),
-            mongodb_database: env::var(&k("MONGODB_DATABASE")).ok(),
+            file_path: env::var(k("FILE_PATH")).ok(),
+            database_url: env::var(k("DATABASE_URL")).ok(),
+            mongodb_database: env::var(k("MONGODB_DATABASE")).ok(),
             s3_bucket: env::var(k("S3_BUCKET")).ok(),
             s3_prefix: env::var(k("S3_PREFIX")).ok(),
             s3_region: env::var(k("S3_REGION")).ok(),
@@ -199,13 +199,13 @@ impl AuditConfig {
                 !(normalized == "false" || normalized == "0")
             }),
             exclusions,
-            source_observer: env::var(&k("SOURCE_OBSERVER"))
+            source_observer: env::var(k("SOURCE_OBSERVER"))
                 .unwrap_or_else(|_| format!("Device/{}", prefix.to_ascii_lowercase())),
-            cloudwatch_log_group: env::var(&k("CLOUDWATCH_LOG_GROUP")).ok(),
-            cloudwatch_log_stream: env::var(&k("CLOUDWATCH_LOG_STREAM")).ok(),
-            cloudwatch_region: env::var(&k("CLOUDWATCH_REGION")).ok(),
+            cloudwatch_log_group: env::var(k("CLOUDWATCH_LOG_GROUP")).ok(),
+            cloudwatch_log_stream: env::var(k("CLOUDWATCH_LOG_STREAM")).ok(),
+            cloudwatch_region: env::var(k("CLOUDWATCH_REGION")).ok(),
             trust_forwarded_for: env_bool(&k("TRUST_FORWARDED_FOR")),
-            tenant: env::var(&k("TENANT"))
+            tenant: env::var(k("TENANT"))
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
@@ -213,7 +213,7 @@ impl AuditConfig {
             batch_size: env_parse(&k("BATCH_SIZE"), 64usize).max(1),
             writers: env_parse(&k("WRITERS"), 4usize).max(1),
             shutdown_timeout_secs: env_parse(&k("SHUTDOWN_TIMEOUT"), 5u64),
-            fallback_file: env::var(&k("FALLBACK_FILE"))
+            fallback_file: env::var(k("FALLBACK_FILE"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             auth_events: env_bool(&k("AUTH_EVENTS")),

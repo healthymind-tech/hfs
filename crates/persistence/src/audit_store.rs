@@ -28,6 +28,7 @@ pub fn audit_tenant(fixed: Option<&str>, request: Option<&str>, default: &str) -
 /// events (creates under ids this server just generated).
 #[async_trait::async_trait]
 pub trait AuditBatchTransaction: crate::core::TransactionProvider {
+    /// Opens the transaction for a batch creating `ids`.
     async fn begin_audit_batch(
         &self,
         tenant: &TenantContext,
@@ -158,6 +159,7 @@ where
     }
 }
 
+/// Audit store writing per event through any [`ResourceStorage`].
 pub struct ResourceAuditStore {
     storage: Arc<dyn ResourceStorage>,
     /// `HFS_AUDIT_TENANT`: every event goes to this tenant.

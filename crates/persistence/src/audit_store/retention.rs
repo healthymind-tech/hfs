@@ -27,7 +27,9 @@ const RESOURCE_TYPE: &str = "AuditEvent";
 /// Outcome of one retention run.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetentionReport {
+    /// Events removed.
     pub purged: u64,
+    /// The archive written by the run, if any.
     pub archive: Option<PathBuf>,
 }
 
