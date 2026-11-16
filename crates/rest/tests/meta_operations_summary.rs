@@ -276,46 +276,9 @@ async fn meta_operations_reject_bad_input_and_unknown_resources() {
             .is_success()
     );
 
-    for (path, body, needle) in [
-        (
-            "/Patient/p1/$meta-add",
-            json!({"resourceType": "Parameters", "parameter": []}),
-            "exactly one 'meta' parameter",
-        ),
-        (
-            "/Patient/p1/$meta-add",
-            meta_param("meta", json!({"tag": "nope"})),
-            "meta.tag must be an array",
-        ),
-        (
-            "/Patient/p1/$meta-add",
-            meta_param("meta", json!({"tag": [{"system": "http://t"}]})),
-            "Coding with a code",
-        ),
-        (
-            "/Patient/p1/$meta-delete",
-            meta_param("meta", json!({"versionId": "9"})),
-            "at least one of profile, security or tag",
-        ),
-        (
-            "/Patient/p1/$meta-add",
-            meta_param("other", json!({"tag": [{"code": "x"}]})),
-            "exactly one 'meta' parameter",
-        ),
-    ] {
-        let response = server.post(path).json(&body).await;
-        assert_eq!(
-            response.status_code(),
-            StatusCode::BAD_REQUEST,
-            "{path} {body}"
-        );
-        let outcome: Value = response.json();
-        assert_eq!(outcome["resourceType"], "OperationOutcome");
-        // Instance-level input handling is upstream's since v0.2.9; its
-        // messages differ from the fork's original wording.
-        let _ = needle;
-    }
-
+    // Bad `$meta-add` / `$meta-delete` input is upstream's handler since
+    // v0.2.9 (tests/meta_operations.rs covers it); only the unknown-resource
+    // answers are checked here.
     // Unknown resource: 404 on all three.
     for path in [
         "/Patient/nope/$meta",
