@@ -38235,7 +38235,9 @@ mod postgres_integration {
             dbname: "postgres".to_string(),
             user: "postgres".to_string(),
             password: Some("postgres".to_string()),
-            max_connections: 1,
+            // Two: the fork's `create_or_update` holds its per-id criteria
+            // lock on one pooled connection while the write uses another.
+            max_connections: 2,
             data_dir: Some(data_dir),
             ..Default::default()
         };
