@@ -2428,22 +2428,31 @@ impl ResourceStorage for PostgresBackend {
         // Fork tables keyed by tenant (hm-0001..hm-0005 and the IG package
         // manager): cluster jobs, subscription delivery state, the resource
         // change feed, package installs and the SearchParameter epoch row.
-        // Children before parents.
-        for sql in [
-            "DELETE FROM subscription_ws_tokens WHERE tenant_id = $1",
-            "DELETE FROM subscription_delivery_outbox WHERE tenant_id = $1",
-            "DELETE FROM subscription_notification_events WHERE tenant_id = $1",
-            "DELETE FROM subscription_state WHERE tenant_id = $1",
-            "DELETE FROM cluster_jobs WHERE tenant_id = $1",
-            "DELETE FROM hfs_package_jobs WHERE tenant_id = $1",
-            "DELETE FROM hfs_package_resources WHERE tenant_id = $1",
-            "DELETE FROM hfs_packages WHERE tenant_id = $1",
-            "DELETE FROM resource_change_feed WHERE tenant_id = $1",
-            "DELETE FROM search_parameter_epochs WHERE tenant_id = $1",
+        // Children before parents. The package tables are created by the
+        // package manager on first use, so a table that does not exist yet is
+        // skipped.
+        for table in [
+            "subscription_ws_tokens",
+            "subscription_delivery_outbox",
+            "subscription_notification_events",
+            "subscription_state",
+            "cluster_jobs",
+            "hfs_package_jobs",
+            "hfs_package_resources",
+            "hfs_packages",
+            "resource_change_feed",
+            "search_parameter_epochs",
         ] {
-            tx.execute(sql, &[&id])
+            let exists: bool = tx
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
                 .await
-                .or_query_error("purge fork state")?;
+                .or_query_error("purge fork state")?
+                .get(0);
+            if exists {
+                tx.execute(&format!("DELETE FROM {table} WHERE tenant_id = $1"), &[&id])
+                    .await
+                    .or_query_error("purge fork state")?;
+            }
         }
         // SQL query terminology relations are tenant-keyed rows (#2185).
         super::sof_terminology::purge_tenant_in_txn(&tx, id).await?;
