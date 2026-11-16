@@ -674,7 +674,9 @@ where
                 let Some(patient) = ctx.patient.clone() else {
                     return forbidden(no_patient);
                 };
-                if id.as_deref() != Some(patient.as_str()) {
+                // Type level (`id` None): upstream's handler narrows it to the
+                // launch patient (#1618), so only another patient's id is refused.
+                if id.as_deref().is_some_and(|id| id != patient.as_str()) {
                     return forbidden(
                         "Patient/$everything is limited to the launch patient for patient/ scopes",
                     );

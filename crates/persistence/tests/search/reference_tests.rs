@@ -315,7 +315,7 @@ async fn test_reference_typed_id_excludes_neighbouring_ids() {
     );
     assert_eq!(
         reference_hits(&backend, &tenant, "patient", "Patient/patient-1/_history/9").await,
-        vec!["hit-relative", "hit-versioned"],
+        vec!["hit-absolute", "hit-relative", "hit-versioned"],
         "a versioned search value is matched version-agnostically"
     );
 }

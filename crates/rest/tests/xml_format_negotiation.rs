@@ -290,7 +290,7 @@ async fn every_response_carries_a_fhir_content_type() {
             }
             if let Some(body) = case.body {
                 request = request
-                    .add_header(CONTENT_TYPE, FHIR_JSON)
+                    .add_header(CONTENT_TYPE, HeaderValue::from_static(case.content_type))
                     .bytes(body.into());
             }
             let response = request.await;
@@ -301,8 +301,10 @@ async fn every_response_carries_a_fhir_content_type() {
             let ct = content_type.to_str().unwrap_or("");
             assert!(
                 ct.starts_with("application/fhir+json") || ct.starts_with("application/fhir+xml"),
-                "{} with Accept {accept:?}: Content-Type {ct:?}",
-                case.label
+                "{} with Accept {accept:?}: Content-Type {ct:?} (status {}: {})",
+                case.label,
+                response.status_code(),
+                response.text()
             );
         }
     }

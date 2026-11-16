@@ -199,7 +199,13 @@ fn converts_a_canonical_content_reference() {
     let schema = serde_json::to_value(&conversion.schema).unwrap();
     assert_eq!(
         schema["elements"]["item"]["elements"]["item"]["elementReference"],
-        json!(["Questionnaire", "elements", "item"])
+        // Upstream #410 form (v0.2.8): the canonical names the schema, which
+        // the resolver finds by URL.
+        json!([
+            "http://hl7.org/fhir/StructureDefinition/Questionnaire",
+            "elements",
+            "item"
+        ])
     );
 }
 

@@ -177,17 +177,12 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // `minValue` / `maxValue`: the packs predate the keywords (stored and
         // IG profiles carry them); regenerating the packs would emit the few
         // core ones.
-        //
-        // `typeProfiles`: core datatype elements carry no type profiles.
-        //
-        // `version`: the embedded packs predate it (stored profiles carry
-        // it; it orders side-by-side releases of one canonical).
+        // (`typeProfiles` and `version` used to live here; the packs
+        // regenerated at the v0.2.8 merge emit both.)
         Ctx::Schema => &[
-            "version",
             "scalar",
             "minValue",
             "maxValue",
-            "typeProfiles",
             "maxLength",
             "minLength",
             "maxSize",
