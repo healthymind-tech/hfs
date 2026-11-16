@@ -855,6 +855,27 @@ impl SubscriptionManager {
         Some(event_number)
     }
 
+    /// Appends an already-numbered event to the subscription's retained
+    /// history (the fork's engine numbers events itself, through the shared
+    /// store when clustered, then records them here for `$events`).
+    pub(crate) fn record_event_history(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        event: NotificationEventData,
+    ) {
+        if self.event_history_size == 0 {
+            return;
+        }
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            while entry.history.len() >= self.event_history_size {
+                entry.history.pop_front();
+            }
+            entry.history.push_back(event);
+        }
+    }
+
     /// Looks up the retained events of a subscription in an inclusive number range.
     ///
     /// Returns `None` when the engine does not hold the subscription. Defaults:

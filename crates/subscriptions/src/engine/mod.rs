@@ -422,6 +422,12 @@ impl SubscriptionEngine {
                 timestamp: event.timestamp,
                 focus_reference: focus_reference.clone(),
             };
+            // Retained for `$events` (upstream v0.2.9), in memory per instance.
+            self.manager.record_event_history(
+                &subscription.tenant_id,
+                &subscription.id,
+                event_data.clone(),
+            );
 
             // Build notification bundle.
             let public_base_url = (self.public_base_url_for_tenant)(&subscription.tenant_id);
