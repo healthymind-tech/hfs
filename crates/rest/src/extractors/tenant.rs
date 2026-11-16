@@ -657,7 +657,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("claimless token must not pick a tenant");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]
