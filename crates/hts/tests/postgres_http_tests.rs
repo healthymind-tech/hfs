@@ -1283,21 +1283,15 @@ async fn update_code_system_refreshes_lookup_display() {
 mod vcl {
     use super::{StatusCode, TestAppPg, bundles};
     use serde_json::{Value, json};
-    use tokio::sync::OnceCell;
 
     const SYS: &str = bundles::VCL_CS_URL;
 
-    /// The VCL bundle uses fixed URLs and every test shares one database, so
-    /// import it exactly once instead of racing re-imports across tests.
-    static IMPORTED: OnceCell<()> = OnceCell::const_new();
-
+    /// The fork's PG harness gives every app its own database, so each test
+    /// imports the VCL bundle into its own (upstream shared one database and
+    /// imported once).
     async fn app() -> TestAppPg {
         let app = TestAppPg::new().await;
-        IMPORTED
-            .get_or_init(|| async {
-                app.import_bundle_ok(bundles::vcl_bundle()).await;
-            })
-            .await;
+        app.import_bundle_ok(bundles::vcl_bundle()).await;
         app
     }
 
