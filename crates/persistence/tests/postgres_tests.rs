@@ -6024,6 +6024,22 @@ mod postgres_integration {
         let client = backend.get_client().await.unwrap();
         for tenant in [&a, &b] {
             for sql in PURGE_SEED_SQL {
+                // The IG package tables are created by the package manager on
+                // first use (fork); seed them only where they exist.
+                if let Some(table) = sql
+                    .strip_prefix("INSERT INTO ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .filter(|t| t.starts_with("hfs_package"))
+                {
+                    let exists: bool = client
+                        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                        .await
+                        .unwrap()
+                        .get(0);
+                    if !exists {
+                        continue;
+                    }
+                }
                 client
                     .execute(*sql, &[tenant])
                     .await
