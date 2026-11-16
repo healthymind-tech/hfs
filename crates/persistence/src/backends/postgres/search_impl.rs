@@ -1620,11 +1620,9 @@ impl SearchProvider for PostgresBackend {
                 };
                 let sql = match single {
                     Some(pred) => format!(
-                        "SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index \
+                        "SELECT COUNT(*) FROM (SELECT DISTINCT resource_id FROM search_index \
                          WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
-                           AND last_updated IS NOT NULL \
-                         GROUP BY last_updated, resource_id \
-                         ORDER BY last_updated DESC, resource_id) matches"
+                           AND last_updated IS NOT NULL) matches"
                     ),
                     None => format!(
                         "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause} AND ({})",

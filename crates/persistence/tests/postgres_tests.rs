@@ -4064,6 +4064,9 @@ mod postgres_integration {
     /// bundle waits on the advisory lock until the 300 ms budget cancels the
     /// wait with SQLSTATE 57014.
     #[tokio::test]
+    #[ignore = "fork 18040faeb: write-lock waits are bounded by LOCK_WAIT_TIMEOUT_MS (600 s), not \
+                statement_timeout (IG-sized bundles outlasted it in production); this upstream test \
+                expects the 300 ms statement_timeout to end the gate wait"]
     async fn postgres_integration_transaction_bundle_gate_timeout_is_transient() {
         use helios_persistence::core::{
             BundleEntry, BundleMethod, BundleProvider, Transaction, TransactionOptions,
@@ -6937,12 +6940,10 @@ mod postgres_integration {
                 )
                 .await
                 .unwrap();
-            // The count keeps the #1580 `INTERSECT`. The first page of this
-            // broad code + quantity pair is the fork's broad-conjunction walk
-            // instead (hm/p3-pgops2: the code drives, the quantity is a
-            // per-row probe), so it carries no `INTERSECT` and is checked by
-            // the answer above.
-            assert_eq!(statements.len(), 1, "one count statement expected");
+            // Count and page both keep the #1580 `INTERSECT` after the v0.2.8
+            // merge: the fork's broad-conjunction walk (hm/p3-pgops2) now
+            // drives token + date pairs only (see the next test).
+            assert_eq!(statements.len(), 2, "count and page statements expected");
             for mode in ["force_custom_plan", "force_generic_plan"] {
                 client
                     .batch_execute(&format!("SET plan_cache_mode = {mode}"))
@@ -22890,6 +22891,8 @@ mod postgres_integration {
     /// backend's `statement_timeout`. Every other session keeps
     /// `pg_catalog.split_part`.
     #[tokio::test]
+    #[ignore = "relies on upstream's compartment export SQL calling split_part (slowed by a \
+                shadowing function); the fork's E/E2 compartment export query does not"]
     async fn postgres_integration_patient_export_statement_timeout_fails_job_as_timeout() {
         use helios_persistence::backends::local_fs::LocalFsOutputStore;
         use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
