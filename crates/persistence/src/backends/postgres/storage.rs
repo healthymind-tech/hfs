@@ -2184,6 +2184,26 @@ impl ResourceStorage for PostgresBackend {
                 .await
                 .or_query_error("purge bulk state")?;
         }
+        // Fork tables keyed by tenant (hm-0001..hm-0005 and the IG package
+        // manager): cluster jobs, subscription delivery state, the resource
+        // change feed, package installs and the SearchParameter epoch row.
+        // Children before parents.
+        for sql in [
+            "DELETE FROM subscription_ws_tokens WHERE tenant_id = $1",
+            "DELETE FROM subscription_delivery_outbox WHERE tenant_id = $1",
+            "DELETE FROM subscription_notification_events WHERE tenant_id = $1",
+            "DELETE FROM subscription_state WHERE tenant_id = $1",
+            "DELETE FROM cluster_jobs WHERE tenant_id = $1",
+            "DELETE FROM hfs_package_jobs WHERE tenant_id = $1",
+            "DELETE FROM hfs_package_resources WHERE tenant_id = $1",
+            "DELETE FROM hfs_packages WHERE tenant_id = $1",
+            "DELETE FROM resource_change_feed WHERE tenant_id = $1",
+            "DELETE FROM search_parameter_epochs WHERE tenant_id = $1",
+        ] {
+            tx.execute(sql, &[&id])
+                .await
+                .or_query_error("purge fork state")?;
+        }
         // SQL query terminology relations are tenant-keyed rows (#2185).
         super::sof_terminology::purge_tenant_in_txn(&tx, id).await?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;

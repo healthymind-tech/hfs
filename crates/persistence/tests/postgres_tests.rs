@@ -5860,6 +5860,23 @@ mod postgres_integration {
         "INSERT INTO bulk_export_progress (job_id, resource_type) VALUES ($1 || '-job', 'Patient')",
         "INSERT INTO bulk_export_files (job_id, resource_type, file_path) \
          VALUES ($1 || '-job', 'Patient', 'seed/out.ndjson')",
+        // Fork tables (hm-0001..hm-0005, IG package manager).
+        "INSERT INTO cluster_jobs (id, tenant_id, kind, payload) VALUES ($1 || '-cj', $1, 'seed', '{}'::jsonb)",
+        "INSERT INTO hfs_package_jobs (id, tenant_id, kind, status, view, owner) \
+         VALUES ($1 || '-pj', $1, 'install', 'queued', '{}'::jsonb, 'seed')",
+        "INSERT INTO hfs_packages (tenant_id, name, version, status, installed_at, document) \
+         VALUES ($1, 'seed.pkg', '1.0.0', 'installed', NOW(), '{}'::jsonb)",
+        "INSERT INTO hfs_package_resources (tenant_id, name, version, target, resource_type, resource_id) \
+         VALUES ($1, 'seed.pkg', '1.0.0', 'hfs', 'StructureDefinition', 'seed-sd')",
+        "INSERT INTO subscription_state (tenant_id, subscription_id) VALUES ($1, 'seed-sub')",
+        "INSERT INTO subscription_notification_events (tenant_id, subscription_id, event_number, bundle) \
+         VALUES ($1, 'seed-sub', 1, '{}'::jsonb)",
+        "INSERT INTO subscription_delivery_outbox (tenant_id, subscription_id, notification_type, bundle) \
+         VALUES ($1, 'seed-sub', 'event-notification', '{}'::jsonb)",
+        "INSERT INTO subscription_ws_tokens (token, tenant_id, subscription_id, expires_at) \
+         VALUES ($1 || '-tok', $1, 'seed-sub', NOW() + INTERVAL '1 hour')",
+        "INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id) VALUES ($1, 'Patient', 'seed-p')",
+        "INSERT INTO search_parameter_epochs (tenant_id, epoch) VALUES ($1, 1) ON CONFLICT (tenant_id) DO NOTHING",
     ];
 
     /// Tables with a `tenant_id` column in the live schema.

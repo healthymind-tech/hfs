@@ -1593,9 +1593,32 @@ impl SearchProvider for PostgresBackend {
                 // which sorts. Any other predicate is grouped as before.
                 // Not for a version-restricted count (#2254): `search_index`
                 // carries no FHIR version.
-                let sql = match PostgresQueryBuilder::single_index_predicate(&fragment.sql)
-                    .filter(|_| query.fhir_version.is_none())
-                {
+                // Only when the parameter is known to have no NULL-`last_updated`
+                // rows (`null_timestamp_facts`): legacy top-level rows written
+                // before `last_updated` was denormalized carry NULL and would
+                // be missed (upstream #2074 legacy fallback).
+                let single = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
+                    .filter(|_| query.fhir_version.is_none());
+                let single = match single {
+                    Some(pred) if super::null_timestamp_facts::enabled() => {
+                        match super::null_timestamp_facts::param_name_of(&pred) {
+                            Some(param)
+                                if super::null_timestamp_facts::param_has_no_null_rows(
+                                    &client,
+                                    tenant_id,
+                                    resource_type,
+                                    &param,
+                                )
+                                .await =>
+                            {
+                                Some(pred)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let sql = match single {
                     Some(pred) => format!(
                         "SELECT COUNT(*) FROM (SELECT last_updated, resource_id FROM search_index \
                          WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
