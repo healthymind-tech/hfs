@@ -42,7 +42,8 @@ anonymously, so a client never silently runs with less access than it thinks.
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS fetches triggered by an unknown `kid` (protects the IdP from token-spraying). |
 | `HFS_AUTH_JWKS_MAX_AGE_SECONDS` | `300` | Longest time a fetched JWKS is trusted. Bounds how long a key the IdP retired (or revoked after a compromise) still validates here. Keycloak sends no cache lifetime, so this is the effective refresh period. |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | Claim that pins the tenant (multi-tenant deployments). |
-| `HFS_AUTH_PATIENT_NON_COMPARTMENT` | `allow` | What `patient/` scopes may *read* outside the Patient compartment (Medication, Practitioner, Organization, Location, …): `allow` (US Core apps need them) or `deny`. Writes there are never allowed for `patient/` scopes. |
+| `HFS_AUTH_PATIENT_NON_COMPARTMENT` | `allow` | Whether `patient/` scopes may *read* the shared reference types outside the Patient compartment: `allow` (US Core apps need them) or `deny`. Writes there are never allowed for `patient/` scopes. |
+| `HFS_AUTH_PATIENT_SHARED_TYPES` | `Medication,Practitioner,PractitionerRole,Organization,Location,HealthcareService,Endpoint,Substance` | The shared reference types `allow` opens (comma list). Any other type outside the compartment (Binary, …) stays unreachable for `patient/` scopes. |
 
 Startup is resilient: if the IdP is unreachable when HFS starts, HFS still
 starts, logs a warning and answers token-bearing requests with
@@ -130,18 +131,21 @@ clients and rollback in `hfs-eval/eval/results-p3-auth/PROD-ROLLOUT.md`.
 The launch patient is the token's `patient` claim (SMART launch context).
 A `patient/` scope without a `patient` claim reaches nothing (`403`).
 
+Enforced by the request handlers (one path, also inside batch/transaction):
+
 | Request | Behaviour |
 |---|---|
-| `GET /T?…`, `POST /T/_search` (T in the Patient compartment) | rewritten to the compartment search `/Patient/{id}/T?…` |
-| `GET /Patient?…` | `_id={id}` is added |
-| `GET /T/{id}`, vread, instance history | the returned resource (each version) must be in the compartment, else `403` / dropped |
-| `GET /Patient/{other}/T`, `/Patient/{other}/$everything`, `/Patient/$everything` | `403` |
-| `_include` / `_revinclude` | entries outside the compartment are removed |
-| `GET /T/_history`, `GET /_history`, batch/transaction, PATCH, conditional update/delete, other `$`-operations | `403` (cannot be confined cheaply; send individual requests) |
-| create / update | the submitted resource must be in the compartment; for update the stored one too (no moving data between patients) |
+| `GET /T?…`, `POST /T/_search` (T in the Patient compartment) | filtered to the launch patient's compartment, ANDed with the client's own parameters |
+| `GET /Patient?…` | pinned to `_id={id}` |
+| `GET /T/{id}`, vread, instance history | the stored resource must be in the compartment, else `403`; history versions outside it are dropped |
+| `GET /Patient/{other}/T`, `/Patient/{other}/$everything`, another compartment's search | `403` |
+| `Patient/$everything`, `Patient/$export` (type level) | narrowed to the launch patient |
+| `_include` / `_revinclude` | entries outside the compartment are removed (shared types kept when the token names them) |
+| batch / transaction | confined entry by entry like the single requests; write entries refused (`403` entry; a transaction is refused whole) |
+| create / update / PATCH | the submitted (patched) resource must be in the compartment, and for update/PATCH the stored one too (no moving data between patients) |
 | delete | the stored resource must be in the compartment |
-| Types outside the compartment (Medication, Practitioner, …) | readable per `HFS_AUTH_PATIENT_NON_COMPARTMENT` |
-| XML responses | `403` when the response would need filtering (ask for JSON) |
+| `GET /T/_history`, `GET /_history`, conditional update/patch/delete, other `$`-operations | `403` |
+| Shared reference types (Medication, Practitioner, …, see `HFS_AUTH_PATIENT_SHARED_TYPES`) | readable (search, read, history, includes) under a `patient/` scope naming them; never writable |
 
 Compartment membership follows the R4 `CompartmentDefinition` for Patient
 (every member parameter, e.g. Observation `subject` and `performer`), the same
@@ -154,7 +158,10 @@ searches get the constraint appended (several granular scopes on the same
 parameter are OR-ed: `category=a,b`); reads and included resources must match
 it; writes are checked against it. Token parameters (`system|code`, `code`,
 `|code`), strings and references are supported; a constraint on a parameter
-HFS does not know fails closed. Granular scopes constraining *different*
+HFS does not know fails closed. For a type the token reaches only through
+granular scopes, batch/transaction, PATCH, conditional writes, type history,
+`Patient/$export` and other operations are refused (they cannot be checked
+against the constraint). Granular scopes constraining *different*
 parameters for one type cannot be combined into one search (`403` with a
 message).
 
