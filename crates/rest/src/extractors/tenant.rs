@@ -242,7 +242,17 @@ impl TenantExtractor {
         // use the JWT tenant authoritatively. When strict validation is enabled,
         // verify that the JWT tenant matches any header/URL tenant to prevent
         // confusion between URL context and actual data access.
-        if let Some(principal) = parts.extensions.get::<helios_auth::Principal>() {
+        //
+        // The administrator credential (`HFS_ADMIN_PASSWORD`, accepted next to
+        // SMART tokens) is the operator's break-glass login, not an IdP token:
+        // it carries no tenant claim and is meant to reach every tenant, as it
+        // does with authentication off. It selects the tenant the ordinary way
+        // (header / URL), so it is not treated as a claimless token here.
+        if let Some(principal) = parts
+            .extensions
+            .get::<helios_auth::Principal>()
+            .filter(|p| p.issuer != crate::middleware::auth::ADMIN_ISSUER)
+        {
             if let Some(jwt_tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
                 // The claim is authoritative for every request below, so it is
                 // validated *first* — before any consistency check and before it
@@ -621,6 +631,33 @@ mod tests {
                 .await
                 .expect_err("empty default tenant should fail closed");
             assert_eq!(status(&err), StatusCode::BAD_REQUEST);
+        }
+
+        /// The administrator credential (break-glass, no tenant claim) selects a
+        /// tenant through the header like an unauthenticated request does,
+        /// instead of being refused as a claimless token.
+        #[tokio::test]
+        async fn test_admin_principal_selects_tenant_by_header() {
+            let state = make_state(false, "test-tenant");
+            let admin = Principal {
+                issuer: crate::middleware::auth::ADMIN_ISSUER.to_string(),
+                subject: "admin".to_string(),
+                ..make_principal(None)
+            };
+            let mut parts = make_parts(Some("acme"), Some(admin));
+
+            let extractor = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect("admin may address any tenant");
+            assert_eq!(extractor.tenant_id(), "acme");
+            assert_eq!(extractor.source(), TenantSource::Header);
+
+            // A claimless IdP token is still refused for the same request.
+            let mut parts = make_parts(Some("acme"), Some(make_principal(None)));
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("claimless token must not pick a tenant");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]

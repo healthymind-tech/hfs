@@ -95,6 +95,15 @@ an IdP login in the console.
 The `/admin/*` API and the cross-tenant console metrics accept either the
 admin credential or a token with `system/*.r` (or broader).
 
+The admin credential carries no tenant claim and selects the tenant the
+ordinary way (`X-Tenant-ID` or the URL prefix), as with authentication off; an
+IdP token without a tenant claim is still refused (`403`) when it asks for a
+non-default tenant.
+
+**hfs.gugulu.tw (2026-11-16):** `write-protect` against a TEST Keycloak in the
+same compose stack (`https://hfs.gugulu.tw/auth/`, realm `hfs-test`); details,
+clients and rollback in `hfs-eval/eval/results-p3-auth/PROD-ROLLOUT.md`.
+
 ## 3. What is enforced
 
 ### Scopes
