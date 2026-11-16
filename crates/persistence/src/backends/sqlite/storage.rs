@@ -5586,6 +5586,9 @@ mod tests {
             .with(|s| s.borrow().clone())
             .into_iter()
             .filter(|s| !s.starts_with("--"))
+            // The tenant's stored-SearchParameter registry load (first write of
+            // a tenant, outside the transaction) is not part of the create.
+            .filter(|s| !s.starts_with("SELECT data FROM resources WHERE resource_type = 'SearchParameter'"))
             .collect();
         let begins = log.iter().filter(|s| s.starts_with("BEGIN")).count();
         let commits = log.iter().filter(|s| s.starts_with("COMMIT")).count();

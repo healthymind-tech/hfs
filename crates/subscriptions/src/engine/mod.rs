@@ -301,6 +301,37 @@ impl SubscriptionEngine {
         &self.topic_registry
     }
 
+    /// Registers a topic parsed by rehydration and records which resource it
+    /// came from, so a later update or delete without `previous_resource`
+    /// can still drop the old canonical URL (upstream v0.2.8).
+    pub(crate) fn register_topic(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: Option<&str>,
+        topic: crate::topics::TopicDefinition,
+    ) {
+        let canonical_url = topic.canonical_url.clone();
+        if let Some(resource_id) = resource_id.filter(|id| !id.is_empty()) {
+            let key = (
+                tenant_id.to_string(),
+                resource_type.to_string(),
+                resource_id.to_string(),
+            );
+            if let Some(previous_url) = self
+                .topic_resource_index
+                .insert(key, canonical_url.clone())
+                .filter(|previous_url| previous_url != &canonical_url)
+            {
+                let _ = self.topic_registry.remove_topic(tenant_id, &previous_url);
+            }
+        } else {
+            warn!(tenant_id, resource_type, topic_url = %canonical_url,
+                "Registering topic without a resource ID; lifecycle index unavailable");
+        }
+        self.topic_registry.add_topic(tenant_id, topic);
+    }
+
     /// Returns a reference to the subscription manager.
     pub fn manager(&self) -> &Arc<SubscriptionManager> {
         &self.manager

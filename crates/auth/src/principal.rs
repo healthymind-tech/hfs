@@ -48,7 +48,19 @@ impl Principal {
     /// The launch patient (`patient` claim, SMART App Launch context), when the
     /// token carries one. `patient/` scopes reach only this patient's
     /// compartment.
+    ///
+    /// Reads upstream's [`LaunchContext`] first (it honours a configured claim
+    /// name and accepts `Patient/<id>`), then the raw `patient` claim the
+    /// fork's SMART layer used before the merge, so both enforcement layers
+    /// agree on the patient.
     pub fn launch_patient(&self) -> Option<&str> {
+        if let Some(id) = self
+            .launch_context
+            .as_ref()
+            .and_then(|ctx| ctx.patient_id())
+        {
+            return Some(id);
+        }
         self.custom_claims
             .get("patient")
             .and_then(|v| v.as_str())

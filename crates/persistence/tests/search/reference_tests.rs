@@ -309,7 +309,9 @@ async fn test_reference_typed_id_excludes_neighbouring_ids() {
 
     assert_eq!(
         reference_hits(&backend, &tenant, "subject", "Patient/patient-1").await,
-        vec!["hit-relative", "hit-versioned"]
+        // Upstream v0.2.8 (897d4a9a6, schema v55 `value_reference_target`):
+        // an absolute URL ending in `Patient/patient-1` matches `Type/id` too.
+        vec!["hit-absolute", "hit-relative", "hit-versioned"]
     );
     assert_eq!(
         reference_hits(&backend, &tenant, "patient", "Patient/patient-1/_history/9").await,

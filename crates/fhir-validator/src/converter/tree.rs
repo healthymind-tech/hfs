@@ -595,7 +595,15 @@ fn parse_content_reference(reference: &str) -> Option<Vec<String>> {
     if root.is_empty() {
         return None;
     }
-    let root = if canonical.is_empty() {
+    // A core-type canonical (`http://hl7.org/fhir/StructureDefinition/A#A.b`)
+    // names the same element as `#A.b`: keep the type root so it resolves
+    // without the canonical being registered (fork behaviour, ad4dd9bbf).
+    // Any other canonical (e.g. the SQL on FHIR ViewDefinition) roots the
+    // path at the canonical's own schema (upstream cc6a78a26).
+    let core_same_type = canonical
+        .strip_prefix("http://hl7.org/fhir/StructureDefinition/")
+        .is_some_and(|name| name == root);
+    let root = if canonical.is_empty() || core_same_type {
         root
     } else {
         canonical
@@ -638,16 +646,23 @@ mod content_reference_tests {
             local,
             Some(vec!["Bundle".into(), "elements".into(), "link".into()])
         );
-        // Upstream #410 form: the canonical names the schema the path is in
-        // (resolved by URL in the registry), not the path's first segment.
+        // A core-type canonical keeps the type root (fork, ad4dd9bbf).
         assert_eq!(
             super::parse_content_reference(
                 "http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link"
             ),
+            Some(vec!["Bundle".into(), "elements".into(), "link".into()])
+        );
+        // Any other canonical names the schema the path is in (upstream #410,
+        // resolved by URL in the registry).
+        assert_eq!(
+            super::parse_content_reference(
+                "http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition/ViewDefinition#ViewDefinition.select"
+            ),
             Some(vec![
-                "http://hl7.org/fhir/StructureDefinition/Bundle".into(),
+                "http://hl7.org/fhir/uv/sql-on-fhir/StructureDefinition/ViewDefinition".into(),
                 "elements".into(),
-                "link".into()
+                "select".into()
             ])
         );
         assert_eq!(super::parse_content_reference("Bundle.link"), None);

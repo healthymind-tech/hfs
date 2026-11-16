@@ -397,9 +397,8 @@ async fn vs_validate_code_accepts_a_versioned_canonical_url() {
     );
 }
 
-/// A `url|version` canonical sent alongside `valueSetVersion` still resolves:
-/// the pipe is stripped from `url`, and the explicit parameter wins, as in
-/// `$expand`.
+/// A `url|version` canonical sent alongside a matching `valueSetVersion`
+/// still resolves; a disagreeing one is a 400 (fork rule).
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn vs_validate_code_versioned_canonical_with_explicit_value_set_version() {
@@ -425,15 +424,12 @@ async fn vs_validate_code_versioned_canonical_with_explicit_value_set_version() 
         .and_then(|p| p["valueBoolean"].as_bool());
     assert_eq!(result, Some(true), "{body}");
 
-    // `valueSetVersion=9.9` overrides `|1.0`, so the lookup misses.
+    // Fork rule (9eab3e5d7): a disagreeing `valueSetVersion` is a 400
+    // (upstream lets the explicit parameter win).
     let (status, body) = app
         .post_fhir("/ValueSet/$validate-code", validate("9.9"))
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(
-        body.to_string().contains("limbs|9.9"),
-        "explicit valueSetVersion must win: {body}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 /// Regression: when a request specifies `version=1.0.0` and the CodeSystem

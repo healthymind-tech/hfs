@@ -428,6 +428,8 @@ async fn type_level_launch_context_accepts_a_patient_reference_and_pages_within_
 }
 
 #[tokio::test]
+#[ignore = "fork keeps fail-closed SMART access (line B): a patient/ token without a usable \
+            launch patient is refused (403) rather than walking every patient"]
 async fn type_level_without_usable_launch_context_walks_every_patient() {
     let principals = [
         smart_principal(None),

@@ -80,6 +80,9 @@ enum Route {
     ConditionalWrite { ty: String },
     /// Any `$validate`: persists nothing and returns no stored data.
     Validate,
+    /// `GET|POST /Patient/$export` (type level). Upstream's handler pins a
+    /// patient-scoped export to the launch patient and its permitted types.
+    PatientExport,
     /// Any other type- or instance-level `$operation`.
     Operation { ty: String },
     /// `POST /` (batch / transaction).
@@ -111,6 +114,7 @@ fn classify(method: &Method, path: &str) -> Route {
             "$everything" if ty == "Patient" && segs.len() <= 3 => Route::Everything {
                 id: (segs.len() == 3).then(|| segs[1].to_string()),
             },
+            "$export" if ty == "Patient" && segs.len() == 2 => Route::PatientExport,
             _ => Route::Operation { ty },
         };
     }
@@ -654,6 +658,15 @@ where
             };
             let response = next.run(request).await;
             filter_response(response, &mut ctx, true, max_body).await
+        }
+        Route::PatientExport => {
+            // The bulk-export handler confines a patient-scoped token to the
+            // launch patient and the types its scopes grant (upstream #1618);
+            // here only a patient context is required when one is needed.
+            if ctx.access("Patient", SmartPermissions::READ).needs_patient() && ctx.patient.is_none() {
+                return forbidden(no_patient);
+            }
+            next.run(request).await
         }
         Route::Everything { id } => {
             let access = ctx.access("Patient", SmartPermissions::READ);

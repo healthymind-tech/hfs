@@ -214,7 +214,7 @@ async fn lookup_accepts_a_versioned_canonical_system() {
 }
 
 /// `url=X|V` (and the `system` alias) validates against version V, the same
-/// as `url=X` + `version=V`. An explicit `version` wins over the pipe.
+/// as `url=X` + `version=V`. A conflicting explicit `version` is a 400.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn validate_code_accepts_a_versioned_canonical_url() {
@@ -259,14 +259,15 @@ async fn validate_code_accepts_a_versioned_canonical_url() {
         "unknown version must not validate: {body}"
     );
 
-    // Explicit `version=2.0` overrides `|1.0`: `leg` is not in 2.0.
-    let (result, body) = validate(&[
+    // Fork rule (9eab3e5d7): a piped version that disagrees with an explicit
+    // `version` is a 400, not "explicit wins" as upstream decided.
+    let req = TestApp::params(&[
         ("url", "valueUri", &v1),
         ("version", "valueString", "2.0"),
         ("code", "valueCode", "leg"),
-    ])
-    .await;
-    assert_eq!(result, Some(false), "explicit version must win: {body}");
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "conflicting versions: {body}");
 }
 
 // ── $subsumes ─────────────────────────────────────────────────────────────────

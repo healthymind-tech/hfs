@@ -299,7 +299,19 @@ pub async fn auth_middleware(
 
     // Validate token
     match auth_state.provider.authenticate(&auth_header).await {
-        Ok(principal) => {
+        Ok(mut principal) => {
+            // Providers that predate upstream's `launch_context` (the fork's
+            // SMART layer reads the claims directly) leave it unset; derive it
+            // from the configured claim names so upstream's handler-level
+            // patient-compartment checks see the same launch patient.
+            if principal.launch_context.is_none() {
+                principal.launch_context = helios_auth::LaunchContext::from_claims(
+                    &principal.custom_claims,
+                    &auth_state.config.patient_claim,
+                    &auth_state.config.encounter_claim,
+                    &auth_state.config.fhir_user_claim,
+                );
+            }
             debug!(
                 sub = %principal.subject(),
                 iss = %principal.issuer(),

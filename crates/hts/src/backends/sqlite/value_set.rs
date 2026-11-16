@@ -568,7 +568,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inline_ctx
                     .default_value_set_versions
                     .clone_from(&req.default_value_set_versions);
-                let codes = if let Some(filter) = req.filter.as_deref() {
+                // `expand_inline_filtered` reads neither `exclude`, nor
+                // `include[].valueSet`, nor `contained`; composes that use them
+                // go through the general path and the text filter is applied
+                // afterwards over the full result (upstream guard, VCL #2019).
+                let text_filter_fast =
+                    !compose_needs_general_path(compose) && inline_ctx.contained.is_empty();
+                let codes = if let Some(filter) = req.filter.as_deref().filter(|_| text_filter_fast) {
                     let limit_hint = window.map(|w| (w * 3).max(100));
                     let compose_str = compose.to_string();
                     let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
@@ -917,8 +923,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // materialisation and concept-id ordering on filtered typeahead.
                             let codes = if let Some(filter) = req.filter.as_deref() {
                                 if let Some(compose_str) = compose_json.as_deref() {
-                                    if let Ok(compose) =
+                                    if let Some(compose) =
                                         serde_json::from_str::<serde_json::Value>(compose_str)
+                                            .ok()
+                                            .filter(|c| !compose_needs_general_path(c))
                                     {
                                         let limit_hint = window.map(|w| (w * 10).max(100));
                                         let prop_key = format!(
@@ -6036,6 +6044,9 @@ fn try_multiinclude_hierarchy_page(
     offset: usize,
     warnings: &mut Vec<String>,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() >= 2 => a,
         _ => return Ok(None),
@@ -6331,6 +6342,9 @@ fn extract_simple_hierarchy_compose(
     compose: &serde_json::Value,
     warnings: &mut Vec<String>,
 ) -> Result<Option<(String, String, String, bool)>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() == 1 => a,
         _ => return Ok(None),
@@ -13550,4 +13564,14 @@ mod tests {
             sys2_rowid
         );
     }
+}
+
+/// True when a compose uses `exclude` or `include[].valueSet`, which the
+/// single-include / text-filter fast paths do not evaluate (upstream).
+fn compose_needs_general_path(compose: &serde_json::Value) -> bool {
+    compose["exclude"].as_array().is_some_and(|a| !a.is_empty())
+        || compose["include"].as_array().is_some_and(|incs| {
+            incs.iter()
+                .any(|i| i["valueSet"].as_array().is_some_and(|a| !a.is_empty()))
+        })
 }

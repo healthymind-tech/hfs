@@ -337,12 +337,14 @@ async fn assert_coding_contract(app: PropertyApp) {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+#[ignore = "upstream #2095 full-Coding property round trip not adopted: the fork stores Coding properties by code (tx-ecosystem behaviour); see results-upstream/REPORT.md"]
 async fn coding_properties_round_trip_sqlite() {
     assert_coding_contract(PropertyApp::Sqlite(common::TestApp::new().await)).await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "upstream #2095 full-Coding property round trip not adopted (see the SQLite variant)"]
 async fn coding_properties_round_trip_postgres() {
     assert_coding_contract(PropertyApp::Postgres(common::TestAppPg::new().await)).await;
 }

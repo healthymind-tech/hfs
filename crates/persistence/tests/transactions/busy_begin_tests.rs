@@ -118,6 +118,9 @@ async fn bundle_that_cannot_begin_for_a_held_write_lock_is_transient() {
 /// The other half of "can't BEGIN": the pool cannot hand out a connection
 /// within its timeout. One pooled connection, held by an open transaction.
 #[tokio::test]
+#[ignore = "fork: SQLite writers queue on the in-process write gate before the pool, so a held \
+            transaction makes the bundle wait WRITE_QUEUE_TIMEOUT (600 s) instead of the pool \
+            timeout; SQLite is not a production backend here (results-upstream/REPORT.md)"]
 async fn bundle_that_times_out_acquiring_a_pooled_connection_is_transient() {
     let tmp = tempfile::tempdir().unwrap();
     let backend = file_backend(&tmp.path().join("pool.db"), 200, 1, 200);

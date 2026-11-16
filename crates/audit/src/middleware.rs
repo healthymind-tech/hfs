@@ -268,7 +268,20 @@ pub async fn audit_middleware(
     );
 
     let tenant = captured.tenant.clone();
-    for event in events {
+    for mut event in events {
+        // Upstream #1515: tag the event with the request's tenant (searchable
+        // with `_tag`); reserved `__…` tenants are left untagged.
+        if let Some(t) = tenant.as_deref().filter(|t| !t.is_empty() && !t.starts_with("__")) {
+            let meta = event.meta.get_or_insert_with(Default::default);
+            let tags = meta.tag.get_or_insert_with(Vec::new);
+            let already = tags.iter().any(|c| {
+                c.system.as_ref().and_then(|s| s.value.as_deref())
+                    == Some(crate::balp::code_systems::HFS_TENANT)
+            });
+            if !already {
+                tags.push(crate::helpers::coding(crate::balp::code_systems::HFS_TENANT, t));
+            }
+        }
         state.sink.record_in(tenant.as_deref(), event).await;
     }
 

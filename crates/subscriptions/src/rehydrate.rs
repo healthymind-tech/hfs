@@ -517,8 +517,12 @@ impl SubscriptionEngine {
                             topic_url = %topic.canonical_url,
                             "Rehydrated SubscriptionTopic"
                         );
-                        self.topic_registry()
-                            .add_topic(tenant.tenant_id().as_str(), topic);
+                        self.register_topic(
+                            tenant.tenant_id().as_str(),
+                            resource_type,
+                            resource.get("id").and_then(Value::as_str),
+                            topic,
+                        );
                         report.topics_registered += 1;
                     }
                     Err(e) => {

@@ -14,17 +14,18 @@ HFS processes starting together never migrate twice.
 
 | Track | Recorded in | Numbering | Owner |
 |---|---|---|---|
-| Upstream ladder | `schema_version(version)` — one row | `v1 → v2 → … → SCHEMA_VERSION` (46 in this build) | upstream HeliosSoftware/hfs |
+| Upstream ladder | `schema_version(version)` — one row | `v1 → v2 → … → SCHEMA_VERSION` (55 in this build, upstream v0.2.8) | upstream HeliosSoftware/hfs |
 | Fork migrations | `hm_schema_migrations(name, applied_at, note)` | by **name**, e.g. `hm-0001-search-parameter-epochs` | healthymind fork |
 
 At startup:
 
 1. If the database is stamped **v47** and contains the fork's
    `search_parameter_epochs` table but not upstream's `idx_resources_reindex_id`,
-   it is a database created by a fork build up to `hm/p25-z` (the production
-   database is one). It is re-stamped to v46 and
-   `hm-0001-search-parameter-epochs` is recorded as applied — one transaction,
-   no data touched (§3).
+   it is a database created by a fork build up to `hm/p25-z`. It is
+   re-stamped to v46 and `hm-0001-search-parameter-epochs` is recorded as
+   applied — one transaction, no data touched (§3) — and the upstream steps
+   v46→v47…v54→v55 then run in step 3 as for any v46 database. (Production
+   was re-stamped by the hm/p3-pgops deploy and is at v46 + hm-0001..hm-0007.)
 2. If the stamped version is **newer** than the binary's `SCHEMA_VERSION`, HFS
    **refuses to start** with an error naming the versions. An older binary does
    not maintain columns and indexes a newer migration added (for example
@@ -48,13 +49,22 @@ Fork migrations in this build:
 | `hm-0004-resource-change-feed` | `resource_change_feed` + StructureDefinition triggers | fork (hm/p3-cluster) |
 | `hm-0005-package-jobs` | `hfs_package_jobs` | fork (hm/p3-cluster) |
 | `hm-0006-search-index-statistics` | dependency-only extended statistics on `search_index`, token statistics target 1000, ANALYZE ([index-strategy.md §4](index-strategy.md#4-planning-cost-and-extended-statistics-hm-0006)) | fork (hm/p3-pgops2) |
-| `hm-0007-bulk-manifest-index-pending` | `bulk_manifests.index_pending` (deferred bulk-submit indexing) | fork (hm/p3-interop2; was startup DDL, registered here at merge) |
+| `hm-0007-bulk-manifest-index-pending` | `bulk_manifests.index_pending` (deferred bulk-submit indexing) | fork (hm/p3-interop2; was startup DDL, registered here at merge). Upstream v52 adds the same column (`BOOLEAN NOT NULL DEFAULT FALSE`) plus `index_pending_types` and `idx_bulk_manifests_index_pending`, all `IF NOT EXISTS`: on a database that already ran hm-0007, v52 only adds the latter two. |
 
 hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
 this track when it was merged with hm/p3-pgops (upstream has its own v48+). No
-deployed database ever carried v48–v51. When upstream releases the cluster
-tables under its own numbers, the upstream step must tolerate them existing
-(all bodies here are `IF NOT EXISTS` / `CREATE OR REPLACE`) — check at rebase.
+deployed database ever carried v48–v51. Checked at the v0.2.8 merge
+(hm/upstream-merge): upstream v47–v55 create none of the hm-0002..hm-0006
+objects (the cluster tables are still only on upstream's unreleased
+`feat/cluster-capable-state` branch); the only overlap is v52 / hm-0007 above.
+
+Upstream v47–v55, in order: v47 `idx_resources_reindex_id`; v48 composite
+slots on `search_index` + legacy contained-composite index; v49
+`idx_resources_live_tenant` (CONCURRENTLY); v50 `idx_search_date_recent_end`;
+v51 SQL-on-FHIR terminology tables; v52 bulk-manifest deferred-index marker;
+v53 composite fast-path indexes partial on `is_contained`; v54
+`bulk_submissions(updated_at)` index; v55 `search_index.value_reference_target`
++ backfill (minutes per 10M index rows).
 
 ```sql
 -- what a database is at

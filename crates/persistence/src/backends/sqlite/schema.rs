@@ -5031,10 +5031,7 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect()
         };
-        assert_eq!(
-            token_columns(&conn).last().map(String::as_str),
-            Some("resource_key")
-        );
+        assert!(token_columns(&conn).contains(&"resource_key".to_string()));
 
         conn.execute_batch(
             "DROP INDEX idx_search_token;
@@ -5046,13 +5043,16 @@ mod tests {
         initialize_schema(&conn).unwrap();
         assert_eq!(
             token_columns(&conn),
+            // upstream v0.2.8 shape (code before system, contained/composite keyed)
             [
                 "tenant_id",
                 "resource_type",
                 "param_name",
-                "value_token_system",
                 "value_token_code",
-                "resource_key"
+                "resource_key",
+                "value_token_system",
+                "composite_group",
+                "is_contained"
             ]
         );
         let sql: String = conn

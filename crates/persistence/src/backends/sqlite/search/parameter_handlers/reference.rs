@@ -367,7 +367,8 @@ mod tests {
         // Version-agnostic via one indexable range over the base and its
         // `_history` versions, with the exact match set as a residual, bound
         // once as `?1`.
-        assert!(frag.sql.starts_with("(value_reference >= ?1 "));
+        assert!(frag.sql.starts_with("(value_reference IS NOT NULL"));
+        assert!(frag.sql.contains("value_reference >= ?1 "));
         assert!(frag.sql.contains("value_reference = ?1"));
         assert!(frag.sql.contains("value_reference >= ?1 || '/_history/'"));
         assert!(frag.sql.contains("value_reference < ?1 || '/_history0'"));
