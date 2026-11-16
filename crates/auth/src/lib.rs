@@ -40,7 +40,7 @@ pub mod scope;
 pub mod session;
 
 // Re-export commonly used types
-pub use config::{AuthConfig, AuthMode, NonCompartmentPolicy};
+pub use config::{AuthConfig, AuthMode, DEFAULT_PATIENT_SHARED_TYPES, NonCompartmentPolicy};
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
 pub use jwks::JwksCache;

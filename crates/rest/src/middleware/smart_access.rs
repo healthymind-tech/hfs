@@ -1,33 +1,36 @@
-//! SMART access control finer than a resource type.
+//! SMART access refinements the handlers do not make.
 //!
-//! [`authz_middleware`](super::auth::authz_middleware) answers the coarse
-//! question — does any scope cover *this operation on this type*? This layer
-//! answers what a covered request may actually reach:
+//! Patient-context confinement (`patient/` scopes, the launch patient's
+//! compartment) is decided once, by [`authz_middleware`](super::auth::authz_middleware)
+//! (and per entry by the batch/transaction handler) through
+//! [`helios_auth::SmartScopePolicy::check`], and enforced by the handlers
+//! through [`crate::patient_compartment::PatientCompartment`] (upstream
+//! #1618): search filters, payload membership on reads and writes, include
+//! filtering, per-entry confinement in batch and transaction, and the shared
+//! reference types (`HFS_AUTH_PATIENT_NON_COMPARTMENT`). This layer does not
+//! repeat any of that. It adds the two things that path does
+//! not cover:
 //!
-//! * **Patient context.** A `patient/` scope reaches only the launch patient's
-//!   compartment (the token's `patient` claim). Searches are rewritten into
-//!   compartment searches (`/Observation?…` → `/Patient/{id}/Observation?…`,
-//!   `/Patient?…` → `/Patient?…&_id={id}`), reads are checked against the
-//!   returned resource, writes against the submitted (and stored) resource,
-//!   and `_include`/`_revinclude`, `$everything` and history results are
-//!   filtered entry by entry. Type and system history, conditional writes,
-//!   PATCH, other `$`-operations and batch/transaction are refused for such a
-//!   token: they cannot be confined to one compartment cheaply.
-//! * **Granular scopes** (SMART v2 `?param=value`). Searches get the
-//!   constraint appended (OR-ed across scopes that constrain the same
-//!   parameter); reads and included resources must match it.
+//! * **SMART v2 granular scopes** (`?param=value`). The grant of the context
+//!   the policy picks (a `user/`/`system/` scope over a `patient/` one) is
+//!   constrained when every scope of that context covering the type carries a
+//!   constraint. Searches then get the constraint appended (OR-ed across
+//!   scopes that constrain the same parameter); reads, instance history,
+//!   creates, updates and deletes must match it; bundles are filtered. What
+//!   cannot be checked against a constraint — batch/transaction, PATCH,
+//!   conditional writes, type history, other operations — is refused when the
+//!   type's grant is constrained.
 //! * **Type leakage through bundles.** A token that does not read every type
-//!   still gets other types back from `_include`/`_revinclude`, `$everything`
-//!   and searches nested in a batch response; those entries are dropped unless
-//!   a scope lets the token read them.
+//!   still gets other types back from `_include`/`_revinclude`,
+//!   `$everything`, compartment `*` searches and searches nested in a batch
+//!   response; entries of a type the token cannot read (or that miss its
+//!   granular constraint) are removed.
 //!
-//! The layer sits inside the FHIR router (it needs the store and the tenant's
-//! search-parameter registry) and in front of route matching, so a rewritten
-//! search is routed as the compartment search it became. It does nothing for
-//! a request without a [`Principal`] (auth off, anonymous read in
-//! write-protect mode) or for a token whose scopes read everything.
+//! It sits inside the FHIR router (it needs the tenant's search-parameter
+//! registry) in front of route matching, after authorization. Requests
+//! without a [`Principal`] and tokens that read every type unconstrained pass
+//! straight through.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -37,9 +40,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use helios_auth::{Access, Grant, NonCompartmentPolicy, Principal, SmartPermissions};
-use helios_fhir::FhirVersion;
-use helios_persistence::core::patient_compartment::PatientCompartmentMatcher;
+use helios_auth::scope::ScopeContext;
+use helios_auth::{Principal, ScopeSet, SmartPermissions};
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::search::{IndexValue, SearchParameterExtractor, SearchParameterRegistry};
 use parking_lot::RwLock;
@@ -57,7 +59,7 @@ enum Route {
     /// `GET /T/id`, `GET /T/id/_history[/vid]`.
     Read { ty: String, id: String },
     /// `GET /T/_history`.
-    TypeHistory,
+    TypeHistory { ty: String },
     /// `GET /_history`.
     SystemHistory,
     /// `GET /C/id/T` (T may be `*`).
@@ -126,7 +128,7 @@ fn classify(method: &Method, path: &str) -> Route {
             Route::ConditionalWrite { ty }
         }
         2 if segs[1] == "_search" && *method == Method::POST => Route::Search { ty, post: true },
-        2 if segs[1] == "_history" && read => Route::TypeHistory,
+        2 if segs[1] == "_history" && read => Route::TypeHistory { ty },
         2 if read => Route::Read {
             ty,
             id: segs[1].to_string(),
@@ -162,112 +164,70 @@ fn is_type_name(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// A FHIR logical id: `[A-Za-z0-9\-\.]{1,64}`.
-fn is_fhir_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-}
-
 /// Whether a query asks for other resource types to be included.
 fn asks_for_includes(query: &str) -> bool {
     url::form_urlencoded::parse(query.as_bytes())
         .any(|(k, _)| k.starts_with("_include") || k.starts_with("_revinclude"))
 }
 
-/// Whether the token's scopes need any of this layer's work at all.
-fn principal_is_restricted(principal: &Principal) -> bool {
-    let scopes = &principal.scopes;
-    scopes.has_patient_scopes() || scopes.has_constrained_scopes()
+/// What a token may see of one type for one permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    /// No scope covers it.
+    Denied,
+    /// Covered without a granular constraint (compartment confinement, if
+    /// any, is the handlers' business).
+    Free,
+    /// Covered only by granular scopes: a resource must match every
+    /// constraint of at least one of these sets.
+    Constrained(Vec<Vec<(String, String)>>),
+}
+
+/// The token's [`Reach`] for `perm` on `ty`. The context is chosen as
+/// [`helios_auth::SmartScopePolicy::check`] chooses it: the `user/`/`system/`
+/// scopes when any covers the type, else the `patient/` ones.
+fn reach(scopes: &ScopeSet, ty: &str, perm: SmartPermissions) -> Reach {
+    let covering: Vec<_> = scopes
+        .scopes()
+        .iter()
+        .filter(|s| s.covers(ty, perm))
+        .collect();
+    if covering.is_empty() {
+        return Reach::Denied;
+    }
+    let wide: Vec<_> = covering
+        .iter()
+        .copied()
+        .filter(|s| s.context != ScopeContext::Patient)
+        .collect();
+    let chosen = if wide.is_empty() { covering } else { wide };
+    if chosen.iter().any(|s| s.constraints.is_empty()) {
+        return Reach::Free;
+    }
+    let mut sets: Vec<Vec<(String, String)>> = Vec::new();
+    for s in chosen {
+        if !sets.contains(&s.constraints) {
+            sets.push(s.constraints.clone());
+        }
+    }
+    Reach::Constrained(sets)
+}
+
+/// Reach for reading `ty` as a returned or included resource: read, else search.
+fn read_reach(scopes: &ScopeSet, ty: &str) -> Reach {
+    match reach(scopes, ty, SmartPermissions::READ) {
+        Reach::Denied => reach(scopes, ty, SmartPermissions::SEARCH),
+        other => other,
+    }
 }
 
 /// Per-request evaluation state.
 struct Ctx {
     principal: Principal,
-    patient: Option<String>,
     registry: Arc<RwLock<SearchParameterRegistry>>,
-    version: FhirVersion,
-    non_compartment: NonCompartmentPolicy,
-    matchers: HashMap<String, PatientCompartmentMatcher>,
 }
 
 impl Ctx {
-    fn in_patient_compartment_type(&self, ty: &str) -> bool {
-        ty == "Patient" || !helios_fhir::get_compartment_params(self.version, "Patient", ty).is_empty()
-    }
-
-    /// The token's reach for `perm` on `ty`, with `patient/` grants on a type
-    /// outside the Patient compartment resolved by the configured policy.
-    fn access(&self, ty: &str, perm: SmartPermissions) -> Access {
-        let access = self.principal.scopes.access(ty, perm);
-        let Access::Restricted(grants) = access else {
-            return access;
-        };
-        if self.in_patient_compartment_type(ty) {
-            return Access::Restricted(grants);
-        }
-        let readable = perm == SmartPermissions::READ || perm == SmartPermissions::SEARCH;
-        let mut out: Vec<Grant> = Vec::new();
-        for grant in grants {
-            if grant.patient_compartment {
-                if !(readable && self.non_compartment == NonCompartmentPolicy::Allow) {
-                    continue;
-                }
-                if grant.constraints.is_empty() {
-                    return Access::Full;
-                }
-                out.push(Grant {
-                    patient_compartment: false,
-                    constraints: grant.constraints,
-                });
-            } else {
-                out.push(grant);
-            }
-        }
-        if out.is_empty() {
-            Access::Denied
-        } else {
-            Access::Restricted(out)
-        }
-    }
-
-    /// Reach for reading `ty` as an included / returned resource: read, else search.
-    fn read_access(&self, ty: &str) -> Access {
-        match self.access(ty, SmartPermissions::READ) {
-            Access::Denied => self.access(ty, SmartPermissions::SEARCH),
-            other => other,
-        }
-    }
-
-    fn patient_refs(&self) -> HashSet<String> {
-        self.patient
-            .iter()
-            .map(|id| format!("Patient/{id}"))
-            .collect()
-    }
-
-    fn is_compartment_member(&mut self, resource: &Value) -> bool {
-        let Some(patient) = self.patient.clone() else {
-            return false;
-        };
-        let ty = resource
-            .get("resourceType")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if ty == "Patient" {
-            return resource.get("id").and_then(Value::as_str) == Some(patient.as_str());
-        }
-        let refs = self.patient_refs();
-        let version = self.version;
-        let registry = Arc::clone(&self.registry);
-        let matcher = self
-            .matchers
-            .entry(ty.to_string())
-            .or_insert_with(|| PatientCompartmentMatcher::new(registry, version, ty));
-        matcher.is_member(resource, &refs)
-    }
-
     fn matches_constraint(&self, resource: &Value, param: &str, wanted: &str) -> bool {
         let ty = resource
             .get("resourceType")
@@ -294,44 +254,34 @@ impl Ctx {
         })
     }
 
-    fn grant_matches(&mut self, grant: &Grant, resource: &Value) -> bool {
-        if grant.patient_compartment && !self.is_compartment_member(resource) {
-            return false;
-        }
-        grant
-            .constraints
-            .iter()
-            .all(|(param, value)| self.matches_constraint(resource, param, value))
-    }
-
-    fn resource_allowed(&mut self, resource: &Value, access: &Access) -> bool {
-        match access {
-            Access::Denied => false,
-            Access::Full => true,
-            Access::Restricted(grants) => {
-                let grants = grants.clone();
-                grants.iter().any(|g| self.grant_matches(g, resource))
-            }
+    fn resource_allowed(&self, resource: &Value, reach: &Reach) -> bool {
+        match reach {
+            Reach::Denied => false,
+            Reach::Free => true,
+            Reach::Constrained(sets) => sets.iter().any(|set| {
+                set.iter()
+                    .all(|(param, value)| self.matches_constraint(resource, param, value))
+            }),
         }
     }
 
     /// Whether `resource` may be returned to this token.
-    fn may_return(&mut self, resource: &Value) -> bool {
+    fn may_return(&self, resource: &Value) -> bool {
         let Some(ty) = resource.get("resourceType").and_then(Value::as_str) else {
             return false;
         };
         if ty == "OperationOutcome" {
             return true;
         }
-        let access = self.read_access(ty);
-        self.resource_allowed(resource, &access)
+        let reach = read_reach(&self.principal.scopes, ty);
+        self.resource_allowed(resource, &reach)
     }
 
     /// Drops every entry this token may not see. Recurses into Bundles
     /// carried as entry resources (searches inside a batch response). With
     /// `drop_bare`, an entry without a resource (a history delete) is dropped
-    /// too, since there is nothing to show it belongs to the compartment.
-    fn filter_bundle(&mut self, bundle: &mut Value, drop_bare: bool) -> usize {
+    /// too: nothing shows it meets the granular constraint.
+    fn filter_bundle(&self, bundle: &mut Value, drop_bare: bool) -> usize {
         let Some(entries) = bundle.get_mut("entry").and_then(Value::as_array_mut) else {
             return 0;
         };
@@ -345,10 +295,7 @@ impl Ctx {
                     dropped += self.filter_bundle(resource, drop_bare);
                     true
                 }
-                Some(resource) => {
-                    let resource = resource.clone();
-                    self.may_return(&resource)
-                }
+                Some(resource) => self.may_return(resource),
                 None => !drop_bare,
             };
             if keep {
@@ -378,20 +325,17 @@ fn value_matches(value: &IndexValue, wanted: &str) -> bool {
     }
 }
 
-/// The search parameters that express the grants' constraints, when they can
-/// be expressed as one AND-ed query; `Err` when they cannot.
-fn constraint_params(grants: &[Grant]) -> Result<Vec<(String, String)>, String> {
-    if grants.iter().any(|g| g.constraints.is_empty()) {
-        return Ok(Vec::new());
+/// The search parameters that express a constrained grant, when they can be
+/// expressed as one AND-ed query; `Err` when they cannot.
+fn constraint_params(sets: &[Vec<(String, String)>]) -> Result<Vec<(String, String)>, String> {
+    if sets.len() == 1 {
+        return Ok(sets[0].clone());
     }
-    if grants.len() == 1 {
-        return Ok(grants[0].constraints.clone());
-    }
-    let single: Vec<&(String, String)> = grants
+    let single: Vec<&(String, String)> = sets
         .iter()
-        .filter_map(|g| (g.constraints.len() == 1).then(|| &g.constraints[0]))
+        .filter_map(|c| (c.len() == 1).then(|| &c[0]))
         .collect();
-    if single.len() == grants.len() && single.iter().all(|(p, _)| *p == single[0].0) {
+    if single.len() == sets.len() && single.iter().all(|(p, _)| *p == single[0].0) {
         let values: Vec<&str> = single.iter().map(|(_, v)| v.as_str()).collect();
         return Ok(vec![(single[0].0.clone(), values.join(","))]);
     }
@@ -455,7 +399,7 @@ fn append_params(query: &str, extra: &[(String, String)]) -> String {
     out
 }
 
-/// The SMART access middleware. See the module documentation.
+/// The SMART refinement middleware. See the module documentation.
 pub async fn smart_access_middleware<S>(
     State(state): State<AppState<S>>,
     request: Request,
@@ -467,8 +411,8 @@ where
     let Some(principal) = request.extensions().get::<Principal>().cloned() else {
         return next.run(request).await;
     };
-    let restricted = principal_is_restricted(&principal);
-    if !restricted && principal.scopes.reads_everything() {
+    let constrained = principal.scopes.has_constrained_scopes();
+    if !constrained && principal.scopes.reads_everything() {
         return next.run(request).await;
     }
 
@@ -476,19 +420,53 @@ where
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_string();
     let route = classify(&method, &path);
-
-    // A token without patient or granular scopes only needs other types kept
-    // out of multi-type results.
-    if !restricted {
-        let multi_type = match &route {
-            Route::Compartment { target, .. } if target == "*" => true,
-            Route::Search { .. } | Route::Compartment { .. } => asks_for_includes(&query),
-            Route::Everything { .. } | Route::Batch => true,
-            _ => false,
-        };
-        if !multi_type {
-            return next.run(request).await;
+    let multi_type = match &route {
+        Route::Compartment { target, .. } if target == "*" => true,
+        Route::Search { .. } | Route::Compartment { .. } => asks_for_includes(&query),
+        Route::Everything { .. } | Route::Batch => true,
+        _ => false,
+    };
+    let scopes = principal.scopes.clone();
+    let granular = |ty: &str, perm: SmartPermissions| -> Option<Vec<Vec<(String, String)>>> {
+        if !constrained {
+            return None;
         }
+        match reach(&scopes, ty, perm) {
+            Reach::Constrained(sets) => Some(sets),
+            _ => None,
+        }
+    };
+    // Nothing granular about this request and nothing to filter: done.
+    let route_granular = match &route {
+        Route::Search { ty, .. } => granular(ty, SmartPermissions::SEARCH).is_some(),
+        Route::Read { ty, .. } => {
+            granular(ty, SmartPermissions::READ).is_some()
+                || (reach(&scopes, ty, SmartPermissions::READ) == Reach::Denied
+                    && granular(ty, SmartPermissions::SEARCH).is_some())
+        }
+        Route::TypeHistory { ty } => granular(ty, SmartPermissions::READ).is_some(),
+        Route::Compartment { target, .. } if target != "*" => {
+            granular(target, SmartPermissions::SEARCH).is_some()
+        }
+        Route::Create { ty } => granular(ty, SmartPermissions::CREATE).is_some(),
+        Route::Update { ty, .. } => granular(ty, SmartPermissions::UPDATE).is_some(),
+        Route::Delete { ty, .. } => granular(ty, SmartPermissions::DELETE).is_some(),
+        Route::Patch { ty } => granular(ty, SmartPermissions::UPDATE).is_some(),
+        Route::ConditionalWrite { ty } | Route::Operation { ty } => [
+            SmartPermissions::READ,
+            SmartPermissions::CREATE,
+            SmartPermissions::UPDATE,
+            SmartPermissions::DELETE,
+        ]
+        .into_iter()
+        .any(|p| granular(ty, p).is_some()),
+        Route::Batch => constrained && !principal.scopes.writes_and_reads_everything(),
+        // Bulk export cannot apply a granular constraint to what it writes.
+        Route::PatientExport => constrained && !principal.scopes.reads_everything(),
+        _ => false,
+    };
+    if !route_granular && !multi_type {
+        return next.run(request).await;
     }
 
     let (mut parts, body) = request.into_parts();
@@ -497,82 +475,38 @@ where
         // Let the handler produce the tenant error it always produces.
         Err(_) => return next.run(Request::from_parts(parts, body)).await,
     };
-    let registry = state.storage().search_param_registry(tenant.context());
-    let mut ctx = Ctx {
-        patient: principal.launch_patient().map(str::to_string),
+    let ctx = Ctx {
         principal: principal.clone(),
-        registry,
-        version: state.config().default_fhir_version,
-        non_compartment: state.auth_config().patient_non_compartment,
-        matchers: HashMap::new(),
+        registry: state.storage().search_param_registry(tenant.context()),
     };
-    if let Some(patient) = &ctx.patient
-        && !is_fhir_id(patient)
-    {
-        return forbidden("the token's patient launch context is not a valid FHIR id");
-    }
     let max_body = state.config().max_body_size;
     let request = Request::from_parts(parts, body);
 
-    if !restricted {
+    if !route_granular {
         let response = next.run(request).await;
-        return filter_response(response, &mut ctx, false, max_body).await;
+        return filter_response(response, &ctx, false, max_body).await;
     }
 
-    // From here on the token carries patient or granular scopes.
-    let needs_patient = |access: &Access| access.needs_patient();
-    let no_patient = "this request needs a patient launch context: the token has patient/ scopes \
-                      but no `patient` claim";
-
-    match route.clone() {
-        Route::Other | Route::Validate => next.run(request).await,
-        Route::Batch => {
-            if principal.scopes.writes_and_reads_everything() {
-                return next.run(request).await;
-            }
-            forbidden(
-                "batch and transaction requests are not available to tokens with patient/ or \
-                 granular scopes; send the requests individually",
-            )
-        }
-        Route::TypeHistory | Route::SystemHistory => forbidden(
-            "type- and system-level history are not available to tokens with patient/ or \
+    match route {
+        Route::Other | Route::Validate | Route::SystemHistory => next.run(request).await,
+        Route::Batch => forbidden(
+            "batch and transaction requests are not available to tokens with granular scopes; \
+             send the requests individually",
+        ),
+        Route::TypeHistory { .. } => forbidden(
+            "type-level history is not available for a type the token reaches only through \
              granular scopes",
         ),
-        Route::ConditionalWrite { ty } | Route::Patch { ty } | Route::Operation { ty } => {
-            let perm = match method {
-                Method::GET | Method::HEAD => SmartPermissions::READ,
-                Method::DELETE => SmartPermissions::DELETE,
-                Method::POST => SmartPermissions::CREATE,
-                _ => SmartPermissions::UPDATE,
-            };
-            if ctx.access(&ty, perm) == Access::Full {
-                return next.run(request).await;
-            }
-            forbidden(
-                "conditional writes, PATCH and operations are not available to a token whose \
-                 access to this type is limited to a patient compartment or granular scope",
-            )
-        }
+        Route::PatientExport => forbidden(
+            "Patient/$export is not available to tokens with granular scopes",
+        ),
+        Route::ConditionalWrite { .. } | Route::Patch { .. } | Route::Operation { .. } => forbidden(
+            "conditional writes, PATCH and operations are not available for a type the token \
+             reaches only through granular scopes",
+        ),
         Route::Search { ty, post } => {
-            let access = ctx.access(&ty, SmartPermissions::SEARCH);
-            let Access::Restricted(grants) = &access else {
-                // Full: only included types need filtering. Denied: authz
-                // refused already; nothing to do.
-                let response = next.run(request).await;
-                return filter_response(response, &mut ctx, false, max_body).await;
-            };
-            if needs_patient(&access) && ctx.patient.is_none() {
-                return forbidden(no_patient);
-            }
-            let compartment = grants.iter().all(|g| g.patient_compartment);
-            if !compartment && grants.iter().any(|g| g.patient_compartment) {
-                return forbidden(
-                    "the token's patient/ and user/system granular scopes for this type cannot be \
-                     combined into one search",
-                );
-            }
-            let extra = match constraint_params(grants) {
+            let sets = granular(&ty, SmartPermissions::SEARCH).unwrap_or_default();
+            let extra = match constraint_params(&sets) {
                 Ok(extra) => extra,
                 Err(message) => return forbidden(&message),
             };
@@ -580,7 +514,7 @@ where
             let mut query = query;
             if post {
                 // Fold the form body into the query and search with GET, so
-                // the request can be routed as a compartment search.
+                // the constraint is applied by the same query parser.
                 let bytes = match axum::body::to_bytes(body, max_body).await {
                     Ok(b) => b,
                     Err(_) => return forbidden("request body too large"),
@@ -597,161 +531,64 @@ where
                 parts.headers.remove(header::CONTENT_TYPE);
                 parts.headers.remove(header::CONTENT_LENGTH);
             }
-            let mut extra = extra;
-            let new_path = if compartment && ty == "Patient" {
-                extra.push((
-                    "_id".to_string(),
-                    ctx.patient.clone().unwrap_or_default(),
-                ));
-                format!("/{ty}")
-            } else if compartment {
-                format!("/Patient/{}/{ty}", ctx.patient.clone().unwrap_or_default())
-            } else {
-                format!("/{ty}")
-            };
+            let new_path = format!("/{ty}");
             let new_query = append_params(&query, &extra);
             match with_query(&new_path, &new_query) {
                 Some(uri) => parts.uri = uri,
                 None => return forbidden("could not restrict the search to the token's scopes"),
             }
-            debug!(path = %new_path, query = %new_query, "SMART access: search restricted");
+            debug!(path = %new_path, query = %new_query, "SMART access: granular search");
             let response = next.run(Request::from_parts(parts, Body::empty())).await;
-            filter_response(response, &mut ctx, false, max_body).await
+            filter_response(response, &ctx, false, max_body).await
         }
-        Route::Compartment { ctype, cid, target } => {
-            if ctype != "Patient" || (target != "*" && !ctx.in_patient_compartment_type(&target)) {
-                // Not a Patient compartment: only allowed if the target type
-                // is fully readable; results are filtered either way.
-                if target != "*" && ctx.access(&target, SmartPermissions::SEARCH) == Access::Full {
-                    let response = next.run(request).await;
-                    return filter_response(response, &mut ctx, false, max_body).await;
-                }
-                return forbidden(
-                    "only the launch patient's compartment can be searched with patient/ scopes",
-                );
-            }
-            let access = if target == "*" {
-                ctx.access("Patient", SmartPermissions::READ)
-            } else {
-                ctx.access(&target, SmartPermissions::SEARCH)
+        Route::Compartment { target, .. } => {
+            let sets = granular(&target, SmartPermissions::SEARCH).unwrap_or_default();
+            let extra = match constraint_params(&sets) {
+                Ok(extra) => extra,
+                Err(message) => return forbidden(&message),
             };
-            if access.needs_patient() {
-                if ctx.patient.is_none() {
-                    return forbidden(no_patient);
-                }
-                if ctx.patient.as_deref() != Some(cid.as_str()) {
-                    return forbidden("the requested compartment is not the launch patient's");
-                }
+            let (mut parts, body) = request.into_parts();
+            if let Some(uri) = with_query(&path, &append_params(&query, &extra)) {
+                parts.uri = uri;
             }
-            let request = if let (Access::Restricted(grants), false) = (&access, target == "*") {
-                let extra = match constraint_params(grants) {
-                    Ok(extra) => extra,
-                    Err(message) => return forbidden(&message),
-                };
-                let (mut parts, body) = request.into_parts();
-                if let Some(uri) = with_query(&path, &append_params(&query, &extra)) {
-                    parts.uri = uri;
-                }
-                Request::from_parts(parts, body)
-            } else {
-                request
-            };
-            let response = next.run(request).await;
-            filter_response(response, &mut ctx, true, max_body).await
+            let response = next.run(Request::from_parts(parts, body)).await;
+            filter_response(response, &ctx, false, max_body).await
         }
-        Route::PatientExport => {
-            // The bulk-export handler confines a patient-scoped token to the
-            // launch patient and the types its scopes grant (upstream #1618);
-            // here only a patient context is required when one is needed.
-            if ctx.access("Patient", SmartPermissions::READ).needs_patient() && ctx.patient.is_none() {
-                return forbidden(no_patient);
-            }
-            next.run(request).await
-        }
-        Route::Everything { id } => {
-            let access = ctx.access("Patient", SmartPermissions::READ);
-            if access.needs_patient() {
-                let Some(patient) = ctx.patient.clone() else {
-                    return forbidden(no_patient);
-                };
-                // Type level (`id` None): upstream's handler narrows it to the
-                // launch patient (#1618), so only another patient's id is refused.
-                if id.as_deref().is_some_and(|id| id != patient.as_str()) {
-                    return forbidden(
-                        "Patient/$everything is limited to the launch patient for patient/ scopes",
-                    );
-                }
-            }
+        Route::Everything { .. } => {
             let response = next.run(request).await;
-            filter_response(response, &mut ctx, true, max_body).await
+            filter_response(response, &ctx, false, max_body).await
         }
-        Route::Read { ty, id } => {
-            let access = ctx.read_access(&ty);
-            if access.needs_patient() {
-                let Some(patient) = ctx.patient.clone() else {
-                    return forbidden(no_patient);
-                };
-                if ty == "Patient"
-                    && id != patient
-                    && matches!(&access, Access::Restricted(g) if g.iter().all(|g| g.patient_compartment))
-                {
-                    return forbidden("the requested Patient is not the launch patient");
-                }
-            }
-            if access == Access::Full {
-                return next.run(request).await;
-            }
+        Route::Read { ty, .. } => {
+            let reach = read_reach(&principal.scopes, &ty);
             let response = next.run(request).await;
-            check_single_response(response, &mut ctx, &access, max_body).await
+            check_single_response(response, &ctx, &reach, max_body).await
         }
         Route::Create { ty } => {
-            let access = ctx.access(&ty, SmartPermissions::CREATE);
-            if !matches!(access, Access::Restricted(_)) {
-                return next.run(request).await;
-            }
-            if access.needs_patient() && ctx.patient.is_none() {
-                return forbidden(no_patient);
-            }
-            if ty == "Patient" && access.needs_patient() {
-                return forbidden("a patient/ scope cannot create another Patient");
-            }
+            let reach = reach(&principal.scopes, &ty, SmartPermissions::CREATE);
             let (parts, body) = request.into_parts();
             let bytes = match axum::body::to_bytes(body, max_body).await {
                 Ok(b) => b,
                 Err(_) => return forbidden("request body too large"),
             };
-            if !body_allowed(&bytes, &ty, &mut ctx, &access) {
-                return forbidden(
-                    "the resource is outside the token's reach (patient compartment or granular \
-                     scope)",
-                );
+            if !body_allowed(&bytes, &ty, &ctx, &reach) {
+                return forbidden("the resource does not match the token's granular scope");
             }
             next.run(Request::from_parts(parts, Body::from(bytes))).await
         }
         Route::Update { ty, id } => {
-            let access = ctx.access(&ty, SmartPermissions::UPDATE);
-            if !matches!(access, Access::Restricted(_)) {
-                return next.run(request).await;
-            }
-            if access.needs_patient() && ctx.patient.is_none() {
-                return forbidden(no_patient);
-            }
+            let reach = reach(&principal.scopes, &ty, SmartPermissions::UPDATE);
             let (mut parts, body) = request.into_parts();
             let bytes = match axum::body::to_bytes(body, max_body).await {
                 Ok(b) => b,
                 Err(_) => return forbidden("request body too large"),
             };
-            if !body_allowed(&bytes, &ty, &mut ctx, &access) {
-                return forbidden(
-                    "the updated resource would be outside the token's reach (patient compartment \
-                     or granular scope)",
-                );
+            if !body_allowed(&bytes, &ty, &ctx, &reach) {
+                return forbidden("the updated resource would not match the token's granular scope");
             }
             match stored(&state, &mut parts, &ty, &id).await {
-                Ok(Some(existing)) if !ctx.resource_allowed(&existing, &access) => {
+                Ok(Some(existing)) if !ctx.resource_allowed(&existing, &reach) => {
                     return forbidden(
-                        "the stored resource is outside the token's reach (patient compartment or \
-                         granular scope)",
+                        "the stored resource does not match the token's granular scope",
                     );
                 }
                 Ok(_) => {}
@@ -760,19 +597,12 @@ where
             next.run(Request::from_parts(parts, Body::from(bytes))).await
         }
         Route::Delete { ty, id } => {
-            let access = ctx.access(&ty, SmartPermissions::DELETE);
-            if !matches!(access, Access::Restricted(_)) {
-                return next.run(request).await;
-            }
-            if access.needs_patient() && ctx.patient.is_none() {
-                return forbidden(no_patient);
-            }
+            let reach = reach(&principal.scopes, &ty, SmartPermissions::DELETE);
             let (mut parts, body) = request.into_parts();
             match stored(&state, &mut parts, &ty, &id).await {
-                Ok(Some(existing)) if !ctx.resource_allowed(&existing, &access) => {
+                Ok(Some(existing)) if !ctx.resource_allowed(&existing, &reach) => {
                     return forbidden(
-                        "the stored resource is outside the token's reach (patient compartment or \
-                         granular scope)",
+                        "the stored resource does not match the token's granular scope",
                     );
                 }
                 Ok(_) => {}
@@ -806,22 +636,22 @@ where
     }
 }
 
-fn body_allowed(bytes: &Bytes, ty: &str, ctx: &mut Ctx, access: &Access) -> bool {
+fn body_allowed(bytes: &Bytes, ty: &str, ctx: &Ctx, reach: &Reach) -> bool {
     let Ok(resource) = serde_json::from_slice::<Value>(bytes) else {
-        // XML or malformed: cannot be shown to be inside the compartment.
+        // XML or malformed: cannot be shown to match the constraint.
         return false;
     };
     if resource.get("resourceType").and_then(Value::as_str) != Some(ty) {
         return false;
     }
-    ctx.resource_allowed(&resource, access)
+    ctx.resource_allowed(&resource, reach)
 }
 
-/// Checks a single-resource (or instance-history) response against `access`.
+/// Checks a single-resource (or instance-history) response against `reach`.
 async fn check_single_response(
     response: Response,
-    ctx: &mut Ctx,
-    access: &Access,
+    ctx: &Ctx,
+    reach: &Reach,
     max_body: usize,
 ) -> Response {
     if !response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED {
@@ -829,7 +659,7 @@ async fn check_single_response(
     }
     if !is_json(&response) {
         return forbidden(
-            "restricted (patient/ or granular) tokens can only receive JSON; request \
+            "a resource reached through granular scopes can only be returned as JSON; request \
              application/fhir+json",
         );
     }
@@ -844,20 +674,15 @@ async fn check_single_response(
         ctx.filter_bundle(&mut value, true);
         return rebuild(parts, &value);
     }
-    if ctx.resource_allowed(&value, access) {
+    if ctx.resource_allowed(&value, reach) {
         Response::from_parts(parts, Body::from(bytes))
     } else {
-        forbidden("the resource is outside the token's reach (patient compartment or granular scope)")
+        forbidden("the resource does not match the token's granular scope")
     }
 }
 
 /// Filters a Bundle response; other responses pass unchanged.
-async fn filter_response(
-    response: Response,
-    ctx: &mut Ctx,
-    drop_bare: bool,
-    max_body: usize,
-) -> Response {
+async fn filter_response(response: Response, ctx: &Ctx, drop_bare: bool, max_body: usize) -> Response {
     if !response.status().is_success() {
         return response;
     }
@@ -896,6 +721,7 @@ fn rebuild(mut parts: axum::http::response::Parts, value: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_auth::ScopeSet;
 
     #[test]
     fn classifies_reads_searches_and_writes() {
@@ -927,7 +753,12 @@ mod tests {
                 id: "1".into()
             }
         );
-        assert_eq!(classify(&Method::GET, "/Observation/_history"), Route::TypeHistory);
+        assert_eq!(
+            classify(&Method::GET, "/Observation/_history"),
+            Route::TypeHistory {
+                ty: "Observation".into()
+            }
+        );
         assert_eq!(classify(&Method::GET, "/_history"), Route::SystemHistory);
         assert_eq!(classify(&Method::POST, "/"), Route::Batch);
         assert_eq!(
@@ -967,19 +798,46 @@ mod tests {
 
     #[test]
     fn constraint_params_or_join_one_parameter() {
-        let g = |c: &[(&str, &str)]| Grant {
-            patient_compartment: true,
-            constraints: c
+        let c = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+                .collect()
         };
         assert_eq!(
-            constraint_params(&[g(&[("category", "a")]), g(&[("category", "b")])]).unwrap(),
+            constraint_params(&[c(&[("category", "a")]), c(&[("category", "b")])]).unwrap(),
             vec![("category".to_string(), "a,b".to_string())]
         );
-        assert!(constraint_params(&[g(&[("category", "a")]), g(&[("code", "b")])]).is_err());
-        assert!(constraint_params(&[g(&[("category", "a")]), g(&[])]).unwrap().is_empty());
+        assert!(constraint_params(&[c(&[("category", "a")]), c(&[("code", "b")])]).is_err());
+        assert_eq!(
+            constraint_params(&[c(&[("category", "a"), ("code", "x")])]).unwrap(),
+            c(&[("category", "a"), ("code", "x")])
+        );
+    }
+
+    #[test]
+    fn reach_follows_the_widest_context_like_the_policy() {
+        let s = |x: &str| ScopeSet::parse(x);
+        let lab = "?category=laboratory";
+        assert_eq!(reach(&s("system/*.rs"), "Observation", SmartPermissions::READ), Reach::Free);
+        assert_eq!(reach(&s("patient/*.rs"), "Observation", SmartPermissions::READ), Reach::Free);
+        assert_eq!(reach(&s("patient/Patient.rs"), "Observation", SmartPermissions::READ), Reach::Denied);
+        assert_eq!(
+            reach(&s(&format!("user/Observation.rs{lab}")), "Observation", SmartPermissions::SEARCH),
+            Reach::Constrained(vec![vec![("category".into(), "laboratory".into())]])
+        );
+        // A wider (user/) grant decides, as SmartScopePolicy picks it over the
+        // patient/ one: its constraint applies even though the patient/ scope
+        // is unconstrained (never wider than either grant).
+        assert!(matches!(
+            reach(&s(&format!("patient/Observation.rs user/Observation.rs{lab}")), "Observation", SmartPermissions::READ),
+            Reach::Constrained(_)
+        ));
+        // Patient-only granular scopes constrain within the compartment.
+        assert!(matches!(
+            reach(&s(&format!("patient/Observation.rs{lab}")), "Observation", SmartPermissions::READ),
+            Reach::Constrained(_)
+        ));
     }
 
     #[test]
@@ -996,14 +854,6 @@ mod tests {
         assert!(value_matches(&token, "http://sys|"));
         assert!(!value_matches(&token, "|lab"));
         assert!(!value_matches(&token, "http://other|lab"));
-    }
-
-    #[test]
-    fn ids_are_validated() {
-        assert!(is_fhir_id("pat-1.a"));
-        assert!(!is_fhir_id("pat/1"));
-        assert!(!is_fhir_id(""));
-        assert!(!is_fhir_id("a?b"));
     }
 
     #[test]

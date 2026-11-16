@@ -663,7 +663,7 @@ where
                     .iter()
                     .filter(|entry| {
                         entry.resource.is_deleted()
-                            || compartment.is_member(
+                            || compartment.is_readable(
                                 || registry.clone(),
                                 entry.resource.fhir_version(),
                                 entry.resource.content(),

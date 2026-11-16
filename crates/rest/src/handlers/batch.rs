@@ -670,7 +670,10 @@ where
                                     }
                             )
                         ) {
-                            entry_compartment = PatientCompartment::confined_to(patient_id);
+                            entry_compartment = PatientCompartment::confined_to(patient_id)
+                                .with_shared_types(
+                                    state.auth_config().patient_shared_read_types().to_vec(),
+                                );
                         } else {
                             return Err(RestError::Forbidden {
                                 message: format!(
@@ -1399,7 +1402,9 @@ where
                         ),
                     });
                 }
-                compartment = PatientCompartment::confined_to(patient_id);
+                compartment = PatientCompartment::confined_to(patient_id).with_shared_types(
+                    state.auth_config().patient_shared_read_types().to_vec(),
+                );
             }
             Err(_) => {
                 // `forbidden` is a child of `security`; `processing` is not an

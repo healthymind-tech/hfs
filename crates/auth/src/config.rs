@@ -43,16 +43,33 @@ impl AuthMode {
 /// What a `patient/` scope may read outside the Patient compartment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NonCompartmentPolicy {
-    /// Types that are not members of the Patient compartment at all
-    /// (Medication, Practitioner, Organization, Location, …) may be read and
-    /// searched under a `patient/` scope that names them (or `*`). They carry
-    /// no patient data by definition, and patient-facing apps (US Core) need
-    /// them to render medications and care teams. Writes stay refused.
+    /// The shared reference types in [`AuthConfig::patient_shared_types`]
+    /// (default [`DEFAULT_PATIENT_SHARED_TYPES`]: Medication, Practitioner,
+    /// Organization, Location, …) may be read and searched under a
+    /// `patient/` scope that names them (or `*`). They are not members of any
+    /// Patient compartment and describe no patient, and patient-facing apps
+    /// (US Core patient access) need them to render medications and care
+    /// teams. Writes to them stay refused. Every other type outside the
+    /// compartment (Binary, …) stays unreachable.
     #[default]
     Allow,
     /// `patient/` scopes reach nothing outside the compartment.
     Deny,
 }
+
+/// The types a `patient/` scope may read outside the Patient compartment by
+/// default ([`NonCompartmentPolicy::Allow`]): the reference data the US Core
+/// patient-access scopes name, none of which belongs to a patient.
+pub const DEFAULT_PATIENT_SHARED_TYPES: &[&str] = &[
+    "Medication",
+    "Practitioner",
+    "PractitionerRole",
+    "Organization",
+    "Location",
+    "HealthcareService",
+    "Endpoint",
+    "Substance",
+];
 
 /// Configuration for the authentication and authorization subsystem.
 ///
@@ -72,6 +89,10 @@ pub struct AuthConfig {
     /// What `patient/` scopes may read outside the Patient compartment
     /// (`HFS_AUTH_PATIENT_NON_COMPARTMENT`, `allow` or `deny`).
     pub patient_non_compartment: NonCompartmentPolicy,
+    /// The types [`NonCompartmentPolicy::Allow`] opens to `patient/` reads
+    /// (`HFS_AUTH_PATIENT_SHARED_TYPES`, comma-separated; default
+    /// [`DEFAULT_PATIENT_SHARED_TYPES`]). Ignored under `Deny`.
+    pub patient_shared_types: Vec<String>,
     /// `capabilities` advertised in `/.well-known/smart-configuration`
     /// (`HFS_SMART_CAPABILITIES`, comma-separated). `None` uses the default.
     pub smart_capabilities: Option<Vec<String>>,
@@ -203,6 +224,7 @@ impl std::fmt::Debug for AuthConfig {
             mode,
             clock_skew_secs,
             patient_non_compartment,
+            patient_shared_types,
             smart_capabilities,
             smart_scopes_supported,
             smart_token_auth_methods,
@@ -238,6 +260,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("mode", mode)
             .field("clock_skew_secs", clock_skew_secs)
             .field("patient_non_compartment", patient_non_compartment)
+            .field("patient_shared_types", patient_shared_types)
             .field("smart_capabilities", smart_capabilities)
             .field("smart_scopes_supported", smart_scopes_supported)
             .field("smart_token_auth_methods", smart_token_auth_methods)
@@ -321,6 +344,12 @@ impl AuthConfig {
                 Ok("deny") => NonCompartmentPolicy::Deny,
                 _ => NonCompartmentPolicy::Allow,
             },
+            patient_shared_types: list_env("HFS_AUTH_PATIENT_SHARED_TYPES").unwrap_or_else(|| {
+                DEFAULT_PATIENT_SHARED_TYPES
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect()
+            }),
             smart_capabilities: list_env("HFS_SMART_CAPABILITIES"),
             smart_scopes_supported: list_env("HFS_SMART_SCOPES_SUPPORTED"),
             smart_token_auth_methods: list_env("HFS_SMART_TOKEN_AUTH_METHODS"),
@@ -373,6 +402,16 @@ impl AuthConfig {
                 .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
                 .unwrap_or(true),
             smart_end_session_endpoint: env::var("HFS_SMART_END_SESSION_ENDPOINT").ok(),
+        }
+    }
+
+    /// The types a `patient/` scope may read outside the Patient compartment:
+    /// [`patient_shared_types`](Self::patient_shared_types) under
+    /// [`NonCompartmentPolicy::Allow`], none under `Deny`.
+    pub fn patient_shared_read_types(&self) -> &[String] {
+        match self.patient_non_compartment {
+            NonCompartmentPolicy::Allow => &self.patient_shared_types,
+            NonCompartmentPolicy::Deny => &[],
         }
     }
 
@@ -457,6 +496,10 @@ impl Default for AuthConfig {
             mode: AuthMode::Full,
             clock_skew_secs: 60,
             patient_non_compartment: NonCompartmentPolicy::Allow,
+            patient_shared_types: DEFAULT_PATIENT_SHARED_TYPES
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
             smart_capabilities: None,
             smart_scopes_supported: None,
             smart_token_auth_methods: None,
@@ -558,6 +601,7 @@ mod tests {
         "HFS_AUTH_MODE",
         "HFS_AUTH_CLOCK_SKEW_SECONDS",
         "HFS_AUTH_PATIENT_NON_COMPARTMENT",
+        "HFS_AUTH_PATIENT_SHARED_TYPES",
         "HFS_SMART_CAPABILITIES",
         "HFS_AUTH_JWKS_URL",
         "HFS_AUTH_ISSUER",
@@ -647,6 +691,23 @@ mod tests {
             config.smart_capabilities,
             Some(vec!["launch-standalone".to_string(), "permission-v2".to_string()])
         );
+        clear_auth_env();
+    }
+
+    #[test]
+    fn patient_shared_types_follow_the_policy() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+        let config = AuthConfig::from_env();
+        assert!(config.patient_shared_read_types().iter().any(|t| t == "Medication"));
+        assert!(!config.patient_shared_read_types().iter().any(|t| t == "Binary"));
+        unsafe { env::set_var("HFS_AUTH_PATIENT_SHARED_TYPES", "Medication, Location") };
+        assert_eq!(
+            AuthConfig::from_env().patient_shared_read_types(),
+            ["Medication".to_string(), "Location".to_string()]
+        );
+        unsafe { env::set_var("HFS_AUTH_PATIENT_NON_COMPARTMENT", "deny") };
+        assert!(AuthConfig::from_env().patient_shared_read_types().is_empty());
         clear_auth_env();
     }
 

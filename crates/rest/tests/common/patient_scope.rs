@@ -526,7 +526,12 @@ pub async fn searches_are_filtered_to_the_compartment_whatever_the_client_asks(
 }
 
 pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
-    // o3's performer is a Practitioner: not in any patient's compartment.
+    // o3's performer is a Practitioner: not in any patient's compartment, but
+    // one of the shared reference types a `patient/*.rs` token may read
+    // directly (HFS_AUTH_PATIENT_NON_COMPARTMENT=allow, the default), so the
+    // include keeps it; another patient's resources are what is dropped (see
+    // `bundles_confine_reads_and_refuse_writes` and the fork's
+    // `smart_access.rs` for the `deny` policy and unnamed types).
     let r = get(
         server,
         P1_READ,
@@ -536,7 +541,7 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
     assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
     let bundle: Value = r.json();
     assert_eq!(ids(&bundle), ["o3"]);
-    assert_eq!(included_ids(&bundle), ["p1"], "{bundle}");
+    assert_eq!(included_ids(&bundle), ["p1", "pr1"], "{bundle}");
 
     // The same search unconfined includes the Practitioner.
     let r = get(
@@ -549,8 +554,18 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
 }
 
 pub async fn types_outside_the_patient_compartment_are_not_reachable(server: &TestServer) {
-    assert_forbidden(&get(server, P1_READ, "/Practitioner/pr1").await, "read");
-    assert_forbidden(&get(server, P1_READ, "/Practitioner").await, "search");
+    // The shared reference types (Practitioner, Medication, ...) are readable
+    // under a patient/ scope that names them (the default `allow` policy, as
+    // US Core patient access needs); any other type outside the compartment
+    // is not, and none of them is writable.
+    let r = get(server, P1_READ, "/Practitioner/pr1").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let r = get(server, P1_READ, "/Practitioner").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_forbidden(
+        &put(server, P1_WRITE, "/Practitioner/pr1", json!({"resourceType": "Practitioner", "id": "pr1"})).await,
+        "write of a shared type",
+    );
     assert_forbidden(&get(server, P1_READ, "/Binary").await, "Binary search");
     // Unconfined, the same reads work.
     let r = get(server, SYSTEM, "/Practitioner/pr1").await;
@@ -1168,27 +1183,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
-        // U-SMART: the fork's smart_access layer (line B, Keycloak e2e 84/84)
-        // refuses batch/transaction, conditional writes and PATCH for patient
-        // tokens and filters includes its own way; upstream #1618 confines
-        // them instead. Both layers run (most restrictive wins) until they are
-        // reconciled; auth is off in production. See results-upstream/REPORT.md.
-        $crate::patient_scope_suite!(@ignored $factory; includes_outside_the_compartment_are_dropped, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope);
-    };
-    (@ignored $factory:path; $($name:ident),* $(,)?) => {
-        $(
-            #[tokio::test]
-            #[ignore = "U-SMART: fork smart_access vs upstream #1618 confinement not reconciled yet"]
-            async fn $name() {
-                let _server_log = $crate::patient_scope::ServerLog::capture(stringify!($name));
-                let Some(server) = $factory(stringify!($name)).await else {
-                    return;
-                };
-                $crate::patient_scope::seed(&server).await;
-                $crate::patient_scope::$name(&server).await;
-            }
-        )*
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient, includes_outside_the_compartment_are_dropped, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(

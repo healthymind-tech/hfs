@@ -416,8 +416,16 @@ pub async fn authz_middleware(
     let routed = routed_path(&path, auth_state.tenant_url_routing);
     match extract_operation(&routed, method.as_str()) {
         Some((resource_type, operation)) => {
+            let shared = auth_state.config.patient_shared_read_types();
             match SmartScopePolicy::check(&principal, &resource_type, operation) {
                 Ok(scope) => {
+                    if scope.is_patient_compartment() {
+                        request
+                            .extensions_mut()
+                            .insert(crate::patient_compartment::PatientSharedTypes(
+                                shared.to_vec(),
+                            ));
+                    }
                     if let AccessScope::PatientCompartment { patient_id } = &scope
                         && let Err(reason) =
                             patient_compartment_path_check(&routed, method.as_str(), patient_id)

@@ -58,17 +58,39 @@ use crate::error::{RestError, RestResult};
 /// it never fails; it reads the [`AccessScope`] the authorization middleware
 /// stored in the request extensions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PatientCompartment(Option<String>);
+pub struct PatientCompartment(Option<String>, Vec<String>);
+
+/// The shared reference types a confined request may still read
+/// ([`helios_auth::AuthConfig::patient_shared_read_types`]); the authorization
+/// layer stores it in the request extensions next to the [`AccessScope`].
+///
+/// SMART leaves resources outside any patient compartment to server policy,
+/// and US Core patient access needs Medication, Practitioner, Organization, …
+/// under `patient/` scopes. A confined grant therefore *reads* these types
+/// (search, read, vread, instance history, includes) while staying confined
+/// for everything else: compartment types keep their membership checks
+/// (an include of another patient's resource is still dropped) and writes to
+/// a shared type stay refused, since it has no compartment members.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatientSharedTypes(pub Vec<String>);
+
 
 impl PatientCompartment {
     /// A request that is not confined to a compartment.
     pub fn unconfined() -> Self {
-        Self(None)
+        Self(None, Vec::new())
     }
 
     /// A request confined to the compartment of the patient with this id.
     pub fn confined_to(patient_id: impl Into<String>) -> Self {
-        Self(Some(patient_id.into()))
+        Self(Some(patient_id.into()), Vec::new())
+    }
+
+    /// The same confinement, reading these shared reference types too (see
+    /// [`PatientSharedTypes`]).
+    pub fn with_shared_types(mut self, shared_types: Vec<String>) -> Self {
+        self.1 = shared_types;
+        self
     }
 
     /// The confinement an access grant implies.
@@ -133,7 +155,31 @@ impl PatientCompartment {
         matcher.is_member(resource, &refs)
     }
 
+    /// Whether `resource` is of a shared reference type this confined request
+    /// may read.
+    fn is_shared(&self, resource: &Value) -> bool {
+        self.is_confined()
+            && resource
+                .get("resourceType")
+                .and_then(Value::as_str)
+                .is_some_and(|t| self.1.iter().any(|s| s == t))
+    }
+
+    /// Whether `resource` may be *read* under this confinement: a member, or
+    /// a shared reference type.
+    pub fn is_readable(
+        &self,
+        registry: impl FnOnce() -> Arc<RwLock<SearchParameterRegistry>>,
+        version: FhirVersion,
+        resource: &Value,
+    ) -> bool {
+        self.is_shared(resource) || self.is_member(registry, version, resource)
+    }
+
     /// Refuses, with `403`, a resource that is not a member of the compartment.
+    ///
+    /// For the read interactions (`what` = `read`, `vread`, `history`) a
+    /// shared reference type passes too; writes never do.
     ///
     /// `what` names the interaction for the client (`read`, `update`, …).
     pub fn assert_member(
@@ -143,6 +189,9 @@ impl PatientCompartment {
         resource: &Value,
         what: &str,
     ) -> RestResult<()> {
+        if matches!(what, "read" | "vread" | "history") && self.is_shared(resource) {
+            return Ok(());
+        }
         if self.is_member(registry, version, resource) {
             return Ok(());
         }
@@ -178,6 +227,11 @@ impl PatientCompartment {
                 values: vec![SearchValue::new(SearchPrefix::Eq, patient_id)],
                 ..Default::default()
             });
+            return Ok(());
+        }
+        if self.1.iter().any(|t| *t == query.resource_type) {
+            // A shared reference type: searched unfiltered (its includes are
+            // still confined by `retain_members`).
             return Ok(());
         }
         let params = helios_fhir::get_compartment_params(version, "Patient", &query.resource_type);
@@ -218,7 +272,8 @@ impl PatientCompartment {
         }
         let registry = registry();
         resources.retain(|stored| {
-            self.is_member(|| registry.clone(), stored.fhir_version(), stored.content())
+            self.1.iter().any(|t| t == stored.resource_type())
+                || self.is_member(|| registry.clone(), stored.fhir_version(), stored.content())
         });
     }
 
@@ -235,9 +290,12 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self::from_access_scope(
-            parts.extensions.get::<AccessScope>(),
-        ))
+        let shared = parts
+            .extensions
+            .get::<PatientSharedTypes>()
+            .map(|s| s.0.clone())
+            .unwrap_or_default();
+        Ok(Self::from_access_scope(parts.extensions.get::<AccessScope>()).with_shared_types(shared))
     }
 }
 
