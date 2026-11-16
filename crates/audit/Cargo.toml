@@ -25,7 +25,7 @@ cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", version = "0.2.8", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
 
 # Serialization
 serde.workspace = true
@@ -39,7 +39,7 @@ async-trait = "0.1"
 chrono.workspace = true
 
 # Prometheus metrics of the write path (audit_metrics)
-helios-observability = { path = "../observability", version = "0.2.8" }
+helios-observability = { path = "../observability", version = "0.2.9" }
 
 # Logging
 tracing = "0.1"

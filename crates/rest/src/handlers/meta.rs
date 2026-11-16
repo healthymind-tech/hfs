@@ -1,48 +1,48 @@
-//! `$meta`, `$meta-add` and `$meta-delete` operation handlers.
+//! `$meta`, `$meta-add` and `$meta-delete` (FHIR `Resource-meta`,
+//! `Resource-meta-add`, `Resource-meta-delete`).
 //!
-//! Implements the FHIR [Resource-meta](https://hl7.org/fhir/R4/resource-operation-meta.html),
-//! [Resource-meta-add](https://hl7.org/fhir/R4/resource-operation-meta-add.html) and
-//! [Resource-meta-delete](https://hl7.org/fhir/R4/resource-operation-meta-delete.html)
-//! operations:
+//! - `GET|POST [base]/[type]/[id]/$meta` — the resource's current `meta`.
+//! - `GET|POST [base]/[type]/[id]/_history/[vid]/$meta` — the `meta` of one
+//!   version.
+//! - `POST [base]/[type]/[id]/$meta-add` — add profiles, tags and security
+//!   labels.
+//! - `POST [base]/[type]/[id]/$meta-delete` — remove them.
+//! - `GET|POST [base]/$meta`, `[base]/[type]/$meta` — every profile, tag and
+//!   security label in use on live resources of the system / type, read from
+//!   the search index (`SearchProvider::distinct_meta_values`; fork, kept at
+//!   the v0.2.9 merge — upstream answers these with `400 not-supported`).
 //!
-//! - `GET|POST [base]/$meta` — every profile, tag and security label in use
-//!   on the server (system level)
-//! - `GET|POST [base]/[type]/$meta` — the same, for one resource type
-//! - `GET|POST [base]/[type]/[id]/$meta` — the resource's `meta`
-//! - `POST [base]/[type]/[id]/$meta-add` — add the profiles, tags and
-//!   security labels of the `meta` input parameter to the resource
-//! - `POST [base]/[type]/[id]/$meta-delete` — remove them
+//! Every form answers a `Parameters` whose `return` is a `Meta`.
 //!
-//! Each answers a `Parameters` whose single `return` parameter is a `Meta`.
+//! An update merges tags and security labels instead of replacing them
+//! (#2562), so `$meta-delete` is the only way a client can remove one.
 //!
-//! # Versioning
+//! # Versions
 //!
-//! `$meta-add` and `$meta-delete` change the resource's `meta` only — its
-//! other content is untouched — but they are writes: like HAPI, the server
-//! stores a **new version** of the resource (so `meta.versionId` advances, the
-//! change is in `_history`, and `_tag` / `_profile` / `_security` searches
-//! see it at once). An input that would change nothing (every tag already
-//! present, or none present to delete) stores nothing and answers the current
-//! `meta`.
-//!
-//! The type- and system-level `$meta` are read from the search index
-//! ([`SearchProvider::distinct_meta_values`]), so they list what a `_tag=` /
-//! `_profile=` / `_security=` search would match: live resources only.
-//! Backends without a queryable index answer `501`.
+//! The specification does not say whether `$meta-add` and `$meta-delete`
+//! create a new version. Here a change to `meta` writes a new version, like
+//! any other update: history, the ETag, subscriptions and the audit trail all
+//! see it. An operation that changes nothing writes nothing and returns the
+//! current `meta`.
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use helios_persistence::core::{DistinctMetaValue, ResourceStorage, SearchProvider};
-use helios_persistence::types::StoredResource;
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
+use helios_persistence::core::{DistinctMetaValue, ResourceStorage, SearchProvider, VersionedStorage};
+use helios_persistence::types::{MetaOperation, StoredResource, apply_meta_operation};
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::extractors::{FhirResource, TenantExtractor};
+use crate::handlers::extract_patient_from_resource;
+use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::negotiate_format;
-use crate::responses::ResourceHeaders;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
+use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
 
 /// `GET|POST [base]/$meta` — every profile, tag and security label in use.
@@ -55,7 +55,7 @@ where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
     let meta = collect_meta(&state, &tenant, None).await?;
-    respond(StatusCode::OK, HeaderMap::new(), meta, &req_headers)
+    respond_summary(meta, &req_headers)
 }
 
 /// `GET|POST [base]/[type]/$meta` — every profile, tag and security label in
@@ -70,319 +70,336 @@ where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
     let meta = collect_meta(&state, &tenant, Some(&resource_type)).await?;
-    respond(StatusCode::OK, HeaderMap::new(), meta, &req_headers)
+    respond_summary(meta, &req_headers)
 }
 
-/// `GET|POST [base]/[type]/[id]/$meta` — the resource's `meta`.
+/// `GET|POST [base]/[type]/[id]/$meta`
 pub async fn meta_instance_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
-    req_headers: HeaderMap,
+    compartment: PatientCompartment,
+    headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let stored = read_current(&state, &tenant, &resource_type, &id).await?;
-    let headers = ResourceHeaders::from_stored(&stored, &state).to_header_map();
-    respond(StatusCode::OK, headers, meta_of(&stored), &req_headers)
+    let stored = read_current(&state, &tenant, &compartment, &resource_type, &id).await?;
+    respond(&state, &stored, &headers)
 }
 
-/// `POST [base]/[type]/[id]/$meta-add`.
+/// `GET|POST [base]/[type]/[id]/_history/[vid]/$meta`
+pub async fn meta_version_handler<S>(
+    State(state): State<AppState<S>>,
+    Path((resource_type, id, version_id)): Path<(String, String, String)>,
+    tenant: TenantExtractor,
+    compartment: PatientCompartment,
+    headers: HeaderMap,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + VersionedStorage + SearchProvider + Send + Sync,
+{
+    let stored = super::vread::execute_vread(
+        &state,
+        &tenant,
+        &compartment,
+        &resource_type,
+        &id,
+        &version_id,
+    )
+    .await?;
+    respond(&state, &stored, &headers)
+}
+
+/// `GET|POST [base]/$meta` and `[base]/[type]/$meta`: not supported.
+pub async fn meta_summary_not_supported_handler() -> RestResult<Response> {
+    Err(RestError::NotSupported {
+        feature: "$meta at the system or type level (a summary of the labels in use); \
+                  invoke it on a resource instance: [type]/[id]/$meta"
+            .to_string(),
+    })
+}
+
+/// `POST [base]/[type]/[id]/$meta-add`
+#[allow(clippy::too_many_arguments)]
 pub async fn meta_add_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
-    version: FhirVersionExtractor,
-    req_headers: HeaderMap,
+    compartment: PatientCompartment,
+    conditional: ConditionalHeaders,
+    headers: HeaderMap,
     FhirResource(body): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let input = meta_input(&body, "$meta-add")?;
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
-    let stored = apply_meta_change(
+    change_meta(
         &state,
+        MetaChange {
+            resource_type,
+            id,
+            operation: MetaOperation::Add,
+        },
         &tenant,
-        fhir_version,
-        &resource_type,
-        &id,
-        &input,
-        MetaChange::Add,
+        &compartment,
+        &conditional,
+        &headers,
+        &body,
     )
-    .await?;
-    let headers = ResourceHeaders::from_stored(&stored, &state).to_header_map();
-    respond(StatusCode::OK, headers, meta_of(&stored), &req_headers)
+    .await
 }
 
-/// `POST [base]/[type]/[id]/$meta-delete`.
+/// `POST [base]/[type]/[id]/$meta-delete`
+#[allow(clippy::too_many_arguments)]
 pub async fn meta_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
-    version: FhirVersionExtractor,
-    req_headers: HeaderMap,
+    compartment: PatientCompartment,
+    conditional: ConditionalHeaders,
+    headers: HeaderMap,
     FhirResource(body): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let input = meta_input(&body, "$meta-delete")?;
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
-    let stored = apply_meta_change(
+    change_meta(
         &state,
+        MetaChange {
+            resource_type,
+            id,
+            operation: MetaOperation::Delete,
+        },
         &tenant,
-        fhir_version,
-        &resource_type,
-        &id,
-        &input,
-        MetaChange::Delete,
+        &compartment,
+        &conditional,
+        &headers,
+        &body,
     )
-    .await?;
-    let headers = ResourceHeaders::from_stored(&stored, &state).to_header_map();
-    respond(StatusCode::OK, headers, meta_of(&stored), &req_headers)
+    .await
 }
 
-/// Which way a `$meta-add` / `$meta-delete` moves the resource's `meta`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetaChange {
-    Add,
-    Delete,
+/// The target and kind of a `$meta-add` / `$meta-delete`.
+struct MetaChange {
+    resource_type: String,
+    id: String,
+    operation: MetaOperation,
 }
 
-/// Reads the current version of the resource; a missing one is a `404`, a
-/// deleted one the `410` the storage error maps to.
+impl MetaChange {
+    fn name(&self) -> &'static str {
+        match self.operation {
+            MetaOperation::Add => "$meta-add",
+            MetaOperation::Delete => "$meta-delete",
+        }
+    }
+}
+
+async fn change_meta<S>(
+    state: &AppState<S>,
+    change: MetaChange,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    conditional: &ConditionalHeaders,
+    headers: &HeaderMap,
+    body: &Value,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    let MetaChange {
+        resource_type, id, ..
+    } = &change;
+    let operation = change.name();
+
+    // AuditEvent resources are immutable, as on update and patch.
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: operation.to_string(),
+            resource_type: resource_type.clone(),
+        });
+    }
+
+    let meta = meta_parameter(body, operation)?;
+    let existing = read_current(state, tenant, compartment, resource_type, id).await?;
+
+    // `If-Match`, as on patch: list-aware, malformed fails the precondition.
+    let if_match = conditional
+        .if_match_tags()
+        .map_err(|e| RestError::PreconditionFailed {
+            message: format!("Malformed If-Match header: {e}"),
+        })?;
+    if !if_match.if_match_satisfied(Some(existing.version_id())) {
+        return Err(RestError::PreconditionFailed {
+            message: format!(
+                "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{}\"",
+                existing.version_id()
+            ),
+        });
+    }
+
+    let mut content = existing.content().clone();
+    let changed =
+        apply_meta_operation(&mut content, meta, change.operation).map_err(|message| {
+            RestError::BadRequest {
+                message: format!("{operation}: {message}"),
+            }
+        })?;
+    if !changed {
+        debug!(%resource_type, %id, operation, "meta unchanged; nothing written");
+        return respond(state, &existing, headers);
+    }
+
+    // A profile added is a profile the resource now claims; check the write
+    // as update and patch do.
+    state
+        .validation()
+        .check_write(
+            tenant.tenant_id(),
+            existing.fhir_version(),
+            resource_type,
+            &content,
+        )
+        .await?;
+
+    let stored = match change.operation {
+        // Everything already present is still present, so the merge an update
+        // applies is a no-op here.
+        MetaOperation::Add => {
+            state
+                .storage()
+                .update(tenant.context(), &existing, content)
+                .await?
+        }
+        // A plain update would merge the deleted labels straight back (#2562).
+        MetaOperation::Delete => {
+            state
+                .storage()
+                .update_verbatim(tenant.context(), &existing, content)
+                .await?
+        }
+    };
+
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            stored.fhir_version(),
+            stored.content(),
+        );
+    }
+
+    debug!(
+        %resource_type,
+        %id,
+        operation,
+        version = %stored.version_id(),
+        "meta changed"
+    );
+
+    super::write_event::report(
+        state,
+        tenant.context(),
+        stored.fhir_version(),
+        resource_type,
+        0,
+        Some(super::write_event::stored_notice(
+            helios_persistence::core::WriteKind::Update,
+            &stored,
+        )),
+    );
+
+    let mut response = respond(state, &stored, headers)?;
+    response
+        .extensions_mut()
+        .insert(helios_audit::AuditResponseContext {
+            resource_type: Some(resource_type.clone()),
+            resource_id: Some(stored.id().to_string()),
+            patient_reference: extract_patient_from_resource(resource_type, stored.content()),
+        });
+    Ok(response)
+}
+
+/// Reads the live resource, confined to a `patient/` scope's compartment.
 async fn read_current<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     id: &str,
 ) -> RestResult<StoredResource>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    state
+    let stored = state
         .storage()
         .read(tenant.context(), resource_type, id)
         .await?
         .ok_or_else(|| RestError::NotFound {
             resource_type: resource_type.to_string(),
             id: id.to_string(),
-        })
-}
-
-/// Applies the input `meta` to the stored resource and stores the result as a
-/// new version, unless nothing changes.
-async fn apply_meta_change<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    fhir_version: helios_fhir::FhirVersion,
-    resource_type: &str,
-    id: &str,
-    input: &Value,
-    change: MetaChange,
-) -> RestResult<StoredResource>
-where
-    S: ResourceStorage + Send + Sync,
-{
-    let current = read_current(state, tenant, resource_type, id).await?;
-    let mut resource = current.content().clone();
-    let changed = {
-        let meta = resource
-            .as_object_mut()
-            .ok_or_else(|| RestError::InternalError {
-                message: "stored resource is not a JSON object".to_string(),
-            })?
-            .entry("meta")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !meta.is_object() {
-            *meta = Value::Object(Map::new());
-        }
-        let meta = meta.as_object_mut().expect("meta is an object");
-        let mut changed = false;
-        changed |= merge_list(meta, input, "profile", change, |a, b| a == b);
-        changed |= merge_list(meta, input, "security", change, same_coding);
-        changed |= merge_list(meta, input, "tag", change, same_coding);
-        changed
-    };
-    if !changed {
-        debug!(
-            resource_type = %resource_type,
-            id = %id,
-            ?change,
-            "$meta change is a no-op; keeping the current version"
-        );
-        return Ok(current);
-    }
-
-    let stored = state
-        .storage()
-        .update(tenant.context(), &current, resource)
-        .await?;
-    super::write_event::report(
-        state,
-        tenant.context(),
-        fhir_version,
-        resource_type,
-        0,
-        Some(super::write_event::stored_notice(
-            super::write_event::upsert_kind(false),
-            &stored,
-        )),
-    );
-    debug!(
-        resource_type = %resource_type,
-        id = %id,
-        version = %stored.version_id(),
-        ?change,
-        "$meta change stored as a new version"
-    );
+        })?;
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        stored.fhir_version(),
+        stored.content(),
+        "meta",
+    )?;
     Ok(stored)
 }
 
-/// Adds to (or removes from) `meta[key]` the entries of `input[key]`, matching
-/// entries with `same`. Returns whether anything changed. An emptied list is
-/// removed from `meta`, as an empty array is not valid FHIR JSON.
-fn merge_list(
-    meta: &mut Map<String, Value>,
-    input: &Value,
-    key: &str,
-    change: MetaChange,
-    same: impl Fn(&Value, &Value) -> bool,
-) -> bool {
-    let Some(incoming) = input.get(key).and_then(Value::as_array) else {
-        return false;
-    };
-    let mut existing: Vec<Value> = meta
-        .get(key)
+/// The `meta` input parameter (1..1, `Meta`) of a `Parameters` body.
+fn meta_parameter<'a>(body: &'a Value, operation: &str) -> RestResult<&'a Value> {
+    if body.get("resourceType").and_then(Value::as_str) != Some("Parameters") {
+        return Err(RestError::BadRequest {
+            message: format!("{operation} takes a Parameters resource with a 'meta' parameter"),
+        });
+    }
+    let mut metas = body
+        .get("parameter")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let before = existing.len();
-    match change {
-        MetaChange::Add => {
-            for entry in incoming {
-                if !existing.iter().any(|e| same(e, entry)) {
-                    existing.push(entry.clone());
-                }
-            }
-        }
-        MetaChange::Delete => {
-            existing.retain(|e| !incoming.iter().any(|entry| same(e, entry)));
-        }
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("name").and_then(Value::as_str) == Some("meta"));
+    let meta = metas.next().ok_or_else(|| RestError::BadRequest {
+        message: format!("{operation} requires the 'meta' parameter"),
+    })?;
+    if metas.next().is_some() {
+        return Err(RestError::BadRequest {
+            message: format!("{operation} takes exactly one 'meta' parameter"),
+        });
     }
-    if existing.len() == before {
-        return false;
-    }
-    if existing.is_empty() {
-        meta.remove(key);
-    } else {
-        meta.insert(key.to_string(), Value::Array(existing));
-    }
-    true
+    meta.get("valueMeta").ok_or_else(|| RestError::BadRequest {
+        message: format!("{operation}: the 'meta' parameter must carry a valueMeta"),
+    })
 }
 
-/// Two Codings name the same concept when their `system` and `code` agree
-/// (`display` and `version` do not take part, as HAPI matches them).
-fn same_coding(a: &Value, b: &Value) -> bool {
-    a.get("system") == b.get("system") && a.get("code") == b.get("code")
-}
-
-/// The `meta` input parameter of a `$meta-add` / `$meta-delete` body: a
-/// `Parameters` with one `meta` parameter whose `valueMeta` is a Meta. A bare
-/// Meta object (no `resourceType`) is accepted too, for convenience.
-fn meta_input(body: &Value, operation: &str) -> RestResult<Value> {
-    let invalid = |message: String| RestError::BadRequest { message };
-    match body.get("resourceType").and_then(Value::as_str) {
-        Some("Parameters") => {
-            let metas: Vec<&Value> = body
-                .get("parameter")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .filter(|p| p.get("name").and_then(Value::as_str) == Some("meta"))
-                .collect();
-            let [param] = metas.as_slice() else {
-                return Err(invalid(format!(
-                    "{operation} requires exactly one 'meta' parameter (found {})",
-                    metas.len()
-                )));
-            };
-            let meta = param.get("valueMeta").ok_or_else(|| {
-                invalid(format!(
-                    "{operation}: the 'meta' parameter must carry a valueMeta"
-                ))
-            })?;
-            validate_meta_input(meta, operation)?;
-            Ok(meta.clone())
-        }
-        Some(other) => Err(invalid(format!(
-            "{operation} expects a Parameters resource, not {other}"
-        ))),
-        None if body.is_object() => {
-            validate_meta_input(body, operation)?;
-            Ok(body.clone())
-        }
-        None => Err(invalid(format!(
-            "{operation} expects a Parameters resource"
-        ))),
-    }
-}
-
-/// The Meta must be an object whose `profile`, `security` and `tag`, when
-/// present, are arrays of the right shape, and must name at least one of them.
-fn validate_meta_input(meta: &Value, operation: &str) -> RestResult<()> {
-    let invalid = |message: String| RestError::BadRequest { message };
-    if !meta.is_object() {
-        return Err(invalid(format!(
-            "{operation}: valueMeta must be a Meta object"
-        )));
-    }
-    let mut named = 0;
-    for key in ["profile", "security", "tag"] {
-        let Some(list) = meta.get(key) else {
-            continue;
-        };
-        let Some(list) = list.as_array() else {
-            return Err(invalid(format!("{operation}: meta.{key} must be an array")));
-        };
-        named += 1;
-        for entry in list {
-            let ok = if key == "profile" {
-                entry.as_str().is_some_and(|s| !s.is_empty())
-            } else {
-                entry.is_object() && entry.get("code").and_then(Value::as_str).is_some()
-            };
-            if !ok {
-                return Err(invalid(format!(
-                    "{operation}: every meta.{key} entry must be {}",
-                    if key == "profile" {
-                        "a canonical URL string"
-                    } else {
-                        "a Coding with a code"
-                    }
-                )));
-            }
-        }
-    }
-    if named == 0 {
-        return Err(invalid(format!(
-            "{operation}: valueMeta must carry at least one of profile, security or tag"
-        )));
-    }
-    Ok(())
-}
-
-/// The stored resource's `meta`, `versionId` and `lastUpdated` included.
-fn meta_of(stored: &StoredResource) -> Value {
-    stored
+/// `Parameters { return: <stored.meta> }`, with the version's ETag and
+/// Last-Modified.
+fn respond<S>(
+    state: &AppState<S>,
+    stored: &StoredResource,
+    headers: &HeaderMap,
+) -> RestResult<Response>
+where
+    S: ResourceStorage,
+{
+    let negotiated = negotiate_format(headers, None);
+    let meta = stored
         .content_with_meta()
         .get("meta")
         .cloned()
-        .unwrap_or_else(|| json!({}))
+        .unwrap_or_else(|| json!({}));
+    let parameters = json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "return", "valueMeta": meta}]
+    });
+    let header_map = ResourceHeaders::from_stored(stored, state)
+        .with_content_type(negotiated.format.mime_type())
+        .to_header_map();
+    format_resource_response(StatusCode::OK, header_map, &parameters, negotiated.format)
 }
+// ── System / type summary (fork) ─────────────────────────────────────────────
 
 /// The union of profiles, tags and security labels in use, as a Meta.
 async fn collect_meta<S>(
@@ -463,205 +480,13 @@ fn coding_of(value: &DistinctMetaValue) -> Option<Value> {
     Some(Value::Object(coding))
 }
 
-/// The operations' response: a `Parameters` with one `return` Meta.
-fn respond(
-    status: StatusCode,
-    headers: HeaderMap,
-    meta: Value,
-    req_headers: &HeaderMap,
-) -> RestResult<Response> {
+/// The summary's response: a `Parameters` with one `return` Meta.
+fn respond_summary(meta: Value, req_headers: &HeaderMap) -> RestResult<Response> {
     let negotiated = negotiate_format(req_headers, None);
     let parameters = json!({
         "resourceType": "Parameters",
         "parameter": [{ "name": "return", "valueMeta": meta }]
     });
-    format_resource_response(status, headers, &parameters, negotiated.format)
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &parameters, negotiated.format)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tag(system: &str, code: &str) -> Value {
-        json!({"system": system, "code": code})
-    }
-
-    #[test]
-    fn meta_input_unwraps_parameters_and_rejects_bad_shapes() {
-        let meta = json!({"tag": [tag("http://t", "a")]});
-        let body = json!({"resourceType": "Parameters",
-            "parameter": [{"name": "meta", "valueMeta": meta}]});
-        assert_eq!(meta_input(&body, "$meta-add").unwrap(), meta);
-
-        // A bare Meta is accepted.
-        assert_eq!(meta_input(&meta, "$meta-add").unwrap(), meta);
-
-        for (body, needle) in [
-            (json!({"resourceType": "Parameters"}), "exactly one 'meta'"),
-            (
-                json!({"resourceType": "Parameters", "parameter": [
-                    {"name": "meta", "valueMeta": meta}, {"name": "meta", "valueMeta": meta}]}),
-                "exactly one 'meta'",
-            ),
-            (
-                json!({"resourceType": "Parameters", "parameter": [{"name": "meta"}]}),
-                "must carry a valueMeta",
-            ),
-            (
-                json!({"resourceType": "Parameters", "parameter": [
-                    {"name": "meta", "valueMeta": {"tag": "x"}}]}),
-                "meta.tag must be an array",
-            ),
-            (
-                json!({"resourceType": "Parameters", "parameter": [
-                    {"name": "meta", "valueMeta": {"tag": [{"system": "http://t"}]}}]}),
-                "Coding with a code",
-            ),
-            (
-                json!({"resourceType": "Parameters", "parameter": [
-                    {"name": "meta", "valueMeta": {"profile": [""]}}]}),
-                "canonical URL string",
-            ),
-            (
-                json!({"resourceType": "Parameters", "parameter": [
-                    {"name": "meta", "valueMeta": {"versionId": "3"}}]}),
-                "at least one of profile, security or tag",
-            ),
-            (json!({"resourceType": "Patient"}), "not Patient"),
-            (json!([]), "expects a Parameters"),
-        ] {
-            let err = meta_input(&body, "$meta-add").unwrap_err();
-            assert!(
-                matches!(&err, RestError::BadRequest { message } if message.contains(needle)),
-                "{body}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn merge_list_adds_without_duplicates_and_deletes_by_system_and_code() {
-        let mut meta = Map::new();
-        meta.insert(
-            "tag".to_string(),
-            json!([tag("http://t", "a"), tag("http://t", "b")]),
-        );
-
-        // Add: `a` already there (display ignored), `c` new.
-        let input = json!({"tag": [
-            {"system": "http://t", "code": "a", "display": "A"}, tag("http://t", "c")]});
-        assert!(merge_list(
-            &mut meta,
-            &input,
-            "tag",
-            MetaChange::Add,
-            same_coding
-        ));
-        assert_eq!(
-            meta["tag"],
-            json!([
-                tag("http://t", "a"),
-                tag("http://t", "b"),
-                tag("http://t", "c")
-            ])
-        );
-        // Adding again changes nothing.
-        assert!(!merge_list(
-            &mut meta,
-            &input,
-            "tag",
-            MetaChange::Add,
-            same_coding
-        ));
-        // Absent key in the input: nothing to do.
-        assert!(!merge_list(
-            &mut meta,
-            &input,
-            "security",
-            MetaChange::Add,
-            same_coding
-        ));
-
-        // Delete: `b` and an unknown one.
-        let input = json!({"tag": [tag("http://t", "b"), tag("http://t", "zzz")]});
-        assert!(merge_list(
-            &mut meta,
-            &input,
-            "tag",
-            MetaChange::Delete,
-            same_coding
-        ));
-        assert_eq!(
-            meta["tag"],
-            json!([tag("http://t", "a"), tag("http://t", "c")])
-        );
-        // Same system, different code is not a match; same code, other system neither.
-        let input = json!({"tag": [tag("http://other", "a")]});
-        assert!(!merge_list(
-            &mut meta,
-            &input,
-            "tag",
-            MetaChange::Delete,
-            same_coding
-        ));
-
-        // Deleting the last entries removes the key altogether.
-        let input = json!({"tag": [tag("http://t", "a"), tag("http://t", "c")]});
-        assert!(merge_list(
-            &mut meta,
-            &input,
-            "tag",
-            MetaChange::Delete,
-            same_coding
-        ));
-        assert!(!meta.contains_key("tag"));
-
-        // Profiles compare as strings.
-        let input = json!({"profile": ["http://p/1", "http://p/1"]});
-        assert!(merge_list(
-            &mut meta,
-            &input,
-            "profile",
-            MetaChange::Add,
-            |a, b| a == b
-        ));
-        assert_eq!(meta["profile"], json!(["http://p/1"]));
-    }
-
-    #[test]
-    fn distinct_codings_collapses_displays() {
-        let v = |code: &str, display: Option<&str>| DistinctMetaValue {
-            system: Some("http://t".into()),
-            code: Some(code.into()),
-            display: display.map(str::to_string),
-            uri: None,
-        };
-        let out = distinct_codings(&[
-            v("a", None),
-            v("a", Some("A")),
-            v("b", Some("B")),
-            v("a", Some("A2")),
-        ]);
-        assert_eq!(out, vec![v("a", Some("A")), v("b", Some("B"))]);
-    }
-
-    #[test]
-    fn coding_of_keeps_system_and_display_when_indexed() {
-        assert_eq!(
-            coding_of(&DistinctMetaValue {
-                system: Some("http://t".into()),
-                code: Some("a".into()),
-                display: Some("A".into()),
-                uri: None,
-            }),
-            Some(json!({"system": "http://t", "code": "a", "display": "A"}))
-        );
-        assert_eq!(
-            coding_of(&DistinctMetaValue {
-                code: Some("a".into()),
-                ..Default::default()
-            }),
-            Some(json!({"code": "a"}))
-        );
-        assert_eq!(coding_of(&DistinctMetaValue::default()), None);
-    }
-}

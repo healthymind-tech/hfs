@@ -194,10 +194,13 @@ impl SubscriptionEngine {
     ) -> Self {
         let config = config.normalize_dispatch_limits();
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
-        let manager = Arc::new(SubscriptionManager::new(
-            Arc::clone(&topic_registry),
-            config.supported_channel_types.clone(),
-        ));
+        let manager = Arc::new(
+            SubscriptionManager::new(
+                Arc::clone(&topic_registry),
+                config.supported_channel_types.clone(),
+            )
+            .with_event_history_size(config.event_history_size),
+        );
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
         let rest_hook_channel = Arc::new(RestHookChannel::new());
         let ws_manager = Arc::new(WebSocketManager::new());

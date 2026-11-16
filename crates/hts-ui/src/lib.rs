@@ -43,6 +43,11 @@
 //! own schedules.
 
 mod admin;
+// Not referenced yet, but linked on purpose: the crate's `R4`/`R4B`/`R5`/`R6`
+// features select the FHIR version through `helios-fhir` so it matches the
+// hts binary (see Cargo.toml).
+use helios_fhir as _;
+
 mod capability;
 mod chart;
 mod code_systems;

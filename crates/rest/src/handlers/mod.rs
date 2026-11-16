@@ -91,8 +91,9 @@ pub use history::{
     history_system_handler, history_type_handler,
 };
 pub use meta::{
-    meta_add_handler, meta_delete_handler, meta_instance_handler, meta_system_handler,
-    meta_type_handler,
+    meta_add_handler, meta_delete_handler, meta_instance_handler,
+    meta_summary_not_supported_handler, meta_system_handler, meta_type_handler,
+    meta_version_handler,
 };
 pub use nl_search::nl_search_handler;
 pub use patch::{conditional_patch_handler, patch_handler};

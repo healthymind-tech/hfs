@@ -402,7 +402,9 @@ where
             get(handlers::validate_instance_get_handler::<S>)
                 .post(handlers::validate_instance_post_handler::<S>),
         )
-        // $meta / $meta-add / $meta-delete — type and instance level.
+        // `$meta`, `$meta-add`, `$meta-delete` — before the catch-alls, like
+        // `$validate`. System and type level answer the labels in use (fork);
+        // instance and version level the resource's own meta.
         .route(
             "/{resource_type}/$meta",
             get(handlers::meta_type_handler::<S>).post(handlers::meta_type_handler::<S>),
@@ -410,6 +412,10 @@ where
         .route(
             "/{resource_type}/{id}/$meta",
             get(handlers::meta_instance_handler::<S>).post(handlers::meta_instance_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta",
+            get(handlers::meta_version_handler::<S>).post(handlers::meta_version_handler::<S>),
         )
         .route(
             "/{resource_type}/{id}/$meta-add",

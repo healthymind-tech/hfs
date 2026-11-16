@@ -530,6 +530,42 @@ where
     .await
 }
 
+/// The lock plan of a multi-key write set as one simple-query text: the
+/// shared tenant gate first, then every resource key, exclusive, in the
+/// ascending order `keys` arrives in.
+///
+/// The keys go through one `unnest` statement rather than one `SELECT
+/// pg_advisory_xact_lock(...)` per key. PostgreSQL executes the function once
+/// per row of the subquery, and that subquery is sorted on the array
+/// ordinal — a subquery with its own `ORDER BY` is never flattened into the
+/// outer query, so the sort is a real node and the rows reach the function in
+/// array order. The keys are already ascending, so the lock order is the one
+/// the per-statement form had, and overlapping write sets still cannot
+/// deadlock each other. `count(...)` collapses the result to one row so the
+/// message carries no result rows worth mentioning.
+///
+/// The text contains only locally derived i32 keys and fixed namespaces,
+/// never tenant or resource strings.
+fn shared_write_locks_sql(gate: i32, keys: &[i32]) -> String {
+    use std::fmt::Write;
+    let mut sql = String::with_capacity(keys.len() * 12 + 256);
+    write!(
+        sql,
+        "SELECT pg_advisory_xact_lock_shared({TENANT_GATE_NAMESPACE}, {gate}); \
+         SELECT count(pg_advisory_xact_lock({RESOURCE_LOCK_NAMESPACE}, k)) \
+         FROM (SELECT k FROM unnest(ARRAY["
+    )
+    .expect("writing to String cannot fail");
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        write!(sql, "{key}").expect("writing to String cannot fail");
+    }
+    sql.push_str("]::int4[]) WITH ORDINALITY AS u(k, n) ORDER BY n) AS s");
+    sql
+}
+
 /// Locks the whole tenant: exclusive tenant gate, no resource keys.
 ///
 /// The exclusive gate conflicts with every shared gate holder, so this waits
@@ -664,6 +700,20 @@ mod tests {
              SELECT pg_advisory_xact_lock_shared(1212568387, -594198615); \
              ROLLBACK TO SAVEPOINT hfs_criteria_wait; \
              RELEASE SAVEPOINT hfs_criteria_wait"
+        );
+    }
+
+    /// The multi-key plan is one message: the shared gate, then the keys in
+    /// the order given, through a sorted subquery so the lock order is the
+    /// array order.
+    #[test]
+    fn shared_write_locks_sql_takes_the_gate_then_every_key_in_order() {
+        assert_eq!(
+            shared_write_locks_sql(-2026577464, &[-5, 7, 261144589]),
+            "SELECT pg_advisory_xact_lock_shared(1212568391, -2026577464); \
+             SELECT count(pg_advisory_xact_lock(1212568402, k)) \
+             FROM (SELECT k FROM unnest(ARRAY[-5,7,261144589]::int4[]) \
+             WITH ORDINALITY AS u(k, n) ORDER BY n) AS s"
         );
     }
 
