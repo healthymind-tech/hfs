@@ -14014,6 +14014,7 @@ mod postgres_integration {
     /// seek when PostgreSQL plans the complete count query with or without bind
     /// values available.
     #[tokio::test]
+    #[ignore = "the search_index-only count it inspects is disabled (COUNT_FROM_INDEX_ALONE, orphan rows #2074)"]
     async fn postgres_reference_bare_id_count_plan_uses_target_index_for_custom_and_generic_plans()
     {
         use helios_persistence::core::SearchProvider;

@@ -1677,8 +1677,14 @@ impl SearchProvider for PostgresBackend {
                 // rows (`null_timestamp_facts`): legacy top-level rows written
                 // before `last_updated` was denormalized carry NULL and would
                 // be missed (upstream #2074 legacy fallback).
+                // Disabled at the v0.2.9 merge: upstream tolerates orphan
+                // `search_index` rows (no live resource; #2074) and a count from
+                // the index alone includes them. The resources-joined count
+                // below is exact; `_summary=count` on a broad token pays for it
+                // (~240 ms at 18k matches instead of ~15 ms).
                 let single = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
-                    .filter(|_| query.fhir_version.is_none());
+                    .filter(|_| query.fhir_version.is_none())
+                    .filter(|_| COUNT_FROM_INDEX_ALONE);
                 let single = match single {
                     Some(pred) if super::null_timestamp_facts::enabled() => {
                         match super::null_timestamp_facts::param_name_of(&pred) {
@@ -3464,3 +3470,8 @@ mod eligible_cache_runtime_tests {
         assert_eq!(ids(&backend, &scope).await, first);
     }
 }
+
+/// Whether `search_count` may count a lone membership test from
+/// `search_index` without joining `resources` (fork hm/p3-pgops2). Off: the
+/// index can hold orphan rows (see upstream #2074), which that count includes.
+const COUNT_FROM_INDEX_ALONE: bool = false;
