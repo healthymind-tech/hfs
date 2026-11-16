@@ -617,6 +617,11 @@ fn choose_walk_driver(estimates: &[f64], roles: &[WalkRole]) -> usize {
         .unwrap_or(0)
 }
 
+/// Token lists with more values than this are reduced to the codes present
+/// before the search is planned; see
+/// `PostgresBackend::reduce_long_token_lists`.
+const TOKEN_LIST_REDUCE_MIN: usize = 1000;
+
 /// How long the null fractions read from `pg_stats` are reused.
 const VALUE_NULL_FRACTION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -817,6 +822,75 @@ impl PostgresBackend {
         Ok(Some((predicates, driver)))
     }
 
+    /// The query with every very long token list cut down to the codes that
+    /// occur at all for that parameter, or `None` when nothing needs it.
+    ///
+    /// PostgreSQL estimates `value_token_code = ANY(<constant array>)` element
+    /// by element against the column's MCV list, so planning grows with the
+    /// list: a 5,000-code `code:in` (an eCQM ValueSet) planned for 160 ms and
+    /// executed in 2 ms on 2.24M resources. Most codes of such a ValueSet
+    /// never occur in a given database (297 distinct Condition codes there).
+    /// One correlated probe per distinct code — `unnest($codes)` against
+    /// `idx_search_token_code`, ~7 µs each — finds the ones that do, and only
+    /// those reach the search. Dropping a code that has no row for this
+    /// tenant, type and parameter cannot change which resources match, with
+    /// or without `:not`; a list left with no present code keeps its first
+    /// value so it still matches nothing (rather than being dropped).
+    ///
+    /// Lists of at most [`TOKEN_LIST_REDUCE_MIN`] values are left alone: their
+    /// planning costs less than the probe.
+    async fn reduce_long_token_lists(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<SearchQuery>> {
+        fn code_of(value: &str) -> &str {
+            value.split_once('|').map_or(value, |(_, code)| code)
+        }
+        let eligible = |p: &crate::types::SearchParameter| {
+            p.param_type == crate::types::SearchParamType::Token
+                && p.values.len() > TOKEN_LIST_REDUCE_MIN
+                // `_id` is answered from `resources`, not `search_index`.
+                && !super::search::writer::answered_from_resources(&p.name)
+                && p.chain.is_empty()
+                && matches!(p.modifier, None | Some(crate::types::SearchModifier::Not))
+                && p.values.iter().all(|v| !code_of(&v.value).is_empty())
+        };
+        if !query.parameters.iter().any(eligible) {
+            return Ok(None);
+        }
+        let mut reduced = query.clone();
+        let tenant_id = tenant.tenant_id().as_str();
+        for param in reduced.parameters.iter_mut().filter(|p| eligible(p)) {
+            let mut codes: Vec<String> = param
+                .values
+                .iter()
+                .map(|v| code_of(&v.value).to_string())
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            let rows = client
+                .query(
+                    "SELECT t.v FROM unnest($4::text[]) AS t(v)
+                     WHERE EXISTS (SELECT 1 FROM search_index s
+                                   WHERE s.tenant_id = $1 AND s.resource_type = $2
+                                     AND s.param_name = $3 AND s.value_token_code = t.v
+                                   OFFSET 0)",
+                    &[&tenant_id, &query.resource_type, &param.name, &codes],
+                )
+                .await
+                .or_query_error("Failed to reduce a long token list")?;
+            let present: HashSet<String> = rows.into_iter().map(|r| r.get(0)).collect();
+            let first = param.values[0].clone();
+            param.values.retain(|v| present.contains(code_of(&v.value)));
+            if param.values.is_empty() {
+                param.values.push(first);
+            }
+        }
+        Ok(Some(reduced))
+    }
+
     /// `pg_stats.null_frac` of a `search_index` value column, cached for
     /// [`VALUE_NULL_FRACTION_TTL`]. `None` before the table is analysed or
     /// when the statistics cannot be read; the estimate is then used as is.
@@ -897,6 +971,8 @@ impl PostgresBackend {
             query,
             self.supports_native_reverse_chains(tenant, query),
         )?;
+        let reduced = self.reduce_long_token_lists(client, tenant, query).await?;
+        let query = reduced.as_ref().unwrap_or(query);
 
         reject_legacy_composites(client, tenant, query, self.index_layout()).await?;
 
@@ -1527,6 +1603,8 @@ impl SearchProvider for PostgresBackend {
 
         let client = self.get_client().await?;
         reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
+        let reduced = self.reduce_long_token_lists(&client, tenant, query).await?;
+        let query = reduced.as_ref().unwrap_or(query);
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let version_clause = fhir_version_clause(query, "fhir_version");
