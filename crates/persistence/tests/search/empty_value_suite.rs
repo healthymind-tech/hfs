@@ -41,6 +41,8 @@ use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// What every empty value must come back as.
 const REJECTED: &str = "EmptyValue";
 
@@ -162,15 +164,21 @@ fn chained(values: &[&str]) -> SearchQuery {
         .with_count(100)
 }
 
-/// `Patient?_has:Observation:subject:<param>=<value>`; the value is unsplit.
+/// `Patient?_has:Observation:subject:<param>=<value>`; the value is unsplit,
+/// and `param:modifier` is split into the parameter and its typed modifier.
 fn has(param: &str, value: &str) -> SearchQuery {
+    let (param, modifier) = match param.split_once(':') {
+        Some((name, m)) => (
+            name,
+            Some(SearchModifier::parse(m).expect("a search modifier")),
+        ),
+        None => (param, None),
+    };
+    let mut chain =
+        ReverseChainedParameter::terminal("Observation", "subject", param, SearchValue::eq(value));
+    chain.modifier = modifier;
     let mut query = SearchQuery::new("Patient").with_count(100);
-    query.reverse_chains = vec![ReverseChainedParameter::terminal(
-        "Observation",
-        "subject",
-        param,
-        SearchValue::eq(value),
-    )];
+    query.reverse_chains = vec![chain];
     query
 }
 
@@ -257,7 +265,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
             .expect("typed")
             .to_string();
         backend
-            .create(tenant, &resource_type, resource, version)
+            .seed_create(tenant, &resource_type, resource, version)
             .await
             .expect("seed resource");
     }

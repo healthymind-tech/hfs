@@ -14,11 +14,44 @@
 //! Kick-off returns `202 Accepted` immediately with a job id; the rebuild runs
 //! in the background.
 //!
+//! # Parameters
+//!
+//! An optional `Parameters` body:
+//!
+//! | Parameter | Type | Effect |
+//! |---|---|---|
+//! | `clearExisting` | `valueBoolean` | Rebuild the run's scope, then drop the index entries of resources the source no longer holds. The index is not emptied first, so a crashed, cancelled or failed run leaves the old index usable |
+//! | `clearOnly` | `valueBoolean` | Empty the run's scope and do not rebuild it. Destructive by design: the scope stays empty until a later rebuild; a failure names the writers already cleared |
+//! | `metadataOnly` | `valueBoolean` | Recompute only per-resource search metadata (MongoDB's `missing_params`) and leave the search index untouched |
+//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources whose metadata is already current |
+//! | `batchSize` | `valueInteger` | Resources per page |
+//! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
+//! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
+//!
+//! Ids compare as strings, byte by byte, on every backend (PostgreSQL compares
+//! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
+//! end (each `idEnd` the next `idStart`) cover a type exactly once. An invalid
+//! combination is `400` before a job starts; an id range on a backend without
+//! range support (S3, Elasticsearch as the source) is `501`, and so is
+//! `metadataOnly` on a deployment without per-resource search metadata (every
+//! backend but MongoDB, including MongoDB with search offloaded, #2008).
+//!
+//! On SQLite, ranges started together mostly queue on its single writer, and
+//! can see the busy → `503` path, rather than rebuild in parallel. They are
+//! for splitting a large rebuild into slices that can be resumed or retried
+//! one at a time.
+//!
 //! # Authorization
 //!
 //! Gated on the `system/reindex` operation scope, following `system/bulk-submit`
 //! — not on ordinary `Update` scope. A reindex rewrites the entire search index
 //! for a tenant, which is an administrative operation, not a resource write.
+//!
+//! # Job visibility
+//!
+//! A job belongs to the tenant that started it. `GET` and `DELETE` on
+//! `/$reindex-status/{job_id}` from any other tenant answer `404`, the same as
+//! for an unknown id, so the job's existence is not disclosed (#2281).
 //!
 //! # Job state is per-process
 //!
@@ -46,7 +79,7 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::search::{ReindexOperation, ReindexRequest};
+use helios_persistence::search::{ReindexError, ReindexOperation, ReindexRequest};
 use serde_json::json;
 
 use crate::error::{RestError, RestResult};
@@ -129,38 +162,7 @@ where
     check_reindex_scope(principal)?;
     let op = driver(state)?;
     let body = read_optional_json_body(http_request).await?;
-
-    let mut request = ReindexRequest::default();
-    request.resource_types = resource_types;
-
-    // Optional Parameters body: `clearExisting` drops the existing entries
-    // before rebuilding, `batchSize` tunes the page size.
-    if let Some(params) = &body {
-        for param in params
-            .get("parameter")
-            .and_then(|p| p.as_array())
-            .into_iter()
-            .flatten()
-        {
-            match param.get("name").and_then(|n| n.as_str()) {
-                Some("clearExisting") => {
-                    request.clear_existing = param
-                        .get("valueBoolean")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                }
-                Some("batchSize") => {
-                    if let Some(size) = param
-                        .get("valueInteger")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        request.batch_size = batch_size_param(size);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    let request = parse_reindex_request(resource_types, body.as_ref())?;
 
     // The requesting principal is threaded into the job so the terminal audit
     // event can attribute the rebuild. The job runs in the background, long
@@ -170,8 +172,15 @@ where
     let job_id = op
         .start(tenant.context().clone(), request, agent)
         .await
-        .map_err(|e| RestError::BadRequest {
-            message: format!("failed to start reindex: {e}"),
+        .map_err(|e| match e {
+            // A capability the backend lacks (an id range on a source
+            // without range support) is 501, as everywhere else (#1739).
+            ReindexError::Unsupported { .. } => RestError::NotImplemented {
+                feature: e.to_string(),
+            },
+            e => RestError::BadRequest {
+                message: format!("failed to start reindex: {e}"),
+            },
         })?;
 
     Ok((
@@ -185,6 +194,74 @@ where
         })),
     )
         .into_response())
+}
+
+/// Builds the request from the optional `Parameters` body (see the module
+/// docs) and rejects an invalid combination with 400.
+fn parse_reindex_request(
+    resource_types: Option<Vec<String>>,
+    body: Option<&serde_json::Value>,
+) -> RestResult<ReindexRequest> {
+    let mut request = ReindexRequest::default();
+    request.resource_types = resource_types;
+
+    let bad_request = |message: String| RestError::BadRequest { message };
+    for param in body
+        .and_then(|params| params.get("parameter"))
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match param.get("name").and_then(|n| n.as_str()) {
+            Some("clearExisting") => {
+                request.clear_existing = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            Some("clearOnly") => {
+                request.clear_only = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request("clearOnly requires valueBoolean".to_string()))?;
+            }
+            Some(name @ ("metadataOnly" | "skipExistingMetadata")) => {
+                let on = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueBoolean")))?;
+                if name == "metadataOnly" {
+                    request.metadata_only = on;
+                } else {
+                    request.skip_existing_metadata = on;
+                }
+            }
+            Some(name @ ("idStart" | "idEnd")) => {
+                let id = param
+                    .get("valueString")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueString")))?
+                    .to_string();
+                if name == "idStart" {
+                    request.id_start = Some(id);
+                } else {
+                    request.id_end = Some(id);
+                }
+            }
+            Some("batchSize") => {
+                if let Some(size) = param
+                    .get("valueInteger")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    request.batch_size = batch_size_param(size);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    request.validate().map_err(|e| bad_request(e.to_string()))?;
+    Ok(request)
 }
 
 /// `POST /$reindex` — reindex every resource type in the tenant.
@@ -215,6 +292,7 @@ where
 /// `GET /$reindex-status/{job_id}` — poll a job's progress.
 pub async fn reindex_status_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -225,8 +303,9 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
+    // A job of another tenant is indistinguishable from an unknown id (#2281).
     let progress = op
-        .get_progress(&job_id)
+        .get_progress_for_tenant(tenant.tenant_id(), &job_id)
         .await
         .ok_or_else(|| RestError::NotFound {
             resource_type: "ReindexJob".to_string(),
@@ -239,6 +318,7 @@ where
 /// `DELETE /$reindex-status/{job_id}` — cancel a running job.
 pub async fn reindex_cancel_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -249,10 +329,12 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
-    op.cancel(&job_id).await.map_err(|_| RestError::NotFound {
-        resource_type: "ReindexJob".to_string(),
-        id: job_id.clone(),
-    })?;
+    op.cancel_for_tenant(tenant.tenant_id(), &job_id)
+        .await
+        .map_err(|_| RestError::NotFound {
+            resource_type: "ReindexJob".to_string(),
+            id: job_id.clone(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }
@@ -292,6 +374,7 @@ mod tests {
             jti: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             custom_claims: serde_json::Map::new(),
+            ..Default::default()
         }
     }
 
@@ -366,6 +449,178 @@ mod tests {
         assert!(matches!(&error, RestError::BadRequest { message }
             if message.starts_with("failed to read reindex request body:")));
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn parameters(parameter: serde_json::Value) -> serde_json::Value {
+        json!({ "resourceType": "Parameters", "parameter": parameter })
+    }
+
+    fn patient() -> Option<Vec<String>> {
+        Some(vec!["Patient".to_string()])
+    }
+
+    #[test]
+    fn id_range_and_clear_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "idStart", "valueString": "4" },
+            { "name": "idEnd", "valueString": "8" },
+            { "name": "batchSize", "valueInteger": 50 }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+        assert_eq!(request.id_end.as_deref(), Some("8"));
+        assert_eq!(request.batch_size, 50);
+        assert!(!request.clear_only);
+
+        let open_start = parameters(json!([{ "name": "idEnd", "valueString": "4" }]));
+        let request = parse_reindex_request(patient(), Some(&open_start)).unwrap();
+        assert_eq!(request.id_start, None);
+        assert_eq!(request.id_end.as_deref(), Some("4"));
+
+        for resource_types in [patient(), None] {
+            let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": true }]));
+            let request = parse_reindex_request(resource_types.clone(), Some(&body)).unwrap();
+            assert!(request.clear_only);
+            assert_eq!(request.resource_types, resource_types);
+        }
+
+        let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": false }]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(!request.clear_only);
+
+        let request = parse_reindex_request(patient(), None).unwrap();
+        assert_eq!((request.id_start, request.id_end), (None, None));
+        assert!(!request.clear_only);
+    }
+
+    #[test]
+    fn metadata_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "metadataOnly", "valueBoolean": true },
+            { "name": "skipExistingMetadata", "valueBoolean": true },
+            { "name": "idStart", "valueString": "4" }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(request.metadata_only);
+        assert!(request.skip_existing_metadata);
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(!request.metadata_only);
+        assert!(!request.skip_existing_metadata);
+    }
+
+    #[test]
+    fn invalid_metadata_only_parameters_are_rejected() {
+        let cases = [
+            (
+                json!([{ "name": "skipExistingMetadata", "valueBoolean": true }]),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+            (
+                json!([{ "name": "metadataOnly", "valueString": "true" }]),
+                "metadataOnly requires valueBoolean",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+        ];
+        for (parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(patient(), Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_id_range_and_clear_only_parameters_are_rejected() {
+        let cases = [
+            (
+                None,
+                json!([{ "name": "idStart", "valueString": "4" }]),
+                "exactly one resource type",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueInteger": 4 }]),
+                "idStart requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueBoolean": true }]),
+                "idEnd requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "8" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearExisting",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idEnd", "valueString": "8" },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearOnly",
+            ),
+            (
+                patient(),
+                json!([{ "name": "clearOnly", "valueString": "true" }]),
+                "clearOnly requires valueBoolean",
+            ),
+        ];
+        for (resource_types, parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(resource_types, Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]

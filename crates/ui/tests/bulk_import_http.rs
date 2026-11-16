@@ -368,7 +368,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
         )
     );
     assert_eq!(html.matches("bulk-import-section").count(), 1);
-    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush kv-grid--facts">"#));
     assert!(!html.contains(r#"class="card detail""#));
 
     // Machine-readable values stay mono while human-readable labels remain
@@ -523,12 +523,11 @@ async fn deleting_a_submission_returns_to_the_list() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location, "/ui/bulk-import");
 
-    // The detail page for a deleted submission redirects back to the list.
-    let res = app(&ctx)
-        .oneshot(Request::get(&detail_path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    // The detail page for a deleted submission is the not-found page, with
+    // its way back to the list (#1673).
+    let (status, html) = get(&ctx, &detail_path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
 }
 
 /// A loopback Data Recipient that records the kick-off body it receives.
@@ -1973,6 +1972,7 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
+    assert!(!html.contains("kv-grid--facts"));
     assert!(
         html.contains(&format!(r#"action="{detail_path}/abort""#)),
         "abort on the progress card: {html}"
@@ -1995,6 +1995,7 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     );
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
     assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
+    assert!(!html.contains("kv-grid--facts"));
     assert!(html.contains("Processing finished at <code>"), "{html}");
     assert!(!html.contains(&format!(r#"action="{detail_path}/abort""#)));
     assert!(!html.contains(r#"class="card detail""#));
@@ -2274,6 +2275,59 @@ async fn a_warning_only_count_severity_array_completes_the_submission() {
     assert!(detail.contains("submission completed"), "{detail}");
     assert!(!detail.contains("marked failed"), "{detail}");
 }
+
+/// HFS reports resources it stored but could not index during ingest — and
+/// is re-indexing on its own — as `warning` outcomes (#1666). The submission
+/// completes, and the Result card and the log say how many resources were
+/// flagged instead of marking the import failed.
+#[tokio::test]
+async fn a_warning_only_manifest_completes_with_a_reindex_note() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Provenance", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": [{"code": "warning", "count": 132}]
+        }]
+    })))
+    .await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(!detail.contains("marked failed"), "{detail}");
+    assert!(
+        detail.contains(
+            "Status: the recipient flagged 132 resource(s) with warnings \
+             (for example, still being re-indexed for search)."
+        ),
+        "{detail}"
+    );
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<span>Warnings</span>"), "{fragment}");
+    assert!(
+        fragment.contains("132 resources flagged with warnings (e.g. being re-indexed for search)"),
+        "{fragment}"
+    );
+    // The error-file count stays zero: warnings are not error files.
+    assert!(fragment.contains("<div>0</div>"), "{fragment}");
+}
+
+/// A clean manifest renders no Warnings field at all.
+#[tokio::test]
+async fn a_clean_manifest_shows_no_warnings_note() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": []
+    })))
+    .await;
+    let (ctx, detail_path, _detail) = run_one_manifest_to_poll(&recipient).await;
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<span>Output files</span>"), "{fragment}");
+    assert!(!fragment.contains("<span>Warnings</span>"), "{fragment}");
+}
+
 /// A recipient that hands out a fresh poll URL per `$bulk-submit-status`
 /// kick-off, so one test can drive several submissions to different terminal
 /// manifests: the nth submission created polls `manifests[n]`.
@@ -2956,4 +3010,14 @@ async fn a_queued_status_change_is_dropped_once_the_submission_is_closed_out() {
     let stored = read_document(&ctx, &detail_path).await;
     assert!(stored.get("pendingStatus").is_none(), "{stored}");
     assert_eq!(stored["status"], "completed");
+}
+
+/// #1673: the detail of an unknown submission renders the not-found page with
+/// a link back to the Import list, instead of silently redirecting to it.
+#[tokio::test]
+async fn an_unknown_submission_detail_is_the_not_found_page() {
+    let ctx = ctx("http://localhost:9/");
+    let (status, html) = get(&ctx, "/ui/bulk-import/00000000-0000-4000-8000-000000000000").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
 }

@@ -32,6 +32,7 @@ use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows}
 use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse};
 use crate::version_order::version_sort_key;
+use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -413,6 +414,7 @@ async fn search_resources_in_transaction<C>(
 where
     C: GenericClient + Sync,
 {
+    // Read large JSON bodies only after string filtering and pagination.
     let metadata_sql = format!(
         "SELECT {columns}
          FROM {table}
@@ -592,7 +594,7 @@ impl PostgresTerminologyBackend {
         }
 
         info!(
-            database_url = %helios_persistence::core::bulk_submit_input::redact_url(database_url),
+            database_url = %redact_database_url(database_url, "postgres"),
             "PostgreSQL terminology backend initialized"
         );
 
@@ -622,7 +624,7 @@ impl PostgresTerminologyBackend {
     /// Called once at the end of a CLI bulk import so the server's first
     /// request doesn't pay the build cost. For SNOMED CT (~20M closure pairs)
     /// this takes ~30–60 s.
-    pub async fn rebuild_missing_closures(&self) -> Result<(), HtsError> {
+    pub async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
         let mut client = self
             .pool
             .get()
@@ -632,8 +634,7 @@ impl PostgresTerminologyBackend {
             .await
             .map_err(|e| {
                 HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
-            })?;
-        Ok(())
+            })
     }
 }
 
@@ -1125,8 +1126,13 @@ impl PostgresTerminologyBackend {
 
         for cs in &parsed.code_systems {
             let fresh = parsed.fresh_load;
+            let replace_edges = !parsed.chunked;
             guarded!("CodeSystem", cs.url, |c| write_code_system(
-                c, cs, &mut stats, fresh
+                c,
+                cs,
+                &mut stats,
+                fresh,
+                replace_edges
             ));
         }
         for vs in &parsed.value_sets {
@@ -1156,6 +1162,17 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
         self.import_parsed(ctx, parsed).await
+    }
+
+    /// Delegates to the inherent [`Self::rebuild_missing_closures`], then drops
+    /// the response caches when anything was rebuilt: a `$subsumes` answered
+    /// from the closure-less state may be sitting in `subsumes_response_cache`.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        let rebuilt = PostgresTerminologyBackend::rebuild_missing_closures(self).await?;
+        if rebuilt > 0 {
+            self.invalidate_caches();
+        }
+        Ok(rebuilt)
     }
 
     /// Write an already-parsed bundle, skipping the JSON parse step.
@@ -1199,23 +1216,30 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // distinguishes empty from non-empty, and a COUNT over an
         // ever-growing concept set would make each batch of a chunked bulk
         // load scan all previously imported rows.
-        let mut systems_needing_closure: Vec<String> = Vec::new();
+        let mut systems_needing_closure: Vec<(String, Option<String>)> = Vec::new();
+        // `chunked` (fork: native importers' batches) and `defer_closure`
+        // (upstream: `/import?defer_closure=true`) both mark one batch of a
+        // bulk load whose closure is built once at the end.
+        let deferred = parsed.chunked || parsed.defer_closure;
         for cs in &parsed.code_systems {
-            let row = client
-                .query_opt(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM concepts c
-                         JOIN code_systems s ON c.system_id = s.id
-                         WHERE s.url = $1
-                     )",
-                    &[&cs.url],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
-            if !has_concepts {
-                systems_needing_closure.push(cs.url.clone());
+            if deferred {
+                let row = client
+                    .query_opt(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM concepts c
+                             JOIN code_systems s ON c.system_id = s.id
+                             WHERE s.url = $1
+                         )",
+                        &[&cs.url],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+                if has_concepts {
+                    continue;
+                }
             }
+            systems_needing_closure.push((cs.url.clone(), cs.version.clone()));
         }
 
         // First attempt: the whole bundle in one transaction without
@@ -1230,7 +1254,14 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             stats.errors.extend(parsed.parse_errors.iter().cloned());
             let res: Result<(), HtsError> = async {
                 for cs in &parsed.code_systems {
-                    write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await?;
+                    write_code_system(
+                        &tx,
+                        cs,
+                        &mut stats,
+                        parsed.fresh_load,
+                        !parsed.chunked,
+                    )
+                    .await?;
                 }
                 for vs in &parsed.value_sets {
                     write_value_set(&tx, vs, &mut stats).await?;
@@ -1273,23 +1304,28 @@ impl BundleImportBackend for PostgresTerminologyBackend {
 
         // Closure maintenance, as SQLite does it (`import_parsed_sync`):
         // `write_code_system` dropped the closure of every row it wrote.
-        // Systems that were empty before the bundle are rebuilt now. Rows of
-        // an already-populated URL are rebuilt now too when their closure is
-        // gone and the hierarchy is small (a re-import or a new version);
-        // above `CLOSURE_REBUILD_INLINE_MAX_EDGES` edges the system is a
-        // chunked bulk load (SNOMED CT, LOINC), whose closure is built once at
-        // the end of the CLI import / on the next start instead of per batch.
+        // Every exact (url, version) row this bundle wrote is rebuilt now
+        // (upstream #2128: a plain re-import must not leave `$subsumes` / is-a
+        // answering from a wiped closure); a deferred batch of a chunked bulk
+        // load only rebuilds systems that were empty before it. Other rows of
+        // a written URL are rebuilt too when their closure is gone and the
+        // hierarchy is small; above `CLOSURE_REBUILD_INLINE_MAX_EDGES` edges
+        // the closure is built once at the end of the load / on the next start.
         //
         // A URL may map to several `code_systems` rows (versions sharing a
         // canonical URL); each row with hierarchy edges gets its own closure.
         let mut rebuilt: HashSet<String> = HashSet::new();
         for cs in &parsed.code_systems {
             let rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[&cs.url])
+                .query(
+                    "SELECT id, version FROM code_systems WHERE url = $1",
+                    &[&cs.url],
+                )
                 .await
                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             for row in rows {
                 let sid: String = row.get(0);
+                let row_version: Option<String> = row.get(1);
                 if !rebuilt.insert(sid.clone()) {
                     continue;
                 }
@@ -1306,11 +1342,11 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                 if edges == 0 {
                     continue;
                 }
-                let wanted = if systems_needing_closure.contains(&cs.url) {
-                    true
-                } else {
-                    !parsed.chunked && !has_closure && edges <= CLOSURE_REBUILD_INLINE_MAX_EDGES
-                };
+                let listed = systems_needing_closure
+                    .iter()
+                    .any(|(url, version)| url == &cs.url && version == &row_version);
+                let wanted = listed
+                    || (!deferred && !has_closure && edges <= CLOSURE_REBUILD_INLINE_MAX_EDGES);
                 if wanted {
                     if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
                         tracing::warn!(
@@ -1695,6 +1731,24 @@ impl BundleImportBackend for PostgresTerminologyBackend {
 
 // ── PostgreSQL write helpers ───────────────────────────────────────────────────
 
+/// Invalidate complete expansions containing this CodeSystem's concepts.
+/// A remaining row would otherwise mark a partial expansion as fully cached.
+async fn invalidate_expansion_cache_for_system(
+    client: &impl GenericClient,
+    system_url: &str,
+) -> Result<(), HtsError> {
+    client
+        .execute(
+            "DELETE FROM value_set_expansions WHERE value_set_id IN (
+                 SELECT value_set_id FROM value_set_expansions WHERE system_url = $1
+             )",
+            &[&system_url],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    Ok(())
+}
+
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -1759,6 +1813,11 @@ async fn write_code_system(
     // properties/designations is skipped (fast path for first-time bulk loads).
     // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
     skip_child_delete: bool,
+    // When `true` (plain, non-chunked writes) each written concept's old
+    // parent edges are replaced rather than added to, so a re-import that
+    // moves a concept does not leave the old edge behind (upstream #2129).
+    // Chunked bulk loads keep adding: a later batch may repeat a code.
+    replace_edges: bool,
 ) -> Result<(), HtsError> {
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
@@ -1881,9 +1940,20 @@ async fn write_code_system(
     // (upsert, drop the old child rows, insert the new ones).
     let mut batch: Vec<&ParsedConcept> = Vec::with_capacity(CONCEPT_BATCH);
     let mut batch_codes: HashSet<&str> = HashSet::with_capacity(CONCEPT_BATCH);
+    // Codes whose old parent edges this write has already cleared: a bundle
+    // can list a code twice, and the second occurrence must not wipe the edges
+    // the first one inserted (upstream #2129).
+    let mut edges_cleared: HashSet<String> = HashSet::new();
     for concept in &cs.concepts {
         if batch.len() >= CONCEPT_BATCH || batch_codes.contains(concept.code.as_str()) {
-            write_concept_batch(client, &system_id, &batch, skip_child_delete).await?;
+            write_concept_batch(
+                client,
+                &system_id,
+                &batch,
+                skip_child_delete,
+                replace_edges.then_some(&mut edges_cleared),
+            )
+            .await?;
             stats.concepts += batch.len() as u32;
             batch.clear();
             batch_codes.clear();
@@ -1892,7 +1962,14 @@ async fn write_code_system(
         batch.push(concept);
     }
     if !batch.is_empty() {
-        write_concept_batch(client, &system_id, &batch, skip_child_delete).await?;
+        write_concept_batch(
+            client,
+            &system_id,
+            &batch,
+            skip_child_delete,
+            replace_edges.then_some(&mut edges_cleared),
+        )
+        .await?;
         stats.concepts += batch.len() as u32;
     }
 
@@ -1911,11 +1988,14 @@ async fn write_code_system(
     // Cached expansions over this system are stale now (the CRUD path did
     // this already; a bundle import did not, so re-importing a fuller copy
     // of a CodeSystem kept serving the old expansions from the DB cache).
+    // Whole expansions go, not only this system's rows: a remaining row would
+    // otherwise mark a partial expansion as fully cached (upstream #2136).
+    invalidate_expansion_cache_for_system(client, &cs.url).await?;
     client
         .cexec(
-            "DELETE FROM value_set_expansions WHERE system_url = $1
-                OR value_set_id IN (SELECT value_set_id FROM value_set_dependencies
-                                     WHERE dep_url = $1)",
+            "DELETE FROM value_set_expansions
+              WHERE value_set_id IN (SELECT value_set_id FROM value_set_dependencies
+                                      WHERE dep_url = $1)",
             &[&cs.url],
         )
         .await
@@ -1940,6 +2020,7 @@ async fn write_concept_batch(
     system_id: &str,
     batch: &[&ParsedConcept],
     skip_child_delete: bool,
+    edges_cleared: Option<&mut HashSet<String>>,
 ) -> Result<(), HtsError> {
     let db = |e: tokio_postgres::Error| HtsError::StorageError(error_chain(&e));
     let codes: Vec<&str> = batch.iter().map(|c| c.code.as_str()).collect();
@@ -1968,6 +2049,22 @@ async fn write_concept_batch(
         })
     };
 
+    if !skip_child_delete && let Some(cleared) = edges_cleared {
+        let clear: Vec<&str> = batch
+            .iter()
+            .map(|c| c.code.as_str())
+            .filter(|code| cleared.insert((*code).to_owned()))
+            .collect();
+        if !clear.is_empty() {
+            client
+                .cexec(
+                    "DELETE FROM concept_hierarchy WHERE system_id = $1 AND child_code = ANY($2)",
+                    &[&system_id, &clear],
+                )
+                .await
+                .map_err(db)?;
+        }
+    }
     if !skip_child_delete {
         let all: Vec<i64> = ids.values().copied().collect();
         client

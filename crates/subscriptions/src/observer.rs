@@ -8,7 +8,8 @@
 //! [`SubscriptionEngine::on_resource_event`] on a spawned task.
 //!
 //! What gets announced is decided by the write path, not here: a write whose
-//! notice is `None` (for example a conditional create) is deliberately silent,
+//! notice is `None` is deliberately silent (conditional writes are not such a
+//! case: they announce like their unconditional counterparts, upstream #862),
 //! and aggregate [`WriteEvent::Counts`] and purge [`WriteEvent::Erased`] events
 //! never produce a notification.
 

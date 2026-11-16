@@ -479,11 +479,17 @@ pub struct ReverseChainedParameter {
     /// The reference parameter on the source type.
     pub reference_param: String,
 
-    /// The search parameter on the source type, optionally followed by a
-    /// search modifier in FHIR syntax (`code`, `code:not`, `date:missing`) —
-    /// see [`terminal_param`](Self::terminal_param).
+    /// The search parameter on the source type (`code`), without a modifier.
     /// For nested `_has`, this may be empty or "_has" indicating nesting.
     pub search_param: String,
+
+    /// The search modifier on the terminal parameter: `:not` in
+    /// `_has:Observation:subject:code:not=1234-5`, applied to the terminal
+    /// search exactly as on `Observation?code:not=1234-5`. Whether it suits
+    /// the parameter's type is checked by the chain resolver, which is where
+    /// that type becomes known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<SearchModifier>,
 
     /// The search value (None if this is a nested `_has` with further chaining).
     pub value: Option<SearchValue>,
@@ -504,9 +510,16 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: search_param.into(),
+            modifier: None,
             value: Some(value),
             nested: None,
         }
+    }
+
+    /// Sets the search modifier on the terminal parameter.
+    pub fn with_modifier(mut self, modifier: SearchModifier) -> Self {
+        self.modifier = Some(modifier);
+        self
     }
 
     /// Creates a nested reverse chain parameter.
@@ -519,22 +532,18 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: String::new(),
+            modifier: None,
             value: None,
             nested: Some(Box::new(inner)),
         }
     }
 
-    /// Splits [`search_param`](Self::search_param) into the parameter name and
-    /// its modifier suffix, still unparsed: `code:not` is `("code", Some("not"))`.
-    ///
-    /// `_has:Observation:subject:code:not=1234-5` puts a modifier on the
-    /// terminal parameter exactly as `Observation?code:not=1234-5` does. It is
-    /// carried inside `search_param`, as written, rather than in a field of its
-    /// own; parse it with [`SearchModifier::parse`].
-    pub fn terminal_param(&self) -> (&str, Option<&str>) {
-        match self.search_param.split_once(':') {
-            Some((name, modifier)) => (name, Some(modifier)),
-            None => (&self.search_param, None),
+    /// The terminal parameter as a request writes it: `code`, or `code:not`
+    /// with its modifier.
+    pub fn terminal_param_as_written(&self) -> String {
+        match &self.modifier {
+            Some(modifier) => format!("{}:{modifier}", self.search_param),
+            None => self.search_param.clone(),
         }
     }
 
@@ -730,6 +739,17 @@ pub struct SearchQuery {
 
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+
+    /// Restricts the match to resources stored under this FHIR version
+    /// (the `fhir_version` every backend records per resource), when the
+    /// client named one with the `fhirVersion` MIME parameter (#2254).
+    ///
+    /// `None` keeps the version-blind search every backend ran before: a
+    /// request that names no version matches resources of every version.
+    /// Applies to the primary result set only, not to `_include` /
+    /// `_revinclude` targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fhir_version: Option<helios_fhir::FhirVersion>,
 }
 
 /// Compartment membership constraint for a compartment search.
@@ -811,6 +831,33 @@ pub fn strip_reference_version(reference: &str) -> &str {
     }
 }
 
+/// For an absolute `http(s)` FHIR reference
+/// (`<base>/<Type>/<id>[/_history/<vid>]`, optional query/fragment), returns
+/// `Type/id`; `None` for relative references and anything that does not end in
+/// a FHIR `Type/id`. The MongoDB writer stores it as `value_reference_target`
+/// and the backfill derives it with this same function (#2394).
+pub fn absolute_reference_target(reference: &str) -> Option<String> {
+    let rest = reference
+        .strip_prefix("https://")
+        .or_else(|| reference.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let rest = strip_reference_version(rest);
+    let mut segments = rest.rsplit('/');
+    let id = segments.next()?;
+    let resource_type = segments.next()?;
+    // A base must precede `Type/id`: `http://host/Patient/1` has `host`
+    // before it, a bare `http://Patient/1` does not.
+    segments.next()?;
+    let type_ok = resource_type.starts_with(|c: char| c.is_ascii_uppercase())
+        && resource_type.chars().all(|c| c.is_ascii_alphanumeric());
+    let id_ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    (type_ok && id_ok).then(|| format!("{resource_type}/{id}"))
+}
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -851,6 +898,25 @@ impl SearchQuery {
     pub fn with_count(mut self, count: u32) -> Self {
         self.count = Some(count);
         self
+    }
+
+    /// Restricts the search to resources stored under `version` (#2254).
+    pub fn with_fhir_version(mut self, version: helios_fhir::FhirVersion) -> Self {
+        self.fhir_version = Some(version);
+        self
+    }
+
+    /// The stored `fhir_version` value [`Self::fhir_version`] matches, in the
+    /// MIME form every backend writes (`"4.0"`, `"5.0"`, …), or `None` when
+    /// the search is version-blind.
+    pub fn stored_fhir_version(&self) -> Option<&'static str> {
+        self.fhir_version.map(|v| v.as_mime_param())
+    }
+
+    /// Whether `stored` (a resource's recorded version) passes this query's
+    /// version filter.
+    pub fn matches_fhir_version(&self, stored: helios_fhir::FhirVersion) -> bool {
+        self.fhir_version.is_none_or(|v| v == stored)
     }
 
     /// Sets the cursor for keyset pagination.
@@ -1256,5 +1322,41 @@ mod tests {
             iterate: false,
         });
         assert!(with_include.requires_advanced_features());
+    }
+
+    #[test]
+    fn absolute_reference_target_extracts_type_and_id() {
+        let t = |r: &str| absolute_reference_target(r);
+        assert_eq!(
+            t("http://example.org/fhir/Patient/p1").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("https://ehr.example.com/r4/Patient/p1").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("https://ehr.example.com/r4/Patient/p1/_history/2").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("http://h/Patient/p.1?x=1#f").as_deref(),
+            Some("Patient/p.1")
+        );
+        assert_eq!(t("http://h/Patient/p-1/").as_deref(), None);
+    }
+
+    #[test]
+    fn absolute_reference_target_rejects_non_fhir_and_relative() {
+        let t = |r: &str| absolute_reference_target(r);
+        assert_eq!(t("Patient/p1"), None);
+        assert_eq!(t("Patient/p1/_history/3"), None);
+        assert_eq!(t("urn:uuid:1234"), None);
+        assert_eq!(t("http://example.org/"), None);
+        assert_eq!(t("http://example.org/foo"), None);
+        assert_eq!(t("http://Patient/p1"), None, "no base before Type/id");
+        assert_eq!(t("http://h/patient/p1"), None, "type must be capitalised");
+        assert_eq!(t("http://h/Pat_ient/p1"), None);
+        assert_eq!(t(&format!("http://h/Patient/{}", "a".repeat(65))), None);
     }
 }

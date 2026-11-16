@@ -6,7 +6,7 @@
  * `rails.<page>` — is no longer this script's job (#754/#755): the server
  * renders the group from `rails.<page>.recent` (`partials/rail_recent.html`),
  * and on the pages where a rail click is intercepted in-page,
- * `saved-queries.js` repaints the group locally and records the click, the
+ * `search-builder.js` repaints the group locally and records the click, the
  * same way it already owns the rest of that in-page navigation. This script
  * keeps only the two behaviors that apply to every rail item regardless of
  * where it came from — the server-rendered list or the server-rendered
@@ -69,6 +69,22 @@
     return range.getBoundingClientRect().width > label.getBoundingClientRect().width + 0.01;
   }
 
+  /* An open modal dialog (the Resources editor, or a shared `addbox--modal`)
+     paints over the page but leaves the item that opened it focused and,
+     until the pointer moves, hovered. The tooltip sits above the dialog's
+     z-index band, so without this check it would stay drawn over the open
+     dialog (#1770). A dialog's panel only has client rects while it is
+     rendered, which covers both `[hidden]` and a closed `<details>`. */
+  function isUnderOpenModal(item) {
+    var dialogs = document.querySelectorAll('[aria-modal="true"]');
+    for (var i = 0; i < dialogs.length; i++) {
+      if (dialogs[i].getClientRects().length && !dialogs[i].contains(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function show(item) {
     var label = item && item.querySelector(
       ".filter-rail__label, .typegrid__label, .result-cell, .result-id"
@@ -92,6 +108,7 @@
       || !fullName
       || !trigger
       || !(item.hasAttribute("data-tooltip-abbreviated") || isClipped(label))
+      || isUnderOpenModal(item)
     ) {
       hide();
       return false;
@@ -119,8 +136,13 @@
 
     var tooltipRect = tooltip.getBoundingClientRect();
     var gap = 8;
-    var rightFits = itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
-    var leftFits = itemRect.left - gap - tooltipRect.width >= gap;
+    /* A result-table cell has neighbouring columns on both sides, so beside
+       the cell the tooltip would cover them: always go below (or above). */
+    var stacked = item.matches("td");
+    var rightFits = !stacked
+      && itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
+    var leftFits = !stacked
+      && itemRect.left - gap - tooltipRect.width >= gap;
     var left;
     var top;
 
@@ -133,9 +155,9 @@
         window.innerHeight - tooltipRect.height - gap
       );
     } else {
-      /* In the stacked <=1100px layout there may be no room beside the rail.
-         Place the tooltip below (or above) so it never covers the trigger or
-         its right-aligned count. */
+      /* Result cells, and the stacked <=1100px layout where there may be no
+         room beside the rail. Place the tooltip below (or above) so it never
+         covers the trigger or its right-aligned count. */
       left = Math.min(
         Math.max(gap, itemRect.left),
         window.innerWidth - tooltipRect.width - gap
@@ -216,6 +238,12 @@
   });
 
   document.addEventListener("change", refresh);
+  /* Opening a dialog fires none of the events above, so the dialogs announce
+     it: the Resources editor dispatches `hfs:modal-open`, and a shared
+     `<details>` dialog fires `toggle` (which does not bubble, hence the
+     capture-phase listener). */
+  document.addEventListener("hfs:modal-open", refresh);
+  document.addEventListener("toggle", refresh, true);
   window.addEventListener("resize", refresh);
   var scrollFrame = null;
   document.addEventListener("scroll", function () {

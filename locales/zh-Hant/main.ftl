@@ -263,25 +263,9 @@ history-deleted = { $version }是刪除操作——沒有可比較的內容。
 history-parse-error = 無法將這些版本解析為JSON。
 ## Saved queries (#234)
 
-nav-saved-queries = 已儲存的查詢
 
-queries-heading = 已儲存的查詢
-queries-lede = 依資源類型保存FHIR搜尋查詢，並依最近執行時間排序。查詢儲存在你的使用者設定中，可跨裝置同步。
-queries-add-heading = 儲存查詢
-queries-type-label = 資源類型
-queries-type-placeholder = 例如：Patient
-queries-name-label = 名稱
-queries-name-placeholder = 例如：波士頓的Smith家族
-queries-query-label = 查詢字串
-queries-query-placeholder = 例如：name=smith&address-city=Boston
-queries-empty = 尚無已儲存的查詢。請在上方儲存一筆開始使用。
-queries-never-run = 尚未執行
 queries-run = 執行
-queries-rename = 重新命名
 queries-delete = 刪除
-queries-rename-prompt = 新名稱
-queries-confirm-delete = 確定要刪除「{ $name }」嗎？
-queries-unavailable = 無法使用已儲存的查詢：此伺服器的儲存後端不支援個別使用者設定。
 
 ## SearchParameter viewer (#238)
 
@@ -388,7 +372,6 @@ cmp-result-fanout-note = 已排除的類型會被略過而非視為失敗——�
 queries-builder-heading = 搜尋建構器
 queries-url-label = FHIR搜尋URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = 可直接編輯GET URL，或透過下方各列編輯——兩者會保持同步。「執行」會在此執行搜尋並記錄到「最近」；為它命名即可保留在已儲存清單中。
 queries-recent = 最近
 queries-recent-heading = 最近的搜尋
 queries-recent-empty = 尚無最近的搜尋——執行一次即會記錄在此。
@@ -598,7 +581,6 @@ editor-primitive-extension-hint = 此值本身帶有擴充（JSON中以 `_` 開�
 editor-collapse-all = 全部收合
 editor-expand-all = 全部展開
 json-view-toggle-fold = 切換JSON區段
-editor-edit-raw = 編輯原始內容
 editor-versions = 版本
 editor-versions-none = 沒有先前的版本。
 
@@ -1221,7 +1203,6 @@ sql-export-since-invalid = 請輸入有效的FHIR instant，例如2026-08-01T00:
 sql-export-patient-invalid = 只能輸入有效的Patient邏輯ID，以逗號或換行分隔。
 sql-export-group-invalid = 只能輸入有效的Group邏輯ID，以逗號或換行分隔。
 sql-export-advanced = 進階
-sql-export-advanced-meta = 追蹤ID · CSV標題列
 sql-export-field-tracking-id = 追蹤ID
 sql-export-field-tracking-id-hint = 會以clientTrackingId回傳在完成清單（manifest）中。
 sql-export-tracking-id-too-long = 追蹤ID不得超過200個字元。
@@ -1310,7 +1291,6 @@ sql-export-detail-col-output = 輸出
 sql-export-detail-col-subject = 項目
 sql-export-detail-col-files = 檔案
 sql-export-detail-outputs-empty = 此工作未產生任何輸出檔案。
-sql-export-file-fallback = 檔案{ $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->
@@ -2455,3 +2435,98 @@ tenants-delete-title = 確定要取消登錄租戶「{ $id }」嗎？
 tenants-delete-impact = 租戶「{ $id }」目前有 { $count } 筆資源。取消登錄只會將它從租戶登錄表中移除；除非透過 API 清除，否則已儲存的資料會保留。
 tenants-delete-type-id = 請輸入 { $id } 以確認
 tenants-delete-submit = 取消登錄
+
+## ---- Keys added by upstream v0.2.8 (merged into the fork 2026-11) ----
+action-back = 返回
+tenants-stat-total-sub-partial = { $count ->
+    [one] 已登錄 { $count } 個 · 尚未完成探索
+   *[other] 已登錄 { $count } 個 · 尚未完成探索
+}
+tenants-stat-resources-sub-stale = 所有租戶合計 · 可能不是最新
+tenants-stat-pending = 計算中…
+tenants-stat-unavailable = 目前無法取得
+tenants-stat-unsupported = 此儲存後端不提供
+tenants-counts-pending = 正在計算各租戶的資源數…
+tenants-counts-refreshing = 正在更新資源數；目前顯示 { $time } 的數字。
+tenants-counts-ready = 資源數計算於 { $time }。
+tenants-counts-partial = 資源數計算於 { $time }，但並非每個租戶都能檢查。
+tenants-counts-stale = { $time } 的數字可能不是最新：最近一次計算失敗。
+tenants-counts-unavailable = 目前無法取得資源數。
+tenants-counts-unsupported = 此儲存後端無法依租戶計算資源數。
+tenants-counts-presence = 此儲存後端只回報哪些租戶有資料，不回報資源數量。
+tenants-counts-approx-pointers = 數字為近似值：以儲存指標計算，包含已刪除的資源。
+tenants-counts-approx-index = 數字來自搜尋索引，可能落後於最近的寫入。
+tenants-counts-refresh = 重新整理
+tenants-count-pending = 計算中…
+tenants-count-unknown = 未知
+tenants-count-unsupported = 此儲存後端不計算
+tenants-count-unavailable = 無法取得數量
+tenants-count-present = 有資料
+tenants-count-present-note = 有資料；此儲存後端不計算數量
+tenants-count-stale = 可能不是最新
+tenants-count-approx = 近似值，並非有效資源的精確數量
+chart-approximate-history-note = 近似值：依最近的寫入計算，仍在與儲存資料核對。虛線只顯示自從計數器從儲存讀取後所記錄的寫入；較早的歷史仍在載入中。
+chart-legend-history-loading = 歷史載入中
+history-op-create = 建立
+history-op-update = 更新
+history-op-patch = 修補
+history-op-delete = 刪除
+history-op-version = 版本
+history-feed-resource = 資源
+history-feed-version = 版本
+history-feed-interaction = 操作
+history-feed-when = 時間
+history-feed-more = 載入更多
+history-feed-empty = 尚無歷史紀錄。
+history-feed-error = 無法載入歷史紀錄。
+sp-degraded-unsupported = 此儲存後端無法列出搜尋參數——對 /SearchParameter 的自我呼叫回應 501 Not Implemented，因為後端不支援此類型的搜尋。
+sp-empty = 此伺服器沒有儲存此 FHIR 版本的搜尋參數，因此沒有可列出的項目。
+cmp-degraded-unsupported = 此儲存後端無法列出 compartment 定義——對 /CompartmentDefinition 的自我呼叫回應 501 Not Implemented，因為後端不支援此類型的搜尋。
+cmp-empty = 此伺服器沒有儲存此 FHIR 版本的 compartment 定義，因此沒有可列出的項目。
+plain-read = 開啟 {"{type}"} {"{id}"}
+editor-save-target = 將儲存為 { $target }
+editor-id-exists = { $target } 已存在。儲存會為它新增一個版本。
+editor-id-exists-confirm = 儲存新版本
+unsaved-leave-confirm = 有尚未儲存的變更。要捨棄並離開此頁嗎？
+unsaved-leave-action = 捨棄並離開
+confirm-dialog-ok = 確認
+editor-format = 格式化
+editor-format-title = 格式化文件（Shift+Alt+F）
+editor-format-invalid = 請先修正 JSON 語法錯誤再格式化。
+editor-collection-add = 新增
+editor-add-undo-pending = 表單更新中，暫時無法復原。
+editor-add-undo-unavailable = 文件已變更，無法再復原。
+editor-update-failed = 表單更新失敗。請重試變更的欄位，再新增或移除元素。
+bulk-import-result-warnings = 警告
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } 筆資源有警告（例如正在重建搜尋索引）
+   *[other] { $count } 筆資源有警告（例如正在重建搜尋索引）
+}
+ui-combobox-name-now = 目前為 { $name }
+ui-combobox-footer-total = { $count } 筆符合 · 捲動以載入更多
+ui-combobox-footer-more = 還有更多符合項目 · 捲動以載入更多
+ui-combobox-footer-end = 已到結果結尾
+ui-combobox-loading-more = 正在載入更多符合項目…
+bulk-export-run-again = 再次執行
+bulk-export-view-files = 檢視檔案
+bulk-export-more-actions = 更多動作
+bulk-export-detail-job-heading = 工作
+bulk-export-detail-field-scope = 範圍
+bulk-export-detail-field-started = 開始時間
+bulk-export-detail-field-duration = 耗時
+bulk-export-detail-outputs-heading = 輸出檔案
+bulk-export-detail-col-type = 資源類型
+bulk-export-detail-col-files = 檔案
+bulk-export-detail-outputs-empty = 此匯出沒有產生輸出檔案。
+vd-results-running = 查詢執行中…
+vd-quickfix-menu = 快速修正
+sql-rail-no-match = 沒有符合「{ $filter }」的項目。
+sql-rail-clear-filter = 清除篩選
+sql-rail-selection-filtered = 不在依「{ $filter }」篩選後的清單中。
+lib-tables-kind-value-set = ValueSet
+lib-tables-kind-concept-map = ConceptMap
+batch-connection-dropped = 伺服器回應前連線已關閉。如果您的登入工作階段已過期，請重新登入；此 bundle 也可能超過伺服器接受的大小。
+sql-library-select-title = 選擇一個查詢或檢視
+sql-library-select-lede = 從清單中選擇一個項目，或建立新的項目。
+sql-library-unavailable-title = 無法使用此選取項目
+sql-library-unavailable-lede = 無法確認可用的查詢與檢視。

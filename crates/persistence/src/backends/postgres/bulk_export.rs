@@ -19,7 +19,7 @@ use crate::core::bulk_export_worker::{
     abandoned_export_message, export_lease_expiry,
 };
 use crate::core::patient_compartment::PatientCompartmentMatcher;
-use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
+use crate::error::{BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::StoredResource;
 
@@ -1154,7 +1154,7 @@ impl ExportDataProvider for PostgresBackend {
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         if !request.resource_types.is_empty() {
@@ -1176,7 +1176,18 @@ impl ExportDataProvider for PostgresBackend {
             return Ok(valid_types);
         }
 
-        let rows = client
+        // The all-types listing reads every live row of the tenant to find a
+        // few dozen distinct types, so its cost follows the tenant's size.
+        // Lift the session `statement_timeout` for this one statement, as the
+        // reindex listing does (#2040); the session keeps it afterwards.
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin export type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for export type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources
                  WHERE tenant_id = $1 AND is_deleted = FALSE
@@ -1184,7 +1195,10 @@ impl ExportDataProvider for PostgresBackend {
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to query types: {}", e)))?;
+            .or_query_error("Failed to query types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish export type listing")?;
 
         let types: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         Ok(types)
@@ -1218,7 +1232,7 @@ impl ExportDataProvider for PostgresBackend {
         let row = client
             .query_one(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+            .or_query_error("Failed to count resources")?;
 
         let count: i64 = row.get(0);
         Ok(count as u64)
@@ -1270,7 +1284,7 @@ impl ExportDataProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query batch: {}", e)))?;
+            .or_query_error("Failed to query batch")?;
 
         let has_more = rows.len() > batch_size as usize;
         let rows_to_process = if has_more {
@@ -1421,7 +1435,7 @@ impl PatientExportProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query patient ids: {}", e)))?;
+            .or_query_error("Failed to query patient ids")?;
 
         let mut ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
 
@@ -1612,7 +1626,7 @@ impl PatientExportProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
+            .or_query_error("Failed to query compartment")?;
 
         // The cursor advances over every candidate the query returned, kept or
         // not, so a page of candidates that all fail the exact test still

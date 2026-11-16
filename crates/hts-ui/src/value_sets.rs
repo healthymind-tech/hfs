@@ -322,6 +322,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
                 rows: Vec::new(),
                 filters: VsBrowserFilters::default(),
                 total: None,
+                paging: Default::default(),
             }),
             count_over_max: true,
         };

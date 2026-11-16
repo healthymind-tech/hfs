@@ -158,6 +158,7 @@ fn session_principal(session: &helios_auth::Session) -> helios_auth::Principal {
         // identity that keys per-user settings.
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        ..Default::default()
     }
 }
 
@@ -456,6 +457,7 @@ mod selfcall_tests {
             compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
             conformance: source,
             tenants: None,
+            tenant_inventory: None,
             provisioning: Default::default(),
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),

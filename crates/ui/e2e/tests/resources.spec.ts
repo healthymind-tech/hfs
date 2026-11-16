@@ -1,14 +1,66 @@
 import { searchLifecycleTests } from "../pages/search-lifecycle";
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
 import {
   createResource,
   updateResource,
+  seedTwoVersions,
   waitSearchable,
   deleteResources,
 } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
 const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
+test("issue2080 modal History choices follow the rail and a reopened resource", async ({ page, resources, request }) => {
+  const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ModalThemedOne" }] },
+    () => ({ name: [{ family: "ModalThemedTwo" }] }));
+  const single = await createResource(request, "Patient", { name: [{ family: "ModalThemedSingle" }] });
+  const posts: string[] = [];
+  page.on("request", req => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/history/diff") posts.push(req.postData() || "");
+  });
+  try {
+    await waitSearchable(request, "Patient", id);
+    await waitSearchable(request, "Patient", single);
+    await resources.goto("Patient");
+    const builderMode = page.locator("[data-mode-btn=builder]");
+    if (await builderMode.count()) await builderMode.click();
+    await resources.builder.run(`Patient?_id=${id}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    const history = resources.modal.history;
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    expect(posts).toHaveLength(1);
+    await history.chooseTo("1");
+    await expect(history.diff).not.toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(2);
+    await history.versions.first().click();
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(3);
+    await history.toTrigger.click();
+    await history.toTrigger.press("Escape");
+    await expect(history.toTrigger).toHaveAttribute("aria-expanded", "false");
+    await expect(resources.modal.root).toBeVisible();
+    await resources.modal.close();
+
+    await resources.builder.run(`Patient?_id=${single}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    await expect(history.versions).toHaveCount(1);
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.toSelect.locator("option")).toHaveCount(1);
+    expect(posts).toHaveLength(4);
+    await resources.modal.close();
+  } finally { await deleteResources(request, "Patient", [id, single]); }
+});
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -33,6 +85,38 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeHidden();
   await resources.railFilter.fill("");
   await expect(resources.railItem("Patient")).toBeVisible();
+});
+
+test("the rail filter narrows the Recently used group too (#1275)", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Account");
+  await expect(resources.recentGroup).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A term matching nothing leaves the whole rail empty, group and divider included.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentItem("Account")).toBeHidden();
+  await expect(resources.recentGroup).toBeHidden();
+  await expect(resources.recentDivider).toBeHidden();
+
+  await resources.railFilter.fill("accou");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A pick made while a filter is active repaints the group under that
+  // filter: Observation matches and joins it, Account does not.
+  await resources.railFilter.fill("observ");
+  await resources.railItem("Observation").click();
+  await expect(resources.recentItem("Observation")).toBeVisible();
+  await expect(resources.recentItem("Account")).toBeHidden();
+
+  // Under a term matching nothing the group stays hidden, and clearing the
+  // box brings back both entries.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentGroup).toBeHidden();
+  await resources.railFilter.fill("");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentItem("Observation")).toBeVisible();
 });
 
 test("a clipped rail name keeps its shared hover and focus tooltip", async ({
@@ -358,7 +442,7 @@ test("URL encoding: Resources and deep links retain visual ampersands", async ({
       .click();
     await expectHydrated(false);
 
-    for (const route of ["/ui/resources", "/ui/queries"]) {
+    for (const route of ["/ui/resources", "/ui/search"]) {
       const url = route + "?url=" + encodeURIComponent(deepLink);
       await page.goto(url, { waitUntil: "networkidle" });
       await switchToBuilderMode(resources);
@@ -597,7 +681,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 });
 
 // "Recently used" group (#603, server-rendered per page since #754/#755):
-// saved-queries.js repaints it in-page on every rail click (cloning the
+// search-builder.js repaints it in-page on every rail click (cloning the
 // live list item — no reload needed to see the effect), and the server keeps
 // the authoritative `rails.resources.recent` list the group would render from
 // on a fresh load.
@@ -694,12 +778,11 @@ test("the recently-used selection survives a reload", async ({ resources, page }
 });
 
 // Recents are per page (#603's shared-across-pages model is gone) — a type
-// picked in Resources must not surface in Search's or Saved Queries' own
+// picked in Resources must not surface in Search's own
 // group.
-test("recents are scoped per page, not shared across Resources, Search, and Saved Queries", async ({
+test("recents are scoped per page, not shared across Resources and Search", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await resources.goto("Patient");
@@ -712,8 +795,6 @@ test("recents are scoped per page, not shared across Resources, Search, and Save
 
   await search.goto();
   await expect(search.recentGroup).toBeHidden();
-  await queries.goto();
-  await expect(queries.recentGroup).toBeHidden();
 
   // And the reverse: Resources never sees what those pages record either.
   await search.goto();
@@ -780,7 +861,6 @@ async function assertRecentsStayPinnedWhileScrolling(resources: ResourcesPage) {
 test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await page.setViewportSize({ width: 1280, height: 700 });
@@ -806,11 +886,6 @@ test("the type rails keep recents and the All Types heading fixed while type ite
     await assertRecentsStayPinnedWhileScrolling(resources);
   });
 
-  await test.step("Saved queries", async () => {
-    await queries.goto("Account");
-    for (const type of picks) await queries.pickType(type);
-    await assertRecentsStayPinnedWhileScrolling(resources);
-  });
 });
 
 test("clicking a recently-used entry selects that type for real", async ({ resources, page }) => {
@@ -824,7 +899,7 @@ test("clicking a recently-used entry selects that type for real", async ({ resou
 });
 
 test("Create new does not register a recently-used entry", async ({ resources }) => {
-  // Create is a <button>, not a rail `<a>`, so saved-queries.js's rail click
+  // Create is a <button>, not a rail `<a>`, so search-builder.js's rail click
   // handler (scoped to `a.filter-rail__item` inside the list or the group,
   // #754/#755) never matches it — even though the default selection
   // (Patient, unpicked) still names it in the button's label. `goto()` with
@@ -915,9 +990,10 @@ test("a long result id shows an 8-character chip on one line and a short id stay
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${longId},${shortId}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const longLink = page.locator(`#query-results-body a.result-id[data-resource-id='${longId}']`);
+  await expect(longLink).toBeVisible();
   await expect(longLink.locator(".result-id__text")).toHaveText(longId.slice(0, 8));
   await expect(longLink).toHaveAccessibleName(longId);
   expect(await longLink.evaluate((el) => el.getClientRects().length)).toBe(1);
@@ -935,9 +1011,9 @@ test("clicking a non-id cell opens the result in the modal", async ({ resources,
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  await resources.results.rows.first().locator("td:last-child").click();
+  await page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child").click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 });
@@ -953,9 +1029,9 @@ test("selecting text in a result row does not open the modal", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const cell = resources.results.rows.first().locator("td:last-child");
+  const cell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child");
   // In Chromium a synthesized pointer click collapses a pre-existing selection
   // before the click event fires, which would defeat the point of this test.
   // Build the selection programmatically and dispatch the click directly: a
@@ -985,8 +1061,8 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 
-  page.once("dialog", (d) => d.accept()); // confirm delete
   await resources.modal.deleteButton.click();
+  await acceptConfirm(page); // the in-page delete confirmation (#1667)
 
   await expect(resources.modal.root).toBeHidden();
   // It's gone from the API.
@@ -1056,7 +1132,7 @@ test("the copy button puts the full id on the clipboard and confirms", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const copyButton = page.locator(
     `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
@@ -1097,20 +1173,20 @@ test("without the Clipboard API no copy button is rendered", async ({ resources,
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   await expect(resources.results.rows).toHaveCount(1);
   await expect(page.locator(".result-id__copy")).toHaveCount(0);
 });
 
-test("the copy label is translated", async ({ page, request }) => {
+test("the copy label is translated", async ({ page, request, resources }) => {
   const id = await createResource(request, "Patient", { name: [{ family: "CopyLabelEs" }] });
   await waitSearchable(request, "Patient", id);
 
   await page.goto("/ui/resources?type=Patient&lang=es", { waitUntil: "networkidle" });
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator("#query-results").waitFor({ state: "visible" });
+  await resources.results.waitDone();
 
   const copyButton = page.locator(
     `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
@@ -1133,9 +1209,11 @@ test("a long result value stays on one line and reveals itself in the shared too
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const nameCell = resources.results.rows.first().locator(".result-cell").nth(0);
+  const nameRow = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`);
+  await expect(nameRow).toBeVisible();
+  const nameCell = nameRow.locator(".result-cell").nth(0);
   expect(await nameCell.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
   expect(await nameCell.evaluate((el) => el.getClientRects().length)).toBe(1);
 
@@ -1158,9 +1236,9 @@ test("a short result value shows no tooltip", async ({ resources, page, request 
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
   await expect(genderCell).toHaveText("male");
   await genderCell.hover();
   await page.waitForTimeout(200);
@@ -1179,7 +1257,7 @@ test("an abbreviated id shows the full id on hover and on keyboard focus", async
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
   const tooltip = page.locator("#filter-rail-tooltip");
@@ -1195,6 +1273,42 @@ test("an abbreviated id shows the full id on hover and on keyboard focus", async
   await expect(tooltip).toBeVisible();
   await expect(tooltip).toHaveText(id);
   await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+});
+
+// #1770: the clicked id keeps focus and hover behind the editor modal, and the
+// tooltip paints above the modal's z-index band, so it must hide on open and
+// stay hidden while the modal covers the results.
+test("an abbreviated id's tooltip hides when its click opens the editor modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "ModalTooltip" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+
+  await link.click();
+  await expect(resources.modal.root).toBeVisible();
+  await expect(tooltip).toBeHidden();
+
+  // Neither pointer movement over the covered id nor the still-focused link
+  // brings it back while the modal is open.
+  const box = await link.boundingBox();
+  if (!box) throw new Error("result id has no layout box");
+  await page.mouse.move(box.x + box.width / 2 + 1, box.y + box.height / 2);
+  await page.waitForTimeout(200);
+  await expect(tooltip).toBeHidden();
 });
 
 // #1106: the pointer resting on a cell with nothing to show must not hide the
@@ -1215,9 +1329,9 @@ test("an abbreviated id keeps its focus tooltip while the pointer rests on a sho
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
   await expect(genderCell).toHaveText("male");
   const genderBox = await genderCell.boundingBox();
   if (!genderBox) throw new Error("gender cell has no layout box");
@@ -1250,7 +1364,7 @@ test("rows with short and long values have the same height", async ({
     .locator("input.query-builder__url[name=url]")
     .fill(`Patient?_id=${shortId},${longId}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(2);
 
   const heights = await resources.results.rows.evaluateAll((rows) =>
@@ -1278,7 +1392,7 @@ test("a full SearchParameter listing shows every attribute the server returned",
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   // The card is already visible from the page's own initial default listing
   // (#1105) — wait for this run's own response to land (an auto-retrying
   // assertion) before reading the headers it produced.
@@ -1302,7 +1416,7 @@ test("_summary=true lists the returned summary elements, not just five", async (
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_summary=true&_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(5);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1317,7 +1431,7 @@ test("_elements keeps overriding the returned attributes", async ({ resources })
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_elements=code,base&_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(5);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1343,7 +1457,7 @@ test("a Patient summary shows every summary element it has, not a hand-picked fo
   await resources.goto("Patient");
   await switchToBuilderMode(resources);
   await resources.builder.run(`Patient?_id=${id}&_summary=true`);
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(1);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1370,7 +1484,7 @@ test("columns are the union across the returned resources", async ({ resources, 
   await resources.goto("Patient");
   await switchToBuilderMode(resources);
   await resources.builder.run(`Patient?_id=${genderOnlyId},${birthDateOnlyId}`);
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(2);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1394,7 +1508,7 @@ test("an empty page falls back to the type's summary columns", async ({ resource
   await switchToBuilderMode(resources);
   await expect(resources.builder.paramOptions.first()).toBeAttached();
   await resources.builder.run("Patient?name=NoSuchPerson1105");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   // The card is already visible from the page's own initial default listing
   // (#1105) — wait for the *new*, empty response to actually land (an
   // auto-retrying assertion) before reading the headers it produced.
@@ -1415,3 +1529,99 @@ test("an empty page falls back to the type's summary columns", async ({ resource
 });
 
 searchLifecycleTests("/ui/resources?type=Patient");
+
+// #1675: "GET /{type}/{id}" in the query box is a read. The type is the
+// segment before the id, so the header and the plain-English line name the
+// real type, Run fetches the resource, and it shows as the one result.
+test("a read by id in the query box opens that resource", async ({ resources, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "ReadById" }] });
+  await resources.goto("Patient");
+  const builderMode = resources.page.locator("[data-mode-btn=builder]");
+  if (await builderMode.count()) await builderMode.click();
+
+  const url = resources.builder.url;
+  await url.fill(`GET /Patient/${id}`);
+  await url.dispatchEvent("change");
+  await url.blur();
+
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.createButton).toContainText("Patient");
+  await expect(resources.builder.plainText).toHaveText(`Open Patient ${id}.`);
+  await expect(resources.builder.sections).toBeHidden();
+
+  await resources.builder.runButton.click();
+  await expect(resources.results.rows).toHaveCount(1);
+  await expect(resources.results.rows.first()).toContainText(id);
+  await expect(resources.results.error).toBeHidden();
+
+  // Back to a search: the builder returns.
+  await resources.builder.setUrl("GET /Patient?_count=5");
+  await expect(resources.builder.sections).toBeVisible();
+});
+
+// #1759: the truncated-cell tooltip goes below (or above) the cell instead of
+// beside it, where it would cover the neighbouring columns.
+test("a result cell's tooltip does not sit beside the cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CellTooltipPlacement" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const cell = link.locator("xpath=ancestor::td");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  const cellBox = await cell.boundingBox();
+  const tipBox = await tooltip.boundingBox();
+  if (!cellBox || !tipBox) throw new Error("cell or tooltip has no layout box");
+  const below = tipBox.y >= cellBox.y + cellBox.height - 1;
+  const above = tipBox.y + tipBox.height <= cellBox.y + 1;
+  expect(below || above).toBe(true);
+});
+
+// #1759: the modal's History tab lists versions as rows (version, date,
+// operation) and marks the compared pair; a bad date never renders as
+// "Invalid Date".
+test("the modal History tab lists versions as rows with date and operation", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "ModalRowOne" }] },
+    () => ({ name: [{ family: "ModalRowTwo" }] }),
+  );
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results-body a.result-id").first().click();
+  await resources.modal.waitOpen();
+  await page.locator('[data-modal-tab="history"]').click();
+
+  const rows = page.locator("#resource-history-versions .history-version");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0).locator(".history-version__id")).toHaveText("v2");
+  await expect(rows.nth(0).locator(".history-version__kind")).toHaveText("current");
+  await expect(rows.nth(1).locator(".history-version__kind")).toHaveText("created");
+  await expect(rows.nth(0)).toHaveClass(/history-version--to/);
+  await expect(rows.nth(1)).toHaveClass(/history-version--from/);
+  for (const i of [0, 1]) {
+    const when = (await rows.nth(i).locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
+});

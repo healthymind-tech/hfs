@@ -30,6 +30,8 @@ use helios_persistence::error::TransactionError;
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, StoredResource};
 
+use crate::seeding::SeedingStorage;
+
 const IDENTIFIER: &str = "http://example.org|12345";
 
 /// The typed form of `identifier=http://example.org|12345`.
@@ -40,6 +42,34 @@ pub fn identifier_criteria() -> Vec<SearchParameter> {
         values: vec![SearchValue::eq(IDENTIFIER)],
         ..Default::default()
     }]
+}
+
+/// Types the criteria of a `Type?criteria` entry the way the REST layer does
+/// before calling the backend (`conditional_entry_criteria`): through the
+/// tenant's registry and the shared builder. Backends take conditional entries
+/// only with typed criteria, so a scenario written with a raw URL goes
+/// through here.
+pub fn with_typed_criteria(
+    backend: &impl helios_persistence::core::SearchProvider,
+    tenant: &TenantContext,
+    mut entry: BundleEntry,
+) -> BundleEntry {
+    let (resource_type, raw) = entry
+        .url
+        .split_once('?')
+        .expect("a conditional entry URL carries criteria");
+    let registry = backend.search_param_registry(tenant);
+    let registry = registry.read();
+    let query = helios_persistence::search::build_conditional_query(
+        &registry,
+        resource_type,
+        raw,
+        helios_persistence::search::ResourceTypeScope::version(FhirVersion::default()),
+    )
+    .expect("criteria build")
+    .expect("criteria select something");
+    entry.criteria = Some(query.parameters);
+    entry
 }
 
 fn patient(family: &str) -> serde_json::Value {
@@ -91,7 +121,7 @@ pub async fn seed_identified_patient<B: BundleProvider>(
     let mut resource = patient(family);
     resource["id"] = json!(id);
     let (stored, _) = backend
-        .create_or_update(tenant, "Patient", id, resource, FhirVersion::default())
+        .seed_put(tenant, "Patient", id, resource, FhirVersion::default())
         .await
         .expect("seed patient");
     stored
@@ -321,10 +351,15 @@ pub async fn overlap_with_an_instance_entry_fails_the_bundle<B: BundleProvider>(
         .expect_err("overlapping identities must fail the bundle");
 
     match err {
-        TransactionError::BundleError { index, message } => {
-            assert_eq!(index, 1, "{message}");
-            assert!(message.contains("Patient/p1"), "{message}");
-            assert!(message.contains("entry 0"), "{message}");
+        TransactionError::OverlappingIdentity {
+            index,
+            identity,
+            other,
+            ..
+        } => {
+            assert_eq!(index, 1, "the conditional entry");
+            assert_eq!(identity, "Patient/p1");
+            assert_eq!(other, 0, "the instance entry it collides with");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -352,7 +387,14 @@ pub async fn two_conditional_entries_resolving_to_one_resource_fail<B: BundlePro
         .expect_err("overlapping identities must fail the bundle");
 
     assert!(
-        matches!(err, TransactionError::BundleError { index: 1, .. }),
+        matches!(
+            err,
+            TransactionError::OverlappingIdentity {
+                index: 1,
+                other: 0,
+                ..
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(family_of(backend, tenant, "p1").await, "Original");
@@ -604,7 +646,14 @@ pub async fn conditional_patch_overlapping_an_instance_entry_fails<B: BundleProv
         .await
         .expect_err("overlapping identities fail the bundle");
     assert!(
-        matches!(err, TransactionError::BundleError { .. }),
+        matches!(
+            err,
+            TransactionError::OverlappingIdentity {
+                index: 1,
+                other: 0,
+                ..
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(family_of(backend, tenant, "p1").await, "Original");

@@ -188,14 +188,14 @@ pub fn check_identity_overlap(
         if let Some(&other) = seen.get(&identity) {
             let entry = &entries[target.entry_index];
             let other_entry = &entries[other];
-            return Err(TransactionError::BundleError {
+            // Both indices stay positions in `entries`: the caller that
+            // reordered the client's Bundle translates them back (#922).
+            return Err(TransactionError::OverlappingIdentity {
                 index: target.entry_index,
-                message: format!(
-                    "{} {} resolves to {identity}, which entry {other} ({} {}) also \
-                     addresses; a transaction whose resolved identities overlap \
-                     fails as a whole (R4 §3.1.0.11.2)",
-                    entry.method, entry.url, other_entry.method, other_entry.url
-                ),
+                entry: format!("{} {}", entry.method, entry.url),
+                identity,
+                other,
+                other_entry: format!("{} {}", other_entry.method, other_entry.url),
             });
         }
         seen.insert(identity, target.entry_index);
@@ -258,7 +258,7 @@ where
 /// `urn:uuid` reference to the entry resolves to the match.
 pub fn conditional_update_entry(updated: StoredResource) -> BundleEntryResult {
     let location = updated.versioned_url();
-    let mut result = BundleEntryResult::ok(updated);
+    let mut result = BundleEntryResult::updated(updated);
     result.location = Some(location);
     result
 }
@@ -415,14 +415,29 @@ mod tests {
         ];
         let targets = vec![target(1, Some(stored("Patient", "p1")))];
         let err = check_identity_overlap(&entries, &targets).expect_err("overlap");
+        let text = err.to_string();
         match err {
-            TransactionError::BundleError { index, message } => {
+            TransactionError::OverlappingIdentity {
+                index,
+                entry,
+                identity,
+                other,
+                other_entry,
+            } => {
+                // Positions in the list the executor received; the REST layer
+                // translates them to the client's (#922).
                 assert_eq!(index, 1);
-                assert!(message.contains("Patient/p1"), "{message}");
-                assert!(message.contains("entry 0"), "{message}");
+                assert_eq!(entry, "PUT Patient?identifier=x");
+                assert_eq!(identity, "Patient/p1");
+                assert_eq!(other, 0);
+                assert_eq!(other_entry, "PUT Patient/p1");
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert!(
+            text.contains("which entry 0 (PUT Patient/p1) also addresses"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -437,7 +452,14 @@ mod tests {
         ];
         let err = check_identity_overlap(&entries, &targets).expect_err("overlap");
         assert!(
-            matches!(err, TransactionError::BundleError { index: 1, .. }),
+            matches!(
+                err,
+                TransactionError::OverlappingIdentity {
+                    index: 1,
+                    other: 0,
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
@@ -455,14 +477,21 @@ mod tests {
     }
 
     #[test]
-    fn update_entry_names_the_updated_version() {
-        let result = conditional_update_entry(stored("Patient", "p1"));
+    fn update_entry_names_the_updated_version_and_records_a_write() {
+        let updated = stored("Patient", "p1");
+        let result = conditional_update_entry(updated.clone());
         assert_eq!(result.status, 200);
         assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
+        assert_eq!(result.effect, crate::core::BundleEntryEffect::Updated);
+        assert!(result.effect.is_write());
+        assert_eq!(result.effect.live_count_delta(), 0);
+        assert_eq!(result.etag.as_deref(), Some(updated.etag()));
         assert_eq!(
-            result.resource.as_ref().and_then(|r| r["id"].as_str()),
-            Some("p1")
+            result.last_modified,
+            Some(updated.last_modified().to_rfc3339())
         );
+        assert_eq!(result.resource, Some(updated.content_with_meta()));
+        assert!(result.outcome.is_none());
     }
 
     #[test]

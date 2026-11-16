@@ -54,7 +54,8 @@
 //!   ([`EffectHandlers::check_extensible`], warning severity); the FHIR
 //!   Schema spec enforces `required` only.
 //! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
-//!   resource and evaluates via `path.all(expr)`, so invariants relying on
+//!   resource and evaluates a nested invariant once per focused node (with
+//!   `%context` bound to that node), so invariants relying on
 //!   nested-resource `%resource` semantics can misfire (helios-fhirpath
 //!   limitation; see `fhirpath_effects`).
 //! - Schema sets are assembled per node without cross-resource memoization;

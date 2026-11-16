@@ -437,6 +437,13 @@ fn populate_designations<'a, B: TerminologyBackend>(
 /// `value` is the full Coding as JSON.
 const CODING_JSON: &str = "CodingJson";
 
+/// `true` when a stored Coding property value is the whole Coding as a JSON
+/// object (the upstream import form for a `valueCoding` without a `code`).
+fn stored_coding_json(value: &str) -> bool {
+    value.starts_with('{')
+        && serde_json::from_str::<Value>(value).is_ok_and(|v| v.is_object())
+}
+
 /// Index the `valueCoding` properties of a stored CodeSystem's concepts by
 /// `(system, concept code, property code, coding code)`.
 fn collect_coding_properties(
@@ -597,7 +604,10 @@ fn populate_properties<'a, B: TerminologyBackend>(
         for (system, pv_opt, cs_opt) in results {
             if let Some(props) = pv_opt {
                 for (code, list) in props {
-                    map.insert((system.clone(), code), list);
+                    map.insert(
+                        (system.clone(), code),
+                        list.into_iter().map(|p| (p.code, p.value)).collect(),
+                    );
                 }
             }
             if let Some(hits) = cs_opt {
@@ -680,6 +690,15 @@ fn populate_properties<'a, B: TerminologyBackend>(
                                     code,
                                     value_type: CODING_JSON.into(),
                                     value: full.to_string(),
+                                };
+                            }
+                            // A valueCoding without a code is stored as the
+                            // whole Coding JSON (upstream #2095).
+                            if stored_coding_json(&value) {
+                                return ExpansionContainsProperty {
+                                    code,
+                                    value_type: CODING_JSON.into(),
+                                    value,
                                 };
                             }
                         }
@@ -1044,7 +1063,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
             .unwrap_or_default();
         let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (code, list) in map {
-            by_code.insert(code, list);
+            by_code.insert(code, list.into_iter().map(|p| (p.code, p.value)).collect());
         }
         // Build a property-code → FHIR-type map from the supplement CodeSystems
         // themselves. The IG `parameters/parameters-expand-supplement-good`
@@ -1087,6 +1106,11 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
                     let value_type = match supp_prop_types.get(prop) {
                         Some(ty) => fhir_property_type_to_value_type(ty),
                         None => "Code".to_string(),
+                    };
+                    let value_type = if value_type == "Coding" && stored_coding_json(value) {
+                        CODING_JSON.to_string()
+                    } else {
+                        value_type
                     };
                     c.properties.push(ExpansionContainsProperty {
                         code: prop.clone(),
@@ -1945,7 +1969,12 @@ pub(crate) async fn process_expand<B: TerminologyBackend>(
     //
     // Canonical `url|version` is folded into `url` + `valueSetVersion` first so
     // the cache key, the negative cache and every resolver below see one shape.
-    let mut params = params;
+    //
+    // A VCL implicit-ValueSet `url` (`http://fhir.org/VCL?v1=…`, upstream
+    // #1830) becomes an inline `valueSet` before any cache key is computed, so
+    // the keys hash the translated body and the `url|version` split / negative
+    // cache never see the VCL expression.
+    let mut params = crate::vcl::rewrite_vcl_params(params)?;
     adopt_limit_param(&mut params);
     let limit = params
         .iter()

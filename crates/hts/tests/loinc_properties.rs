@@ -146,7 +146,7 @@ fn zip(files: &[(&str, &str)]) -> tempfile::NamedTempFile {
         .unwrap();
     {
         let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-        let opts = zip::write::FileOptions::default();
+        let opts = zip::write::SimpleFileOptions::default();
         for (name, body) in files {
             zip.start_file(*name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();

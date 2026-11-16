@@ -28,6 +28,8 @@ use helios_fhir_validator::{
 };
 use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_observability::redact::redact_url;
+use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
@@ -1780,7 +1782,7 @@ impl RemoteTerminologyProvider {
     /// issue says `not-found`, means the server does not know the value set;
     /// anything else is treated as the service being unavailable.
     fn classify_failure(url: &str, status: reqwest::StatusCode, body: &str) -> TerminologyError {
-        let message = format!("{url} returned {status}");
+        let message = format!("{} returned {status}", redact_url(url));
         if status == reqwest::StatusCode::NOT_FOUND {
             return TerminologyError::unknown_value_set(message);
         }
@@ -2061,7 +2063,8 @@ impl RemoteTerminologyProvider {
         let response = send_retrying(|| self.client.post(&url).json(&payload))
             .await
             .map_err(|e| {
-                let detail = error_chain(&e);
+                let detail = redact_urls_in(&error_chain(&e));
+                let url = redact_url(&url);
                 warn!(url = %url, elapsed_ms = started.elapsed().as_millis() as u64, error = %detail,
                       "terminology request failed");
                 TerminologyError::new(format!("request to {url} failed: {detail}"))
@@ -2074,7 +2077,12 @@ impl RemoteTerminologyProvider {
         let body: Value = response
             .json()
             .await
-            .map_err(|e| TerminologyError::new(format!("invalid $validate-code response: {e}")))?;
+            .map_err(|e| {
+                TerminologyError::new(format!(
+                    "invalid $validate-code response: {}",
+                    redact_urls_in(&e.to_string())
+                ))
+            })?;
         let verdict = self.settle(check, key, &url, status, Some(&body), "");
         self.check_unverifiable(check, &body, verdict, language)
             .await
@@ -2115,7 +2123,8 @@ impl RemoteTerminologyProvider {
                 // The server is overloaded or slow on these checks: asking
                 // them again one by one would only add to its load. Each
                 // check is reported as not performed.
-                let detail = error_chain(&e);
+                let detail = redact_urls_in(&error_chain(&e));
+                let url = redact_url(&url);
                 warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                       error = %detail, "terminology batch timed out");
                 return Some(
@@ -2133,7 +2142,7 @@ impl RemoteTerminologyProvider {
             }
             Err(e) => {
                 warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
-                      error = %error_chain(&e), "terminology batch failed; checking one by one");
+                      error = %redact_urls_in(&error_chain(&e)), "terminology batch failed; checking one by one");
                 return None;
             }
         };
@@ -2856,5 +2865,59 @@ mod binding_pin_tests {
             binding_of(&service, url).as_deref(),
             Some("http://ips.test/ValueSet/smoking")
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_terminology_redaction_tests {
+    use super::*;
+
+    /// A terminology-server failure reaches the client in the validation
+    /// OperationOutcome, so its message must not carry the configured URL's
+    /// credentials or query (#2149).
+    fn assert_redacted(message: &str, host: &str) {
+        assert!(!message.contains("SECRET"), "credential leaked: {message}");
+        assert!(message.contains(host), "host missing: {message}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_error_omits_the_url_credentials() {
+        // Port 1 on loopback refuses the connection immediately.
+        let provider = RemoteTerminologyProvider::new(
+            "http://tx:PASS-SECRET@127.0.0.1:1?token=QUERY-SECRET".to_string(),
+            Duration::from_secs(5),
+        );
+        let err = provider
+            .validate_code(
+                "http://hl7.org/fhir/ValueSet/administrative-gender",
+                &CodedValue::Code("male".to_string()),
+            )
+            .await
+            .expect_err("nothing listens on port 1");
+        assert_redacted(err.message(), "127.0.0.1:1");
+    }
+
+    #[tokio::test]
+    async fn error_status_message_omits_the_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app =
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = RemoteTerminologyProvider::new(
+            format!("http://tx:PASS-SECRET@{addr}/fhir"),
+            Duration::from_secs(5),
+        );
+        let err = provider
+            .validate_code(
+                "http://hl7.org/fhir/ValueSet/administrative-gender",
+                &CodedValue::Code("male".to_string()),
+            )
+            .await
+            .expect_err("the server answers 503");
+        assert_redacted(err.message(), &addr.to_string());
+        assert!(err.message().contains("503"), "{}", err.message());
     }
 }

@@ -41,6 +41,11 @@ const DOC_PATH: &str = "/hfs_read-stub_patient/_doc/Patient_p1";
 /// A real 7.17.29 / 8.15.0 answer for a read of an index that does not exist.
 const INDEX_NOT_FOUND: &str = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [hfs_read-stub_patient]","resource.type":"index_or_alias","resource.id":"hfs_read-stub_patient","index_uuid":"_na_","index":"hfs_read-stub_patient"}],"type":"index_not_found_exception","reason":"no such index [hfs_read-stub_patient]","resource.type":"index_or_alias","resource.id":"hfs_read-stub_patient","index_uuid":"_na_","index":"hfs_read-stub_patient"},"status":404}"#;
 
+/// A real 7.17.29 answer for a search over a tenant index glob that matches no
+/// index: a `200` that searched zero shards and carries no `aggregations`
+/// (#1906).
+const ZERO_SHARDS: &str = r#"{"took":0,"timed_out":false,"_shards":{"total":0,"successful":0,"skipped":0,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"max_score":null,"hits":[]}}"#;
+
 /// A real 7.17.29 / 8.15.0 answer for a `GET _doc` of an id that is not in an
 /// index that exists.
 const DOC_NOT_FOUND: &str =
@@ -238,13 +243,18 @@ async fn count_on_an_unreachable_cluster_is_unavailable() {
         .count(&tenant(), Some("Patient"))
         .await
         .expect_err("no answer is not a count of 0");
-    assert!(
-        matches!(
-            error,
-            StorageError::Backend(BackendError::Unavailable { .. })
-        ),
-        "{error:?}"
+    // The client text names the operation only (#2385): the transport error
+    // names the node, the request path and the index, and goes to the log.
+    let StorageError::Backend(BackendError::Unavailable { message, .. }) = &error else {
+        panic!("expected Unavailable, got {error:?}");
+    };
+    assert_eq!(
+        message,
+        "Count failed after 3 attempts: the search index is temporarily unavailable; retry the request"
     );
+    for leaked in ["127.0.0.1", "_count", "hfs_"] {
+        assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+    }
 }
 
 /// `index_not_found_exception` is a count of 0. A `404` that does not carry it
@@ -528,19 +538,23 @@ async fn list_resource_types_retries_and_never_reports_a_failure_as_empty() {
     }
 
     // No index under the tenant's prefix: Elasticsearch answers a wildcard
-    // with an empty `200`, and a concrete missing index by name.
-    let server = MockServer::start().await;
-    on(&server, "POST", TENANT_SEARCH_PATH, |_| {
-        raw_json(404, INDEX_NOT_FOUND)
-    })
-    .await;
-    assert!(
-        backend(&server)
-            .list_resource_types(&tenant())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    // with an empty `200` (zero shards searched, no `aggregations`, #1906),
+    // and a concrete missing index by name.
+    for (status, answer) in [(200, ZERO_SHARDS), (404, INDEX_NOT_FOUND)] {
+        let server = MockServer::start().await;
+        on(&server, "POST", TENANT_SEARCH_PATH, move |_| {
+            raw_json(status, answer)
+        })
+        .await;
+        assert!(
+            backend(&server)
+                .list_resource_types(&tenant())
+                .await
+                .unwrap()
+                .is_empty(),
+            "{status}"
+        );
+    }
 }
 
 /// A failed page is an error. It used to be an empty last page, which ends the

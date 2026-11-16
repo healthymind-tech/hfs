@@ -1,18 +1,24 @@
-//! T2 cluster-harness helpers (docs/cluster-testing-methodology.md §4).
+//! T2 cluster-harness helpers.
 //!
 //! A cluster bug is a multi-observer bug, and the faithful single-process
 //! simulation of two `hfs` instances is two *freshly constructed* backend
 //! handles that share nothing but the backing store (same connection
 //! parameters) — never a cloned `Arc`, which would share an in-process heap
-//! and prove nothing (methodology §7, the cloned-`Arc` anti-pattern).
+//! and prove nothing (the cloned-`Arc` anti-pattern).
 //!
 //! These helpers encode the mechanics every T2 cluster suite reuses: fresh
 //! two-handle construction, barrier-synchronized racing, and the
-//! definition-of-done assertion rows (visibility / isolation / exclusivity,
-//! strategy §4). Calibrated in Phase 0 against the already-cluster-safe
-//! bulk-export job store (`postgres_integration_cluster_bulk_export_*` in
-//! `postgres_tests.rs`); later phases point the same helpers at each new
-//! cluster-capable subsystem.
+//! definition-of-done assertion rows (visibility / isolation / exclusivity).
+//! Calibrated against the already-cluster-safe bulk-export job store
+//! (`postgres_integration_cluster_bulk_export_*` in `postgres_tests.rs`), so
+//! the harness is proven before any product change relies on it; later
+//! cluster-capable subsystems point the same helpers at their own stores.
+
+// This file is `#[path]`-included by several test binaries, and each uses
+// only the helpers its subsystem needs; an unused helper in one binary is not
+// dead code, so the per-binary dead-code lint is silenced here rather than
+// per item.
+#![allow(dead_code)]
 
 use std::future::Future;
 use std::sync::Arc;
@@ -44,7 +50,7 @@ where
 
 /// Runs two futures on separate tasks released simultaneously by a barrier,
 /// so both hit the shared store as close to concurrently as the runtime
-/// allows (the same shape as the D3 cold-start race test).
+/// allows.
 ///
 /// Each future must own everything it touches (`Send + 'static`); move the
 /// handle into an `async move` block and re-observe afterwards through a

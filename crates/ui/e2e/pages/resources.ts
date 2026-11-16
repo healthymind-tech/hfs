@@ -4,7 +4,11 @@
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
 import { SearchBuilder, SearchResults } from "./search-builder";
-import { armDialog, disarmDialog } from "./fixtures";
+import { chooseFixed, fixedTrigger } from "./fixed-select";
+import { acceptConfirm } from "./fixtures";
+
+/** How long closing the modal may take before an unexpected confirmation is assumed. */
+const CLOSE_TIMEOUT_MS = 10_000;
 
 export class ResourcesPage {
   readonly modal: ResourceModal;
@@ -137,23 +141,26 @@ export class ResourceModal {
     await this.editor.doc.waitFor({ state: "attached" });
   }
 
-  async close(): Promise<void> {
-    // Closing with unsaved changes asks a native confirm (#1240); arm
-    // "accept" so this helper keeps closing the modal unconditionally, as it
-    // did before that guard existed. A no-op when the modal is clean — no
-    // dialog fires, and the armed action is cleared right after anyway.
-    armDialog(this.page, "accept");
+  /**
+   * Closes the modal with the × button. A dirty modal asks the in-page
+   * discard confirmation first (#1240, #1667): pass `{ discard: true }` when
+   * the caller knows it is dirty, and it is confirmed. Without it no prompt is
+   * expected — an unexpected one keeps the modal open and the wait for it to
+   * hide fails, rather than being silently accepted.
+   */
+  async close(opts: { discard?: boolean } = {}): Promise<void> {
     // The × button, not the backdrop (which sits behind the editor grid).
     await this.page.locator(".modal__x").click();
-    await this.root.waitFor({ state: "hidden" });
-    disarmDialog(this.page);
+    if (opts.discard) await acceptConfirm(this.page);
+    // Bounded, so an unexpected confirmation fails in seconds, not at the test timeout.
+    await this.root.waitFor({ state: "hidden", timeout: CLOSE_TIMEOUT_MS });
   }
 
-  async closeWithEscape(): Promise<void> {
-    armDialog(this.page, "accept");
+  /** Closes the modal with Escape; `{ discard: true }` as for `close()`. */
+  async closeWithEscape(opts: { discard?: boolean } = {}): Promise<void> {
     await this.page.keyboard.press("Escape");
-    await this.root.waitFor({ state: "hidden" });
-    disarmDialog(this.page);
+    if (opts.discard) await acceptConfirm(this.page);
+    await this.root.waitFor({ state: "hidden", timeout: CLOSE_TIMEOUT_MS });
   }
 
   async save(): Promise<void> {
@@ -184,6 +191,10 @@ export class ModalHistory {
   get toSelect(): Locator {
     return this.page.locator("#resource-history-to");
   }
+  get fromTrigger(): Locator { return fixedTrigger(this.fromSelect); }
+  get toTrigger(): Locator { return fixedTrigger(this.toSelect); }
+  async chooseFrom(value: string): Promise<void> { await chooseFixed(this.fromSelect, value); }
+  async chooseTo(value: string): Promise<void> { await chooseFixed(this.toSelect, value); }
   get metadataCheckbox(): Locator {
     return this.page.locator("#resource-history-metadata");
   }

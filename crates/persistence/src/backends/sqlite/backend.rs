@@ -133,6 +133,9 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
@@ -382,6 +385,11 @@ impl SqliteBackend {
             // never fsyncs anyway.
             if enable_wal && !is_memory {
                 conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
             }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
@@ -508,10 +516,16 @@ impl SqliteBackend {
             );
         }
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
+            wal_path,
             registries,
             write_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -606,6 +620,16 @@ impl SqliteBackend {
     /// completion on the blocking thread and keeps holding its pooled
     /// connection until it does. Expensive scans must therefore still be
     /// bounded at the query level, not by racing a timeout against them.
+    ///
+    /// The same holds earlier on: a future dropped while its task is still
+    /// waiting in `pool.get()` does not withdraw the work. The task goes on
+    /// waiting, and when a connection frees up it acquires it and runs the
+    /// closure with nobody left to read the result. SQLite's `busy_timeout`
+    /// does not help here either: it bounds how long a statement waits for a
+    /// lock, not how long a statement runs once it has one. The storage tests
+    /// `abandoned_run_blocking_keeps_its_connection_until_the_closure_ends` and
+    /// `run_blocking_abandoned_while_acquiring_still_runs_its_closure` pin both
+    /// halves (#1827).
     ///
     /// # Diagnostics
     ///
@@ -765,6 +789,11 @@ impl SqliteBackend {
         }
 
         Ok(())
+    }
+
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
     }
 
     /// Returns whether this is an in-memory database.
@@ -1076,6 +1105,77 @@ mod tests {
             synchronous, 1,
             "a WAL file backend should use synchronous=NORMAL"
         );
+    }
+
+    /// #2365: `init_schema`, the entry point every SQLite start goes through,
+    /// refuses a database that records a newer `schema_version`, names the
+    /// database, and leaves the recorded version alone.
+    #[test]
+    fn init_schema_refuses_a_newer_schema_version_and_names_the_database() {
+        let newer = schema::SCHEMA_VERSION + 1;
+        let set_newer = |backend: &SqliteBackend| {
+            let conn = backend.get_connection().unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [newer])
+                .unwrap();
+        };
+        let stored = |backend: &SqliteBackend| -> i32 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // A database file written by a "newer" build, opened by this one. The
+        // assertion is on the file name, not the full path, because
+        // `sqlite3_db_filename` normalises the path on Windows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        {
+            let backend =
+                SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+            backend.init_schema().unwrap();
+            set_newer(&backend);
+        }
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        let err = backend
+            .init_schema()
+            .expect_err("a newer database must be refused");
+        let message = match err {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                ..
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        };
+        assert!(message.contains("SQLite database '"), "{message}");
+        assert!(message.contains("newer.db'"), "{message}");
+        assert!(
+            message.contains(&format!("has schema_version {newer}")),
+            "{message}"
+        );
+        assert!(!message.contains(":memory:"), "{message}");
+        assert_eq!(
+            stored(&backend),
+            newer,
+            "the stored version must not change"
+        );
+
+        // An in-memory database has no file; `conn.path()` is empty for the
+        // shared-cache URI, so it is labelled `:memory:`.
+        let backend = SqliteBackend::in_memory().unwrap();
+        backend.init_schema().unwrap();
+        set_newer(&backend);
+        let err = backend
+            .init_schema()
+            .expect_err("a newer in-memory database must be refused");
+        assert!(
+            err.to_string().contains("SQLite database ':memory:'"),
+            "{err}"
+        );
+        assert_eq!(stored(&backend), newer);
     }
 
     #[test]

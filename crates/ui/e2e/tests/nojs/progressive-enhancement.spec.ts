@@ -3,7 +3,7 @@ import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../../pages/button-geometry";
-import { createResource, waitSearchable } from "../../pages/api";
+import { createResource, deleteResources, waitSearchable } from "../../pages/api";
 import { langLink, openUserMenu } from "../../pages/user-menu";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
@@ -149,13 +149,13 @@ for (const { path, list, recent, param } of SQL_RAILS) {
     const id =
       param === "vd"
         ? await createResource(request, "ViewDefinition", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             resource: "Patient",
             select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
           })
         : await createResource(request, "Library", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             type: {
               coding: [
@@ -166,19 +166,34 @@ for (const { path, list, recent, param } of SQL_RAILS) {
               ],
             },
           });
-    await waitSearchable(request, param === "vd" ? "ViewDefinition" : "Library", id);
+    const type = param === "vd" ? "ViewDefinition" : "Library";
+    try {
+      await waitSearchable(request, type, id);
 
-    await page.goto(path);
-    const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
-    await expect(item).toBeVisible();
-    await item.click();
-    await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
-    await expect(item).toHaveAttribute("aria-current", "true");
+      // The rail is name-sorted and paged at 50; the suite leaves earlier-sorting
+      // definitions behind, so an unfiltered page 1 may not hold this one.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
+      await expect(item).toBeVisible();
+      await item.click();
+      await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
+      await expect(item).toHaveAttribute("aria-current", "true");
 
-    await page.goto(path);
-    const recentGroup = page.locator(`#${recent}`);
-    await expect(recentGroup).toBeVisible();
-    await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(path);
+      const recentGroup = page.locator(`#${recent}`);
+      await expect(recentGroup).toBeVisible();
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+
+      // The filter narrows the group on a plain GET too (#1275): a matching
+      // term keeps the entry, a term matching nothing hides the group.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(`${path}?filter=zzzznomatch_${stamp}`);
+      await expect(recentGroup).toBeHidden();
+      await expect(recentGroup.locator(".filter-rail__item")).toHaveCount(0);
+    } finally {
+      await deleteResources(request, type, [id]);
+    }
   });
 }
 
@@ -519,14 +534,22 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(card).toContainText("Cancelled");
   await assertSummary();
 
+  await card.locator("details.menu > summary").click();
   const disclosure = card.locator("details.job-card__delete");
   await disclosure.locator("summary").click();
   await expect(disclosure).toHaveAttribute("open", "");
+  const confirmation = disclosure.locator(".job-card__delete-confirm");
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation.locator("p")).toContainText(
+    "and its output files from the server? This cannot be undone.",
+  );
+  await expect(confirmation.getByRole("button", { name: "Delete export" })).toBeVisible();
   await disclosure.getByRole("link", { name: "Keep export" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
 
+  await card.locator("details.menu > summary").click();
   const reopened = card.locator("details.job-card__delete");
   await reopened.locator("summary").click();
   await reopened.getByRole("button", { name: "Delete export" }).click();
@@ -671,7 +694,7 @@ test("Patients scope with an empty ID list submits without JavaScript", async ({
 });
 
 test("issue1577 search lifecycle controls stay hidden without JavaScript", async ({ page }) => {
-  for (const route of ["/ui/resources", "/ui/queries"]) {
+  for (const route of ["/ui/resources", "/ui/search"]) {
     await page.goto(route);
     for (const id of ["query-search-status", "query-search-elapsed", "query-search-cancel", "query-search-slow", "query-results-previous"]) {
       await expect(page.locator(`#${id}`)).toBeHidden();
@@ -679,4 +702,95 @@ test("issue1577 search lifecycle controls stay hidden without JavaScript", async
     await expect(page.locator("#saved-query-form input[name=url]")).toBeVisible();
     await expect(page.locator("[data-intent=run]")).toBeEnabled();
   }
+});
+
+// #1758: Run again is a plain form inside the card's native overflow menu.
+test("Bulk Export Run again adds a new card without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-rerun": {
+      name: "No-JS rerun export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(1);
+    const card = page.locator("#job-nojs-rerun");
+    await card.locator("details.menu > summary").click();
+    await card.getByRole("button", { name: "Run again" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    await expect(card.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+test("an export's own page lists its output files as download links without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-detail": {
+      name: "No-JS detail export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+      files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Patient", url: "http://files.test/p2" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    const card = page.locator("#job-nojs-detail");
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export\/active\/nojs-detail$/);
+    const links = page.locator("table.data-table a[download]");
+    await expect(links).toHaveCount(2);
+    await expect(links.first()).toHaveAttribute("download", "Patient-0001.ndjson");
+    await expect(links.nth(1)).toHaveAttribute("download", "Patient-0002.ndjson");
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1851: the Tenants page renders the registry at once and loads resource
+// counts in the background. With JavaScript off nothing polls, so while the
+// counts are on their way the status line offers a plain Refresh link; an
+// ordinary reload reads the shared cache (it never counts in the request)
+// and eventually shows the settled counts.
+test("the tenants page refreshes its counts without JavaScript", async ({ page }) => {
+  await page.goto("/ui/tenants");
+  if (await page.locator(".card.notice").isVisible().catch(() => false)) {
+    test.skip(true, "no tenant store on this backend");
+  }
+  const table = page.locator("section.table-card .data-table");
+  const status = page.locator("#tenant-counts-status");
+  const state = status.locator("[data-counts-state]");
+  await expect(table).toBeVisible();
+  await expect(status).toHaveAttribute("role", "status");
+
+  await expect
+    .poll(
+      async () => {
+        const current = await state.getAttribute("data-counts-state");
+        if (current === "pending" || current === "refreshing") {
+          // The no-JS way forward: a real link back to this page.
+          const refresh = status.locator("a.counts-status__refresh");
+          await expect(refresh).toHaveAttribute("href", /^\/ui\/tenants/);
+          await refresh.click();
+          await expect(table).toBeVisible();
+        }
+        return state.getAttribute("data-counts-state");
+      },
+      { timeout: 60_000, intervals: [1_000] },
+    )
+    .toMatch(/^(ready|partial|stale|unavailable|unsupported)$/);
+  // Settled: no Refresh link, the table and both cards still rendered.
+  await expect(status.locator("a.counts-status__refresh")).toHaveCount(0);
+  await expect(page.locator("#tenant-stats .stat")).toHaveCount(2);
 });

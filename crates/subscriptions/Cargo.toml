@@ -20,13 +20,13 @@ postgres = ["helios-persistence/postgres"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.8", default-features = false }
 
 # Persistence (for TenantContext, StoredResource, etc.)
-helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.8", default-features = false }
 
 # Outbound auth (OutboundAuthProvider trait + static-bearer impl)
-helios-auth = { path = "../auth", version = "0.2.4" }
+helios-auth = { path = "../auth", version = "0.2.8" }
 
 # Serialization
 serde.workspace = true
@@ -67,7 +67,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # T2 cluster suites against Postgres run with this crate's `postgres` feature
 # (not a dev-dependency feature: that would switch PostgreSQL on for every
 # crate's tests in a workspace build).
-helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false, features = ["sqlite"] }
+helios-persistence = { path = "../persistence", version = "0.2.8", default-features = false, features = ["sqlite"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 

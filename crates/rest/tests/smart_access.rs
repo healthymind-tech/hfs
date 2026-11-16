@@ -48,6 +48,7 @@ impl AuthProvider for StubProvider {
             jti: None,
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
             custom_claims: claims,
+            launch_context: None,
         })
     }
 

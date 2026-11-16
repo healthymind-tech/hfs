@@ -87,17 +87,11 @@ pub struct TopicMatch {
 
 /// Registry for subscription topics.
 ///
-/// Stores topic definitions and evaluates which topics match a given
-/// resource event.
-///
-/// Tenant-scoped: topics are keyed `(tenant_id, canonical_url)`, so one
-/// tenant's topic is invisible to another tenant's subscriptions and
-/// events — the same canonical URL may exist independently per tenant.
-/// (Before Phase 3 the key was the bare canonical URL, which let tenant B's
-/// Subscription resolve tenant A's topic.)
+/// Stores topic definitions by tenant and canonical URL. Every lookup and
+/// lifecycle operation is restricted to the supplied tenant.
 pub struct InMemoryTopicRegistry {
-    /// Topics keyed by `(tenant_id, canonical_url)`.
-    topics: RwLock<HashMap<(String, String), TopicDefinition>>,
+    /// Tenant catalogs, each keyed by canonical URL.
+    topics: RwLock<HashMap<String, HashMap<String, TopicDefinition>>>,
 }
 
 impl InMemoryTopicRegistry {
@@ -108,42 +102,47 @@ impl InMemoryTopicRegistry {
         }
     }
 
-    /// Registers a topic definition for a tenant.
+    /// Registers or replaces a topic definition in the supplied tenant.
     pub fn add_topic(&self, tenant_id: &str, topic: TopicDefinition) {
         let mut topics = self.topics.write().unwrap();
-        topics.insert((tenant_id.to_string(), topic.canonical_url.clone()), topic);
+        topics
+            .entry(tenant_id.to_string())
+            .or_default()
+            .insert(topic.canonical_url.clone(), topic);
     }
 
-    /// Removes a tenant's topic by canonical URL.
+    /// Removes a topic by canonical URL from the supplied tenant only.
     pub fn remove_topic(&self, tenant_id: &str, canonical_url: &str) -> bool {
         let mut topics = self.topics.write().unwrap();
-        topics
-            .remove(&(tenant_id.to_string(), canonical_url.to_string()))
-            .is_some()
+        let Some(catalog) = topics.get_mut(tenant_id) else {
+            return false;
+        };
+        let removed = catalog.remove(canonical_url).is_some();
+        if catalog.is_empty() {
+            topics.remove(tenant_id);
+        }
+        removed
     }
 
-    /// Returns all of a tenant's registered topic canonical URLs.
+    /// Returns the supplied tenant's registered topic canonical URLs.
     pub fn list_topics(&self, tenant_id: &str) -> Vec<String> {
         let topics = self.topics.read().unwrap();
         topics
-            .keys()
-            .filter(|(tenant, _)| tenant == tenant_id)
-            .map(|(_, url)| url.clone())
-            .collect()
+            .get(tenant_id)
+            .map(|catalog| catalog.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Returns a tenant's topic definition by canonical URL.
+    /// Returns a topic definition from the supplied tenant by canonical URL.
     pub fn get_topic(&self, tenant_id: &str, canonical_url: &str) -> Option<TopicDefinition> {
         let topics = self.topics.read().unwrap();
-        topics
-            .get(&(tenant_id.to_string(), canonical_url.to_string()))
-            .cloned()
+        topics.get(tenant_id)?.get(canonical_url).cloned()
     }
 
-    /// Evaluates which of a tenant's topics match a resource event.
+    /// Evaluates which topics match a resource event.
     ///
-    /// Checks the tenant's registered topics' resource triggers against the
-    /// event's resource type and interaction type.
+    /// Checks the supplied tenant's topic triggers against the event's resource
+    /// type and interaction type.
     pub fn matching_topics(
         &self,
         tenant_id: &str,
@@ -152,11 +151,11 @@ impl InMemoryTopicRegistry {
     ) -> Vec<TopicMatch> {
         let topics = self.topics.read().unwrap();
         let mut matches = Vec::new();
+        let Some(catalog) = topics.get(tenant_id) else {
+            return matches;
+        };
 
-        for ((tenant, _), topic) in topics.iter() {
-            if tenant != tenant_id {
-                continue;
-            }
+        for topic in catalog.values() {
             for trigger in &topic.resource_triggers {
                 if trigger.resource_type == resource_type
                     && trigger.interactions.contains(&event_type)
@@ -666,6 +665,77 @@ mod tests {
         let topics = registry.list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
+    }
+
+    #[test]
+    fn tenant_catalogs_keep_shared_canonicals_independent() {
+        let registry = InMemoryTopicRegistry::new();
+        let encounter = sample_encounter_topic();
+        let shared_url = encounter.canonical_url.clone();
+        let mut observation = sample_observation_topic();
+        observation.canonical_url = shared_url.clone();
+        registry.add_topic("tenant-a", encounter);
+        registry.add_topic("tenant-b", observation);
+        registry.add_topic("tenant-b", sample_observation_topic());
+
+        assert_eq!(
+            registry
+                .get_topic("tenant-a", &shared_url)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Encounter"
+        );
+        assert_eq!(
+            registry
+                .get_topic("tenant-b", &shared_url)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Observation"
+        );
+        assert!(
+            registry
+                .get_topic("tenant-a", "http://example.org/topic/new-lab-result")
+                .is_none()
+        );
+        assert_eq!(registry.list_topics("tenant-a"), vec![shared_url.clone()]);
+        assert_eq!(registry.list_topics("tenant-b").len(), 2);
+        assert!(registry.list_topics("unknown").is_empty());
+        assert!(registry.get_topic("unknown", &shared_url).is_none());
+        assert!(
+            registry
+                .matching_topics("unknown", "Encounter", ResourceEventType::Create)
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .matching_topics("tenant-a", "Encounter", ResourceEventType::Create)
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .matching_topics("tenant-a", "Observation", ResourceEventType::Create)
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .matching_topics("tenant-b", "Observation", ResourceEventType::Create)
+                .len(),
+            2
+        );
+
+        assert!(!registry.remove_topic("unknown", &shared_url));
+        assert!(registry.remove_topic("tenant-b", &shared_url));
+        assert!(registry.get_topic("tenant-b", &shared_url).is_none());
+        assert!(registry.get_topic("tenant-a", &shared_url).is_some());
+        assert_eq!(
+            registry
+                .matching_topics("tenant-a", "Encounter", ResourceEventType::Create)
+                .len(),
+            1
+        );
     }
 
     #[test]

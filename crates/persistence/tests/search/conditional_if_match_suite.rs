@@ -28,6 +28,8 @@ use helios_persistence::error::{ConcurrencyError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::SearchQuery;
 
+use crate::seeding::SeedingStorage;
+
 const CRITERIA: &str = "identifier=ne123";
 const NOBODY: &str = "identifier=nobody";
 
@@ -62,7 +64,7 @@ where
 {
     for (id, family, identifier) in [("target", "Neal", "ne123"), ("decoy", "Smith", "mrn-1")] {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 patient(Some(id), family, identifier),
@@ -334,9 +336,9 @@ pub async fn if_match_is_evaluated_against_the_resolved_match<S>(
 /// there surfaced the server's `WriteConflict` as `BackendError::Internal`
 /// (#1405).
 ///
-/// These writers are futures on one task, so a backend whose calls never yield
-/// (SQLite) runs them one after another; `versioned_write_race_suite.rs` is the
-/// test with real parallelism.
+/// These writers are futures on one task, so they interleave only where a
+/// backend's calls yield; `versioned_write_race_suite.rs` is the test with
+/// real parallelism.
 pub async fn concurrent_writers_with_the_same_if_match_admit_one<S>(backend: &S, base: &str)
 where
     S: ResourceStorage + ConditionalStorage + SearchProvider,

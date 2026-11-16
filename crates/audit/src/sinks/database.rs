@@ -2,6 +2,12 @@
 //!
 //! Persists `AuditEvent` resources via the FHIR storage backend by serializing
 //! the typed struct to `serde_json::Value` and calling `ResourceStorage::create()`.
+//!
+//! A failed write is retried with exponential backoff; an event that still
+//! cannot be written is spilled to the fallback NDJSON file (replayed on the
+//! next start) or, without one, counted in `audit_events_dropped_total`.
+//! (Fork design kept over upstream's transient-only retry from #2234: it never
+//! drops an event while a fallback file is configured.)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +79,7 @@ pub struct DatabaseSink {
 }
 
 impl DatabaseSink {
-    /// Create a new database sink.
+    /// Create a new database sink (default retry delay, no fallback file).
     pub fn new(storage: Arc<dyn AuditStorage>, fhir_version: FhirVersion) -> Self {
         Self {
             storage,
@@ -365,7 +371,7 @@ mod tests {
                 _: serde_json::Value,
                 _: FhirVersion,
             ) -> Result<(), String> {
-                Err("connection refused".to_string())
+                Err("constraint violation".into())
             }
         }
 

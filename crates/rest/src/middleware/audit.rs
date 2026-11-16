@@ -59,6 +59,7 @@ mod tests {
             jti: None,
             expires_at: chrono::Utc::now(),
             custom_claims: claims,
+            launch_context: None,
         };
         let u = audit_user(&p);
         assert_eq!(u.subject, "s-1");

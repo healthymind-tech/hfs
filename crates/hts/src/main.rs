@@ -7,6 +7,7 @@ use helios_hts::config::{
 };
 use helios_hts::import::dispatch::dispatch_import;
 use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
+use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 use tracing::info;
 
@@ -75,7 +76,7 @@ async fn run() -> anyhow::Result<()> {
                 port = config.port,
                 host = %config.host,
                 storage_backend = %config.storage_backend,
-                database_url = %helios_persistence::core::bulk_submit_input::redact_url(&config.database_url),
+                database_url = %redact_database_url(&config.database_url, &config.storage_backend),
                 // Eagerly resolve the HELIOS_OBS_MODE OnceLock at boot and stamp
                 // it into the startup line. The same-session A/B benchmark (#297)
                 // greps this to assert each arm's server actually resolved to the
@@ -264,10 +265,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     // bootstrapped server can come up with chunked SNOMED/LOINC closure data
     // wiped during import and never rebuilt. Idempotent — only systems missing
     // closure rows are recomputed.
-    backend
+    let rebuilt = backend
         .rebuild_missing_closures()
         .await
         .map_err(|e| anyhow::anyhow!("post-bootstrap closure rebuild failed: {e}"))?;
+    if rebuilt > 0 {
+        info!(
+            systems = rebuilt,
+            "Rebuilt concept closures after bootstrap"
+        );
+    }
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -769,7 +776,7 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     info!(
         path = %args.path.display(),
         is_dir,
-        database_url = %helios_persistence::core::bulk_submit_input::redact_url(&args.database_url),
+        database_url = %redact_database_url(&args.database_url, &args.storage_backend),
         storage_backend = %args.storage_backend,
         dry_run = args.dry_run,
         verbose = args.verbose,
@@ -791,11 +798,11 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
             // closure build, blowing past the 60 s health-check timeout.
             if !args.dry_run {
                 info!("Building concept closures (this may take ~30–60 s for SNOMED CT)…");
-                backend
+                let rebuilt = backend
                     .rebuild_missing_closures()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
-                info!("Concept closures ready");
+                info!(systems = rebuilt, "Concept closures ready");
             }
 
             result

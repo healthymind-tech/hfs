@@ -28,8 +28,8 @@ use super::backend::ElasticsearchBackend;
 /// of `create_index_mapping`. Without the bump, existing indices never see
 /// the change (#1335: `ignore_malformed` from #1314 reached new indices only).
 /// Edits to the `settings` half do not need a bump: settings are not part of
-/// `PUT _mapping`, and the dynamic ones have their own pass
-/// (`raise_nested_objects_limit`).
+/// `PUT _mapping`, and the dynamic ones have their own passes
+/// (`raise_nested_objects_limit`, `apply_refresh_interval`).
 ///
 /// # What a bump can and cannot deliver
 ///
@@ -72,7 +72,12 @@ use super::backend::ElasticsearchBackend;
 ///   found by those prefixes until a `$reindex`. A `Period` indexed before it
 ///   is still two independent points, so `lt` and `sa` are only right for
 ///   point values until then.
-pub const SCHEMA_VERSION: u64 = 2;
+/// - `3` — `search_params.reference.reference_target`, the `Type/id` an
+///   absolute `http(s)` reference points at (#2394). Documents indexed before
+///   it lack the field, so a reference search or `_revinclude` does not match
+///   their absolute references (`http://host/fhir/Patient/p1`) until a
+///   `$reindex`; relative references are unaffected.
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -239,6 +244,8 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "reference": { "type": "keyword" },
                                 "resource_type": { "type": "keyword" },
                                 "resource_id": { "type": "keyword" },
+                                // `Type/id` of an absolute http(s) reference (#2394).
+                                "reference_target": { "type": "keyword" },
                                 "display": { "type": "text" }
                             }
                         },
@@ -455,6 +462,116 @@ fn indices_below_nested_limit(body: &serde_json::Value, target: u64) -> Vec<Stri
     below
 }
 
+/// The index setting `refresh_interval` is reported under with `flat_settings`.
+const REFRESH_INTERVAL_SETTING: &str = "index.refresh_interval";
+
+/// Sets the configured `refresh_interval` on every existing index under the
+/// configured prefix that has a different one, and returns how many indices
+/// were changed (#1749).
+///
+/// The interval goes into the settings an index is created with, so an index
+/// made under an earlier value keeps it. Under `wait_for` writes that value is
+/// what every interactive write waits for. The setting is dynamic, so it
+/// changes on a live index.
+///
+/// Unlike [`raise_nested_objects_limit`] this sets the value rather than only
+/// raising it, so it overwrites one an operator set by hand on any index
+/// matching `{prefix}_*`.
+pub async fn apply_refresh_interval(backend: &ElasticsearchBackend) -> StorageResult<usize> {
+    /// Index names per update request, keeping the request URL short.
+    const INDICES_PER_REQUEST: usize = 50;
+
+    let target = backend.config().refresh_interval.as_str();
+    let pattern = format!("{}_*", backend.config().index_prefix);
+
+    let response = backend
+        .client()
+        .indices()
+        .get_settings(IndicesGetSettingsParts::IndexName(
+            &[&pattern],
+            &[REFRESH_INTERVAL_SETTING],
+        ))
+        .include_defaults(true)
+        .flat_settings(true)
+        .allow_no_indices(true)
+        .ignore_unavailable(true)
+        .send()
+        .await
+        .map_err(|e| settings_error(format!("Failed to read index settings: {e}")))?;
+    let status = response.status_code();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| settings_error(format!("Failed to parse index settings: {e}")))?;
+    if !status.is_success() {
+        return Err(settings_error(format!(
+            "Reading index settings failed (status {status}): {body}"
+        )));
+    }
+
+    let differing = indices_with_other_refresh_interval(&body, target);
+    for chunk in differing.chunks(INDICES_PER_REQUEST) {
+        let names: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let mut settings = serde_json::Map::new();
+        settings.insert(REFRESH_INTERVAL_SETTING.to_string(), json!(target));
+        let response = backend
+            .client()
+            .indices()
+            .put_settings(IndicesPutSettingsParts::Index(&names))
+            .body(serde_json::Value::Object(settings))
+            .send()
+            .await
+            .map_err(|e| {
+                settings_error(format!("Failed to set {REFRESH_INTERVAL_SETTING}: {e}"))
+            })?;
+        let status = response.status_code();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(settings_error(format!(
+                "Setting {REFRESH_INTERVAL_SETTING} failed (status {status}): {text}"
+            )));
+        }
+    }
+    Ok(differing.len())
+}
+
+/// The indices in a `GET _settings?include_defaults=true&flat_settings=true`
+/// response whose refresh interval is not `target`, sorted by name.
+///
+/// Intervals are compared as durations, so `1000ms` matches `1s`; a value
+/// either side that is not a time value this crate reads is compared as text.
+/// An explicit per-index value wins over the cluster default. An index that
+/// reports the setting in neither place is left alone rather than guessed at.
+fn indices_with_other_refresh_interval(body: &serde_json::Value, target: &str) -> Vec<String> {
+    use super::backend::parse_refresh_interval;
+
+    let Some(indices) = body.as_object() else {
+        return Vec::new();
+    };
+    let wanted = parse_refresh_interval(target);
+    let mut differing: Vec<String> = indices
+        .iter()
+        .filter_map(|(name, entry)| {
+            let current = entry
+                .get("settings")
+                .and_then(|s| s.get(REFRESH_INTERVAL_SETTING))
+                .or_else(|| {
+                    entry
+                        .get("defaults")
+                        .and_then(|d| d.get(REFRESH_INTERVAL_SETTING))
+                })?
+                .as_str()?;
+            let same = match (wanted, parse_refresh_interval(current)) {
+                (Some(wanted), Some(current)) => wanted == current,
+                _ => current.trim() == target.trim(),
+            };
+            (!same).then(|| name.clone())
+        })
+        .collect();
+    differing.sort();
+    differing
+}
+
 fn settings_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
         backend_name: "elasticsearch".to_string(),
@@ -470,11 +587,14 @@ fn settings_error(message: String) -> crate::error::StorageError {
 /// rebuild writes: reported as `Internal`, a network blip here failed the whole
 /// page as *permanently* rejected resources, and the rebuild never retried them
 /// (#1125).
-fn index_unavailable(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Unavailable {
-        backend_name: "elasticsearch".to_string(),
-        message,
-    })
+///
+/// `context` names the step and is the only text the client sees, beside a fixed
+/// "temporarily unavailable; retry" sentence. `detail` (the index name, the
+/// transport error, or the Elasticsearch response body) goes to the log and never
+/// into the client text: the transport error names the Elasticsearch host and the
+/// index (#2385).
+fn index_unavailable(context: &str, detail: &dyn std::fmt::Display) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
 }
 
 /// What reconciling one index's mapping came to.
@@ -684,6 +804,17 @@ fn predates_date_range_end(meta: Option<&Value>) -> bool {
     stored_schema_version(meta) < DATE_END_SCHEMA_VERSION
 }
 
+/// The first [`SCHEMA_VERSION`] whose documents carry
+/// `search_params.reference.reference_target` (#2394).
+const REFERENCE_TARGET_SCHEMA_VERSION: u64 = 3;
+
+/// Whether an index whose mapping `_meta` is `meta` was laid out before
+/// [`REFERENCE_TARGET_SCHEMA_VERSION`], so that its documents were indexed
+/// without `search_params.reference.reference_target`.
+fn predates_reference_target(meta: Option<&Value>) -> bool {
+    stored_schema_version(meta) < REFERENCE_TARGET_SCHEMA_VERSION
+}
+
 /// Document counts per index out of a filtered `GET {indices}/_stats/docs`
 /// response (`indices.<name>.primaries.docs.count`). An index the response does
 /// not list has no entry.
@@ -779,6 +910,26 @@ fn warn_reindex_needed(indices: &[String]) {
     );
 }
 
+/// Warns, once, that the documents of `indices` were indexed before #2394
+/// (schema version `3`) and so have no `search_params.reference.reference_target`:
+/// a reference search or `_revinclude` does not match their absolute
+/// (`http(s)://...`) references until `$reindex` indexes them again.
+fn warn_reference_reindex_needed(indices: &[String]) {
+    if indices.is_empty() {
+        return;
+    }
+    const SAMPLE: usize = 5;
+    tracing::warn!(
+        indices = indices.len(),
+        sample = indices[..indices.len().min(SAMPLE)].join(", "),
+        schema_version = SCHEMA_VERSION,
+        "Elasticsearch indices holding documents indexed before #2394 were upgraded to a \
+         mapping with `search_params.reference.reference_target`, but those documents have \
+         no such field, so references stored as absolute URLs will not match reference \
+         searches or _revinclude until `$reindex` is run"
+    );
+}
+
 /// Brings every existing HFS index under the configured prefix up to
 /// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
 /// convention and the failure policy.
@@ -857,6 +1008,15 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         let counts = document_counts(backend, &predating).await;
         warn_reindex_needed(&indices_holding_documents(&predating, &counts));
     }
+    let predating_ref: Vec<String> = updated_names
+        .iter()
+        .filter(|name| predates_reference_target(previous.get(*name).and_then(Option::as_ref)))
+        .cloned()
+        .collect();
+    if !predating_ref.is_empty() {
+        let counts = document_counts(backend, &predating_ref).await;
+        warn_reference_reindex_needed(&indices_holding_documents(&predating_ref, &counts));
+    }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -880,12 +1040,14 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
         return;
     }
     let mut predates_end = false;
+    let mut predates_ref = false;
     let outcome = match read_schema_versions(backend, index).await {
         Err(outcome) => outcome,
         Ok(body) => match stale_indices(&body) {
             (stale, _) if !stale.is_empty() => {
                 let meta = stale[0].1.as_ref();
                 predates_end = predates_date_range_end(meta);
+                predates_ref = predates_reference_target(meta);
                 let body = reconcile_mapping_body(backend.config(), meta);
                 put_mapping(backend, &[index], body).await
             }
@@ -900,10 +1062,16 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             schema_version = SCHEMA_VERSION,
             "reconciled Elasticsearch index mapping"
         );
-        if predates_end {
+        if predates_end || predates_ref {
             let names = [index.to_string()];
             let counts = document_counts(backend, &names).await;
-            warn_reindex_needed(&indices_holding_documents(&names, &counts));
+            let holding = indices_holding_documents(&names, &counts);
+            if predates_end {
+                warn_reindex_needed(&holding);
+            }
+            if predates_ref {
+                warn_reference_reindex_needed(&holding);
+            }
         }
     }
     note_reconcile_outcome(backend, index, &outcome);
@@ -926,7 +1094,7 @@ pub async fn ensure_index(
         .send()
         .await
         .map_err(|e| {
-            index_unavailable(format!("Failed to check index existence for {index}: {e}"))
+            index_unavailable("Failed to check index existence", &format!("{index}: {e}"))
         })?;
 
     let exists_status = exists_response.status_code();
@@ -937,9 +1105,10 @@ pub async fn ensure_index(
     // A throttled or failing cluster says nothing about whether the index
     // exists; creating it now would only fail the same way, or worse, race.
     if super::storage::is_transient_bulk_status(u64::from(exists_status.as_u16())) {
-        return Err(index_unavailable(format!(
-            "Failed to check index existence for {index} (status {exists_status})"
-        )));
+        return Err(index_unavailable(
+            &format!("Failed to check index existence (status {exists_status})"),
+            &format!("index {index} answered status {exists_status}"),
+        ));
     }
 
     // Create the index with mappings
@@ -952,7 +1121,7 @@ pub async fn ensure_index(
         .body(mapping)
         .send()
         .await
-        .map_err(|e| index_unavailable(format!("Failed to create index {index}: {e}")))?;
+        .map_err(|e| index_unavailable("Failed to create index", &format!("{index}: {e}")))?;
 
     let status = response.status_code();
     if !status.is_success() {
@@ -961,13 +1130,16 @@ pub async fn ensure_index(
         if body.contains("resource_already_exists_exception") {
             return Ok(());
         }
+        if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
+            return Err(index_unavailable(
+                &format!("Failed to create index (status {status})"),
+                &format!("{index}: {body}"),
+            ));
+        }
         let message = format!(
             "Failed to create index {} (status {}): {}",
             index, status, body
         );
-        if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
-            return Err(index_unavailable(message));
-        }
         return Err(crate::error::StorageError::Backend(
             BackendError::Internal {
                 backend_name: "elasticsearch".to_string(),
@@ -1147,6 +1319,16 @@ mod tests {
             mapping["settings"]["index.mapping.nested_objects.limit"],
             50_000
         );
+        // #1749: the configured interval is part of an index's own settings.
+        assert_eq!(mapping["settings"]["refresh_interval"], "1s");
+        let slow = ElasticsearchConfig {
+            refresh_interval: "30s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            create_index_mapping(&slow)["settings"]["refresh_interval"],
+            "30s"
+        );
 
         // Verify mappings exist
         let props = &mapping["mappings"]["properties"];
@@ -1292,6 +1474,36 @@ mod tests {
         assert!(!predates_date_range_end(Some(
             &json!({ SCHEMA_VERSION_META_KEY: 3 })
         )));
+    }
+
+    /// #2394: an index recorded below version 3 holds documents without
+    /// `search_params.reference.reference_target`.
+    #[test]
+    fn test_predates_reference_target() {
+        assert!(predates_reference_target(None));
+        assert!(predates_reference_target(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 2 })
+        )));
+        assert!(!predates_reference_target(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 3 })
+        )));
+        let mapping = create_index_mapping(&ElasticsearchConfig::default());
+        assert_eq!(
+            mapping["mappings"]["properties"]["search_params"]["properties"]["reference"]["properties"]
+                ["reference_target"]["type"],
+            "keyword"
+        );
+    }
+
+    /// #2394: the warning names the field and the remedy, once.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_warn_reference_reindex_needed_message() {
+        warn_reference_reindex_needed(&[]);
+        assert!(!logs_contain("#2394"));
+        warn_reference_reindex_needed(&["hfs_t_patient".to_string()]);
+        assert!(logs_contain("reference_target"));
+        assert!(logs_contain("$reindex"));
     }
 
     /// #1391: an empty index has nothing to reindex; one whose count could not
@@ -1543,6 +1755,35 @@ mod tests {
         });
     }
 
+    /// #1506: an index the startup pass already brought up to date is not read
+    /// or warned about again by the write path on the same backend.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_write_path_skips_an_index_the_startup_pass_reconciled() {
+        let server = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            200,
+            Some(&[("hfs_t_patient", 4)]),
+        )
+        .await;
+        let backend = backend_on(&server);
+        reconcile_index_mappings(&backend).await;
+        reconcile_index(&backend, "hfs_t_patient").await;
+
+        let single_reads = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/hfs_t_patient/_mapping")
+            .count();
+        assert_eq!(single_reads, 0);
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "{lines:?}");
+            Ok(())
+        });
+    }
+
     /// #1391: the write path reconciles an index the startup pass did not see;
     /// the same rule applies there, once per index.
     #[tokio::test]
@@ -1630,5 +1871,166 @@ mod tests {
         );
         assert!(indices_below_nested_limit(&json!({}), 50_000).is_empty());
         assert!(indices_below_nested_limit(&json!("not an object"), 50_000).is_empty());
+    }
+
+    /// #1749: which existing indices get the configured interval. Durations are
+    /// compared, an explicit value beats the cluster default, and an index that
+    /// reports no value is not guessed at.
+    #[test]
+    fn test_indices_with_other_refresh_interval() {
+        let body = json!({
+            "hfs_t_slow": { "settings": { "index.refresh_interval": "30s" }, "defaults": {} },
+            "hfs_t_same": { "settings": { "index.refresh_interval": "1s" } },
+            "hfs_t_same_in_ms": { "settings": { "index.refresh_interval": "1000ms" } },
+            "hfs_t_off": { "settings": { "index.refresh_interval": "-1" } },
+            "hfs_t_default": { "settings": {}, "defaults": { "index.refresh_interval": "1s" } },
+            "hfs_t_explicit_over_default": {
+                "settings": { "index.refresh_interval": "5s" },
+                "defaults": { "index.refresh_interval": "1s" }
+            },
+            "hfs_t_unknown": { "settings": {}, "defaults": {} }
+        });
+
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "1s"),
+            vec![
+                "hfs_t_explicit_over_default".to_string(),
+                "hfs_t_off".to_string(),
+                "hfs_t_slow".to_string()
+            ]
+        );
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "-1"),
+            vec![
+                "hfs_t_default".to_string(),
+                "hfs_t_explicit_over_default".to_string(),
+                "hfs_t_same".to_string(),
+                "hfs_t_same_in_ms".to_string(),
+                "hfs_t_slow".to_string()
+            ]
+        );
+        // A target this crate cannot read falls back to comparing text.
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "1.5s").len(),
+            6,
+            "every index with a value differs from an unreadable target"
+        );
+        assert!(indices_with_other_refresh_interval(&json!({}), "1s").is_empty());
+        assert!(indices_with_other_refresh_interval(&json!("nope"), "1s").is_empty());
+    }
+
+    /// A stub cluster answering `GET _settings` with `listing` and every
+    /// `PUT _settings` with `put_status`.
+    async fn settings_cluster(listing: Value, put_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/hfs_\\*/_settings/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(listing))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/.+/_settings$"))
+            .respond_with(
+                ResponseTemplate::new(put_status).set_body_json(json!({ "acknowledged": true })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn settings_puts(server: &MockServer) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/_settings"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_sets_only_the_indices_that_differ() {
+        let server = settings_cluster(
+            json!({
+                "hfs_t_patient": { "settings": { "index.refresh_interval": "30s" } },
+                "hfs_t_encounter": { "settings": { "index.refresh_interval": "1000ms" } },
+                "hfs_t_basic": { "settings": {}, "defaults": { "index.refresh_interval": "1s" } },
+                "hfs_t_group": { "settings": { "index.refresh_interval": "-1" } }
+            }),
+            200,
+        )
+        .await;
+
+        let changed = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect("apply");
+        assert_eq!(changed, 2);
+
+        let puts = settings_puts(&server).await;
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].url.path(), "/hfs_t_group,hfs_t_patient/_settings");
+        let body: Value = serde_json::from_slice(&puts[0].body).unwrap();
+        assert_eq!(body, json!({ "index.refresh_interval": "1s" }));
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_is_a_no_op_when_every_index_matches() {
+        let server = settings_cluster(
+            json!({ "hfs_t_patient": { "settings": { "index.refresh_interval": "1s" } } }),
+            200,
+        )
+        .await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            0
+        );
+        assert!(settings_puts(&server).await.is_empty());
+
+        // No indices at all.
+        let server = settings_cluster(json!({}), 200).await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            0
+        );
+        assert!(settings_puts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_reports_a_failed_read_or_write() {
+        let server = settings_cluster(
+            json!({ "hfs_t_patient": { "settings": { "index.refresh_interval": "30s" } } }),
+            403,
+        )
+        .await;
+        let error = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect_err("a refused update is an error");
+        assert!(error.to_string().contains("403"), "{error}");
+
+        // The listing itself failing.
+        let server = MockServer::start().await;
+        let error = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect_err("an unanswered read is an error");
+        assert!(error.to_string().contains("settings"), "{error}");
+    }
+
+    /// Many indices go in chunks, so the request URL stays short.
+    #[tokio::test]
+    async fn apply_refresh_interval_chunks_large_clusters() {
+        let listing: serde_json::Map<String, Value> = (0..120)
+            .map(|i| {
+                (
+                    format!("hfs_t_type{i:03}"),
+                    json!({ "settings": { "index.refresh_interval": "30s" } }),
+                )
+            })
+            .collect();
+        let server = settings_cluster(Value::Object(listing), 200).await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            120
+        );
+        assert_eq!(settings_puts(&server).await.len(), 3);
     }
 }

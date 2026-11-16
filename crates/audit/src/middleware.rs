@@ -24,7 +24,7 @@
 //!    no event of a completed request is lost.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::body::HttpBody as _;
@@ -33,6 +33,7 @@ use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
+pub use crate::agent::AuditAgent;
 use crate::config::AuditConfig;
 use crate::context::{Captured, RequestAudit};
 use crate::correlation::{AuditCorrelation, BundleAuditEntry};
@@ -114,13 +115,28 @@ impl AuditMiddlewareState {
     }
 }
 
-/// Agent identifier for audit events.
+/// Slot for the tenant a request resolved to (#1515).
 ///
-/// Set in request extensions by the auth middleware. Kept for embedders; the
-/// REST stack reports the full [`AuditUser`] through
-/// [`crate::context::set_user`] instead.
-#[derive(Clone, Debug)]
-pub struct AuditAgent(pub String);
+/// The tenant is resolved inside the handler (by the REST layer's tenant
+/// extractor), after this middleware has handed the request on. The middleware
+/// inserts an empty slot into the request extensions; whatever resolves the
+/// tenant fills it, and the middleware reads it back once the handler returns
+/// to tag the event. A request that never resolved a tenant (rejected before
+/// the handler, or naming a reserved tenant) leaves the event untagged.
+#[derive(Clone, Debug, Default)]
+pub struct AuditTenant(Arc<OnceLock<String>>);
+
+impl AuditTenant {
+    /// Records the resolved tenant. Only the first value is kept.
+    pub fn set(&self, tenant_id: &str) {
+        let _ = self.0.set(tenant_id.to_string());
+    }
+
+    /// The resolved tenant, if any.
+    pub fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
 
 /// Optional audit context attached by handlers to enrich middleware audit events.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -136,7 +152,7 @@ pub struct AuditResponseContext {
 /// Axum middleware function that records audit events for FHIR operations.
 pub async fn audit_middleware(
     State(state): State<Arc<AuditMiddlewareState>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = request.method().as_str().to_string();
@@ -161,6 +177,10 @@ pub async fn audit_middleware(
     // A legacy `AuditAgent` (set by an outer layer) is the best we have when
     // no user is reported from inside.
     let legacy_agent = request.extensions().get::<AuditAgent>().cloned();
+    // Upstream's tenant slot (#1515): the REST tenant extractor fills it; used
+    // when the task-local context captured no tenant.
+    let tenant_slot = AuditTenant::default();
+    request.extensions_mut().insert(tenant_slot.clone());
 
     let (request, form_body) = capture_form_search(request, &method, &path).await;
 
@@ -211,7 +231,10 @@ pub async fn audit_middleware(
         && let Some(agent) = legacy_agent
     {
         captured.user = Some(AuditUser {
-            subject: agent.0,
+            subject: agent.subject,
+            issuer: agent.issuer,
+            name: agent.display,
+            fhir_user: agent.reference,
             ..Default::default()
         });
     }
@@ -224,6 +247,12 @@ pub async fn audit_middleware(
         site: site_of(&state.server_address),
         request_id: Some(request_id),
     };
+
+    if captured.tenant.is_none()
+        && let Some(t) = tenant_slot.get()
+    {
+        captured.tenant = Some(t.to_string());
+    }
 
     let fhir_path = strip_tenant(&path, &captured, state.url_tenant_routing);
     let events = events_for_request(

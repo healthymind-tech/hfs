@@ -1056,7 +1056,10 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
         let entry = zip
             .by_index(i)
             .map_err(|e| HtsError::InvalidRequest(format!("ZIP entry error: {e}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| HtsError::InvalidRequest(format!("ZIP entry name error: {e}")))?
+            .into_owned();
         let lower = name.to_lowercase();
         let filename = lower.rsplit('/').next().unwrap_or(&lower);
 
@@ -1735,7 +1738,7 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
         let tmp = NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
 
             zip.start_file("LoincTable.csv", opts).unwrap();
             zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
@@ -1778,7 +1781,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let tmp = NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
 
             zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
             zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
@@ -1824,7 +1827,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let tmp = NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
 
             zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
             zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
@@ -2069,7 +2072,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let tmp = make_test_loinc_zip();
         {
             let mut zip = zip::ZipWriter::new_append(tmp.reopen().unwrap()).unwrap();
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             for (name, body) in [
                 ("AccessoryFiles/PartFile/Part.csv", PART_CSV),
                 // The PanelsAndForms copy must lose to AnswerFile/.
@@ -2269,7 +2272,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let tmp = NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
 
             zip.start_file("AccessoryFiles/PartFile/LoincPartLink_Primary.csv", opts)
                 .unwrap();
@@ -2692,7 +2695,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             // Sorted before LoincTable/ exactly like the official archive.
             zip.start_file("AccessoryFiles/PanelsAndForms/Loinc.csv", opts)
                 .unwrap();
@@ -2733,7 +2736,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let tmp = NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
 
             zip.start_file("Loinc_2.77/LoincTable.csv", opts).unwrap();
             zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();

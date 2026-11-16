@@ -3532,7 +3532,9 @@ async fn pg_filter_regex(
     // (`property` = `code` or empty) or against the values of the named
     // concept property.
     let regex = compile_vs_regex(value)?;
-    if property == "code" || property.is_empty() {
+    // `concept` is the concept code too (upstream #2115: VCL emits
+    // `(sys)concept/"re"`).
+    if property == "code" || property == "concept" || property.is_empty() {
         let rows = client
             .cq(
                 "SELECT code, display FROM concepts WHERE system_id = $1 ORDER BY code",
@@ -3705,12 +3707,6 @@ async fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
-        .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
-        .collect();
-
     let expansion_set: HashSet<(String, String)> = flat
         .iter()
         .map(|c| (c.system.clone(), c.code.clone()))
@@ -3733,7 +3729,6 @@ async fn build_hierarchical_expansion(
     }
 
     let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
 
     for (sys_url, sys_id) in &system_id_map {
         let edge_rows = client
@@ -3753,44 +3748,17 @@ async fn build_hierarchical_expansion(
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    // Shared with SQLite; stops at back-edges (SNOMED CT RF2 leaves mutual
+    // parent/child pairs) and roots rootless cycles (upstream 8c1ce8fc8).
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Replace the `value_set_dependencies` rows of `vs_id`: every code system
@@ -5514,6 +5482,20 @@ async fn compose_page_fast_pg(
         Some(a) if !a.is_empty() => a,
         _ => return Ok(None),
     };
+
+    // Excludes are applied purely by (system, code) below, so anything that
+    // is not an enumerated `concept[]` list (filter, valueSet, whole system)
+    // needs the real expansion engine (upstream 5f5810c26).
+    if let Some(excl) = compose["exclude"].as_array() {
+        for exc in excl {
+            let has_concepts = exc["concept"].as_array().is_some_and(|c| !c.is_empty());
+            let has_filter = exc["filter"].as_array().is_some_and(|f| !f.is_empty());
+            let has_vs = exc["valueSet"].as_array().is_some_and(|v| !v.is_empty());
+            if !has_concepts || has_filter || has_vs {
+                return Ok(None);
+            }
+        }
+    }
 
     // Bail on anything that needs a real expansion engine.
     for inc in includes {

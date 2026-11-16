@@ -214,6 +214,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
         jti: None,
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        ..Default::default()
     };
 
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(
@@ -555,6 +556,88 @@ async fn test_reindex_status_of_unknown_job_is_404() {
         .assert_status(StatusCode::NOT_FOUND);
 }
 
+/// Builds a server with auth-style principals whose tenant comes from the
+/// test-only `x-test-principal-tenant` header, all holding `system/reindex`.
+fn server_with_per_request_principal_tenant() -> TestServer {
+    let backend = test_backend();
+    let reindex = Arc::new(ReindexOperation::new(
+        backend.clone(),
+        backend.tenant_registries().clone(),
+    ));
+    let state = helios_rest::AppState::new(
+        backend.clone(),
+        ServerConfig {
+            base_url: "http://localhost:8080".to_string(),
+            ..ServerConfig::for_testing()
+        },
+    )
+    .with_reindex(reindex);
+
+    let app =
+        helios_rest::routing::fhir_routes::create_routes(state).layer(axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: Next| async move {
+                let tenant = request
+                    .headers()
+                    .get("x-test-principal-tenant")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                request.extensions_mut().insert(Principal {
+                    subject: "client-1".to_string(),
+                    issuer: "https://idp.example.com".to_string(),
+                    tenant_id: tenant,
+                    scopes: ScopeSet::parse("system/reindex"),
+                    jti: None,
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                    custom_claims: serde_json::Map::new(),
+                    ..Default::default()
+                });
+                next.run(request).await
+            },
+        ));
+    TestServer::new(app).expect("create test server")
+}
+
+/// A job is visible and cancellable only by its own tenant (#2281).
+#[tokio::test]
+async fn test_reindex_status_and_cancel_are_tenant_isolated() {
+    let server = server_with_per_request_principal_tenant();
+    const HEADER: &str = "x-test-principal-tenant";
+
+    let kickoff = server
+        .post("/$reindex")
+        .add_header(HEADER, "tenant-a")
+        .await;
+    kickoff.assert_status(StatusCode::ACCEPTED);
+    let job_id = param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+    let path = format!("/$reindex-status/{job_id}");
+
+    let unknown = server
+        .get("/$reindex-status/no-such-job")
+        .add_header(HEADER, "tenant-b")
+        .await;
+    unknown.assert_status(StatusCode::NOT_FOUND);
+
+    let other_get = server.get(&path).add_header(HEADER, "tenant-b").await;
+    other_get.assert_status(StatusCode::NOT_FOUND);
+    server
+        .delete(&path)
+        .add_header(HEADER, "tenant-b")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // The other tenant's attempt neither revealed nor cancelled the job.
+    let owner_get = server.get(&path).add_header(HEADER, "tenant-a").await;
+    owner_get.assert_status(StatusCode::OK);
+    let state = param_string(&owner_get.json::<Value>(), "status", "valueCode").unwrap_or_default();
+    assert_ne!(state, "cancelled", "another tenant must not cancel the job");
+
+    server
+        .delete(&path)
+        .add_header(HEADER, "tenant-a")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+}
+
 /// The type-scoped route must not be shadowed by `/{resource_type}/{id}`.
 #[tokio::test]
 async fn test_reindex_type_route_is_reachable() {
@@ -614,6 +697,201 @@ async fn test_reindex_rejects_a_malformed_or_oversized_body() {
         .await
         .assert_status(StatusCode::ACCEPTED);
     assert_eq!(reindex_starts(&sink), 1);
+}
+
+/// Polls `$reindex-status` until the job is terminal and returns its body.
+async fn wait_for_reindex(server: &TestServer, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let status = server.get(&format!("/$reindex-status/{job_id}")).await;
+        if status.status_code() == StatusCode::OK {
+            let body = status.json::<Value>();
+            let state = param_string(&body, "status", "valueCode").unwrap_or_default();
+            if ["completed", "failed", "cancelled"].contains(&state.as_str()) {
+                return body;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("reindex job {job_id} did not finish");
+}
+
+fn reindex_parameters(parameter: Value) -> String {
+    json!({ "resourceType": "Parameters", "parameter": parameter }).to_string()
+}
+
+/// Each invalid `idStart` / `idEnd` / `clearOnly` combination is 400 before a
+/// job starts (#1739).
+#[tokio::test]
+async fn test_reindex_rejects_invalid_id_range_and_clear_only_parameters() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let cases = [
+        (
+            "/$reindex",
+            json!([{ "name": "idStart", "valueString": "4" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/$reindex",
+            json!([{ "name": "idEnd", "valueString": "8" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "8" },
+                { "name": "idEnd", "valueString": "4" }
+            ]),
+            "idStart must be less than idEnd",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idStart", "valueString": "" }]),
+            "cannot be empty",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idEnd", "valueInteger": 8 }]),
+            "idEnd requires valueString",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearExisting", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearExisting",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearOnly", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearOnly",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "clearOnly", "valueString": "true" }]),
+            "clearOnly requires valueBoolean",
+        ),
+    ];
+    for (path, parameter, message) in cases {
+        let response = server.post(path).text(reindex_parameters(parameter)).await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            response.text().contains(message),
+            "{path}: {}",
+            response.text()
+        );
+    }
+    assert_eq!(
+        reindex_starts(&sink),
+        0,
+        "a rejected request must not start a job"
+    );
+}
+
+/// SQLite reindexes an id range (#1767): only the type's resources with an id
+/// in `[idStart, idEnd)` are counted and rebuilt.
+#[tokio::test]
+async fn test_reindex_id_range_rebuilds_only_ids_in_range() {
+    let (server, backend, sink) = server_with_ops();
+    for id in ["p1", "q1", "r1"] {
+        seed(&backend, id).await;
+    }
+
+    for (range, expected) in [
+        (
+            json!([
+                { "name": "idStart", "valueString": "p2" },
+                { "name": "idEnd", "valueString": "r" }
+            ]),
+            1,
+        ),
+        (json!([{ "name": "idStart", "valueString": "q" }]), 2),
+        (json!([{ "name": "idEnd", "valueString": "p1" }]), 0),
+    ] {
+        let kickoff = server
+            .post("/Patient/$reindex")
+            .text(reindex_parameters(range.clone()))
+            .await;
+        kickoff.assert_status(StatusCode::ACCEPTED);
+        let job_id =
+            param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+        let status = wait_for_reindex(&server, &job_id).await;
+        assert_eq!(
+            param_string(&status, "status", "valueCode").as_deref(),
+            Some("completed"),
+            "{range}: {status}"
+        );
+        let integer = |name: &str| {
+            status["parameter"]
+                .as_array()
+                .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+                .and_then(|p| p["valueInteger"].as_u64())
+        };
+        assert_eq!(integer("total"), Some(expected), "{range}: {status}");
+        assert_eq!(integer("processed"), Some(expected), "{range}: {status}");
+    }
+    assert_eq!(reindex_starts(&sink), 3);
+}
+
+/// `clearOnly` on one type clears that type's index, rebuilds nothing, and
+/// leaves other types searchable (#1739).
+#[tokio::test]
+async fn test_reindex_clear_only_clears_one_type_without_rebuilding() {
+    let (server, backend, _sink) = server_with_ops();
+    seed(&backend, "p1").await;
+    backend
+        .create(
+            &tenant(),
+            "Organization",
+            json!({"resourceType": "Organization", "id": "o1", "name": "Purgeable"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed organization");
+    let organizations = || async {
+        let response = server.get("/Organization?name=Purgeable").await;
+        response.assert_status_ok();
+        response.json::<Value>()["entry"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(search_matches(&server).await, 1);
+    assert_eq!(organizations().await, 1);
+
+    let kickoff = server
+        .post("/Patient/$reindex")
+        .text(reindex_parameters(
+            json!([{ "name": "clearOnly", "valueBoolean": true }]),
+        ))
+        .await;
+    kickoff.assert_status(StatusCode::ACCEPTED);
+    let job_id = param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+    let status = wait_for_reindex(&server, &job_id).await;
+
+    assert_eq!(
+        param_string(&status, "status", "valueCode").as_deref(),
+        Some("completed"),
+        "{status}"
+    );
+    let integer = |name: &str| {
+        status["parameter"]
+            .as_array()
+            .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+            .and_then(|p| p["valueInteger"].as_u64())
+    };
+    assert_eq!(integer("total"), Some(0));
+    assert_eq!(integer("processed"), Some(0));
+    assert_eq!(
+        search_matches(&server).await,
+        0,
+        "the Patient index stays cleared"
+    );
+    assert_eq!(organizations().await, 1, "other types stay searchable");
 }
 
 /// The scope check comes before the body is read: a caller without the scope

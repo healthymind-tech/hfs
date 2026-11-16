@@ -93,15 +93,8 @@ fn build_query(
                 SortDirective::parse(&format!("-{}", sort.field))
             };
             // Resolve the search-parameter type so backends can sort by the
-            // indexed value column. `_id`/`_lastUpdated` are columns on the
-            // resources table and need no type.
-            let param_type = if directive.parameter.starts_with('_') {
-                None
-            } else {
-                registry
-                    .get_param(resource_type, &directive.parameter)
-                    .map(|d| d.param_type)
-            };
+            // indexed value column.
+            let param_type = sort_param_type(resource_type, &directive.parameter, registry);
             query.sort.push(directive.with_param_type(param_type));
         }
     }
@@ -248,6 +241,12 @@ fn build_query(
     // builds a query without doing so — a conditional reference, a
     // `_typeFilter` — gets the error instead of a wider match.
     helios_persistence::search::validate_value_presence(&query)?;
+    // And a composite value whose `$`-separated part count is not the
+    // parameter's component count (`code-value-quantity=8302-2`): SQLite,
+    // PostgreSQL and Elasticsearch answered it with an empty Bundle, MongoDB
+    // with a 400 (#1236). After the empty-value check, which owns an empty
+    // part.
+    helios_persistence::search::validate_composite_values(&query)?;
 
     Ok(query)
 }
@@ -592,7 +591,7 @@ fn validate_reverse_chain(
             .or_else(|| registry.get_param("Resource", name))
     };
     let display = || {
-        let (terminal, _) = reverse.terminal_param();
+        let terminal = reverse.search_param.as_str();
         format!("{level}{terminal}")
     };
     let Some(def) = lookup(&reverse.reference_param) else {
@@ -632,7 +631,7 @@ fn validate_reverse_chain(
     if let Some(nested) = &reverse.nested {
         return validate_reverse_chain(source, nested, registry, &level);
     }
-    let (terminal, _) = reverse.terminal_param();
+    let terminal = reverse.search_param.as_str();
     if !GLOBAL_SEARCH_PARAMS.contains(&terminal) && lookup(terminal).is_none() {
         return Err(RestError::InvalidParameter {
             param: display(),
@@ -651,6 +650,32 @@ fn join_types(types: &[&String]) -> String {
         .map(|t| t.as_str())
         .collect::<Vec<_>>()
         .join(" / ")
+}
+
+/// The search-parameter type a `_sort` key is sorted by, or `None` when it
+/// has none: `_id`, `_lastUpdated` and `_score` order by fixed columns (or
+/// relevance) rather than by an indexed value, and an unknown name has no
+/// definition.
+///
+/// Every other key resolves like a filter does — the resource type's own
+/// definition, then the `Resource`-level one. Underscore-prefixed parameters
+/// are not special here: `_tag`, `_security`, `_profile` and `_source` are
+/// defined on `Resource` and indexed like any token or uri parameter, and
+/// leaving them untyped made every backend fall back to id order without a
+/// warning (#1711). The query, the lenient warning and the strict check all
+/// read this one resolution so they cannot disagree about a key.
+pub(crate) fn sort_param_type(
+    resource_type: &str,
+    code: &str,
+    registry: &SearchParameterRegistry,
+) -> Option<SearchParamType> {
+    if matches!(code, "_id" | "_lastUpdated" | "_score") {
+        return None;
+    }
+    registry
+        .get_param(resource_type, code)
+        .or_else(|| registry.get_param("Resource", code))
+        .map(|def| def.param_type)
 }
 
 /// Returns warnings for `_sort` directives the backends cannot honor (#958).
@@ -687,10 +712,7 @@ pub fn unsortable_sort_fields(
         if code.is_empty() || code == "_id" || code == "_lastUpdated" {
             continue;
         }
-        let def = registry
-            .get_param(resource_type, code)
-            .or_else(|| registry.get_param("Resource", code));
-        match def {
+        match sort_param_type(resource_type, code, registry) {
             None => fields.push((
                 code.to_string(),
                 format!(
@@ -698,9 +720,12 @@ pub fn unsortable_sort_fields(
                      results are ordered by id instead"
                 ),
             )),
-            Some(def) => {
-                let kind = def.param_type.to_string();
-                if kind == "composite" || kind == "special" {
+            Some(param_type) => {
+                if matches!(
+                    param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                ) {
+                    let kind = param_type.to_string();
                     fields.push((
                         code.to_string(),
                         format!(
@@ -826,6 +851,17 @@ fn parse_search_parameter_in(
         chain,
         components: vec![],
     };
+
+    // A `system|code` naming another system than the one implied by a `code`
+    // element's required binding matches nothing (#1395). Terminology-backed
+    // modifiers were expanded into plain values before this, so their codes
+    // are checked too; a chained parameter's terminal is checked by the chain
+    // resolver, which knows its resource type.
+    helios_persistence::search::narrow_parameter_implied_code_systems(
+        registry,
+        resource_type,
+        &mut param,
+    );
 
     // For composite parameters, resolve the component sub-parameters from the
     // registry (type + code), so the backend can match each component within
@@ -1118,26 +1154,23 @@ fn parse_has_level(
     }
 
     // `_has:Observation:subject:code:not=…` — what follows the terminal
-    // parameter is its search modifier. `ReverseChainedParameter` carries it
-    // inside `search_param`, as written (see `terminal_param`); the chain
-    // resolver applies it to the terminal search and checks it against the
-    // parameter's type. Here it only has to *be* a modifier. (In the
-    // `_has=Type:ref:param:value` form the fourth part is the value.)
-    let search_param = match parts.get(3) {
+    // parameter is its search modifier. The chain resolver applies it to the
+    // terminal search and checks it against the parameter's type. Here it only
+    // has to *be* a modifier. (In the `_has=Type:ref:param:value` form the
+    // fourth part is the value.)
+    let modifier = match parts.get(3) {
         Some(suffix) if name != "_has" => {
             let modifier = parse_terminal_modifier(key, &search_param, suffix, types)?;
             check_missing_literal(key, Some(&modifier), value)?;
-            format!("{search_param}:{suffix}")
+            Some(modifier)
         }
-        _ => search_param,
+        _ => None,
     };
 
-    Ok(Some(ReverseChainedParameter::terminal(
-        source_type,
-        reference_param,
-        search_param,
-        search_value,
-    )))
+    let mut chain =
+        ReverseChainedParameter::terminal(source_type, reference_param, search_param, search_value);
+    chain.modifier = modifier;
+    Ok(Some(chain))
 }
 
 /// Parses _include/_revinclude directive.
@@ -2129,19 +2162,20 @@ mod tests {
     }
 
     /// #1302: `_has:Type:ref:param:modifier` keeps the modifier, in
-    /// `search_param`, for the chain resolver to apply.
+    /// `modifier`, for the chain resolver to apply.
     #[test]
     fn test_parse_has_parameter_terminal_modifier() {
         let chain = parse_has_parameter("_has:Observation:subject:code:not", "1234-5")
             .unwrap()
             .unwrap();
-        assert_eq!(chain.search_param, "code:not");
-        assert_eq!(chain.terminal_param(), ("code", Some("not")));
+        assert_eq!(chain.search_param, "code");
+        assert_eq!(chain.modifier, Some(SearchModifier::Not));
 
         let plain = parse_has_parameter("_has:Observation:subject:code", "1234-5")
             .unwrap()
             .unwrap();
-        assert_eq!(plain.terminal_param(), ("code", None));
+        assert_eq!(plain.search_param, "code");
+        assert_eq!(plain.modifier, None);
 
         let nested = parse_has_parameter(
             "_has:Encounter:subject:_has:Observation:encounter:code:not",
@@ -2149,9 +2183,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let inner = nested.nested.as_ref().unwrap();
         assert_eq!(
-            nested.nested.as_ref().unwrap().terminal_param(),
-            ("code", Some("not"))
+            (inner.search_param.as_str(), &inner.modifier),
+            ("code", &Some(SearchModifier::Not))
         );
 
         assert!(parse_has_parameter("_has:Observation:subject:code:bogus", "1").is_err());
@@ -2777,6 +2812,156 @@ mod tests {
         );
     }
 
+    /// [`test_registry`] plus the `Resource`-level meta parameters, typed as
+    /// the embedded fallbacks declare them, and the special `_text`.
+    fn registry_with_meta_params() -> SearchParameterRegistry {
+        let mut r = test_registry();
+        for (code, ty, base) in [
+            ("_tag", SearchParamType::Token, "Resource"),
+            ("_security", SearchParamType::Token, "Resource"),
+            ("_profile", SearchParamType::Uri, "Resource"),
+            ("_source", SearchParamType::Uri, "Resource"),
+            ("_text", SearchParamType::Special, "DomainResource"),
+        ] {
+            r.register(
+                SearchParameterDefinition::new(
+                    format!("http://hl7.org/fhir/SearchParameter/Resource{code}"),
+                    code,
+                    ty,
+                    "ignored",
+                )
+                .with_base(vec![base]),
+            )
+            .unwrap();
+        }
+        r
+    }
+
+    /// #1711: the `meta` parameters are declared on `Resource`, not on the
+    /// searched type. They used to be skipped for being `_`-prefixed, so the
+    /// backends got no type and sorted by id.
+    #[test]
+    fn test_sort_on_meta_params_resolves_resource_level_type() {
+        let mut params = HashMap::new();
+        params.insert(
+            "_sort".to_string(),
+            "_tag,-_security,_profile,-_source".to_string(),
+        );
+        let search_params = SearchParams::from_map(params);
+        let query =
+            build_search_query("Patient", &search_params, &registry_with_meta_params()).unwrap();
+
+        let resolved: Vec<_> = query
+            .sort
+            .iter()
+            .map(|s| (s.parameter.as_str(), s.param_type))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("_tag", Some(SearchParamType::Token)),
+                ("_security", Some(SearchParamType::Token)),
+                ("_profile", Some(SearchParamType::Uri)),
+                ("_source", Some(SearchParamType::Uri)),
+            ]
+        );
+    }
+
+    /// `_id`, `_lastUpdated` and `_score` order by fixed columns (or
+    /// relevance), never by an index value, so they stay untyped.
+    #[test]
+    fn test_sort_on_column_keys_stays_untyped() {
+        let mut params = HashMap::new();
+        params.insert("_sort".to_string(), "_id,-_lastUpdated,_score".to_string());
+        let search_params = SearchParams::from_map(params);
+        let query =
+            build_search_query("Patient", &search_params, &registry_with_meta_params()).unwrap();
+
+        assert_eq!(query.sort.len(), 3);
+        assert!(
+            query.sort.iter().all(|s| s.param_type.is_none()),
+            "{:?}",
+            query.sort
+        );
+    }
+
+    /// A sortable meta parameter draws no "ordered by id instead" warning,
+    /// while an unsortable `_`-prefixed one and an unknown one still do.
+    #[test]
+    fn test_unsortable_sort_warnings_for_underscore_params() {
+        let registry = registry_with_meta_params();
+        let warnings_for = |sort: &str| {
+            let mut params = HashMap::new();
+            params.insert("_sort".to_string(), sort.to_string());
+            unsortable_sort_warnings("Patient", &SearchParams::from_map(params), &registry)
+        };
+
+        assert!(
+            warnings_for("_tag,-_security,_profile,-_source,_id,-_lastUpdated").is_empty(),
+            "{:?}",
+            warnings_for("_tag,-_security,_profile,-_source,_id,-_lastUpdated")
+        );
+
+        // Special, and declared on `DomainResource`, which sort resolution
+        // (like filter resolution) does not consult: warned either way.
+        let text = warnings_for("_text");
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("ordered by id instead"), "{text:?}");
+
+        let mut with_special = registry_with_meta_params();
+        with_special
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/Resource-special",
+                    "_special",
+                    SearchParamType::Special,
+                    "ignored",
+                )
+                .with_base(vec!["Resource"]),
+            )
+            .unwrap();
+        let mut params = HashMap::new();
+        params.insert("_sort".to_string(), "_special".to_string());
+        let special =
+            unsortable_sort_warnings("Patient", &SearchParams::from_map(params), &with_special);
+        assert_eq!(special.len(), 1, "{special:?}");
+        assert!(special[0].contains("type special"), "{special:?}");
+
+        let unknown = warnings_for("-_nope");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(
+            unknown[0].contains("not a search parameter of Patient"),
+            "{unknown:?}"
+        );
+    }
+
+    /// A definition on the searched type wins over the `Resource`-level one,
+    /// the same precedence a filter uses.
+    #[test]
+    fn test_sort_param_type_prefers_resource_type_definition() {
+        let mut registry = registry_with_meta_params();
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/Patient-tag",
+                    "_tag",
+                    SearchParamType::String,
+                    "ignored",
+                )
+                .with_base(vec!["Patient"]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            sort_param_type("Patient", "_tag", &registry),
+            Some(SearchParamType::String)
+        );
+        assert_eq!(
+            sort_param_type("Observation", "_tag", &registry),
+            Some(SearchParamType::Token)
+        );
+    }
+
     #[test]
     fn test_build_search_query_with_include() {
         let mut params = HashMap::new();
@@ -2809,6 +2994,33 @@ mod tests {
         assert_eq!(query.parameters.len(), 2, "both name params preserved");
         assert!(name_values.contains(&"Smith"));
         assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_membership_in_parses_as_a_plain_reference_parameter() {
+        // `_in` is not special-cased by the builder: the membership resolver
+        // reads it from `query.parameters`, so pin the shapes it relies on.
+        let build = |key: &str, value: &str| {
+            let sp = SearchParams::from_pairs(vec![(key.to_string(), value.to_string())]);
+            build_search_query("Patient", &sp, &test_registry()).unwrap()
+        };
+
+        let query = build("_in", "Group/1,List/2");
+        assert_eq!(query.parameters.len(), 1);
+        let param = &query.parameters[0];
+        assert_eq!(param.name, "_in");
+        assert!(param.modifier.is_none() && param.chain.is_empty());
+        let values: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["Group/1", "List/2"], "comma values are OR-ed");
+
+        let query = build("_in:Group", "x");
+        assert_eq!(
+            query.parameters[0].modifier,
+            Some(helios_persistence::types::SearchModifier::Type(
+                "Group".to_string()
+            ))
+        );
+        assert!(query.list.is_empty(), "_in must not feed the _list field");
     }
 
     #[test]

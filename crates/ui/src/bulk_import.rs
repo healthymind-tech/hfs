@@ -29,7 +29,8 @@ use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::{
-    RequestTenant, RequestVersion, WebState, current_status, render, upstream_failure_detail,
+    RequestTenant, RequestVersion, WebState, current_status, render, render_not_found,
+    upstream_failure_detail,
 };
 
 fn public_url_with_segments<'a>(
@@ -686,7 +687,13 @@ pub async fn detail(
     let status = current_status(&state, rv.0, &rt);
 
     let Some((s, _sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
+        return render_not_found(
+            status,
+            i18n,
+            "bulk-import",
+            "/ui/bulk-import",
+            i18n.t("bulk-import-title"),
+        );
     };
 
     let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
@@ -938,13 +945,13 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
         // the recipient out-of-band.
         "RS384" => None,
         _ => {
-            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            use p384::elliptic_curve::sec1::ToSec1Point;
             use p384::pkcs8::DecodePrivateKey;
 
             let secret = p384::SecretKey::from_pkcs8_pem(pem)
                 .or_else(|_| p384::SecretKey::from_sec1_pem(pem))
                 .ok()?;
-            let point = secret.public_key().to_encoded_point(false);
+            let point = secret.public_key().to_sec1_point(false);
             let x = URL_SAFE_NO_PAD.encode(point.x()?);
             let y = URL_SAFE_NO_PAD.encode(point.y()?);
             let canonical = format!(r#"{{"crv":"P-384","kty":"EC","x":"{x}","y":"{y}"}}"#);
@@ -1330,7 +1337,7 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
 /// Anything else yields `None`. An unrecognised `countSeverity` says nothing
 /// about the file, so the caller treats it exactly like a missing one and
 /// counts the entry as an error rather than assuming it was clean.
-fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
+fn severity_total(cs: &Value, codes: &[&str]) -> Option<u64> {
     if let Some(entries) = cs.as_array() {
         return Some(
             entries
@@ -1440,13 +1447,28 @@ async fn poll_status(
                         .iter()
                         .filter(|file| {
                             file.get("countSeverity")
-                                .and_then(|cs| severity_total(cs, ["error", "fatal"]))
+                                .and_then(|cs| severity_total(cs, &["error", "fatal"]))
                                 .is_none_or(|count| count > 0)
                         })
                         .count()
                 })
                 .unwrap_or(0);
             let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0) + outcome_errors;
+            // Warnings are issues, not files: a recipient that stored a
+            // resource but is still repairing it (HFS re-indexing what the
+            // search index rejected during ingest, #1666) reports it as a
+            // warning, so the submission completes and the card says how
+            // many resources were flagged instead of failing the import.
+            let warnings: u64 = manifest["outcome"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|file| file.get("countSeverity"))
+                        .filter_map(|cs| severity_total(cs, &["warning"]))
+                        .sum()
+                })
+                .unwrap_or(0);
             // A closed-out submission keeps the instant it was closed out.
             let completed_at = match submission.result["completedAt"].as_str() {
                 Some(at) if is_terminal(&submission.status) && !at.is_empty() => at.to_string(),
@@ -1456,6 +1478,7 @@ async fn poll_status(
                 "completedAt": completed_at,
                 "outputs": outputs,
                 "errors": errors,
+                "warnings": warnings,
             });
             submission.progress = String::new();
             submission.poll_url = String::new();
@@ -1490,6 +1513,14 @@ async fn poll_status(
                         "Status: got 200 OK — processing finished cleanly ({outputs} outputs); submission completed."
                     ),
                 );
+                if warnings > 0 {
+                    push_log(
+                        submission,
+                        format!(
+                            "Status: the recipient flagged {warnings} resource(s) with warnings (for example, still being re-indexed for search)."
+                        ),
+                    );
+                }
             }
         }
         status @ (401 | 403) => {
@@ -1781,6 +1812,7 @@ fn apply_status_change(submission: &mut Submission, status: &str, outcome: &Kick
                     "completedAt": now_stamp(),
                     "outputs": submission.result["outputs"].as_u64().unwrap_or(0),
                     "errors": submission.result["errors"].as_u64().unwrap_or(0),
+                    "warnings": submission.result["warnings"].as_u64().unwrap_or(0),
                 });
             }
         }
@@ -1883,6 +1915,10 @@ struct StatusCard {
     progress: String,
     outputs: u64,
     errors: u64,
+    /// Resources the recipient flagged with `warning` severity — e.g. stored
+    /// but still being re-indexed for search (#1666). They do not fail the
+    /// submission; the Result card notes them when non-zero.
+    warnings: u64,
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
@@ -1956,6 +1992,7 @@ pub async fn status_fragment(
         progress: s.progress.clone(),
         outputs: s.result["outputs"].as_u64().unwrap_or(0),
         errors: s.result["errors"].as_u64().unwrap_or(0),
+        warnings: s.result["warnings"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
         status_error,

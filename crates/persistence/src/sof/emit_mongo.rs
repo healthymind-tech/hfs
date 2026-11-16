@@ -12,10 +12,12 @@
 //! mid-path `where()` (`$filter`), `unionAll` (`$facet`), `repeat:`
 //! (`$function` recursive traversal), `join()`, collection columns, the
 //! boundary functions, `getReferenceKey`, and three-valued comparison.
-//! Constructs the in-DB compiler does not cover (nested/sibling `repeat`,
-//! `unionAll` nested inside another `select`) return
-//! [`SofError::Uncompilable`] — surfaced by the handler as `422` — exactly as
-//! they do on the SQL backends.
+//! A `repeat:` may sit anywhere in the stage chain (under a `forEach`, under
+//! another `repeat`, or beside siblings): each one seeds its traversal from
+//! its enclosing scope. `unionAll` is only lowered at the plan root; the
+//! compiler distributes nested unions up to it. Constructs the compiler still
+//! does not cover return [`SofError::Uncompilable`] — surfaced by the handler
+//! as `422` — exactly as they do on the SQL backends.
 //!
 //! Numbers are stored as serde_json `arbitrary_precision` wrapper objects (see
 //! [`coerce_number`]); `repeat:` uses server-side JavaScript, which must be
@@ -27,7 +29,7 @@
 //! resource), `fe.value` / `fe2.value` (lateral-unnest iteration rows). Each
 //! maps to a MongoDB field: `r.data` → `data`; `feN.value` → a synthetic
 //! top-level field `__feN` that the emitter `$set`s to the unnest source and
-//! then `$unwind`s.
+//! then `$unwind`s; `rec_N.node` → `__rec_N`, the unwound `repeat:` node.
 
 use mongodb::bson::{Bson, Document, doc};
 
@@ -35,7 +37,7 @@ use crate::core::sof_runner::SofError;
 
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, LitValue, PathStep, PlanNode, RowIndexScope,
-    SqlExpr, UnaryOp,
+    SqlExpr, UnaryOp, nearest_left_scope,
 };
 
 /// Output of [`emit_mongo`]: a ready-to-run pipeline plus its output columns.
@@ -89,7 +91,9 @@ fn emit_project_pipeline(
     for column in columns {
         validate_column_name(&column.name)?;
         let expr = lower_expr(&column.expr, &Ctx::root(constants))?;
-        project.insert(column.name.clone(), expr);
+        // An absent value must still produce the key (as `null`), like the
+        // SQL runners; `$project` would otherwise drop it.
+        project.insert(column.name.clone(), doc! { "$ifNull": [expr, Bson::Null] });
         names.push(column.name.clone());
     }
     pipeline.push(doc! { "$project": project });
@@ -181,6 +185,7 @@ fn lower_source(
             left_join,
             on_filter,
             flat_index,
+            ..
         } => {
             lower_source(parent, pipeline, constants)?;
             let ctx = Ctx::root(constants);
@@ -193,52 +198,107 @@ fn lower_source(
             // N, and skip the `$unwind`. `forEach` (not OrNull) drops rows where
             // the element is absent.
             if let Some(idx) = flat_index {
-                let flattened = match source {
+                let mut flattened = match source {
                     SqlExpr::JsonPath { root, path } => lower_collection_agg(root, path, &ctx)?,
                     _ => ensure_array(source_expr),
                 };
+                // `forEach: "x.where(crit)[N]"` / `.first()` indexes the
+                // FILTERED collection: apply the criterion (rooted at
+                // `<out_alias>.value`) to each element before picking one.
+                if let Some(filter) = on_filter {
+                    let var = scope_var(out_alias);
+                    let child = ctx.child(format!("{out_alias}.value"), var.clone());
+                    let cond = truthy(lower_expr(filter, &child)?);
+                    flattened = doc! {
+                        "$filter": { "input": flattened, "as": var, "cond": cond }
+                    }
+                    .into();
+                }
                 let elem: Bson = doc! { "$arrayElemAt": [flattened, *idx] }.into();
                 pipeline.push(doc! { "$set": { &base: elem } });
                 if !*left_join {
-                    pipeline.push(doc! {
-                        "$match": {
-                            "$expr": doc! { "$ne": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] }
-                        }
-                    });
+                    // Below an EMPTY `forEachOrNull` the null row survives.
+                    let optional = match source {
+                        SqlExpr::JsonPath { root, .. } => nearest_left_scope(parent, root),
+                        _ => None,
+                    };
+                    match optional {
+                        Some((left, _)) => push_optional_scope_guard(pipeline, &base, Some(&left)),
+                        None => pipeline.push(doc! {
+                            "$match": {
+                                "$expr": doc! { "$ne": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] }
+                            }
+                        }),
+                    }
                 }
                 return Ok(());
             }
 
+            // A multi-field source (a flattened `forEachOrNull` chain) iterates
+            // the FLATTENED collection, so the null row only appears when the
+            // whole collection is empty.
+            let field_steps = match source {
+                SqlExpr::JsonPath { path, .. } => path
+                    .0
+                    .iter()
+                    .filter(|s| matches!(s, PathStep::Field(_)))
+                    .count(),
+                _ => 0,
+            };
+            let source_expr = match source {
+                SqlExpr::JsonPath { root, path } if field_steps > 1 => {
+                    lower_collection_agg(root, path, &ctx)?
+                }
+                _ => source_expr,
+            };
+            // `forEachOrNull: "x.where(crit)"` filters the array BEFORE the
+            // `$unwind`, so a non-empty array whose elements all fail the
+            // criterion still yields the preserved null row (the SQL runners'
+            // `LEFT JOIN ... ON <crit>` behaves the same way).
+            let source_expr = match on_filter {
+                Some(filter) if *left_join => {
+                    let var = scope_var(out_alias);
+                    let child = ctx.child(format!("{out_alias}.value"), var.clone());
+                    let cond = truthy(lower_expr(filter, &child)?);
+                    doc! {
+                        "$filter": { "input": ensure_array(source_expr), "as": var, "cond": cond }
+                    }
+                    .into()
+                }
+                _ => source_expr,
+            };
             pipeline.push(doc! { "$set": { &base: source_expr } });
             // `includeArrayIndex` exposes the 0-based element position for
             // `%rowIndex` (see `lower_expr`'s `RowIndex` arm). It is `null` for a
             // `forEachOrNull` miss (empty/missing array), which `%rowIndex` maps
             // to 0. The field is dropped by the final inclusion `$project`.
+            // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null row.
+            let optional = if *left_join {
+                None
+            } else {
+                match source {
+                    SqlExpr::JsonPath { root, .. } => {
+                        nearest_left_scope(parent, root).map(|(a, _)| a)
+                    }
+                    _ => None,
+                }
+            };
             pipeline.push(doc! {
                 "$unwind": {
                     "path": format!("${base}"),
-                    "preserveNullAndEmptyArrays": *left_join,
+                    "preserveNullAndEmptyArrays": *left_join || optional.is_some(),
                     "includeArrayIndex": unnest_index_field(out_alias),
                 }
             });
+            push_optional_scope_guard(pipeline, &base, optional.as_deref());
             // `forEach: "x.where(crit)"` — filter the unwound elements by the
             // criterion (rooted at `<out_alias>.value` → the `$__<out_alias>`
-            // field). For `forEachOrNull`, keep rows whose element is null (the
-            // preserved empties) so left-join semantics hold.
-            if let Some(filter) = on_filter {
+            // field). `forEachOrNull` was already filtered above.
+            if let Some(filter) = on_filter
+                && !*left_join
+            {
                 let pred = truthy(lower_expr(filter, &ctx)?);
-                let guard: Bson = if *left_join {
-                    doc! {
-                        "$or": [
-                            doc! { "$eq": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] },
-                            pred,
-                        ]
-                    }
-                    .into()
-                } else {
-                    pred
-                };
-                pipeline.push(doc! { "$match": { "$expr": guard } });
+                pipeline.push(doc! { "$match": { "$expr": pred } });
             }
             Ok(())
         }
@@ -256,11 +316,15 @@ fn lower_source(
         )),
         PlanNode::Recurse {
             parent,
+            seed_root,
             step_paths,
             out_alias,
-            ..
         } => {
             lower_source(parent, pipeline, constants)?;
+            // The traversal starts at the enclosing scope: the resource, a
+            // `forEach` element or the node of an outer `repeat`. Every scope
+            // is a flat top-level field, so any chain position resolves.
+            let seed = root_ref(seed_root, &Ctx::root(constants))?;
             // Field-name lists per step path (Index/OfType steps are ignored —
             // `repeat:` paths are simple field chains).
             let paths: Vec<Vec<String>> = step_paths
@@ -275,28 +339,44 @@ fn lower_source(
                 })
                 .collect();
             let base = unnest_base(out_alias);
-            // `$function` walks the step paths recursively from the resource
-            // document, emitting every descendant node in pre-order — the same
-            // traversal as the SQL recursive CTE.
+            // `$function` walks the step paths recursively from the seed,
+            // emitting every descendant node in pre-order — the same
+            // traversal as the SQL recursive CTE. A missing seed (e.g. a
+            // `forEachOrNull` miss) yields no nodes.
             let traversed: Bson = doc! {
                 "$function": {
                     "body": REPEAT_TRAVERSE_JS,
-                    "args": ["$data", doc! { "$literal": bson_paths(&paths) }],
+                    "args": [seed, doc! { "$literal": bson_paths(&paths) }],
                     "lang": "js",
                 }
             }
             .into();
             pipeline.push(doc! { "$set": { &base: traversed } });
+            let optional = nearest_left_scope(parent, seed_root).map(|(a, _)| a);
             pipeline.push(doc! {
                 "$unwind": {
                     "path": format!("${base}"),
-                    "preserveNullAndEmptyArrays": false,
+                    "preserveNullAndEmptyArrays": optional.is_some(),
                     "includeArrayIndex": unnest_index_field(out_alias),
                 }
             });
+            push_optional_scope_guard(pipeline, &base, optional.as_deref());
             Ok(())
         }
     }
+}
+
+/// After an `$unwind` that preserves empties for a step below a
+/// `forEachOrNull`: keep a row when the step matched OR that ancestor missed.
+fn push_optional_scope_guard(pipeline: &mut Vec<Document>, base: &str, left_alias: Option<&str>) {
+    let Some(left) = left_alias else { return };
+    let null_of = |field: String| doc! { "$ifNull": [format!("${field}"), Bson::Null] };
+    pipeline.push(doc! {
+        "$match": { "$expr": { "$or": [
+            doc! { "$ne": [null_of(base.to_string()), Bson::Null] },
+            doc! { "$eq": [null_of(unnest_base(left)), Bson::Null] },
+        ] } }
+    });
 }
 
 /// Step paths as a nested BSON array for the `$function` argument.
@@ -415,23 +495,49 @@ fn root_ref(root: &str, ctx: &Ctx) -> Result<Bson, SofError> {
     Err(uncompilable(format!("unsupported value root '{root}'")))
 }
 
+/// A bare field or variable reference (`"$data"`, `"$__fe0"`, `"$$v_w0"`) or a
+/// `$literal`: cheap to evaluate again, so it is never bound with `$let`.
+fn is_cheap(v: &Bson) -> bool {
+    match v {
+        Bson::String(s) => s.starts_with('$'),
+        Bson::Document(d) => d.len() == 1 && d.contains_key("$literal"),
+        Bson::Null | Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => true,
+        _ => false,
+    }
+}
+
+/// Evaluates `value` once: MongoDB does not share common subexpressions, so an
+/// operand used more than once by `build` is bound with `$let` to `var` and
+/// `build` receives the `$$var` reference. Cheap operands pass through. `var`
+/// must start with a lowercase letter and differ from the emitter's own
+/// variables (`this`, `value`, `ns`, `obj`, `j`, `c`, `sf`, `v_<alias>`).
+fn bind_once(value: Bson, var: &str, build: impl FnOnce(Bson) -> Bson) -> Bson {
+    if is_cheap(&value) {
+        return build(value);
+    }
+    let body = build(Bson::String(format!("$${var}")));
+    doc! { "$let": { "vars": { var: value }, "in": body } }.into()
+}
+
 /// Coerces a value to an array: arrays pass through, null/missing → `[]`, and a
 /// scalar → a one-element array (the FHIRPath scalar-as-singleton model).
 fn ensure_array(v: Bson) -> Bson {
-    doc! {
-        "$cond": [
-            doc! { "$isArray": v.clone() },
-            v.clone(),
-            doc! {
-                "$cond": [
-                    doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] },
-                    Bson::Array(Vec::new()),
-                    [v],
-                ]
-            },
-        ]
-    }
-    .into()
+    bind_once(v, "cse_arr", |v| {
+        doc! {
+            "$cond": [
+                doc! { "$isArray": v.clone() },
+                v.clone(),
+                doc! {
+                    "$cond": [
+                        doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] },
+                        Bson::Array(Vec::new()),
+                        [v],
+                    ]
+                },
+            ]
+        }
+        .into()
+    })
 }
 
 /// Lowers a `forEach` source path to the array expression to unwind.
@@ -468,14 +574,16 @@ fn lower_json_path(root: &str, path: &JsonPath, ctx: &Ctx) -> Result<Bson, SofEr
     for step in &path.0 {
         match step {
             PathStep::Field(name) => {
-                let flattened = doc! {
-                    "$cond": [
-                        doc! { "$isArray": acc.clone() },
-                        doc! { "$first": acc.clone() },
-                        acc,
-                    ]
-                };
-                acc = doc! { "$getField": { "field": name.clone(), "input": flattened } }.into();
+                acc = bind_once(acc, "cse_nav", |acc| {
+                    let flattened = doc! {
+                        "$cond": [
+                            doc! { "$isArray": acc.clone() },
+                            doc! { "$first": acc.clone() },
+                            acc,
+                        ]
+                    };
+                    doc! { "$getField": { "field": name.clone(), "input": flattened } }.into()
+                });
             }
             PathStep::Index(n) => {
                 acc = index_step(acc, *n);
@@ -492,15 +600,17 @@ fn lower_json_path(root: &str, path: &JsonPath, ctx: &Ctx) -> Result<Bson, SofEr
 /// `$arrayElemAt` would raise a runtime error on a non-array (e.g. the scalar
 /// produced by `name.family.first()`), so the array case is guarded.
 fn index_step(acc: Bson, n: i64) -> Bson {
-    let non_array = if n == 0 { acc.clone() } else { Bson::Null };
-    doc! {
-        "$cond": [
-            doc! { "$isArray": acc.clone() },
-            doc! { "$arrayElemAt": [acc, n] },
-            non_array,
-        ]
-    }
-    .into()
+    bind_once(acc, "cse_nav", |acc| {
+        let non_array = if n == 0 { acc.clone() } else { Bson::Null };
+        doc! {
+            "$cond": [
+                doc! { "$isArray": acc.clone() },
+                doc! { "$arrayElemAt": [acc, n] },
+                non_array,
+            ]
+        }
+        .into()
+    })
 }
 
 /// Lowers a `LitValue` to a BSON literal value.
@@ -556,19 +666,21 @@ fn number_string(expr: Bson) -> Bson {
 /// Coerces a possibly-wrapped number to a real double for use as a comparison or
 /// arithmetic operand. Non-number values pass through unchanged.
 fn coerce_number(expr: Bson) -> Bson {
-    doc! {
-        "$let": {
-            "vars": { "ns": number_string(expr.clone()) },
-            "in": doc! {
-                "$cond": [
-                    doc! { "$ne": [doc! { "$ifNull": ["$$ns", Bson::Null] }, Bson::Null] },
-                    doc! { "$toDouble": "$$ns" },
-                    expr,
-                ]
+    bind_once(expr, "cse_num", |expr| {
+        doc! {
+            "$let": {
+                "vars": { "ns": number_string(expr.clone()) },
+                "in": doc! {
+                    "$cond": [
+                        doc! { "$ne": [doc! { "$ifNull": ["$$ns", Bson::Null] }, Bson::Null] },
+                        doc! { "$toDouble": "$$ns" },
+                        expr,
+                    ]
+                }
             }
         }
-    }
-    .into()
+        .into()
+    })
 }
 
 /// Lowers an IR value expression to a MongoDB aggregation expression.
@@ -576,6 +688,15 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
     match expr {
         SqlExpr::Lit(v) => Ok(literal_expr(v)),
         SqlExpr::JsonPath { root, path } => lower_json_path(root, path, ctx),
+        // `getResourceKey()` on the resource: the SQL `id` column is the
+        // document's `id`.
+        SqlExpr::ColRef(name) if name == super::compile_path::RESOURCE_ID_COLUMN => {
+            lower_json_path(
+                "r.data",
+                &JsonPath(vec![PathStep::Field("id".to_string())]),
+                ctx,
+            )
+        }
         SqlExpr::RowIndex(scope) => match scope {
             // Top level / non-iterating scopes are always 0. Must be wrapped in
             // `$literal` — a bare `0` in `$project` means "exclude this field".
@@ -637,10 +758,12 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         SqlExpr::NullIf(a, b) => {
             let a = lower_expr(a, ctx)?;
             let b = lower_expr(b, ctx)?;
-            Ok(doc! {
-                "$cond": [ doc! { "$eq": [a.clone(), b] }, Bson::Null, a ]
-            }
-            .into())
+            Ok(bind_once(a, "cse_nif", |a| {
+                doc! {
+                    "$cond": [ doc! { "$eq": [a.clone(), b] }, Bson::Null, a ]
+                }
+                .into()
+            }))
         }
         SqlExpr::ReferenceKey {
             reference,
@@ -667,7 +790,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         } => lower_join_aggregate(
             outer_focus,
             outer_alias,
-            inner_field,
+            inner_field.as_deref(),
             inner_alias,
             separator,
             ctx,
@@ -680,7 +803,8 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         | SqlExpr::Scalar(_)
         | SqlExpr::Exists(_)
         | SqlExpr::CountSub(_)
-        | SqlExpr::ScalarFromChain { .. } => Err(uncompilable(
+        | SqlExpr::ScalarFromChain { .. }
+        | SqlExpr::ChainArray { .. } => Err(uncompilable(
             "expression construct is not supported by the Mongo emitter (stage 1)",
         )),
     }
@@ -701,7 +825,7 @@ fn lower_where_exists(
     negate: bool,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let filtered = lower_where_filter(focus, iter_alias, predicate, ctx)?;
+    let filtered = lower_where_filter(focus, iter_alias, predicate, true, ctx)?;
     let exists: Bson = doc! { "$gt": [doc! { "$size": filtered }, 0i64] }.into();
     if negate {
         Ok(doc! { "$not": [exists] }.into())
@@ -719,7 +843,7 @@ fn lower_where_scalar(
     projection: &SqlExpr,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let filtered = lower_where_filter(focus, iter_alias, predicate, ctx)?;
+    let filtered = lower_where_filter(focus, iter_alias, predicate, false, ctx)?;
     let var = scope_var(iter_alias);
     let child = ctx.child(format!("{iter_alias}.value"), var.clone());
     let projection = lower_expr(projection, &child)?;
@@ -734,13 +858,31 @@ fn lower_where_scalar(
 
 /// Shared `$filter` for the `where()` constructs: iterate `focus` (coerced to an
 /// array), binding each element to the alias variable, keeping the truthy ones.
+///
+/// With `flatten`, a `JsonPath` focus crossing more than one field step is
+/// flattened across every repeating step (`$reduce`/`$concatArrays`) instead of
+/// following only the first element of each intermediate array.
 fn lower_where_filter(
     focus: &SqlExpr,
     iter_alias: &str,
     predicate: &SqlExpr,
+    flatten: bool,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let arr = ensure_array(lower_expr(focus, ctx)?);
+    let arr = match focus {
+        SqlExpr::JsonPath { root, path }
+            if flatten
+                && path
+                    .0
+                    .iter()
+                    .filter(|s| matches!(s, PathStep::Field(_)))
+                    .count()
+                    > 1 =>
+        {
+            lower_collection_agg(root, path, ctx)?
+        }
+        _ => ensure_array(lower_expr(focus, ctx)?),
+    };
     let var = scope_var(iter_alias);
     let child = ctx.child(format!("{iter_alias}.value"), var.clone());
     let cond = truthy(lower_expr(predicate, &child)?);
@@ -748,31 +890,35 @@ fn lower_where_filter(
 }
 
 /// `<base>.<field>.join(<sep>)` — flatten `<field>` across `<base>` and join the
-/// non-null values with `separator`. Empty input yields null (matching the SQL
+/// non-null values with `separator`; without a `<field>` the elements of
+/// `<base>` are joined directly. Empty input yields null (matching the SQL
 /// `group_concat`/`string_agg` aggregate over no rows).
 fn lower_join_aggregate(
     outer_focus: &SqlExpr,
     _outer_alias: &str,
-    inner_field: &str,
+    inner_field: Option<&str>,
     _inner_alias: &str,
     separator: &str,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
     let outer = ensure_array(lower_expr(outer_focus, ctx)?);
     // Flatten `inner_field` across each outer element.
-    let flat: Bson = doc! {
-        "$reduce": {
-            "input": outer,
-            "initialValue": Bson::Array(Vec::new()),
-            "in": {
-                "$concatArrays": [
-                    "$$value",
-                    ensure_array(doc! { "$getField": { "field": inner_field, "input": "$$this" } }.into()),
-                ]
+    let flat: Bson = match inner_field {
+        Some(inner_field) => doc! {
+            "$reduce": {
+                "input": outer,
+                "initialValue": Bson::Array(Vec::new()),
+                "in": {
+                    "$concatArrays": [
+                        "$$value",
+                        ensure_array(doc! { "$getField": { "field": inner_field, "input": "$$this" } }.into()),
+                    ]
+                }
             }
         }
-    }
-    .into();
+        .into(),
+        None => outer,
+    };
     let non_null: Bson = doc! {
         "$filter": {
             "input": flat,
@@ -991,6 +1137,22 @@ fn lower_boundary(
     }
 }
 
+/// `key(l, r)` that is null when either operand is null. The right operand is
+/// only bound (and so only evaluated) once the left is known to be non-null:
+/// `$let` evaluates its vars eagerly, while the old `$or` short-circuited, and
+/// `r` may throw (`$divide` by zero, `$concat` of a non-string). Bound variables
+/// are safe from capture because every operand is a closed expression.
+fn null_guarded_comparison(key: &str, l: Bson, r: Bson) -> Bson {
+    let is_null =
+        |v: &Bson| doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] };
+    bind_once(l, "cse_lhs", |l| {
+        let on_non_null_left = bind_once(r, "cse_rhs", |r| {
+            doc! { "$cond": [is_null(&r), Bson::Null, doc! { key: [l.clone(), r] }] }.into()
+        });
+        doc! { "$cond": [is_null(&l), Bson::Null, on_non_null_left] }.into()
+    })
+}
+
 fn lower_binop(op: BinOp, lhs: &SqlExpr, rhs: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
     // AND/OR coerce their operands to booleans; the rest operate on values.
     if matches!(op, BinOp::And | BinOp::Or) {
@@ -1028,16 +1190,7 @@ fn lower_binop(op: BinOp, lhs: &SqlExpr, rhs: &SqlExpr, ctx: &Ctx) -> Result<Bso
         // (null/missing) the result is null, not a boolean. SQL gets this from
         // `NULL = x → NULL`; Mongo's `$eq`/`$lt`/… return a boolean, so guard
         // explicitly. (Arithmetic/`$concat` already propagate null in Mongo.)
-        let either_null = doc! {
-            "$or": [
-                doc! { "$eq": [doc! { "$ifNull": [l.clone(), Bson::Null] }, Bson::Null] },
-                doc! { "$eq": [doc! { "$ifNull": [r.clone(), Bson::Null] }, Bson::Null] },
-            ]
-        };
-        Ok(doc! {
-            "$cond": [either_null, Bson::Null, doc! { key: [l, r] }]
-        }
-        .into())
+        Ok(null_guarded_comparison(key, l, r))
     } else {
         Ok(doc! { key: [l, r] }.into())
     }
@@ -1062,6 +1215,12 @@ fn lower_reference_key(
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
     let reference = lower_expr(reference, ctx)?;
+    Ok(bind_once(reference, "cse_rk", |reference| {
+        reference_key_body(reference, expected_type)
+    }))
+}
+
+fn reference_key_body(reference: Bson, expected_type: Option<&str>) -> Bson {
     // Guard against null references (`$split` of null errors).
     let last_segment = doc! {
         "$cond": [
@@ -1072,18 +1231,18 @@ fn lower_reference_key(
     };
 
     match expected_type {
-        None => Ok(last_segment.into()),
+        None => last_segment.into(),
         Some(ty) => {
             // Keep the key only when the reference points at `<ty>/...`.
             let regex = format!("(^|/){ty}/");
-            Ok(doc! {
+            doc! {
                 "$cond": [
                     doc! { "$regexMatch": { "input": reference, "regex": regex } },
                     last_segment,
                     Bson::Null,
                 ]
             }
-            .into())
+            .into()
         }
     }
 }
@@ -1092,15 +1251,17 @@ fn lower_reference_key(
 /// is truthy iff it is non-null, non-`false`, non-zero, and non-empty-string.
 /// Mirrors the SQL `truthy_predicate` dialect helper.
 fn truthy(expr: Bson) -> Bson {
-    doc! {
-        "$and": [
-            doc! { "$ne": [ doc! { "$ifNull": [expr.clone(), Bson::Null] }, Bson::Null ] },
-            doc! { "$ne": [expr.clone(), false] },
-            doc! { "$ne": [expr.clone(), 0i64] },
-            doc! { "$ne": [expr, ""] },
-        ]
-    }
-    .into()
+    bind_once(expr, "cse_tv", |expr| {
+        doc! {
+            "$and": [
+                doc! { "$ne": [ doc! { "$ifNull": [expr.clone(), Bson::Null] }, Bson::Null ] },
+                doc! { "$ne": [expr.clone(), false] },
+                doc! { "$ne": [expr.clone(), 0i64] },
+                doc! { "$ne": [expr, ""] },
+            ]
+        }
+        .into()
+    })
 }
 
 /// MongoDB forbids field names that are empty, start with `$`, or contain `.`.
@@ -1118,7 +1279,9 @@ mod tests {
     use helios_fhir::FhirVersion;
     use serde_json::json;
 
+    use super::null_guarded_comparison;
     use crate::sof::compiler::compile_view_definition_mongo;
+    use mongodb::bson::{Bson, Document, doc};
 
     fn compile(view: serde_json::Value) -> Vec<mongodb::bson::Document> {
         compile_view_definition_mongo(&view, FhirVersion::R4)
@@ -1170,6 +1333,154 @@ mod tests {
         assert!(rendered.contains("$isArray"), "expected array guard");
     }
 
+    fn exists_where_pipeline(path: &str) -> String {
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": path }],
+        }));
+        format!("{pipeline:?}")
+    }
+
+    #[test]
+    fn exists_over_multi_step_focus_flattens_every_repeating_step() {
+        let rendered = exists_where_pipeline(
+            "component.code.coding.exists(system = 'http://loinc.org' and code = '8480-6')",
+        );
+        assert!(rendered.contains("$filter"), "expected a $filter");
+        assert!(
+            rendered.contains("$reduce") && rendered.contains("$concatArrays"),
+            "expected $reduce/$concatArrays flattening: {rendered}"
+        );
+
+        let negated = exists_where_pipeline("component.code.coding.where(code = '8480-6').empty()");
+        assert!(negated.contains("$reduce"), "empty() must flatten too");
+    }
+
+    /// MongoDB does no common-subexpression elimination, so a path step that
+    /// repeated its operand grew the pipeline as 3^depth (91 KB for this filter).
+    /// Operands are bound once with `$let`: the size stays linear in the depth.
+    #[test]
+    fn multi_step_path_filter_stays_small() {
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": "code.coding.first().code = '8302-2'" }],
+        }));
+        let bytes: usize = pipeline
+            .iter()
+            .map(|stage| mongodb::bson::to_vec(stage).unwrap().len())
+            .sum();
+        assert!(
+            bytes < 8 * 1024,
+            "where filter compiled to {bytes} bytes; operands are being copied"
+        );
+        let rendered = format!("{pipeline:?}");
+        assert!(rendered.contains("$let"), "expected $let bindings");
+        assert!(rendered.contains("$$cse_nav"), "expected bound navigation");
+    }
+
+    #[test]
+    fn comparison_right_operand_is_not_evaluated_for_null_left() {
+        // A throwing right operand ($divide by zero) must stay inside the
+        // non-null branch, not in the outer $let vars.
+        let r = Bson::Document(doc! { "$divide": ["$a", 0] });
+        let out = null_guarded_comparison("$eq", Bson::Document(doc! { "$first": "$x" }), r);
+        let outer = out.as_document().unwrap().get_document("$let").unwrap();
+        let vars = outer.get_document("vars").unwrap();
+        assert!(vars.contains_key("cse_lhs") && !vars.contains_key("cse_rhs"));
+        let cond = outer
+            .get_document("in")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert!(
+            !format!("{:?}", cond[0]).contains("$divide"),
+            "guard must not touch r"
+        );
+        assert!(
+            format!("{:?}", cond[2]).contains("$divide"),
+            "r lives in the else branch"
+        );
+    }
+
+    /// Goes through the real compiler: a refactor of `lower_binop` that bypassed
+    /// the null guard would move the throwing `$divide` out of the guard's else
+    /// branch and fail this test.
+    #[test]
+    fn compiled_where_keeps_throwing_right_operand_under_the_guard() {
+        // Every `$divide` must sit under index 2 (else branch) of some `$cond`.
+        fn unguarded_divides(b: &Bson, guarded: bool, found: &mut usize) -> usize {
+            match b {
+                Bson::Document(d) => d
+                    .iter()
+                    .map(|(k, v)| {
+                        if k == "$divide" {
+                            *found += 1;
+                            usize::from(!guarded) + unguarded_divides(v, guarded, found)
+                        } else if k == "$cond" {
+                            match v {
+                                Bson::Array(a) => a
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, e)| unguarded_divides(e, guarded || i == 2, found))
+                                    .sum(),
+                                other => unguarded_divides(other, guarded, found),
+                            }
+                        } else {
+                            unguarded_divides(v, guarded, found)
+                        }
+                    })
+                    .sum(),
+                Bson::Array(a) => a.iter().map(|e| unguarded_divides(e, guarded, found)).sum(),
+                _ => 0,
+            }
+        }
+
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": "value.ofType(Quantity).value > (1 / 0)" }],
+        }));
+        let mut found = 0;
+        let unguarded: usize = pipeline
+            .iter()
+            .map(|s| unguarded_divides(&Bson::Document(s.clone()), false, &mut found))
+            .sum();
+        assert!(found > 0, "expected a $divide in {pipeline:?}");
+        assert_eq!(unguarded, 0, "$divide escaped the null guard: {pipeline:?}");
+    }
+
+    #[test]
+    fn nested_comparisons_bind_only_the_left_outside() {
+        let inner = |k| {
+            null_guarded_comparison(
+                k,
+                doc! { "$first": "$a" }.into(),
+                doc! { "$first": "$b" }.into(),
+            )
+        };
+        let out = null_guarded_comparison("$eq", inner("$eq"), inner("$lt"));
+        let vars = out
+            .as_document()
+            .unwrap()
+            .get_document("$let")
+            .unwrap()
+            .get_document("vars")
+            .unwrap();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), ["cse_lhs"]);
+    }
+
+    #[test]
+    fn exists_over_single_repeating_step_keeps_plain_lowering() {
+        let rendered = exists_where_pipeline("category.exists(text = 'vital-signs')");
+        assert!(rendered.contains("$filter"), "expected a $filter");
+        assert!(!rendered.contains("$reduce"), "single-step focus unchanged");
+    }
+
     #[test]
     fn foreach_emits_set_and_unwind() {
         let pipeline = compile(json!({
@@ -1192,6 +1503,19 @@ mod tests {
         assert!(!unwind.get_bool("preserveNullAndEmptyArrays").unwrap());
     }
 
+    /// A `$project` column's expression, inside the `$ifNull: [expr, null]`
+    /// wrapper that keeps absent values as explicit nulls.
+    fn column_expr<'a>(project: &'a Document, name: &str) -> &'a Bson {
+        let args = project
+            .get_document(name)
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[1], Bson::Null);
+        &args[0]
+    }
+
     #[test]
     fn foreach_row_index_uses_unwind_array_index() {
         let pipeline = compile(json!({
@@ -1212,7 +1536,7 @@ mod tests {
         // The `%rowIndex` column reads it back, defaulting a null (forEachOrNull
         // miss) to 0.
         let project = pipeline[3].get_document("$project").unwrap();
-        let idx_expr = project.get_document("idx").unwrap();
+        let idx_expr = column_expr(project, "idx").as_document().unwrap();
         let args = idx_expr.get_array("$ifNull").unwrap();
         assert_eq!(args[0].as_str().unwrap(), "$__fe__idx");
         assert_eq!(args[1].as_i32().unwrap(), 0);
@@ -1228,7 +1552,7 @@ mod tests {
         let project = pipeline.last().unwrap().get_document("$project").unwrap();
         // Wrapped in `$literal` so `$project` treats it as the value 0, not a
         // field-exclusion flag.
-        let idx = project.get_document("idx").unwrap();
+        let idx = column_expr(project, "idx").as_document().unwrap();
         assert_eq!(idx.get_i64("$literal").unwrap(), 0);
     }
 
@@ -1296,5 +1620,207 @@ mod tests {
             FhirVersion::R4,
         );
         assert!(out.is_ok(), "collection column should compile: {out:?}");
+    }
+
+    // ---- Hand-built plans: repeat anywhere in the chain, root-level union ----
+
+    use crate::sof::decode::ColumnDecode;
+    use crate::sof::emit_mongo::emit_mongo;
+    use crate::sof::ir::{
+        Column, JsonPath, LitValue, PathStep, PlanNode, ResourceFilter, SqlExpr, SqlType,
+    };
+
+    fn path(root: &str, fields: &[&str]) -> SqlExpr {
+        SqlExpr::JsonPath {
+            root: root.to_string(),
+            path: JsonPath(
+                fields
+                    .iter()
+                    .map(|f| PathStep::Field(f.to_string()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn col(name: &str, expr: SqlExpr) -> Column {
+        Column {
+            name: name.to_string(),
+            expr,
+            collection: false,
+            ty: SqlType::Text,
+            decode: ColumnDecode::default(),
+        }
+    }
+
+    fn scan() -> PlanNode {
+        PlanNode::Scan {
+            alias: "r".to_string(),
+            resource_type: "Questionnaire".to_string(),
+            filter: ResourceFilter::default(),
+        }
+    }
+
+    fn unnest(parent: PlanNode, root: &str, field: &str, alias: &str) -> PlanNode {
+        PlanNode::LateralUnnest {
+            parent: Box::new(parent),
+            source: path(root, &[field]),
+            out_alias: alias.to_string(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
+            array_source: false,
+        }
+    }
+
+    fn recurse(parent: PlanNode, seed_root: &str, alias: &str) -> PlanNode {
+        PlanNode::Recurse {
+            parent: Box::new(parent),
+            seed_root: seed_root.to_string(),
+            step_paths: vec![JsonPath(vec![PathStep::Field("item".to_string())])],
+            out_alias: alias.to_string(),
+        }
+    }
+
+    fn project(parent: PlanNode, columns: Vec<Column>) -> PlanNode {
+        PlanNode::Project {
+            parent: Box::new(parent),
+            columns,
+        }
+    }
+
+    /// The `$function` seed argument of the `$set` stage that defines `field`.
+    fn seed_of(pipeline: &[Document], field: &str) -> String {
+        let stage = pipeline
+            .iter()
+            .find_map(|s| {
+                s.get_document("$set")
+                    .ok()
+                    .filter(|d| d.contains_key(field))
+            })
+            .unwrap_or_else(|| panic!("no $set for {field}"));
+        let func = stage
+            .get_document(field)
+            .unwrap()
+            .get_document("$function")
+            .unwrap();
+        func.get_array("args").unwrap()[0]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unwind_paths(pipeline: &[Document]) -> Vec<String> {
+        pipeline
+            .iter()
+            .filter_map(|s| s.get_document("$unwind").ok())
+            .map(|u| u.get_str("path").unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn top_level_repeat_still_seeds_from_the_resource() {
+        let plan = project(
+            recurse(scan(), "r.data", "rec_0"),
+            vec![col("link", path("rec_0.node", &["linkId"]))],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+    }
+
+    #[test]
+    fn repeat_under_foreach_seeds_from_the_element() {
+        let plan = project(
+            recurse(unnest(scan(), "r.data", "item", "fe"), "fe.value", "rec_1"),
+            vec![
+                col("outer", path("fe.value", &["linkId"])),
+                col("inner", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$__fe");
+        assert_eq!(unwind_paths(&out.pipeline), ["$__fe", "$__rec_1"]);
+    }
+
+    #[test]
+    fn repeat_inside_repeat_seeds_from_the_outer_node() {
+        let plan = project(
+            recurse(recurse(scan(), "r.data", "rec_0"), "rec_0.node", "rec_1"),
+            vec![
+                col("outer", path("rec_0.node", &["linkId"])),
+                col("inner", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$__rec_0");
+        assert_eq!(unwind_paths(&out.pipeline), ["$__rec_0", "$__rec_1"]);
+    }
+
+    #[test]
+    fn sibling_repeats_both_seed_from_the_same_scope() {
+        let plan = project(
+            recurse(recurse(scan(), "r.data", "rec_0"), "r.data", "rec_1"),
+            vec![
+                col("a", path("rec_0.node", &["linkId"])),
+                col("b", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$data");
+    }
+
+    #[test]
+    fn repeat_row_index_reads_its_own_unwind_index() {
+        let plan = project(
+            recurse(unnest(scan(), "r.data", "item", "fe"), "fe.value", "rec_1"),
+            vec![col(
+                "idx",
+                SqlExpr::RowIndex(crate::sof::ir::RowIndexScope::Repeat("rec_1".to_string())),
+            )],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        let project = out
+            .pipeline
+            .last()
+            .unwrap()
+            .get_document("$project")
+            .unwrap();
+        let expr = column_expr(project, "idx").as_document().unwrap();
+        assert_eq!(
+            expr.get_array("$ifNull").unwrap()[0].as_str().unwrap(),
+            "$__rec_1__idx"
+        );
+    }
+
+    #[test]
+    fn union_of_repeat_branches_lowers_to_one_facet() {
+        let branch = |alias: &str| {
+            project(
+                recurse(scan(), "r.data", alias),
+                vec![col("v", path(&format!("{alias}.node"), &["linkId"]))],
+            )
+        };
+        let plan = PlanNode::Union(vec![branch("rec_0"), branch("rec_1")]);
+        let out = emit_mongo(&plan, &[]).unwrap();
+        let facet = out
+            .pipeline
+            .iter()
+            .find_map(|s| s.get_document("$facet").ok())
+            .expect("union lowers to $facet");
+        assert_eq!(facet.len(), 2);
+        assert_eq!(out.columns, vec!["v".to_string()]);
+    }
+
+    #[test]
+    fn nested_union_is_still_refused() {
+        let plan = project(
+            PlanNode::Union(vec![project(
+                scan(),
+                vec![col("v", SqlExpr::Lit(LitValue::Null))],
+            )]),
+            vec![col("v", SqlExpr::Lit(LitValue::Null))],
+        );
+        assert!(emit_mongo(&plan, &[]).is_err());
     }
 }

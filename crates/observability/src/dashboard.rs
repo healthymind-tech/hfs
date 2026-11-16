@@ -140,6 +140,14 @@ pub struct DashboardSeries {
     pub total: u64,
     /// Dense daily points, oldest first.
     pub points: Vec<DashboardPoint>,
+    /// `Some(instant)` while the series has no storage history behind it
+    /// (#1603): it was built from write counters that have only recorded this
+    /// process's own writes since their base was read from storage at
+    /// `instant`, so the points before that bucket are not measurements — a
+    /// renderer must not draw them as a curve, only the buckets from `instant`
+    /// onward and the current total. `None` once the window's history is
+    /// loaded: every point is backed by storage.
+    pub recorded_from: Option<DateTime<Utc>>,
 }
 
 /// A resource type the tenant actually stores, with its current total —
@@ -310,6 +318,68 @@ impl Figures {
     }
 }
 
+/// Which store a [`HeldTotals::Held`] figure was counted in (#1850).
+///
+/// `exact` in [`Figures::Exact`] is relative to this source, never beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalsSource {
+    /// The authoritative resource store (SQLite, PostgreSQL, MongoDB): live,
+    /// non-deleted resources.
+    AuthoritativeStore,
+    /// A search index standing in for a primary that keeps no counts (S3 with
+    /// Elasticsearch, #1518): exact relative to the index only, which may lag
+    /// or omit the primary. Not an authoritative live-resource total.
+    SearchIndex,
+}
+
+/// The resource totals a provider already holds in memory for one tenant,
+/// read without side effects (#1850, #1848 contract 7).
+///
+/// A missing or inexact figure is never zero: callers that need a number
+/// treat everything except [`HeldTotals::authoritative_exact`] as unknown,
+/// and must not sum held figures from several tenants into a claimed exact
+/// global total unless every one of them is authoritative and exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldTotals {
+    /// No dashboard provider is registered (a build without persistence, or
+    /// the standalone UI example).
+    NoProvider,
+    /// The provider cannot count resources on this backend (standalone S3),
+    /// or does not implement held totals.
+    Unsupported,
+    /// The provider holds no figures for the tenant: it was never reconciled
+    /// from storage, or it was evicted or removed since.
+    Missing,
+    /// Figures held in memory.
+    Held {
+        /// The tenant's resources, summed over every type with counter state.
+        resources: u64,
+        /// [`Figures::Exact`] when the counters matched `source` at their last
+        /// reconcile and nothing changed since, [`Figures::Approximate`]
+        /// otherwise. Never `Pending` or `Unsupported`.
+        figures: Figures,
+        /// Where `resources` was counted.
+        source: TotalsSource,
+    },
+}
+
+impl HeldTotals {
+    /// The tenant's resource total, only when it is an exact count of live
+    /// resources in the authoritative store. Search-index figures (S3 with
+    /// Elasticsearch, #1848 D8) and approximate figures answer `None`: they
+    /// are not authoritative live totals.
+    pub fn authoritative_exact(&self) -> Option<u64> {
+        match self {
+            HeldTotals::Held {
+                resources,
+                figures: Figures::Exact { .. },
+                source: TotalsSource::AuthoritativeStore,
+            } => Some(*resources),
+            _ => None,
+        }
+    }
+}
+
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
 /// the server's live resource counters and registered via [`set_provider`] at
 /// startup.
@@ -336,6 +406,19 @@ pub trait DashboardProvider: Send + Sync {
         types: &[String],
         include_empty: bool,
     ) -> DashboardSnapshot;
+
+    /// The resource totals already held in memory for `tenant` (an empty id
+    /// is the provider's default tenant), with their provenance (#1850).
+    ///
+    /// Strictly passive, unlike [`snapshot`](Self::snapshot): no storage
+    /// call, no view bookkeeping (it does not keep the tenant from eviction
+    /// or reorder the reconcile), no chart registration and no seed. A
+    /// tenant the provider holds nothing for stays
+    /// [`HeldTotals::Missing`]; asking does not schedule it. The default
+    /// answers [`HeldTotals::Unsupported`].
+    fn held_totals(&self, _tenant: &str) -> HeldTotals {
+        HeldTotals::Unsupported
+    }
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -354,16 +437,39 @@ fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
 
+/// The resource totals the registered provider already holds for `tenant`,
+/// read passively (see [`DashboardProvider::held_totals`]); never touches the
+/// snapshot cache and never awaits anything (#1850).
+///
+/// Like [`snapshot`], this reads the **process-global** provider: the most
+/// recent [`set_provider`] wins, so in a process that builds several apps
+/// (the test suites) it answers for the last one built. One server process
+/// mounts one app, which is the case this serves; tests that need isolation
+/// call a provider instance directly.
+pub fn held_totals(tenant: &str) -> HeldTotals {
+    held_totals_via(provider(), tenant)
+}
+
+/// [`held_totals`] with the provider injected, for tests.
+fn held_totals_via(provider: Option<Arc<dyn DashboardProvider>>, tenant: &str) -> HeldTotals {
+    match provider {
+        Some(provider) => provider.held_totals(tenant),
+        None => HeldTotals::NoProvider,
+    }
+}
+
 /// Cache identity: window, tenant, the joined charted types, and the "View all
 /// resources" toggle (#599).
 type CacheKey = (DashboardWindow, String, String, bool);
 
-/// One cached key: the last snapshot written (with when it was written) and
-/// whether a compute holds the refresh slot.
+/// One cached key: the last snapshot written (with when it was written),
+/// whether a compute holds the refresh slot, and when a request last asked for
+/// it (what [`evict_least_recent`] orders by).
 #[derive(Default)]
 struct CacheEntry {
     value: Option<(Instant, DashboardSnapshot)>,
     computing: bool,
+    touched: Option<Instant>,
 }
 
 type SnapCache = Arc<RwLock<HashMap<CacheKey, CacheEntry>>>;
@@ -385,8 +491,16 @@ const WAIT: Duration = Duration::from_millis(500);
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a waiting request re-checks the cache.
 const POLL: Duration = Duration::from_millis(20);
+/// The most keys the cache holds. The charted types come from the request's
+/// query string, so without a bound every distinct selection — a crawler
+/// walking the type picker's links, or junk `?types=` values — added a
+/// snapshot that was never dropped, and the process grew until it was killed
+/// (#2186). Past the bound the least recently requested idle keys are evicted;
+/// real use (a few tenants, windows and selections) stays far below it.
+const MAX_ENTRIES: usize = 256;
 
-/// The cache's timings, injected so tests run on fast clocks.
+/// The cache's timings and size bound, injected so tests run on fast clocks
+/// and small caches.
 #[derive(Clone, Copy, Debug)]
 struct Timings {
     /// See [`TTL`].
@@ -395,12 +509,15 @@ struct Timings {
     wait: Duration,
     /// See [`COMPUTE_TIMEOUT`].
     compute_timeout: Duration,
+    /// See [`MAX_ENTRIES`].
+    max_entries: usize,
 }
 
 const TIMINGS: Timings = Timings {
     ttl: TTL,
     wait: WAIT,
     compute_timeout: COMPUTE_TIMEOUT,
+    max_entries: MAX_ENTRIES,
 };
 
 /// The outcome of a dashboard read. The two ways of not having a snapshot are
@@ -506,7 +623,11 @@ async fn snapshot_via(
         let Ok(mut guard) = cache.write() else {
             return SnapshotState::Pending;
         };
+        if !guard.contains_key(&key) && guard.len() >= timings.max_entries {
+            evict_least_recent(&mut guard, timings.max_entries.saturating_sub(1));
+        }
         let entry = guard.entry(key.clone()).or_default();
+        entry.touched = Some(Instant::now());
         if let Some((written_at, snapshot)) = &entry.value
             && written_at.elapsed() < timings.ttl
         {
@@ -555,6 +676,25 @@ async fn snapshot_via(
         // Not "no data" — the compute is still running and will fill the
         // cache, so callers must render waiting, not absence (#956).
         None => SnapshotState::Pending,
+    }
+}
+
+/// Drops the least recently requested keys until at most `keep` remain. A key
+/// whose compute is running is skipped: its task writes back into the entry,
+/// and the compute timeout already bounds how many of those exist at once.
+fn evict_least_recent(cache: &mut HashMap<CacheKey, CacheEntry>, keep: usize) {
+    let excess = cache.len().saturating_sub(keep);
+    if excess == 0 {
+        return;
+    }
+    let mut idle: Vec<(Option<Instant>, CacheKey)> = cache
+        .iter()
+        .filter(|(_, entry)| !entry.computing)
+        .map(|(key, entry)| (entry.touched, key.clone()))
+        .collect();
+    idle.sort_by_key(|(touched, _)| *touched);
+    for (_, key) in idle.into_iter().take(excess) {
+        cache.remove(&key);
     }
 }
 
@@ -705,6 +845,7 @@ mod tests {
             ttl,
             wait,
             compute_timeout,
+            max_entries: MAX_ENTRIES,
         }
     }
 
@@ -804,6 +945,93 @@ mod tests {
         );
         assert_eq!(provider.hits(), 1, "no recompute inside the TTL");
         assert_eq!(observe(&cache, &default_key()), (false, Some(1)));
+    }
+
+    /// Distinct selections past the bound evict the least recently requested
+    /// keys instead of piling up (#2186); the key just asked for stays.
+    #[tokio::test]
+    async fn distinct_selections_past_the_bound_evict_the_least_recent() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[]);
+        let t = Timings {
+            max_entries: 2,
+            ..timings(Duration::from_secs(60), WAIT, NO_TIMEOUT)
+        };
+        let select = |types: &'static [&'static str]| {
+            let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            let (cache, provider) = (cache.clone(), provider.clone());
+            async move {
+                snapshot_via(
+                    &cache,
+                    provider,
+                    DashboardWindow::LastHour,
+                    "default",
+                    &types,
+                    false,
+                    t,
+                )
+                .await
+            }
+        };
+        let key = |types: &str| {
+            (
+                DashboardWindow::LastHour,
+                "default".to_string(),
+                types.to_string(),
+                false,
+            )
+        };
+
+        total(select(&["Patient"]).await);
+        total(select(&["Observation"]).await);
+        // Patient is requested again, so Observation is now the least recent.
+        total(select(&["Patient"]).await);
+        total(select(&["Condition"]).await);
+
+        let guard = cache.read().expect("cache readable");
+        assert_eq!(guard.len(), 2, "the cache stays at its bound");
+        assert!(guard.contains_key(&key("Patient")));
+        assert!(guard.contains_key(&key("Condition")));
+        assert!(!guard.contains_key(&key("Observation")));
+    }
+
+    /// A key whose compute is still running is never evicted: its task writes
+    /// back into the entry.
+    #[test]
+    fn eviction_skips_a_key_whose_compute_is_running() {
+        let key = |types: &str| {
+            (
+                DashboardWindow::LastHour,
+                "default".to_string(),
+                types.to_string(),
+                false,
+            )
+        };
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert(
+            key("Oldest"),
+            CacheEntry {
+                computing: true,
+                touched: Some(now),
+                ..CacheEntry::default()
+            },
+        );
+        cache.insert(
+            key("Newer"),
+            CacheEntry {
+                touched: Some(now + Duration::from_secs(1)),
+                ..CacheEntry::default()
+            },
+        );
+
+        evict_least_recent(&mut cache, 1);
+
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.contains_key(&key("Oldest")),
+            "the running compute stays"
+        );
     }
 
     /// Past the TTL the request that noticed waits for its refresh and gets the
@@ -1012,6 +1240,7 @@ mod tests {
                         delta: 7,
                         cumulative: 7,
                     }],
+                    recorded_from: None,
                 }],
                 available: Vec::new(),
                 export_jobs: None,
@@ -1051,6 +1280,81 @@ mod tests {
         // the state the UI needs to tell a real snapshot from a slow one.
         let state = snapshot_state(DashboardWindow::LastHour, "default", &[], false).await;
         assert!(matches!(state, SnapshotState::Ready(_)), "{state:?}");
+    }
+
+    /// A provider whose `snapshot` must never run: it panics. Its held totals
+    /// are scripted.
+    struct HeldOnly(HeldTotals);
+
+    #[async_trait]
+    impl DashboardProvider for HeldOnly {
+        async fn snapshot(
+            &self,
+            _window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
+            panic!("held_totals must not build a snapshot");
+        }
+
+        fn held_totals(&self, _tenant: &str) -> HeldTotals {
+            self.0
+        }
+    }
+
+    /// #1850: the passive read reports "no provider" and the default
+    /// "unsupported" as themselves, never as zero, and passes a provider's
+    /// answer through without building a snapshot.
+    #[test]
+    fn held_totals_never_builds_a_snapshot() {
+        assert_eq!(held_totals_via(None, "default"), HeldTotals::NoProvider);
+        assert_eq!(
+            held_totals_via(Some(Arc::new(Fixed)), "default"),
+            HeldTotals::Unsupported,
+            "a provider without held totals answers unsupported"
+        );
+        let read_at = DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap();
+        let held = HeldTotals::Held {
+            resources: 9,
+            figures: Figures::Exact { read_at },
+            source: TotalsSource::AuthoritativeStore,
+        };
+        assert_eq!(held_totals_via(Some(Arc::new(HeldOnly(held))), "t"), held);
+        assert_eq!(
+            held_totals_via(Some(Arc::new(HeldOnly(HeldTotals::Missing))), "t"),
+            HeldTotals::Missing
+        );
+    }
+
+    /// #1850, #1848 D8: only an exact authoritative figure is a usable total.
+    #[test]
+    fn only_exact_authoritative_totals_are_usable() {
+        let read_at = DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap();
+        let exact = Figures::Exact { read_at };
+        let approximate = Figures::Approximate {
+            read_at,
+            reconciled_at: read_at,
+        };
+        let held = |figures, source| HeldTotals::Held {
+            resources: 5,
+            figures,
+            source,
+        };
+        assert_eq!(
+            held(exact, TotalsSource::AuthoritativeStore).authoritative_exact(),
+            Some(5)
+        );
+        for unusable in [
+            held(approximate, TotalsSource::AuthoritativeStore),
+            held(exact, TotalsSource::SearchIndex),
+            held(approximate, TotalsSource::SearchIndex),
+            HeldTotals::Missing,
+            HeldTotals::Unsupported,
+            HeldTotals::NoProvider,
+        ] {
+            assert_eq!(unusable.authoritative_exact(), None, "{unusable:?}");
+        }
     }
 
     #[test]

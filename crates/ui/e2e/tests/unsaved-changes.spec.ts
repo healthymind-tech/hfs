@@ -1,12 +1,24 @@
-import { test, expect, armDialog, dialogsSeen } from "../pages/fixtures";
+import {
+  test,
+  expect,
+  acceptConfirm,
+  armDialog,
+  confirmDialog,
+  dialogsSeen,
+  dismissConfirm,
+} from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource, createSqlQueryLibrary, waitSearchable } from "../pages/api";
 import { VdEditor } from "../pages/vd-editor";
 
 // Unsaved-changes tracking (#1240) in the standalone /ui/editor page and the
 // Resources modal: the "Unsaved changes" pill next to Save, the browser's own
-// beforeunload confirmation on a real navigation, and the modal's own confirm
-// on the closes that never navigate at all (the X, the backdrop, Escape).
+// beforeunload confirmation on browser-controlled navigation, and the in-page discard
+// confirmation (#1667) on the closes that never navigate at all (the X, the
+// backdrop, Escape).
+
+const DISCARD_MESSAGE = "You have unsaved changes. Discard them and close?";
+const LEAVE_MESSAGE = "You have unsaved changes. Discard them and leave this page?";
 
 test("the standalone editor shows the cue only while the document differs from the loaded one", async ({
   page,
@@ -38,8 +50,8 @@ test("a whitespace-only raw edit does not mark the editor dirty", async ({ page,
   await expect(cue).toBeHidden();
 
   await ed.enterRaw();
-  const text = await ed.source.inputValue();
-  await ed.source.fill(text + "\n\n   ");
+  const text = await ed.jsonText();
+  await ed.setJson(text + "\n\n   ");
   await ed.leaveRaw();
 
   await expect(cue).toBeHidden();
@@ -70,7 +82,7 @@ test("saving clears the cue and leaving afterwards asks nothing", async ({
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
 });
 
-test("leaving the editor with unsaved changes asks the browser confirmation", async ({
+test("leaving the editor with unsaved changes asks the shared confirmation", async ({
   page,
   request,
   chrome,
@@ -84,9 +96,10 @@ test("leaving the editor with unsaved changes asks the browser confirmation", as
   await ed.applyJson({ ...original, gender: "other" });
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/editor/);
@@ -103,16 +116,13 @@ test("the Resources modal asks before closing with unsaved changes and keeps the
   await ed.applyJson({ resourceType: "Patient", name: [{ family: "ModalDirty" }] });
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await page.locator(".modal__x").click();
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeVisible();
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
+  await expect(resources.modal.unsavedCue).toBeVisible();
 
   // Accepting (the page object's own close()) does discard it.
-  await resources.modal.close();
+  await resources.modal.close({ discard: true });
   await expect(resources.modal.root).toBeHidden();
 });
 
@@ -138,22 +148,45 @@ test("typing in a form field and closing the modal asks before discarding", asyn
   await page.fill('[data-set="name.0.family"]', "TypedInModalEdited");
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await page.locator(".modal__x").click();
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeVisible();
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
 
   // Accepting discards it, and a hidden modal stays clean afterwards.
-  await resources.modal.close();
+  await resources.modal.close({ discard: true });
   await expect(resources.modal.root).toBeHidden();
 
   dialogsSeen(page);
   await chrome.navLink("/ui/tenants").click();
   await page.waitForURL("**/ui/tenants");
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
+});
+
+// #1667: Escape opens the discard confirmation from inside its own keydown.
+// Without preventDefault the browser's <dialog> handling dismissed that fresh
+// dialog with the same keypress, so the modal neither closed nor asked.
+test("Escape on a dirty modal shows the discard confirmation and keeps it open", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  await resources.modal.editor.applyJson({ resourceType: "Patient", name: [{ family: "EscDirty" }] });
+  await expect(resources.modal.unsavedCue).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await dismissConfirm(page, DISCARD_MESSAGE);
+  await expect(resources.modal.root).toBeVisible();
+
+  // Escape inside the dialog is its Cancel.
+  await page.keyboard.press("Escape");
+  await expect(confirmDialog(page)).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(confirmDialog(page)).toHaveCount(0);
+  await expect(resources.modal.root).toBeVisible();
+
+  await resources.modal.closeWithEscape({ discard: true });
+  await expect(resources.modal.root).toBeHidden();
 });
 
 test("accepting the discard on a fast × click leaves the closed modal clean", async ({
@@ -179,8 +212,8 @@ test("accepting the discard on a fast × click leaves the closed modal clean", a
   await page.fill('[data-set="name.0.family"]', "FastCloseEdited");
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "accept");
   await page.locator(".modal__x").click();
+  await acceptConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeHidden();
 
   dialogsSeen(page);
@@ -189,7 +222,7 @@ test("accepting the discard on a fast × click leaves the closed modal clean", a
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
 });
 
-test("typing in a form field and leaving the editor asks the browser", async ({
+test("typing in a form field and leaving the editor asks the shared confirmation", async ({
   page,
   request,
   chrome,
@@ -204,9 +237,10 @@ test("typing in a form field and leaving the editor asks the browser", async ({
   await page.fill('[data-set="name.0.family"]', "TypedInEditorEdited");
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/editor/);
@@ -226,6 +260,7 @@ test("Escape on a clean modal closes without asking", async ({ resources, page, 
   dialogsSeen(page);
   await resources.modal.closeWithEscape();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("saving in the modal clears the cue", async ({ resources, page }) => {
@@ -243,6 +278,7 @@ test("saving in the modal clears the cue", async ({ resources, page }) => {
   dialogsSeen(page);
   await resources.modal.closeWithEscape();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 // ---- View Definitions (#1240) ----------------------------------------------
@@ -320,7 +356,7 @@ test("saving a View Definition does not ask and lands clean", async ({ page, req
   await expect(cue).toBeHidden();
 });
 
-test("leaving a dirty View Definition asks the browser", async ({ page, request, chrome }) => {
+test("leaving a dirty View Definition asks the shared confirmation", async ({ page, request, chrome }) => {
   const stamp = Date.now().toString(36);
   const vdId = await createResource(
     request,
@@ -337,9 +373,10 @@ test("leaving a dirty View Definition asks the browser", async ({ page, request,
   await vd.setDoc(JSON.stringify({ ...parsed, name: `${parsed.name}_dirty` }));
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions/);
@@ -488,6 +525,7 @@ test("the bulk import New Submission dialog closes with typed values without ask
   await bulkImport.createDialog.getByRole("button", { name: "Cancel" }).click();
   await expect(bulkImport.createDialog).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 
   // The backdrop (the addbox--modal's own <summary>) closes without asking too.
   await bulkImport.newSubmission.click();
@@ -496,6 +534,7 @@ test("the bulk import New Submission dialog closes with typed values without ask
   await bulkImport.newSubmission.click({ position: { x: 4, y: 4 }, force: true });
   await expect(bulkImport.createDialog).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("the bulk import Edit dialog asks before discarding typed values", async ({
@@ -517,17 +556,39 @@ test("the bulk import Edit dialog asks before discarding typed values", async ({
   await nameInput.fill("Edited Submission");
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await toggle.click({ position: { x: 4, y: 4 }, force: true });
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(dialog).toBeVisible();
   await expect(nameInput).toHaveValue("Edited Submission");
 
-  armDialog(page, "accept");
   await toggle.click({ position: { x: 4, y: 4 }, force: true });
+  await acceptConfirm(page, DISCARD_MESSAGE);
+  await expect(dialog).toBeHidden();
+});
+
+// #1667: the same Escape-opens-the-confirmation path for an addbox dialog.
+test("Escape on the dirty bulk import Edit dialog asks, and cancelling keeps the typed values", async ({
+  page,
+  request,
+  bulkImport,
+}) => {
+  await bulkImport.seedAndGoto(request, `e2e-unsaved-esc-${Date.now().toString(36)}`);
+  const toggle = page.locator("details.addbox--modal > summary");
+  const dialog = page.locator("details.addbox--modal [role='dialog']");
+  await toggle.click();
+  await expect(dialog).toBeVisible();
+
+  const nameInput = dialog.locator("input[name='name']");
+  await nameInput.fill("Edited By Escape");
+  await expect(dialog.locator(".tag--unsaved")).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await dismissConfirm(page, DISCARD_MESSAGE);
+  await expect(dialog).toBeVisible();
+  await expect(nameInput).toHaveValue("Edited By Escape");
+
+  await page.keyboard.press("Escape");
+  await acceptConfirm(page, DISCARD_MESSAGE);
   await expect(dialog).toBeHidden();
 });
 
@@ -548,22 +609,5 @@ test("the tenants add panel closes with a typed name without asking", async ({
   await page.keyboard.press("Escape");
   await expect(tenants.addForm).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
-});
-
-test("the Queries save-name field shows the cue until the query is saved", async ({
-  page,
-  queries,
-}) => {
-  await queries.goto("Patient");
-  await queries.builder.setUrl("/Patient?_count=1");
-  const cue = page.locator(".query-builder__save .tag--unsaved");
-  await expect(cue).toBeHidden();
-
-  await queries.builder.nameInput.fill(`E2eUnsavedQuery${Date.now().toString(36)}`);
-  await expect(cue).toBeVisible();
-
-  await queries.builder.saveButton.click();
-  await expect(queries.builder.nameInput).toHaveValue("");
-  await expect(cue).toBeHidden();
-  expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });

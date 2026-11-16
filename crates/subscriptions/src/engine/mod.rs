@@ -85,6 +85,37 @@ enum RegistrationSource {
     Hydration,
 }
 
+/// Effective subscription dispatch limits and counters (upstream #2018 API).
+///
+/// Fork note: upstream v0.2.8 replaced the engine's per-event spawn with a
+/// bounded scheduler (`engine/dispatch.rs`). This fork keeps its own engine,
+/// which carries the cluster fan-out / durable outbox (hm/p3-cluster), so the
+/// scheduler was not adopted in the v0.2.8 merge. The limits are parsed and
+/// normalized exactly as upstream does and reported here, but not enforced;
+/// the live counters are always zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchSnapshot {
+    pub event_queue_capacity: usize,
+    pub max_pending_notifications: usize,
+    pub per_subscription_queue_capacity: usize,
+    pub dispatch_concurrency: usize,
+    pub handshake_concurrency: usize,
+    pub ingress_queued: usize,
+    pub evaluating_events: usize,
+    pub resident_notifications: usize,
+    pub queued_notifications: usize,
+    pub active_notifications: usize,
+    pub notification_workers: usize,
+    pub active_attempts: usize,
+    pub pending_activations: usize,
+    pub active_activations: usize,
+    pub dropped_ingress_full: u64,
+    pub dropped_ingress_closed: u64,
+    pub dropped_global_full: u64,
+    pub dropped_subscription_full: u64,
+    pub dropped_worker_full: u64,
+}
+
 /// The subscription engine orchestrates the entire subscription pipeline.
 ///
 /// It is designed to be invoked asynchronously after resource writes
@@ -161,6 +192,7 @@ impl SubscriptionEngine {
         resolve_default_message_source: bool,
         outbound_auth: Arc<dyn OutboundAuthProvider>,
     ) -> Self {
+        let config = config.normalize_dispatch_limits();
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&topic_registry),
@@ -250,6 +282,18 @@ impl SubscriptionEngine {
     /// Whether this engine runs against cluster-shared state.
     pub fn is_cluster_backed(&self) -> bool {
         self.cluster.is_some()
+    }
+
+    /// The configured (normalized) dispatch limits; see [`DispatchSnapshot`].
+    pub fn dispatch_snapshot(&self) -> DispatchSnapshot {
+        DispatchSnapshot {
+            event_queue_capacity: self.config.event_queue_capacity,
+            max_pending_notifications: self.config.max_pending_notifications,
+            per_subscription_queue_capacity: self.config.per_subscription_queue_capacity,
+            dispatch_concurrency: self.config.dispatch_concurrency,
+            handshake_concurrency: self.config.handshake_concurrency,
+            ..Default::default()
+        }
     }
 
     /// Returns a reference to the topic registry.

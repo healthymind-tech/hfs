@@ -2,7 +2,7 @@
 #
 # Resolve the `backend` workflow_dispatch input into a job matrix for
 # fhir-benchmark.yml, and validate the free-text tuning inputs in one place
-# before the ~13-minute build runs — once, not once per leg; its single
+# before the ~5-minute build runs — once, not once per leg; its single
 # binary serves every leg in the resolved matrix.
 #
 # Called from: the `setup` job's "Resolve matrix from backend input" step.
@@ -14,7 +14,7 @@
 # inputs already carry, limited today to people with write access).
 #
 # Required environment (exported by the workflow step's env:):
-#   IN_BACKEND                      inputs.backend
+#   IN_BACKEND                      inputs.backend (comma list, `-` excludes)
 #   IN_MAX_PARALLEL                 inputs.max_parallel
 #   IN_ES_HEAP                      inputs.es_heap
 #   IN_ES_SYNC_MODE                 inputs.es_sync_mode
@@ -44,17 +44,67 @@ port_for() {
   esac
 }
 
-case "$BACKEND" in
-  core)          LEGS="sqlite postgres" ;;
-  all)           LEGS="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
-  elasticsearch) LEGS="sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
-  sqlite|postgres|mongodb|sqlite-elasticsearch|postgres-elasticsearch|mongodb-elasticsearch)
-                 LEGS="$BACKEND" ;;
-  *)
-    echo "::error::Unknown backend selection '$BACKEND'"
+# `backend` is a comma-separated list of tokens. A token is one of the six
+# legs or an alias (core/all, sqlite-postgres, elasticsearch); a leading `-`
+# removes the leg(s) it names. Inclusions are unioned, then exclusions are
+# subtracted; with only exclusions the start is `core`. The result is
+# de-duplicated and emitted in the canonical order below. A single legacy
+# value (`core`, `postgres`, ...) resolves exactly as before.
+CANONICAL="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch"
+
+expand_token() {
+  case "$1" in
+    core|all)        echo "$CANONICAL" ;;
+    sqlite-postgres) echo "sqlite postgres" ;;
+    elasticsearch)   echo "sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
+    sqlite|postgres|mongodb|sqlite-elasticsearch|postgres-elasticsearch|mongodb-elasticsearch)
+                     echo "$1" ;;
+    *)               return 1 ;;
+  esac
+}
+
+INCLUDE=" "
+EXCLUDE=" "
+HAVE_INCLUDE=0
+IFS=',' read -r -a TOKENS <<< "$BACKEND"
+for raw in "${TOKENS[@]}"; do
+  tok="${raw//[[:space:]]/}"
+  neg=0
+  if [[ "$tok" == -* ]]; then
+    neg=1
+    tok="${tok#-}"
+  fi
+  if [ -z "$tok" ]; then
+    echo "::error::Empty backend token in '$BACKEND'"
     FAIL=1
-    LEGS="" ;;
-esac
+    continue
+  fi
+  if ! expanded=$(expand_token "$tok"); then
+    echo "::error::Unknown backend token '$tok' in '$BACKEND' (legs: $CANONICAL; aliases: core, all, sqlite-postgres, elasticsearch; prefix a token with - to exclude it)"
+    FAIL=1
+    continue
+  fi
+  if [ "$neg" -eq 1 ]; then
+    EXCLUDE="$EXCLUDE$expanded "
+  else
+    HAVE_INCLUDE=1
+    INCLUDE="$INCLUDE$expanded "
+  fi
+done
+if [ "$HAVE_INCLUDE" -eq 0 ]; then
+  INCLUDE=" $CANONICAL "
+fi
+
+LEGS=""
+for leg in $CANONICAL; do
+  if [[ "$INCLUDE" == *" $leg "* && "$EXCLUDE" != *" $leg "* ]]; then
+    LEGS="${LEGS:+$LEGS }$leg"
+  fi
+done
+if [ -z "$LEGS" ] && [ "$FAIL" -eq 0 ]; then
+  echo "::error::backend '$BACKEND' selects no legs"
+  FAIL=1
+fi
 
 ITEMS=""
 for b in $LEGS; do
@@ -69,7 +119,7 @@ LEG_COUNT=$(echo "$LEGS" | wc -w)
 # default inputs) needs about 6 GB (the capacity gate's own formula:
 # 2048+1536 primary, 1024*2+512 ES = 6144MB, so 8 GB free with its
 # 2 GB margin), so 2 concurrent legs already use most of the shared
-# 4-CPU / 11 GB Docker host that the rest of CI also runs on.
+# 4-CPU Docker host that the rest of CI also runs on.
 MAX_PARALLEL="${IN_MAX_PARALLEL:-1}"
 case "$MAX_PARALLEL" in
   *[!0-9]*)
@@ -94,7 +144,7 @@ case "$MAX_PARALLEL" in
         FAIL=1
         MAX_PARALLEL=1
       elif [ "$MAX_PARALLEL" -gt 2 ]; then
-        echo "::warning::max_parallel=$MAX_PARALLEL clamped to 2 (shared 4-CPU / 11 GB Docker host)"
+        echo "::warning::max_parallel=$MAX_PARALLEL clamped to 2 (shared 4-CPU Docker host)"
         MAX_PARALLEL=2
       fi
     fi
@@ -147,7 +197,7 @@ fi
 # HFS_MONGO_POOL from the same raw input (env:
 # IN_HFS_MONGO_MAX_CONNECTIONS) without re-checking it, trusting
 # this step to have already rejected a bad value before the
-# ~13-minute build runs on every leg, including sqlite/postgres.
+# ~5-minute build runs on every leg, including sqlite/postgres.
 HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
 # At most 4 digits (matched BEFORE the -gt 1000 test below): an
 # overlong digit string handed straight to `[ -gt ]` risks "value

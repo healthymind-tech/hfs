@@ -51,6 +51,17 @@ pub struct ParsedBundle {
     /// which, for a hierarchy below the inline-rebuild limit, meant one full
     /// closure build per batch.
     pub chunked: bool,
+    /// When `true`, the write layer does not rebuild `concept_closure` for code
+    /// systems that already held concepts before this bundle. Rebuilding after
+    /// every batch of a chunked bulk load (SNOMED RF2, LOINC, RxNorm, …) is
+    /// O(n²), so those importers set this on each batch and leave the single
+    /// rebuild to `finalize_after_bootstrap` / `migrate_concept_closure*`.
+    /// Systems that were empty before the bundle are still rebuilt (cheap).
+    ///
+    /// Defaults to `false`: every code system the bundle writes gets its
+    /// closure rebuilt before the import returns, so a plain re-import never
+    /// leaves `$subsumes` / `is-a` answering from a wiped closure (#2128).
+    pub defer_closure: bool,
 }
 
 /// Authority rank for a resource we have POSITIVE evidence is authoritative:
@@ -723,12 +734,15 @@ pub fn extract_property_value(prop: &Value) -> (String, String) {
     if let Some(v) = prop["valueDateTime"].as_str() {
         return ("dateTime".into(), v.into());
     }
+    if let Some(v) = prop["value"].as_str() {
+        return ("string".into(), v.into());
+    }
     // A Coding property is stored as its code (filters compare codes).
     if let Some(v) = prop["valueCoding"]["code"].as_str() {
         return ("coding".into(), v.into());
     }
-    if let Some(v) = prop["value"].as_str() {
-        return ("string".into(), v.into());
+    if prop["valueCoding"].is_object() {
+        return ("Coding".into(), prop["valueCoding"].to_string());
     }
     ("string".into(), String::new())
 }
@@ -1272,6 +1286,91 @@ mod tests {
             let (vt, v) = extract_property_value(prop);
             assert_eq!(vt, *expected_type);
             assert_eq!(v, *expected_value);
+        }
+    }
+
+    #[test]
+    fn scalar_values_keep_precedence_when_coding_is_also_present() {
+        let cases = [
+            ("valueCode", serde_json::json!("ABC"), "code", "ABC"),
+            ("valueBoolean", serde_json::json!(false), "boolean", "false"),
+            ("valueInteger", serde_json::json!(0), "integer", "0"),
+            ("valueDecimal", serde_json::json!(1.25), "decimal", "1.25"),
+            ("valueString", serde_json::json!("text"), "string", "text"),
+            (
+                "valueDateTime",
+                serde_json::json!("2026-01-01"),
+                "dateTime",
+                "2026-01-01",
+            ),
+            ("value", serde_json::json!("text"), "string", "text"),
+        ];
+        for (field, value, expected_type, expected_value) in cases {
+            let mut property = serde_json::json!({"valueCoding": {"code": "A"}});
+            property[field] = value;
+            assert_eq!(
+                extract_property_value(&property),
+                (expected_type.to_owned(), expected_value.to_owned()),
+                "{field} must retain its existing precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn coding_property_preserves_the_complete_object() {
+        // Fork: a Coding with a `code` is stored as that code (filters compare
+        // codes; `$expand` restores the full Coding from the stored resource).
+        // Only a Coding without a code keeps the whole object (upstream #2095).
+        let coding = serde_json::json!({
+            "system": "http://example.org/target",
+            "version": "2026",
+            "code": "A",
+            "display": "Alpha",
+            "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let edges = HierarchyProperties::default();
+        let property = parse_property(
+            &serde_json::json!({"code": "maps-to", "valueCoding": coding}),
+            &edges,
+        )
+        .unwrap();
+        assert_eq!(property.value_type, "coding");
+        assert_eq!(property.value, "A");
+        assert!(!property.is_parent_edge);
+
+        let codeless = serde_json::json!({
+            "system": "http://example.org/target",
+            "display": "Alpha"
+        });
+        let property = parse_property(
+            &serde_json::json!({"code": "maps-to", "valueCoding": codeless}),
+            &edges,
+        )
+        .unwrap();
+        assert_eq!(property.value_type, "Coding");
+        assert_eq!(
+            serde_json::from_str::<Value>(&property.value).unwrap(),
+            codeless
+        );
+    }
+
+    #[test]
+    fn non_object_coding_properties_are_skipped() {
+        for value in [
+            Value::Null,
+            serde_json::json!("A"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                parse_property(
+                    &serde_json::json!({"code": "maps-to", "valueCoding": value}),
+                    &HierarchyProperties::default(),
+                )
+                .is_none()
+            );
         }
     }
 }

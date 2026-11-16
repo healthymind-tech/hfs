@@ -780,7 +780,7 @@ where
 {
     let tenant = match TenantExtractor::from_request_parts(parts, state).await {
         Ok(t) => t,
-        Err((status, message)) => return Err((status, message).into_response()),
+        Err(rejection) => return Err(rejection.into_response()),
     };
     match state.storage().read(tenant.context(), ty, id).await {
         Ok(found) => Ok(found.map(|r| r.content().clone())),

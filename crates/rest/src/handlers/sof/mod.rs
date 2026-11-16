@@ -12,10 +12,12 @@
 pub mod capability;
 pub mod export;
 pub(crate) mod graph;
+pub(crate) mod input_limits;
 pub(crate) mod references;
 pub mod run;
 pub mod sqlquery;
 pub mod subject;
+pub(crate) mod terminology;
 pub(crate) mod view_sources;
 
 pub use capability::{

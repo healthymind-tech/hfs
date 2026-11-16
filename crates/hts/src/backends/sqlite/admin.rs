@@ -661,7 +661,9 @@ impl TerminologyAdmin for SqliteTerminologyBackend {
         let step = step.to_string();
         self.blocking(move |conn| {
             match step.as_str() {
-                "closure" => schema::migrate_concept_closure(conn).map_err(storage)?,
+                "closure" => {
+                    schema::migrate_concept_closure(conn).map_err(storage)?;
+                }
                 "fts" => {
                     value_set::prebuild_concepts_fts(conn);
                 }

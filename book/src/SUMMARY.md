@@ -1,6 +1,13 @@
-# Summary
+# The Helios FHIR Server
 
-- [Introduction](ch01-introduction.md)
+[The Helios FHIR Server](title-page.md)
+[Foreword](foreword.md)
+
+[Introduction](introduction.md)
+
+---
+
+- [Getting Started with FHIR](ch01-introduction.md)
 - [Installation](ch02-installation.md)
 - [Quick Start](ch03-quickstart.md)
 - [FHIR Basics](ch04-fhir-basics.md)
@@ -8,6 +15,9 @@
 - [SQL-on-FHIR](ch06-sql-on-fhir.md)
 - [Natural-Language Search](components/natural-language-search.md)
 - [Web UI Self-Calls and Authentication](components/web-ui-self-calls.md)
+- [Identity Providers]()
+  - [Microsoft Entra ID](identity-providers/entra-id.md)
+  - [Okta](identity-providers/okta.md)
 - [Architecture Overview](ch07-architecture.md)
 - [Multi-Version FHIR Support](ch08-versions.md)
 - [Python Bindings (pysof)](ch09-pysof.md)
@@ -17,6 +27,7 @@
 - [Development Setup](ch13-dev-setup.md)
 - [Contributing Guidelines](ch14-contributing.md)
 - [Running HFS in a Cluster](ch15-cluster-deployment.md)
+- [Live API Demo](live-api-demo.md)
 
 ---
 

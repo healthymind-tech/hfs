@@ -21,9 +21,14 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::{SearchParameter, StoredResource};
 
 use super::PostgresBackend;
+use super::backend::OverlayFreshness;
+use super::bundle_lock_plan::LockPlan;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::GuardedClient;
-use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
+use super::lock_protocol::{
+    acquire_criteria_lock, acquire_exclusive_write_gate, acquire_shared_write_locks,
+    criteria_key_for, try_criteria_lock, wait_for_criteria_lock,
+};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
 fn internal_error(message: String) -> StorageError {
@@ -37,6 +42,25 @@ fn internal_error(message: String) -> StorageError {
 #[allow(dead_code)]
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
+}
+
+/// What [`PostgresTransaction::lock_criteria`] did for a conditional create
+/// whose search found nothing, and so what the caller does next (#1747).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CriteriaLock {
+    /// Nothing to take: create without searching again. This covers no criteria
+    /// locks (the exclusive gate, or a bulk batch), criteria that name nothing
+    /// to match on, and a key this transaction already holds, in which case the
+    /// search that missed ran under it.
+    Unneeded,
+    /// This transaction took the key and holds it to COMMIT: search again and
+    /// create only if that still misses.
+    Held,
+    /// Another transaction held the key; this one waited for it to end and holds
+    /// nothing. Search again: a match is what the holder created and needs no
+    /// lock. On a miss, call [`PostgresTransaction::hold_criteria`] and search a
+    /// third time.
+    Waited,
 }
 
 /// A PostgreSQL transaction.
@@ -83,28 +107,28 @@ pub struct PostgresTransaction {
     conflict: Option<DeferredConflict>,
     /// Complete logical keys declared before BEGIN for a shared-gate batch.
     planned_keys: Option<HashSet<(String, String)>>,
+    /// Whether a `create` under an id this transaction minted needs no planned
+    /// key: nothing else can address it before commit (#1637). Set by a
+    /// transaction Bundle's plan, never by a bulk-submit batch's.
+    minted_creates: bool,
+    /// Ids that transaction-bundle reference pinning minted into a POST body
+    /// before the entry ran (#1934). They are as unpublished as an id `create`
+    /// mints itself, so `create` treats them as minted.
+    pinned_mints: HashSet<(String, String)>,
+    /// Whether a conditional create that found no match takes a criteria lock
+    /// and searches again; see [`PostgresTransaction::lock_criteria`].
+    criteria_locks: bool,
+    /// The criteria keys this transaction took `EXCLUSIVE` and holds to COMMIT,
+    /// never the ones it only waited for (#1747).
+    criteria_held: HashSet<i32>,
+    /// Set when a resource outside the lock plan was addressed: the planner and
+    /// the executor disagreed about what the transaction touches. That is a
+    /// defect of the server, not of the request (see
+    /// [`PostgresTransaction::plan_violation`]).
+    plan_violation: Option<String>,
     /// An unexpected key or post-mutation error cannot be committed.
     poisoned: bool,
     search_snapshot_dirty: bool,
-}
-
-/// The keys a shared-gate transaction may touch, declared before BEGIN.
-///
-/// Any key outside the plan poisons the transaction (see
-/// `ensure_planned_key`), so a plan is a promise, not a hint.
-#[derive(Debug, Default)]
-pub(crate) struct LockPlan {
-    /// Locked exclusively, in ascending key order, right after BEGIN.
-    pub locked: Vec<(String, String)>,
-    /// Ids this server generated for the transaction's own creates just before
-    /// BEGIN. No other writer can name one before this transaction commits,
-    /// so there is nothing to serialise against and they take no lock; a
-    /// primary-key collision would still surface as the usual conflict. They
-    /// stay out of the lock set because a 1,600-entry import bundle would
-    /// otherwise hold 1,600 advisory locks, and sixteen of those overflow
-    /// PostgreSQL's shared lock table (`max_locks_per_transaction` x
-    /// `max_connections`).
-    pub fresh: Vec<(String, String)>,
 }
 
 /// A create whose `resources`/`resource_history`/`search_index` rows are built
@@ -158,15 +182,271 @@ impl std::fmt::Debug for PostgresTransaction {
 }
 
 impl PostgresTransaction {
+    /// Read the current revision, including its deletion timestamp when it is
+    /// a tombstone. Ordinary transaction reads continue to hide deleted rows.
+    pub async fn read_including_deleted(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.read_resource(resource_type, id, true).await
+    }
+
+    /// Restore a tombstone as its next revision in this transaction. The
+    /// supplied tombstone must belong to this tenant and still match the
+    /// stored deletion state and version. History and search indexes are
+    /// updated with the resource; callers must roll back on any write error.
+    pub async fn restore(
+        &mut self,
+        deleted: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        if !deleted.is_deleted() || deleted.tenant_id() != self.tenant.tenant_id() {
+            return Err(StorageError::Validation(
+                crate::error::ValidationError::InvalidResource {
+                    message: "Restore requires a deleted resource from the transaction's tenant"
+                        .into(),
+                    details: Vec::new(),
+                },
+            ));
+        }
+        self.write_revision(deleted, resource, true).await
+    }
+
+    async fn read_resource(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        include_deleted: bool,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.ensure_usable()?;
+        self.ensure_planned_key(resource_type, id, false)?;
+
+        // Buffered creates must be visible to everything that is not another
+        // create. This is what keeps `read`/`update`/`delete` — and therefore a
+        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
+        // what they saw before: the batch is a wire-level optimisation, never a
+        // change of visibility inside the transaction.
+        self.flush().await?;
+
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str();
+
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at
+                 FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+
+        match row {
+            Some(row) => {
+                let version_id: String = row.get(0);
+                let data: serde_json::Value = row.get(1);
+                let last_updated: chrono::DateTime<Utc> = row.get(2);
+                let is_deleted: bool = row.get(3);
+                let fhir_version_str: String = row.get(4);
+
+                let deleted_at: Option<chrono::DateTime<Utc>> = row.get(5);
+
+                if is_deleted && !include_deleted {
+                    return Ok(None);
+                }
+
+                // Older tombstones may lack deleted_at. Preserve their deleted
+                // state using the timestamp of the deletion revision.
+                let deleted_at = is_deleted.then_some(deleted_at.unwrap_or(last_updated));
+
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+                Ok(Some(StoredResource::from_storage(
+                    resource_type,
+                    id,
+                    version_id,
+                    self.tenant.tenant_id().clone(),
+                    data,
+                    last_updated,
+                    last_updated,
+                    deleted_at,
+                    fhir_version,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn write_revision(
+        &mut self,
+        current: &StoredResource,
+        resource: Value,
+        expected_deleted: bool,
+    ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
+        self.ensure_usable()?;
+        self.ensure_planned_key(current.resource_type(), current.id(), false)?;
+
+        // Buffered creates must be visible to everything that is not another
+        // create. This is what keeps `read`/`update`/`delete` — and therefore a
+        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
+        // what they saw before: the batch is a wire-level optimisation, never a
+        // change of visibility inside the transaction.
+        self.flush().await?;
+        self.refresh_search_snapshot_if_dirty().await?;
+        self.poisoned = true;
+
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str().to_string();
+        let resource_type = current.resource_type();
+        let id = current.id();
+
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Build the resource with id and resourceType
+        let mut data = resource;
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+        }
+
+        let now = Utc::now();
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param();
+        // Version check, update and history row in one statement. Folding the
+        // expected version into the `WHERE` makes the check and write atomic:
+        // a concurrent writer cannot bump the version between two statements
+        // and have this update overwrite it while reporting success.
+        let updated = execute_cached(
+            client,
+            "WITH upd AS (
+                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3,
+                     is_deleted = FALSE, deleted_at = NULL
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = $9 AND version_id = $7
+                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+             )
+             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, \
+                 data, last_updated, is_deleted, fhir_version)
+             SELECT tenant_id, resource_type, id, version_id, data, last_updated, \
+                 is_deleted, $8 FROM upd",
+            &[
+                &new_version_str,
+                &data,
+                &now,
+                &tenant_id,
+                &resource_type,
+                &id,
+                &expected_version,
+                &fhir_version_str,
+                &expected_deleted,
+            ],
+        )
+        .await
+        .or_query_error("Failed to update resource")?;
+
+        if updated == 0 {
+            // The statement matched nothing because the row is missing,
+            // in the wrong deletion state, or has a different version. Only
+            // the last case is a concurrency conflict; the lookup is needed only on this error
+            // path to distinguish it from the two not-found cases.
+            let actual = query_opt_cached(
+                client,
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = $4",
+                &[&tenant_id, &resource_type, &id, &expected_deleted],
+            )
+            .await
+            .or_query_error("Failed to get current version")?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
+        // Re-index the resource for search
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+            self.refresh_search_snapshot_if_dirty().await?;
+        }
+        if let Err(error) = self
+            .index_resource(
+                &tenant_id,
+                resource_type,
+                id,
+                now,
+                super::storage::IndexWrite::Replace,
+                &data,
+            )
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.poisoned = false;
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            self.tenant.tenant_id().clone(),
+            data,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// Create a new transaction.
+    ///
+    /// With a `plan` the transaction takes the tenant gate shared plus the
+    /// plan's resource keys and refuses any resource outside it; without one it
+    /// takes the exclusive gate.
     async fn new(
         backend: &PostgresBackend,
         client: Client,
         tenant: TenantContext,
         plan: Option<LockPlan>,
         options: TransactionOptions,
+        freshness: OverlayFreshness,
     ) -> StorageResult<Self> {
         // Start the transaction.
+        //
+        // A planned transaction pins `READ COMMITTED` instead of taking the
+        // server's `default_transaction_isolation` (#1637). The criteria lock
+        // of a transaction Bundle (`lock_criteria`) is only worth anything if
+        // the search that follows the wait is a *new snapshot* that sees what
+        // the lock's previous holder committed, and that is a READ COMMITTED
+        // behaviour: under `repeatable read` the snapshot dates from the first
+        // statement, the gate lock taken before the wait, and the search misses
+        // the holder's row. Bulk submit's planned batches share this
+        // constructor and so take the same `BEGIN`. The exclusive path
+        // (`begin_transaction`) keeps a bare `BEGIN`: it takes no criteria
+        // lock, because nobody can interleave with it.
         //
         // `batch_execute` and not `execute`: `execute("BEGIN", &[])` takes the
         // extended protocol, which for a `&str` means Parse + Describe + Sync
@@ -178,7 +458,12 @@ impl PostgresTransaction {
         // bundle pays this twice (BEGIN and COMMIT), plus once more on the
         // rollback paths.
         let mut guarded = GuardedClient::new(client, backend.cleanup_tracker.clone(), None);
-        guarded.batch_execute("BEGIN").await.map_err(|e| {
+        let begin = if plan.is_some() {
+            "BEGIN ISOLATION LEVEL READ COMMITTED"
+        } else {
+            "BEGIN"
+        };
+        guarded.batch_execute(begin).await.map_err(|e| {
             StorageError::Transaction(TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
             })
@@ -186,7 +471,7 @@ impl PostgresTransaction {
 
         let tenant_id = tenant.tenant_id().as_str();
         let lock_result = match plan.as_ref() {
-            Some(plan) => acquire_shared_write_locks(&*guarded, tenant_id, &plan.locked).await,
+            Some(plan) => acquire_shared_write_locks(&*guarded, tenant_id, &plan.resources).await,
             None => acquire_exclusive_write_gate(&*guarded, tenant_id).await,
         };
         if let Err(error) = lock_result {
@@ -197,7 +482,7 @@ impl PostgresTransaction {
         }
         let extracts = !backend.is_search_offloaded() && !options.defer_search_indexing;
         let extractor = match backend
-            .write_extractor(&*guarded, tenant_id, extracts, true)
+            .write_extractor_with(&*guarded, tenant_id, extracts, false, freshness)
             .await
         {
             Ok(extractor) => extractor,
@@ -225,7 +510,12 @@ impl PostgresTransaction {
             pending_index_rows: 0,
             creates_seen: 0,
             conflict: None,
-            planned_keys: plan.map(|plan| plan.locked.into_iter().chain(plan.fresh).collect()),
+            minted_creates: plan.as_ref().is_some_and(|plan| plan.minted_creates),
+            pinned_mints: HashSet::new(),
+            criteria_locks: plan.as_ref().is_some_and(|plan| plan.criteria_locks),
+            criteria_held: HashSet::new(),
+            plan_violation: None,
+            planned_keys: plan.map(|plan| plan.resources.into_iter().collect()),
             poisoned: false,
             search_snapshot_dirty: false,
         })
@@ -241,6 +531,18 @@ impl PostgresTransaction {
     /// bookkeeping statements (rollback records, receipts) into the same
     /// commit — see the bulk-submit batch ingest (#872).
     pub(crate) fn raw_client(&self) -> StorageResult<&Client> {
+        self.client()
+    }
+
+    /// Borrow the active connection for extension tables that must commit with
+    /// resource writes. Buffered creates are flushed before it is returned.
+    ///
+    /// Callers must not issue transaction-control statements or retain the
+    /// connection beyond this borrow. Roll back the transaction if extension
+    /// work fails; committing remains the responsibility of `Transaction`.
+    pub async fn transaction_client(&mut self) -> StorageResult<&Client> {
+        self.ensure_usable()?;
+        self.flush().await?;
         self.client()
     }
 
@@ -401,28 +703,42 @@ impl PostgresTransaction {
 }
 
 impl PostgresBackend {
-    /// Begins a bulk-submit batch whose complete resource keys are known.
-    pub(super) async fn begin_planned_transaction(
+    /// Begin a READ COMMITTED transaction for a complete set of resource keys.
+    ///
+    /// Each key is `(resource_type, logical_id)`. The transaction takes the
+    /// tenant gate shared and locks these keys in a consistent order before
+    /// reading. Reads and writes outside the declared set are rejected. Callers
+    /// must choose IDs for creates before beginning this transaction.
+    pub async fn begin_planned_transaction(
         &self,
         tenant: &TenantContext,
         options: TransactionOptions,
         keys: Vec<(String, String)>,
     ) -> StorageResult<PostgresTransaction> {
-        let plan = LockPlan {
-            locked: keys,
-            fresh: Vec::new(),
-        };
-        self.begin_bundle_transaction(tenant, options, plan).await
+        // Bulk submit takes its overlay snapshot under the tenant gate and
+        // must see every SearchParameter committed before it, so it bypasses
+        // the fingerprint TTL that ordinary writes use.
+        let client = self.get_client().await?;
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            Some(LockPlan::resources_only(keys)),
+            options,
+            OverlayFreshness::Authoritative,
+        )
+        .await
     }
 
-    /// Begins a transaction under the shared tenant gate and `plan`'s keys.
     /// Begins a transaction that only **creates** resources under ids this
-    /// server has just generated (`fresh`), such as a batch of audit events.
+    /// server has just generated (`fresh`), such as a batch of audit events
+    /// (fork, hm/p3-audit).
     ///
     /// No other writer can name those ids, so it takes only the tenant's
     /// shared write lock — unlike [`TransactionProvider::begin_transaction`],
     /// whose unplanned transaction holds the tenant's exclusive write gate and
-    /// so stalls every other write in the tenant for as long as it runs.
+    /// so stalls every other write in the tenant for as long as it runs. The
+    /// ids are minted creates under the lock plan (#1637): they need no key.
     pub async fn begin_fresh_create_transaction(
         &self,
         tenant: &TenantContext,
@@ -430,12 +746,23 @@ impl PostgresBackend {
         fresh: Vec<(String, String)>,
     ) -> StorageResult<PostgresTransaction> {
         let plan = LockPlan {
-            locked: Vec::new(),
-            fresh,
+            resources: Vec::new(),
+            minted_creates: true,
+            criteria_locks: false,
         };
-        self.begin_bundle_transaction(tenant, options, plan).await
+        let mut tx = self.begin_bundle_transaction(tenant, options, plan).await?;
+        for (resource_type, id) in &fresh {
+            tx.note_pinned_mint(resource_type, id);
+        }
+        Ok(tx)
     }
 
+    /// Begins a transaction under `plan`: the tenant gate shared, then the
+    /// plan's resource keys, and no exclusive gate (#1637).
+    ///
+    /// The transaction Bundle path plans from its entries; bulk submit plans
+    /// from its batch and keeps its complete-key-set rule
+    /// ([`LockPlan::resources_only`]).
     pub(super) async fn begin_bundle_transaction(
         &self,
         tenant: &TenantContext,
@@ -443,7 +770,15 @@ impl PostgresBackend {
         plan: LockPlan,
     ) -> StorageResult<PostgresTransaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options).await
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            Some(plan),
+            options,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
     }
 }
 
@@ -496,6 +831,181 @@ impl PostgresTransaction {
     /// The conflict a flush discovered, if any.
     pub(crate) fn deferred_conflict(&self) -> Option<&DeferredConflict> {
         self.conflict.as_ref()
+    }
+
+    /// Why the transaction was refused a resource outside its lock plan, if it
+    /// was (#1637).
+    ///
+    /// The planner and the executor read an entry with one parser, so this
+    /// should never be set. If it is, the server has a defect: the Bundle driver
+    /// ends the Bundle as a server error (`RolledBack`, a 500), not as the
+    /// `BundleError` (a 400 naming the entry) that would blame the request.
+    /// Records an id bundle reference pinning minted into a POST body, so the
+    /// `create` that writes it counts as a minted create under the lock plan.
+    pub(crate) fn note_pinned_mint(&mut self, resource_type: &str, id: &str) {
+        self.pinned_mints
+            .insert((resource_type.to_string(), id.to_string()));
+    }
+
+    pub(crate) fn plan_violation(&self) -> Option<&str> {
+        self.plan_violation.as_deref()
+    }
+
+    /// Takes, or waits out, the criteria lock for a conditional create of
+    /// `resource_type` whose search under `criteria` found nothing (#1637).
+    ///
+    /// A Bundle creates only while it holds the key `EXCLUSIVE` and a search
+    /// under that lock has missed. What differs is the wait. The key is tried
+    /// first, without waiting:
+    ///
+    /// * free: it is taken and held to COMMIT ([`CriteriaLock::Held`]). The
+    ///   caller searches again and creates only on a miss. This is the whole
+    ///   cost of an uncontended miss: one lock statement and one search.
+    /// * held by another Bundle: this one waits for that Bundle to end *without
+    ///   keeping the key* ([`CriteriaLock::Waited`]): a shared wait inside a
+    ///   savepoint, rolled back as soon as it is granted. Every Bundle waiting
+    ///   on one holder is granted together when it ends, and none of them holds
+    ///   anything, so they no longer run one after another (#1747). The caller
+    ///   searches again: under READ COMMITTED that search sees what the holder
+    ///   committed, and a match is the holder's resource, which needs no lock.
+    ///   Only if it still misses does the caller take the key with
+    ///   [`PostgresTransaction::hold_criteria`] and search a third time.
+    ///
+    /// [`CriteriaLock::Unneeded`] means there is nothing to re-check: this
+    /// transaction takes no criteria locks (it holds the exclusive gate, so
+    /// nobody can interleave, or it is a bulk-submit batch), the criteria name
+    /// nothing a search could match, or it already held this key, in which case
+    /// the search that just missed already ran under it.
+    ///
+    /// The wait blocks. A deadlock against another Bundle taking criteria locks
+    /// in the opposite order, a statement timeout, `lock_not_available` and a
+    /// full lock table (`53200`), in the try or in the wait, are returned as
+    /// [`TransactionError::Transient`], which the Bundle path ends as a
+    /// retryable 503 (see `lock_protocol::acquire_criteria_lock`). Only the
+    /// criteria lock statements are marked so: no other statement of the Bundle
+    /// can become `Transient`. Any failure poisons the transaction.
+    ///
+    /// The savepoint lives inside the wait's single batch and is released there,
+    /// so it neither flushes nor discards the buffered creates of earlier
+    /// entries, which the transaction's own savepoint helpers would.
+    ///
+    /// One limit remains. A transaction that took the key and then finds a match
+    /// on its re-search keeps the key to COMMIT though it creates nothing, so
+    /// Bundles that miss the same criteria in that window wait for its whole
+    /// transaction, as all of them did before #1747. It needs another Bundle to
+    /// commit between this one's first search and its lock. Giving the key back
+    /// would need a savepoint around a search, and a search flushes buffered
+    /// creates, which a rollback would lose. The same holds for a Bundle that
+    /// waited, missed, took the key with `hold_criteria` and then matched on its
+    /// third search: it keeps the key to COMMIT too. When the holder rolls back
+    /// (a deadlock victim, a 503, a failed entry), its waiters all miss and take
+    /// the key one after another, each keeping it to its own COMMIT, as before
+    /// #1747. Waiters carry on together only when the holder commits a match
+    /// (test (m) in `postgres_tests.rs`,
+    /// `postgres_integration_bundle_lock_waiters_of_a_rolled_back_creator_create_exactly_once`).
+    ///
+    /// # What this closes, and what it does not
+    ///
+    /// The lock closes the race between two Bundles that create on the *same*
+    /// criteria. It does not make a Bundle's `ifNoneExist` search exclusive of
+    /// every writer, which is what the exclusive tenant gate did for Bundles
+    /// before the lock plan (#1637). A writer that does not take this lock can
+    /// create a match, or turn a resource into one, while the search runs, and
+    /// the Bundle then creates a duplicate:
+    ///
+    /// * a plain `POST` or `PUT` in another Bundle (its entries carry no
+    ///   criteria), or a `PATCH` that makes a resource match;
+    /// * a single-resource create, update or `PATCH`, which holds the tenant
+    ///   gate shared plus its own resource key, and so runs beside this Bundle.
+    ///
+    /// That is the same class as the race the lock already leaves open between
+    /// Bundles whose criteria differ but match one resource (`identifier=...`
+    /// against `name=...`), and as the one that existed before #1487 took any
+    /// lock at all. Also reopened, with a smaller effect: a resource the search
+    /// matched can be deleted by a concurrent Bundle holding its key before this
+    /// one commits, so the Bundle then writes references to a deleted resource.
+    pub(crate) async fn lock_criteria(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<CriteriaLock> {
+        let Some(key) = self.criteria_key_to_take(resource_type, criteria)? else {
+            return Ok(CriteriaLock::Unneeded);
+        };
+        // The outcome is computed before `self` is touched, so the borrow of
+        // the client ends first.
+        let outcome = match self.client() {
+            Ok(client) => match try_criteria_lock(client, key).await {
+                Ok(true) => Ok(CriteriaLock::Held),
+                Ok(false) => wait_for_criteria_lock(client, key)
+                    .await
+                    .map(|()| CriteriaLock::Waited),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(lock) => {
+                if lock == CriteriaLock::Held {
+                    self.criteria_held.insert(key);
+                }
+                Ok(lock)
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Takes the criteria lock `EXCLUSIVE`, waiting for its holder, after
+    /// [`PostgresTransaction::lock_criteria`] returned [`CriteriaLock::Waited`]
+    /// and the search that followed still found nothing.
+    ///
+    /// Returns `true` when the key was taken and is held to COMMIT: the caller
+    /// must search again and create only if that still misses. Returns `false`
+    /// when there is nothing to take (see [`CriteriaLock::Unneeded`]). Failures
+    /// are as for `lock_criteria`.
+    pub(crate) async fn hold_criteria(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<bool> {
+        let Some(key) = self.criteria_key_to_take(resource_type, criteria)? else {
+            return Ok(false);
+        };
+        let outcome = match self.client() {
+            Ok(client) => acquire_criteria_lock(client, key).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.criteria_held.insert(key);
+        Ok(true)
+    }
+
+    /// The criteria key a conditional create must still take, if any: `None`
+    /// when this transaction takes no criteria locks, the criteria name nothing
+    /// to match on, or the key is already held.
+    fn criteria_key_to_take(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<i32>> {
+        self.ensure_usable()?;
+        if !self.criteria_locks {
+            return Ok(None);
+        }
+        match criteria_key_for(self.tenant.tenant_id().as_str(), resource_type, criteria) {
+            Ok(Some(key)) if self.criteria_held.contains(&key) => Ok(None),
+            Ok(key) => Ok(key),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Sends every buffered create.
@@ -590,18 +1100,33 @@ impl PostgresTransaction {
         Ok(())
     }
 
-    fn ensure_planned_key(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
-        if let Some(keys) = &self.planned_keys {
-            if resource_type == "SearchParameter"
-                || !keys.contains(&(resource_type.to_string(), id.to_string()))
-            {
-                self.poisoned = true;
-                return Err(StorageError::Transaction(TransactionError::RolledBack {
-                    reason: format!(
-                        "resource {resource_type}/{id} was not in the transaction lock plan"
-                    ),
-                }));
-            }
+    /// Refuses a resource the transaction's lock plan does not cover.
+    ///
+    /// `minted` is true for a `create` of an id this transaction generated. It
+    /// needs no key when the plan says so ([`LockPlan::minted_creates`]): the
+    /// identity is unpublished until `COMMIT`, so no other transaction can
+    /// address it, and the primary key still arbitrates if one somehow did. A
+    /// SearchParameter is refused regardless, minted or not, because its writer
+    /// needs the exclusive gate.
+    fn ensure_planned_key(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        minted: bool,
+    ) -> StorageResult<()> {
+        let Some(keys) = &self.planned_keys else {
+            return Ok(());
+        };
+        let covered = (minted && self.minted_creates)
+            || keys.contains(&(resource_type.to_string(), id.to_string()));
+        if resource_type == "SearchParameter" || !covered {
+            self.poisoned = true;
+            let reason =
+                format!("resource {resource_type}/{id} was not in the transaction lock plan");
+            self.plan_violation = Some(reason.clone());
+            return Err(StorageError::Transaction(TransactionError::RolledBack {
+                reason,
+            }));
         }
         Ok(())
     }
@@ -612,14 +1137,14 @@ impl PostgresTransaction {
             let extracts = !self.search_offloaded && !self.defer_search_indexing;
             let extractor = match self
                 .backend
-                // Dirty means this transaction wrote a SearchParameter or
-                // rolled back to a savepoint: what it reads now may be
-                // uncommitted, so it must not reach the shared cache.
+                // The snapshot is dirty because this transaction wrote a
+                // SearchParameter: read it, but keep it out of the cache
+                // until the commit (see `write_extractor`).
                 .write_extractor(
                     self.client()?,
                     self.tenant.tenant_id().as_str(),
                     extracts,
-                    false,
+                    true,
                 )
                 .await
             {
@@ -735,12 +1260,16 @@ impl Transaction for PostgresTransaction {
         self.ensure_usable()?;
 
         // Get or generate ID
-        let id = resource
+        let payload_id = resource
             .get("id")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(crate::types::new_resource_id);
-        self.ensure_planned_key(resource_type, &id)?;
+            .map(|s| s.to_string());
+        let minted = payload_id.as_ref().is_none_or(|id| {
+            self.pinned_mints
+                .contains(&(resource_type.to_string(), id.clone()))
+        });
+        let id = payload_id.unwrap_or_else(crate::types::new_resource_id);
+        self.ensure_planned_key(resource_type, &id, minted)?;
         self.refresh_search_snapshot_if_dirty().await?;
 
         // Build the resource with id and resourceType
@@ -828,58 +1357,7 @@ impl Transaction for PostgresTransaction {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        self.ensure_usable()?;
-        self.ensure_planned_key(resource_type, id)?;
-
-        // Buffered creates must be visible to everything that is not another
-        // create. This is what keeps `read`/`update`/`delete` — and therefore a
-        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
-        // what they saw before: the batch is a wire-level optimisation, never a
-        // change of visibility inside the transaction.
-        self.flush().await?;
-
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str();
-
-        let row = query_opt_cached(
-            client,
-            "SELECT version_id, data, last_updated, is_deleted, fhir_version
-                 FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
-
-        match row {
-            Some(row) => {
-                let version_id: String = row.get(0);
-                let data: serde_json::Value = row.get(1);
-                let last_updated: chrono::DateTime<Utc> = row.get(2);
-                let is_deleted: bool = row.get(3);
-                let fhir_version_str: String = row.get(4);
-
-                if is_deleted {
-                    return Ok(None);
-                }
-
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    self.tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
-            }
-            None => Ok(None),
-        }
+        self.read_resource(resource_type, id, false).await
     }
 
     async fn update(
@@ -887,7 +1365,7 @@ impl Transaction for PostgresTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        self.update_inner(current, resource, false).await
+        self.write_revision(current, resource, false).await
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
@@ -895,7 +1373,7 @@ impl Transaction for PostgresTransaction {
             .check_permission(Operation::Delete, resource_type)?;
 
         self.ensure_usable()?;
-        self.ensure_planned_key(resource_type, id)?;
+        self.ensure_planned_key(resource_type, id, false)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -926,6 +1404,11 @@ impl Transaction for PostgresTransaction {
                 (v, d, f)
             }
             None => {
+                // Nothing to delete. Only a `SELECT` has run since the flush,
+                // so the transaction is as usable as before this call, and a
+                // caller that answers this as a no-op (#2523) must still be able
+                // to commit.
+                self.poisoned = false;
                 return Err(StorageError::Resource(ResourceError::NotFound {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
@@ -1104,7 +1587,15 @@ impl TransactionProvider for PostgresBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), None, options).await
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            None,
+            options,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
     }
 }
 
@@ -1131,7 +1622,7 @@ mod reindex_groups_tests {
         let pg = SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                let container = crate::container_cleanup::with_cleanup_label(
                     Postgres::default()
                         .with_tag("16-alpine")
                         .with_label("github.run_id", &run_id),
@@ -1159,6 +1650,378 @@ mod reindex_groups_tests {
         .expect("backend");
         backend.init_schema().await.expect("schema");
         backend
+    }
+
+    async fn assert_restore_rows(
+        tx: &PostgresTransaction,
+        versions: &[(&str, bool)],
+        tag: Option<&str>,
+    ) {
+        let client = tx.client().unwrap();
+        let rows = client
+            .query(
+                "SELECT version_id, is_deleted FROM resource_history
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = 'restored'
+             ORDER BY version_id::integer",
+                &[&tx.tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let actual: Vec<(String, bool)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+        assert_eq!(
+            actual,
+            versions
+                .iter()
+                .map(|(v, deleted)| (v.to_string(), *deleted))
+                .collect::<Vec<_>>()
+        );
+        let rows = client
+            .query(
+                "SELECT value_token_code FROM search_index
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'restored'
+               AND param_name = '_tag'",
+                &[&tx.tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let tags: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        assert_eq!(
+            tags,
+            tag.into_iter().map(str::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_handles_a_legacy_tombstone_without_deleted_at() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-legacy-tombstone"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let body = json!({"resourceType":"Patient", "id":"legacy-tombstone"});
+        tx.create("Patient", body.clone()).await.unwrap();
+        tx.delete("Patient", "legacy-tombstone").await.unwrap();
+        tx.transaction_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE resources SET deleted_at = NULL WHERE tenant_id = $1 \
+                 AND id = 'legacy-tombstone'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            tx.read("Patient", "legacy-tombstone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let deleted = tx
+            .read_including_deleted("Patient", "legacy-tombstone")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert_eq!(deleted.deleted_at(), Some(deleted.last_modified()));
+        let restored = tx.restore(&deleted, body).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_history_and_indexes_across_commit_and_rollback() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-revisions"),
+            TenantPermissions::full_access(),
+        );
+        let body = |tag| {
+            json!({"resourceType":"Patient", "id":"restored",
+            "meta":{"tag":[{"system":"http://example.com/tags", "code":tag}]}})
+        };
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let created = tx.create("Patient", body("original")).await.unwrap();
+        // This also exercises PostgreSQL's buffered-create flush.
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "1"
+        );
+        assert!(matches!(
+            tx.restore(&created, body("invalid")).await,
+            Err(StorageError::Validation(_))
+        ));
+        tx.delete("Patient", "restored").await.unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert!(deleted.deleted_at().is_some());
+        assert_eq!(deleted.version_id(), "2");
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None).await;
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let restored = tx.restore(&deleted, body("rolled-back")).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        assert_eq!(restored.fhir_version(), created.fhir_version());
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("rolled-back"),
+        )
+        .await;
+        Box::new(tx).rollback().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "2"
+        );
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None).await;
+        tx.restore(&deleted, body("committed")).await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let read = tx.read("Patient", "restored").await.unwrap().unwrap();
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.fhir_version(), created.fhir_version());
+        assert_eq!(read.content(), &body("committed"));
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("committed"),
+        )
+        .await;
+        assert!(matches!(
+            tx.restore(&deleted, body("must-not-overwrite-live")).await,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        tx.delete("Patient", "restored").await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        // The same old tombstone must not overwrite a later delete revision.
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, body("stale")).await,
+            Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                actual_version,
+                ..
+            })) if expected_version == "2" && actual_version == "4"
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "4"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false), ("4", true)],
+            None,
+        )
+        .await;
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_tombstone_from_another_tenant() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-tenant-validation"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.create("Patient", json!({"id":"restored"}))
+            .await
+            .unwrap();
+        tx.delete("Patient", "restored").await.unwrap();
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        Box::new(tx).commit().await.unwrap();
+        let other = TenantContext::new(
+            TenantId::new("restore-other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&other, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, json!({"resourceType":"Patient"}))
+                .await,
+            Err(StorageError::Validation(_))
+        ));
+        assert!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_client_flushes_buffered_writes_and_rolls_back_extensions() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("transaction-client-extension"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"buffered-extension"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            transaction.pending.len(),
+            1,
+            "fixture must exercise buffered create"
+        );
+        let before: i64 = transaction
+            .client()
+            .unwrap()
+            .query_one(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND id = 'buffered-extension'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            before, 0,
+            "create must not reach SQL before the extension accessor"
+        );
+
+        let table = format!("extension_{}", uuid::Uuid::new_v4().simple());
+        let client = transaction.transaction_client().await.unwrap();
+        let visible = client
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM resources WHERE tenant_id = $1 \
+                 AND id = 'buffered-extension'),
+                    (SELECT COUNT(*) FROM resource_history WHERE tenant_id = $1 \
+                    AND id = 'buffered-extension')",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.get::<_, i64>(0), 1);
+        assert_eq!(visible.get::<_, i64>(1), 1);
+        client
+            .batch_execute(&format!("CREATE TABLE {table}(resource_id TEXT NOT NULL)"))
+            .await
+            .unwrap();
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} SELECT id FROM resources WHERE tenant_id = $1 \
+                     AND id = 'buffered-extension'"
+                ),
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let extension_rows: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(extension_rows, 1);
+        assert!(transaction.pending.is_empty());
+        Box::new(transaction).rollback().await.unwrap();
+
+        let observer = backend.get_client().await.unwrap();
+        let remaining = observer
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM resources WHERE tenant_id = $1 \
+                 AND id = 'buffered-extension'),
+                    (SELECT COUNT(*) FROM resource_history WHERE tenant_id = $1 \
+                    AND id = 'buffered-extension'),
+                    to_regclass($2::text) IS NULL",
+                &[&tenant.tenant_id().as_str(), &table],
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.get::<_, i64>(0), 0);
+        assert_eq!(remaining.get::<_, i64>(1), 0);
+        assert!(
+            remaining.get::<_, bool>(2),
+            "extension DDL must roll back with raw/history writes"
+        );
     }
 
     #[tokio::test]
@@ -1263,6 +2126,388 @@ mod reindex_groups_tests {
             .get(0);
         assert_eq!(count, 1);
     }
+
+    fn bundle_plan(keys: &[(&str, &str)]) -> LockPlan {
+        LockPlan {
+            resources: keys
+                .iter()
+                .map(|(t, i)| ((*t).to_string(), (*i).to_string()))
+                .collect(),
+            minted_creates: true,
+            criteria_locks: true,
+        }
+    }
+
+    async fn patient_count(backend: &PostgresBackend, tenant: &TenantContext) -> i64 {
+        backend
+            .get_client()
+            .await
+            .expect("observer")
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    /// A Bundle plan lets a create under an id the transaction minted through
+    /// without a key — nothing else can address it before commit — while a
+    /// payload id the plan does not name still poisons the transaction.
+    #[tokio::test]
+    async fn a_bundle_plan_allows_minted_creates_but_not_unplanned_payload_ids() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-plan-minted"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_bundle_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                bundle_plan(&[("Patient", "planned")]),
+            )
+            .await
+            .expect("begin bundle transaction");
+        let minted = transaction
+            .create("Patient", json!({"resourceType":"Patient"}))
+            .await
+            .expect("a minted id needs no key");
+        assert!(!minted.id().is_empty());
+        transaction
+            .create("Patient", json!({"resourceType":"Patient","id":"planned"}))
+            .await
+            .expect("a payload id the plan names");
+        let error = transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"unplanned"}),
+            )
+            .await
+            .expect_err("a payload id outside the plan is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        // Recorded for the Bundle driver, which ends the Bundle as a server
+        // error rather than blaming the entry.
+        assert!(
+            transaction
+                .plan_violation()
+                .is_some_and(|reason| reason.contains("Patient/unplanned"))
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+        assert_eq!(patient_count(&backend, &tenant).await, 0);
+    }
+
+    /// Bulk submit keeps its complete-key-set rule: a create it did not plan,
+    /// minted or not, is refused.
+    #[tokio::test]
+    async fn a_bulk_plan_still_rejects_minted_creates() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bulk-plan-minted"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_planned_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                vec![("Patient".into(), "allowed".into())],
+            )
+            .await
+            .expect("begin planned transaction");
+        let error = transaction
+            .create("Patient", json!({"resourceType":"Patient"}))
+            .await
+            .expect_err("a bulk plan has no minted-id exemption");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+    }
+
+    /// A SearchParameter is refused under any plan, minted id or not: its
+    /// writer needs the exclusive gate.
+    #[tokio::test]
+    async fn a_minted_search_parameter_create_is_refused_in_a_bundle_plan() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-plan-search-parameter"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        let error = transaction
+            .create(
+                "SearchParameter",
+                json!({"resourceType":"SearchParameter","code":"x"}),
+            )
+            .await
+            .expect_err("a SearchParameter needs the exclusive gate");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+    }
+
+    /// Whether `key` is free in the criteria namespace, probed from a second
+    /// session. Takes and gives back the lock when it is.
+    async fn criteria_lock_is_free(client: &deadpool_postgres::Client, key: i32) -> bool {
+        let namespace = super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE;
+        let free: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1, $2)", &[&namespace, &key])
+            .await
+            .expect("probe")
+            .get(0);
+        if free {
+            client
+                .query_one("SELECT pg_advisory_unlock($1, $2)", &[&namespace, &key])
+                .await
+                .expect("unlock probe");
+        }
+        free
+    }
+
+    /// `lock_criteria` returns `CriteriaLock::Held` once per key and
+    /// `Unneeded` afterwards, so `hold_criteria` then has nothing to take. No
+    /// lock is taken for criteria with nothing to match on, nor under a plan
+    /// without criteria locks (a bulk batch).
+    #[tokio::test]
+    async fn lock_criteria_takes_each_lock_once_and_only_when_enabled() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("criteria-once"),
+            TenantPermissions::full_access(),
+        );
+        let key = criteria_key_for(
+            tenant.tenant_id().as_str(),
+            "Organization",
+            "identifier=a|1",
+        )
+        .unwrap()
+        .unwrap();
+        let probe = backend.get_client().await.expect("probe session");
+
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        assert!(criteria_lock_is_free(&probe, key).await);
+        assert_eq!(
+            transaction
+                .lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            CriteriaLock::Held,
+            "the first lock must be followed by a second search"
+        );
+        assert!(!criteria_lock_is_free(&probe, key).await, "lock is held");
+        assert_eq!(
+            transaction
+                .lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            CriteriaLock::Unneeded,
+            "already held: the search that missed ran under it"
+        );
+        assert!(
+            !transaction
+                .hold_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            "already held: nothing more to take"
+        );
+        assert_eq!(
+            transaction.lock_criteria("Organization", "").await.unwrap(),
+            CriteriaLock::Unneeded,
+            "nothing to match on, nothing to lock"
+        );
+        Box::new(transaction).rollback().await.unwrap();
+        assert!(
+            criteria_lock_is_free(&probe, key).await,
+            "ending the transaction releases the lock"
+        );
+
+        let mut bulk = backend
+            .begin_planned_transaction(&tenant, TransactionOptions::default(), Vec::new())
+            .await
+            .expect("begin planned transaction");
+        assert_eq!(
+            bulk.lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            CriteriaLock::Unneeded
+        );
+        assert!(
+            !bulk
+                .hold_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap()
+        );
+        assert!(criteria_lock_is_free(&probe, key).await);
+        Box::new(bulk).rollback().await.unwrap();
+    }
+
+    /// Waits, bounded, until some session is queued (not granted) on the
+    /// criteria lock `key`, read straight out of `pg_locks`. The key is derived
+    /// from a tenant of the calling test's own, so no other test's waiter can
+    /// satisfy it.
+    async fn wait_for_ungranted_criteria_lock(observer: &deadpool_postgres::Client, key: i32) {
+        // `classid` and `objid` are unsigned `oid`s: a negative key is read
+        // back as `key + 2^32`.
+        let namespace = i64::from(super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE);
+        let object = i64::from(key as u32);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let queued: i64 = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_locks
+                     WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted
+                       AND classid::bigint = $1 AND objid::bigint = $2",
+                    &[&namespace, &object],
+                )
+                .await
+                .expect("observe pg_locks")
+                .get(0);
+            if queued > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no session queued on the criteria lock within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `lock_criteria` waits for the lock's holder instead of giving up, and
+    /// proceeds the moment the holder's transaction ends, holding nothing
+    /// (#1747); `hold_criteria` then takes the key.
+    #[tokio::test]
+    async fn lock_criteria_waits_for_the_holder_and_keeps_nothing() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("criteria-blocks"),
+            TenantPermissions::full_access(),
+        );
+        let key = criteria_key_for(
+            tenant.tenant_id().as_str(),
+            "Organization",
+            "identifier=b|1",
+        )
+        .unwrap()
+        .unwrap();
+        let holder = backend.get_client().await.expect("holder session");
+        holder
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock({}, {key})",
+                super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE
+            ))
+            .await
+            .expect("hold the criteria lock");
+
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        let waiter = tokio::spawn(async move {
+            let result = transaction
+                .lock_criteria("Organization", "identifier=b|1")
+                .await;
+            (transaction, result)
+        });
+        // Not a sleep: the waiter has to be seen queued on the lock, or
+        // "still running" would also be true of a task that never started.
+        // The holder's own session observes: `pg_locks` is server-wide, and the
+        // pool has no third connection to spare.
+        wait_for_ungranted_criteria_lock(&holder, key).await;
+        assert!(!waiter.is_finished(), "lock_criteria did not wait");
+
+        holder.batch_execute("ROLLBACK").await.expect("release");
+        let (mut transaction, result) = waiter.await.expect("waiter task");
+        assert_eq!(
+            result.expect("wait ends once the holder is gone"),
+            CriteriaLock::Waited
+        );
+        assert!(
+            criteria_lock_is_free(&holder, key).await,
+            "the wait gave its shared lock back"
+        );
+        assert!(
+            transaction
+                .hold_criteria("Organization", "identifier=b|1")
+                .await
+                .expect("the transaction is still usable"),
+            "a miss after the wait takes the key"
+        );
+        assert!(!criteria_lock_is_free(&holder, key).await, "key is held");
+        Box::new(transaction).rollback().await.unwrap();
+        assert!(criteria_lock_is_free(&holder, key).await);
+    }
+
+    /// A planned transaction -- a transaction Bundle's, and bulk submit's, which
+    /// shares the constructor -- runs at `READ COMMITTED` whatever the session
+    /// defaults to, so the criteria lock's re-search is a new snapshot. The
+    /// exclusive path (`begin_transaction`) is left as it was and follows the
+    /// session default.
+    #[tokio::test]
+    async fn a_planned_transaction_pins_read_committed_and_the_exclusive_one_does_not() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("isolation-pin"),
+            TenantPermissions::full_access(),
+        );
+        // Both of the pool's sessions now default to `repeatable read`.
+        {
+            let first = backend.get_client().await.expect("first session");
+            let second = backend.get_client().await.expect("second session");
+            for session in [&first, &second] {
+                session
+                    .batch_execute("SET default_transaction_isolation = 'repeatable read'")
+                    .await
+                    .expect("change the session default");
+            }
+        }
+        async fn isolation(transaction: &PostgresTransaction) -> String {
+            transaction
+                .client()
+                .expect("open transaction")
+                .query_one("SHOW transaction_isolation", &[])
+                .await
+                .expect("show the isolation level")
+                .get(0)
+        }
+
+        let bundle = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        assert_eq!(isolation(&bundle).await, "read committed");
+        Box::new(bundle).rollback().await.unwrap();
+
+        let bulk = backend
+            .begin_planned_transaction(&tenant, TransactionOptions::default(), Vec::new())
+            .await
+            .expect("begin planned transaction");
+        assert_eq!(isolation(&bulk).await, "read committed");
+        Box::new(bulk).rollback().await.unwrap();
+
+        let exclusive = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .expect("begin exclusive transaction");
+        assert_eq!(isolation(&exclusive).await, "repeatable read");
+        Box::new(exclusive).rollback().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1307,191 +2552,5 @@ mod tests {
         let attempted = [("Patient", "x")];
         let mut inserted = key_set(&[("Observation", "x")]);
         assert_eq!(first_unaccounted_key(&attempted, &mut inserted), Some(0));
-    }
-}
-
-impl PostgresTransaction {
-    /// `update`, or — with `from_deleted` — the resurrection of a
-    /// soft-deleted row at `current`'s (delete-marker) version.
-    async fn update_inner(
-        &mut self,
-        current: &StoredResource,
-        resource: Value,
-        from_deleted: bool,
-    ) -> StorageResult<StoredResource> {
-        self.tenant
-            .check_permission(Operation::Update, current.resource_type())?;
-
-        self.ensure_usable()?;
-        self.ensure_planned_key(current.resource_type(), current.id())?;
-
-        // Buffered creates must be visible to everything that is not another
-        // create. This is what keeps `read`/`update`/`delete` — and therefore a
-        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
-        // what they saw before: the batch is a wire-level optimisation, never a
-        // change of visibility inside the transaction.
-        self.flush().await?;
-        self.refresh_search_snapshot_if_dirty().await?;
-        self.poisoned = true;
-
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str().to_string();
-        let resource_type = current.resource_type();
-        let id = current.id();
-
-        // The expected version is `current`'s, and the UPDATE below only matches a
-        // row that still carries it — so the new version follows from what the
-        // caller already read, with no round trip to ask what is stored.
-        let expected_version = current.version_id().to_string();
-        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Build the resource with id and resourceType
-        let mut data = resource;
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-        }
-
-        let now = Utc::now();
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param();
-        // Version check, update and history row in one statement. Folding the
-        // expected version into the `WHERE` makes the check and write atomic:
-        // a concurrent writer cannot bump the version between two statements
-        // and have this update overwrite it while reporting success.
-        let updated = execute_cached(
-            client,
-            "WITH upd AS (
-                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3,
-                     is_deleted = FALSE, deleted_at = NULL
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                   AND is_deleted = $9 AND version_id = $7
-                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
-             )
-             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
-            &[
-                &new_version_str,
-                &data,
-                &now,
-                &tenant_id,
-                &resource_type,
-                &id,
-                &expected_version,
-                &fhir_version_str,
-                &from_deleted,
-            ],
-        )
-        .await
-        .or_query_error("Failed to update resource")?;
-
-        if updated == 0 {
-            // The statement matched nothing because the row is missing,
-            // soft-deleted, or has a different version. Only the last case is
-            // a concurrency conflict; the lookup is needed only on this error
-            // path to distinguish it from the two not-found cases.
-            let actual = query_opt_cached(
-                client,
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to get current version")?;
-
-            return match actual {
-                Some(row) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version,
-                        actual_version: row.get::<_, String>(0),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
-        }
-
-        // Re-index the resource for search
-        if resource_type == "SearchParameter" {
-            self.search_snapshot_dirty = true;
-            self.refresh_search_snapshot_if_dirty().await?;
-        }
-        if let Err(error) = self
-            .index_resource(
-                &tenant_id,
-                resource_type,
-                id,
-                now,
-                super::storage::IndexWrite::Replace,
-                &data,
-            )
-            .await
-        {
-            self.poisoned = true;
-            return Err(error);
-        }
-        self.poisoned = false;
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            self.tenant.tenant_id().clone(),
-            data,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
-    }
-
-    /// Brings a soft-deleted resource back to life inside this transaction —
-    /// a bundle `PUT` to a deleted id (FHIR http.html#delete) — continuing
-    /// its version chain. `Ok(None)` when no deleted row exists for the id.
-    pub(crate) async fn restore_deleted(
-        &mut self,
-        resource_type: &str,
-        id: &str,
-        resource: Value,
-    ) -> StorageResult<Option<StoredResource>> {
-        self.ensure_usable()?;
-        self.flush().await?;
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str().to_string();
-        let row = query_opt_cached(
-            client,
-            "SELECT version_id, fhir_version FROM resources
-             WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .or_query_error("Failed to look up a deleted resource")?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let version: String = row.get(0);
-        let fhir_version_str: String = row.get(1);
-        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-            .unwrap_or_else(FhirVersion::default_enabled);
-        let marker = StoredResource::from_storage(
-            resource_type,
-            id,
-            version,
-            self.tenant.tenant_id().clone(),
-            Value::Null,
-            Utc::now(),
-            Utc::now(),
-            None,
-            fhir_version,
-        );
-        self.update_inner(&marker, resource, true).await.map(Some)
     }
 }

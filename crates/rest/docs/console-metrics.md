@@ -407,7 +407,8 @@ The top-level `scope` is backend-derived (`"cluster"` on PostgreSQL/MongoDB/S3,
 ## `GET /console/metrics/tenants`
 
 Per-tenant comparison — authoritative stored-resource counts joined with windowed
-traffic. Sorted by resource count, busiest first.
+traffic. Sorted by resource count, busiest first. On S3 the rows report data
+presence instead of counts; see [Tenant data evidence](#tenant-data-evidence-s3).
 
 > **🔒 Admin endpoint** — this **enumerates every tenant** and its data volume, so
 > it is the most sensitive console endpoint. Requires a valid token **and** a
@@ -440,9 +441,68 @@ traffic. Sorted by resource count, busiest first.
 
 | Field | Meaning |
 |-------|---------|
-| `resources` | Authoritative count from the backend (this aggregate **spans tenants** by design — an operator view). `resources_scope` is backend-derived — `"cluster"` on a shared DB (PostgreSQL/MongoDB/S3), `"single-instance"` on SQLite. |
-| `requests_per_second` / `p95_ms` / `error_rate` | Best-effort, from the in-process request log, keyed by `X-Tenant-ID` (empty → `default`). A tenant with stored data but no recent traffic reports zeroes; a tenant seen only in traffic appears with `resources: 0`. **Single-instance** (`traffic_scope: "single-instance"`) — behind a load balancer these reflect only the answering `instance`; see [Clustering / multi-instance](#clustering--multi-instance). |
+| `resources` | Authoritative count from the backend (this aggregate **spans tenants** by design — an operator view). `resources_scope` is backend-derived — `"cluster"` on a shared DB (PostgreSQL/MongoDB/S3), `"single-instance"` on SQLite. `null` when the backend reports presence instead of counts — see [Tenant data evidence](#tenant-data-evidence-s3). |
+| `requests_per_second` / `p95_ms` / `error_rate` | Best-effort, from the in-process request log, keyed by `X-Tenant-ID` (empty → `default`). A tenant with stored data but no recent traffic reports zeroes; a tenant seen only in traffic appears with `resources: 0` (or `resources: null` with `has_data` on a presence backend). **Single-instance** (`traffic_scope: "single-instance"`) — behind a load balancer these reflect only the answering `instance`; see [Clustering / multi-instance](#clustering--multi-instance). |
 | `instance` / `resources_scope` / `traffic_scope` | The answering instance's hostname, and the scope of the resource vs. traffic columns (`"cluster"` / `"single-instance"`). |
+| `resources_evidence` / `discovery_complete` / `has_data` | Present **only** when the rows carry no counts (S3). See [Tenant data evidence](#tenant-data-evidence-s3). |
+
+### Tenant data evidence (S3)
+
+`GET /console/metrics/tenants` and `GET /admin/tenants` (the tenant-maintenance
+API, same admin tier) find the tenants that hold data with the storage
+backend's tenant discovery, never with an exhaustive per-resource count (#1913).
+What the backend can prove decides the shape of the data column:
+
+| Backend | `resources` | `has_data` | `resources_evidence` | `discovery_complete` |
+|---|---|---|---|---|
+| SQLite, PostgreSQL, MongoDB (and composites over them) | exact non-deleted count; `0` for a tenant without data | *absent* | *absent* | *absent* |
+| S3, prefix-per-tenant (what the `hfs` binary configures) | `null` on every row | `true` / `false` / `null` | `"presence"` | `true` (see below) |
+| S3, bucket-per-tenant (`HFS_S3_TENANCY=bucket-per-tenant`) | `null` on every row | `null` | `"unsupported"` | `false` |
+
+- **Counted responses are unchanged.** On SQLite, PostgreSQL and MongoDB the
+  payloads are byte-for-byte what they were before #1913; `resources_evidence`,
+  `discovery_complete` and `has_data` never appear there. A client that sees no
+  `resources_evidence` can keep reading `resources` as a number.
+- **Presence (`"presence"`).** Counting on S3 means listing every
+  current-pointer object of every tenant: the request grew with stored
+  resources and timed out on large stores. Discovery instead lists the tenant
+  groups (one page per 1,000) and probes each with a single one-key listing,
+  so its cost grows with the number of tenants only. It proves *that* a tenant
+  holds data — any object under its resources, including history versions and
+  delete tombstones, i.e. data a purge would remove — not *how much*.
+  `has_data: true` means data was found; `has_data: false` means the complete
+  listing found none; `has_data: null` means unknown (only if the backend
+  stopped before covering every tenant, which `discovery_complete: false`
+  announces). `resources` is `null` rather than a
+  pointer count, because a pointer count includes tombstones and is not a live
+  total. Data-only tenants (deregistered without purge, or holding only
+  tombstones) stay listed. On the console endpoint, data-holding tenants come
+  first, ordered by id, followed by traffic-only tenants.
+- **Unsupported (`"unsupported"`).** In bucket-per-tenant mode tenants live in
+  a static bucket map, so there is no shared keyspace to discover them in.
+  `GET /admin/tenants` lists registered tenants only and the console lists
+  traffic only; data is unknown (`has_data: null`), never reported as empty.
+- **Completeness (`discovery_complete`).** `true` means every tenant that
+  holds data is in the response. `false` means some may be missing — the
+  backend cannot discover them (`"unsupported"`), or discovery stopped before
+  covering every tenant — so `tenant_count` is provisional: it counts the
+  registered tenants and the tenants found so far, not every tenant with data.
+  S3 prefix-per-tenant walks all its tenant groups in one request and reports
+  `true`.
+- **Reserved ids in traffic.** Traffic rows are keyed by the raw
+  `X-Tenant-ID`, including rejected requests, so a client can make a reserved
+  id such as `__system__` appear as a traffic-only row. Such a row always
+  carries `has_data: null`: whether the system tenant holds data (the
+  AuditEvent trail under `HFS_AUDIT_BACKEND=database`) is never disclosed.
+- **An S3 store with no tenant data at all** returns the counted shape: every
+  tenant then has an exact zero, which is honest under either basis.
+
+These fields are additive and appear only on backends that previously had no
+honest number to give; there is no separate API version for the console or
+admin JSON. Example S3 row: `{ "tenant": "acme-health", "resources": null,
+"has_data": true, "requests_per_second": 2.9, "p95_ms": 19.0, "error_rate":
+0.003 }` with `"resources_evidence": "presence"` and `"discovery_complete":
+true` at the top level.
 
 ---
 
@@ -457,9 +517,14 @@ http_request_duration_seconds{service="hfs",...}                                
 uptime_seconds{service="hfs"}                                                                14691.53
 ```
 
-The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) adds
-its own series. Like the HTTP series they have no `hfs_` prefix, carry only the
-global `service` label, and have no tenant or resource-type label:
+The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) runs
+when `hfs` serves the web UI. On a headless start (`HFS_UI_ENABLED=false`, or a
+binary built without the `ui` feature), no dashboard startup seed or reconcile
+storage reads run, and none of the dashboard series below is published. Other
+`/metrics` series remain available.
+
+Like the HTTP series, the dashboard series have no `hfs_` prefix, carry only
+the global `service` label, and have no tenant or resource-type label:
 
 | Series | Type | Meaning |
 |--------|------|---------|
@@ -484,7 +549,7 @@ sampled at scrape time. Besides `service` their only label is `pool`:
 `primary` for the storage backend, and `audit` for the database audit sink
 (`HFS_AUDIT_BACKEND=database`), which opens its own pool even when it shares
 the primary database. SQLite, MongoDB and S3 export no `postgres_pool_*`
-series.
+series (MongoDB has its own, below).
 
 | Series | Type | Unit | Meaning |
 |--------|------|------|---------|
@@ -508,6 +573,40 @@ minutes), for example:
 
 ```
 min_over_time(postgres_pool_waiting_callers{pool="primary"}[5m]) > 0
+```
+
+With a MongoDB primary (`HFS_STORAGE_BACKEND=mongodb` or
+`mongodb-elasticsearch`), the driver's connection pool is reported the same way,
+sampled at scrape time from the driver's connection-pool events. Besides
+`service` their only label is `pool`: `primary` for the storage backend, and
+`audit` for the audit sink when it opens its own client. The ceiling comes from
+`HFS_MONGODB_MAX_CONNECTIONS`, else the URI's `maxPoolSize`, else `10`.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `mongodb_pool_max_connections{pool}` | gauge | connections | The effective ceiling, per server |
+| `mongodb_pool_connections{pool}` | gauge | connections | Connections currently open, idle or in use |
+| `mongodb_pool_in_use_connections{pool}` | gauge | connections | Connections checked out by a caller |
+| `mongodb_pool_idle_connections{pool}` | gauge | connections | Open connections that can be checked out now |
+| `mongodb_pool_waiting_callers{pool}` | gauge | callers | Callers waiting for a connection |
+| `mongodb_pool_checkout_wait_seconds{pool}` | histogram | seconds | Time a caller waited to check out a connection |
+
+Caveats:
+
+- Against a replica set the driver keeps one pool per server. The connection,
+  in-use, idle and waiting series are summed across those pools, while
+  `mongodb_pool_max_connections` is the ceiling of one server, so the sum can
+  exceed it.
+- The Rust driver has no timeout for waiting on a pooled connection
+  (`waitQueueTimeoutMS` is ignored), so `mongodb_pool_waiting_callers` and the
+  checkout histogram are how saturation shows. A wait ends only when a
+  connection frees up or server selection or the request timeout expires.
+- The values are instantaneous at scrape time, as for PostgreSQL.
+
+A sustained-saturation alert, for example:
+
+```
+min_over_time(mongodb_pool_waiting_callers{pool="primary"}[5m]) > 0
 ```
 
 Per-tenant stored-resource counts are **deliberately NOT exported to

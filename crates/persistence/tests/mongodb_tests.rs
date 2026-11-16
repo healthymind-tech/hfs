@@ -23,6 +23,16 @@
 //! the harness's own container that error is a test *failure* (see
 //! [`transactions_required`]), because it can only mean the harness itself
 //! failed to bring the replica set up.
+//!
+//! Each test's database is dropped after the test ends, by a sweeper thread, so
+//! the shared mongod holds only the databases of tests still running (#2311, see
+//! `db_cleanup`). A dropped database's WiredTiger tables are released at the first
+//! checkpoint (every 60 s) after the server's snapshot history window, which the
+//! harness's own container shortens from 300 s to 5 s (#2326), so WiredTiger
+//! data handles trail the database count by up to about a minute.
+//! `HFS_TEST_MONGODB_KEEP_FAILED=1` keeps up to 8 failed tests' databases;
+//! `db_cleanup::end_of_run_report` (ignored) reports what is left on the mongod
+//! at `HFS_TEST_MONGODB_URL`.
 
 #![cfg(feature = "mongodb")]
 
@@ -31,6 +41,13 @@ mod scoped_clear;
 
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
+
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
+#[cfg(feature = "R4")]
+#[path = "common/sof_pr410_views.rs"]
+mod sof_pr410_views;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +64,8 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    TooLargeForCacheCause, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -58,6 +76,12 @@ use helios_persistence::types::{
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
+
+/// The T2 cluster harness (two independently constructed backends over one
+/// shared store); path-included rather than placed in a `mod common`, which no
+/// test target declares.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
 
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
 const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
@@ -76,6 +100,15 @@ const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
 const TEST_BACKEND_MAX_POOL: u32 = 4;
 const TEST_RAW_CLIENT_MAX_POOL: u32 = 2;
 
+/// The settling-read bound (`settle_read_max_time_ms`) of the `failCommand`
+/// backends built by [`create_backend_with_app_name`] (#2419). The tests that
+/// expect an applied commit whose outcome stayed unknown to be confirmed by the
+/// read need the majority to reach that commit within it, and the shared CI
+/// Docker host has taken longer than the production 1 s. A never-applied
+/// commit's read returns long before it (`write_abort_retry`'s
+/// `NEVER_APPLIED_MAX_ELAPSED`).
+const TEST_SETTLE_READ_MAX_TIME_MS: u64 = 30_000;
+
 /// Builds a raw `mongodb::Client` with a small pool for test-only assertions and
 /// fixture writes, instead of the driver's default `max_pool_size` of 100.
 async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
@@ -84,13 +117,20 @@ async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
     Client::with_options(options)
 }
 
+/// A unique database name for one test.
+///
+/// The database is dropped once the calling thread (the test) has ended (#2311,
+/// see [`db_cleanup`]), so call this from the test body, not from a spawned
+/// thread or task.
 fn build_test_database_name(test_name: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let reserved_len = MONGODB_TEST_DB_PREFIX.len() + 1 + suffix.len();
     let max_test_name_len = MONGODB_MAX_DATABASE_NAME_LEN.saturating_sub(reserved_len);
     let truncated_test_name: String = test_name.chars().take(max_test_name_len).collect();
 
-    format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}")
+    let name = format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}");
+    db_cleanup::register(&name);
+    name
 }
 
 fn extract_resource_id_from_location(location: &str) -> String {
@@ -107,15 +147,25 @@ fn test_mongodb_config_defaults() {
     let config = MongoBackendConfig::default();
     assert_eq!(config.connection_string, "mongodb://localhost:27017");
     assert_eq!(config.database_name, "helios");
-    assert_eq!(config.max_connections, 10);
-    assert_eq!(config.connect_timeout_ms, 5000);
+    assert_eq!(config.max_connections, None);
+    assert_eq!(config.connect_timeout_ms, None);
     // Unchanged from when this was a hardcoded constant — making it configurable
     // must not change the default behaviour of an existing deployment.
-    assert_eq!(config.server_selection_timeout_ms, 15_000);
+    assert_eq!(config.server_selection_timeout_ms, None);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
     // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
     assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
+    // #1776: at most this many transaction Bundles run at once.
+    assert_eq!(config.max_concurrent_transaction_bundles, 4);
+    // #1806: one standard Bundle is this many entries; the gate's room is
+    // counted in entries.
+    assert_eq!(config.transaction_bundle_weight_entries, 1000);
+    // #1806: no separate deadline unless the embedder sets one.
+    assert_eq!(config.bundle_transaction_deadline, None);
+    // #1975: the deferred-index threshold follows the gate's entry room unless
+    // the embedder sets it.
+    assert_eq!(config.transaction_bundle_deferred_index_entries, None);
 }
 
 #[test]
@@ -123,9 +173,9 @@ fn test_mongodb_config_serialization() {
     let config = MongoBackendConfig {
         connection_string: "mongodb://mongo.test:27018".to_string(),
         database_name: "phase2".to_string(),
-        max_connections: 24,
-        connect_timeout_ms: 7000,
-        server_selection_timeout_ms: 9000,
+        max_connections: Some(24),
+        connect_timeout_ms: Some(7000),
+        server_selection_timeout_ms: Some(9000),
         ..Default::default()
     };
 
@@ -134,9 +184,9 @@ fn test_mongodb_config_serialization() {
 
     assert_eq!(decoded.connection_string, "mongodb://mongo.test:27018");
     assert_eq!(decoded.database_name, "phase2");
-    assert_eq!(decoded.max_connections, 24);
-    assert_eq!(decoded.connect_timeout_ms, 7000);
-    assert_eq!(decoded.server_selection_timeout_ms, 9000);
+    assert_eq!(decoded.max_connections, Some(24));
+    assert_eq!(decoded.connect_timeout_ms, Some(7000));
+    assert_eq!(decoded.server_selection_timeout_ms, Some(9000));
 }
 
 #[test]
@@ -310,7 +360,7 @@ mod shared_mongo {
     /// hostname as the sole member — unreachable from the host. Initiating
     /// explicitly here, then polling for a writable primary ourselves, gives
     /// full control over both.
-    async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
         let exec_result = container
             .exec(ExecCommand::new([
                 "mongosh",
@@ -338,7 +388,9 @@ mod shared_mongo {
     /// against a node still in `STARTUP2`/`SECONDARY`. Panics after 60s: at
     /// that point the harness's own container is broken, and letting every
     /// dependent test silently report "skip: no Docker" would hide that.
-    async fn wait_for_writable_primary(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn wait_for_writable_primary(
+        container: &testcontainers::ContainerAsync<Mongo>,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let exec_result = container
@@ -365,6 +417,66 @@ mod shared_mongo {
         }
     }
 
+    /// Why [`start_dedicated_replica_set`] returned no server. The two cases are
+    /// separate because its callers do not treat them alike.
+    pub(super) enum DedicatedMongodError {
+        /// The container did not start, which is what a host without Docker gets.
+        NotStarted(testcontainers::TestcontainersError),
+        /// The container runs, but its host or mapped port could not be read.
+        NoAddress(testcontainers::TestcontainersError),
+    }
+
+    /// Starts a mongo:7.0 single-member replica set (`rs0`) for one test or
+    /// harness alone, and returns it with its URL. It has a writable primary when
+    /// this returns. The container is removed when the first element is dropped.
+    ///
+    /// The command is `mongod --bind_ip_all --wiredTigerCacheSizeGB <wt_cache_gb>
+    /// --replSet rs0` followed by `extra_flags`, in that order. Callers pass
+    /// `--oplogSize` there too: without it mongod sizes the oplog from the free
+    /// disk.
+    ///
+    /// What a failure means is the caller's choice: this neither skips nor reads
+    /// `HFS_TEST_REQUIRE_MONGODB`. `initiate_replica_set` and
+    /// `wait_for_writable_primary` still panic on a broken container.
+    pub(super) async fn start_dedicated_replica_set(
+        wt_cache_gb: &str,
+        extra_flags: &[&str],
+    ) -> Result<(testcontainers::ContainerAsync<Mongo>, String), DedicatedMongodError> {
+        let command = [
+            "mongod",
+            "--bind_ip_all",
+            "--wiredTigerCacheSizeGB",
+            wt_cache_gb,
+            "--replSet",
+            "rs0",
+        ]
+        .into_iter()
+        .chain(extra_flags.iter().copied());
+        let container = super::container_cleanup::with_cleanup_label(
+            Mongo::default()
+                .with_tag("7.0")
+                .with_cmd(command)
+                .with_ulimit("nofile", 64000, Some(64000))
+                .with_startup_timeout(Duration::from_secs(120)),
+        )
+        .start()
+        .await
+        .map_err(DedicatedMongodError::NotStarted)?;
+        initiate_replica_set(&container).await;
+        wait_for_writable_primary(&container).await;
+        let (host, port) = match (
+            container.get_host().await,
+            container.get_host_port_ipv4(27017).await,
+        ) {
+            (Ok(host), Ok(port)) => (host, port),
+            (Err(error), _) | (_, Err(error)) => {
+                return Err(DedicatedMongodError::NoAddress(error));
+            }
+        };
+        let url = format!("mongodb://{host}:{port}/?directConnection=true");
+        Ok((container, url))
+    }
+
     async fn shared() -> Option<&'static SharedMongo> {
         SHARED
             .get_or_init(|| async {
@@ -377,12 +489,12 @@ mod shared_mongo {
                 }
                 // Otherwise start an ephemeral single-node replica-set Mongo
                 // container; if Docker is unavailable, `start()` errors and
-                // the suite skips.
+                // the suite skips (or fails when `HFS_TEST_REQUIRE_MONGODB` is set).
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
                 let container = super::container_cleanup::with_cleanup_label(
-                    Mongo::default()
+                    Mongo::default().with_tag("7.0")
                         .with_label("github.run_id", &run_id)
                         // Cap WiredTiger's cache. By default mongod sizes it to
                         // ~50% of *host* RAM (ignoring container limits), so on CI
@@ -417,25 +529,60 @@ mod shared_mongo {
                             "rs0",
                             "--oplogSize",
                             "128",
+                            // #2326: a dropped test database's WiredTiger tables
+                            // are freed at the first checkpoint (every 60 s) after
+                            // the snapshot history window, which defaults to 300 s.
+                            // 5 s frees them within about a minute of the drop.
+                            // Nothing in the backend or the suite reads at an older
+                            // cluster time (no `readConcern: snapshot` or
+                            // `atClusterTime`), and an open transaction keeps its
+                            // own snapshot whatever the window. A test that adds
+                            // such a read needs a longer window.
+                            "--setParameter",
+                            "minSnapshotHistoryWindowInSeconds=5",
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
-                        // across all of them. With 50+ test databases the stock
-                        // container nofile limit is exhausted and index builds die
-                        // with TooManyFilesOpen (error 264) late in the run. 64000
-                        // is mongod's own recommended minimum.
+                        // across all of them. Each test's database is dropped after
+                        // its test (#2311, `db_cleanup`), but its tables' file
+                        // handles are released only at the first checkpoint after
+                        // the snapshot history window above, so up to about a
+                        // minute's worth of dropped test databases still hold
+                        // handles alongside the running tests'. With 50+ test
+                        // databases the stock container nofile limit is exhausted
+                        // and index builds die with TooManyFilesOpen (error 264)
+                        // late in the run. 64000 is mongod's own recommended
+                        // minimum.
                         .with_ulimit("nofile", 64000, Some(64000))
                         .with_startup_timeout(std::time::Duration::from_secs(120)),
                 )
                 .start()
-                .await
-                .ok()?;
+                .await;
+                let container = match container {
+                    Ok(container) => container,
+                    Err(error) => {
+                        super::skip_or_fail_unavailable(&format!(
+                            "HFS_TEST_MONGODB_URL unset and the Mongo container did not start ({error})"
+                        ));
+                        return None;
+                    }
+                };
 
                 initiate_replica_set(&container).await;
                 wait_for_writable_primary(&container).await;
 
-                let host = container.get_host().await.ok()?;
-                let port = container.get_host_port_ipv4(27017).await.ok()?;
+                let (host, port) = match (
+                    container.get_host().await,
+                    container.get_host_port_ipv4(27017).await,
+                ) {
+                    (Ok(host), Ok(port)) => (host, port),
+                    (Err(error), _) | (_, Err(error)) => {
+                        super::skip_or_fail_unavailable(&format!(
+                            "the Mongo container has no reachable address ({error})"
+                        ));
+                        return None;
+                    }
+                };
                 Some(SharedMongo {
                     // The replica set's sole member advertises
                     // `localhost:27017` (its address inside the container),
@@ -456,10 +603,26 @@ mod shared_mongo {
     pub(super) async fn connection_string() -> Option<String> {
         Some(shared().await?.connection_string.clone())
     }
+
+    /// The shared mongo's connection string when a test has already resolved it,
+    /// without starting anything: `None` before the first [`connection_string`]
+    /// call and when no mongo is available. Synchronous, so the database sweeper
+    /// (`db_cleanup`) can call it from its own thread.
+    pub(super) fn started_connection_string() -> Option<String> {
+        SHARED
+            .get()?
+            .as_ref()
+            .map(|shared| shared.connection_string.clone())
+    }
 }
 
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
+
+/// #2311: drops each test's database once its test has ended, so the shared
+/// mongod holds only the databases of running tests.
+#[path = "mongodb/db_cleanup.rs"]
+mod db_cleanup;
 
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and PostgreSQL suites.
@@ -469,10 +632,21 @@ mod container_cleanup;
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 /// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
 /// (#859), shared with the SQLite and PostgreSQL suites.
 #[path = "transactions/conditional_url_suite.rs"]
 mod conditional_url_suite;
+
+/// Backend-agnostic bundle identity scenarios (#1894, #1934): forward
+/// references, the overlap rule, no-op conditional deletes.
+#[path = "transactions/bundle_identity_suite.rs"]
+mod bundle_identity_suite;
 
 /// The backend-agnostic day-precision date-boundary suite (issue #519) — the
 /// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
@@ -585,8 +759,22 @@ async fn mongodb_missing_sort_values_sort_last() {
         eprintln!("skipping: no MongoDB container available");
         return;
     };
-    // Multi-key parameter sorts are refused here until #1564 lands.
-    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
+}
+
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
+/// #1711: an untyped meta-parameter sort read `value_string`, which those rows
+/// do not have, so every resource was "missing" and id order won.
+#[tokio::test]
+async fn mongodb_meta_params_sort_by_value() {
+    let Some(backend) = create_backend_with_full_registry("sort_meta").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    sort_meta_suite::meta_params_sort_by_value(&backend, "sort-meta-1711").await;
 }
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
@@ -700,7 +888,7 @@ async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
         "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
     });
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation.clone(),
@@ -711,7 +899,7 @@ async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
     let mut inside = observation;
     inside["id"] = json!("inside");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "DiagnosticReport",
             json!({
@@ -1021,6 +1209,10 @@ mod token_code_system_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
 /// #1379: `gender=<system>|female` never matched a `code` element. Needs the
 /// full registry so `gender`, `status` and `code` extract into the search
 /// index — the suite's positive controls fail loudly if they did not.
@@ -1127,10 +1319,30 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
+/// #2394: `value_reference` is stored normalized and old rows are rewritten
+/// by the search-index builder.
+#[path = "mongodb/reference_normalize.rs"]
+mod reference_normalize;
+
+/// #2283: a total is reported only when `_total` asks for one.
+#[tokio::test]
+async fn mongodb_total_mode_reported_only_when_requested() {
+    let Some(backend) = create_backend_with_full_registry("total_mode").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283").await;
+}
+
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
+
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
 
 /// #1408: `:of-type`, reference `:identifier` and reference `:[type]` were
 /// refused as unsupported modifiers. Needs the full registry.
@@ -1143,6 +1355,99 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
+        &[
+            // Plain `Type/id` stays an exact match on MongoDB (index plan), so
+            // it does not reach absolute URLs, versioned or foreign-base, and
+            // `:not` therefore does NOT exclude them. Deliberate (#2394);
+            // `ob-foreign` is likewise not matched here, unlike the other three
+            // backends, which ignore the base.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1,Patient/nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-grp",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1,Group/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            // `:above` a `_history/1` URL also finds the `_history/2` form
+            // (SQLite returns only the unversioned `ob-abs`): the version
+            // segment is not compared. Inconsistent across backends.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-abs", "ob-abs-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1/_history/2",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1,nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1&code=9999-9",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-ver"]),
+            },
+        ],
+    )
+    .await;
+}
+
+/// #2296: `_revinclude` includes relative, versioned and absolute references
+/// alike. Needs the full registry.
+#[tokio::test]
+async fn mongodb_revinclude_matches_every_reference_form() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_forms").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
         &[],
     )
     .await;
@@ -1186,15 +1491,133 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1739: `$reindex` id ranges and `clearOnly`.
+#[path = "mongodb/reindex_id_range.rs"]
+mod reindex_id_range;
+
+/// #2008: metadata-only `$reindex` backfills `missing_params`.
+#[path = "mongodb/reindex_metadata_only.rs"]
+mod reindex_metadata_only;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
+/// A single-resource write whose transaction the server aborts for a reason
+/// other than a lost race (a chunk migration's `StaleConfig`) is run again.
+#[path = "mongodb/write_abort_retry.rs"]
+mod write_abort_retry;
+
+/// #2271: a transient driver failure of a single-document read is `Unavailable`
+/// (503); any other keeps its driver error as `Internal`'s source.
+#[path = "mongodb/read_errors.rs"]
+mod read_errors;
+
+/// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
+/// their turn. #1806: the gate's room is counted in entries, so small Bundles
+/// share a slot and large ones take more than one.
+#[path = "mongodb/transaction_bundle_admission.rs"]
+mod transaction_bundle_admission;
+
+/// #2351: `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` refuses a
+/// transaction Bundle over its payload limit before admission.
+#[path = "mongodb/transaction_bundle_payload_limit.rs"]
+mod transaction_bundle_payload_limit;
+
+/// #1776: measurement harness for concurrent transaction Bundles under
+/// WiredTiger cache pressure. Ignored by default. #1806: also takes the weight
+/// (entries per standard Bundle) the gate's room is counted in.
+#[path = "mongodb/transaction_bundle_load.rs"]
+mod transaction_bundle_load;
+
+/// #1975: transaction Bundles of N+ entries write their search rows after the
+/// commit; ledger, repair, conditional rule, ceiling.
+#[path = "mongodb/deferred_search_index.rs"]
+mod deferred_search_index;
+
+/// #2294: chain and `_has` hops read ids and indexed reference values, not
+/// bodies; the hooks agree with the trait defaults.
+#[path = "mongodb/chain_has_projection.rs"]
+mod chain_has_projection;
+
+/// #2294: the backend-agnostic wide chain / nested `_has` suite (#1930), the
+/// same wiring as `sqlite_tests.rs`.
+/// Only the chain / `_has` half is wired here; the 70,000-value `_id` half
+/// stays SQLite and PostgreSQL only, so its helpers go unused.
+#[allow(dead_code)]
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn mongodb_wide_chain_and_nested_has() {
+    let Some(backend) = create_backend("wide_chain").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-mongodb").await;
+}
+
+/// #1977: a transaction Bundle sends its creates in chunks with no existence
+/// read; command counts from the profiler, reused ids, read-after-create.
+#[path = "mongodb/bundle_create_chunks.rs"]
+mod bundle_create_chunks;
+
+/// #1748: potentially broad searches wait for a permit, so a read can still get
+/// a pooled connection while they run.
+#[path = "mongodb/broad_search_admission.rs"]
+mod broad_search_admission;
+
+/// #1828: `count_by_tenant` alone carries a `maxTimeMS` budget; its expiry is a
+/// `BackendError::Timeout` and the next call succeeds.
+#[path = "mongodb/count_by_tenant_budget.rs"]
+mod count_by_tenant_budget;
+
+/// #1910: `count_by_tenant` is a covered scan of `idx_resources_live_tenant`,
+/// created by schema init on new and existing stores.
+#[path = "mongodb/count_by_tenant_index.rs"]
+mod count_by_tenant_index;
+
+/// #2352: a build refuses a database whose schema_version is newer than its
+/// own, and never lowers the recorded version.
+#[path = "mongodb/schema_version_guard.rs"]
+mod schema_version_guard;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
 mod ifnoneexist_resource_params;
+
+/// #1976: lone-transaction ceiling with and without the version-1
+/// `resource_history` copy, per WiredTiger cache size. Ignored by default.
+#[path = "mongodb/v1_history_ceiling.rs"]
+mod v1_history_ceiling;
+
+/// #2258: a single-resource write whose topology check (`hello`) fails is an
+/// error, never a write without a transaction; on the replica set its resource
+/// and history row commit together.
+#[path = "mongodb/single_write_topology.rs"]
+mod single_write_topology;
+
+/// #2411: a driver-reported change of the server's type (unreachable, or a
+/// standalone server after a restart) forgets a backend's kept transactional
+/// `hello` answer, so the next write asks again.
+#[path = "mongodb/topology_events.rs"]
+mod topology_events;
+
+/// #2268: the #1391 reindex reminder needs `search_index` rows that were there
+/// at boot; rows a fresh database takes during its first build never trigger it.
+#[path = "mongodb/search_index_upgrade_warning.rs"]
+mod search_index_upgrade_warning;
+
+/// #2353: explain plans of every resource_history reader with and without
+/// idx_history_resource_updated, and its drop at boot.
+#[path = "mongodb/history_index_plans.rs"]
+mod history_index_plans;
+
+/// #2375: instance history pages match the pre-#2375 algorithm and read about one page of documents.
+#[path = "mongodb/instance_history_paging.rs"]
+mod instance_history_paging;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -1278,7 +1701,7 @@ async fn mongodb_comma_separated_date_values_are_ored() {
     const BIRTHDATES: [&str; 3] = ["1985-05-05", "1995-10-02", "2005-01-01"];
     for (i, birth) in BIRTHDATES.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"id": format!("cod-{i}"), "birthDate": birth}),
@@ -1420,7 +1843,7 @@ async fn mongodb_comma_separated_number_values_are_ored() {
     const FACTORS: [f64; 3] = [0.25, 0.75, 1.5];
     for (i, factor) in FACTORS.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ChargeItem",
                 json!({
@@ -1536,6 +1959,10 @@ fn msg_is_mongo_unavailable(msg: &str) -> bool {
         || msg.contains("os error 111") // Linux: connection refused
         || msg.contains("os error 104") // Linux: connection reset by peer
         || msg.contains("os error 10061") // Windows: connection refused
+        // #2303: `classify_mongodb_error` answers a dropped connection, a cleared
+        // pool or a failed server selection with this text and logs the driver
+        // error instead.
+        || msg.contains("the database is temporarily unavailable")
 }
 
 fn is_mongo_unavailable(err: &BackendError) -> bool {
@@ -1552,6 +1979,15 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
+/// The seeding writes of #2435, shared with every binary that compiles a converted suite.
+#[path = "common/seeding.rs"]
+mod seeding;
+use seeding::SeedingStorage;
+
+/// #2435: [`SeedingStorage`] runs a setup write again after an eviction rollback, and nothing else.
+#[path = "mongodb/seeding_retry.rs"]
+mod seeding_retry;
+
 /// Builds a `MongoBackend` and runs schema initialization.
 ///
 /// Returns `None` when the shared mongo has become unreachable, so callers skip
@@ -1562,7 +1998,7 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
 /// writes) under load, without masking real bugs — those fail every attempt.
 async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
     const MAX_ATTEMPTS: u32 = 3;
-    config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    config.max_connections = Some(config.effective_max_pool_size().min(TEST_BACKEND_MAX_POOL));
     // Generation-2 indexes are built after boot by default; tests assert
     // winning plans right after boot, so they wait for the build.
     config.index_build = IndexBuildMode::Inline;
@@ -1597,10 +2033,9 @@ async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
                 attempt += 1;
             }
             Err(err) if is_mongo_unavailable(&err) => {
-                eprintln!(
-                    "Skipping mongodb integration test: shared mongo unreachable after \
-                     {MAX_ATTEMPTS} attempts ({err})"
-                );
+                skip_or_fail_unavailable(&format!(
+                    "shared mongo unreachable after {MAX_ATTEMPTS} attempts ({err})"
+                ));
                 return None;
             }
             Err(err) => {
@@ -1652,23 +2087,30 @@ fn test_append_query_param() {
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
 ///
-/// Used exclusively by the bulk-submit `failCommand` retry tests below, which
-/// assert on *this module's own* bounded retry/attempt counting against a
-/// fail point's `times` budget. Against a replica set the driver's own
-/// retryable-writes support (on by default) transparently retries a dropped
-/// single-statement write once before the error ever reaches this module's
-/// code, silently spending part of the fail point's budget and changing (or
-/// erasing) the attempt counts these tests assert on — so `retryWrites=false`
-/// is forced here to restore the semantics they were written against: every
-/// dropped command must reach this module's own retry loop.
+/// Used by the `failCommand` retry tests: the bulk-submit ones below and those
+/// of the `write_abort_retry`, `transaction_retry`, `transaction_regressions`
+/// and `transaction_bundle_payload_limit` modules. They assert on *this
+/// module's own* bounded retry/attempt counting against a fail point's `times`
+/// budget. Against a replica set the driver's own retryable-writes support (on
+/// by default) transparently retries a dropped single-statement write once
+/// before the error ever reaches this module's code, silently spending part of
+/// the fail point's budget and changing (or erasing) the attempt counts these
+/// tests assert on — so `retryWrites=false` is forced here to restore the
+/// semantics they were written against: every dropped command must reach this
+/// module's own retry loop.
+///
+/// The helper also sets the settling-read bound to
+/// [`TEST_SETTLE_READ_MAX_TIME_MS`], so that the `write_abort_retry` tests of
+/// an applied but unknown commit are settled on a slow host (#2419).
 async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
     let connection_string = append_query_param(&connection_string, "retryWrites=false");
     let config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
-        app_name: app_name.to_string(),
+        app_name: Some(app_name.to_string()),
         data_dir: Some(repo_data_dir()),
+        settle_read_max_time_ms: TEST_SETTLE_READ_MAX_TIME_MS,
         ..Default::default()
     };
     build_backend(config).await
@@ -1695,6 +2137,22 @@ async fn count_docs(backend: &MongoBackend, collection: &str, filter: Document) 
 /// name that states the dependency at the call site.
 async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBackend> {
     create_backend(test_name).await
+}
+
+/// A [`create_backend`] whose plan probes do not time out. The default probe
+/// timeout is short enough that a loaded host times a probe out, and the
+/// search then takes a different (still correct) plan than the one a
+/// winning-plan assertion expects; a generous timeout keeps the plan fixed.
+async fn create_backend_with_stable_probes(test_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
 }
 
 async fn search_index_entry_count(
@@ -1755,6 +2213,9 @@ async fn mongodb_integration_readiness_check() {
 
 /// The indexes queries hint by name, written out here rather than read from
 /// the production list, so the test catches the list losing an entry.
+/// `idx_resources_missing_params` is built after boot and required only once
+/// built (#2001); `missing_index::mongodb_missing_index_follows_index_build_mode`
+/// covers it.
 const HINTED_INDEXES: [(&str, &str); 5] = [
     ("resources", "idx_resources_identity"),
     ("resources", "idx_resources_type_scan"),
@@ -1855,7 +2316,7 @@ async fn mongodb_integration_readiness_fails_when_a_hinted_search_would() {
     };
     let tenant = create_tenant("readiness-hinted-search");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "ready-p", "birthDate": "1980-01-01"}),
@@ -1990,7 +2451,7 @@ async fn mongodb_integration_create_or_update_restores_deleted() {
     let tenant = create_tenant("tenant-restore");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
@@ -2001,7 +2462,7 @@ async fn mongodb_integration_create_or_update_restores_deleted() {
     let id = created.id().to_string();
     assert_eq!(created.version_id(), "1");
 
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let (restored, _created_new) = backend
         .create_or_update(
@@ -2069,7 +2530,7 @@ async fn mongodb_integration_restore_deleted_requires_permission() {
     let tenant = create_tenant("tenant-restore-perm");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient"}),
@@ -2078,7 +2539,7 @@ async fn mongodb_integration_restore_deleted_requires_permission() {
         .await
         .unwrap();
     let id = created.id().to_string();
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let read_only = TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
     let result = backend
@@ -2111,7 +2572,7 @@ async fn mongodb_integration_string_exact_is_case_sensitive() {
     let tenant = create_tenant("tenant-exact");
     for family in ["Smith", "SMITH", "Smithson"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "name": [{"family": family}]}),
@@ -2230,7 +2691,7 @@ async fn mongodb_integration_reference_search_does_not_match_extended_sibling_id
     ];
     for (id, reference) in refs {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -2328,7 +2789,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     let config = MongoBackendConfig {
         connection_string: connection_string.clone(),
         database_name: build_test_database_name("client_pool_reuse"),
-        max_connections: 8,
+        max_connections: Some(8),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
@@ -2341,7 +2802,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
 
     let tenant = create_tenant("tenant-client-pool");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2516,7 +2977,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
     let tenant = create_tenant("tenant-bundle-mixed");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2530,7 +2991,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2665,7 +3126,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
     let tenant = create_tenant("tenant-if-none-exist-urn");
 
     let existing = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2799,7 +3260,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
     );
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2900,7 +3361,7 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
     let tenant = create_tenant("tenant-bundle-rollback");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2986,7 +3447,7 @@ async fn mongodb_integration_tenant_isolation() {
     let tenant_b = create_tenant("tenant-b");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant_a,
             "Patient",
             json!({
@@ -3037,7 +3498,7 @@ async fn mongodb_integration_count_and_batch() {
     let mut ids = Vec::new();
     for idx in 0..3 {
         let created = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -3077,15 +3538,15 @@ async fn mongodb_integration_count_by_types() {
 
     // Seed a small deterministic dataset: 2 Patients, 1 Observation.
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3109,15 +3570,15 @@ async fn mongodb_integration_count_all_types() {
     let tenant = create_tenant("tenant-console-count-all-types");
 
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3203,11 +3664,11 @@ async fn mongodb_integration_count_by_day() {
     let tenant = create_tenant("tenant-console-count-by-day");
 
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3240,17 +3701,17 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     let tenant = create_tenant("tenant-console-count-deltas");
 
     let first = backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     // An update writes a v2 history row, which must contribute no delta — the
     // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
     backend
-        .update(&tenant, &first, json!({"active": true}))
+        .seed_update(&tenant, &first, json!({"active": true}))
         .await
         .unwrap();
 
@@ -3271,7 +3732,7 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     );
 
     backend
-        .delete(&tenant, "Patient", first.id())
+        .seed_delete(&tenant, "Patient", first.id())
         .await
         .unwrap();
     let rows = backend
@@ -3291,15 +3752,15 @@ async fn mongodb_integration_activity_histogram() {
 
     // 3 writes for this tenant -> 3 resource_history rows.
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3329,23 +3790,23 @@ async fn mongodb_integration_count_by_tenant() {
 
     // tenant-a: 3 resources, tenant-b: 2 resources.
     backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3354,6 +3815,147 @@ async fn mongodb_integration_count_by_tenant() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("tenant-a"), Some(&3));
     assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // #1828: the budgeted aggregate keeps the live-resource semantics through
+    // soft delete and restore, across tenants, and leaves registry-only and
+    // data-only tenants to their own interfaces.
+    let counts_now = || async {
+        backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashMap<String, u64>>()
+    };
+
+    // tenant-c holds data but is never registered; tenant-registered-empty is
+    // registered but holds nothing; tenant-d's only resource gets deleted.
+    let tenant_c = create_tenant("tenant-c");
+    let tenant_d = create_tenant("tenant-d");
+    backend
+        .seed_create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let d1 = backend
+        .seed_create(&tenant_d, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .register_tenant("tenant-registered-empty", None)
+        .await
+        .unwrap();
+
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-registered-empty"), None);
+
+    // A soft delete in tenant-a lowers only its count.
+    let a_victim = backend
+        .seed_create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
+    backend
+        .seed_delete(&tenant_a, "Observation", a_victim.id())
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-a"), Some(&3));
+    assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // A tenant whose only resource is deleted drops out of the aggregate.
+    backend
+        .seed_delete(&tenant_d, "Patient", d1.id())
+        .await
+        .unwrap();
+    assert_eq!(counts_now().await.get("tenant-d"), None);
+
+    // Restoring it through create_or_update brings it back.
+    backend
+        .seed_put(
+            &tenant_d,
+            "Patient",
+            d1.id(),
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-a"), Some(&3));
+
+    // Registered-empty tenants come only from the registry; data-only tenants
+    // only from the aggregate.
+    let registered: Vec<String> = backend
+        .list_tenants()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(registered, vec!["tenant-registered-empty".to_string()]);
+}
+
+/// #1672: MongoDB discovery is its grouped live count, complete in one
+/// aggregate, so deleted resources do not count.
+#[tokio::test]
+async fn mongodb_integration_discover_tenants_reports_live_counts() {
+    use helios_persistence::core::{
+        CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence,
+    };
+    let Some(backend) = create_backend("discover_tenants").await else {
+        eprintln!(
+            "Skipping mongodb_integration_discover_tenants_reports_live_counts (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_gone = create_tenant("tenant-gone");
+
+    for resource_type in ["Patient", "Patient", "Observation"] {
+        backend
+            .seed_create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let deleted = backend
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .seed_delete(&tenant_a, "Patient", deleted.id())
+        .await
+        .unwrap();
+    let only = backend
+        .seed_create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .seed_delete(&tenant_gone, "Patient", only.id())
+        .await
+        .unwrap();
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+        .tenants
+        .into_iter()
+        .map(|t| (t.id, t.evidence))
+        .collect();
+    assert_eq!(
+        found.get("tenant-a"),
+        Some(&TenantDataEvidence::Counted {
+            resources: 3,
+            basis: CountBasis::LiveResources,
+        })
+    );
+    assert!(!found.contains_key("tenant-gone"));
 }
 
 #[tokio::test]
@@ -3404,6 +4006,276 @@ async fn mongodb_integration_tenant_registry_crud() {
     assert_eq!(remaining, vec![beta]);
 }
 
+/// Raw handle on a test backend's database, through a plain driver client.
+async fn purge_raw_db(backend: &MongoBackend) -> mongodb::Database {
+    raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client")
+        .database(&backend.config().database_name)
+}
+
+/// Seeds one bulk-submit change document (with a prior body) for a resource.
+fn purge_change_doc(tenant: &str, resource_id: &str) -> Document {
+    doc! {
+        "tenant_id": tenant,
+        "submitter": "sub",
+        "submission_id": "s1",
+        "change_id": format!("c-{resource_id}"),
+        "manifest_id": "m1",
+        "change_type": "update",
+        "resource_type": "Patient",
+        "resource_id": resource_id,
+        "previous_version": "1",
+        "new_version": "2",
+        "previous_content": "{\"resourceType\":\"Patient\",\"name\":[{\"family\":\"Secret\"}]}",
+    }
+}
+
+async fn purge_record_sync_failure(backend: &MongoBackend, tenant: &str, resource_id: &str) {
+    use helios_persistence::composite::{
+        SecondarySyncFailureLedger, SyncFailureKey, SyncFailureReport, SyncOperation,
+    };
+    let report = SyncFailureReport {
+        key: SyncFailureKey {
+            tenant_id: tenant.to_string(),
+            resource_type: "Patient".to_string(),
+            resource_id: resource_id.to_string(),
+            backend_id: "es".to_string(),
+        },
+        operation: SyncOperation::Update,
+        attempts: 3,
+        error: "boom".to_string(),
+        failed_at: chrono::Utc::now(),
+    };
+    assert!(backend.record_sync_failure(&report).await.unwrap());
+}
+
+/// Schema-driven completeness check for #2279: every collection that carries a
+/// tenant id (top-level `tenant_id` or `_id.tenant_id`) must be empty for the
+/// purged tenant, and a collection nobody classified fails the test so a new
+/// one cannot be forgotten.
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
+    let Some(backend) = create_backend("purge_tenant_complete").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_tenant_data_leaves_no_tenant_rows (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    // Not tenant-keyed: the registry, per-user documents, login sessions,
+    // the schema version marker, and the content-addressed `:missing` fingerprint catalogue shared by tenants.
+    const EXEMPT: &[&str] = &[
+        "tenants",
+        "user_settings",
+        "login_sessions",
+        "missing_params_fingerprints",
+        "schema_version",
+    ];
+    // Tenant-keyed collections this test seeds, so they must hold rows first.
+    const SEEDED: &[&str] = &[
+        "resources",
+        "resource_history",
+        "bulk_submissions",
+        "bulk_manifests",
+        "bulk_entry_results",
+        "bulk_submission_changes",
+        "bulk_submit_files",
+        "secondary_sync_failures",
+        "search_layout",
+    ];
+    // Tenant-keyed collections that may legitimately be empty or absent here.
+    const MAY_BE_EMPTY: &[&str] = &[
+        "search_index",
+        "search_index_contained",
+        "search_index_pending",
+        "bulk_provider_submissions",
+        "sof_terminology_registry",
+        "sof_terminology_rows",
+    ];
+
+    let tenant_a = create_tenant("tenant-purgec-a");
+    let tenant_b = create_tenant("tenant-purgec-b");
+    let db = purge_raw_db(&backend).await;
+
+    for (tenant, id) in [
+        ("tenant-purgec-a", &tenant_a),
+        ("tenant-purgec-b", &tenant_b),
+    ] {
+        let created = backend
+            .seed_create(id, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .seed_update(
+                id,
+                &created,
+                json!({"resourceType": "Patient", "id": created.id()}),
+            )
+            .await
+            .unwrap();
+        let submission = doc! { "tenant_id": tenant, "submitter": "sub", "submission_id": "s1" };
+        for collection in [
+            "bulk_submissions",
+            "bulk_manifests",
+            "bulk_entry_results",
+            "bulk_submit_files",
+        ] {
+            db.collection::<Document>(collection)
+                .insert_one(submission.clone())
+                .await
+                .unwrap();
+        }
+        db.collection::<Document>("bulk_submission_changes")
+            .insert_one(purge_change_doc(tenant, created.id()))
+            .await
+            .unwrap();
+        purge_record_sync_failure(&backend, tenant, created.id()).await;
+        // A `tuple_code` completeness marker, as a clean `$reindex` writes it.
+        db.collection::<Document>("search_layout")
+            .insert_one(doc! {
+                "_id": format!("{tenant}|composite_tuple_code_v2"),
+                "tenant_id": tenant,
+                "layout": "composite_tuple_code_v2",
+            })
+            .await
+            .unwrap();
+    }
+
+    let tenant_filter = |t: &str| doc! { "$or": [ { "tenant_id": t }, { "_id.tenant_id": t } ] };
+    let names = db.list_collection_names().await.unwrap();
+    for name in &names {
+        let known = EXEMPT.contains(&name.as_str())
+            || SEEDED.contains(&name.as_str())
+            || MAY_BE_EMPTY.contains(&name.as_str());
+        assert!(
+            known,
+            "collection `{name}` is not classified: if it carries a tenant id, seed it here \
+             and delete it in purge_tenant_data; otherwise add it to EXEMPT"
+        );
+    }
+    for name in SEEDED {
+        assert!(names.iter().any(|n| n == name), "`{name}` was not created");
+        let n = db
+            .collection::<Document>(name)
+            .count_documents(tenant_filter("tenant-purgec-a"))
+            .await
+            .unwrap();
+        assert!(
+            n > 0,
+            "`{name}` must hold rows for the tenant before the purge"
+        );
+    }
+
+    backend.purge_tenant_data("tenant-purgec-a").await.unwrap();
+
+    for name in names.iter().filter(|n| !EXEMPT.contains(&n.as_str())) {
+        let coll = db.collection::<Document>(name);
+        let left = coll
+            .count_documents(tenant_filter("tenant-purgec-a"))
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "`{name}` still holds rows for the purged tenant");
+    }
+    for name in SEEDED {
+        let kept = db
+            .collection::<Document>(name)
+            .count_documents(tenant_filter("tenant-purgec-b"))
+            .await
+            .unwrap();
+        assert!(kept > 0, "`{name}` lost the other tenant's rows");
+    }
+}
+
+/// The single-resource purge blanks the resource's `previous_content` in the
+/// bulk-submit change log (keeping the row) and drops its sync failures.
+#[tokio::test]
+async fn mongodb_integration_purge_clears_previous_content() {
+    let Some(backend) = create_backend("purge_prev_content").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_clears_previous_content (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-purgep");
+    let p1 = backend
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let p2 = backend
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let db = purge_raw_db(&backend).await;
+    let changes = db.collection::<Document>("bulk_submission_changes");
+    for id in [p1.id(), p2.id()] {
+        changes
+            .insert_one(purge_change_doc("tenant-purgep", id))
+            .await
+            .unwrap();
+        purge_record_sync_failure(&backend, "tenant-purgep", id).await;
+    }
+
+    backend.purge(&tenant, "Patient", p1.id()).await.unwrap();
+
+    let purged = changes
+        .find_one(doc! { "tenant_id": "tenant-purgep", "resource_id": p1.id() })
+        .await
+        .unwrap()
+        .expect("the change row itself stays");
+    assert_eq!(purged.get("previous_content"), Some(&Bson::Null));
+    let other = changes
+        .find_one(doc! { "tenant_id": "tenant-purgep", "resource_id": p2.id() })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        other.get("previous_content"),
+        Some(Bson::String(_))
+    ));
+
+    let failures = db.collection::<Document>("secondary_sync_failures");
+    let count = |id: String| {
+        let failures = failures.clone();
+        async move {
+            failures
+                .count_documents(doc! { "_id.tenant_id": "tenant-purgep", "_id.resource_id": id })
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(p1.id().to_string()).await, 0);
+    assert_eq!(count(p2.id().to_string()).await, 1);
+
+    // The erasure is served by `idx_bulk_changes_resource`, not a scan of the
+    // tenant's whole change log.
+    let plan = db
+        .run_command(doc! {
+            "explain": {
+                "update": "bulk_submission_changes",
+                "updates": [{
+                    "q": {
+                        "tenant_id": "tenant-purgep",
+                        "resource_type": "Patient",
+                        "resource_id": p1.id(),
+                    },
+                    "u": { "$set": { "previous_content": Bson::Null } },
+                    "multi": true,
+                }],
+            },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .unwrap();
+    let winning = plan
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .unwrap();
+    assert!(
+        winning.to_string().contains("idx_bulk_changes_resource"),
+        "purge's previous_content erasure is not indexed: {winning}"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_purge_tenant_data() {
     let Some(backend) = create_backend("purge_tenant_data").await else {
@@ -3415,15 +4287,15 @@ async fn mongodb_integration_purge_tenant_data() {
     let tenant_b = create_tenant("tenant-purge-b");
 
     let a1 = backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let a2 = backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let b1 = backend
-        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3522,7 +4394,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
     let tenant = create_tenant("tenant-versioned");
 
     let v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -3536,7 +4408,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .unwrap();
 
     let v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             json!({
@@ -3548,7 +4420,10 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .await
         .unwrap();
 
-    backend.delete(&tenant, "Patient", v2.id()).await.unwrap();
+    backend
+        .seed_delete(&tenant, "Patient", v2.id())
+        .await
+        .unwrap();
 
     let read_v1 = backend
         .vread(&tenant, "Patient", v1.id(), "1")
@@ -3592,7 +4467,7 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
     let tenant = create_tenant("tenant-if-match");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -3735,7 +4610,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     }
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder", "First"),
@@ -3769,7 +4644,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // Task 4's `purge` change). There is no REST-independent way to purge
     // other than the trait method the REST handler calls directly.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-purge", "PurgeMe"),
@@ -3804,7 +4679,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // the backend method directly, the same way the single-resource `purge`
     // coverage above does.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-purge-all", "PurgeAllMe"),
@@ -3834,7 +4709,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // out-of-scope containers, so their contained rows would otherwise be
     // left as orphans.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-clear", "ClearMe"),
@@ -3860,7 +4735,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // the two-collection invariant (#1160 Task 4) — clears both collections
     // for the id.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-per-entry", "PerEntryMe"),
@@ -4024,7 +4899,7 @@ async fn mongodb_integration_purge_tenant_clears_contained_rows() {
     };
 
     backend
-        .create(
+        .seed_create(
             &tenant_a,
             "Observation",
             with_contained("purge-a-holder"),
@@ -4033,7 +4908,7 @@ async fn mongodb_integration_purge_tenant_clears_contained_rows() {
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant_b,
             "Observation",
             with_contained("purge-b-holder"),
@@ -4091,7 +4966,7 @@ async fn mongodb_integration_history_providers() {
     let tenant = create_tenant("tenant-history");
 
     let patient_v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -4105,7 +4980,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     let patient_v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &patient_v1,
             json!({
@@ -4118,12 +4993,12 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     backend
-        .delete(&tenant, "Patient", patient_v2.id())
+        .seed_delete(&tenant, "Patient", patient_v2.id())
         .await
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -4191,7 +5066,7 @@ async fn seed_type_history_corpus(
     for i in 0..obs_count {
         let id = format!("hist-obs-{i}");
         let v1 = backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({"resourceType": "Observation", "id": id, "status": "final"}),
@@ -4202,7 +5077,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "1".to_string()));
 
         let v2 = backend
-            .update(
+            .seed_update(
                 tenant,
                 &v1,
                 json!({"resourceType": "Observation", "id": id, "status": "amended"}),
@@ -4212,7 +5087,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "2".to_string()));
 
         backend
-            .update(
+            .seed_update(
                 tenant,
                 &v2,
                 json!({"resourceType": "Observation", "id": id, "status": "final"}),
@@ -4426,7 +5301,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .unwrap()
         .unwrap();
     let obs0_v4 = backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v3,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -4434,7 +5309,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .await
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v4,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -4562,7 +5437,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
     for i in 0..5usize {
         let id = format!("sys-pat-{i}");
         let v1 = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]}),
@@ -4571,7 +5446,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         let v2 = backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v1,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Y"}]}),
@@ -4579,7 +5454,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v2,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Z"}]}),
@@ -4838,11 +5713,10 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
 
     // Only the *winning* plan matters here. `explain` also carries
     // `queryPlanner.rejectedPlans` — other candidates the multi-planner
-    // tried and discarded (e.g. via idx_history_identity or
-    // idx_history_resource_updated), several of which legitimately contain
-    // their own SORT stage. Scanning the whole explain document (including
-    // rejected plans) would false-positive on those, so only the winning
-    // plan tree is searched for a blocking SORT.
+    // tried and discarded (e.g. via idx_history_identity), several of which
+    // legitimately contain their own SORT stage. Scanning the whole explain
+    // document (including rejected plans) would false-positive on those, so
+    // only the winning plan tree is searched for a blocking SORT.
     let winning_plan = explain
         .get_document("queryPlanner")
         .expect("explain missing queryPlanner")
@@ -4923,7 +5797,7 @@ async fn mongodb_integration_history_delete_trial_use_not_supported() {
     let tenant = create_tenant("tenant-history-not-supported");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -4972,7 +5846,7 @@ async fn mongodb_integration_contained_search() {
     let tenant = create_tenant("tenant-contained");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -4993,7 +5867,7 @@ async fn mongodb_integration_contained_search() {
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
@@ -5122,7 +5996,7 @@ async fn mongodb_integration_contained_rows_are_written_to_their_own_collection(
 async fn seed_contained_smiths(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
     for i in 0..n {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({
@@ -5279,7 +6153,7 @@ async fn mongodb_integration_contained_container_with_two_matches_counts_once() 
 
     // Two contained Patients named Smith in one Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5296,7 +6170,7 @@ async fn mongodb_integration_contained_container_with_two_matches_counts_once() 
         .unwrap();
     // One contained Patient named Smith in a second Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5368,7 +6242,7 @@ async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_enti
     // `split`: the two conditions (name=Smith, gender=male) are each
     // satisfied, but by DIFFERENT contained Patients — must NOT match.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5385,7 +6259,7 @@ async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_enti
         .unwrap();
     // `whole`: one contained Patient satisfies BOTH conditions — must match.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5453,7 +6327,7 @@ async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary(
     let tenant = create_tenant("tenant-contained-both");
     for i in 0..2 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({ "resourceType": "Patient", "id": format!("top-{i}"), "name": [{ "family": "Smith" }] }),
@@ -5543,7 +6417,7 @@ async fn mongodb_integration_standard_search_ignores_same_type_contained_values(
     let tenant = create_tenant("tenant-same-type-contained");
     // The holder's only `code = X` lives inside a contained Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5613,7 +6487,7 @@ async fn mongodb_integration_cross_type_contained_search_still_returns_the_conta
     };
     let tenant = create_tenant("tenant-cross-type-contained");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5669,7 +6543,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     // top-level match through its contained rows, so this case was not a
     // real dedupe.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -5684,7 +6558,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     // top-level search is for type Patient and never sees Observation-typed
     // index rows, so this container is invisible to the top-level portion.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5698,7 +6572,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         .unwrap();
     // (c) A non-match, to prove filtering.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "plain", "name": [{ "family": "Jones" }] }),
@@ -5767,7 +6641,7 @@ async fn mongodb_integration_search_quantity() {
     let tenant = create_tenant("tenant-quantity");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5856,7 +6730,7 @@ async fn mongodb_quantity_eq_ne_use_implicit_precision() {
     ];
     for (id, weight) in WEIGHTS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -5950,7 +6824,7 @@ async fn mongodb_integration_compartment_search() {
 
     // In the compartment via `subject`.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5967,7 +6841,7 @@ async fn mongodb_integration_compartment_search() {
 
     // In the compartment via the NON-first param `performer` only.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5985,7 +6859,7 @@ async fn mongodb_integration_compartment_search() {
 
     // Not in the compartment (references another patient).
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6045,7 +6919,7 @@ async fn mongodb_integration_search_token_string_and_offset_pagination() {
         ("patient-search-3", "MRN-SEARCH-3", "Jones"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6109,7 +6983,7 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 
     for id in ["patient-cursor-1", "patient-cursor-2", "patient-cursor-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6178,7 +7052,7 @@ async fn create_cursor_paging_patients(backend: &MongoBackend, tenant: &TenantCo
     );
     for i in 1..=n {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({
@@ -6441,7 +7315,7 @@ async fn mongodb_integration_search_cursor_pagination_sorted_by_id() {
     // would not produce these pages.
     for id in ["cp-5", "cp-4", "cp-3", "cp-2", "cp-1"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6564,7 +7438,7 @@ async fn mongodb_integration_search_cursor_pagination_sorted_by_last_updated() {
 
     for id in ["lu-1", "lu-2", "lu-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6651,7 +7525,7 @@ async fn mongodb_integration_search_multi_field_sort_mints_no_cursor() {
 
     for id in ["ms-1", "ms-2", "ms-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id}),
@@ -6736,7 +7610,7 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
             resource["birthDate"] = json!(birth_date);
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -6875,7 +7749,7 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             resource["birthDate"] = json!(birth_date);
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7015,6 +7889,16 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             ids(&result),
             ids(&backend.search(&tenant, &single).await.unwrap())
         );
+        // A trailing `_id` uses the tie-breaker slot, not a sort key: 15
+        // parameter keys plus `_id` fit, in descending id order.
+        let with_id = query.clone().with_sort(SortDirective::parse("-_id"));
+        let single_with_id = single.clone().with_sort(SortDirective::parse("-_id"));
+        assert_eq!(
+            ids(&backend.search(&tenant, &with_id).await.unwrap()),
+            ids(&backend.search(&tenant, &single_with_id).await.unwrap()),
+            "filtered={filtered} 15 keys + -_id"
+        );
+
         query = query.with_sort(family("family"));
         let err = backend.search(&tenant, &query).await.unwrap_err();
         match err {
@@ -7024,15 +7908,171 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             ),
             other => panic!("unexpected sort-limit error: {other:?}"),
         }
+        // A 16th parameter key is still refused when `_id` follows it.
+        let err = backend
+            .search(&tenant, &query.with_sort(SortDirective::parse("_id")))
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                message,
+                "MongoDB supports at most 15 search-parameter sort keys"
+            ),
+            other => panic!("unexpected sort-limit error with _id: {other:?}"),
+        }
+    }
+
+    // A trailing `_id` sets the direction of the id tie-break on both paths:
+    // the 1980-01-01 ties and the Patients without a birthDate reverse; the
+    // birthDate order and missing-last are unchanged.
+    for filtered in [false, true] {
+        for (label, sort, expected) in [
+            (
+                "birthdate,_id",
+                vec![birthdate("birthdate"), SortDirective::parse("_id")],
+                vec![
+                    "ms-clark",
+                    "ms-adams",
+                    "ms-brown",
+                    "ms-excluded",
+                    "ms-nofamily",
+                    "ms-z-adams",
+                    "ms-a-nobirth",
+                    "ms-neither-a",
+                    "ms-neither-z",
+                    "ms-z-nobirth",
+                ],
+            ),
+            (
+                "birthdate,-_id",
+                vec![birthdate("birthdate"), SortDirective::parse("-_id")],
+                vec![
+                    "ms-clark",
+                    "ms-z-adams",
+                    "ms-nofamily",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-adams",
+                    "ms-z-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                    "ms-a-nobirth",
+                ],
+            ),
+            (
+                "-birthdate,-_id",
+                vec![birthdate("-birthdate"), SortDirective::parse("-_id")],
+                vec![
+                    "ms-z-adams",
+                    "ms-nofamily",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-adams",
+                    "ms-clark",
+                    "ms-z-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                    "ms-a-nobirth",
+                ],
+            ),
+            (
+                "birthdate,family,-_id",
+                vec![
+                    birthdate("birthdate"),
+                    family("family"),
+                    SortDirective::parse("-_id"),
+                ],
+                vec![
+                    "ms-clark",
+                    "ms-z-adams",
+                    "ms-adams",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-nofamily",
+                    "ms-z-nobirth",
+                    "ms-a-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                ],
+            ),
+        ] {
+            let mut query = SearchQuery::new("Patient");
+            if filtered {
+                query = query.with_parameter(active());
+            }
+            for directive in sort {
+                query = query.with_sort(directive);
+            }
+            let expected: Vec<&str> = expected
+                .into_iter()
+                .filter(|id| !filtered || *id != "ms-excluded")
+                .collect();
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(ids(&result), expected, "filtered={filtered} {label}");
+
+            // Offset pages over the same sort neither skip nor repeat.
+            let mut paged = Vec::new();
+            for offset in (0..expected.len()).step_by(2) {
+                let mut page_query = query.clone();
+                page_query.count = Some(2);
+                page_query.offset = Some(offset as u32);
+                paged.extend(ids(&backend.search(&tenant, &page_query).await.unwrap()));
+            }
+            assert_eq!(paged, expected, "filtered={filtered} paged {label}");
+        }
+
+        // An ascending trailing `_id` is the default order.
+        let mut with_id = SearchQuery::new("Patient")
+            .with_sort(birthdate("-birthdate"))
+            .with_sort(SortDirective::parse("_id"));
+        let mut without_id = SearchQuery::new("Patient").with_sort(birthdate("-birthdate"));
+        if filtered {
+            with_id = with_id.with_parameter(active());
+            without_id = without_id.with_parameter(active());
+        }
+        assert_eq!(
+            ids(&backend.search(&tenant, &with_id).await.unwrap()),
+            ids(&backend.search(&tenant, &without_id).await.unwrap()),
+            "filtered={filtered} -birthdate,_id"
+        );
+    }
+
+    // Removing the final tie-breaker must not hide an earlier reserved key.
+    for other in ["_id", "-_lastUpdated", "_score"] {
+        for middle in [false, true] {
+            let mut mixed = SearchQuery::new("Patient")
+                .with_sort(birthdate("birthdate"))
+                .with_sort(SortDirective::parse(other));
+            if middle {
+                mixed = mixed.with_sort(family("family"));
+            }
+            mixed = mixed.with_sort(SortDirective::parse("-_id"));
+            let err = backend.search(&tenant, &mixed).await.unwrap_err();
+            match err {
+                StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                    message,
+                    format!(
+                        "MongoDB cannot combine _sort={} with a search-parameter sort; \
+                         sort by search parameters, optionally followed by _id",
+                        SortDirective::parse(other).parameter
+                    )
+                ),
+                other => panic!("unexpected mixed-sort error: {other:?}"),
+            }
+        }
     }
 
     // These are persistence-layer errors; the REST layer maps them to HTTP 400.
+    // `_id` is accepted only as the last key; first, it is still refused.
     for other in ["_id", "-_lastUpdated", "_score"] {
         for reserved_first in [false, true] {
+            if other == "_id" && !reserved_first {
+                continue;
+            }
             let reserved = SortDirective::parse(other);
             let expected = format!(
                 "MongoDB cannot combine _sort={} with a search-parameter sort; \
-                 sort by search parameters only",
+                 sort by search parameters, optionally followed by _id",
                 reserved.parameter
             );
             let mixed = if reserved_first {
@@ -7080,7 +8120,7 @@ async fn mongodb_integration_sort_param_name_is_a_literal() {
             "birthDate": birth_date,
         });
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7150,7 +8190,7 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
         ("vs-x", "http://example.org/fhirx/ValueSet/b"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -7236,14 +8276,14 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
 /// stays bounded rather than falling back to a full collection scan.
 #[tokio::test]
 async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_uri_below").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_uri_below").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
     let tenant = create_tenant("tenant-covered-uri-below");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -7257,7 +8297,7 @@ async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
     }
     for i in 0..5 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -7316,7 +8356,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     for n in 1..=6u32 {
         let birth_date = format!("199{}-01-01", n - 1);
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -7397,7 +8437,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p2,
             json!({
@@ -7416,7 +8456,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p5,
             json!({
@@ -7460,7 +8500,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     // rows and `all_resource_ids` excludes it, so this pins that a deleted
     // resource neither occupies a page slot nor counts toward `total`.
     backend
-        .delete(&tenant, "Patient", "patient-psors-6")
+        .seed_delete(&tenant, "Patient", "patient-psors-6")
         .await
         .unwrap();
 
@@ -7550,7 +8590,7 @@ async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
             resource["birthDate"] = json!(format!("{birth_year}-01-01"));
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7783,7 +8823,7 @@ async fn mongodb_integration_param_sort_by_quantity_orders_by_value() {
         ("obs-qty-c", 42.0),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -7866,7 +8906,7 @@ async fn mongodb_integration_search_id_and_last_updated_modifiers() {
 
     for id in ["patient-idm-1", "patient-idm-2", "patient-idm-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -8027,7 +9067,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id=a,b & status:not=amended -> [a] ----------------------------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8041,7 +9081,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8085,7 +9125,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id=a,c & code:missing=true/false -> [c] / [a] ------------------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8099,7 +9139,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8190,7 +9230,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     use helios_persistence::types::CompartmentMembership;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8204,7 +9244,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8218,7 +9258,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8277,7 +9317,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id + component-code-value-quantity, with the seed driving -------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8299,7 +9339,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8326,7 +9366,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     // wins the driver race.
     for id in ["obs-idcc-outside-1", "obs-idcc-outside-2"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -8401,6 +9441,267 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     );
 }
 
+/// The `:missing` / `:not` complements, the unfiltered parameter sort and the
+/// compartment restriction collect resource ids. A `distinct` reply is one BSON
+/// document and fails past 16 MB (about 345,000 UUID-length ids) however few
+/// rows a request asks for, so none of these may use `distinct`: the profiler
+/// must show no `distinct` on `resources` or `search_index`. The results must
+/// stay the same, including with a deleted resource and a stale `search_index`
+/// row for a resource that no longer exists.
+#[tokio::test]
+async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("id_sets_no_distinct").await else {
+        eprintln!(
+            "Skipping mongodb_integration_id_set_queries_do_not_use_distinct (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-sets-no-distinct");
+    for (id, gender, birth_date) in [
+        ("nd-a", Some("female"), "1990-01-01"),
+        ("nd-b", Some("male"), "1970-01-01"),
+        ("nd-c", None, "1980-01-01"),
+        ("nd-deleted", Some("female"), "2000-01-01"),
+    ] {
+        let mut patient = json!({ "resourceType": "Patient", "id": id, "birthDate": birth_date });
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        backend
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    for (id, subject, status) in [
+        ("nd-o1", "Patient/nd-a", "final"),
+        ("nd-o2", "Patient/nd-a", "cancelled"),
+        ("nd-o3", "Patient/nd-b", "final"),
+    ] {
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": status,
+                    "code": { "text": "id-set" },
+                    "subject": { "reference": subject },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    backend
+        .seed_delete(&tenant, "Patient", "nd-deleted")
+        .await
+        .unwrap();
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+
+    // Stale rows: copies of nd-a's gender and birthdate rows for a resource
+    // that does not exist.
+    let search_index: Collection<Document> = database.collection("search_index");
+    let mut rows = search_index
+        .find(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "nd-a",
+            "param_name": { "$in": ["gender", "birthdate"] },
+        })
+        .await
+        .unwrap();
+    let mut stale = Vec::new();
+    while rows.advance().await.unwrap() {
+        let mut row: Document = rows.deserialize_current().unwrap();
+        row.remove("_id");
+        row.insert("resource_id", "nd-stale");
+        stale.push(row);
+    }
+    assert_eq!(stale.len(), 2, "nd-a has one gender and one birthdate row");
+    search_index.insert_many(stale).await.unwrap();
+
+    let token = |name: &str, modifier: SearchModifier, value: &str| SearchParameter {
+        name: name.to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(modifier),
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let mut compartment_not = SearchQuery::new("Observation").with_parameter(token(
+        "status",
+        SearchModifier::Not,
+        "cancelled",
+    ));
+    compartment_not.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/nd-a".to_string(),
+    });
+    let queries = [
+        (
+            "gender:missing=true",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Missing,
+                "true",
+            )),
+            vec!["nd-c"],
+        ),
+        (
+            "gender:missing=false",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Missing,
+                "false",
+            )),
+            vec!["nd-a", "nd-b"],
+        ),
+        (
+            "gender:not=male",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Not,
+                "male",
+            )),
+            vec!["nd-a", "nd-c"],
+        ),
+        (
+            "_sort=birthdate",
+            SearchQuery::new("Patient").with_sort(
+                SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)),
+            ),
+            vec!["nd-b", "nd-c", "nd-a"],
+        ),
+        (
+            "Patient/nd-a compartment, status:not=cancelled",
+            compartment_not,
+            vec!["nd-o1"],
+        ),
+    ];
+    let ids = |result: &helios_persistence::core::SearchResult, sorted: bool| {
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        if !sorted {
+            ids.sort();
+        }
+        ids
+    };
+
+    // Results first, unconditionally, so a server that refuses profiling still
+    // leaves a checked test.
+    for (label, query, expected) in &queries {
+        let result = backend.search(&tenant, query).await.unwrap();
+        assert_eq!(ids(&result, !query.sort.is_empty()), *expected, "{label}");
+    }
+
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_id_set_queries_do_not_use_distinct profiler \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+    for (label, query, _) in &queries {
+        backend
+            .search(&tenant, query)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let namespaces = [
+        format!("{db_name}.resources"),
+        format!("{db_name}.search_index"),
+    ];
+    let recorded = profile
+        .count_documents(doc! { "ns": { "$in": namespaces.to_vec() } })
+        .await
+        .expect("failed to count profile entries");
+    assert!(recorded > 0, "the profiler recorded the searches");
+    let distinct = profile
+        .count_documents(doc! {
+            "ns": { "$in": namespaces.to_vec() },
+            "command.distinct": { "$exists": true },
+        })
+        .await
+        .expect("failed to count distinct commands");
+    assert_eq!(
+        distinct, 0,
+        "id sets must be read through a cursor, not distinct"
+    );
+}
+
+/// Complement searches (`:missing=false`, `:not`) must return every matching
+/// resource, not just the first cursor batch.
+#[tokio::test]
+async fn mongodb_integration_complement_search_reads_complete_pages() {
+    let Some(backend) = create_backend_with_full_registry("id_sets_multiple_batches").await else {
+        eprintln!(
+            "Skipping mongodb_integration_complement_search_reads_complete_pages (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-sets-multiple-batches");
+    // Exceeds the default initial cursor batch MongoDB returns for a find.
+    let expected: Vec<String> = (0..300).map(|i| format!("batch-{i:03}")).collect();
+    for id in &expected {
+        backend
+            .seed_create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": id, "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let queries = [
+        (SearchModifier::Missing, "false"),
+        (SearchModifier::Not, "male"),
+    ]
+    .into_iter()
+    .map(|(modifier, value)| {
+        SearchQuery::new("Patient")
+            .with_count(expected.len() as u32)
+            .with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(modifier),
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            })
+    })
+    .collect::<Vec<_>>();
+
+    for query in &queries {
+        let result = backend.search(&tenant, query).await.unwrap();
+        let mut actual: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "query={query:?}");
+        assert!(!result.resources.page_info.has_next);
+    }
+}
+
 /// #1528: `_id` never bounded what `matching_resource_ids` read from
 /// `search_index` — a single `_id` plus an unrelated normal parameter drove
 /// entirely off that parameter's own population, however large. With enough
@@ -8422,7 +9723,7 @@ async fn mongodb_integration_search_id_bounds_a_broad_term() {
 
     for (id, status) in [("obs-ibt-a", "final"), ("obs-ibt-b", "amended")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -8568,7 +9869,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     let hit_ids = ["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"];
     for id in hit_ids {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -8689,8 +9990,8 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     // so an *unhinted* IXSCAN on the date population also satisfies
     // `planSummary.contains("resource_id: 1")` — this pinned nothing, and
     // would have passed on origin/main's own (unfixed) driver-cursor plan for
-    // this same query too. Pin the literal `hint` field on an actual `find`
-    // command instead, which only a seeded check ever sets.
+    // this same query too. Pin the literal hint on the bounded membership
+    // aggregate instead of inferring access from a plan-summary field name.
     let profile: Collection<Document> = database.collection("system.profile");
     let mut cursor = profile
         .find(doc! { "ns": format!("{db_name}.search_index") })
@@ -8713,7 +10014,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
             total_keys_examined += k;
         }
         if let Ok(command) = entry.get_document("command")
-            && command.contains_key("find")
+            && command.get_str("aggregate") == Ok("search_index")
             && command.get_str("hint") == Ok("idx_search_composite")
         {
             saw_composite_hint = true;
@@ -8721,7 +10022,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     }
     assert!(
         saw_composite_hint,
-        "expected at least one `find` on search_index hinted onto idx_search_composite, \
+        "expected a membership aggregate on search_index hinted onto idx_search_composite, \
          proving a seeded check ran"
     );
     assert!(
@@ -8748,7 +10049,7 @@ async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_t
     let tenant = create_tenant("tenant-large-seed-selective-term");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8762,7 +10063,7 @@ async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_t
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8884,7 +10185,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
     let hit_ids = ["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"];
     for id in hit_ids {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9038,11 +10339,8 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
 
     let _ = database.run_command(doc! { "profile": 0_i32 }).await;
 
-    // The sibling `status` check is an unhinted `distinct` bounded to
-    // `resource_id: {"$in": [...]}` (the driver is `code`, so `hint: false`
-    // here — see `retain_matching_candidates`'s doc comment). Its `$in` must
-    // carry only the (up to 3) seed-intersected candidates, not the 303 the
-    // `code` driver cursor actually read.
+    // The sibling status aggregation must carry only the seed-intersected
+    // candidates (at most 3), not the 303 IDs returned by the code driver.
     fn find_resource_id_in_len(doc: &Document) -> Option<usize> {
         if let Ok(sub) = doc.get_document("resource_id")
             && let Ok(arr) = sub.get_array("$in")
@@ -9075,7 +10373,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
     let mut cursor = profile
         .find(doc! {
             "ns": format!("{db_name}.search_index"),
-            "command.distinct": "search_index",
+            "command.aggregate": "search_index",
         })
         .await
         .expect("failed to query system.profile");
@@ -9096,7 +10394,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
         }
     }
     let smallest_in_len = smallest_in_len
-        .expect("expected a `distinct` command on search_index checking `resource_id: $in`");
+        .expect("expected an aggregate command on search_index checking `resource_id: $in`");
     assert!(
         smallest_in_len <= 3,
         "resource_id $in had {smallest_in_len} entries — the sibling `status` check must only \
@@ -9130,7 +10428,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
     // In the compartment AND in the seed: must be in the result.
     for id in ["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9147,7 +10445,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
     // In the compartment but NOT in the seed: must be excluded (`_id` AND
     // compartment, not compartment alone).
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9162,7 +10460,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
         .unwrap();
     // In the seed but NOT in the compartment: must be excluded.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9298,7 +10596,7 @@ async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process
     ] {
         let resource_type = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -9392,14 +10690,14 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
     ] {
         let rt = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &rt, resource, FhirVersion::default())
+            .seed_create(&tenant, &rt, resource, FhirVersion::default())
             .await
             .unwrap();
     }
 
     for i in 0..P1_COUNT {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9416,7 +10714,7 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
 
     for i in 0..P2_COUNT {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9519,6 +10817,177 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
     );
 }
 
+/// The in-database aggregate (typed `ViewRow` cursor) and the patient/group
+/// fallback `find` both honour `sof_cursor_batch_size` (#2161): with 1,200
+/// Observations and a batch of 512 each scan needs three server replies, and
+/// the result must still be complete with no row repeated.
+#[tokio::test]
+async fn mongodb_integration_sof_scan_spans_several_cursor_batches() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    const OBSERVATIONS: usize = 1200;
+    const BATCH: u32 = 512;
+
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_scan_spans_several_cursor_batches \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("sof_scan_cursor_batches"),
+        data_dir: Some(repo_data_dir()),
+        sof_cursor_batch_size: BATCH,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().sof_cursor_batch_size, BATCH);
+    let tenant = create_tenant("tenant-sof-cursor-batches");
+
+    backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "cb-p1" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..OBSERVATIONS {
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/cb-p1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("obs {i}: {e}"));
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+    let runner = backend
+        .sof_runner()
+        .expect("MongoDB backend must provide a SOF runner");
+
+    for (label, filters) in [
+        ("in-database aggregate", ViewFilters::default()),
+        (
+            "patient fallback find",
+            ViewFilters {
+                patient: vec!["Patient/cb-p1".to_string()],
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut stream = runner
+            .run_view(&tenant, view.clone(), filters)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: run_view: {e}"));
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.unwrap_or_else(|e| panic!("{label}: row: {e}"));
+            ids.push(row["obs_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), OBSERVATIONS, "{label}: row count");
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            OBSERVATIONS,
+            "{label}: ids must be distinct"
+        );
+    }
+}
+
+/// The HL7/sql-on-fhir PR #410 example views (plus the hand-checked corner
+/// cases) return exactly the in-process engine's rows through the native
+/// aggregation-pipeline runner.
+#[cfg(feature = "R4")]
+#[tokio::test]
+async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use std::collections::BTreeMap;
+    use tokio_stream::StreamExt;
+
+    let Some(backend) = create_backend("sof_pr410_views").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_pr410_views_match_in_process_reference \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sof-pr410");
+    for (resource_type, resource) in sof_pr410_views::resources() {
+        backend
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::R4)
+            .await
+            .expect("seed PR #410 resource");
+    }
+    let runner = backend.sof_runner().expect("MongoDB provides a SOF runner");
+    assert_eq!(runner.runner_name(), "mongo-indb");
+
+    type Row = BTreeMap<String, serde_json::Value>;
+    let sorted = |mut rows: Vec<Row>| {
+        rows.sort_by_key(|r| serde_json::to_string(r).unwrap_or_default());
+        rows
+    };
+    let mut failures = Vec::new();
+    for case in sof_pr410_views::pr410_cases()
+        .into_iter()
+        .chain(sof_pr410_views::extra_cases())
+    {
+        let got = match runner
+            .run_view(&tenant, case.view, ViewFilters::default())
+            .await
+        {
+            Ok(mut stream) => {
+                let mut rows = Vec::new();
+                while let Some(row) = stream.next().await {
+                    let row = row.expect("row must not be an error");
+                    rows.push(
+                        row.as_object()
+                            .expect("object")
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+                sorted(rows)
+            }
+            Err(e) => {
+                failures.push(format!("{}: {e}", case.name));
+                continue;
+            }
+        };
+        let want = sorted(
+            case.expected
+                .iter()
+                .map(|r| r.as_object().expect("row").clone().into_iter().collect())
+                .collect(),
+        );
+        if got != want {
+            failures.push(format!("{}:\n  got:  {got:?}\n  want: {want:?}", case.name));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[tokio::test]
 async fn mongodb_integration_sof_since_filter() {
     use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
@@ -9540,7 +11009,7 @@ async fn mongodb_integration_sof_since_filter() {
     let tenant = create_tenant("tenant-sof-since");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "since-pt-1" }),
@@ -9550,7 +11019,7 @@ async fn mongodb_integration_sof_since_filter() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9570,13 +11039,16 @@ async fn mongodb_integration_sof_since_filter() {
         .await
         .unwrap()
         .unwrap();
-    let cutoff = stored_before.last_modified();
+    // `since` is inclusive (#1707), so cut off 1 ms after the first resource's
+    // stamp (MongoDB stores milliseconds) to exclude it.
+    let before_at = stored_before.last_modified();
+    let cutoff = before_at + chrono::Duration::milliseconds(1);
 
     // Ensure the second resource gets a strictly later timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9659,6 +11131,25 @@ async fn mongodb_integration_sof_since_filter() {
         filtered,
         vec!["since-obs-after"],
         "since={cutoff:?} must exclude before-cutoff and return only after-cutoff: {filtered:?}"
+    );
+
+    // Patient filter + since exactly at the first resource's stamp: inclusive,
+    // so both observations.
+    let at = collect_ids_since(
+        runner.as_ref(),
+        &tenant,
+        view.clone(),
+        ViewFilters {
+            patient: vec!["Patient/since-pt-1".to_string()],
+            since: Some(before_at),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        at,
+        vec!["since-obs-after", "since-obs-before"],
+        "since={before_at:?} is inclusive and must keep the resource stamped at it: {at:?}"
     );
 
     // Patient filter + future cutoff: nothing.
@@ -9744,7 +11235,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
     let tenant = create_tenant("tenant-conditional-update-delete");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -9836,7 +11327,7 @@ async fn mongodb_integration_conditional_writes_refuse_an_unknown_parameter() {
     });
 
     backend
-        .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+        .seed_create(&tenant, "Patient", patient.clone(), FhirVersion::default())
         .await
         .unwrap();
 
@@ -9918,7 +11409,7 @@ async fn mongodb_integration_conditional_create_multiple_matches() {
         ("patient-cond-multi-2", "http://system-b.org"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -9967,7 +11458,7 @@ async fn mongodb_integration_conditional_patch_is_supported() {
 
     let tenant = create_tenant("tenant-conditional-patch");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "cond-patch-1", "active": false}),
@@ -10179,7 +11670,7 @@ async fn mongodb_integration_search_parameter_update_status_change() {
     let tenant = create_tenant("tenant-search-param-update-status");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -10256,7 +11747,7 @@ async fn mongodb_integration_search_parameter_delete_unregisters() {
     let tenant = create_tenant("tenant-search-param-delete");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -10615,10 +12106,21 @@ async fn mongodb_integration_reindex_page_batches_index_writes() {
             inserts <= 1,
             "a reindex page must issue at most one insert_many, got {inserts}: {entries:?}"
         );
+        let writes = entries
+            .iter()
+            .filter(|e| matches!(e.get_str("op").ok(), Some("remove" | "insert" | "update")))
+            .count();
         assert!(
-            entries.len() <= 2,
-            "a reindex page must issue at most 2 write commands total, got {}: {entries:?}",
-            entries.len()
+            writes <= 2,
+            "a reindex page must issue at most 2 write commands total, got {writes}: {entries:?}"
+        );
+        // The only other commands are the page's two verification reads of
+        // this collection: the row ids left after its delete and the row ids
+        // present after its insert.
+        let reads = entries.len() - writes;
+        assert!(
+            reads <= 2,
+            "a reindex page issues two verification reads besides its writes, got {reads}: {entries:?}"
         );
     }
 
@@ -11023,7 +12525,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
     let tenant = create_tenant("tenant-includes");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -11036,7 +12538,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
         .unwrap();
 
     let observation = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -11156,7 +12658,7 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
     let tenant = create_tenant("tenant-revinclude-profiler");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Streamed"}]}),
@@ -11167,7 +12669,7 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
 
     for i in 0..12 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -11250,6 +12752,135 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
     );
 }
 
+/// #2394: the normalized `_revinclude` filter is a two-field `$or`
+/// (`value_reference` / `value_reference_target`). The same shape once defeated
+/// the index on the plain reference search, so check on a real server that the
+/// recorded `find` never falls back to a collection scan and examines only
+/// about as many documents as it returns.
+#[tokio::test]
+async fn mongodb_revinclude_normalized_or_filter_uses_indexes() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_or_explain").await else {
+        eprintln!(
+            "Skipping mongodb_revinclude_normalized_or_filter_uses_indexes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-revinclude-explain");
+    let patient = backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "target"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..1500 {
+        let reference = match i {
+            0..=2 => format!("Patient/{}", patient.id()),
+            3 => format!("http://example.org/fhir/Patient/{}", patient.id()),
+            _ => format!("Patient/other-{i}"),
+        };
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": format!("c-{i}")}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend.wait_for_search_index_build().await;
+
+    let Some(cs) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let db = raw_test_client(&cs)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("server refused {{profile: 2}}; skipping");
+        return;
+    }
+    let revinclude = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let result = backend
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&revinclude),
+        )
+        .await
+        .expect("resolve_revincludes");
+    db.run_command(doc! { "profile": 0_i32 }).await.unwrap();
+    assert_eq!(result.len(), 4, "3 relative + 1 absolute referrer");
+
+    use futures::stream::TryStreamExt;
+    let profile = db.collection::<Document>("system.profile");
+    let entries: Vec<Document> = profile
+        .find(doc! {
+            "ns": format!("{}.search_index", db.name()),
+            "command.find": "search_index",
+        })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "one find per reference field");
+    let mut total_docs = 0;
+    for entry in &entries {
+        let command = entry.get_document("command").unwrap();
+        let mut inner = Document::new();
+        for key in ["find", "filter", "sort", "limit", "projection", "hint"] {
+            if let Some(v) = command.get(key) {
+                inner.insert(key, v.clone());
+            }
+        }
+        let explain = db
+            .run_command(doc! { "explain": inner, "verbosity": "executionStats" })
+            .await
+            .unwrap();
+        let plan = format!(
+            "{:?}",
+            explain
+                .get_document("queryPlanner")
+                .unwrap()
+                .get("winningPlan")
+        );
+        let stats = explain.get_document("executionStats").unwrap();
+        let num = |k: &str| {
+            stats
+                .get_i64(k)
+                .or_else(|_| stats.get_i32(k).map(i64::from))
+                .unwrap()
+        };
+        let (keys, docs) = (num("totalKeysExamined"), num("totalDocsExamined"));
+        eprintln!(
+            "REVINCLUDE-EXPLAIN filter={:?} keys={keys} docs={docs}",
+            command.get("filter")
+        );
+        assert!(!plan.contains("COLLSCAN"), "collection scan: {plan}");
+        total_docs += docs;
+    }
+    assert!(
+        total_docs <= 50,
+        "examined {total_docs} documents for 4 matches"
+    );
+}
+
 /// #1061 part (b): the referring set must be bounded at
 /// `max_included_resources`, applied per directive, with truncation signaled
 /// by a synthetic `OperationOutcome` (`search.mode = outcome`) rather than
@@ -11271,7 +12902,7 @@ async fn mongodb_revinclude_caps_included_and_signals_truncation() {
     let tenant = create_tenant("tenant-revinclude-cap");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Capped"}]}),
@@ -11282,7 +12913,7 @@ async fn mongodb_revinclude_caps_included_and_signals_truncation() {
 
     for i in 0..12 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -11424,7 +13055,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
     let tenant = create_tenant("tenant-include-iterate");
 
     let (org, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Organization",
             "org-iter-1",
@@ -11434,7 +13065,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
         .await
         .unwrap();
     let (patient, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Patient",
             "patient-iter-1",
@@ -11449,7 +13080,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
         .await
         .unwrap();
     let observation = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -11582,7 +13213,7 @@ fn include_type_ids(
 /// both referencing `pat-1` via `subject`.
 async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Organization",
             "org-1",
@@ -11597,7 +13228,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Patient",
             "pat-1",
@@ -11613,7 +13244,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-cond",
@@ -11633,7 +13264,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-org",
@@ -11863,7 +13494,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
     for suffix in ["a", "b", "c", "d"] {
         let org_id = format!("org-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Organization",
                 &org_id,
@@ -11879,7 +13510,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
 
         let enc_id = format!("enc-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Encounter",
                 &enc_id,
@@ -12550,6 +14181,54 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
         .await;
 }
 
+/// #2185: the SQL-on-FHIR terminology store contract, with the tenant's row
+/// chunks and registry entries as the residue.
+#[tokio::test]
+async fn mongodb_integration_sof_terminology_store_suite() {
+    let Some(backend) = create_backend("sof_terminology").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_terminology_store_suite (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let db = backend.get_database().await.expect("database");
+    let residue = move |tenant: String| {
+        let db = db.clone();
+        Box::pin(async move {
+            let rows = db
+                .collection::<mongodb::bson::Document>("sof_terminology_rows")
+                .count_documents(mongodb::bson::doc! { "tenant_id": &tenant })
+                .await
+                .unwrap() as usize;
+            let entries = db
+                .collection::<mongodb::bson::Document>("sof_terminology_registry")
+                .find_one(mongodb::bson::doc! { "tenant_id": &tenant })
+                .await
+                .unwrap()
+                .map_or(0, |doc| {
+                    let registry: serde_json::Value =
+                        serde_json::from_str(doc.get_str("registry").unwrap()).unwrap();
+                    registry["entries"].as_array().map_or(0, Vec::len)
+                });
+            rows + entries
+        }) as futures::future::BoxFuture<'static, usize>
+    };
+    sof_terminology_suite::run_all(&backend, "sof-term", Some(&residue)).await;
+}
+
+/// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.
+#[tokio::test]
+async fn mongodb_integration_tenant_has_resources_matches_discovery() {
+    let Some(backend) = create_backend("tenant_existence").await else {
+        eprintln!(
+            "Skipping mongodb_integration_tenant_has_resources_matches_discovery (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
+    tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
+}
+
 // ===========================================================================
 // Bulk Data Submit ($bulk-submit)
 //
@@ -12711,6 +14390,26 @@ mod bulk_submit {
                 })
                 .await
                 .expect("waitForFailPoint failCommand");
+        }
+
+        /// Whether this configuration matches `additional` commands within
+        /// `max_time_ms`; `false` when the server's wait times out first.
+        pub(super) async fn entered_within(&self, additional: i64, max_time_ms: i64) -> bool {
+            match self
+                .admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": max_time_ms,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(command) if command.code == 50) => {
+                    false
+                }
+                Err(error) => panic!("waitForFailPoint failed unexpectedly: {error}"),
+            }
         }
 
         /// Turns the failpoint off and releases the lock. Call at the end of
@@ -13271,7 +14970,7 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
 
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "existing", "gender": "female"}),
@@ -13330,7 +15029,7 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
 
         let created = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "tombstoned"}),
@@ -13339,7 +15038,7 @@ mod bulk_submit {
             .await
             .unwrap();
         backend
-            .delete(&tenant, "Patient", created.id())
+            .seed_delete(&tenant, "Patient", created.id())
             .await
             .unwrap();
 
@@ -13541,7 +15240,7 @@ mod bulk_submit {
         const IDS: usize = 60;
         for n in (0..IDS).step_by(2) {
             backend
-                .create(
+                .seed_create(
                     &tenant,
                     "Patient",
                     json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
@@ -14018,6 +15717,28 @@ mod bulk_submit {
         release_contract::release_after_abort_is_a_no_op(
             &backend,
             &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
+    mod index_pending_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/index_pending_contract.rs"
+        ));
+    }
+
+    /// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+    #[tokio::test]
+    async fn test_submit_marked_manifest_is_listed_until_cleared() {
+        let Some(backend) = create_backend("submit_index_pending").await else {
+            return;
+        };
+        index_pending_contract::marked_manifest_is_listed_until_cleared(
+            &backend,
+            &create_tenant("submit-index-pending"),
+            true,
         )
         .await;
     }
@@ -14715,12 +16436,182 @@ mod bulk_submit {
             .list_expired_submissions(after_write, Duration::from_secs(0), 10)
             .await
             .unwrap();
-        assert!(expired.iter().any(|(_, sub)| sub == &id));
+        assert!(expired.iter().any(|e| e.id == id));
         let fresh = backend
             .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 10)
             .await
             .unwrap();
-        assert!(!fresh.iter().any(|(_, sub)| sub == &id));
+        assert!(!fresh.iter().any(|e| e.id == id));
+    }
+
+    /// #2280: repeated list-then-purge passes (batch of 100) clean 250 expired
+    /// submissions, and leave no child documents behind.
+    #[tokio::test]
+    async fn test_expired_sweep_purges_250_submissions() {
+        let Some(backend) = create_backend("submit_purge_250").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge");
+        let mut ids = Vec::new();
+        for _ in 0..250 {
+            let (id, _m) = seed(&backend, &tenant).await;
+            backend.complete_submission(&tenant, &id).await.unwrap();
+            ids.push(id);
+        }
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(0);
+        let mut purged = 0;
+        for _ in 0..5 {
+            let batch = backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for e in batch {
+                assert!(
+                    backend
+                        .purge_submission(&e.tenant, &e.id, now)
+                        .await
+                        .unwrap()
+                );
+                purged += 1;
+            }
+        }
+        assert_eq!(purged, 250);
+        assert!(
+            backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for id in &ids {
+            assert!(backend.get_submission(&tenant, id).await.unwrap().is_none());
+            assert!(
+                backend
+                    .list_manifests(&tenant, id)
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+        // Idempotent: purging a gone submission reports false.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &ids[0], now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: live work is never listed; an abandoned submission is listed as
+    /// in-progress (the sweep aborts it first); a recent one is untouched.
+    #[tokio::test]
+    async fn test_expired_listing_skips_active_and_recent() {
+        let Some(backend) = create_backend("submit_purge_active").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-active");
+        // Pending manifest: live work.
+        let (active, _m) = seed(&backend, &tenant).await;
+        // No manifests: abandoned once old enough.
+        let abandoned = SubmissionId::generate("data-provider");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == active));
+        let ab = listed
+            .iter()
+            .find(|e| e.id == abandoned)
+            .expect("abandoned listed");
+        assert_eq!(ab.status, SubmissionStatus::InProgress);
+
+        // An in-progress submission is never purged directly.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+
+        // Recent terminal submission: not listed, not purged.
+        backend
+            .abort_submission(&tenant, &abandoned, "expired")
+            .await
+            .unwrap();
+        let fresh = backend
+            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 100)
+            .await
+            .unwrap();
+        assert!(fresh.is_empty());
+        assert!(
+            !backend
+                .purge_submission(
+                    &tenant,
+                    &abandoned,
+                    chrono::Utc::now() - chrono::Duration::hours(24)
+                )
+                .await
+                .unwrap()
+        );
+        // A TTL later it is purged.
+        assert!(
+            backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: a purge cut short after the children were deleted (submission
+    /// document still present) is listed again and completes.
+    #[tokio::test]
+    async fn test_interrupted_purge_resumes() {
+        let Some(backend) = create_backend("submit_purge_resume").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-resume");
+        let (id, _m) = seed(&backend, &tenant).await;
+        backend.complete_submission(&tenant, &id).await.unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        // Simulate the interruption: only the artifacts are gone.
+        backend
+            .delete_submission_artifacts(&tenant, &id)
+            .await
+            .unwrap();
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|e| e.id == id));
+        assert!(backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            backend
+                .get_submission(&tenant, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Idempotent: a second purge of the gone submission is a clean `false`,
+        // and the listing no longer returns it.
+        assert!(!backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            !backend
+                .list_expired_submissions(now, Duration::from_secs(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.id == id)
+        );
     }
 
     #[tokio::test]
@@ -16061,6 +17952,13 @@ mod bulk_submit {
             assert_eq!(issue["code"], "transient");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
             assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            // #2324: the receipt carries the driver-free text, not the driver
+            // error (whose text starts "Kind:" and can name the server).
+            assert!(
+                diagnostics.contains("the database is temporarily unavailable"),
+                "{diagnostics}"
+            );
+            assert!(!diagnostics.contains("Kind:"), "{diagnostics}");
             assert!(
                 diagnostics.contains("re-ingesting this file"),
                 "{diagnostics}"
@@ -16272,7 +18170,7 @@ async fn seed_patient_at(
     at: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let stored = backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             serde_json::json!({"resourceType": "Patient"}),
@@ -16553,7 +18451,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
 
     let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
     let v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
@@ -16563,7 +18461,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
         .unwrap();
     let patient_id = v1.id().to_string();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             serde_json::json!({
@@ -16577,7 +18475,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
     pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
 
     let obs = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             serde_json::json!({
@@ -16658,7 +18556,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
     let tenant = create_tenant("tenant-if-none-exist-multi");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -16672,7 +18570,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -16788,7 +18686,7 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
 
     for family in ["One", "Two"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -16878,7 +18776,7 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
     let tenant = create_tenant("tenant-if-none-exist-offloaded");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -16947,7 +18845,7 @@ async fn mongodb_integration_if_none_exist_of_only_result_parameters_is_refused(
 
     let tenant = create_tenant("tenant-if-none-exist-only-result-params");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Existing"}]}),
@@ -17411,11 +19309,15 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
-const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
+/// Generation 5: `idx_search_reference_target_v2` is added (#2394).
+/// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
+const CURRENT_BACKGROUND_NAMES: [&str; 11] = [
+    "idx_search_composite_tuple_qty",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
+    "idx_search_reference_target_v2",
     "idx_search_reference_v2",
     "idx_search_string_v2",
     "idx_search_token_display_v2",
@@ -17500,7 +19402,7 @@ async fn boot_with_mode(
         connection_string: connection_string.to_string(),
         database_name: database_name.to_string(),
         index_build: mode,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         data_dir,
         ..Default::default()
     })
@@ -17552,7 +19454,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(6)
     );
 }
 
@@ -17570,7 +19472,7 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
     let tenant = create_tenant("tenant-builder");
     for i in 0..5 {
         staged
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({ "resourceType": "Patient", "id": format!("p{i}"), "gender": "female" }),
@@ -17627,7 +19529,7 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
 
 /// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
 /// `value_date` alone. The builder must build `idx_search_date_v3` (and only
-/// that), then drop `idx_search_date_v2`, and record generation 4.
+/// that), then drop `idx_search_date_v2`, and record the current generation (5).
 #[tokio::test]
 async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
     let Some(cs) = shared_mongo::connection_string().await else {
@@ -17677,7 +19579,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(6)
     );
 }
 
@@ -17765,7 +19667,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(4));
+    assert_eq!(si.get_i32("generation"), Ok(6));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -17804,7 +19706,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         connection_string: cs.clone(),
         database_name: db_name.clone(),
         index_build: IndexBuildMode::Inline,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         ..Default::default()
     })
     .unwrap();
@@ -18057,29 +19959,50 @@ async fn assert_search_index_ops_are_covered(
         "expected at least one profiled operation on {ns}"
     );
     for op in &ops {
-        let docs_examined = op
-            .get_i64("docsExamined")
-            .or_else(|_| op.get_i32("docsExamined").map(i64::from))
-            .unwrap_or(0);
-        let plan = op.get_str("planSummary").unwrap_or_default().to_string();
+        // Aggregate profiler entries omit execStats on some MongoDB versions.
+        // Explain the actual command to inspect the winning source plan. A
+        // resource join may legitimately fetch resources; the search-index
+        // source itself must still be covered by the expected value index.
+        let command = op
+            .get_document("command")
+            .expect("profile must include command");
+        let inner = command_for_explain(command);
+        let explain = db
+            .run_command(doc! {
+                "explain": inner, "verbosity": "executionStats",
+            })
+            .await
+            .expect("explain captured search-index command");
+        let source = explain
+            .get_array("stages")
+            .ok()
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find_map(|stage| stage.as_document()?.get_document("$cursor").ok())
+            })
+            .unwrap_or(&explain);
+        let stats = source
+            .get_document("executionStats")
+            .expect("source execution statistics");
+        let docs_examined = stats
+            .get_i64("totalDocsExamined")
+            .or_else(|_| stats.get_i32("totalDocsExamined").map(i64::from))
+            .unwrap();
         assert_eq!(
             docs_examined, 0,
-            "not covered: planSummary={plan} op={op:?}"
+            "search-index source is not covered: {source:?}"
         );
-        // `planSummary` carries only the winning plan's key pattern (e.g.
-        // `IXSCAN { tenant_id: 1, ... }`), never the index's name — verified
-        // against this server: every other `planSummary` assertion already in
-        // this file (e.g. `mongodb_history_type_plan_is_a_bounded_index_walk`)
-        // only checks for the `IXSCAN` stage name, never a specific index. The
-        // chosen index's name is recorded deeper, at `execStats..indexName`;
-        // match there instead of substring-matching a field that structurally
-        // cannot carry it.
-        let op_repr = format!("{op:?}");
+        let winning_plan = source
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        let mut indexes = Vec::new();
+        collect_index_names(winning_plan, &mut indexes);
         assert!(
-            op_repr.contains(&format!(
-                "\"indexName\": String(\"{expected_index_fragment}\")"
-            )),
-            "wrong index: planSummary={plan} op={op:?}"
+            indexes.iter().any(|name| name == expected_index_fragment),
+            "wrong winning index: expected {expected_index_fragment}, got {indexes:?}"
         );
     }
 }
@@ -18090,14 +20013,14 @@ async fn assert_search_index_ops_are_covered(
 /// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
 async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_date").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
     let tenant = create_tenant("tenant-covered-date");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -18195,7 +20118,7 @@ async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
     let tenant = create_tenant("tenant-date-or-and");
     for year in 2015..=2022 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -18210,7 +20133,7 @@ async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
     }
     // A Period from mid-2019 to March 2020: in neither year, over both.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -18297,7 +20220,7 @@ async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
         ("garbage", "not-a-date"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -18342,14 +20265,14 @@ async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
 
 #[tokio::test]
 async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_token").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_token").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
     let tenant = create_tenant("tenant-covered-token");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -18397,7 +20320,7 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
 /// key — the scan is fully covered.
 #[tokio::test]
 async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("missing_false").await else {
+    let Some(backend) = create_backend_with_stable_probes("missing_false").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -18410,7 +20333,7 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
             resource["gender"] = json!("male");
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -18605,7 +20528,7 @@ async fn seed_height_weight_observations(backend: &MongoBackend, tenant: &Tenant
         ("weight-180", "29463-7", 180.0_f64),
     ] {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({
@@ -18696,7 +20619,7 @@ async fn mongodb_integration_composite_component_code_value_quantity_respects_gr
     let tenant = create_tenant("tenant-composite-bp");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -19115,7 +21038,7 @@ async fn mongodb_integration_contained_matches_composite_parameter() {
     };
     let tenant = create_tenant("tenant-contained-composite");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "DiagnosticReport",
             json!({
@@ -19217,7 +21140,10 @@ async fn mongodb_integration_composite_tenant_isolation() {
 /// one resource -- fewer rows than either composite component arm -- so the
 /// *plain* parameter wins the driver probe this time, and the composite
 /// (checked via the grouped pair check regardless of which param drives)
-/// must still filter the smaller candidate set correctly.
+/// must still filter the smaller candidate set correctly. Since #1896 the
+/// filter planner makes this choice (`resource_filter_plan` probes every
+/// predicate, the composite's chosen arm among them, and drives from the
+/// smallest); the collector keeps it for `:missing`/`:not` siblings.
 #[tokio::test]
 async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driver() {
     let Some(backend) = create_backend_with_full_registry("composite_plus_plain_driver").await
@@ -19231,7 +21157,7 @@ async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driv
     seed_height_weight_observations(&backend, &tenant).await;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -19278,7 +21204,10 @@ async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driv
 /// driver probe over the token arm (not merely tie or lose), and the result
 /// must still be correct when it does. Five observations share
 /// code=8302-2 (token arm count 5); only one exceeds the quantity
-/// threshold (quantity arm count 1).
+/// threshold (quantity arm count 1). Since #1896 the planner's bounded arm
+/// probe (`composite_predicate`) decides which arm discovers the candidates;
+/// the collector's `composite_driver_probe` makes the same choice for
+/// `:missing`/`:not` siblings.
 #[tokio::test]
 async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
     let Some(backend) = create_backend_with_full_registry("composite_quantity_arm_driver").await
@@ -19298,7 +21227,7 @@ async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
         ("h5", 170.0),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -19340,6 +21269,12 @@ async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
 /// Bundles (50 entries per batch, the same shape
 /// `mongodb_integration_search_paged_intersection_correctness` uses for its
 /// 600-row setup) rather than 610 sequential single creates.
+///
+/// Since #1896 the plain composite query is served by the filter planner
+/// (`CandidateIds`: the quantity arm's 600 rows are within the 10,000-row
+/// bound). A `status:not` sibling keeps the candidate collector, which is
+/// what accumulates `confirmed` across 512-id batches, so the second query
+/// below keeps that path covered.
 #[tokio::test]
 async fn mongodb_integration_composite_multi_batch_driver_paging() {
     const MATCHING: usize = 600; // 8302-2 @ 170 (satisfies $gt160; exceeds CANDIDATE_BATCH_SIZE)
@@ -19443,6 +21378,27 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
         .await
         .expect("search_count must agree with search on the same multi-batch query");
     assert_eq!(count as usize, MATCHING);
+
+    // `:not` is a complement the planner leaves to the collector, whose driver
+    // cursor reads 600 candidates in two 512-id batches.
+    let mut not_cancelled = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("cancelled")],
+        ..Default::default()
+    };
+    not_cancelled.modifier = Some(SearchModifier::Not);
+    let collector_query = query.with_parameter(not_cancelled);
+    let result = backend
+        .search(&tenant, &collector_query)
+        .await
+        .expect("collector search across a driver larger than CANDIDATE_BATCH_SIZE");
+    assert_eq!(result.resources.items.len(), MATCHING);
+    let count = backend
+        .search_count(&tenant, &collector_query)
+        .await
+        .expect("search_count must agree with search on the collector's multi-batch query");
+    assert_eq!(count as usize, MATCHING);
 }
 
 /// #1394: `ifNoneExist` inside a MongoDB transaction with search offloaded
@@ -19492,7 +21448,7 @@ async fn i1394r1_seed(
     identifier_value: &str,
 ) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             i1394r1_patient(family, identifier_value),
@@ -20019,7 +21975,7 @@ async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
     };
     let tenant = i1394r1_tenant("id-list");
     let seeded = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             i1394r1_patient("Seeded", "MRN-BASE-1"),
@@ -20103,7 +22059,7 @@ async fn mongodb_integration_export_compartment_membership_follows_the_compartme
     ] {
         let resource_type = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -20154,6 +22110,50 @@ async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
 }
 
 #[tokio::test]
+async fn mongodb_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_cancel_keeps_the_index").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_cancel_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_failed_read_keeps_the_index").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_failed_read_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let Some(backend) = create_backend("clear_interrupted_completed_run_sweeps_orphans").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
+}
+
+#[tokio::test]
 async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
     let Some(backend) = create_backend("resource_scoped_clear").await else {
         eprintln!(
@@ -20165,4 +22165,3588 @@ async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(backend);
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+/// Seeds each tenant with a Patient plus an active, a retired and a deleted
+/// SearchParameter, so a stored-parameter load has something to skip in every
+/// tenant (#1764).
+async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[TenantContext]) {
+    fn search_parameter(id: String, status: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+            "name": id,
+            "status": status,
+            "code": id,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.family"
+        })
+    }
+
+    for (i, tenant) in tenants.iter().enumerate() {
+        backend
+            .seed_create(
+                tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("stored-sp-patient-{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for (id, status) in [
+            (format!("storedactive{i}"), "active"),
+            (format!("storedretired{i}"), "retired"),
+            (format!("storeddeleted{i}"), "active"),
+        ] {
+            backend
+                .seed_create(
+                    tenant,
+                    "SearchParameter",
+                    search_parameter(id, status),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .seed_delete(tenant, "SearchParameter", &format!("storeddeleted{i}"))
+            .await
+            .unwrap();
+    }
+}
+
+/// Start-up loads every tenant's stored SearchParameters, and each tenant's
+/// registry holds only its own active parameter — not its retired or deleted
+/// ones, and none of another tenant's (#1764).
+#[tokio::test]
+async fn mongodb_startup_loads_each_tenants_stored_search_parameters() {
+    let Some(seed_backend) = create_backend("startup_stored_sp").await else {
+        eprintln!(
+            "Skipping mongodb_startup_loads_each_tenants_stored_search_parameters \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("startup-sp-a"),
+        create_tenant("startup-sp-b"),
+        create_tenant("startup-sp-c"),
+    ];
+    seed_stored_search_parameters(&seed_backend, &tenants).await;
+    let config = seed_backend.config().clone();
+    drop(seed_backend);
+
+    // A fresh process over the same database: only `init_schema`'s load can
+    // have populated the stored-parameter cache.
+    let Some(backend) = build_backend(config).await else {
+        return;
+    };
+    for (i, tenant) in tenants.iter().enumerate() {
+        let registry = backend.search_param_registry(tenant);
+        let registry = registry.read();
+        for (j, _) in tenants.iter().enumerate() {
+            let active = registry.get_param("Patient", &format!("storedactive{j}"));
+            assert_eq!(
+                active.is_some(),
+                i == j,
+                "tenant {i} sees tenant {j}'s active parameter: {}",
+                active.is_some()
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storedretired{j}"))
+                    .is_none(),
+                "tenant {i} must not see a retired parameter"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storeddeleted{j}"))
+                    .is_none(),
+                "tenant {i} must not see a deleted parameter"
+            );
+        }
+    }
+}
+
+/// Every read of `resources` the stored-SearchParameter load makes seeks on
+/// `tenant_id`: the tenant listing is a `DISTINCT_SCAN`, and each tenant's
+/// query is an index scan bounded on that tenant — never a `COLLSCAN` (#1764).
+#[tokio::test]
+async fn mongodb_stored_search_parameter_load_plan_seeks_by_tenant() {
+    let Some(backend) = create_backend("stored_sp_plan").await else {
+        eprintln!(
+            "Skipping mongodb_stored_search_parameter_load_plan_seeks_by_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("stored-sp-plan-a"),
+        create_tenant("stored-sp-plan-b"),
+        create_tenant("stored-sp-plan-c"),
+    ];
+    seed_stored_search_parameters(&backend, &tenants).await;
+    let database = backend.get_database().await.unwrap();
+
+    let winning_plan = |explain: &Document| {
+        explain
+            .get_document("queryPlanner")
+            .expect("explain missing queryPlanner")
+            .get_document("winningPlan")
+            .expect("explain missing winningPlan")
+            .clone()
+    };
+
+    let explain = database
+        .run_command(doc! {
+            "explain": { "distinct": "resources", "key": "tenant_id", "query": {} },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .expect("explain of the tenant distinct failed");
+    let plan = winning_plan(&explain);
+    assert!(
+        !contains_stage_named(&plan, "COLLSCAN"),
+        "listing tenants must not scan resources: {plan}"
+    );
+    assert!(
+        contains_stage_named(&plan, "DISTINCT_SCAN"),
+        "listing tenants must walk a tenant_id-leading index: {plan}"
+    );
+
+    for tenant in &tenants {
+        let tenant_id = tenant.tenant_id().as_str();
+        let explain = database
+            .run_command(doc! {
+                "explain": {
+                    "find": "resources",
+                    "filter": MongoBackend::stored_search_parameters_filter(tenant_id),
+                },
+                "verbosity": "queryPlanner",
+            })
+            .await
+            .expect("explain of the per-tenant SearchParameter find failed");
+        let plan = winning_plan(&explain);
+        assert!(
+            !contains_stage_named(&plan, "COLLSCAN"),
+            "{tenant_id}: the SearchParameter load must not scan resources: {plan}"
+        );
+        let mut index_names = Vec::new();
+        collect_index_names(&plan, &mut index_names);
+        assert!(
+            !index_names.is_empty(),
+            "{tenant_id}: the SearchParameter load must use an index: {plan}"
+        );
+        // The scan's `tenant_id` bounds are the single tenant, not [MinKey, MaxKey].
+        let mut bounds = Vec::new();
+        collect_tenant_id_bounds(&plan, &mut bounds);
+        let expected = format!("[\"{tenant_id}\", \"{tenant_id}\"]");
+        assert!(
+            !bounds.is_empty() && bounds.iter().all(|b| b == &expected),
+            "{tenant_id}: the index scan must be bounded on tenant_id, got {bounds:?}: {plan}"
+        );
+    }
+}
+
+/// Collects every `indexBounds.tenant_id` interval in an explain plan.
+fn collect_tenant_id_bounds(doc: &Document, out: &mut Vec<String>) {
+    if let Ok(bounds) = doc.get_document("indexBounds")
+        && let Ok(intervals) = bounds.get_array("tenant_id")
+    {
+        out.extend(
+            intervals
+                .iter()
+                .filter_map(|b| b.as_str().map(str::to_string)),
+        );
+    }
+    for (_, v) in doc.iter() {
+        match v {
+            Bson::Document(d) => collect_tenant_id_bounds(d, out),
+            Bson::Array(arr) => {
+                for item in arr {
+                    if let Bson::Document(d) = item {
+                        collect_tenant_id_bounds(d, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A SearchParameter write reloads only the writing tenant: another tenant's
+/// cached registry is left in place, not invalidated and rebuilt (#1764).
+#[tokio::test]
+async fn mongodb_search_parameter_write_reloads_only_its_tenant() {
+    let Some(backend) = create_backend("stored_sp_write_scope").await else {
+        eprintln!(
+            "Skipping mongodb_search_parameter_write_reloads_only_its_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let writer = create_tenant("stored-sp-scope-a");
+    let bystander = create_tenant("stored-sp-scope-b");
+    let registries = backend.tenant_registries().clone();
+
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    let writer_before = registries.for_tenant(writer.tenant_id().as_str());
+
+    backend
+        .create(
+            &writer,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "scopedwrite",
+                "url": "http://example.org/fhir/SearchParameter/scopedwrite",
+                "name": "scopedwrite",
+                "status": "active",
+                "code": "scopedwrite",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        Arc::ptr_eq(
+            &bystander_before,
+            &registries.for_tenant(bystander.tenant_id().as_str())
+        ),
+        "a write in another tenant must not invalidate this tenant's registry"
+    );
+    let writer_after = registries.for_tenant(writer.tenant_id().as_str());
+    assert!(
+        !Arc::ptr_eq(&writer_before, &writer_after),
+        "the writing tenant's registry must be rebuilt"
+    );
+    assert!(
+        writer_after
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_some()
+    );
+    assert!(
+        backend
+            .search_param_registry(&bystander)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
+
+    // Deleting it reloads the writer only, and the parameter leaves resolution.
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    backend
+        .delete(&writer, "SearchParameter", "scopedwrite")
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &bystander_before,
+        &registries.for_tenant(bystander.tenant_id().as_str())
+    ));
+    assert!(
+        backend
+            .search_param_registry(&writer)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
+}
+
+/// Setting `HFS_TEST_REQUIRE_MONGODB` turns "no MongoDB available" from a skip into
+/// a failure, so CI can insist on this tier running.
+fn mongodb_required() -> bool {
+    std::env::var("HFS_TEST_REQUIRE_MONGODB").is_ok_and(|value| !value.is_empty())
+}
+
+/// Reports a MongoDB-unavailable skip, or fails when [`mongodb_required`].
+fn skip_or_fail_unavailable(reason: &str) {
+    if mongodb_required() {
+        panic!("{reason}; HFS_TEST_REQUIRE_MONGODB forbids skipping");
+    }
+    eprintln!("Skipping mongodb integration tests: {reason}");
+}
+
+#[tokio::test]
+async fn mongodb_integration_readiness_rejects_missing_hinted_index() {
+    let Some(backend) = create_backend("readiness_missing_index").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_rejects_missing_hinted_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-readiness");
+    backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "readiness-patient",
+                "birthDate": "1980-01-01",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create patient for the hinted search");
+
+    // Filtering by id makes the parameter sort use idx_search_composite.
+    let query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("readiness-patient")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    let baseline = backend
+        .search(&tenant, &query)
+        .await
+        .expect("hinted search must work before the index is removed");
+    assert_eq!(baseline.resources.items.len(), 1);
+    assert_eq!(baseline.resources.items[0].id(), "readiness-patient");
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("backend must be ready before the index is removed");
+
+    // create_backend uses a unique database and waits for all index builds.
+    // Remove the index after startup to reproduce drift, not an initialization race.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("connect to the isolated test database");
+    client
+        .database(&backend.config().database_name)
+        .collection::<Document>("search_index")
+        .drop_index("idx_search_composite")
+        .await
+        .expect("remove the required index from the isolated test database");
+
+    let search_error = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("hinted search must fail without its required index")
+        .to_string();
+    assert!(
+        search_error.contains("Failed to sort by search parameter")
+            && search_error.contains("hint"),
+        "expected a missing-index hint failure, got: {search_error}"
+    );
+    let readiness = ResourceStorage::readiness_check(&backend).await;
+    assert!(
+        readiness.is_err(),
+        "backend must not report ready when a required hinted index is missing"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_readiness_tracks_required_indexes_and_recovery() {
+    use futures::TryStreamExt;
+
+    let Some(backend) = create_backend("readiness_index_recovery").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_tracks_required_indexes_and_recovery \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("connect to the isolated test database");
+    let database = client.database(&backend.config().database_name);
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("backend must initially be ready");
+
+    // Keep the expected requirements independent of the production list.
+    // The helper waits for background builds, so the optional index exists too.
+    let cases = [
+        ("resources", "idx_resources_identity", true),
+        ("resources", "idx_resources_type_scan", true),
+        ("search_index", "idx_search_composite", true),
+        ("search_index", "idx_search_composite_slot_probe", true),
+        (
+            "search_index_contained",
+            "idx_search_contained_composite_slot_probe",
+            true,
+        ),
+        ("search_index", "idx_search_date_v3", false),
+    ];
+    for (collection_name, index_name, required) in cases {
+        let collection = database.collection::<Document>(collection_name);
+        let index = collection
+            .list_indexes()
+            .await
+            .expect("list indexes before removal")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read index definitions")
+            .into_iter()
+            .find(|index| {
+                index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.name.as_deref())
+                    == Some(index_name)
+            })
+            .unwrap_or_else(|| panic!("missing baseline index: {collection_name}.{index_name}"));
+        collection
+            .drop_index(index_name)
+            .await
+            .unwrap_or_else(|error| panic!("drop {collection_name}.{index_name}: {error}"));
+
+        let readiness = ResourceStorage::readiness_check(&backend).await;
+        if required {
+            match readiness {
+                Err(BackendError::Unavailable {
+                    backend_name,
+                    message,
+                }) => {
+                    assert_eq!(backend_name, "mongodb");
+                    assert!(
+                        message.contains(&format!("{collection_name}.{index_name}")),
+                        "readiness must identify the missing index: {message}"
+                    );
+                }
+                other => panic!(
+                    "missing {collection_name}.{index_name} must make the backend unavailable: {other:?}"
+                ),
+            }
+        } else {
+            assert!(
+                readiness.is_ok(),
+                "optional index {collection_name}.{index_name} must not gate readiness: {readiness:?}"
+            );
+        }
+
+        // Restore the exact definition, including unique and partial options.
+        collection
+            .create_index(index)
+            .await
+            .unwrap_or_else(|error| panic!("restore {collection_name}.{index_name}: {error}"));
+        ResourceStorage::readiness_check(&backend)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "readiness must recover after restoring {collection_name}.{index_name}: {error}"
+                )
+            });
+    }
+}
+
+/// Rebuilds a profiled command without session/routing metadata. BSON field
+/// order matters: MongoDB interprets the first key as the command name, so
+/// options such as `hint` must follow `find`, `aggregate`, or `distinct`.
+fn command_for_explain(command: &Document) -> Document {
+    let name = ["find", "aggregate", "distinct"]
+        .into_iter()
+        .find(|name| command.contains_key(*name))
+        .expect("profile must contain a supported search command");
+    let mut inner = Document::new();
+    inner.insert(name, command.get(name).unwrap().clone());
+    for key in [
+        "pipeline",
+        "cursor",
+        "allowDiskUse",
+        "hint",
+        "filter",
+        "projection",
+        "sort",
+        "skip",
+        "limit",
+        "key",
+        "query",
+    ] {
+        if let Some(value) = command.get(key) {
+            inner.insert(key, value.clone());
+        }
+    }
+    inner
+}
+
+#[test]
+fn test_explain_command_keeps_command_name_first() {
+    for (name, command, expected) in [
+        (
+            "find",
+            doc! {
+                "hint": "date_index", "find": "search_index",
+                "filter": { "param_name": "date" }, "projection": { "resource_id": 1 },
+                "sort": { "resource_id": 1 }, "skip": 2, "limit": 20,
+                "$db": "test", "lsid": { "id": "session" },
+                "$readPreference": { "mode": "primary" },
+            },
+            doc! {
+                "find": "search_index", "hint": "date_index",
+                "filter": { "param_name": "date" }, "projection": { "resource_id": 1 },
+                "sort": { "resource_id": 1 }, "skip": 2, "limit": 20,
+            },
+        ),
+        (
+            "aggregate",
+            doc! {
+                "hint": "date_index", "aggregate": "search_index",
+                "pipeline": [{ "$match": { "param_name": "date" } }],
+                "cursor": {}, "allowDiskUse": true, "$db": "test",
+            },
+            doc! {
+                "aggregate": "search_index",
+                "pipeline": [{ "$match": { "param_name": "date" } }],
+                "cursor": {}, "allowDiskUse": true, "hint": "date_index",
+            },
+        ),
+        (
+            "distinct",
+            doc! {
+                "query": { "param_name": "date" }, "distinct": "search_index",
+                "key": "resource_id", "$db": "test",
+            },
+            doc! {
+                "distinct": "search_index", "key": "resource_id",
+                "query": { "param_name": "date" },
+            },
+        ),
+    ] {
+        let inner = command_for_explain(&command);
+        assert_eq!(inner.keys().next().map(String::as_str), Some(name));
+        assert_eq!(inner, expected);
+    }
+}
+
+/// A small complement-only page must not enumerate the resource universe
+/// through `distinct`, whose single BSON reply can exceed MongoDB's size limit.
+#[tokio::test]
+async fn mongodb_missing_value_page_avoids_unbounded_distinct() {
+    let Some(backend) = create_backend_with_full_registry("missing_page_no_distinct").await else {
+        eprintln!(
+            "Skipping mongodb_missing_value_page_avoids_unbounded_distinct \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-missing-page");
+    for (id, birthdate) in [
+        ("patient-a", None),
+        ("patient-b", Some("1980-01-01")),
+        ("patient-c", None),
+        ("patient-d", None),
+    ] {
+        let mut patient = json!({ "resourceType": "Patient", "id": id });
+        if let Some(birthdate) = birthdate {
+            patient["birthDate"] = json!(birthdate);
+        }
+        backend
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let mut query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("_id"))
+        .with_count(2);
+    query.total = Some(TotalMode::None);
+
+    // Profile only this search, in its isolated database, after setup finishes.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let database = client.database(&backend.config().database_name);
+    database
+        .run_command(doc! { "profile": 2_i32 })
+        .await
+        .expect("this regression requires database profiling to inspect search commands");
+    let result = backend.search(&tenant, &query).await;
+    database
+        .run_command(doc! { "profile": 0_i32 })
+        .await
+        .expect("disable profiling before checking the search result");
+    let result = result.expect("the missing-value search must succeed");
+    let ids: Vec<&str> = result.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(ids, vec!["patient-a", "patient-c"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, None);
+    assert_eq!(result.resources.page_info.total, None);
+
+    let profile = database.collection::<Document>("system.profile");
+    let resource_reads = profile
+        .count_documents(doc! {
+            "$or": [
+                { "command.find": "resources" },
+                { "command.aggregate": "resources" },
+            ],
+        })
+        .await
+        .expect("read profiled resource queries");
+    assert!(
+        resource_reads > 0,
+        "profiling must capture the search, not pass vacuously"
+    );
+    let unbounded_distincts = profile
+        .count_documents(doc! {
+            "$or": [
+                {
+                    "command.distinct": "resources",
+                    "command.key": "id",
+                    "command.query.id": { "$exists": false },
+                },
+                {
+                    "command.distinct": "search_index",
+                    "command.key": "resource_id",
+                    "command.query.resource_id": { "$exists": false },
+                },
+            ],
+        })
+        .await
+        .expect("count unbounded ID distinct commands");
+    assert_eq!(
+        unbounded_distincts, 0,
+        "a two-result page without totals must not fetch all resource or parameter-presence IDs via distinct"
+    );
+}
+
+/// Small pages must transfer bounded candidate batches rather than every match.
+/// Profile first, next and previous pages, including every getMore reply.
+#[tokio::test]
+async fn mongodb_filtered_page_avoids_materializing_all_matching_ids() {
+    use futures::TryStreamExt;
+
+    async fn profiled_page(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        database: &mongodb::Database,
+    ) -> helios_persistence::core::SearchResult {
+        database
+            .run_command(doc! { "profile": 2_i32 })
+            .await
+            .expect("this regression requires database profiling");
+        let result = backend.search(tenant, query).await;
+        database
+            .run_command(doc! { "profile": 0_i32 })
+            .await
+            .expect("disable profiling before asserting search results");
+        let result = result.expect("a small filtered page must succeed");
+        assert_eq!(result.total, None);
+        assert_eq!(result.resources.page_info.total, None);
+        // Count documents returned over the wire, not documents scanned internally.
+        // Include both the initial cursor response and subsequent getMore batches.
+        let replies: Vec<Document> = database
+            .collection::<Document>("system.profile")
+            .find(doc! {
+                "ns": { "$in": [
+                    format!("{}.search_index", database.name()),
+                    format!("{}.resources", database.name()),
+                ] },
+                "op": { "$in": ["query", "command", "getmore"] },
+                "nreturned": { "$exists": true },
+            })
+            .await
+            .expect("read profiled search replies")
+            .try_collect()
+            .await
+            .expect("collect profiled search replies");
+        let returned: i64 = replies
+            .iter()
+            .map(|reply| {
+                reply
+                    .get_i64("nreturned")
+                    .or_else(|_| reply.get_i32("nreturned").map(i64::from))
+                    .expect("profiled reply must contain an integer nreturned")
+            })
+            .sum();
+        assert!(
+            returned >= 2,
+            "profiling must capture actual result transfer"
+        );
+        // An ordered probe, replay seed and live check each transfer at most one
+        // 256-ID batch; fetching the page adds at most three resources.
+        assert!(
+            returned <= 3 * 256 + 3,
+            "a two-result page must stay within candidate batches, below the 1200-row corpus; \
+             MongoDB returned {returned} documents across the search replies"
+        );
+        database
+            .collection::<Document>("system.profile")
+            .drop()
+            .await
+            .unwrap();
+        result
+    }
+
+    let Some(backend) = create_backend_with_full_registry("filtered_page_bounded_ids").await else {
+        eprintln!(
+            "Skipping mongodb_filtered_page_avoids_materializing_all_matching_ids \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-filtered-page");
+    for number in (0..1200).rev() {
+        backend
+            .seed_create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("patient-{number:04}"),
+                    "gender": "female",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("_id"))
+        .with_count(2);
+    query.total = Some(TotalMode::None);
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let database = client.database(&backend.config().database_name);
+    let result = profiled_page(&backend, &tenant, &query, &database).await;
+    let ids: Vec<_> = result.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(ids, ["patient-0000", "patient-0001"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, None);
+    assert_eq!(result.resources.page_info.total, None);
+    // The broad server-side path must retain keyset and offset semantics too.
+    let second = profiled_page(
+        &backend,
+        &tenant,
+        &query
+            .clone()
+            .with_cursor(result.resources.page_info.next_cursor.clone().unwrap()),
+        &database,
+    )
+    .await;
+    let ids: Vec<_> = second.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(ids, ["patient-0002", "patient-0003"]);
+    assert!(second.resources.page_info.has_next);
+    let back = profiled_page(
+        &backend,
+        &tenant,
+        &query
+            .clone()
+            .with_cursor(second.resources.page_info.previous_cursor.clone().unwrap()),
+        &database,
+    )
+    .await;
+    let ids: Vec<_> = back.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(ids, ["patient-0000", "patient-0001"]);
+    assert!(back.resources.page_info.has_next);
+    query.offset = Some(1198);
+    query.total = Some(TotalMode::Accurate);
+    let last = backend.search(&tenant, &query).await.unwrap();
+    let ids: Vec<_> = last.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(ids, ["patient-1198", "patient-1199"]);
+    assert_eq!(last.total, Some(1200));
+    assert!(!last.resources.page_info.has_next);
+}
+
+/// Required selective execution must stay bounded. Optional ordered probes have
+/// separate time/row budgets; record their actual work without exhausting them.
+#[tokio::test]
+async fn mongodb_filtered_page_selectivity_preserves_bounded_database_work() {
+    use futures::TryStreamExt;
+
+    fn counter(document: &Document, name: &str) -> Option<i64> {
+        document
+            .get_i64(name)
+            .or_else(|_| document.get_i32(name).map(i64::from))
+            .ok()
+    }
+
+    let Some(backend) = create_backend_with_full_registry("filtered_selectivity").await else {
+        eprintln!(
+            "Skipping filtered selectivity comparison (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-filtered-selectivity");
+    for number in 0..1000 {
+        backend
+            .seed_create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("patient-{number:04}"),
+                    "gender": if number == 999 { "male" } else { "female" },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    let profile = db.collection::<Document>("system.profile");
+    let mut regressions = Vec::new();
+    for (gender, expected) in [
+        ("female", vec!["patient-0000", "patient-0001"]),
+        ("male", vec!["patient-0999"]),
+        ("unknown", vec![]),
+    ] {
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq(gender)],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_sort(SortDirective::parse("_id"))
+            .with_count(2);
+        query.total = Some(TotalMode::None);
+        db.run_command(doc! { "profile": 2_i32 })
+            .await
+            .expect("selectivity comparison requires profiling");
+        let result = backend.search(&tenant, &query).await;
+        db.run_command(doc! { "profile": 0_i32 })
+            .await
+            .expect("disable profiling before inspecting results");
+        let result = result.unwrap();
+        let actual: Vec<_> = result.resources.items.iter().map(|row| row.id()).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(result.resources.page_info.has_next, gender == "female");
+        assert_eq!(result.total, None);
+
+        let operations: Vec<Document> = profile
+            .find(doc! {
+                "ns": { "$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())] },
+                "op": { "$in": ["query", "command", "getmore"] },
+            })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !operations.is_empty(),
+            "profiling must capture search commands"
+        );
+        let mut required = (0, 0);
+        let mut optional = (0, 0);
+        let mut probes_without_counters = 0;
+        for operation in operations {
+            let command = if operation.get_str("op") == Ok("getmore") {
+                operation.get_document("originatingCommand")
+            } else {
+                operation.get_document("command")
+            }
+            .expect("profile entry must identify its originating command");
+            let ordered_probe = command.get_str("find") == Ok("search_index")
+                && command.get_str("hint") == Ok("idx_search_composite")
+                && command
+                    .get_document("sort")
+                    .is_ok_and(|sort| sort.contains_key("resource_id"));
+            let work = (
+                counter(&operation, "keysExamined"),
+                counter(&operation, "docsExamined"),
+            );
+            if ordered_probe {
+                let budget = counter(command, "maxTimeMS")
+                    .expect("optional probe needs a finite time budget");
+                assert!(budget > 0 && budget <= backend.config().probe_timeout_ms as i64);
+                let limit =
+                    counter(command, "limit").expect("optional probe needs a finite row limit");
+                assert!(limit > 0 && limit <= 256);
+                if work.0.is_none() || work.1.is_none() {
+                    assert!(
+                        matches!(counter(&operation, "errCode"), Some(50 | 262)),
+                        "only timed-out probes may omit work counters: {operation:?}"
+                    );
+                    probes_without_counters += 1;
+                }
+                optional.0 += work.0.unwrap_or(0);
+                optional.1 += work.1.unwrap_or(0);
+            } else {
+                required.0 += work
+                    .0
+                    .expect("required operation must report examined keys");
+                required.1 += work
+                    .1
+                    .expect("required operation must report examined documents");
+            }
+        }
+        let total = (required.0 + optional.0, required.1 + optional.1);
+        eprintln!(
+            "gender={gender}: observed total keys/docs={total:?}, required={required:?}, optional={optional:?}, timed-out probes without counters={probes_without_counters}"
+        );
+        // Dense pages may validate one candidate batch. One/zero-match queries
+        // must not walk the resource type during required execution.
+        let excessive = if gender == "female" {
+            required.1 > 256 + 3 + 32
+        } else {
+            required.0 > 2 * expected.len() as i64 + 32 || required.1 > expected.len() as i64 + 32
+        };
+        if excessive {
+            regressions.push(format!(
+                "gender={gender}: required={required:?}, optional={optional:?}, total={total:?}"
+            ));
+        }
+        profile
+            .drop()
+            .await
+            .expect("clear profiles before the next case");
+    }
+    assert!(
+        regressions.is_empty(),
+        "selective queries perform excessive database work: {regressions:?}"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_resource_filtered_cursor_pages_preserve_exact_totals() {
+    let Some(backend) = create_backend_with_full_registry("resource_filter_cursor_totals").await
+    else {
+        eprintln!(
+            "Skipping mongodb_resource_filtered_cursor_pages_preserve_exact_totals \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-complement-cursor");
+    // Interleaved exclusions catch limiting resource candidates before filtering.
+    for id in ["g", "f", "e", "d", "c", "b", "a"] {
+        let mut patient = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "active": !matches!(id, "b" | "d"),
+        });
+        if matches!(id, "b" | "d") {
+            patient["birthDate"] = json!("1980-01-01");
+            patient["gender"] = json!("male");
+        } else if id != "g" {
+            patient["gender"] = json!("female");
+        }
+        backend
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let assert_page =
+        |result: &helios_persistence::core::SearchResult, expected: &[&str], total| {
+            let ids: Vec<_> = result.resources.items.iter().map(|row| row.id()).collect();
+            assert_eq!(ids, expected);
+            assert_eq!(result.total, Some(total));
+            assert_eq!(result.resources.page_info.total, Some(total));
+        };
+    for (name, param_type, modifier, value) in [
+        (
+            "birthdate",
+            SearchParamType::Date,
+            Some(SearchModifier::Missing),
+            "true",
+        ),
+        (
+            "gender",
+            SearchParamType::Token,
+            Some(SearchModifier::Not),
+            "male",
+        ),
+        ("active", SearchParamType::Token, None, "true"),
+    ] {
+        for (sort, expected) in [
+            ("_id", ["a", "c", "e", "f", "g"]),
+            ("-_id", ["g", "f", "e", "c", "a"]),
+        ] {
+            let mut query = SearchQuery::new("Patient")
+                .with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    modifier: modifier.clone(),
+                    values: vec![SearchValue::eq(value)],
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_sort(SortDirective::parse(sort))
+                .with_count(2);
+            query.total = Some(TotalMode::Accurate);
+
+            let first = backend.search(&tenant, &query).await.unwrap();
+            assert_page(&first, &expected[..2], 5);
+            assert!(!first.resources.page_info.has_previous);
+            assert!(first.resources.page_info.previous_cursor.is_none());
+            assert!(first.resources.page_info.has_next);
+
+            let second_query = query.clone().with_cursor(
+                first
+                    .resources
+                    .page_info
+                    .next_cursor
+                    .clone()
+                    .expect("first page has a next cursor"),
+            );
+            let second = backend.search(&tenant, &second_query).await.unwrap();
+            assert_page(&second, &expected[2..4], 5);
+            assert!(second.resources.page_info.has_previous);
+            assert!(second.resources.page_info.has_next);
+
+            let last_query = query.clone().with_cursor(
+                second
+                    .resources
+                    .page_info
+                    .next_cursor
+                    .clone()
+                    .expect("second page has a next cursor"),
+            );
+            let last = backend.search(&tenant, &last_query).await.unwrap();
+            assert_page(&last, &expected[4..], 5);
+            assert!(last.resources.page_info.has_previous);
+            assert!(!last.resources.page_info.has_next);
+            assert!(last.resources.page_info.next_cursor.is_none());
+
+            // Walk back from the short final page, then back to the first page.
+            let back_second = backend
+                .search(
+                    &tenant,
+                    &query.clone().with_cursor(
+                        last.resources
+                            .page_info
+                            .previous_cursor
+                            .clone()
+                            .expect("last page has a previous cursor"),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_page(&back_second, &expected[2..4], 5);
+            let back_first = backend
+                .search(
+                    &tenant,
+                    &query.clone().with_cursor(
+                        back_second
+                            .resources
+                            .page_info
+                            .previous_cursor
+                            .clone()
+                            .expect("second page has a previous cursor"),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_page(&back_first, &expected[..2], 5);
+            assert!(!back_first.resources.page_info.has_previous);
+
+            let mut offset_query = query.clone();
+            offset_query.offset = Some(2);
+            let offset_page = backend.search(&tenant, &offset_query).await.unwrap();
+            assert_page(&offset_page, &expected[2..4], 5);
+            offset_query.offset = Some(5);
+            let empty_page = backend.search(&tenant, &offset_query).await.unwrap();
+            assert_page(&empty_page, &[], 5);
+            assert!(!empty_page.resources.page_info.has_next);
+        }
+    }
+
+    // Both predicates match individually, but their intersection is empty.
+    let mut empty_query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("male")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_count(2);
+    empty_query.total = Some(TotalMode::Accurate);
+    let empty = backend.search(&tenant, &empty_query).await.unwrap();
+    assert_page(&empty, &[], 0);
+    assert!(!empty.resources.page_info.has_next);
+}
+
+#[tokio::test]
+async fn mongodb_date_sort_honors_all_explicit_date_and_id_directions() {
+    let Some(backend) = create_backend_with_full_registry("date_sort_directions").await else {
+        eprintln!(
+            "Skipping mongodb_date_sort_honors_all_explicit_date_and_id_directions \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-date-sort-directions");
+    for (id, birth_date, gender) in [
+        ("patient-a", "2000-01-01", "female"),
+        ("patient-b", "2000-01-01", "female"),
+        ("patient-c", "1990-01-01", "female"),
+        ("patient-d", "2010-01-01", "male"),
+    ] {
+        backend
+            .seed_create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "birthDate": birth_date,
+                    "gender": gender,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (date_sort, id_sort, expected) in [
+        (
+            "birthdate",
+            "_id",
+            vec!["patient-c", "patient-a", "patient-b", "patient-d"],
+        ),
+        (
+            "birthdate",
+            "-_id",
+            vec!["patient-c", "patient-b", "patient-a", "patient-d"],
+        ),
+        (
+            "-birthdate",
+            "_id",
+            vec!["patient-d", "patient-a", "patient-b", "patient-c"],
+        ),
+        (
+            "-birthdate",
+            "-_id",
+            vec!["patient-d", "patient-b", "patient-a", "patient-c"],
+        ),
+    ] {
+        let query = SearchQuery::new("Patient")
+            .with_sort(SortDirective::parse(date_sort).with_param_type(Some(SearchParamType::Date)))
+            .with_sort(SortDirective::parse(id_sort))
+            .with_count(4);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let actual: Vec<&str> = result.resources.items.iter().map(|row| row.id()).collect();
+        assert_eq!(actual, expected, "sort={date_sort},{id_sort}");
+    }
+
+    // The filtered path must preserve the requested tie-break direction and
+    // count only patients matching both gender and the date range.
+    for (id_sort, expected) in [
+        ("_id", vec!["patient-a", "patient-b"]),
+        ("-_id", vec!["patient-b", "patient-a"]),
+    ] {
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq("female")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::parse("ge1995-01-01")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_sort(
+                SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)),
+            )
+            .with_sort(SortDirective::parse(id_sort))
+            .with_count(2);
+        query.total = Some(TotalMode::Accurate);
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let actual: Vec<&str> = result.resources.items.iter().map(|row| row.id()).collect();
+        assert_eq!(actual, expected, "filtered sort=birthdate,{id_sort}");
+        assert_eq!(result.total, Some(2));
+    }
+
+    backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "patient-e", "gender": "female" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let filtered_with_missing_sort_key = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_sort(SortDirective::parse("_id"))
+        .with_count(4);
+    let result = backend
+        .search(&tenant, &filtered_with_missing_sort_key)
+        .await
+        .unwrap();
+    let actual: Vec<&str> = result.resources.items.iter().map(|row| row.id()).collect();
+    assert_eq!(
+        actual,
+        vec!["patient-c", "patient-a", "patient-b", "patient-e"]
+    );
+}
+
+#[tokio::test]
+async fn mongodb_selective_reference_search_uses_existing_ordered_index() {
+    let Some(backend) = create_backend_with_stable_probes("reference_plan").await else {
+        return;
+    };
+    let tenant = create_tenant("reference-plan");
+    for i in 0..20 {
+        backend.seed_create(&tenant, "Observation", json!({
+            "resourceType":"Observation", "id":format!("o{i}"), "status":"final", "code":{"text":"reference test"},
+            "subject":{"reference":if i == 19 { "Patient/rare" } else { "Patient/common" }},
+        }), FhirVersion::default()).await.unwrap();
+    }
+    let query = SearchQuery::new("Observation")
+        .with_count(2)
+        .with_parameter(SearchParameter {
+            name: "subject".into(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Patient/rare")],
+            chain: vec![],
+            components: vec![],
+        });
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(result.resources.items.len(), 1);
+            assert_eq!(result.resources.items[0].id(), "o19");
+        },
+        "idx_search_reference_v2",
+    )
+    .await;
+}
+
+/// Both bounded candidates and the broad fallback must preserve repeated date
+/// predicates, live-resource validation, exact totals and bidirectional paging.
+/// Pages and exact totals validate live resources; index-only estimates count
+/// distinct indexed IDs, including stale IDs but never duplicate index rows.
+#[tokio::test]
+async fn mongodb_predicate_plans_preserve_dates_live_scope_and_cursor_pages() {
+    let Some(backend) = create_backend_with_full_registry("index_intersection").await else {
+        eprintln!("Skipping index intersection test (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    assert!(
+        matches!(
+            backend.wait_for_search_index_build().await,
+            Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
+        ),
+        "ready indexes must enable the index-only estimate path"
+    );
+    let tenant = create_tenant("intersection");
+    let other = create_tenant("intersection-other");
+    #[derive(Clone)]
+    struct FixtureRow {
+        id: String,
+        patient: &'static str,
+        date: &'static str,
+        own_tenant: bool,
+        deleted: bool,
+    }
+
+    let mut fixture: Vec<_> = (0..240)
+        .map(|number| FixtureRow {
+            id: format!("o{number:03}"),
+            patient: if number < 160 {
+                "Patient/p0"
+            } else {
+                "Patient/p1"
+            },
+            date: if (80..160).contains(&number) {
+                "2026-03-10T12:00:00Z"
+            } else {
+                "2026-01-10T12:00:00Z"
+            },
+            own_tenant: true,
+            deleted: number == 0,
+        })
+        .collect();
+    let source = fixture[1].clone();
+    let mut foreign = source.clone();
+    foreign.id = "foreign".to_string();
+    foreign.own_tenant = false;
+    fixture.push(foreign.clone());
+
+    for row in &fixture {
+        let code_text = if row.own_tenant {
+            "trial"
+        } else {
+            "other tenant"
+        };
+        backend
+            .seed_create(
+                if row.own_tenant { &tenant } else { &other },
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": row.id,
+                    "status": "final",
+                    "code": {"text": code_text},
+                    "subject": {"reference": row.patient},
+                    "effectiveDateTime": row.date,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    let tenant_id = tenant.tenant_id().as_str();
+    let resources = db.collection::<Document>("resources");
+    resources
+        .update_many(
+            doc! {"tenant_id": tenant_id},
+            doc! {"$set": {
+                "last_updated": mongodb::bson::DateTime::from_millis(1_770_000_000_000_i64),
+            }},
+        )
+        .await
+        .unwrap();
+    for row in fixture.iter().filter(|row| row.own_tenant && row.deleted) {
+        resources
+            .update_one(
+                doc! {"tenant_id": tenant_id, "id": &row.id},
+                doc! {"$set": {"is_deleted": true}},
+            )
+            .await
+            .unwrap();
+    }
+    let index = db.collection::<Document>("search_index");
+    let mut cursor = index
+        .find(doc! {"tenant_id": tenant_id, "resource_id": &source.id})
+        .await
+        .unwrap();
+    let mut extra = Vec::new();
+    while cursor.advance().await.unwrap() {
+        let mut row = cursor.deserialize_current().unwrap();
+        row.remove("_id");
+        extra.push(row.clone()); // Repeating index rows must not inflate the count.
+        row.insert("resource_id", foreign.id.clone()); // Exists only in the other tenant.
+        extra.push(row);
+    }
+    index.insert_many(extra).await.unwrap();
+
+    let january = ("2026-01-01", "2026-02-01");
+    let scopes = [
+        (Some("Patient/p0"), None),
+        (Some("Patient/p0"), Some(january)),
+        (None, Some(january)),
+        (Some("Patient/p0"), Some(("2026-03-01", "2026-04-01"))),
+    ];
+
+    for broad in [false, true] {
+        if broad {
+            let mut cursor = index
+                .find(doc! {
+                    "tenant_id": tenant_id, "resource_id": &source.id,
+                    "param_name": { "$in": ["patient", "date"] },
+                })
+                .await
+                .unwrap();
+            let mut templates = Vec::new();
+            while cursor.advance().await.unwrap() {
+                let mut row = cursor.deserialize_current().unwrap();
+                row.remove("_id");
+                templates.push(row);
+            }
+            assert!(
+                !templates.is_empty(),
+                "missing indexed fixture rows for {}",
+                source.id
+            );
+            // Duplicate January rows push the original scopes past the candidate budget.
+            // Insert in batches to keep fixture memory bounded.
+            for _ in 0..21 {
+                let rows: Vec<_> = (0..500).flat_map(|_| templates.iter().cloned()).collect();
+                index.insert_many(rows).await.unwrap();
+            }
+        }
+        let mut covered_stale_estimate = false;
+        let mut covered_live_only_estimate = false;
+        for total_mode in [TotalMode::None, TotalMode::Estimate, TotalMode::Accurate] {
+            for (scope, &(patient, dates)) in scopes.iter().enumerate() {
+                for sort in ["", "_id", "-_id", "_lastUpdated", "-_lastUpdated"] {
+                    let context = format!(
+                        "scope={scope}, total={total_mode:?}, sort={sort:?}, broad={broad}"
+                    );
+                    let mut query = SearchQuery::new("Observation").with_count(17);
+                    if !sort.is_empty() {
+                        query = query.with_sort(SortDirective::parse(sort));
+                    }
+                    let mut filters = Vec::new();
+                    if let Some(patient) = patient {
+                        filters.push(("patient", SearchParamType::Reference, patient.to_string()));
+                    }
+                    if let Some((start, end)) = dates {
+                        filters.extend([
+                            ("date", SearchParamType::Date, format!("ge{start}")),
+                            ("date", SearchParamType::Date, format!("lt{end}")),
+                        ]);
+                    }
+                    for (name, kind, value) in filters {
+                        query = query.with_parameter(SearchParameter {
+                            name: name.into(),
+                            param_type: kind,
+                            modifier: None,
+                            values: vec![SearchValue::parse(&value)],
+                            chain: vec![],
+                            components: vec![],
+                        });
+                    }
+                    // Parameter order must not determine which condition drives the plan.
+                    if total_mode == TotalMode::Accurate {
+                        query.parameters.reverse();
+                    }
+                    query.total = Some(total_mode);
+                    let bounds = dates.map(|(start, end)| {
+                        (
+                            chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap(),
+                            chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap(),
+                        )
+                    });
+                    let indexed_matches: Vec<_> = fixture
+                        .iter()
+                        .filter(|row| {
+                            patient.is_none_or(|patient| row.patient == patient)
+                                && bounds.is_none_or(|(start, end)| {
+                                    let date = chrono::DateTime::parse_from_rfc3339(row.date)
+                                        .unwrap()
+                                        .with_timezone(&chrono::Utc)
+                                        .date_naive();
+                                    start <= date && date < end
+                                })
+                        })
+                        .collect();
+                    let mut expected: Vec<String> = indexed_matches
+                        .iter()
+                        .filter(|row| row.own_tenant && !row.deleted)
+                        .map(|row| row.id.clone())
+                        .collect();
+                    let live_total = expected.len() as u64;
+                    let expected_count = if total_mode == TotalMode::Estimate {
+                        let indexed_total = indexed_matches.len() as u64;
+                        covered_stale_estimate |= indexed_total > live_total;
+                        covered_live_only_estimate |= indexed_total == live_total;
+                        indexed_total
+                    } else {
+                        live_total
+                    };
+                    let expected_total = (total_mode != TotalMode::None).then_some(expected_count);
+                    expected.sort();
+                    if sort != "_id" {
+                        expected.reverse();
+                    } // Timestamp ties use descending ID.
+                    let mut request = query.clone();
+                    let mut pages = Vec::new();
+                    let mut previous = loop {
+                        let result = backend
+                            .search(&tenant, &request)
+                            .await
+                            .unwrap_or_else(|error| panic!("search failed: {context}: {error}"));
+                        assert_eq!(result.total, expected_total, "{context}");
+                        assert_eq!(
+                            backend
+                                .search_count(&tenant, &request)
+                                .await
+                                .unwrap_or_else(|error| panic!("count failed: {context}: {error}")),
+                            expected_count,
+                            "{context}"
+                        );
+                        let ids: Vec<String> = result
+                            .resources
+                            .items
+                            .iter()
+                            .map(|r| r.id().to_string())
+                            .collect();
+                        let offset = pages.iter().map(Vec::len).sum::<usize>();
+                        assert_eq!(
+                            ids,
+                            expected[offset..(offset + 17).min(expected.len())],
+                            "{context}"
+                        );
+                        pages.push(ids);
+                        if let Some(cursor) = result.resources.page_info.next_cursor {
+                            request = query.clone().with_cursor(cursor);
+                        } else {
+                            break result.resources.page_info.previous_cursor;
+                        }
+                    };
+                    for expected_page in pages[..pages.len() - 1].iter().rev() {
+                        let cursor = previous
+                            .take()
+                            .unwrap_or_else(|| panic!("missing previous cursor: {context}"));
+                        let request = query.clone().with_cursor(cursor);
+                        let result =
+                            backend
+                                .search(&tenant, &request)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("previous search failed: {context}: {error}")
+                                });
+                        let ids: Vec<String> = result
+                            .resources
+                            .items
+                            .iter()
+                            .map(|r| r.id().to_string())
+                            .collect();
+                        assert_eq!(&ids, expected_page, "{context}");
+                        assert_eq!(result.total, expected_total, "{context}");
+                        previous = result.resources.page_info.previous_cursor;
+                    }
+                    assert!(previous.is_none(), "{context}");
+                }
+            }
+        }
+        assert!(
+            covered_stale_estimate,
+            "fixture must distinguish indexed estimates from exact fallback (broad={broad})"
+        );
+        assert!(
+            covered_live_only_estimate,
+            "fixture must cover queries excluding stale indexed IDs (broad={broad})"
+        );
+    }
+}
+
+/// A bounded live-match sample chooses routing without changing page results or totals.
+#[tokio::test]
+async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() {
+    use futures::TryStreamExt;
+    use tracing::instrument::WithSubscriber;
+
+    let Some(backend) = create_backend_with_full_registry("no_total_page_policy").await else {
+        eprintln!("Skipping offset policy test: MongoDB unavailable");
+        return;
+    };
+    let tenant = create_tenant("offset-policy");
+    let db = backend.get_database().await.unwrap();
+    let resources = db.collection::<Document>("resources");
+    let index = db.collection::<Document>("search_index");
+    let coding = |rare: bool| {
+        let mut values = vec![json!({"system":"urn:page-policy", "code":"base"})];
+        if rare {
+            values.push(json!({"system":"urn:page-policy", "code":"rare"}));
+        }
+        json!({"coding":values})
+    };
+    backend
+        .seed_create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType":"Observation", "id":"r00000", "status":"final",
+                "code":coding(true), "effectiveDateTime":"2026-01-10T12:00:00Z",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let template = resources
+        .find_one(doc! {"id":"r00000"})
+        .await
+        .unwrap()
+        .unwrap();
+    let mut templates = Vec::new();
+    let mut cursor = index
+        .find(doc! {
+            "resource_id":"r00000", "param_name":{"$in":["code","date","status"]},
+        })
+        .await
+        .unwrap();
+    while let Some(mut row) = cursor.try_next().await.unwrap() {
+        row.remove("_id");
+        templates.push(row);
+    }
+    assert!(
+        templates
+            .iter()
+            .any(|row| row.get_str("value_token_code").ok() == Some("rare"))
+    );
+    const ROWS: usize = 12_000;
+    const RARE_STRIDE: usize = 32;
+    for start in (1..ROWS).step_by(500) {
+        let mut resource_rows = Vec::new();
+        let mut index_rows = Vec::new();
+        for number in start..(start + 500).min(ROWS) {
+            let id = format!("r{number:05}");
+            let rare = number % RARE_STRIDE == 0;
+            let mut resource = template.clone();
+            resource.remove("_id");
+            resource.insert("id", id.clone());
+            let data = resource.get_document_mut("data").unwrap();
+            data.insert("id", id.clone());
+            data.insert("code", mongodb::bson::to_bson(&coding(rare)).unwrap());
+            resource_rows.push(resource);
+            for row in &templates {
+                if !rare && row.get_str("value_token_code").ok() == Some("rare") {
+                    continue;
+                }
+                let mut row = row.clone();
+                row.insert("resource_id", id.clone());
+                index_rows.push(row);
+            }
+        }
+        resources.insert_many(resource_rows).await.unwrap();
+        index.insert_many(index_rows).await.unwrap();
+    }
+    let rare_template = templates
+        .iter()
+        .find(|row| row.get_str("value_token_code").ok() == Some("rare"))
+        .unwrap();
+    // Keep both individual probes inconclusive without changing distinct membership.
+    for _ in 0..21 {
+        index
+            .insert_many(vec![rare_template.clone(); 500])
+            .await
+            .unwrap();
+    }
+    let other = create_tenant("offset-policy-other");
+    backend
+        .seed_create(
+            &other,
+            "Observation",
+            json!({
+                "resourceType":"Observation", "id":"foreign", "status":"final", "code":coding(true),
+                "effectiveDateTime":"2026-01-10T12:00:00Z",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType":"Patient", "id":"wrongtype", "gender":"female",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let stale_ids = ["foreign", "missing", "wrongtype"];
+    for id in stale_ids {
+        let rows: Vec<_> = templates
+            .iter()
+            .map(|template| {
+                let mut row = template.clone();
+                row.insert("resource_id", id);
+                row
+            })
+            .collect();
+        index.insert_many(rows).await.unwrap();
+    }
+    let parameter = |name: &str, kind, value: &str| SearchParameter {
+        name: name.to_string(),
+        param_type: kind,
+        modifier: None,
+        values: vec![SearchValue::parse(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let date = SearchQuery::new("Observation")
+        .with_parameter(parameter("date", SearchParamType::Date, "ge2026-01-01"))
+        .with_parameter(parameter("date", SearchParamType::Date, "lt2026-02-01"));
+    let status_date =
+        date.clone()
+            .with_parameter(parameter("status", SearchParamType::Token, "final"));
+    let status = SearchQuery::new("Observation").with_parameter(parameter(
+        "status",
+        SearchParamType::Token,
+        "final",
+    ));
+    // Page-only planning issues no full counts. With both probes capped and
+    // equal index access, the last predicate (base) drives the sparse page.
+    let sparse = SearchQuery::new("Observation")
+        .with_parameter(parameter(
+            "code",
+            SearchParamType::Token,
+            "urn:page-policy|rare",
+        ))
+        .with_parameter(parameter(
+            "code",
+            SearchParamType::Token,
+            "urn:page-policy|base",
+        ));
+    let observer = PageStrategyLog::default();
+    for (label, base, stride, expected_strategy) in [
+        ("date", date, 1, Some("streaming")),
+        ("status-date", status_date, 1, Some("streaming")),
+        ("sparse", sparse.clone(), RARE_STRIDE, Some("bounded")),
+        ("status", status, 1, None),
+    ] {
+        for sort in ["_id", "-_id"] {
+            let mut ordered: Vec<_> = (0..ROWS)
+                .step_by(stride)
+                .map(|number| format!("r{number:05}"))
+                .collect();
+            if sort == "-_id" {
+                ordered.reverse();
+            }
+            for offset in [0, 20, 256, 257, 4097, 9979, 9980, 10000] {
+                let context = format!("{label}, sort={sort}, offset={offset}");
+                let mut query = base
+                    .clone()
+                    .with_count(20)
+                    .with_sort(SortDirective::parse(sort));
+                query.offset = Some(offset);
+                query.total = Some(TotalMode::None);
+                observer.decisions.lock().unwrap().clear();
+                let result = backend
+                    .search(&tenant, &query)
+                    .with_subscriber(observer.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: {error}"));
+                let expected: Vec<_> = ordered
+                    .iter()
+                    .skip(offset as usize)
+                    .take(20)
+                    .cloned()
+                    .collect();
+                let ids: Vec<_> = result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(ids, expected, "{context}");
+                assert_eq!(result.total, None, "{context}");
+                assert_eq!(
+                    result.resources.page_info.has_next,
+                    (offset as usize + 20) < ordered.len(),
+                    "{context}"
+                );
+                let decisions = observer.decisions.lock().unwrap().clone();
+                if matches!(offset, 257 | 4097 | 9979)
+                    && let Some(expected_strategy) = expected_strategy
+                {
+                    let strategies: Vec<_> = decisions
+                        .iter()
+                        .map(|(strategy, _, _)| strategy.as_str())
+                        .collect();
+                    assert_eq!(strategies, [expected_strategy], "{context}");
+                } else {
+                    assert!(
+                        decisions.is_empty(),
+                        "ineligible request: {context}, {decisions:?}"
+                    );
+                }
+            }
+            let query = base
+                .clone()
+                .with_count(20)
+                .with_sort(SortDirective::parse(sort));
+            let first = backend.search(&tenant, &query).await.unwrap();
+            let cursor = first.resources.page_info.next_cursor.unwrap();
+            observer.decisions.lock().unwrap().clear();
+            let next = backend
+                .search(&tenant, &query.clone().with_cursor(cursor))
+                .with_subscriber(observer.clone())
+                .await
+                .unwrap();
+            assert!(
+                observer.decisions.lock().unwrap().is_empty(),
+                "cursor must retain streaming: {label}, {sort}"
+            );
+            let ids: Vec<_> = next
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            assert_eq!(ids, ordered[20..40], "next page: {label}, {sort}");
+            let previous = next.resources.page_info.previous_cursor.unwrap();
+            let back = backend
+                .search(&tenant, &query.clone().with_cursor(previous))
+                .await
+                .unwrap();
+            let ids: Vec<_> = back
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            assert_eq!(ids, ordered[..20], "previous page: {label}, {sort}");
+        }
+    }
+    for total in [TotalMode::Accurate, TotalMode::Estimate] {
+        let mut query = sparse
+            .clone()
+            .with_count(20)
+            .with_sort(SortDirective::parse("_id"));
+        query.offset = Some(257);
+        query.total = Some(total);
+        observer.decisions.lock().unwrap().clear();
+        let result = backend
+            .search(&tenant, &query)
+            .with_subscriber(observer.clone())
+            .await
+            .unwrap();
+        let mut expected_ids: std::collections::BTreeSet<_> = (0..ROWS)
+            .step_by(RARE_STRIDE)
+            .map(|number| format!("r{number:05}"))
+            .collect();
+        if total == TotalMode::Estimate {
+            expected_ids.extend(stale_ids.iter().map(|id| id.to_string()));
+        }
+        assert_eq!(result.total, Some(expected_ids.len() as u64), "{total:?}");
+        let expected_page: Vec<_> = (0..ROWS)
+            .step_by(RARE_STRIDE)
+            .skip(257)
+            .take(20)
+            .map(|number| format!("r{number:05}"))
+            .collect();
+        let ids: Vec<_> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, expected_page, "{total:?}");
+        assert!(
+            observer.decisions.lock().unwrap().is_empty(),
+            "totals must not use adaptive paging: {total:?}"
+        );
+    }
+    // A fresh backend starts with an empty decision cache, so this scenario
+    // does not depend on how long the matrix above took: the first request
+    // samples, the repeat after the deletion reuses that fresh decision.
+    let fresh = MongoBackend::new(backend.config().clone()).unwrap();
+    fresh.init_schema().await.unwrap();
+    let mut query = sparse.with_count(20).with_sort(SortDirective::parse("_id"));
+    query.offset = Some(257);
+    observer.decisions.lock().unwrap().clear();
+    fresh
+        .search(&tenant, &query)
+        .with_subscriber(observer.clone())
+        .await
+        .unwrap();
+    let decisions = observer.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].0, "bounded");
+    assert!(
+        !decisions[0].2,
+        "the first request on a fresh backend must sample, not reuse"
+    );
+    resources
+        .update_many(
+            doc! {
+                "tenant_id":tenant.tenant_id().as_str(), "resource_type":"Observation",
+                "id":{"$lt":"r00256"},
+            },
+            doc! {"$set":{"is_deleted":true}},
+        )
+        .await
+        .unwrap();
+    observer.decisions.lock().unwrap().clear();
+    let result = fresh
+        .search(&tenant, &query)
+        .with_subscriber(observer.clone())
+        .await
+        .unwrap();
+    let decisions = observer.decisions.lock().unwrap().clone();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].0, "bounded");
+    assert!(
+        decisions[0].2,
+        "repeat requests must reuse the cached decision"
+    );
+    let expected: Vec<_> = (256..ROWS)
+        .step_by(RARE_STRIDE)
+        .skip(257)
+        .take(20)
+        .map(|number| format!("r{number:05}"))
+        .collect();
+    let ids: Vec<_> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "a cached decision must revalidate deletion before applying the offset"
+    );
+    assert_eq!(result.total, None);
+    let mut config = backend.config().clone();
+    config.adaptive_offset_paging = false;
+    let disabled = MongoBackend::new(config).unwrap();
+    disabled.init_schema().await.unwrap();
+    observer.decisions.lock().unwrap().clear();
+    let previous_page_executions = observer
+        .page_executions
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let disabled_result = disabled
+        .search(&tenant, &query)
+        .with_subscriber(observer.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        disabled_result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(disabled_result.total, None);
+    assert!(
+        observer.decisions.lock().unwrap().is_empty(),
+        "switching it off must bypass adaptive sampling"
+    );
+    assert_eq!(
+        observer
+            .page_executions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        previous_page_executions + 1,
+        "disabled offset paging must execute Page rather than direct BoundedPage"
+    );
+}
+
+/// Candidate batches must count each resource once, apply offsets after all
+/// predicates and liveness checks, and retain global ID order across batches.
+#[tokio::test]
+async fn mongodb_index_batches_preserve_counts_offsets_and_resource_filters() {
+    let Some(backend) = create_backend_with_full_registry("index_batches").await else {
+        eprintln!("Skipping index batches test (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("index-batches");
+    let other = create_tenant("index-batches-other");
+    for number in 0..1200 {
+        let mut coding = vec![json!({"system": "urn:batch-test", "code": "base"})];
+        if number % 3 != 0 {
+            coding.push(json!({"system": "urn:batch-test", "code": "eligible"}));
+        }
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("r{number:04}"),
+                    "status": "final", "code": {"coding": coding},
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .seed_create(
+            &other,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "foreign", "status": "final", "code": {"text": "foreign"}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let tenant_id = tenant.tenant_id().as_str();
+    let resources = db.collection::<Document>("resources");
+    resources
+        .update_one(
+            doc! {"tenant_id": tenant_id, "id": "r0601"},
+            doc! {"$set": {"is_deleted": true}},
+        )
+        .await
+        .unwrap();
+    let index = db.collection::<Document>("search_index");
+    let mut cursor = index
+        .find(doc! {"tenant_id": tenant_id, "resource_id": "r0001", "param_name": "code"})
+        .await
+        .unwrap();
+    let mut templates = Vec::new();
+    while cursor.advance().await.unwrap() {
+        let mut row = cursor.deserialize_current().unwrap();
+        row.remove("_id");
+        templates.push(row);
+    }
+    assert!(!templates.is_empty());
+    // Both predicates exceed the old 10,000-row cap. Duplicate values must not
+    // count twice, including when the same ID occurs across cursor batches.
+    for _ in 0..21 {
+        let rows: Vec<_> = (0..500).flat_map(|_| templates.iter().cloned()).collect();
+        index.insert_many(rows).await.unwrap();
+    }
+    for ghost in ["foreign", "missing"] {
+        let rows: Vec<_> = templates
+            .iter()
+            .map(|template| {
+                let mut row = template.clone();
+                row.insert("resource_id", ghost);
+                row
+            })
+            .collect();
+        index.insert_many(rows).await.unwrap();
+    }
+    let parameter = |name: &str, kind, value: &str| SearchParameter {
+        name: name.into(),
+        param_type: kind,
+        modifier: None,
+        values: vec![SearchValue::parse(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let query = SearchQuery::new("Observation")
+        .with_parameter(parameter(
+            "code",
+            SearchParamType::Token,
+            "urn:batch-test|base",
+        ))
+        .with_parameter(parameter(
+            "code",
+            SearchParamType::Token,
+            "urn:batch-test|eligible",
+        ));
+    let expected: Vec<_> = (0..1200)
+        .filter(|number| number % 3 != 0 && *number != 601)
+        .map(|number| format!("r{number:04}"))
+        .collect();
+    // The single-predicate count also crosses the larger count batch boundary.
+    let mut single = query.clone();
+    single.parameters.truncate(1);
+    assert_eq!(backend.search_count(&tenant, &single).await.unwrap(), 1199);
+    for direction in ["_id", "-_id"] {
+        let mut ordered = expected.clone();
+        if direction == "-_id" {
+            ordered.reverse();
+        }
+        let mut query = query
+            .clone()
+            .with_sort(SortDirective::parse(direction))
+            .with_count(301);
+        query.total = Some(TotalMode::Accurate);
+        if direction == "-_id" {
+            query.parameters.reverse();
+        }
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let first = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(first.total, Some(ordered.len() as u64));
+        assert_eq!(ids(&first), ordered[..301]);
+        let second = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(first.resources.page_info.next_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&second), ordered[301..602]);
+        assert_eq!(second.total, Some(ordered.len() as u64));
+        let previous = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(second.resources.page_info.previous_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&previous), ordered[..301]);
+        for offset in [257, 700, 900] {
+            let mut offset_query = query.clone().with_count(37);
+            offset_query.offset = Some(offset);
+            let result = backend.search(&tenant, &offset_query).await.unwrap();
+            let start = (offset as usize).min(ordered.len());
+            assert_eq!(
+                ids(&result),
+                ordered[start..(start + 37).min(ordered.len())]
+            );
+            assert_eq!(result.total, Some(ordered.len() as u64));
+        }
+    }
+    // Combined first-page totals must match the unchanged page-only path for
+    // one predicate too, at small and large page sizes and in both directions.
+    for direction in ["_id", "-_id"] {
+        for size in [1, 20, 100, 1000, 2000] {
+            let mut request = single
+                .clone()
+                .with_sort(SortDirective::parse(direction))
+                .with_count(size);
+            request.total = Some(TotalMode::None);
+            let page_only = backend.search(&tenant, &request).await.unwrap();
+            request.total = Some(TotalMode::Accurate);
+            let combined = backend.search(&tenant, &request).await.unwrap();
+            let ids = |result: &helios_persistence::core::SearchResult| {
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(combined.total, Some(1199));
+            assert_eq!(ids(&combined), ids(&page_only));
+            assert_eq!(
+                combined.resources.page_info.has_next,
+                page_only.resources.page_info.has_next
+            );
+        }
+    }
+    // A resource-local condition is evaluated after index candidate matching.
+    resources
+        .update_many(
+            doc! {"tenant_id": tenant_id},
+            doc! {"$set": {"last_updated": mongodb::bson::DateTime::parse_rfc3339_str("2026-01-01T00:00:00Z").unwrap()}},
+        )
+        .await
+        .unwrap();
+    resources
+        .update_many(
+            doc! {"tenant_id": tenant_id, "id": {"$gte": "r0600"}},
+            doc! {"$set": {"last_updated": mongodb::bson::DateTime::parse_rfc3339_str("2026-03-01T00:00:00Z").unwrap()}},
+        )
+        .await
+        .unwrap();
+    let filtered = query.clone().with_parameter(parameter(
+        "_lastUpdated",
+        SearchParamType::Date,
+        "ge2026-02-01",
+    ));
+    assert_eq!(backend.search_count(&tenant, &filtered).await.unwrap(), 399);
+    let empty = query.with_parameter(parameter(
+        "code",
+        SearchParamType::Token,
+        "urn:batch-test|absent",
+    ));
+    assert_eq!(backend.search_count(&tenant, &empty).await.unwrap(), 0);
+    for (request, total) in [(filtered, 399), (empty, 0)] {
+        let mut request = request
+            .with_sort(SortDirective::parse("_id"))
+            .with_count(20);
+        request.total = Some(TotalMode::None);
+        let page_only = backend.search(&tenant, &request).await.unwrap();
+        request.total = Some(TotalMode::Accurate);
+        let combined = backend.search(&tenant, &request).await.unwrap();
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(combined.total, Some(total));
+        assert_eq!(ids(&combined), ids(&page_only));
+    }
+}
+
+/// Exact counts drain multiple overlapping batches without counting duplicate,
+/// stale, deleted or foreign-tenant index rows. Timestamps vary per resource,
+/// rather than having the uniform timestamps typical of a bulk-loaded corpus.
+#[tokio::test]
+async fn mongodb_pipelined_counts_validate_every_batch() {
+    let Some(backend) = create_backend_with_full_registry("pipelined_counts").await else {
+        eprintln!("Skipping pipelined counts test (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("pipelined-counts");
+    let tenant_id = tenant.tenant_id().as_str();
+    backend
+        .seed_create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "template", "status": "final", "code": {"text": "test"}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let resources = db.collection::<Document>("resources");
+    let index = db.collection::<Document>("search_index");
+    let mut resource_template = resources
+        .find_one(doc! {"tenant_id": tenant_id, "id": "template"})
+        .await
+        .unwrap()
+        .unwrap();
+    resource_template.remove("_id");
+    let mut index_template = index
+        .find_one(doc! {"tenant_id": tenant_id, "resource_id": "template", "param_name": "status"})
+        .await
+        .unwrap()
+        .unwrap();
+    index_template.remove("_id");
+    resources
+        .delete_one(doc! {"tenant_id": tenant_id, "id": "template"})
+        .await
+        .unwrap();
+    index
+        .delete_many(doc! {"tenant_id": tenant_id, "resource_id": "template"})
+        .await
+        .unwrap();
+
+    // Four 4,096-ID batches exceed the two-batch concurrency limit and exercise
+    // both replenishing the queue and draining its final partial batch.
+    let count = 12_289;
+    let epoch = mongodb::bson::DateTime::parse_rfc3339_str("2026-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let mut documents = Vec::new();
+    let mut rows = Vec::new();
+    for number in 0..count {
+        let id = format!("r{number:04}");
+        let mut resource = resource_template.clone();
+        resource.insert("id", &id);
+        resource.get_document_mut("data").unwrap().insert("id", &id);
+        resource.insert(
+            "last_updated",
+            mongodb::bson::DateTime::from_millis(epoch + number * 1_000),
+        );
+        resource.insert("is_deleted", number % 7 == 0);
+        documents.push(resource);
+        let mut row = index_template.clone();
+        row.insert("resource_id", id);
+        rows.push(row.clone());
+        rows.push(row);
+    }
+    let mut foreign = resource_template;
+    foreign.insert("id", "foreign");
+    foreign
+        .get_document_mut("data")
+        .unwrap()
+        .insert("id", "foreign");
+    foreign.insert("tenant_id", "other-tenant");
+    documents.push(foreign);
+    for id in ["foreign", "missing"] {
+        let mut row = index_template.clone();
+        row.insert("resource_id", id);
+        rows.push(row);
+    }
+    resources.insert_many(documents).await.unwrap();
+    index.insert_many(rows).await.unwrap();
+
+    let parameter = |name: &str, kind, value: &str| SearchParameter {
+        name: name.into(),
+        param_type: kind,
+        modifier: None,
+        values: vec![SearchValue::parse(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let query = SearchQuery::new("Observation").with_parameter(parameter(
+        "status",
+        SearchParamType::Token,
+        "final",
+    ));
+    let expected = (0..count).filter(|number| number % 7 != 0).count() as u64;
+    assert_eq!(
+        backend.search_count(&tenant, &query).await.unwrap(),
+        expected
+    );
+    let filtered = query.clone().with_parameter(parameter(
+        "_lastUpdated",
+        SearchParamType::Date,
+        "ge2026-01-01T00:30:00Z",
+    ));
+    let expected = (1_800..count).filter(|number| number % 7 != 0).count() as u64;
+    assert_eq!(
+        backend.search_count(&tenant, &filtered).await.unwrap(),
+        expected
+    );
+
+    // Combined totals must retain only the extreme page IDs from every batch,
+    // without truncating the total or admitting stale/foreign/deleted rows.
+    for (base, first_number) in [(&query, 0), (&filtered, 1_800)] {
+        let mut expected_ids: Vec<_> = (first_number..count)
+            .filter(|number| number % 7 != 0)
+            .map(|number| format!("r{number:04}"))
+            .collect();
+        expected_ids.sort();
+        for direction in ["_id", "-_id"] {
+            for page_size in [20, 1000] {
+                let mut combined = base
+                    .clone()
+                    .with_sort(SortDirective::parse(direction))
+                    .with_count(page_size);
+                combined.total = Some(TotalMode::Accurate);
+                let result = backend.search(&tenant, &combined).await.unwrap();
+                let mut ordered = expected_ids.clone();
+                if direction == "-_id" {
+                    ordered.reverse();
+                }
+                assert_eq!(result.total, Some(ordered.len() as u64));
+                let expected_page = ordered[..page_size as usize].to_vec();
+                assert_eq!(
+                    result
+                        .resources
+                        .items
+                        .iter()
+                        .map(|r| r.id().to_owned())
+                        .collect::<Vec<_>>(),
+                    expected_page,
+                );
+                let ids = |result: &helios_persistence::core::SearchResult| {
+                    result
+                        .resources
+                        .items
+                        .iter()
+                        .map(|r| r.id().to_owned())
+                        .collect::<Vec<_>>()
+                };
+                assert!(result.resources.page_info.has_next);
+                let mut page_only = combined.clone();
+                page_only.total = Some(TotalMode::None);
+                let page = backend.search(&tenant, &page_only).await.unwrap();
+                assert_eq!(ids(&page), expected_page);
+                assert_eq!(page.total, None);
+                assert!(page.resources.page_info.has_next);
+                let next = backend
+                    .search(
+                        &tenant,
+                        &combined
+                            .clone()
+                            .with_cursor(result.resources.page_info.next_cursor.unwrap()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(next.total, Some(ordered.len() as u64));
+                assert_eq!(
+                    ids(&next),
+                    ordered[page_size as usize..2 * page_size as usize]
+                );
+                let previous = backend
+                    .search(
+                        &tenant,
+                        &combined
+                            .clone()
+                            .with_cursor(next.resources.page_info.previous_cursor.unwrap()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(previous.total, Some(ordered.len() as u64));
+                assert_eq!(ids(&previous), expected_page);
+
+                // Includes a near-end page, an empty page and the deep-offset
+                // fallback that must not allocate an offset-sized top-k buffer.
+                for offset in [
+                    1,
+                    4_097,
+                    10_001,
+                    ordered.len() as u32 - 1,
+                    ordered.len() as u32 + 1,
+                ] {
+                    let mut request = combined.clone();
+                    request.offset = Some(offset);
+                    let actual = backend.search(&tenant, &request).await.unwrap();
+                    let start = (offset as usize).min(ordered.len());
+                    let end = (start + page_size as usize).min(ordered.len());
+                    assert_eq!(actual.total, Some(ordered.len() as u64));
+                    assert_eq!(ids(&actual), ordered[start..end]);
+                    assert_eq!(actual.resources.page_info.has_next, end < ordered.len());
+                }
+            }
+        }
+    }
+    let mut empty = query
+        .with_parameter(parameter(
+            "_lastUpdated",
+            SearchParamType::Date,
+            "ge2027-01-01",
+        ))
+        .with_sort(SortDirective::parse("_id"))
+        .with_count(20);
+    empty.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &empty).await.unwrap();
+    assert_eq!(result.total, Some(0));
+    assert!(result.resources.items.is_empty());
+    assert!(!result.resources.page_info.has_next);
+
+    // The windowed page path must continue through windows in which every
+    // candidate fails a resource-local predicate, and terminate when exhausted.
+    empty.total = Some(TotalMode::None);
+    let result = backend.search(&tenant, &empty).await.unwrap();
+    assert!(result.resources.items.is_empty());
+    assert!(!result.resources.page_info.has_next);
+    assert_eq!(result.total, None);
+}
+
+/// Admission protects a point read while broad cursor commands occupy the pool.
+/// waitForFailPoint proves the commands hold sockets before the read starts.
+#[tokio::test]
+async fn mongodb_broad_search_admission_protects_reads() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping mongodb_broad_search_admission_protects_reads (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    for (limit, total) in [
+        (1, None),
+        (2, None),
+        (1, Some(TotalMode::Accurate)),
+        (2, Some(TotalMode::Accurate)),
+    ] {
+        let app = format!("admission-{limit}-{}", uuid::Uuid::new_v4());
+        let Some(backend) = build_backend(MongoBackendConfig {
+            connection_string: connection_string.clone(),
+            database_name: build_test_database_name(&format!("admission_{limit}")),
+            app_name: Some(app.clone()),
+            max_connections: Some(2),
+            broad_search_concurrency: Some(limit),
+            data_dir: Some(repo_data_dir()),
+            ..Default::default()
+        })
+        .await
+        else {
+            eprintln!(
+                "Skipping mongodb_broad_search_admission_protects_reads (MongoDB unavailable)"
+            );
+            return;
+        };
+        let backend = Arc::new(backend);
+        let tenant = create_tenant("admission");
+        let mut read_id = String::new();
+        for _ in 0..600 {
+            let patient = backend
+                .seed_create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "gender":"female"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            read_id = patient.id().to_string();
+        }
+        let mut query = SearchQuery::new("Patient");
+        query.parameters.push(SearchParameter {
+            name: "gender".into(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        });
+        query.total = total;
+        let failpoint = bulk_submit::FailPoint::enable(
+            &app,
+            doc! {"failCommands": ["getMore"], "blockConnection": true, "blockTimeMS": 3000},
+            doc! {"times": limit as i32},
+        )
+        .await
+        .expect("enableTestCommands required");
+        let mut searches = Vec::new();
+        for _ in 0..2 {
+            let (backend, tenant, query) = (backend.clone(), tenant.clone(), query.clone());
+            searches.push(tokio::spawn(async move {
+                backend.search(&tenant, &query).await
+            }));
+        }
+        failpoint.wait_until_entered(limit as i64).await;
+        let read = backend.read(&tenant, "Patient", &read_id);
+        tokio::pin!(read);
+        if limit == 1 {
+            let resource = tokio::time::timeout(Duration::from_secs(1), &mut read)
+                .await
+                .expect("point read should have a free connection")
+                .unwrap();
+            assert_eq!(resource.unwrap().id(), read_id);
+            assert!(searches.iter().all(|task| !task.is_finished()));
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut read)
+                    .await
+                    .is_err(),
+                "both pool connections should be occupied"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), &mut read)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .id(),
+                read_id
+            );
+        }
+        failpoint.off().await;
+        for search in searches {
+            let result = tokio::time::timeout(Duration::from_secs(15), search)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.total, total.map(|_| 600));
+        }
+    }
+}
+
+/// Separate page and total work reuse each predicate observation, including a
+/// repeated parameter, while retaining every predicate in actual matching.
+#[tokio::test]
+async fn mongodb_request_reuses_page_probes_for_separate_total() {
+    use tracing::instrument::WithSubscriber;
+    // The default probe timeout is short enough that a loaded host times
+    // probes out and changes the plan; a generous one keeps the counts fixed.
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("request_probes"),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("request-probes");
+    for number in 0..20 {
+        backend.seed_create(&tenant, "Observation", json!({
+            "resourceType":"Observation", "id":format!("p{number:02}"),
+            "status":"final", "code":{"coding":[{"system":"urn:request-probes", "code":"base"}]},
+        }), FhirVersion::default()).await.unwrap();
+    }
+    let token = |name: &str, value: &str| SearchParameter {
+        name: name.into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let mut query = SearchQuery::new("Observation")
+        .with_count(5)
+        .with_sort(SortDirective::parse("_lastUpdated"))
+        .with_parameter(token("code", "urn:request-probes|base"))
+        .with_parameter(token("status", "final"))
+        .with_parameter(token("code", "urn:request-probes|base"));
+    query.total = Some(TotalMode::Accurate);
+    let log = PageStrategyLog::default();
+    let result = backend
+        .search(&tenant, &query)
+        .with_subscriber(log.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.total, Some(20));
+    assert_eq!(result.resources.items.len(), 5);
+    assert_eq!(
+        *log.probes.lock().unwrap(),
+        vec![(2, 4)],
+        "two distinct probes, one repeated page predicate and three reused count predicates"
+    );
+}
+
+#[derive(Clone)]
+struct PageStrategyLog {
+    decisions: Arc<std::sync::Mutex<Vec<(String, u64, bool)>>>,
+    page_executions: Arc<std::sync::atomic::AtomicUsize>,
+    probes: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Default for PageStrategyLog {
+    fn default() -> Self {
+        pin_tracing_interest();
+        Self {
+            decisions: Default::default(),
+            page_executions: Default::default(),
+            probes: Default::default(),
+        }
+    }
+}
+
+/// `tracing-core` caches a callsite's interest when it first runs. While at
+/// most one dispatcher is registered it asks only the running thread's
+/// default, so another test's search can cache `never` for an event that a
+/// scoped `PageStrategyLog` on this thread is waiting for (#1942). Two
+/// permanent dispatchers that answer `sometimes` keep every registration on
+/// the full list and leave each event to the dispatcher current when it fires.
+fn pin_tracing_interest() {
+    static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(SometimesInterest),
+            tracing::Dispatch::new(SometimesInterest),
+        ]
+    });
+}
+
+struct SometimesInterest;
+
+impl tracing::Subscriber for SometimesInterest {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    // Leaves the global max level to the dispatchers that record events.
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::OFF)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[derive(Default)]
+struct PageStrategyVisitor {
+    strategy: Option<String>,
+    live_matches: Option<u64>,
+    cached: Option<bool>,
+    probe_requests: Option<u64>,
+    probe_reuses: Option<u64>,
+}
+
+impl tracing::field::Visit for PageStrategyVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "page_strategy" {
+            self.strategy = Some(value.to_string());
+        }
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "live_matches" => self.live_matches = Some(value),
+            "probe_requests" => self.probe_requests = Some(value),
+            "probe_reuses" => self.probe_reuses = Some(value),
+            _ => {}
+        }
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "cached" {
+            self.cached = Some(value);
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl tracing::Subscriber for PageStrategyLog {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "helios_mongodb_page"
+            || metadata.target() == "helios_mongodb_plan"
+            || (metadata.is_span() && metadata.name() == "execute_page")
+    }
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::DEBUG)
+    }
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        if attributes.metadata().name() == "execute_page" {
+            self.page_executions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = PageStrategyVisitor::default();
+        event.record(&mut visitor);
+        if let (Some(requests), Some(reuses)) = (visitor.probe_requests, visitor.probe_reuses) {
+            self.probes.lock().unwrap().push((requests, reuses));
+        }
+        if let Some(strategy) = visitor.strategy {
+            self.decisions.lock().unwrap().push((
+                strategy,
+                visitor.live_matches.unwrap(),
+                visitor.cached.unwrap(),
+            ));
+        }
+    }
+}
+
+/// `PUT`/`DELETE Type?criteria` entries resolve on the transaction's session:
+/// no match creates, one match updates or deletes, several roll the bundle
+/// back, and a `urn:uuid` reference to the conditional entry resolves either way.
+#[tokio::test]
+async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
+    const TEST: &str = "mongodb_integration_transaction_bundle_conditional_url_entries";
+    let Some(backend) = create_backend_with_full_registry("bundle_conditional_url_entries").await
+    else {
+        eprintln!("Skipping {TEST} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-bundle-conditional-url");
+    let criteria_url = "Patient?identifier=http://example.org/mrn|MRN-TX-URL-1";
+    let criteria = conditional_url_suite::with_typed_criteria(
+        &backend,
+        &tenant,
+        BundleEntry {
+            url: criteria_url.to_string(),
+            ..Default::default()
+        },
+    )
+    .criteria;
+    let patient = |family: &str| {
+        json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-URL-1"}],
+            "name": [{"family": family}]
+        })
+    };
+    let put_and_observe = |family: &str| {
+        vec![
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: criteria_url.to_string(),
+                criteria: criteria.clone(),
+                resource: Some(patient(family)),
+                full_url: Some("urn:uuid:patient".to_string()),
+                ..Default::default()
+            },
+            BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                    "subject": {"reference": "urn:uuid:patient"}
+                })),
+                ..Default::default()
+            },
+        ]
+    };
+
+    let Some(created) =
+        process_transaction_or_skip(&backend, &tenant, put_and_observe("Created"), TEST).await
+    else {
+        return;
+    };
+    assert_eq!(created.entries[0].status, 201);
+    assert_eq!(created.entries[0].effect, BundleEntryEffect::Created);
+    let id = created.entries[0].resource.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        created.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that created resolves to the new id"
+    );
+
+    let updated = backend
+        .process_transaction(&tenant, put_and_observe("Updated"), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(updated.entries[0].status, 200);
+    assert_eq!(updated.entries[0].effect, BundleEntryEffect::Updated);
+    assert_eq!(updated.entries[0].resource.as_ref().unwrap()["id"], id);
+    assert_eq!(
+        updated.entries[0].resource.as_ref().unwrap()["meta"]["versionId"],
+        "2"
+    );
+    assert_eq!(
+        updated.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that matched resolves to the match"
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    assert_eq!(
+        backend.count(&tenant, Some("Observation")).await.unwrap(),
+        2
+    );
+
+    let delete = || {
+        vec![BundleEntry {
+            method: BundleMethod::Delete,
+            url: criteria_url.to_string(),
+            criteria: criteria.clone(),
+            ..Default::default()
+        }]
+    };
+    let deleted = backend
+        .process_transaction(&tenant, delete(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.entries[0].status, 204);
+    assert_eq!(deleted.entries[0].effect, BundleEntryEffect::Deleted);
+    // A soft delete answers `Gone` on this backend.
+    assert!(
+        matches!(
+            backend.read(&tenant, "Patient", &id).await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the matched Patient must be gone"
+    );
+    let deleted_again = backend
+        .process_transaction(&tenant, delete(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted_again.entries[0].status, 204);
+    assert_eq!(deleted_again.entries[0].effect, BundleEntryEffect::NotFound);
+
+    for family in ["One", "Two"] {
+        backend
+            .seed_create(&tenant, "Patient", patient(family), FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let ambiguous = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "name": [{"family": "Plain"}]})),
+            ..Default::default()
+        },
+        BundleEntry {
+            method: BundleMethod::Put,
+            url: criteria_url.to_string(),
+            criteria: criteria.clone(),
+            resource: Some(patient("Ambiguous")),
+            ..Default::default()
+        },
+    ];
+    let error = backend
+        .process_transaction(&tenant, ambiguous, FhirVersion::default())
+        .await
+        .expect_err("two matches must fail the bundle");
+    match error {
+        TransactionError::MultipleMatches { operation, count } => {
+            assert_eq!(operation, "update");
+            assert_eq!(count, 2);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        2,
+        "the ambiguous transaction must not persist the plain create"
+    );
+}
+
+#[path = "mongodb/covered_membership.rs"]
+mod covered_membership;
+
+/// #1896: composites, `:identifier` and compartments on the bounded plans;
+/// the pair check's hint; the ignored over-cap harness.
+#[path = "mongodb/composite_plan.rs"]
+mod composite_plan;
+
+/// `tuple_code` of token+quantity composites and the one-scan search it enables.
+#[path = "mongodb/composite_tuple.rs"]
+mod composite_tuple;
+
+/// #2254: searches and view runs restricted to one stored FHIR version. The
+/// same type is stored under R4 and R5, so both features are needed.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "mongodb/fhir_version_filter.rs"]
+mod fhir_version_filter;
+
+/// The backend-agnostic FHIR version filter suite (#2254), run by
+/// `fhir_version_filter::mongodb_search_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// The backend-agnostic SoF runner check for the FHIR version filter (#2254),
+/// run by `fhir_version_filter::mongodb_sof_runner_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
+#[path = "mongodb/transaction_regressions.rs"]
+mod transaction_regressions;
+
+/// Runs one `bundle_identity_suite` scenario on a backend with the full
+/// registry, skipped where transactions are unavailable.
+macro_rules! mongodb_bundle_identity_test {
+    ($test_name:ident, $scenario:ident) => {
+        #[tokio::test]
+        async fn $test_name() {
+            let Some(backend) = create_backend_with_full_registry(stringify!($scenario)).await
+            else {
+                eprintln!(
+                    "Skipping {} (requires Docker or HFS_TEST_MONGODB_URL)",
+                    stringify!($test_name)
+                );
+                return;
+            };
+            let tenant = create_tenant(concat!("tenant-identity-", stringify!($scenario)));
+            if process_transaction_or_skip(&backend, &tenant, vec![], stringify!($test_name))
+                .await
+                .is_none()
+            {
+                return;
+            }
+            bundle_identity_suite::$scenario(&backend, &tenant).await;
+        }
+    };
+}
+
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_instance_put,
+    post_resolves_a_later_instance_put
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_conditional_put_that_creates,
+    post_resolves_a_later_conditional_put_that_creates
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_post,
+    post_resolves_a_later_post
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_if_none_exist_match,
+    post_resolves_a_later_if_none_exist_match
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_put_then_patch_on_one_id_rolls_back,
+    put_then_patch_on_one_id_rolls_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_two_puts_on_one_id_roll_back,
+    two_puts_on_one_id_roll_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_conditional_delete_without_a_match_reports_not_found,
+    conditional_delete_without_a_match_reports_not_found
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_instance_delete_with_nothing_to_delete_reports_not_found,
+    instance_delete_with_nothing_to_delete_reports_not_found
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
+    changed_conditional_target_after_a_written_reference_rolls_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_put_over_a_deleted_id_restores_it,
+    put_over_a_deleted_id_restores_it
+);
+
+#[path = "mongodb/missing_index.rs"]
+mod missing_index;
+
+/// #2006: write, storage and cache cost of `missing_params` metadata.
+#[path = "mongodb/missing_params_cost_bench.rs"]
+mod missing_params_cost_bench;
+
+/// #2004: positive filters combined with metadata `:missing=true` at volume.
+#[path = "mongodb/missing_positive_bench.rs"]
+mod missing_positive_bench;
+
+/// #2285: complement and unfiltered parameter-sort measurement harness.
+#[path = "mongodb/complement_sort_bench.rs"]
+mod complement_sort_bench;
+
+/// #2285: an unfiltered `_sort` by a search parameter has no cursor, so its
+/// offset is bounded: a window reaching past the 300,000-id cap answers
+/// `TooManyResults` (HTTP 422) instead of ordering the whole type. Windows
+/// within the cap keep the ordering, `has_next` and `total` of before.
+#[tokio::test]
+async fn mongodb_integration_unfiltered_param_sort_is_bounded() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+        eprintln!(
+            "Skipping mongodb_integration_unfiltered_param_sort_is_bounded (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-param-sort-bounded");
+    // Dates ascending by number, except 3 and 6, which have none and sort last
+    // in id order.
+    for number in 1..=7 {
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": format!("psb-{number}"),
+            "name": [{"family": format!("Psb-{number}")}],
+        });
+        if number != 3 && number != 6 {
+            resource["birthDate"] = json!(format!("19{:02}-01-01", 70 + number));
+        }
+        backend
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let sort =
+        |value: &str| SortDirective::parse(value).with_param_type(Some(SearchParamType::Date));
+    let page = |sort_value: &str, count: u32, offset: u32| {
+        let mut query = SearchQuery::new("Patient")
+            .with_sort(sort(sort_value))
+            .with_count(count);
+        query.offset = Some(offset);
+        query.total = Some(TotalMode::Accurate);
+        query
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // Ascending, three pages: keyed rows first, the keyless tail in id order.
+    let expected = [
+        "psb-1", "psb-2", "psb-4", "psb-5", "psb-7", "psb-3", "psb-6",
+    ];
+    for (offset, has_next) in [(0u32, true), (3, true), (6, false)] {
+        let result = backend
+            .search(&tenant, &page("birthdate", 3, offset))
+            .await
+            .unwrap();
+        let start = offset as usize;
+        assert_eq!(
+            ids(&result),
+            expected[start..(start + 3).min(expected.len())],
+            "offset {offset}"
+        );
+        assert_eq!(
+            result.resources.page_info.has_next, has_next,
+            "offset {offset}"
+        );
+        assert_eq!(result.resources.page_info.has_previous, offset > 0);
+        assert_eq!(result.total, Some(7), "offset {offset}");
+    }
+
+    // Descending: the keyed rows reverse, the keyless ones still come last.
+    let result = backend
+        .search(&tenant, &page("-birthdate", 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(ids(&result), ["psb-7", "psb-5", "psb-4", "psb-2", "psb-1"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(7));
+
+    // A window ending exactly at the cap is served; one past it is refused.
+    let result = backend
+        .search(&tenant, &page("birthdate", 100, 299_900))
+        .await
+        .unwrap();
+    assert!(ids(&result).is_empty());
+    assert!(!result.resources.page_info.has_next);
+    let err = backend
+        .search(&tenant, &page("birthdate", 101, 299_900))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(helios_persistence::error::SearchError::TooManyResults {
+                max: 300_000,
+                ..
+            })
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[path = "mongodb/reindex_failures.rs"]
+mod reindex_failures;
+
+#[path = "mongodb/tenant_purge_races.rs"]
+mod tenant_purge_races;
+
+// ============================================================================
+// T2 cluster suite — F5 resource version-id race (restore path).
+// ============================================================================
+//
+// Two independently constructed `MongoBackend`s on ONE database play
+// "instance A" and "instance B"; `create_backend` mints a fresh database per
+// call, so the second handle is built from the first's config instead. Mongo's
+// restore was already a version-guarded CAS; what these rows pin is that a
+// lost race is *retried* by `create_or_update` rather than surfacing a 404 on
+// a PUT, and that the loser reports `VersionConflict` with the stored version.
+
+use cluster_harness as harness;
+
+/// Two fresh handles, one database. `None` when Mongo is unavailable (the
+/// suite's usual skip convention).
+async fn two_mongo_handles(test_name: &str) -> Option<(MongoBackend, MongoBackend)> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let a = build_backend(MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name(test_name),
+        max_connections: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let b = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: a.config().database_name.clone(),
+        max_connections: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    Some((a, b))
+}
+
+/// Asserts a resource's history holds every version exactly once,
+/// contiguous from 1 — no duplicate version_ids, no lost history rows.
+async fn assert_mongo_history_versions(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    expected_len: u64,
+) {
+    let history = backend
+        .history_instance(
+            tenant,
+            resource_type,
+            id,
+            &HistoryParams::new().include_deleted(true),
+        )
+        .await
+        .unwrap();
+    let mut versions: Vec<u64> = history
+        .items
+        .iter()
+        .map(|e| e.resource.version_id().parse().unwrap())
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        (1..=expected_len).collect::<Vec<_>>(),
+        "history must hold every version exactly once"
+    );
+}
+
+/// Creates a Patient and soft-deletes it, returning its id: version 1 is the
+/// create, version 2 the tombstone.
+async fn seed_mongo_tombstone(backend: &MongoBackend, tenant: &TenantContext) -> String {
+    let created = backend
+        .seed_create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .seed_delete(tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    created.id().to_string()
+}
+
+/// DoD rows (F5, restore path): two instances race unconditional PUTs onto
+/// one soft-deleted id; both succeed (winner restores, loser converges through
+/// the update arm), history is contiguous 1..=4 and the newest entry carries
+/// the live body. Without the retry the loser's CAS miss surfaced as a 404.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_race_keeps_history_coherent() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_race").await else {
+        return;
+    };
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    let tenant = create_tenant("cluster-f5-restore");
+
+    for round in 0..5 {
+        let id = seed_mongo_tombstone(&a, &tenant).await;
+
+        let (ra, rb) = (Arc::clone(&a), Arc::clone(&b));
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                ra.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                rb.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) =
+            res_a.unwrap_or_else(|e| panic!("round {round}: PUT via A must succeed: {e:?}"));
+        let (stored_b, created_b) =
+            res_b.unwrap_or_else(|e| panic!("round {round}: PUT via B must succeed: {e:?}"));
+
+        let restored = |flag: bool| flag.then_some(());
+        harness::assert_exactly_one(
+            &restored(created_a),
+            &restored(created_b),
+            &format!("round {round}: the restore of one tombstone"),
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "round {round}: racing writers must never assign the same version"
+        );
+
+        let current = a.read(&tenant, "Patient", &id).await.unwrap().unwrap();
+        assert_eq!(current.version_id(), "4", "round {round}");
+        assert!(!current.is_deleted(), "round {round}");
+        assert_mongo_history_versions(&b, &tenant, "Patient", &id, 4).await;
+
+        let history = b
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let newest = history
+            .items
+            .iter()
+            .max_by_key(|e| e.resource.version_id().parse::<u64>().unwrap())
+            .unwrap();
+        assert_eq!(
+            newest.resource.content(),
+            current.content(),
+            "round {round}: newest history entry must carry the live body"
+        );
+    }
+}
+
+/// DoD row (F5, restore path): isolation — a PUT onto the same id under
+/// another tenant creates a fresh version-1 resource there and leaves the
+/// first tenant's tombstone untouched.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_restores() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_iso").await else {
+        return;
+    };
+    let tenant = create_tenant("cluster-f5-restore-iso");
+    let id = seed_mongo_tombstone(&a, &tenant).await;
+
+    let other = create_tenant("cluster-f5-restore-other");
+    let (stored, created) = b
+        .create_or_update(
+            &other,
+            "Patient",
+            &id,
+            json!({"resourceType": "Patient", "name": [{"family": "Other"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert!(created, "the other tenant must get a fresh resource");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(stored.tenant_id().as_str(), other.tenant_id().as_str());
+
+    match a.read(&tenant, "Patient", &id).await {
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        got => panic!("first tenant's resource must still be deleted, got {got:?}"),
+    }
+    assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
+}
+
+/// Every index the search offload leaves unused, as `(collection, name)` pairs
+/// that the standalone boot builds (`IndexBuildMode::Inline` in these tests).
+async fn search_side_index_names(
+    backend: &MongoBackend,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    (
+        index_names(&db, "search_index").await,
+        index_names(&db, "search_index_contained").await,
+        index_names(&db, "resources").await,
+    )
+}
+
+/// With search offloaded to Elasticsearch (mongo-es), a fresh boot builds none
+/// of the `search_index` / `search_index_contained` indexes nor
+/// `idx_resources_missing_params(_fp)`, both builders report `Skipped`, and
+/// readiness does not require any of them (#2289).
+#[tokio::test]
+async fn mongodb_integration_offloaded_boot_skips_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("offloaded_boot_skips_search_indexes", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index indexes, got {search:?}"
+    );
+    assert!(
+        contained.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index_contained indexes, got {contained:?}"
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|n| n.starts_with("idx_resources_missing_params")),
+        "offloaded boot must not build the missing_params indexes, got {resources:?}"
+    );
+    // The CRUD indexes are still there.
+    assert!(resources.contains(&"idx_resources_identity".to_string()));
+    assert!(resources.contains(&"idx_resources_type_scan".to_string()));
+
+    assert!(matches!(
+        backend.wait_for_search_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("an offloaded node is ready without the search-side indexes");
+
+    // The CRUD indexes remain required.
+    drop_test_index(&backend, "resources", "idx_resources_type_scan").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_type_scan"
+    );
+}
+
+/// The standalone counterpart: the same boot builds the search-side indexes and
+/// readiness still requires them, so dropping one makes the node not ready.
+#[tokio::test]
+async fn mongodb_integration_standalone_boot_keeps_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("standalone_boot_keeps_search_indexes", false).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(
+        resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("standalone node is ready");
+
+    drop_test_index(&backend, "search_index", "idx_search_composite").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: search_index.idx_search_composite"
+    );
+    backend.init_schema().await.expect("recreate");
+    drop_test_index(&backend, "resources", "idx_resources_missing_params").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_missing_params"
+    );
+}
+
+/// Switching a database from mongo-es to the standalone backend (#2289): the
+/// standalone boot rebuilds the search-side indexes by itself, searches see
+/// nothing until `$reindex` (the offloaded writes never wrote search rows), and
+/// after `$reindex` search and `:missing` answer correctly.
+#[tokio::test]
+async fn mongodb_integration_offloaded_to_standalone_switch_rebuilds_and_reindexes() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("offloaded_to_standalone_switch", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-offloaded-switch");
+    for (id, gender) in [("sw-male", Some("male")), ("sw-nogender", None)] {
+        let mut patient = json!({"resourceType": "Patient", "id": id});
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        offloaded
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let (search, _, resources) = search_side_index_names(&offloaded).await;
+    assert!(search.iter().all(|n| n == "_id_"), "{search:?}");
+    assert!(
+        !resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+
+    // The same database, now booted as the standalone backend.
+    let mut config = offloaded.config().clone();
+    config.search_offloaded = false;
+    drop(offloaded);
+    let Some(standalone) = build_backend(config).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    // The boot recreated every index the standalone backend reads and requires.
+    let (search, contained, resources) = search_side_index_names(&standalone).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(matches!(
+        standalone.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    assert!(matches!(
+        standalone.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    let (_, _, resources_after) = search_side_index_names(&standalone).await;
+    assert!(
+        resources_after.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?} -> {resources_after:?}"
+    );
+    ResourceStorage::readiness_check(&standalone)
+        .await
+        .expect("the standalone node is ready after the switch");
+
+    let gender = |modifier, value: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    // Before `$reindex` the search rows do not exist.
+    let before = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert!(ids(&before).is_empty(), "{:?}", ids(&before));
+
+    let registries = standalone.tenant_registries().clone();
+    let standalone = Arc::new(standalone);
+    let reindex = ReindexOperation::new(standalone.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    let found = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec!["sw-male"]);
+    let missing = standalone
+        .search(&tenant, &gender(Some(SearchModifier::Missing), "true"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&missing), vec!["sw-nogender"]);
 }

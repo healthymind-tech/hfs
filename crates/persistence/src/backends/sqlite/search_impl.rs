@@ -4,11 +4,11 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
-//!   query whose chains were not resolved first (#1389)
+//! - `search()` refuses a query whose chains were not resolved first by the
+//!   shared resolver (`crate::search::resolve_chains`, #1389)
 //! - Search parameter filtering using the search_index table
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -16,18 +16,21 @@ use helios_fhir::FhirVersion;
 use rusqlite::params;
 
 use crate::core::{
-    ChainedSearchProvider, DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider,
-    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult,
+    DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo,
-    ReverseChainedParameter, SearchQuery, SearchValue, StoredResource,
+    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, SearchQuery,
+    SearchValue, StoredResource,
 };
 
 use super::SqliteBackend;
-use super::search::{FilterPart, KeysetKey, Membership, QueryBuilder, SortValueKind, SqlParam};
+use super::search::{
+    KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
+    membership_exists_predicate,
+};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -50,6 +53,7 @@ fn internal_error(message: String) -> StorageError {
 /// (#1293, #1295), so the shared date gate runs here too: an invalid value is
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+    use crate::types::{ContainedMode, SearchModifier, SearchParamType};
     crate::search::reject_unsupported_metadata_modifier(query)?;
     crate::search::validate_date_values(query)?;
     // And a number or quantity value that is not a number (#1319, #1340).
@@ -57,6 +61,49 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
     crate::search::validate_value_presence(query)?;
+    // And a composite value with the wrong number of `$`-separated parts
+    // (`code-value-quantity=8302-2`): the builder matched nothing, MongoDB
+    // answered 400 (#1236). After the empty-value check, which owns an
+    // empty alternative.
+    crate::search::validate_composite_values(query)?;
+    for parameter in &query.parameters {
+        if parameter.param_type != SearchParamType::Composite
+            || (query.contained == ContainedMode::Off
+                && matches!(parameter.modifier, Some(SearchModifier::Missing)))
+        {
+            continue;
+        }
+        for family in parameter
+            .components
+            .iter()
+            .map(|component| component.param_type)
+            .collect::<HashSet<_>>()
+        {
+            let count = parameter
+                .components
+                .iter()
+                .filter(|component| component.param_type == family)
+                .count();
+            if count > 1
+                && (count > u8::MAX as usize
+                    || !matches!(
+                        family,
+                        SearchParamType::Token
+                            | SearchParamType::Number
+                            | SearchParamType::Quantity
+                            | SearchParamType::String
+                            | SearchParamType::Date
+                    ))
+            {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' has unsupported repeated {family:?} components ({count}) on SQLite",
+                        parameter.name
+                    ),
+                }));
+            }
+        }
+    }
     // And a chain nobody resolved (#1389).
     reject_unresolved_chains(query)
 }
@@ -99,10 +146,159 @@ fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     QueryBuilder::reject_unsupported_contained(query).map_err(StorageError::Search)
 }
 
+/// Old unfolded rows cannot prove the order of repeated component types.
+/// Probe by parameter, before paging or count-zero shortcuts, using the
+/// caller's connection so conditional transactions see their own index state.
+fn legacy_composite_probe_sql(
+    conn: &rusqlite::Connection,
+    contained: bool,
+) -> StorageResult<String> {
+    use rusqlite::OptionalExtension;
+    let (type_column, scope, index) = if contained {
+        (
+            "contained_type",
+            "is_contained = 1",
+            "idx_search_contained_composite_legacy",
+        )
+    } else {
+        (
+            "resource_type",
+            "is_contained = 0",
+            "idx_search_composite_legacy",
+        )
+    };
+    // The broader contained index can win the equality-prefix heuristic and
+    // visit every row after reindex. Prefer the sparse probe explicitly, but
+    // preserve correct reads while bulk rebuild temporarily drops it.
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            [index],
+            |_| Ok(()),
+        )
+        .optional()
+        .or_query_error("Failed to read composite probe index metadata")?
+        .is_some();
+    let hint = if exists {
+        format!(" INDEXED BY {index}")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "SELECT 1 FROM search_index{hint} WHERE tenant_id = ?1 AND {type_column} = ?2 \
+                AND param_name = ?3 AND {scope} AND composite_group IS NOT NULL \
+                AND composite_slot IS NULL LIMIT 1"
+    ))
+}
+
+fn reject_legacy_composites(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<()> {
+    use crate::types::{ContainedMode, SearchModifier, SearchParamType};
+
+    for parameter in &query.parameters {
+        if parameter.param_type != SearchParamType::Composite
+            // Ordinary :missing tests presence only, without component order.
+            || (query.contained == ContainedMode::Off
+                && matches!(parameter.modifier, Some(SearchModifier::Missing)))
+            || !parameter
+                .components
+                .iter()
+                .enumerate()
+                .any(|(position, component)| {
+                    parameter.components[..position]
+                        .iter()
+                        .any(|earlier| earlier.param_type == component.param_type)
+                })
+        {
+            continue;
+        }
+        for contained in [false, true] {
+            if (contained && query.contained == ContainedMode::Off)
+                || (!contained && query.contained == ContainedMode::On)
+            {
+                continue;
+            }
+            let sql = legacy_composite_probe_sql(conn, contained)?;
+            let legacy = run_legacy_composite_probe(
+                conn,
+                &sql,
+                tenant.tenant_id().as_str(),
+                &query.resource_type,
+                &parameter.name,
+            )
+            .or_query_error("Failed to probe legacy composite index rows")?;
+            if legacy.is_some() {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' requires $reindex: older SQLite composite index rows lack component slots; update all writers and reindex the full tenant",
+                        parameter.name
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_legacy_composite_probe(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    tenant: &str,
+    resource_type: &str,
+    parameter: &str,
+) -> rusqlite::Result<Option<()>> {
+    use rusqlite::OptionalExtension;
+    let probe = |sql: &str| {
+        conn.query_row(sql, params![tenant, resource_type, parameter], |_| Ok(()))
+            .optional()
+    };
+    match probe(sql) {
+        Err(error) => {
+            // A bulk rebuild can drop the index after the metadata read. Retry
+            // only that exact missing-index error, leaving every other failure
+            // visible. A transaction that holds a schema snapshot needs no retry.
+            let missing = match &error {
+                rusqlite::Error::SqliteFailure(_, Some(message)) => {
+                    message.strip_prefix("no such index: ").filter(|name| {
+                        matches!(
+                            *name,
+                            "idx_search_composite_legacy" | "idx_search_contained_composite_legacy"
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some(index) = missing {
+                let hint = format!(" INDEXED BY {index}");
+                if sql.contains(&hint) {
+                    return probe(&sql.replace(&hint, ""));
+                }
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+/// ` AND <column> = '<version>'` restricting a `resources` scan to the
+/// FHIR version the query names (#2254), or empty for a version-blind query,
+/// whose SQL text then stays exactly as before. The value comes from a closed
+/// enum ([`helios_fhir::FhirVersion::as_mime_param`]), so the inlined literal
+/// cannot carry anything but `4.0`, `4.3`, `5.0` or `6.0`.
+fn fhir_version_clause(query: &SearchQuery, column: &str) -> String {
+    query
+        .stored_fhir_version()
+        .map(|v| format!(" AND {column} = '{v}'"))
+        .unwrap_or_default()
+}
+
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
 /// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
 /// is a bad request (400), not a server fault (#1120).
-fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
     StorageError::Search(SearchError::InvalidCursor {
         cursor: cursor.encode(),
     })
@@ -184,261 +380,6 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
     }
 }
 
-/// A membership listing at most this many `search_index` rows drives the
-/// search: the outer query looks each candidate up by rowid and sorts them,
-/// instead of walking every resource of the type in sort order until a page
-/// of matches turns up.
-///
-/// Measured on the 527k-resource benchmark database (Observation, `_count=50`,
-/// warm): looking up and sorting N candidates costs ~10 µs each; the ordered
-/// walk costs ~15 ms for a set of any size up to a few thousand, more for a
-/// rare one (61 ms for 5 matches, which it has to look past every row of the
-/// type to find). They cross at about a thousand rows.
-const DRIVE_MAX_ROWS: usize = 1_000;
-
-/// When no membership is selective enough to drive, each is counted up to
-/// this many rows to choose the smallest one to materialise (the rest are
-/// probed per candidate). Counting reads only index entries.
-const PICK_MAX_ROWS: usize = 50_000;
-
-/// How a search's filter joins the outer `resources` query; see
-/// [`plan_filter`].
-pub(crate) struct FilterPlan {
-    /// Conditions to append to the outer `WHERE`, each starting with ` AND `.
-    pub clause: String,
-    /// The values the clause binds, in placeholder order, after the outer
-    /// query's own leading parameters.
-    pub params: Vec<SqlParam>,
-    /// The driving membership is selective: the outer query must reach rows
-    /// through it (by rowid) rather than through a `resources` index.
-    pub drive: bool,
-}
-
-fn sql_param_value(param: &SqlParam) -> rusqlite::types::Value {
-    use rusqlite::types::Value;
-    match param {
-        SqlParam::String(s) => Value::Text(s.clone()),
-        SqlParam::Integer(i) => Value::Integer(*i),
-        SqlParam::Float(f) => Value::Real(*f),
-        SqlParam::Null => Value::Null,
-    }
-}
-
-/// What a key probe read: the matching rows' `resource_key`s and how many
-/// rows it read.
-struct ProbedKeys {
-    /// The keys, in index order. A row without a `resource_key` names no
-    /// resource (`rowid IN` never matched it either) and is left out.
-    keys: Vec<i64>,
-    /// Rows read, keyed or not; at most the probe's cap plus one.
-    rows: usize,
-}
-
-/// The `resource_key`s `m` matches, stopping after `cap + 1` rows.
-///
-/// `values` holds every value of the outer statement in placeholder order;
-/// the probe binds the prefix its own highest placeholder needs (the outer
-/// query's other leading values, e.g. a cursor's, are bound but unused).
-fn probe_membership_keys(
-    conn: &rusqlite::Connection,
-    m: &Membership,
-    values: &[rusqlite::types::Value],
-    cap: usize,
-) -> StorageResult<ProbedKeys> {
-    let sql = format!("SELECT resource_key FROM ({}) LIMIT {}", m.select, cap + 1);
-    let mut stmt = conn
-        .prepare(&sql)
-        .or_query_error("Failed to prepare search filter probe")?;
-    let n = stmt.parameter_count().min(values.len());
-    let read: Vec<Option<i64>> = stmt
-        .query_map(rusqlite::params_from_iter(&values[..n]), |row| row.get(0))
-        .or_query_error("Failed to probe search filter")?
-        .collect::<Result<Vec<_>, _>>()
-        .or_query_error("Failed to read search filter probe")?;
-    Ok(ProbedKeys {
-        rows: read.len(),
-        keys: read.into_iter().flatten().collect(),
-    })
-}
-
-/// Counts the rows `m` matches, stopping at `cap + 1`. Reads index entries
-/// only: `SELECT 1` keeps a token or reference probe inside its covering
-/// index instead of reading each row's `resource_key`.
-fn probe_membership_count(
-    conn: &rusqlite::Connection,
-    m: &Membership,
-    values: &[rusqlite::types::Value],
-    cap: usize,
-) -> StorageResult<usize> {
-    let select = m.select.replace(
-        "SELECT resource_key FROM search_index WHERE ",
-        "SELECT 1 FROM search_index WHERE ",
-    );
-    let sql = format!("SELECT COUNT(*) FROM ({select} LIMIT {})", cap + 1);
-    let mut stmt = conn
-        .prepare(&sql)
-        .or_query_error("Failed to prepare search filter probe")?;
-    let n = stmt.parameter_count().min(values.len());
-    let rows: i64 = stmt
-        .query_row(rusqlite::params_from_iter(&values[..n]), |row| row.get(0))
-        .or_query_error("Failed to probe search filter")?;
-    Ok(rows as usize)
-}
-
-/// Chooses how the search filter `parts` joins an outer query over
-/// `resources` (`FROM resources`, unaliased, with `?1` = tenant and `?2` =
-/// type).
-///
-/// The filter used to be one `rowid IN (SELECT DISTINCT resource_key FROM
-/// search_index WHERE … AND resource_key IN (…) AND resource_key IN (…))`.
-/// SQLite materialises every `IN` list in full, and with no statistics it
-/// always ordered the outer query by walking `idx_resources_reindex`. So
-/// `Observation?patient=X&code=Y` built the list of all 17,837 `code=Y`
-/// Observations to intersect with the patient's 57 (~190 ms), and a query
-/// that matches a handful of rows walked every row of the type to find them.
-///
-/// Now the positive memberships are probed (bounded, from the index), the
-/// smallest becomes the one `rowid IN (…)` list, and every other membership is
-/// a correlated `EXISTS` probe of that candidate's own rows through
-/// `idx_search_composite` (`tenant_id, resource_type, resource_key,
-/// param_name`). The hint is required: left to itself SQLite answers the
-/// `EXISTS` from the value index, re-reading the whole value set per
-/// candidate. When the smallest membership is selective ([`DRIVE_MAX_ROWS`])
-/// the plan says so, and the caller makes the outer query reach rows through
-/// it. Every other condition keeps the original wrapper.
-///
-/// The result set is the same: the wrapper only required that a resource
-/// have some `search_index` row of its type, which any membership implies.
-pub(crate) fn plan_filter(
-    conn: &rusqlite::Connection,
-    parts: Vec<FilterPart>,
-    leading: &[rusqlite::types::Value],
-) -> StorageResult<Option<FilterPlan>> {
-    let mut params: Vec<SqlParam> = Vec::new();
-    let mut memberships: Vec<Membership> = Vec::new();
-    let mut others: Vec<String> = Vec::new();
-    for part in parts {
-        match part {
-            FilterPart::Membership(m) => {
-                params.extend(m.params.iter().cloned());
-                memberships.push(m);
-            }
-            FilterPart::Other(f) => {
-                params.extend(f.params);
-                if !f.sql.is_empty() {
-                    others.push(format!("({})", f.sql));
-                }
-            }
-        }
-    }
-
-    let mut clause = String::new();
-    let mut drive = false;
-    let mut json_keys = None;
-    if !memberships.is_empty() {
-        let values: Vec<rusqlite::types::Value> = leading
-            .iter()
-            .cloned()
-            .chain(params.iter().map(sql_param_value))
-            .collect();
-        let mut keys = Vec::with_capacity(memberships.len());
-        for m in &memberships {
-            keys.push(probe_membership_keys(conn, m, &values, DRIVE_MAX_ROWS)?);
-        }
-        let mut counts: Vec<usize> = keys.iter().map(|k| k.rows).collect();
-        let mut smallest = argmin(&counts);
-        drive = counts[smallest] <= DRIVE_MAX_ROWS;
-        if drive {
-            // The probe already read the whole membership, so the outer query
-            // takes its keys rather than running it a second time: a
-            // membership that cannot seek (a `name` prefix, a `:contains`)
-            // costs one pass over its rows, not two. The probe ran a statement
-            // earlier on this connection; a write committed in between is
-            // seen by the rest of the query but not by this list, exactly as
-            // if the search had started a moment earlier.
-            let json = format!(
-                "[{}]",
-                keys[smallest]
-                    .keys
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            clause.push_str(&format!(
-                " AND rowid IN (SELECT value FROM json_each(?{}))",
-                leading.len() + params.len() + 1
-            ));
-            json_keys = Some(json);
-        } else {
-            if memberships.len() > 1 {
-                counts.clear();
-                for m in &memberships {
-                    counts.push(probe_membership_count(conn, m, &values, PICK_MAX_ROWS)?);
-                }
-                smallest = argmin(&counts);
-            }
-            clause.push_str(&format!(" AND rowid IN ({})", memberships[smallest].select));
-        }
-        for (i, m) in memberships.iter().enumerate() {
-            if i != smallest {
-                clause.push_str(&format!(
-                    " AND EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
-                     WHERE resource_key = resources.rowid AND {})",
-                    m.row_where
-                ));
-            }
-        }
-    }
-    if !others.is_empty() {
-        clause.push_str(&format!(
-            " AND rowid IN (SELECT DISTINCT resource_key FROM search_index \
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-            others.join(" AND ")
-        ));
-    } else if memberships.is_empty() {
-        // Parameters that built no condition still restricted the search to
-        // resources with a `search_index` row of the type; keep that.
-        clause.push_str(
-            " AND rowid IN (SELECT DISTINCT resource_key FROM search_index \
-             WHERE tenant_id = ?1 AND resource_type = ?2)",
-        );
-    }
-    // Bound last: its placeholder was numbered after every part's.
-    params.extend(json_keys.map(SqlParam::String));
-    Ok(Some(FilterPlan {
-        clause,
-        params,
-        drive,
-    }))
-}
-
-/// The outer statement's leading values for [`plan_filter`]'s probes: tenant,
-/// type, then `NULL` for any further leading placeholder (a cursor's), which
-/// no probe reads.
-fn leading_values(
-    tenant_id: &str,
-    resource_type: &str,
-    param_offset: usize,
-) -> Vec<rusqlite::types::Value> {
-    use rusqlite::types::Value;
-    let mut values = vec![
-        Value::Text(tenant_id.to_string()),
-        Value::Text(resource_type.to_string()),
-    ];
-    values.resize(param_offset.max(2), Value::Null);
-    values
-}
-
-fn argmin(counts: &[usize]) -> usize {
-    counts
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, n)| **n)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
 impl SqliteBackend {
     /// The declared target types of the query's reference parameters that
     /// carry a bare-id value, for [`QueryBuilder::with_reference_targets`].
@@ -495,7 +436,39 @@ impl SqliteBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        self.search_with_connection_probe(conn, tenant, query, total, probe_enabled())
+    }
+
+    /// [`Self::search_with_connection`] with the bounded probe forced on or
+    /// off (`HFS_SQLITE_SEARCH_PROBE` decides in production).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_with_connection_probe(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        probe: bool,
+    ) -> StorageResult<SearchResult> {
+        with_composite_rewrite(conn, query, |rewrite| {
+            self.search_with_connection_plan(conn, tenant, query, total, probe, rewrite)
+        })
+    }
+
+    /// [`Self::search_with_connection_probe`] with the code-first composite
+    /// pairing forced on or off.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_with_connection_plan(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        probe: bool,
+        composite_rewrite: bool,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(query)?;
+        reject_legacy_composites(conn, tenant, query)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -522,26 +495,62 @@ impl SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let plan = if !query.parameters.is_empty() || query.compartment.is_some() {
+        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
+                .with_composite_rewrite(composite_rewrite)
                 .with_reference_targets(self.reference_targets(tenant_id, query));
-            plan_filter(
-                conn,
-                builder.build_parts(query),
-                &leading_values(tenant_id, resource_type, param_offset),
-            )?
+            let fragment = builder.build(query)?;
+            if !fragment.sql.is_empty() {
+                Some(fragment)
+            } else {
+                None
+            }
         } else {
             None
         };
-        // A selective filter drives: `+` keeps the planner off the `resources`
-        // indexes so it reaches the rows by rowid through the filter.
-        let scope = if plan.as_ref().is_some_and(|p| p.drive) {
-            "+tenant_id = ?1 AND +resource_type = ?2"
-        } else {
-            "tenant_id = ?1 AND resource_type = ?2"
+        let mut filter_clause = search_filter
+            .as_ref()
+            .map(|f| format!(" AND rowid IN ({})", f.sql))
+            .unwrap_or_default();
+        let first_page_source = first_page_source(search_filter.is_some(), query, count);
+        // A version-restricted search (#2254) adds its predicate to the page
+        // statements below and skips the probe and its early-exit windows,
+        // which read the index rows / newest resources without it.
+        let version_clause = fhir_version_clause(query, "fhir_version");
+        let probe = probe && query.fhir_version.is_none();
+        // First page of a one-parameter membership search: the probe may pick
+        // a cheaper plan for it (same rows, same order).
+        let mut probed_keys: Option<Vec<i64>> = None;
+        let first_page_plan = match &search_filter {
+            Some(f)
+                if probe
+                    && cursor.is_none()
+                    && query.offset.is_none()
+                    && query.sort.is_empty()
+                    && query.compartment.is_none()
+                    && query.parameters.len() == 1
+                    && count > 1 =>
+            {
+                let (plan, keys) =
+                    probe_first_page(conn, tenant_id, resource_type, &f.sql, &f.params);
+                if plan == FirstPagePlan::ListDriven {
+                    probed_keys = Some(keys);
+                }
+                plan
+            }
+            _ => FirstPagePlan::Planner,
         };
-        let (filter_clause, search_params) = plan.map(|p| (p.clause, p.params)).unwrap_or_default();
+        // A short key list is already in hand: the page reads those rows by
+        // rowid instead of evaluating the filter a second time (a pairing of
+        // token and quantity rows costs as much as the probe did).
+        if let Some(keys) = &probed_keys {
+            let placeholders = (0..keys.len())
+                .map(|i| format!("?{}", param_offset + 1 + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            filter_clause = format!(" AND rowid IN ({placeholders})");
+        }
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -559,13 +568,46 @@ impl SqliteBackend {
             QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
         };
 
+        // The bounded early-exit attempts, tried before the page statement and
+        // kept only when one fills the page: the newest [`WINDOWS`] resources
+        // in turn. A short window (the filter matches few of the newest
+        // resources) widens before the page statement runs, since a miss only
+        // costs the window.
+        let window_sqls: Vec<String> = match (first_page_plan, &search_filter) {
+            (FirstPagePlan::ExistsDriven, Some(f)) => membership_exists_predicate(&f.sql, "w.rk")
+                .map(|exists| {
+                    WINDOWS
+                        .iter()
+                        .map(|window| {
+                            format!(
+                                "SELECT {select_cols} FROM \
+                                 (SELECT rowid AS rk, last_updated AS lu, id AS rid \
+                                  FROM resources INDEXED BY idx_resources_reindex \
+                                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                                  ORDER BY last_updated DESC, id ASC LIMIT {window}) AS w \
+                                 CROSS JOIN resources ON resources.rowid = w.rk \
+                                 WHERE {exists} \
+                                 ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
+                                lim = count + 1,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let search_params = match probed_keys {
+            Some(keys) => keys.into_iter().map(SqlParam::Integer).collect(),
+            None => search_filter.map(|f| f.params).unwrap_or_default(),
+        };
+
         // Build query based on pagination mode.
         let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
             let backward = cursor.direction() == CursorDirection::Previous;
             let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE {scope} AND is_deleted = 0{filter} \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
                  AND {condition} \
                  ORDER BY {order} LIMIT {lim}",
                 cols = select_cols,
@@ -577,7 +619,7 @@ impl SqliteBackend {
         } else if let Some(offset) = query.offset {
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE {scope} AND is_deleted = 0{filter} \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
                  {order} LIMIT {lim} OFFSET {off}",
                 cols = select_cols,
                 filter = filter_clause,
@@ -587,21 +629,22 @@ impl SqliteBackend {
             );
             (sql, offset > 0)
         } else {
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE {scope} AND is_deleted = 0{filter} \
-                 {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-            );
+            let page = |source: &str, filter: &str| {
+                format!(
+                    "SELECT {cols} FROM {source} \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
+                     {order} LIMIT {lim}",
+                    cols = select_cols,
+                    order = order_by,
+                    lim = count + 1,
+                )
+            };
+            let sql = match first_page_plan {
+                FirstPagePlan::ListDriven => page("resources NOT INDEXED", &filter_clause),
+                _ => page(first_page_source, &filter_clause),
+            };
             (sql, false)
         };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare search query")?;
 
         // Bind params: tenant, type, then (cursor) sort value + id, then filter params.
         let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -624,8 +667,11 @@ impl SqliteBackend {
 
         // The sort key (column 5) is selected only when keyset paging is active.
         let sort_kind = keyset.as_ref().map(|k| k.kind);
-        let raw_rows: Vec<(String, String, Vec<u8>, String, String, Option<CursorValue>)> = stmt
-            .query_map(param_refs.as_slice(), |row| {
+        let run = |sql: &str| -> StorageResult<Vec<RawRow>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .or_query_error("Failed to prepare search query")?;
+            stmt.query_map(param_refs.as_slice(), |row| {
                 let id: String = row.get(0)?;
                 let version_id: String = row.get(1)?;
                 let data: Vec<u8> = row.get(2)?;
@@ -643,7 +689,18 @@ impl SqliteBackend {
             })
             .or_query_error("Failed to execute search")?
             .collect::<Result<Vec<_>, _>>()
-            .or_query_error("Failed to read row")?;
+            .or_query_error("Failed to read row")
+        };
+        // A window attempt may fail to prepare (an index dropped for a bulk
+        // load) or fall short of a full page: either way the next, wider
+        // window and finally the page statement run.
+        let windowed = window_sqls
+            .iter()
+            .find_map(|window| run(window).ok().filter(|rows| rows.len() > count));
+        let raw_rows = match windowed {
+            Some(rows) => rows,
+            None => run(&sql)?,
+        };
 
         // Parse rows, carrying the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -737,6 +794,450 @@ impl SqliteBackend {
     }
 }
 
+/// One `resources` row as the page statements return it, with its sort key.
+type RawRow = (String, String, Vec<u8>, String, String, Option<CursorValue>);
+
+/// Newest `resources` rows the early-exit attempts look at, narrowest first.
+/// A page the 512 newest cannot fill (a date range that the newest resources
+/// mostly miss) is retried on 4,096 before the planner's plan runs.
+const WINDOWS: [usize; 2] = [512, 4096];
+
+/// Rows of a single parameter's index the probe reads at most. A filter with
+/// fewer rows is "selective": its whole key list is cheap to build.
+const PROBE_CAP: usize = 2001;
+
+/// Whether the bounded probe is on: `HFS_SQLITE_SEARCH_PROBE`, read once.
+/// Unset or empty means on; `0`, `false`, `off` or `no` turn it off.
+fn probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("HFS_SQLITE_SEARCH_PROBE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// How the first page of a one-parameter membership search reaches its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstPagePlan {
+    /// The planner's choice: `rowid IN (<keys>)` with `resources` walked in
+    /// `last_updated` order.
+    Planner,
+    /// The key list is short (under [`PROBE_CAP`] index rows): drive from it
+    /// and read `resources` by rowid, sorting the few rows. The probe's own
+    /// keys are bound to the page statement, so the filter runs once.
+    ListDriven,
+    /// The key list is long: try the newest [`WINDOWS`] resources in page
+    /// order, each tested against the index with a correlated `EXISTS`; the
+    /// page is final when the window fills it, else the planner's plan runs.
+    ExistsDriven,
+}
+
+/// Picks the [`FirstPagePlan`] with one bounded probe over the filter's own
+/// index rows (`SELECT … FROM (<rows> LIMIT 2001)`, a seek that stops early).
+/// Any shape other than one plain parameter membership, and any probe error,
+/// is [`FirstPagePlan::Planner`]: the result of every plan is the same set in
+/// the same `ORDER BY last_updated DESC, id` order, so this only chooses cost.
+///
+/// Only the tests call it; the production path reaches the same plans through
+/// the probe's own keys.
+#[cfg(test)]
+fn choose_first_page_plan(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    rows_sql: &str,
+    filter_params: &[SqlParam],
+) -> FirstPagePlan {
+    probe_first_page(conn, tenant_id, resource_type, rows_sql, filter_params).0
+}
+
+/// [`choose_first_page_plan`], and for [`FirstPagePlan::ListDriven`] the
+/// distinct `resource_key`s the probe read (under [`PROBE_CAP`] of them), so
+/// the page can be read by rowid without evaluating the filter again.
+fn probe_first_page(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    rows_sql: &str,
+    filter_params: &[SqlParam],
+) -> (FirstPagePlan, Vec<i64>) {
+    if !is_parameter_rows(rows_sql) {
+        return (FirstPagePlan::Planner, Vec::new());
+    }
+    let probe = format!("SELECT resource_key FROM ({rows_sql} LIMIT {PROBE_CAP})");
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    for param in filter_params {
+        bound.push(match param {
+            SqlParam::String(s) => Box::new(s.clone()),
+            SqlParam::Integer(i) => Box::new(*i),
+            SqlParam::Float(f) => Box::new(*f),
+            SqlParam::Null => Box::new(Option::<String>::None),
+        });
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+    let keys = conn.prepare(&probe).and_then(|mut stmt| {
+        stmt.query_map(refs.as_slice(), |row| row.get::<_, Option<i64>>(0))?
+            .collect::<Result<Vec<_>, _>>()
+    });
+    match keys {
+        Ok(keys) if keys.len() < PROBE_CAP => {
+            let mut keys: Vec<i64> = keys.into_iter().flatten().collect();
+            keys.sort_unstable();
+            keys.dedup();
+            (FirstPagePlan::ListDriven, keys)
+        }
+        Ok(_) => (FirstPagePlan::ExistsDriven, Vec::new()),
+        Err(_) => (FirstPagePlan::Planner, Vec::new()),
+    }
+}
+
+/// The table expression of a first page (no cursor, no offset) of `count`
+/// resources: `resources`, or `resources NOT INDEXED` for a filtered one-row
+/// page on the default order.
+///
+/// SQLite plans that page (`LIMIT` 1 or 2) by reading every key of the
+/// filter's `rowid IN (…)` list and sorting them: it probes
+/// `idx_resources_live_type` for each key, then reads the row anyway for its
+/// `data`, so a broad filter (`date=le…`, `ne…`) paid two lookups per match
+/// (#1506). `NOT INDEXED` keeps that plan with the row read alone. From three
+/// rows up, and for `_sort=_lastUpdated` or `_id`, SQLite walks an index in
+/// the page order and stops when the page is full, which `NOT INDEXED` would
+/// forbid, so those pages and every `_sort` are left to the planner.
+fn first_page_source(filtered: bool, query: &SearchQuery, count: usize) -> &'static str {
+    if filtered && query.sort.is_empty() && count <= 1 {
+        "resources NOT INDEXED"
+    } else {
+        "resources"
+    }
+}
+
+/// Whether `query` can use the code-first composite pairing: it has a
+/// composite parameter and both indexes the pairing is hinted to exist, the
+/// token index in its code-first shape (a database still carrying the earlier,
+/// system-first `idx_search_token` would answer the hinted statement with a
+/// table lookup per token row). `INDEXED BY` makes a statement fail to prepare
+/// against a missing index, and a bulk rebuild drops the value indexes for its
+/// duration.
+fn composite_rewrite_available(conn: &rusqlite::Connection, query: &SearchQuery) -> bool {
+    use crate::types::SearchParamType;
+    if !query
+        .parameters
+        .iter()
+        .any(|p| p.param_type == SearchParamType::Composite)
+    {
+        return false;
+    }
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND ( \
+            name = 'idx_search_composite_cov' \
+            OR (name = 'idx_search_token' AND sql LIKE '%value_token_code, resource_key, value_token_system, composite_group%'))",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n == 2)
+    .unwrap_or(false)
+}
+
+/// Runs `run(rewrite)` with the composite pairing on when
+/// [`composite_rewrite_available`], and again with it off if an index was
+/// dropped between that check and the statement's prepare.
+fn with_composite_rewrite<T>(
+    conn: &rusqlite::Connection,
+    query: &SearchQuery,
+    run: impl Fn(bool) -> StorageResult<T>,
+) -> StorageResult<T> {
+    if !composite_rewrite_available(conn, query) {
+        return run(false);
+    }
+    match run(true) {
+        Err(error) if error.to_string().contains("no such index") => run(false),
+        result => result,
+    }
+}
+
+/// The id-only page of [`SearchProvider::search_ids`], run on a blocking
+/// thread by the caller.
+fn search_ids_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: Option<PageCursor>,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<Page<String>> {
+    with_composite_rewrite(conn, query, |rewrite| {
+        search_ids_on_plan(conn, tenant, query, cursor.clone(), rewrite, targets)
+    })
+}
+
+fn search_ids_on_plan(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: Option<PageCursor>,
+    composite_rewrite: bool,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<Page<String>> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+    let param_offset = if cursor.is_some() { 4 } else { 2 };
+    let search_filter = if !query.parameters.is_empty() {
+        let fragment = QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(param_offset)
+            .with_composite_rewrite(composite_rewrite)
+            .with_reference_targets(targets.clone())
+            .build(query)?;
+        if fragment.sql.is_empty() {
+            None
+        } else {
+            Some(fragment)
+        }
+    } else {
+        None
+    };
+    let filter_clause = search_filter
+        .as_ref()
+        .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let search_params = search_filter
+        .map(|fragment| fragment.params)
+        .unwrap_or_default();
+    let cursor_clause = if cursor.is_some() {
+        " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
+    } else {
+        ""
+    };
+    let count = query.count.unwrap_or(100) as usize;
+    let version_clause = fhir_version_clause(query, "fhir_version");
+    let sql = format!(
+        "SELECT id, last_updated FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter_clause}{cursor_clause} \
+             ORDER BY last_updated DESC, id ASC LIMIT {}",
+        count + 1
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    if let Some(cursor) = &cursor {
+        bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+        params.push(Box::new(cursor.resource_id().to_string()));
+    }
+    for param in &search_params {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    reject_legacy_composites(conn, tenant, query)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare id-only search query")?;
+    let mut rows: Vec<(String, String)> = stmt
+        .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .or_query_error("Failed to execute id-only search")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read id-only search row")?;
+    let has_next = rows.len() > count;
+    if has_next {
+        rows.pop();
+    }
+    let has_previous = cursor.is_some();
+    let next_cursor = if has_next {
+        rows.last().map(|(id, updated)| {
+            PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    let previous_cursor = if has_previous {
+        rows.first().map(|(id, updated)| {
+            PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    Ok(Page::new(
+        rows.into_iter().map(|(id, _)| id).collect(),
+        PageInfo {
+            next_cursor,
+            previous_cursor,
+            total: None,
+            has_next,
+            has_previous,
+        },
+    ))
+}
+
+/// The count of [`SearchProvider::search_count`] for a query without
+/// `_contained`, run on a blocking thread by the caller.
+/// The distinct indexed values of `reference_param` on the current,
+/// top-level resources matching `query`, for
+/// [`SearchProvider::search_reference_values`]. One statement: the filter's
+/// candidates are evaluated once, not once per page (#1930).
+fn search_reference_values_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<Vec<String>> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let (sql, params) = reference_values_statement(tenant, query, reference_param, targets)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare reference-value query")?;
+    let values = stmt
+        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+        .or_query_error("Failed to execute reference-value query")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read reference-value row")?;
+    Ok(values)
+}
+
+/// The statement of [`search_reference_values_on`] and its bound values.
+fn reference_values_statement(
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+
+    let fragment = if query.parameters.is_empty() {
+        None
+    } else {
+        Some(
+            QueryBuilder::new(tenant_id, resource_type)
+                .with_param_offset(2)
+                .with_reference_targets(targets.clone())
+                .build(query)?,
+        )
+    };
+    let filter = fragment
+        .as_ref()
+        .filter(|fragment| !fragment.sql.is_empty())
+        .map(|fragment| format!(" AND r.rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    for param in fragment.iter().flat_map(|fragment| &fragment.params) {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    params.push(Box::new(reference_param.to_string()));
+    let param_name = params.len();
+    let version_clause = fhir_version_clause(query, "r.fhir_version");
+
+    // Drive from the candidates and probe `search_index` per candidate:
+    // `CROSS JOIN` keeps the candidates as the outer loop, the
+    // `(tenant_id, resource_type)` prefix lets the `resource_key` probe seek
+    // `idx_search_composite` (#1197), and the unary `+` keeps the planner off
+    // `idx_search_reference`, which would read every row of the parameter.
+    let sql = format!(
+        "SELECT DISTINCT si.value_reference \
+         FROM (SELECT r.rowid AS resource_key FROM resources r \
+                WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0{version_clause}{filter}) c \
+         CROSS JOIN search_index si \
+         WHERE si.tenant_id = ?1 AND si.resource_type = ?2 \
+           AND si.resource_key = c.resource_key \
+           AND +si.param_name = ?{param_name} \
+           AND si.is_contained = 0 \
+           AND si.value_reference IS NOT NULL"
+    );
+    Ok((sql, params))
+}
+
+fn search_count_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<u64> {
+    with_composite_rewrite(conn, query, |rewrite| {
+        search_count_on_plan(conn, tenant, query, rewrite, targets)
+    })
+}
+
+fn search_count_on_plan(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    composite_rewrite: bool,
+    targets: &HashMap<String, Vec<String>>,
+) -> StorageResult<u64> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+    let version_clause = fhir_version_clause(query, "fhir_version");
+
+    // Build the search filter if there are search parameters or a compartment.
+    let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
+        || query.compartment.is_some()
+    {
+        let builder = QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(2)
+            .with_composite_rewrite(composite_rewrite)
+            .with_reference_targets(targets.clone());
+        let fragment = builder.build(query)?;
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+
+        // Add search params
+        for param in &fragment.params {
+            match param {
+                SqlParam::String(s) => params.push(Box::new(s.clone())),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause} AND rowid IN ({})",
+            fragment.sql
+        );
+
+        (sql, params)
+    } else {
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}"
+        );
+        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        (sql, params)
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+    let count: i64 = conn
+        .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+        .or_query_error("Failed to count resources")?;
+
+    Ok(count as u64)
+}
+
 #[async_trait]
 impl SearchProvider for SqliteBackend {
     async fn search(
@@ -764,8 +1265,14 @@ impl SearchProvider for SqliteBackend {
             None
         };
 
-        let conn = self.get_connection()?;
-        self.search_with_connection(&conn, tenant, query, total)
+        // On a blocking thread, so that a chain resolver draining many pages
+        // yields between them: the request timeout can then fire and a
+        // dropped request stops after the page in flight (#1930).
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| this.search_with_connection(conn, &tenant, &query, total))
+            .await
     }
 
     async fn search_ids(
@@ -804,97 +1311,11 @@ impl SearchProvider for SqliteBackend {
 
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
-        let param_offset = if cursor.is_some() { 4 } else { 2 };
-        let conn = self.get_connection()?;
-        let plan = if !query.parameters.is_empty() {
-            let parts = QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(param_offset)
-                .with_reference_targets(self.reference_targets(tenant_id, query))
-                .build_parts(query);
-            plan_filter(
-                &conn,
-                parts,
-                &leading_values(tenant_id, resource_type, param_offset),
-            )?
-        } else {
-            None
-        };
-        // See `search_with_connection`.
-        let scope = if plan.as_ref().is_some_and(|p| p.drive) {
-            "+tenant_id = ?1 AND +resource_type = ?2"
-        } else {
-            "tenant_id = ?1 AND resource_type = ?2"
-        };
-        let (filter_clause, search_params) = plan.map(|p| (p.clause, p.params)).unwrap_or_default();
-        let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
-        } else {
-            ""
-        };
-        let count = query.count.unwrap_or(100) as usize;
-        let sql = format!(
-            "SELECT id, last_updated FROM resources \
-             WHERE {scope} AND is_deleted = 0{filter_clause}{cursor_clause} \
-             ORDER BY last_updated DESC, id ASC LIMIT {}",
-            count + 1
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(tenant_id.to_string()),
-            Box::new(resource_type.to_string()),
-        ];
-        if let Some(cursor) = &cursor {
-            bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
-            params.push(Box::new(cursor.resource_id().to_string()));
-        }
-        for param in &search_params {
-            match param {
-                SqlParam::String(value) => params.push(Box::new(value.clone())),
-                SqlParam::Integer(value) => params.push(Box::new(*value)),
-                SqlParam::Float(value) => params.push(Box::new(*value)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|param| param.as_ref()).collect();
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare id-only search query")?;
-        let mut rows: Vec<(String, String)> = stmt
-            .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
-            .or_query_error("Failed to execute id-only search")?
-            .collect::<Result<Vec<_>, _>>()
-            .or_query_error("Failed to read id-only search row")?;
-        let has_next = rows.len() > count;
-        if has_next {
-            rows.pop();
-        }
-        let has_previous = cursor.is_some();
-        let next_cursor = if has_next {
-            rows.last().map(|(id, updated)| {
-                PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        let previous_cursor = if has_previous {
-            rows.first().map(|(id, updated)| {
-                PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        Ok(Page::new(
-            rows.into_iter().map(|(id, _)| id).collect(),
-            PageInfo {
-                next_cursor,
-                previous_cursor,
-                total: None,
-                has_next,
-                has_previous,
-            },
-        ))
+        let targets = self.reference_targets(tenant.tenant_id().as_str(), query);
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_ids_on(conn, &tenant, &query, cursor, &targets))
+            .await
     }
 
     async fn search_count(
@@ -912,85 +1333,47 @@ impl SearchProvider for SqliteBackend {
             return Ok(plan.top_total + plan.keys.len() as u64);
         }
 
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
+        let targets = self.reference_targets(tenant.tenant_id().as_str(), query);
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_count_on(conn, &tenant, &query, &targets))
+            .await
+    }
 
-        // Build the search filter if there are search parameters or a compartment.
-        let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
-            .parameters
-            .is_empty()
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Only the plain single-type filter the resolver builds, over an index
+        // this backend maintains; anything else keeps the paged path.
+        if self.is_search_offloaded()
+            || !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.cursor.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
             || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
         {
-            let builder = QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(2)
-                .with_reference_targets(self.reference_targets(tenant_id, query));
-            // Planned like a search, but the outer query is left free to
-            // answer `is_deleted` from `idx_resources_live_type` (covering,
-            // one seek per candidate rowid) even when the filter is
-            // selective, so no `+` here.
-            let (clause, filter_params) = plan_filter(
-                &conn,
-                builder.build_parts(query),
-                &leading_values(tenant_id, resource_type, 2),
-            )?
-            .map(|p| (p.clause, p.params))
-            .unwrap_or_default();
-
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-
-            // Add search params
-            for param in &filter_params {
-                match param {
-                    SqlParam::String(s) => params.push(Box::new(s.clone())),
-                    SqlParam::Integer(i) => params.push(Box::new(*i)),
-                    SqlParam::Float(f) => params.push(Box::new(*f)),
-                    SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-                }
-            }
-
-            let sql = format!(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{clause}"
-            );
-
-            (sql, params)
-        } else {
-            let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
-            let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-            (sql, params)
-        };
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
-
-        let count: i64 = conn
-            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .or_query_error("Failed to count resources")?;
-
-        Ok(count as u64)
-    }
-
-    fn search_param_registry(
-        &self,
-        tenant: &crate::tenant::TenantContext,
-    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.tenant_registry(tenant.tenant_id().as_str())
-    }
-
-    fn supports_contained_search(&self) -> bool {
-        true
-    }
-
-    fn modifiers_for_param_type(
-        &self,
-        param_type: crate::types::SearchParamType,
-    ) -> Vec<&'static str> {
-        Self::modifiers_for_type(param_type)
+            return Ok(None);
+        }
+        reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+        let targets = self.reference_targets(tenant.tenant_id().as_str(), query);
+        let tenant = tenant.clone();
+        let query = query.clone();
+        let reference_param = reference_param.to_string();
+        self.run_blocking(move |conn| {
+            search_reference_values_on(conn, &tenant, &query, &reference_param, &targets)
+        })
+        .await
+        .map(Some)
     }
 
     async fn distinct_meta_values(
@@ -1038,6 +1421,24 @@ impl SearchProvider for SqliteBackend {
             }
         }
         Ok(values)
+    }
+
+    fn search_param_registry(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
     }
 }
 
@@ -1296,159 +1697,6 @@ impl RevincludeProvider for SqliteBackend {
     }
 }
 
-#[async_trait]
-impl ChainedSearchProvider for SqliteBackend {
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        use super::search::ChainQueryBuilder;
-
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        if chain.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
-
-        // Parse the chain
-        let parsed = match builder.parse_chain(chain) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(internal_error(format!("Failed to parse chain: {}", e)));
-            }
-        };
-
-        // Build the SQL fragment. The chained value still carries its
-        // comparator prefix (`patient.birthdate=le1956-07-14`); strip it only
-        // when the terminal parameter's type admits one — date, number and
-        // quantity, explicit `eq` included — so a string or token value is
-        // never misread: not `family=Levine` as le + "vine" (#258), nor
-        // `family=nelson` as ne + "lson" (#1307).
-        let search_value = SearchValue::parse_for_type(value, parsed.terminal_type);
-        let fragment = match builder.build_forward_chain_sql(&parsed, &search_value) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(internal_error(format!("Failed to build chain SQL: {}", e)));
-            }
-        };
-
-        // Execute the query to get matching IDs
-        // The fragment generates: r.id IN (SELECT ...)
-        // We need to wrap it in a proper SELECT FROM resources
-        let sql = format!(
-            "SELECT DISTINCT r.id FROM resources r \
-             WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0 AND {}",
-            fragment.sql
-        );
-
-        // Bind parameters: tenant_id, resource_type, then fragment params
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare chain query")?;
-
-        // Build parameter vector for rusqlite
-        let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        bound_params.push(Box::new(tenant_id.to_string()));
-        bound_params.push(Box::new(base_type.to_string()));
-        for param in &fragment.params {
-            match param {
-                SqlParam::String(s) => bound_params.push(Box::new(s.clone())),
-                SqlParam::Integer(i) => bound_params.push(Box::new(*i)),
-                SqlParam::Float(f) => bound_params.push(Box::new(*f)),
-                SqlParam::Null => bound_params.push(Box::new(rusqlite::types::Null)),
-            }
-        }
-
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .or_query_error("Failed to execute chain query")?;
-
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.or_query_error("Failed to read row")?);
-        }
-
-        Ok(ids)
-    }
-
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>> {
-        use super::search::ChainQueryBuilder;
-
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
-
-        // Build the SQL fragment for reverse chain
-        let fragment = match builder.build_reverse_chain_sql(reverse_chain) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(internal_error(format!(
-                    "Failed to build reverse chain SQL: {}",
-                    e
-                )));
-            }
-        };
-
-        // Execute the query to get matching IDs
-        // The fragment generates: r.id IN (SELECT ...)
-        let sql = format!(
-            "SELECT DISTINCT r.id FROM resources r \
-             WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0 AND {}",
-            fragment.sql
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare reverse chain query")?;
-
-        // Build parameter vector for rusqlite
-        let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        bound_params.push(Box::new(tenant_id.to_string()));
-        bound_params.push(Box::new(base_type.to_string()));
-        for param in &fragment.params {
-            match param {
-                SqlParam::String(s) => bound_params.push(Box::new(s.clone())),
-                SqlParam::Integer(i) => bound_params.push(Box::new(*i)),
-                SqlParam::Float(f) => bound_params.push(Box::new(*f)),
-                SqlParam::Null => bound_params.push(Box::new(rusqlite::types::Null)),
-            }
-        }
-
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .or_query_error("Failed to execute reverse chain query")?;
-
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.or_query_error("Failed to read row")?);
-        }
-
-        Ok(ids)
-    }
-}
-
 /// Finds the `contained[]` entry with the given local `id` in a container's
 /// content.
 fn extract_contained_resource(
@@ -1564,6 +1812,10 @@ impl SqliteBackend {
     ) -> StorageResult<ContainedPlan> {
         use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchParameter};
 
+        {
+            let conn = self.get_connection()?;
+            reject_legacy_composites(&conn, tenant, query)?;
+        }
         let mut keys = self.contained_matches(tenant.tenant_id().as_str(), query)?;
         if query.contained_return == ContainedReturn::Container {
             for key in &mut keys {
@@ -1635,9 +1887,22 @@ impl SqliteBackend {
         let builder = QueryBuilder::new(tenant_id, contained_type);
         let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
             Some(fragment) => {
+                // A version-restricted search (#2254) keeps the contained
+                // matches whose live container is stored under that version.
+                let sql = match query.stored_fhir_version() {
+                    Some(version) => format!(
+                        "SELECT m.resource_type, m.resource_id, m.contained_local_id \
+                         FROM ({}) m WHERE EXISTS (SELECT 1 FROM resources r \
+                         WHERE r.tenant_id = ?1 AND r.resource_type = m.resource_type \
+                         AND r.id = m.resource_id AND r.is_deleted = 0 \
+                         AND r.fhir_version = '{version}')",
+                        fragment.sql
+                    ),
+                    None => fragment.sql,
+                };
                 let conn = self.get_connection()?;
                 let mut stmt = conn
-                    .prepare(&fragment.sql)
+                    .prepare(&sql)
                     .or_query_error("Failed to prepare contained query")?;
                 let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
                     Box::new(tenant_id.to_string()),
@@ -1947,6 +2212,315 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    #[tokio::test]
+    async fn composite_legacy_guard_uses_the_supplied_transaction_connection() {
+        use crate::types::{CompositeSearchComponent, SearchParamType, SearchValue};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend.create(&tenant,"Observation",json!({"resourceType":"Observation","id":"o","status":"final","code":{"coding":[{"code":"A"}]},"valueCodeableConcept":{"coding":[{"code":"B"}]}}),FhirVersion::default()).await.unwrap();
+        let mut query = SearchQuery::new("Observation");
+        query.count = Some(0);
+        query.parameters.push(SearchParameter {
+            name: "code-value-concept".into(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("missing$missing")],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "value-concept".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let explain_real_probe = |conn: &rusqlite::Connection| {
+            for contained in [false, true] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    legacy_composite_probe_sql(conn, contained).unwrap()
+                );
+                let plan = conn
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_map(
+                        params![
+                            tenant.tenant_id().as_str(),
+                            "Observation",
+                            "code-value-concept"
+                        ],
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let index = if contained {
+                    "idx_search_contained_composite_legacy"
+                } else {
+                    "idx_search_composite_legacy"
+                };
+                assert!(plan.contains(index), "real probe {plan}");
+                assert!(!plan.contains("SCAN search_index"), "{plan}");
+            }
+        };
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE; UPDATE search_index SET composite_slot=NULL WHERE param_name='code-value-concept'").unwrap();
+            let error = backend
+                .search_with_connection(&conn, &tenant, &query, None)
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"), "{error}");
+            for (missing, expected) in [(false, 1), (true, 0)] {
+                for count in [0, 100] {
+                    let mut presence = query.clone();
+                    presence.parameters[0].modifier = Some(crate::types::SearchModifier::Missing);
+                    presence.parameters[0].values = vec![SearchValue::eq(missing.to_string())];
+                    presence.count = Some(count);
+                    let result = backend
+                        .search_with_connection(&conn, &tenant, &presence, None)
+                        .unwrap();
+                    assert_eq!(
+                        result.resources.items.len(),
+                        if count == 0 { 0 } else { expected }
+                    );
+                }
+            }
+            explain_real_probe(&conn);
+            let stale_sql = legacy_composite_probe_sql(&conn, false).unwrap();
+            let definition: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='idx_search_composite_legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute("DROP INDEX idx_search_composite_legacy", [])
+                .unwrap();
+            assert!(
+                run_legacy_composite_probe(
+                    &conn,
+                    &stale_sql,
+                    tenant.tenant_id().as_str(),
+                    "Observation",
+                    "code-value-concept"
+                )
+                .unwrap()
+                .is_some(),
+                "a concurrent bulk drop between metadata and prepare retains the guard"
+            );
+            assert!(
+                run_legacy_composite_probe(
+                    &conn,
+                    "SELECT invalid_column FROM search_index",
+                    tenant.tenant_id().as_str(),
+                    "Observation",
+                    "code-value-concept"
+                )
+                .is_err(),
+                "other SQL errors are not hidden by fallback"
+            );
+            conn.execute(&definition, []).unwrap();
+            conn.execute_batch("ROLLBACK").unwrap();
+            explain_real_probe(&conn);
+        }
+        assert!(backend.search(&tenant, &query).await.is_ok());
+        for component in &mut query.parameters[0].components {
+            component.param_type = SearchParamType::Reference;
+        }
+        for mode in [
+            crate::types::ContainedMode::Off,
+            crate::types::ContainedMode::On,
+            crate::types::ContainedMode::Both,
+        ] {
+            query.contained = mode;
+            let error = backend
+                .search(&tenant, &query)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("code-value-concept") && error.contains("unsupported repeated"),
+                "{error}"
+            );
+            assert!(
+                !error.contains("$reindex"),
+                "an unsupported shape cannot be repaired by reindex: {error}"
+            );
+        }
+    }
+
+    /// #866: a search parameter the query builder can build no condition for
+    /// must fail the search. Dropped, it left a query with no conditions, which
+    /// matches every indexed resource of the type: `DELETE Patient?_query=x`
+    /// deleted the only Patient on file, and a plain search answered with
+    /// everything.
+    #[tokio::test]
+    async fn a_parameter_without_a_condition_is_an_error_not_a_dropped_filter() {
+        use crate::types::{SearchParamType, SearchValue};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in ["a", "b"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Control: with no parameters both Patients are the answer, and a
+        // parameter that does filter narrows it.
+        let count = |query: &SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let query = query.clone();
+            async move { backend.search(tenant, &query).await }
+        };
+        assert_eq!(
+            count(&SearchQuery::new("Patient"))
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            2
+        );
+        let by_id = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("a")],
+            ..Default::default()
+        });
+        assert_eq!(count(&by_id).await.unwrap().resources.items.len(), 1);
+
+        // `_query` and `_type` are registered by the spec and indexed by
+        // nothing; `_made_up` is registered by nobody; `near` is a `special`
+        // parameter. None has a condition to build.
+        for (name, param_type) in [
+            ("_query", SearchParamType::Token),
+            ("_type", SearchParamType::Token),
+            ("_made_up", SearchParamType::Token),
+            ("near", SearchParamType::Special),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                values: vec![SearchValue::eq("x")],
+                ..Default::default()
+            });
+
+            let error = count(&query).await.expect_err(&format!(
+                "{name}: search must not answer with every Patient"
+            ));
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Search(SearchError::QueryParseError { ref message })
+                        if message.contains(&format!("'{name}'"))
+                ),
+                "{name}: {error:?}"
+            );
+            assert!(
+                backend.search_count(&tenant, &query).await.is_err(),
+                "{name}: the count is gated the same way"
+            );
+        }
+
+        // A parameter with no values asks for nothing, so it constrains nothing.
+        let nothing_asked = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_query".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![],
+            ..Default::default()
+        });
+        assert_eq!(
+            count(&nothing_asked).await.unwrap().resources.items.len(),
+            2
+        );
+    }
+
+    fn composite_query(v: &str) -> SearchQuery {
+        use crate::types::{CompositeSearchComponent, SearchParamType, SearchValue};
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq(v)],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_composite_value_with_the_wrong_number_of_parts_is_refused() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let message_of = |err: StorageError| match err {
+            StorageError::Search(SearchError::InvalidComposite { message }) => message,
+            other => panic!("expected InvalidComposite, got {other:?}"),
+        };
+
+        let err = backend
+            .search(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("one part for two components");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search_count(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("search_count is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search(&tenant, &composite_query("8302-2$5$6"))
+            .await
+            .expect_err("three parts for two components");
+        assert!(message_of(err).contains("has 3 component(s)"));
+
+        let mut contained = composite_query("8302-2");
+        contained.contained = crate::types::ContainedMode::On;
+        let err = backend
+            .search(&tenant, &contained)
+            .await
+            .expect_err("the contained path is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search_ids(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("search_ids is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        // Positive control: the right number of parts is still a search.
+        backend
+            .search(&tenant, &composite_query("8302-2$gt150"))
+            .await
+            .expect("two parts for two components");
     }
 
     #[tokio::test]
@@ -2883,734 +3457,782 @@ mod tests {
     }
 
     // ========================================================================
-    // ChainedSearchProvider Tests
+    // Chained Search Tests
     // ========================================================================
 
-    /// #258: a chained value keeps its comparator prefix when the terminal
-    /// parameter compares (dates), and never loses its head to one when it
-    /// does not (a family name starting with a valid prefix pair).
-    #[tokio::test]
-    async fn test_resolve_chain_comparator_prefix() {
+    /// #1930: the reference-value read reaches `search_index` by
+    /// `resource_key` through `idx_search_composite`, never by scanning the
+    /// table or every row of the reference parameter.
+    #[test]
+    fn reference_values_probe_the_composite_index_by_resource_key() {
         let backend = create_test_backend();
         let tenant = create_test_tenant();
-
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "birthDate": "1950-04-12", "name": [{"family": "Levine"}]}),
-                FhirVersion::default(),
-            )
-            .await
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("http://loinc.org|8302-2")],
+            chain: vec![],
+            components: vec![],
+        });
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient", &HashMap::new()).unwrap();
+        let conn = backend.get_connection().unwrap();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // The comparator reaches the date comparison: le on a later date
-        // matches, gt1900 matches everyone, le on an earlier date excludes.
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1956-07-14")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "le includes the 1950 birth");
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "gt1900-01-01")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "gt1900 matches every patient");
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1940-01-01")
-            .await
-            .unwrap();
-        assert!(ids.is_empty(), "le on an earlier date excludes");
-
-        // A string value beginning with a valid prefix pair stays whole:
-        // family=Levine must not become le + "vine".
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.family", "Levine")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "Levine matches, unclipped");
+        assert!(
+            plan.iter().any(|line| line.starts_with("SEARCH si")
+                && line.contains("idx_search_composite")
+                && line.contains("resource_key=?")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN si")),
+            "{plan:#?}"
+        );
     }
 
-    /// Seeds the #1307 fixture through the real write path. Every terminal
-    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
-    /// whose value is what is left once the pair is wrongly stripped, so a
-    /// misparse shows up as the decoy being returned.
-    async fn seed_chain_prefix_fixture(backend: &SqliteBackend, tenant: &TenantContext) {
-        let resources = [
-            (
-                "Patient",
-                json!({"id": "nelson-1", "birthDate": "1950-04-12", "name": [{"family": "Nelson"}]}),
-            ),
-            (
-                "Patient",
-                json!({"id": "wilson-1", "birthDate": "1960-01-01", "name": [{"family": "Wilson"}]}),
-            ),
-            (
-                "Patient",
-                json!({"id": "equus-1", "birthDate": "1970-01-01", "name": [{"family": "Equus"}]}),
-            ),
-            ("Device", json!({"id": "dev-news", "url": "news:example/1"})),
-            ("Device", json!({"id": "dev-ws", "url": "ws:example/1"})),
-            (
-                "MolecularSequence",
-                json!({"id": "ms-10", "coordinateSystem": 0, "referenceSeq": {"windowStart": 10}}),
-            ),
-            (
-                "MolecularSequence",
-                json!({"id": "ms-0", "coordinateSystem": 0, "referenceSeq": {"windowStart": 0}}),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-nelson", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "ne123"}]},
-                    "subject": {"reference": "Patient/nelson-1"},
-                    "device": {"reference": "Device/dev-news"},
-                    "derivedFrom": [{"reference": "MolecularSequence/ms-10"}],
-                    "valueQuantity": {"value": 5.4, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-wilson", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "123"}]},
-                    "subject": {"reference": "Patient/wilson-1"},
-                    "device": {"reference": "Device/dev-ws"},
-                    "derivedFrom": [{"reference": "MolecularSequence/ms-0"}],
-                    "valueQuantity": {"value": 0, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-equus", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "eq77"}]},
-                    "subject": {"reference": "Patient/equus-1"},
-                    "valueQuantity": {"value": 7.0, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-77", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "77"}]},
-                    "valueQuantity": {"value": 9.0, "unit": "mg"},
-                }),
-            ),
+    /// #1955: a reference search (`Observation?subject=Patient/x`) seeks the
+    /// partial `idx_search_reference` index. Without `value_reference IS NOT
+    /// NULL` beside the `=`-or-`_history`-range test, the planner does not
+    /// prove the partial index's `WHERE` and reads every `subject` row of the
+    /// type instead: 28 s instead of 1 s on 454k Observations.
+    #[test]
+    fn reference_search_seeks_the_partial_reference_index() {
+        let backend = create_test_backend();
+        let subject = |values: Vec<SearchValue>| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        // Patient/p1/Observation: membership through any compartment param.
+        let mut compartment = SearchQuery::new("Observation");
+        compartment.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        for query in [
+            subject(vec![SearchValue::eq("Patient/p1")]),
+            subject(vec![
+                SearchValue::eq("Patient/p1"),
+                SearchValue::eq("Patient/p2"),
+            ]),
+            compartment,
+        ] {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query)
+                .unwrap();
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new("t".to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            // The seek must be bounded on the value: an equality, or a range
+            // with both ends. `value_reference>?` alone reads to the end of
+            // the parameter's rows.
+            assert!(
+                plan.iter().any(|line| line.contains("idx_search_reference")
+                    && !line.contains("idx_search_reference_target")
+                    && (line.contains("value_reference=?")
+                        || (line.contains("value_reference>")
+                            && line.contains("value_reference<")))),
+                "{}\n{plan:#?}",
+                fragment.sql
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_search_reference_target")
+                        && line.contains("value_reference_target=?")),
+                "target arm must seek idx_search_reference_target\n{}\n{plan:#?}",
+                fragment.sql
+            );
+            assert_reference_plan_is_seeks(&plan, &fragment.sql);
+        }
+
+        // The EXISTS-driven first page tests each outer row with one
+        // correlated lookup that answers both the `value_reference` and the
+        // `value_reference_target` arm.
+        let query = subject(vec![SearchValue::eq("Patient/p1")]);
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&query)
+            .unwrap();
+        let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+            .expect("reference membership has an EXISTS form");
+        assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+        assert!(
+            exists.contains("value_reference IS NOT NULL")
+                && exists.contains("value_reference_target IN"),
+            "{exists}"
+        );
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT w.rk FROM (SELECT rowid AS rk FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+             WHERE {exists}"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new("t".to_string()),
+            Box::new("Observation".to_string()),
         ];
-        for (resource_type, body) in resources {
+        for param in &fragment.params {
+            if let SqlParam::String(value) = param {
+                params.push(Box::new(value.clone()));
+            }
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let conn = backend.get_connection().unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("SEARCH")
+                && line.contains("idx_search_composite")
+                && line.contains("resource_key=?")),
+            "{exists}\n{plan:#?}"
+        );
+        assert_reference_plan_is_seeks(&plan, &exists);
+    }
+
+    /// The merged single-`EXISTS` reference predicate (chosen by the
+    /// `ExistsDriven` plan from 2001 matches, so the parity suite never runs
+    /// it) returns the same resources as the `rowid IN (… UNION ALL …)` form
+    /// it replaces, for relative, versioned and absolute references.
+    ///
+    /// Expectation, taken from running the `UNION ALL` form: `subject=
+    /// Patient/p1` matches the relative reference (a), the absolute reference
+    /// (c) and the absolute versioned reference (d) through
+    /// `value_reference_target`; the relative versioned reference (b) is
+    /// matched through the `Patient/p1/_history/` range of `value_reference`
+    /// (the `=`-or-`_history`-range test); a different patient (e) and a
+    /// missing subject (f) never match.
+    #[tokio::test]
+    async fn merged_reference_exists_returns_the_union_all_resources() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, subject) in [
+            ("a", Some("Patient/p1")),
+            ("b", Some("Patient/p1/_history/3")),
+            ("c", Some("http://example.org/fhir/Patient/p1")),
+            ("d", Some("http://example.org/fhir/Patient/p1/_history/2")),
+            ("e", Some("Patient/p2")),
+            ("f", None),
+        ] {
+            let mut obs = json!({"resourceType":"Observation","id":id,"status":"final","code":{"coding":[{"code":"A"}]}});
+            if let Some(subject) = subject {
+                obs["subject"] = json!({ "reference": subject });
+            }
             backend
-                .create(tenant, resource_type, body, FhirVersion::default())
+                .create(&tenant, "Observation", obs, FhirVersion::default())
                 .await
                 .unwrap();
         }
-        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Patient/p1")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&query)
+            .unwrap();
+        let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+            .expect("reference membership has an EXISTS form");
+        assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+        assert!(fragment.sql.contains(" UNION ALL "), "{}", fragment.sql);
+
+        let run = |predicate: &str| -> BTreeSet<String> {
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(tenant.tenant_id().as_str().to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let merged = run(&exists);
+        let union_all = run(&format!("w.rk IN ({})", fragment.sql));
+        assert_eq!(merged, union_all, "{exists}");
+        assert!(!merged.is_empty(), "{merged:?}");
+        // Observed from the UNION ALL form: (b) matches too.
+        for id in ["a", "b", "c", "d"] {
+            assert!(merged.contains(id), "{id} missing from {merged:?}");
+        }
+        for id in ["e", "f"] {
+            assert!(!merged.contains(id), "{id} must not match: {merged:?}");
+        }
+    }
+
+    /// Binds a fragment's string parameters after `?1`/`?2` (tenant, type).
+    fn bind_reference_params(
+        tenant: &str,
+        fragment: &crate::backends::sqlite::search::SqlFragment,
+    ) -> Vec<Box<dyn rusqlite::ToSql>> {
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant.to_string()),
+            Box::new("Observation".to_string()),
+        ];
+        for param in &fragment.params {
+            if let SqlParam::String(value) = param {
+                params.push(Box::new(value.clone()));
+            }
+        }
+        params
+    }
+
+    /// #2493: a comma list of references returns exactly the union of each
+    /// value's single-value result, including stored `_history` references
+    /// that the old exact-`IN` shortcut dropped, through the end-to-end
+    /// search, the `rowid IN (…)` form and the merged `EXISTS` form.
+    #[tokio::test]
+    async fn reference_comma_list_is_the_union_of_its_values() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, subject) in [
+            ("ob-pat", Some("Patient/p1")),
+            ("ob-ver", Some("Patient/p1/_history/3")),
+            ("ob-p2", Some("Patient/p2")),
+            ("ob-none", None),
+        ] {
+            let mut obs =
+                json!({"resourceType":"Observation","id":id,"status":"final","code":{"text":"x"}});
+            if let Some(subject) = subject {
+                obs["subject"] = json!({ "reference": subject });
+            }
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let query_for = |values: &[&str]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        async fn search_ids(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            query: SearchQuery,
+        ) -> BTreeSet<String> {
+            use crate::core::SearchProvider;
+            backend
+                .search(tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect()
+        }
+        let sql_ids = |values: &[&str], exists_form: bool| -> BTreeSet<String> {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query_for(values))
+                .unwrap();
+            let predicate = if exists_form {
+                membership_exists_predicate(&fragment.sql, "w.rk")
+                    .unwrap_or_else(|| panic!("no EXISTS form for {values:?}: {}", fragment.sql))
+            } else {
+                format!("w.rk IN ({})", fragment.sql)
+            };
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let params = bind_reference_params(tenant.tenant_id().as_str(), &fragment);
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|s| s.to_string()).collect() };
+
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["Patient/p1"], &["ob-pat", "ob-ver"]),
+            (&["Patient/p1", "Patient/nobody"], &["ob-pat", "ob-ver"]),
+            (&["Patient/nobody", "Patient/p1"], &["ob-pat", "ob-ver"]),
+            (
+                &["Patient/p1", "Patient/p2"],
+                &["ob-pat", "ob-ver", "ob-p2"],
+            ),
+            (
+                &["Patient/p1/_history/3", "Patient/nobody"],
+                &["ob-pat", "ob-ver"],
+            ),
+        ];
+        for (values, expected) in cases {
+            let expected = set(expected);
+            let mut union = BTreeSet::new();
+            for v in values {
+                union.extend(search_ids(&backend, &tenant, query_for(&[v])).await);
+            }
+            assert_eq!(union, expected, "union of singles for {values:?}");
+            assert_eq!(
+                search_ids(&backend, &tenant, query_for(values)).await,
+                expected,
+                "search {values:?}"
+            );
+            assert_eq!(sql_ids(values, false), expected, "rowid IN {values:?}");
+            assert_eq!(sql_ids(values, true), expected, "EXISTS {values:?}");
+        }
+    }
+
+    /// #2493: a list of more than `VERSION_ROWS_CHUNK` (50) references splits
+    /// the `_history` arm into several `UNION ALL`-ed selects; the result must
+    /// still be the union of the values, in the end-to-end search, the
+    /// `rowid IN (…)` form and the merged `EXISTS` form (which collapses the
+    /// chunks back into one test).
+    #[tokio::test]
+    async fn reference_comma_list_beyond_one_chunk_is_the_union_of_its_values() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        // 120 bases = chunks of 50 + 50 + 20. One versioned and one plain
+        // stored reference in each chunk, plus unrelated ones.
+        let stored = [
+            ("ob-v10", "Patient/q10/_history/2"),
+            ("ob-p20", "Patient/q20"),
+            ("ob-v70", "Patient/q70/_history/9"),
+            ("ob-p60", "Patient/q60"),
+            ("ob-v110", "Patient/q110/_history/1"),
+            ("ob-p119", "Patient/q119"),
+            ("ob-other", "Patient/other"),
+            ("ob-other-v", "Patient/other/_history/1"),
+        ];
+        for (id, subject) in stored {
+            let obs = json!({"resourceType":"Observation","id":id,"status":"final",
+                "code":{"text":"x"},"subject":{"reference":subject}});
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let query_for = |values: &[String]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(v.as_str())).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let search_ids = |values: Vec<String>| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let query = query_for(&values);
+            async move {
+                use crate::core::SearchProvider;
+                backend
+                    .search(tenant, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<BTreeSet<String>>()
+            }
+        };
+        let sql_ids = |values: &[String], exists_form: bool| -> BTreeSet<String> {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query_for(values))
+                .unwrap();
+            let predicate = if exists_form {
+                membership_exists_predicate(&fragment.sql, "w.rk")
+                    .unwrap_or_else(|| panic!("no EXISTS form: {}", fragment.sql))
+            } else {
+                format!("w.rk IN ({})", fragment.sql)
+            };
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let params = bind_reference_params(tenant.tenant_id().as_str(), &fragment);
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|s| s.to_string()).collect() };
+
+        let all: Vec<String> = (0..120).map(|i| format!("Patient/q{i}")).collect();
+        // Only the versioned reference of the last chunk matches.
+        let mut last_only: Vec<String> = (0..119).map(|i| format!("Patient/nobody{i}")).collect();
+        last_only.push("Patient/q110".to_string());
+        // The matching value sits in the middle chunk.
+        let mut middle: Vec<String> = (0..119).map(|i| format!("Patient/nobody{i}")).collect();
+        middle.insert(60, "Patient/q70".to_string());
+
+        let cases: [(&Vec<String>, BTreeSet<String>); 3] = [
+            (
+                &all,
+                set(&["ob-v10", "ob-p20", "ob-v70", "ob-p60", "ob-v110", "ob-p119"]),
+            ),
+            (&last_only, set(&["ob-v110"])),
+            (&middle, set(&["ob-v70"])),
+        ];
+        for (values, expected) in cases {
+            // The property: the list equals the union of its single values.
+            let mut union = BTreeSet::new();
+            for v in values.iter() {
+                union.extend(search_ids(vec![v.clone()]).await);
+            }
+            assert_eq!(union, expected, "union of singles");
+            assert_eq!(search_ids(values.clone()).await, expected, "search");
+            assert_eq!(sql_ids(values, false), expected, "rowid IN");
+            assert_eq!(sql_ids(values, true), expected, "EXISTS");
+        }
+    }
+
+    /// #2493: the lists that now also match `_history` references still seek
+    /// an index: no plan line scans `search_index`, in the `rowid IN (…)` form
+    /// and in the merged `EXISTS` form.
+    #[test]
+    fn reference_comma_list_with_versions_does_not_scan_search_index() {
+        let backend = create_test_backend();
+        let abs = "http://example.org/fhir/Patient/p1";
+        let lists: Vec<Vec<&str>> = vec![
+            vec!["Patient/p1", "Patient/nobody"],
+            vec!["Patient/p1/_history/3", "Patient/nobody"],
+            vec!["Patient/p1", "Patient/p2", "Patient/p3"],
+            vec!["Patient/nobody", abs],
+            vec!["Group/p1", abs],
+        ];
+        let plan_of = |sql: &str, params: &[Box<dyn rusqlite::ToSql>]| -> Vec<String> {
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for values in lists {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query)
+                .unwrap();
+            let params = bind_reference_params("t", &fragment);
+
+            let rows_sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let plan = plan_of(&rows_sql, &params);
+            assert!(
+                plan.iter().any(|l| l.contains("idx_search_reference")),
+                "{values:?}\n{}\n{plan:#?}",
+                fragment.sql
+            );
+            assert_reference_plan_is_seeks(&plan, &fragment.sql);
+
+            let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+                .unwrap_or_else(|| panic!("no EXISTS form for {values:?}: {}", fragment.sql));
+            assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+            let exists_sql = format!(
+                "EXPLAIN QUERY PLAN SELECT w.rk FROM (SELECT rowid AS rk FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {exists}"
+            );
+            let plan = plan_of(&exists_sql, &params);
+            assert!(
+                plan.iter().any(|l| l.contains("SEARCH")
+                    && l.contains("idx_search_composite")
+                    && l.contains("resource_key=?")),
+                "{values:?}\n{exists}\n{plan:#?}"
+            );
+            assert_reference_plan_is_seeks(&plan, &exists);
+        }
+    }
+
+    /// No plan line scans `search_index`: every access to it is a `SEARCH`
+    /// through an index.
+    fn assert_reference_plan_is_seeks(plan: &[String], sql: &str) {
+        for line in plan {
+            assert!(
+                !(line.starts_with("SCAN") && line.contains("search_index"))
+                    && !line.starts_with("SCAN si"),
+                "full scan of search_index in {line:?}\n{sql}\n{plan:#?}"
+            );
+        }
+    }
+
+    thread_local! {
+        static TRACED_SQL: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// `Connection::trace_v2` callback: keeps each statement as it starts,
+    /// with its bound values written in.
+    fn record_traced_sql(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(statement, _) = event
+            && let Some(sql) = statement.expanded_sql()
+        {
+            TRACED_SQL.with(|traced| traced.borrow_mut().push(sql));
+        }
+    }
+
+    /// #1506: a filtered one-row page on the default order reads each match
+    /// by rowid, where SQLite would probe `idx_resources_live_type` first, and
+    /// a single date parameter is not wrapped in a `SELECT DISTINCT` that
+    /// re-probes `idx_search_composite` per key; `le`'s two ranges are a
+    /// `UNION ALL`. A longer page keeps the walk of `idx_resources_reindex`
+    /// that stops at the page, and both pages start with the same resource.
+    #[tokio::test]
+    async fn a_one_row_page_reads_its_matches_by_rowid() {
+        use crate::types::{SearchParamType, SearchPrefix};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, start) in [
+            ("e1", "1990-01-01"),
+            ("e2", "1999-06-01"),
+            ("e3", "2005-01-01"),
+        ] {
             backend
                 .create(
-                    tenant,
-                    "DiagnosticReport",
-                    json!({
-                        "id": obs.replacen("o-", "dr-", 1), "status": "final",
-                        "code": {"text": "panel"},
-                        "result": [{"reference": format!("Observation/{obs}")}],
-                    }),
+                    &tenant,
+                    "Encounter",
+                    json!({"resourceType": "Encounter", "id": id, "status": "finished",
+                           "class": {"code": "AMB"}, "period": {"start": start}}),
                     FhirVersion::default(),
                 )
                 .await
                 .unwrap();
         }
-    }
+        let query = |count| {
+            let mut query = SearchQuery::new("Encounter").with_parameter(SearchParameter {
+                name: "date".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(SearchPrefix::Le, "2000")],
+                chain: vec![],
+                components: vec![],
+            });
+            query.count = Some(count);
+            query
+        };
 
-    /// #1307: through the `ChainedSearchProvider` trait API a comparator
-    /// prefix is recognised only on date / number / quantity terminals —
-    /// including an explicit `eq` — and never on string / token / reference /
-    /// uri terminals, whatever the value starts with.
-    #[tokio::test]
-    async fn test_resolve_chain_prefix_only_on_ordered_terminals() {
-        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
-        const VALUE_QUANTITY: &str = "result.value-quantity";
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        seed_chain_prefix_fixture(&backend, &tenant).await;
-
-        let cases: &[(&str, &str, &str, &[&str])] = &[
-            // Positive controls: unprefixed values prove each terminal is
-            // indexed, so the cases below cannot pass or fail vacuously.
-            ("Observation", "subject.family", "Wilson", &["o-wilson"]),
-            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
-            (
-                "DiagnosticReport",
-                "result.subject",
-                "wilson-1",
-                &["dr-wilson"],
-            ),
-            (
-                "Observation",
-                "device:Device.url",
-                "ws:example/1",
-                &["o-wilson"],
-            ),
-            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
-            ("Observation", WINDOW_START, "10", &["o-nelson"]),
-            (
-                "Observation",
-                "subject.birthdate",
-                "1950-04-12",
-                &["o-nelson"],
-            ),
-            // String terminal: `ne` + "lson" would also match Wilson.
-            ("Observation", "subject.family", "nelson", &["o-nelson"]),
-            ("Observation", "subject.family", "Nelson", &["o-nelson"]),
-            ("Observation", "subject.family", "Equus", &["o-equus"]),
-            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
-            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
-            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
-            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
-            (
-                "DiagnosticReport",
-                "result.subject",
-                "nelson-1",
-                &["dr-nelson"],
-            ),
-            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
-            (
-                "Observation",
-                "device:Device.url",
-                "news:example/1",
-                &["o-nelson"],
-            ),
-            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
-            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
-            (
-                "DiagnosticReport",
-                VALUE_QUANTITY,
-                "ne5.4",
-                &["dr-77", "dr-equus", "dr-wilson"],
-            ),
-            (
-                "DiagnosticReport",
-                VALUE_QUANTITY,
-                "gt6",
-                &["dr-77", "dr-equus"],
-            ),
-            // Number terminal, likewise.
-            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
-            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
-            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
-            // Date terminal with an explicit `eq`.
-            (
-                "Observation",
-                "subject.birthdate",
-                "eq1950-04-12",
-                &["o-nelson"],
-            ),
-        ];
-
-        let mut failures = Vec::new();
-        for (base, chain, value, expected) in cases {
-            let mut ids = backend
-                .resolve_chain(&tenant, base, chain, value)
-                .await
-                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
-            ids.sort();
-            let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
-            if ids != expected {
-                failures.push(format!(
-                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
-                ));
-            }
-        }
-        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_simple() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patients
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p2", "name": [{"family": "Jones"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observations
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o2",
-                    "subject": {"reference": "Patient/p2"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries since FHIRPath extraction
-        // may not fully populate them due to unsupported functions
-        {
-            let conn = backend.get_connection().unwrap();
-            // Insert patient names
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p2', 'name', 'Jones')",
-                params![tenant_id],
-            ).unwrap();
-            // Insert observation subject references
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o2', 'subject', 'Patient/p2')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Find observations where patient.name contains "Smith"
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.name", "Smith")
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_no_match() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patient
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Search for non-existent name
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.name", "Nonexistent")
-            .await
-            .unwrap();
-
-        assert!(matching_ids.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_reverse_chain() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patients
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p2"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observations with codes
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"},
-                    "code": {"coding": [{"code": "8867-4"}]}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o2",
-                    "subject": {"reference": "Patient/p2"},
-                    "code": {"coding": [{"code": "other"}]}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries since FHIRPath extraction
-        // may not fully populate them due to unsupported functions
-        {
-            let conn = backend.get_connection().unwrap();
-            // Insert subject references for observations
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o2', 'subject', 'Patient/p2')",
-                params![tenant_id],
-            ).unwrap();
-            // Insert code tokens for observations
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                 VALUES (?1, 'Observation', 'o1', 'code', '8867-4')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                 VALUES (?1, 'Observation', 'o2', 'code', 'other')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // _has:Observation:subject:code=8867-4
-        let reverse_chain = ReverseChainedParameter::terminal(
-            "Observation",
-            "subject",
-            "code",
-            crate::types::SearchValue::eq("8867-4"),
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
         );
-
-        let matching_ids = backend
-            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
-            .await
-            .unwrap();
-
-        // Should find p1 (referenced by observation with code 8867-4)
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"p1".to_string()));
-    }
-
-    /// #1389, end to end on real rows: `system|` on a chained token terminal
-    /// matches every code in that system, forward and reverse. The SQL text
-    /// tests cannot show the predicate matches anything.
-    #[tokio::test]
-    async fn test_resolve_chain_system_only_token_matches_rows() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        for (ty, id, body) in [
-            ("Patient", "p1", json!({"id": "p1"})),
-            ("Patient", "p2", json!({"id": "p2"})),
-            (
-                "Observation",
-                "o1",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-            ),
-            (
-                "Observation",
-                "o2",
-                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
-            ),
+        let mut first = Vec::new();
+        for (count, read) in [
+            (1, "USING INTEGER PRIMARY KEY"),
+            (10, "idx_resources_reindex"),
         ] {
-            let _ = id;
-            backend
-                .create(&tenant, ty, body, FhirVersion::default())
-                .await
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let result = backend
+                .search_with_connection_probe(&conn, &tenant, &query(count), None, false)
                 .unwrap();
+            let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+            assert_eq!(ids.len(), count.min(2) as usize, "{ids:?}");
+            first.push(ids[0].to_string());
+
+            let page = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            assert!(!page.contains("SELECT DISTINCT"), "{page}");
+            assert_eq!(page.matches(" UNION ALL ").count(), 1, "{page}");
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {page}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH resources") && line.contains(read)),
+                "_count={count}: {plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("idx_resources_live_type")),
+                "_count={count}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_search_date_start")),
+                "{plan:#?}"
+            );
         }
-        {
-            let conn = backend.get_connection().unwrap();
-            for (rt, rid, name, refv) in [
-                ("Observation", "o1", "subject", "Patient/p1"),
-                ("Observation", "o2", "subject", "Patient/p2"),
-            ] {
-                conn.execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![tenant_id, rt, rid, name, refv],
-                )
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(first[0], first[1]);
+    }
+
+    /// #1955: a search on positive parameters takes its candidates straight
+    /// from the value indexes. It no longer re-reads every `search_index` row
+    /// of every candidate through `idx_search_composite` to de-duplicate keys.
+    #[test]
+    fn positive_filter_candidates_skip_the_composite_index_probe() {
+        let backend = create_test_backend();
+        let token = |name: &str, value: &str| SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        for query in [
+            SearchQuery::new("Observation").with_parameter(token("category", "laboratory")),
+            SearchQuery::new("Observation")
+                .with_parameter(token("category", "laboratory"))
+                .with_parameter(token("code", "http://loinc.org|8302-2")),
+        ] {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query)
                 .unwrap();
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new("t".to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
             }
-            for (rt, rid, name, sys, code) in [
-                ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
-                ("Patient", "p2", "identifier", "http://other.example", "X1"),
-                ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
-                (
-                    "Observation",
-                    "o2",
-                    "code",
-                    "http://snomed.info/sct",
-                    "271649006",
-                ),
-            ] {
-                conn.execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![tenant_id, rt, rid, name, sys, code],
-                )
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
                 .unwrap();
-            }
+            assert!(
+                plan.iter().any(|line| line.contains("idx_search_token")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("idx_search_composite")),
+                "{plan:#?}"
+            );
         }
-
-        let forward = backend
-            .resolve_chain(
-                &tenant,
-                "Observation",
-                "subject.identifier",
-                "http://ex.org/mrn|",
-            )
-            .await
-            .unwrap();
-        assert_eq!(forward, vec!["o1".to_string()]);
-
-        let reverse_chain = ReverseChainedParameter::terminal(
-            "Observation",
-            "subject",
-            "code",
-            crate::types::SearchValue::eq("http://loinc.org|"),
-        );
-        let reverse = backend
-            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
-            .await
-            .unwrap();
-        assert_eq!(reverse, vec!["p1".to_string()]);
     }
 
+    /// #1930: search, id-only search and count wait for SQLite on a blocking
+    /// thread. With the pool's only connection held, the first poll of each
+    /// is pending instead of parking the async worker until the pool times
+    /// out, so a request timeout or a dropped request can take effect.
     #[tokio::test]
-    async fn test_resolve_chain_multi_level() {
-        // Test 3-level chain: Observation?subject.organization.name=Hospital
-        let backend = create_test_backend();
+    async fn search_waits_for_sqlite_off_the_async_worker() {
+        let mut config = crate::backends::sqlite::backend::SqliteBackendConfig::default();
+        config.max_connections = 1;
+        config.min_connections = 1;
+        config.connection_timeout_ms = 2_000;
+        let backend = SqliteBackend::with_config(":memory:", config).unwrap();
+        backend.init_schema().unwrap();
         let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
+        let query = SearchQuery::new("Patient");
 
-        // Create organization
-        backend
-            .create(
-                &tenant,
-                "Organization",
-                json!({"id": "org1", "name": "General Hospital"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
+        let held = backend.get_connection().unwrap();
+        let mut search = Box::pin(backend.search(&tenant, &query));
+        let mut ids = Box::pin(backend.search_ids(&tenant, &query));
+        let mut count = Box::pin(backend.search_count(&tenant, &query));
+        assert!(futures::poll!(&mut search).is_pending(), "search");
+        assert!(futures::poll!(&mut ids).is_pending(), "search_ids");
+        assert!(futures::poll!(&mut count).is_pending(), "search_count");
+        drop(held);
 
-        // Create patient linked to organization
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "managingOrganization": {"reference": "Organization/org1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation linked to patient
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            // Organization name
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Organization', 'org1', 'name', 'General Hospital')",
-                params![tenant_id],
-            ).unwrap();
-            // Patient -> Organization reference
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Patient', 'p1', 'organization', 'Organization/org1')",
-                params![tenant_id],
-            ).unwrap();
-            // Observation -> Patient reference
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Find observations where patient's organization name contains "Hospital"
-        let matching_ids = backend
-            .resolve_chain(
-                &tenant,
-                "Observation",
-                "subject.organization.name",
-                "Hospital",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_with_type_modifier() {
-        // Test chain with explicit type: Observation?subject:Patient.name=Smith
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patient
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Use explicit type modifier
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject:Patient.name", "Smith")
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_chain_invalid_param_error() {
-        // Test that invalid chain parameters return an error
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Try a chain with non-existent parameter
-        let result = backend
-            .resolve_chain(&tenant, "Observation", "invalid.param", "value")
-            .await;
-
-        // Should return an error due to unknown parameter
-        assert!(result.is_err());
+        assert!(search.await.unwrap().resources.items.is_empty());
+        assert!(ids.await.unwrap().items.is_empty());
+        assert_eq!(count.await.unwrap(), 0);
     }
 
     /// `search()` reads neither `SearchParameter::chain` nor
@@ -3619,7 +4241,7 @@ mod tests {
     /// Patient, and a forward chain was read as a reference to an id (#1389).
     #[tokio::test]
     async fn search_refuses_unresolved_chains() {
-        use crate::types::{ChainedParameter, SearchParamType};
+        use crate::types::{ChainedParameter, ReverseChainedParameter, SearchParamType};
 
         let backend = create_test_backend();
         let tenant = create_test_tenant();
@@ -4148,5 +4770,557 @@ mod tests {
         q.parameters[0].values = vec![SearchValue::eq("Jones")];
         let result = backend.search(&tenant, &q).await.unwrap();
         assert!(result.resources.items.is_empty());
+    }
+
+    // ---- bounded probe + first-page plan selection ----
+
+    use crate::types::{CompositeSearchComponent, SearchPrefix};
+
+    fn obs_param(
+        name: &str,
+        param_type: SearchParamType,
+        prefix: SearchPrefix,
+        value: &str,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// 2,300 Observations: `B2001` is indexed on exactly 2,001 of them and
+    /// `B2000` on exactly 2,000, so a probe capped at 2,001 rows sees the
+    /// boundary on either side.
+    async fn probe_fixture() -> (SqliteBackend, TenantContext) {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..2300usize {
+            let mut codings =
+                vec![json!({"system": "http://loinc.org", "code": format!("C{}", i % 7)})];
+            if i < 2001 {
+                codings.push(json!({"system": "http://x.org", "code": "B2001"}));
+            }
+            if i < 2000 {
+                codings.push(json!({"system": "http://x.org", "code": "B2000"}));
+            }
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("o{i:04}"),
+                        "status": "final",
+                        "category": [{"coding": [{
+                            "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                            "code": if i % 10 == 0 { "vital-signs" } else { "laboratory" }}]}],
+                        "code": {"coding": codings},
+                        "subject": {"reference": format!("Patient/p{}", i % 50)},
+                        "effectiveDateTime": format!("{}-01-15T10:00:00Z", 2000 + i % 20),
+                        "valueQuantity": {"value": (i % 500) as f64, "unit": "mg",
+                            "system": "http://unitsofmeasure.org", "code": "mg"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        (backend, tenant)
+    }
+
+    fn probe_plan_of(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> FirstPagePlan {
+        let conn = backend.get_connection().unwrap();
+        let fragment = QueryBuilder::new(tenant.tenant_id().as_str(), &query.resource_type)
+            .with_param_offset(2)
+            .build(query)
+            .unwrap();
+        choose_first_page_plan(
+            &conn,
+            tenant.tenant_id().as_str(),
+            &query.resource_type,
+            &fragment.sql,
+            &fragment.params,
+        )
+    }
+
+    /// Every page of `query` through the planner path (probe off) and the
+    /// probe path, compared id by id.
+    fn assert_same_pages(backend: &SqliteBackend, tenant: &TenantContext, query: &SearchQuery) {
+        let conn = backend.get_connection().unwrap();
+        let mut cursor_old: Option<String> = None;
+        let mut cursor_new: Option<String> = None;
+        let mut seen = 0usize;
+        for page_no in 0..6 {
+            let mut q_old = query.clone();
+            q_old.cursor = cursor_old.clone();
+            let mut q_new = query.clone();
+            q_new.cursor = cursor_new.clone();
+            let old = backend
+                .search_with_connection_probe(&conn, tenant, &q_old, None, false)
+                .unwrap();
+            let new = backend
+                .search_with_connection_probe(&conn, tenant, &q_new, None, true)
+                .unwrap();
+            let ids = |r: &SearchResult| -> Vec<String> {
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect()
+            };
+            assert_eq!(
+                ids(&old),
+                ids(&new),
+                "page {page_no} of {:?}",
+                query.parameters
+            );
+            assert_eq!(
+                old.resources.page_info.has_next,
+                new.resources.page_info.has_next
+            );
+            seen += ids(&new).len();
+            cursor_old = old.resources.page_info.next_cursor.clone();
+            cursor_new = new.resources.page_info.next_cursor.clone();
+            if cursor_old.is_none() {
+                break;
+            }
+        }
+        assert!(
+            seen > 0 || query.parameters.is_empty(),
+            "{:?} matched nothing",
+            query.parameters
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_plan_gives_the_same_pages_as_the_planner() {
+        let (backend, tenant) = probe_fixture().await;
+        let mut shapes: Vec<SearchParameter> = vec![
+            // token: selective, dense, boundary, rare
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "C3"),
+            obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "http://loinc.org|C5",
+            ),
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "B2000"),
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "B2001"),
+            obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "laboratory",
+            ),
+            obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "vital-signs",
+            ),
+            // quantity: dense, selective, empty
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Lt,
+                "460",
+            ),
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Gt,
+                "450",
+            ),
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Le,
+                "20",
+            ),
+            // date: dense, selective, union (le/ge), empty
+            obs_param(
+                "date",
+                SearchParamType::Date,
+                SearchPrefix::Gt,
+                "2005-01-01",
+            ),
+            obs_param(
+                "date",
+                SearchParamType::Date,
+                SearchPrefix::Gt,
+                "2018-01-01",
+            ),
+            obs_param("date", SearchParamType::Date, SearchPrefix::Le, "2003"),
+            obs_param("date", SearchParamType::Date, SearchPrefix::Ge, "2010"),
+            // reference
+            obs_param(
+                "subject",
+                SearchParamType::Reference,
+                SearchPrefix::Eq,
+                "Patient/p7",
+            ),
+        ];
+        // composite stays on the planner path but must still agree
+        shapes.push(SearchParameter {
+            name: "code-value-quantity".into(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("C3$gt100")],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        for param in shapes {
+            for count in [2u32, 7, 50, 250] {
+                let mut query = SearchQuery::new("Observation").with_parameter(param.clone());
+                query.count = Some(count);
+                assert_same_pages(&backend, &tenant, &query);
+            }
+        }
+        // a value no row has: both plans return an empty page
+        let mut empty = SearchQuery::new("Observation").with_parameter(obs_param(
+            "code",
+            SearchParamType::Token,
+            SearchPrefix::Eq,
+            "no-such-code",
+        ));
+        empty.count = Some(20);
+        let conn = backend.get_connection().unwrap();
+        for probe in [false, true] {
+            let r = backend
+                .search_with_connection_probe(&conn, &tenant, &empty, None, probe)
+                .unwrap();
+            assert!(r.resources.items.is_empty());
+        }
+    }
+
+    fn cvq(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "code-value-quantity".into(),
+            param_type: SearchParamType::Composite,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The code-first composite pairing returns the pages, the page flags and
+    /// the total of the whole-parameter `GROUP BY`, with the probe on and off,
+    /// for a selective code, a code past the probe cap (the `EXISTS`-driven
+    /// window), an empty one, an OR of values, and the shapes that keep the
+    /// `GROUP BY` (`system|` without a code).
+    #[tokio::test]
+    async fn composite_pairing_gives_the_same_pages_as_the_group_by() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        let mut paired_somewhere = false;
+        for values in [
+            vec!["C3$gt100"],
+            vec!["http://loinc.org|C5$lt20"],
+            vec!["B2001$ge0"],
+            vec!["B2001$gt400"],
+            vec!["B2000$lt3"],
+            vec!["C1$gt1000"],
+            vec!["no-such$gt1"],
+            vec!["C3$gt480", "C5$lt3"],
+            vec!["http://loinc.org|$gt490"],
+            vec!["|C2$gt490"],
+        ] {
+            for count in [2u32, 7, 50] {
+                for probe in [false, true] {
+                    let mut query = SearchQuery::new("Observation").with_parameter(cvq(&values));
+                    query.count = Some(count);
+                    let mut cursor: Option<String> = None;
+                    for page_no in 0..4 {
+                        query.cursor = cursor.clone();
+                        let old = backend
+                            .search_with_connection_plan(&conn, &tenant, &query, None, probe, false)
+                            .unwrap();
+                        let new = backend
+                            .search_with_connection_plan(&conn, &tenant, &query, None, probe, true)
+                            .unwrap();
+                        assert_eq!(
+                            ids(&old),
+                            ids(&new),
+                            "{values:?} count {count} probe {probe} page {page_no}"
+                        );
+                        assert_eq!(
+                            old.resources.page_info.has_next,
+                            new.resources.page_info.has_next
+                        );
+                        paired_somewhere |= !ids(&new).is_empty();
+                        cursor = old.resources.page_info.next_cursor.clone();
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let query = SearchQuery::new("Observation").with_parameter(cvq(&values));
+            assert_eq!(
+                search_count_on_plan(&conn, &tenant, &query, false, &HashMap::new()).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, true, &HashMap::new()).unwrap(),
+                "{values:?} total"
+            );
+        }
+        assert!(paired_somewhere);
+    }
+
+    /// The pairing is chosen only for a token(code)+quantity composite; the
+    /// wide one past the probe cap is `EXISTS`-driven, and a missing hinted
+    /// index falls back to the `GROUP BY` instead of failing the search.
+    #[tokio::test]
+    async fn composite_pairing_plan_and_missing_index_fallback() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        let build = |values: &[&str], rewrite: bool| {
+            QueryBuilder::new(tenant.tenant_id().as_str(), "Observation")
+                .with_param_offset(2)
+                .with_composite_rewrite(rewrite)
+                .build(&SearchQuery::new("Observation").with_parameter(cvq(values)))
+                .unwrap()
+        };
+        assert!(
+            build(&["C3$gt1"], true)
+                .sql
+                .contains("INDEXED BY idx_search_token")
+        );
+        assert!(!build(&["C3$gt1"], false).sql.contains("INDEXED BY"));
+        assert!(
+            !build(&["http://loinc.org|$gt1"], true)
+                .sql
+                .contains("INDEXED BY")
+        );
+        // An OR of values keeps the GROUP BY (the pairing measured slower there).
+        assert!(
+            !build(&["C3$gt1", "C5$gt1"], true)
+                .sql
+                .contains("INDEXED BY")
+        );
+        let wide = build(&["B2001$ge0"], true);
+        assert_eq!(
+            choose_first_page_plan(&conn, "test-tenant", "Observation", &wide.sql, &wide.params),
+            FirstPagePlan::ExistsDriven
+        );
+        assert!(
+            membership_exists_predicate(&wide.sql, "w.rk")
+                .unwrap()
+                .contains("c.resource_key = w.rk")
+        );
+        let narrow = build(&["C3$gt400"], true);
+        assert_eq!(
+            choose_first_page_plan(
+                &conn,
+                "test-tenant",
+                "Observation",
+                &narrow.sql,
+                &narrow.params
+            ),
+            FirstPagePlan::ListDriven
+        );
+
+        let mut query = SearchQuery::new("Observation").with_parameter(cvq(&["C3$gt100"]));
+        query.count = Some(5);
+        let with_index = backend
+            .search_with_connection(&conn, &tenant, &query, None)
+            .unwrap();
+        assert!(!with_index.resources.items.is_empty());
+        conn.execute("DROP INDEX idx_search_token", []).unwrap();
+        let without = backend
+            .search_with_connection(&conn, &tenant, &query, None)
+            .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&with_index), ids(&without));
+        // Forcing the pairing against the missing index is the error the
+        // fallback absorbs.
+        let forced = backend.search_with_connection_plan(&conn, &tenant, &query, None, false, true);
+        assert!(forced.unwrap_err().to_string().contains("no such index"));
+        assert_eq!(
+            search_count_on(&conn, &tenant, &query, &HashMap::new()).unwrap(),
+            search_count_on_plan(&conn, &tenant, &query, false, &HashMap::new()).unwrap()
+        );
+    }
+
+    /// A broad date search (`le`: a `UNION ALL` of two ranges) whose matches
+    /// are all older than the newest 512 resources: the first window comes up
+    /// empty, the 4,096 window fills the page, and the page is the planner's.
+    #[tokio::test]
+    async fn union_date_search_widens_the_recency_window() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..2600usize {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("d{i:04}"),
+                        "status": "final",
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+                        // the 2,050 oldest are the only matches of `le2000`
+                        "effectiveDateTime": if i < 2050 { "1990-01-15T10:00:00Z" } else { "2020-01-15T10:00:00Z" },
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let query = SearchQuery::new("Observation").with_parameter(obs_param(
+            "date",
+            SearchParamType::Date,
+            SearchPrefix::Le,
+            "2000",
+        ));
+        assert_eq!(
+            probe_plan_of(&backend, &tenant, &query),
+            FirstPagePlan::ExistsDriven
+        );
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        TRACED_SQL.with(|t| t.borrow_mut().clear());
+        let probed = backend
+            .search_with_connection_probe(&conn, &tenant, &query, None, true)
+            .unwrap();
+        let windows: Vec<String> = TRACED_SQL.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|s| s.contains("INDEXED BY idx_resources_reindex"))
+                .cloned()
+                .collect()
+        });
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert!(windows[0].contains("LIMIT 512)") && windows[1].contains("LIMIT 4096)"));
+        assert!(windows[1].contains(") OR EXISTS ("));
+        let planned = backend
+            .search_with_connection_probe(&conn, &tenant, &query, None, false)
+            .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&probed), ids(&planned));
+        assert_eq!(ids(&probed).len(), 100);
+        assert!(probed.resources.page_info.has_next);
+    }
+
+    #[tokio::test]
+    async fn probe_boundary_is_2001_index_rows() {
+        let (backend, tenant) = probe_fixture().await;
+        let plan = |value: &str| {
+            let mut q = SearchQuery::new("Observation").with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                value,
+            ));
+            q.count = Some(10);
+            probe_plan_of(&backend, &tenant, &q)
+        };
+        assert_eq!(plan("B2000"), FirstPagePlan::ListDriven, "2000 rows");
+        assert_eq!(plan("B2001"), FirstPagePlan::ExistsDriven, "2001 rows");
+        assert_eq!(plan("C3"), FirstPagePlan::ListDriven);
+        assert_eq!(plan("no-such-code"), FirstPagePlan::ListDriven);
+        // composites, `:not` and two parameters never take the probe
+        let mut two = SearchQuery::new("Observation")
+            .with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "B2001",
+            ))
+            .with_parameter(obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "laboratory",
+            ));
+        two.count = Some(10);
+        assert_eq!(
+            probe_plan_of(&backend, &tenant, &two),
+            FirstPagePlan::Planner
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_picks_the_measured_plans_for_the_page_statement() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        for (value, needle) in [
+            ("B2000", "resources NOT INDEXED"),
+            (
+                "B2001",
+                "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite",
+            ),
+        ] {
+            TRACED_SQL.with(|t| t.borrow_mut().clear());
+            let mut q = SearchQuery::new("Observation").with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                value,
+            ));
+            q.count = Some(10);
+            backend
+                .search_with_connection_probe(&conn, &tenant, &q, None, true)
+                .unwrap();
+            let page = TRACED_SQL
+                .with(|t| {
+                    t.borrow()
+                        .iter()
+                        .find(|s| s.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            assert!(page.contains(needle), "{value}: {page}");
+        }
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     }
 }

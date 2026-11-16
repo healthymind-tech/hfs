@@ -473,7 +473,9 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
 
     async fn finalize_step(&self, step: &str) -> Result<(), HtsError> {
         match step {
-            "closure" => self.rebuild_missing_closures().await?,
+            "closure" => {
+                self.rebuild_missing_closures().await?;
+            }
             "analyze" => {
                 let c = self.client().await?;
                 c.batch_execute("ANALYZE").await.map_err(pg)?;

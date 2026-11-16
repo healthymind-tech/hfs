@@ -500,7 +500,11 @@ fn zip_entries(path: &Path) -> Vec<String> {
         return Vec::new();
     };
     (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter_map(|i| {
+            zip.by_index(i)
+                .ok()
+                .and_then(|e| e.name().ok().map(|n| n.into_owned()))
+        })
         .collect()
 }
 
@@ -564,7 +568,7 @@ mod tests {
         let path = dir.path().join(name);
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
         for e in entries {
-            zip.start_file(*e, zip::write::FileOptions::default())
+            zip.start_file(*e, zip::write::SimpleFileOptions::default())
                 .unwrap();
             zip.write_all(b"x").unwrap();
         }
@@ -680,7 +684,7 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             let mut zip = zip::ZipWriter::new(std::fs::File::create(&p).unwrap());
             for e in *entries {
-                zip.start_file(*e, zip::write::FileOptions::default())
+                zip.start_file(*e, zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(b"x").unwrap();
             }

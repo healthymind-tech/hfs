@@ -1,5 +1,5 @@
-//! Server-side state for the eight sidebar "rails" (Resources, Search, Saved
-//! Queries, Search Parameters, Compartments, View Definitions, SQL Queries,
+//! Server-side state for the seven sidebar "rails" (Resources, Search,
+//! Search Parameters, Compartments, View Definitions, SQL Queries,
 //! SQL Views): per user, per tenant, per page, what was picked most recently
 //! and what the very last pick was.
 //!
@@ -76,7 +76,7 @@ use serde_json::{Map, Value};
 /// server itself would keep) all take it from here.
 pub(crate) const MAX_RECENT: usize = 5;
 
-/// One of the eight pages that carries rail state, and the JSON key its
+/// One of the seven pages that carries rail state, and the JSON key its
 /// record lives under in `rails.<page>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RailPage {
@@ -84,8 +84,6 @@ pub(crate) enum RailPage {
     Resources,
     /// The Search page's type rail (#255, #541).
     Search,
-    /// The Saved Queries page's type rail (#234, #541).
-    Queries,
     /// The SearchParameter viewer's type rail (#238) — the only page that uses
     /// [`RailState::select_all`]'s `last: ""` "All types" state.
     SearchParameters,
@@ -106,7 +104,6 @@ impl RailPage {
         match self {
             Self::Resources => "resources",
             Self::Search => "search",
-            Self::Queries => "queries",
             Self::SearchParameters => "searchParameters",
             Self::Compartments => "compartments",
             Self::ViewDefinitions => "viewDefinitions",
@@ -129,7 +126,7 @@ pub(crate) struct RailEntry {
 
 impl RailEntry {
     /// A recent entry carrying only its id — what every "type" rail
-    /// (Resources, Search, Saved Queries, Search Parameters) writes. Their
+    /// (Resources, Search, Search Parameters) writes. Their
     /// live rail always has the item and the id doubles as the label, so no
     /// snapshot is needed.
     pub(crate) fn id_only(id: impl Into<String>) -> Self {
@@ -378,6 +375,31 @@ pub(crate) struct ResolvedRailEntry {
     pub(crate) href: String,
     pub(crate) count: Option<String>,
     pub(crate) current: bool,
+}
+
+/// Case-insensitive "contains" of a rail's filter box text, the one predicate
+/// every rail uses to narrow both its list and its "Recently used" group
+/// (#1275). An empty filter keeps everything.
+pub(crate) fn matches_rail_filter(text: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Narrows resolved recents to the rail's own filter: an entry stays when
+/// `on_list` says the filtered list already shows it, or when its label
+/// matches `filter`. The first arm keeps a recent from vanishing while the
+/// list still shows it (the server's `name:contains` can be laxer than
+/// [`matches_rail_filter`]); the second lets an entry the list does not
+/// carry (another page) surface from its stored snapshot when it matches.
+pub(crate) fn retain_matching_recents(
+    entries: &mut Vec<ResolvedRailEntry>,
+    filter: &str,
+    on_list: impl Fn(&str) -> bool,
+) {
+    if filter.trim().is_empty() {
+        return;
+    }
+    entries.retain(|entry| on_list(&entry.id) || matches_rail_filter(&entry.label, filter));
 }
 
 /// The per-user settings document [`crate::resolve_prefs`] already fetched for
@@ -1034,6 +1056,42 @@ mod tests {
     // ── Resolving recents against the live rail ──────────────────────────
 
     #[test]
+    fn matches_rail_filter_is_case_insensitive_and_empty_keeps_all() {
+        assert!(matches_rail_filter("Patient_Demographics", "demo"));
+        assert!(matches_rail_filter("anything", ""));
+        assert!(!matches_rail_filter("observation_flat", "patient"));
+        // Surrounding whitespace is not part of the term (the client trims too).
+        assert!(matches_rail_filter("patient_demographics", "  patient "));
+        assert!(matches_rail_filter("anything", "   "));
+    }
+
+    #[test]
+    fn retain_matching_recents_keeps_listed_or_label_matching_entries() {
+        let entry = |id: &str, label: &str| ResolvedRailEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            meta: None,
+            href: String::new(),
+            count: None,
+            current: false,
+        };
+        let all = vec![entry("a", "alpha"), entry("b", "beta"), entry("c", "gamma")];
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "", |_| false);
+        assert_eq!(kept.len(), 3, "an empty filter keeps everything");
+        // "a" is on the list despite not matching; "c" matches off-list.
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "GAM", |id| id == "a");
+        assert_eq!(
+            kept.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        let mut kept = all;
+        retain_matching_recents(&mut kept, "zzz", |_| false);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
     fn resolve_recents_prefers_live_data_over_the_snapshot() {
         let state = RailState {
             last: Some("abc".to_string()),
@@ -1222,6 +1280,7 @@ mod tests {
             compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
             conformance: source,
             tenants: None,
+            tenant_inventory: None,
             provisioning: Default::default(),
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),

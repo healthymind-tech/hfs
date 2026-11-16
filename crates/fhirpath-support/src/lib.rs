@@ -286,18 +286,29 @@ pub fn wrap_choice_field(result: EvaluationResult, field_name: &str) -> Evaluati
 /// like `Patient.active.id` and `Patient.birthDate.extension` can reach it.
 ///
 /// `extension` holds each FHIR Extension as an `EvaluationResult::Object`.
+///
+/// `decimal_exponent` is not FHIR element metadata. It records the precision of a
+/// FHIR decimal written with a positive exponent, which `rust_decimal::Decimal`
+/// cannot hold (see the field docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PrimitiveElement {
     /// Optional element identifier (the `id` field of the Element).
     pub id: Option<String>,
     /// Extensions on the primitive, each represented as an `EvaluationResult::Object`.
     pub extension: Vec<EvaluationResult>,
+    /// For a decimal whose least significant digit lies left of the units place,
+    /// the power of ten of that digit. `9.5e2` is `Some(1)`: the value is `950`,
+    /// but it is only precise to the tens. `rust_decimal` has no negative scale,
+    /// so `Decimal::from_scientific("9.5e2")` is `950` at scale 0, the same as a
+    /// literal `950`. `None` when the decimal's own scale already describes its
+    /// precision. `lowBoundary()`/`highBoundary()` read it (#2173).
+    pub decimal_exponent: Option<u32>,
 }
 
 impl PrimitiveElement {
-    /// Returns true when there is no id and no extensions.
+    /// Returns true when there is no id, no extensions and no decimal precision hint.
     pub fn is_empty(&self) -> bool {
-        self.id.is_none() && self.extension.is_empty()
+        self.id.is_none() && self.extension.is_empty() && self.decimal_exponent.is_none()
     }
 }
 
@@ -539,6 +550,15 @@ pub enum EvaluationError {
     ///
     /// Example: "Function 'conformsTo' is not implemented"
     UnsupportedFunction(String),
+    /// A terminology operation failed: no terminology server is configured, or a request to it
+    /// failed (HTTP error, timeout, connection error, invalid response).
+    ///
+    /// Displays with the `Invalid Operation:` prefix these errors had before they got their own
+    /// variant, so error text is unchanged.
+    TerminologyError(String),
+    /// The terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up. Also a
+    /// terminology error: see [`EvaluationError::is_terminology_error`].
+    TerminologyCallLimit(String),
     /// Generic error for cases not covered by specific variants.
     ///
     /// Used for internal errors, edge cases, or temporary error conditions
@@ -580,8 +600,26 @@ impl std::fmt::Display for EvaluationError {
             }
             EvaluationError::SemanticError(msg) => write!(f, "Semantic Error: {}", msg),
             EvaluationError::UnsupportedFunction(msg) => write!(f, "Unsupported Function: {}", msg),
+            EvaluationError::TerminologyError(msg) | EvaluationError::TerminologyCallLimit(msg) => {
+                write!(f, "Invalid Operation: {}", msg)
+            }
             EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
         }
+    }
+}
+
+impl EvaluationError {
+    /// True for every failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        matches!(
+            self,
+            Self::TerminologyError(_) | Self::TerminologyCallLimit(_)
+        )
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        matches!(self, Self::TerminologyCallLimit(_))
     }
 }
 
@@ -1612,5 +1650,22 @@ fn format_unit_for_display(unit: &str) -> String {
     } else {
         // UCUM code units: display with quotes
         format!("'{}'", unit)
+    }
+}
+
+#[cfg(test)]
+mod evaluation_error_tests {
+    use super::EvaluationError;
+
+    #[test]
+    fn terminology_variants_display_and_classify() {
+        let t = EvaluationError::TerminologyError("x".into());
+        let c = EvaluationError::TerminologyCallLimit("x".into());
+        assert_eq!(t.to_string(), "Invalid Operation: x");
+        assert_eq!(c.to_string(), "Invalid Operation: x");
+        assert!(t.is_terminology_error() && !t.is_terminology_call_limit());
+        assert!(c.is_terminology_error() && c.is_terminology_call_limit());
+        let o = EvaluationError::InvalidOperation("x".into());
+        assert!(!o.is_terminology_error() && !o.is_terminology_call_limit());
     }
 }

@@ -587,17 +587,19 @@ fn parse_numeric_max(max: Option<&str>) -> Option<u64> {
 }
 
 fn parse_content_reference(reference: &str) -> Option<Vec<String>> {
-    // `#Bundle.link`, or the canonical form R4 IG snapshots carry,
-    // `http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link`.
-    let path = match reference.strip_prefix('#') {
-        Some(path) => path,
-        None => reference.split_once('#')?.1,
-    };
+    // `#A.b` names an element of the base type `A`; `<canonical>#A.b` (as the
+    // SQL on FHIR ViewDefinition uses) names one of that canonical's schema.
+    let (canonical, path) = reference.split_once('#')?;
     let mut parts = path.split('.');
     let root = parts.next()?;
     if root.is_empty() {
         return None;
     }
+    let root = if canonical.is_empty() {
+        root
+    } else {
+        canonical
+    };
     let mut segments = vec![root.to_string()];
     for part in parts {
         if part.is_empty() {
@@ -636,11 +638,17 @@ mod content_reference_tests {
             local,
             Some(vec!["Bundle".into(), "elements".into(), "link".into()])
         );
+        // Upstream #410 form: the canonical names the schema the path is in
+        // (resolved by URL in the registry), not the path's first segment.
         assert_eq!(
             super::parse_content_reference(
                 "http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link"
             ),
-            local
+            Some(vec![
+                "http://hl7.org/fhir/StructureDefinition/Bundle".into(),
+                "elements".into(),
+                "link".into()
+            ])
         );
         assert_eq!(super::parse_content_reference("Bundle.link"), None);
     }

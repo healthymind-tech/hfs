@@ -1544,7 +1544,7 @@ async fn set_index_pending(backend: &Arc<SqliteBackend>, poll_path: &str, pendin
                 lease_duration: Duration::from_secs(60),
                 fencing_token: 0,
             };
-            backend.mark_manifest_index_pending(&lease).await.unwrap();
+            backend.mark_manifest_index_pending(&lease, &[]).await.unwrap();
         } else {
             backend
                 .clear_manifest_index_pending(&target.tenant, &manifest.manifest_id)
@@ -2438,4 +2438,89 @@ async fn test_progress_header_stays_ascii_in_every_branch() {
         text.contains("609,191 Resources written"),
         "the count branch must still be the one under test, got: {text}"
     );
+}
+
+fn attribution_fetcher() -> Arc<MockFetcher> {
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "https://provider/attributed.ndjson?X-Amz-Signature=secret".to_string(),
+        concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"attr-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"gone\"}\n",
+            "not-json\n",
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    Arc::new(MockFetcher {
+        files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider/attributed.ndjson?X-Amz-Signature=secret".to_string(),
+                count: Some(3),
+            }],
+            deleted: vec![],
+        },
+        manifests: std::collections::HashMap::new(),
+    })
+}
+
+#[tokio::test]
+async fn error_receipts_name_the_input_file_and_line() {
+    let (server, backend, fetcher, output, _tmp) =
+        create_submit_server_with(attribution_fetcher(), BulkSubmitConfig::default()).await;
+    let tenant = TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    );
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "gone"}),
+            helios_fhir::FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "gone").await.unwrap();
+
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    let manifest: Value = server.get(&poll_path).await.json();
+    let outcome = manifest["outcome"].as_array().expect("outcome array");
+    assert_eq!(outcome.len(), 1, "{manifest:#}");
+    let outcome_url = outcome[0]["url"].as_str().expect("outcome url");
+    let outcome_bytes = server.get(local_file_path(outcome_url)).await.text();
+    let rows: Vec<Value> = outcome_bytes
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+
+    let attributed: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row["extension"][0]["url"]
+                == "https://helios.software/StructureDefinition/bulk-submit-input"
+        })
+        .collect();
+    assert_eq!(attributed.len(), 1, "{rows:#?}");
+    assert_eq!(
+        attributed[0]["extension"][0]["extension"],
+        json!([
+            {"url": "file", "valueUrl": "https://provider/attributed.ndjson?[redacted]"},
+            {"url": "line", "valuePositiveInt": 2}
+        ]),
+        "{rows:#?}"
+    );
+
+    for row in &rows {
+        let diagnostics = row["issue"][0]["diagnostics"].as_str().unwrap_or_default();
+        if diagnostics.contains("could not be parsed") {
+            assert!(row.get("extension").is_none(), "{row:#}");
+        }
+    }
+
+    assert_eq!(manifest["output"][0]["count"], 1, "{manifest:#}");
 }

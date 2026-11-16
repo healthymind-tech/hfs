@@ -71,12 +71,13 @@ Options:
   -V, --version                  Print version
 ```
 
-`hfs --version` prints the crate version and, when the binary was built from a
-git checkout, the commit it was cut from — `hfs 0.2.1 (git 1a2b3c4d5)`. The
+`hfs --version` prints the crate version and, when the binary is a release
+build (`--release`) from a git checkout, the commit it was cut from — `hfs 0.2.1 (git 1a2b3c4d5)`. The
 same identity is advertised to FHIR clients as `CapabilityStatement.software`
 on `GET /metadata` (the commit as an extension on `software`) and reported by
 `GET /health`. When building from a source archive with no `.git`, set
-`HFS_GIT_SHA=<sha>` in the build environment to record the commit.
+`HFS_GIT_SHA=<sha>` in the build environment to record the commit; the same
+variable records it in a debug build.
 
 ## Configuration
 
@@ -92,7 +93,7 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | 3600 | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
-| `HFS_MAX_BODY_SIZE` | 134217728 | Max request body size (bytes; applies to the decompressed body for compressed requests). The 128 MiB default covers the largest per-patient Synthea Bundle (#1662); a batch or transaction body is parsed whole in memory, so lower it on small hosts. |
+| `HFS_MAX_BODY_SIZE` | 134217728 | Max request body size (bytes; applies to the decompressed body for compressed requests). The 128 MiB default covers the largest per-patient Synthea Bundle (#1662); a batch or transaction body is parsed whole in memory, so lower it on small hosts. A bundle that size takes minutes to process (the largest, 27,056 entries, took about 2 minutes on a release build with SQLite), and `HFS_REQUEST_TIMEOUT` can answer 408 before it finishes: raise that too when posting large bundles. |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
@@ -123,14 +124,17 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `HFS_PACKAGE_MARKETPLACE` | FHIR/ig-registry `fhir-ig-list.json` | Marketplace index URL, or `off` |
 | `HFS_PACKAGE_MAX_SIZE` / `HFS_PACKAGE_MAX_UNPACKED` / `HFS_PACKAGE_MAX_ENTRY` | 256 MiB / 1 GiB / 64 MiB | Limits on a package archive, its unpacked total, and one file inside it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends (`sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch`, `s3-elasticsearch`). One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk-load flows that immediately search). Ignored when the storage backend has no search secondary. |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Elasticsearch index `refresh_interval` for ES-backed backends. Controls how quickly indexed documents become searchable when no per-write refresh is requested. `-1` disables periodic refresh entirely. Applied when an index is created; indices that already exist keep their current setting. |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Elasticsearch index `refresh_interval` for ES-backed backends. Controls how quickly indexed documents become searchable when no per-write refresh is requested. `-1` disables periodic refresh entirely. Set when an index is created and reconciled at startup onto every existing `{HFS_ELASTICSEARCH_INDEX_PREFIX}_*` index, overwriting a value set by hand with `PUT _settings`. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the interval is the price of every interactive write, so keep it short (`1s` or less); a long value makes each write wait for the next refresh (#1749). |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | The `refresh` parameter applied to Elasticsearch index/delete operations. One of `false` (no per-write refresh), `wait_for` (block each write until the affected shards refresh), or `true` (force a refresh per write; expensive, low-volume deployments only). |
 | `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Elasticsearch `index.max_terms_count`: the most values a single `terms` query may carry. A chained or `_has` search whose terminal hop resolved more ids than this is sent as several `terms` clauses of at most this many values each, instead of being refused (#1548). Applied to new indices through the index template. |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Elasticsearch `index.mapping.nested_objects.limit`: the maximum nested objects a single document may contain, summed across every nested search-parameter field. Elasticsearch's own default of 10000 rejects larger documents, so a resource with very many indexed values (for example a Synthea `Provenance` with 13,554 `target` references) is stored but never searchable. Applied to new indices through the index template, and raised at startup on existing indices that are below it; the setting is dynamic, so no reindex is needed for resources that already indexed. |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch HTTP request, in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent, down to a single document, so raise this only when one large document still times out on its own. |
 | `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` (10 MiB) | Byte cap on one `_bulk` request body, applied together with the 500-operation cap, for bulk creates and every rebuild. Without it, 500 Synthea `Provenance` resources (~108 KB each) made a ~54 MB request that exceeded the request timeout. A single document larger than the cap is sent alone. |
 | `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | How many `_bulk` requests of one page are in flight at once. `1` sends them one at a time, as before #1125. Raising it shortens a rebuild when the cluster is not the bottleneck; splitting after a `413` or a timeout, and `429` back-off, stay sequential within the request that caused them. |
+| `HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` | `0` (built-in 16) | Most contained-document sweeps in flight at once. On every update and delete the Elasticsearch writer runs a `_delete_by_query` over the tenant's indices to remove the container's stale `contained[]` documents; each sweep opens a scroll context on every shard it visits and the cluster allows `search.max_open_scroll_context` (500) in all, so an unbounded burst is answered `429 too_many_scroll_contexts`. A sweep the cluster still refuses is repeated on its own (4 rounds, jittered back-off) instead of redoing the whole sync event. The sweep always runs on update and delete. |
+| `HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS` | `0` | Threads that extract search values for one `$reindex` page on the Elasticsearch writer, which is what the composite deployments' post-import rebuild runs through. `0` uses cores − 1, clamped to 1–4; `1` extracts on the page's own thread, as before #1250; an explicit value is capped at 64. Pages of fewer than 16 resources, and any page on a current-thread runtime, extract inline. |
 | `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild, on top of `HFS_REINDEX_BATCH_SIZE`. `0` means count only; with a cap set, a page of ~108 KB `Provenance` resources stays near the cap instead of holding ~108 MB in memory. Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only. |
+| `HFS_REINDEX_PREFETCH` | `true` | Whether the search-index rebuild fetches the next page from the primary while the current one is written, for `POST $reindex` and the automatic post-import rebuild alike. Honoured wherever the source allows the overlap: standalone MongoDB and `mongo-es` (id phase), and `sqlite-es`, `postgres-es` and `s3-es`, where search is offloaded so the page read and the Elasticsearch write touch disjoint stores; standalone SQLite and PostgreSQL keep the serial loop. `false` restores the strictly serial fetch → write loop on every backend (#1250). `HFS_MONGODB_REINDEX_PREFETCH` remains the MongoDB-specific switch underneath. |
 | `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | The `refresh` parameter for the `_bulk` writes of `$reindex` and of the deferred post-import rebuild: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH`. Set `false` to let a rebuild skip the per-request refresh wait while ordinary writes keep `wait_for`. |
 | `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild that follows a bulk import, on every backend. `POST $reindex` keeps its own `batchSize` parameter (default 100), capped at 10,000. |
 
@@ -152,12 +156,60 @@ recorded by `Type/id`, with Elasticsearch's `error.type` and `reason` when it
 gave one, in `GET /$reindex-status/{job_id}`. See
 [Bulk writes and rebuilds on Elasticsearch-backed composites](../persistence/README.md#bulk-writes-and-rebuilds-on-elasticsearch-backed-composites).
 
+For `$bulk-submit`, which indexing mode and settings to run per backend are in the [indexing-mode table](../rest/README.md#bulk-submit-indexing-mode-per-storage-backend); the paragraph below is only about the `$reindex` rebuild.
+
 On `sqlite-elasticsearch`, the recommended pair for a bulk import is
 `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` with
 `HFS_ELASTICSEARCH_REINDEX_REFRESH=false`: ordinary writes stay
 read-your-write, while the rebuild skips the per-request refresh wait.
 Measured on a 228,580-resource cut, that took the deferred rebuild from 806 s
 to 145 s (1,576 resources/s) with the same result.
+
+**Recommended `HFS_ELASTICSEARCH_REFRESH_INTERVAL`: keep the `1s` default (#1749).**
+A long interval does not shorten a bulk import and it makes every interactive
+write slower. Measured on `postgres-elasticsearch` (PostgreSQL 16, Elasticsearch
+8.15.0 with an 8 GB heap, 8 CPU / 23 GB, `HFS_BULK_SUBMIT_DEFER_INDEXING=false`,
+`HFS_COMPOSITE_SYNC_MODE=synchronous`, `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`,
+919,752 resources, three runs per value in rotated order):
+
+| `REFRESH_INTERVAL` | Import (mean of 3) | Elasticsearch CPU (mean) | Refreshes | Single `POST /Basic`, p50 |
+|---|---|---|---|---|
+| `1s` | 223 s | ~95 % | ~365 | 1.0 s |
+| `5s` | 220 s | ~75 % | ~144 | 5.0 s |
+| `30s` | 220 s | ~40 % | ~95 | not measurable: HFS did not become ready |
+| `-1` | not measurable with `wait_for` | | | |
+
+- **Import:** the three intervals are within 2 % of each other, far under the 10 %
+  that would justify a dynamic interval, so none is built. The longer interval
+  only saves Elasticsearch CPU; the import is limited by HFS and PostgreSQL.
+- **Interactive writes:** with `wait_for` a write, a batch of 8 and a transaction
+  of 662 entries each take about one interval (1.0 s at `1s`, 5.0 s at `5s`), the
+  same with or without an import running. `HFS_ELASTICSEARCH_WRITE_REFRESH=true`
+  or `false` returns in under 0.1 s (p95) at any interval, but then a write is not
+  searchable on return (`false`) or each write forces a refresh (`true`).
+- **A new index takes the configured interval:** the first write of a type never
+  written before created `hfs_default_riskassessment` with the configured value,
+  so a long interval also slows the first save of each type.
+- **`30s` and `-1` with `wait_for` are not usable:** HFS seeds the search
+  parameters with `wait_for` writes at startup. On an empty cluster at `30s` that
+  took 212 s in two runs, and in two other attempts it was still not ready after
+  2 and after 10 minutes (each seed write timing out at the 30 s request timeout
+  and being retried); with `-1` the server was not ready after 10 minutes in
+  three runs. HFS now logs a warning at startup
+  for these combinations.
+- **Larger corpus (25 % cut of the full Synthea corpus, 4,738,958 resources in all
+  24 types, same machine and settings):** the long interval still does not pay for
+  itself. Imported with `1s`: 1,363 s (3,477 resources/s), 2,828 refreshes,
+  Elasticsearch CPU ~97 %. With `30s`: 1,328 s (3,568 resources/s, 2.6 % faster),
+  391 refreshes, Elasticsearch CPU ~54 %. On the same loaded server, with no
+  configuration change, a `POST /Basic`, a batch of 8, a 662-entry transaction and
+  the first write of a new type (`RiskAssessment`) took about 1.0 s at `1s` and
+  about 30 s (p95 and maximum 60 s) at `30s`.
+- **Not measured:** the full 18.96 M-resource corpus (the import rate falls as the
+  index grows: an interrupted full run averaged ~2,460 resources/s at 64 %, so the
+  25 % figures are optimistic) and the real 8-entry batch and 662-entry transaction
+  Bundles (the numbers above use synthetic `Basic` Bundles of the same size). The
+  during-import pass overlapped only the end of a 100-bundle import.
 
 A manifest ingested with indexing deferred records that it still owes a
 rebuild, on its own row. If the server stops mid-rebuild, the next start
@@ -231,6 +283,12 @@ cargo build -p helios-hfs --no-default-features --features R4,mongodb
 | history (system) | GET | `/_history` |
 | batch/transaction | POST | `/` |
 | health | GET | `/health` |
+
+History reads (instance, type and system `_history`) accept `_count` (capped at `HFS_MAX_PAGE_SIZE`), `_since` (an RFC 3339 instant with a time zone, such as `2024-01-01T00:00:00Z`; only versions created at or after it are returned) and `_format`, each at most once. FHIR's general parameters `_pretty`, `_summary` and `_elements` are accepted but not applied to history. The other history parameters FHIR defines, `_at`, `_list` and `_sort`, are not implemented. They are refused with `400 Bad Request` and an OperationOutcome with issue code `not-supported`, whatever their value and whatever `Prefer: handling` the request sends, because answering with the unfiltered, default-ordered history would look like a filtered or sorted answer. Use `_since` to narrow a history read by time. Any other parameter is refused with `400` (issue code `invalid`) under `Prefer: handling=strict` and ignored otherwise: unlike a searchset, a history Bundle has nowhere to report an ignored parameter. A `_count` that is not a non-negative integer, a `_since` that is not an instant, or a repeated `_count`, `_since` or `_format` is a `400` with issue code `invalid`. History Bundles carry a `self` link and, when there is another page, a `next` link that carries the effective `_count` (the default when the request sent none, capped at `HFS_MAX_PAGE_SIZE`) plus the request's `_since` and `_format`: follow `next` to read the following page. A `_count=0` page has no `next`. Its `_cursor` is opaque, so use the link as given; a `_cursor` that does not decode, or a repeated one, is a `400` with issue code `invalid`.
+
+A `DELETE [type]/[id]` of a resource that never existed, or that is already deleted, is a successful no-op (#2523): `204 No Content`, or `200 OK` with an informational OperationOutcome (`severity` `information`, `code` `informational`, saying nothing was deleted) when the request sends `Prefer: return=OperationOutcome` — the answer a conditional `DELETE [type]?criteria` that matches nothing already gives. FHIR R4, R4B and R5 ([http.html#delete](https://hl7.org/fhir/R4/http.html#delete)) say a server should answer `200` or `204` "if the resource does not exist at all", and that deleting a resource that is already deleted "has no effect". Nothing is written for it — no history version, no tombstone, no `lastUpdated` change — and no subscription notice is sent; the AuditEvent records a successful delete of the addressed `Type/id`. A batch or transaction `DELETE` entry answers the same `204`, and the rest of the transaction commits. This holds on every storage backend, S3 included (S3 refuses transaction Bundles outright, so there it covers the plain delete and batch entries). With `If-Match` (or a Bundle entry's `ifMatch`) an absent or deleted resource is still `412 Precondition Failed`, and a read of a deleted resource is still `410 Gone`. Until #2523 the answer was `404 Not Found` (`410 Gone` on S3 for an already-deleted id), and a transaction entry failed the whole Bundle with `400`: a client that read the `404` as "it was not there" now gets `204`, or `200` with the OperationOutcome above.
+
+The same URLs in a batch or transaction `GET` entry are answered like the direct requests (#2380): a vread entry carries the requested version (or is a `404` / `410` entry), and a history entry carries the `history` Bundle, with the parameters, refusals and links above and the Bundle request's `Prefer: handling`; `_format` in an entry URL is ignored. In a transaction they run after the writes, as search entries do: a refused or malformed parameter fails the whole transaction before anything is written, while a missing or deleted version is that entry's own error.
 
 ## Examples
 

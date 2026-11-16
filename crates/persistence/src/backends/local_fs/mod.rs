@@ -175,6 +175,15 @@ impl ExportOutputStore for LocalFsOutputStore {
         let dir = self.job_dir(tenant.tenant_id().as_str(), job_id);
         delete_dir_idempotent(&dir).await
     }
+
+    async fn delete_tenant_outputs(&self, tenant_id: &str) -> StorageResult<()> {
+        // `root.join("")` is the root itself and `..` escapes it: refuse
+        // anything that is not a single plain path component.
+        if !is_single_component(tenant_id) {
+            return Err(io_err(format!("refusing tenant output path {tenant_id:?}")));
+        }
+        delete_dir_idempotent(&self.root.join(tenant_id)).await
+    }
 }
 
 /// How many times a job-directory removal is attempted when a concurrent
@@ -183,6 +192,16 @@ impl ExportOutputStore for LocalFsOutputStore {
 /// outlasts it.
 const REMOVE_DIR_ATTEMPTS: usize = 20;
 const REMOVE_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// `true` if `name` is exactly one normal path component (not empty, `.`,
+/// `..`, and without separators).
+fn is_single_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
 
 /// Removes a directory if it exists; a missing directory is `Ok`.
 async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
@@ -194,7 +213,8 @@ async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
 
 /// Removes `dir` and everything under it with `remove`. A missing directory
 /// is `Ok`. A part finalized into the directory while it is being walked
-/// makes the final `rmdir` fail with `DirectoryNotEmpty`; that is retried up
+/// makes the final `rmdir` fail with `DirectoryNotEmpty` (or, on Windows, a
+/// part still open fails with a sharing violation); that is retried up
 /// to `attempts` times, pausing [`REMOVE_DIR_RETRY_DELAY`] between attempts.
 /// Any other failure is returned at once.
 async fn remove_dir_all_retrying<F, Fut>(
@@ -212,12 +232,22 @@ where
         match remove(dir).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < attempts => {
+            Err(e) if is_transient_remove_error(&e) && attempt < attempts => {
                 tokio::time::sleep(REMOVE_DIR_RETRY_DELAY).await;
             }
             Err(e) => return Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
         }
     }
+}
+
+/// Whether a failed removal is the writer race and worth retrying: the final
+/// `rmdir` found a part landed after the walk (`DirectoryNotEmpty`), or, on
+/// Windows, a part the writer still holds open could not be deleted
+/// (`ERROR_SHARING_VIOLATION`, os error 32, which std leaves uncategorized).
+fn is_transient_remove_error(e: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || (cfg!(windows) && e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
 }
 
 #[cfg(test)]
@@ -229,6 +259,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn delete_tenant_outputs_removes_only_that_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFsOutputStore::new(tmp.path(), "http://localhost:8080");
+        for tenant in ["t1", "t2"] {
+            let key = ExportPartKey::output(tenant, ExportJobId::new(), "Patient", 0, 1);
+            let mut w = store.open_writer(&key).await.unwrap();
+            w.write_line("{}").await.unwrap();
+            store.finalize_part(&key, w).await.unwrap();
+        }
+        store.delete_tenant_outputs("t1").await.unwrap();
+        store.delete_tenant_outputs("t1").await.unwrap(); // idempotent
+        assert!(!tmp.path().join("t1").exists());
+        assert!(tmp.path().join("t2").exists());
+        for bad in ["", "..", ".", "a/b"] {
+            assert!(store.delete_tenant_outputs(bad).await.is_err(), "{bad:?}");
+        }
+        assert!(tmp.path().exists());
+    }
 
     fn test_key(job: &ExportJobId) -> ExportPartKey {
         ExportPartKey::output("t1", job.clone(), "Patient", 0, 1)
@@ -611,7 +661,10 @@ mod tests {
         let writer_dir = dir.clone();
         let writer = tokio::task::spawn_blocking(move || {
             for i in 0..200 {
-                std::fs::create_dir_all(&writer_dir).unwrap();
+                // Windows refuses to recreate a directory that is still
+                // pending deletion (ERROR_ALREADY_EXISTS); the writer only
+                // needs to keep landing files where it can.
+                let _ = std::fs::create_dir_all(&writer_dir);
                 let _ = std::fs::write(
                     writer_dir.join(format!("output-Patient-{i}-1.ndjson")),
                     b"{}\n",

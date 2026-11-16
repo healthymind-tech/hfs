@@ -1,5 +1,7 @@
 //! ResourceStorage and VersionedStorage implementations for PostgreSQL.
 
+use crate::core::transaction::BundleTransactionState;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,17 +31,19 @@ use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
 use crate::search::SearchParameterExtractor;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexIdRange, ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::PostgresBackend;
+use super::bundle_lock_plan::{BundleLockMode, MAX_BUNDLE_LOCK_KEYS, plan_bundle_locks};
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::{GuardedClient, ReindexAdmission};
 use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
+use super::search_impl::invalid_cursor;
 
 #[cfg(test)]
 pub(super) struct ReindexTestHook {
@@ -102,10 +106,28 @@ mod reindex_groups_tests {
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
 
     async fn backend(pool_size: usize) -> PostgresBackend {
+        backend_in(pool_size, "postgres").await
+    }
+
+    /// A backend over a database of its own, for a test whose rows and
+    /// statistics must not leak into the tests sharing `postgres`.
+    async fn isolated_backend(pool_size: usize, name: &str) -> PostgresBackend {
+        let admin = backend(1).await;
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .expect("create database");
+        backend_in(pool_size, name).await
+    }
+
+    async fn backend_in(pool_size: usize, dbname: &str) -> PostgresBackend {
         let pg = SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                let container = crate::container_cleanup::with_cleanup_label(
                     Postgres::default()
                         .with_tag("16-alpine")
                         .with_label("github.run_id", &run_id),
@@ -123,7 +145,7 @@ mod reindex_groups_tests {
         PostgresBackend::new(PostgresConfig {
             host: pg.host.clone(),
             port: pg.port,
-            dbname: "postgres".into(),
+            dbname: dbname.into(),
             user: "postgres".into(),
             password: Some("postgres".into()),
             max_connections: pool_size,
@@ -578,6 +600,77 @@ mod reindex_groups_tests {
             .expect("oversized session settled");
     }
 
+    /// A planner/executor disagreement -- an entry that touches a resource the
+    /// lock plan did not lock -- is a defect of the server, not a mistake in the
+    /// request. The Bundle ends as `RolledBack` (a 500 whose reason is only
+    /// logged), not as the `BundleError` (a 400 naming the entry) that blames
+    /// the client, and nothing is written.
+    ///
+    /// The planner and the executor read an entry with one parser, so no
+    /// Bundle reaches this through `process_transaction`; the plan is built by
+    /// hand and handed to `run_transaction_bundle`, the one step the planner is
+    /// not part of.
+    #[tokio::test]
+    async fn a_plan_violation_ends_the_bundle_as_a_server_error() {
+        use crate::backends::postgres::bundle_lock_plan::LockPlan;
+        use crate::core::{BundleEntry, BundleMethod};
+
+        let backend = backend(3).await;
+        backend.init_schema().await.expect("initialize tables");
+        let tenant = TenantContext::new(
+            TenantId::new("plan-violation"),
+            TenantPermissions::full_access(),
+        );
+        let entries = vec![
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/planned".to_string(),
+                resource: Some(json!({"resourceType":"Patient","id":"planned"})),
+                ..Default::default()
+            },
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/unplanned".to_string(),
+                resource: Some(json!({"resourceType":"Patient","id":"unplanned"})),
+                ..Default::default()
+            },
+        ];
+        let plan = LockPlan {
+            resources: vec![("Patient".to_string(), "planned".to_string())],
+            minted_creates: true,
+            criteria_locks: true,
+        };
+
+        let outcome = backend
+            .run_transaction_bundle(
+                &tenant,
+                entries,
+                FhirVersion::default(),
+                None,
+                BundleLockMode::Shared(plan),
+            )
+            .await;
+        match outcome {
+            Err(TransactionError::RolledBack { reason }) => {
+                assert!(reason.contains("Patient/unplanned"), "{reason}");
+                assert!(reason.contains("lock plan"), "{reason}");
+            }
+            other => panic!("a plan violation must be a RolledBack (500), got {other:?}"),
+        }
+        let written: i64 = backend
+            .get_client()
+            .await
+            .expect("observer")
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(written, 0, "the Bundle must roll back whole");
+    }
+
     #[test]
     fn sorted_signed_keys_deduplicate_opposing_orders() {
         let a = sorted_resource_keys(
@@ -606,6 +699,171 @@ mod reindex_groups_tests {
             keys.len(),
             1,
             "collisions serialize the two full identities"
+        );
+    }
+
+    /// #1767: every id-range statement reads `idx_resources_reindex_id` with
+    /// the range and the cursor as index bounds, under both plan-cache modes,
+    /// and the uncapped page never sorts.
+    #[tokio::test]
+    async fn reindex_id_range_queries_are_bounded_on_the_reindex_id_index() {
+        let backend = backend(2).await;
+        backend.init_schema().await.expect("schema");
+        let tenant = format!("id-range-plan-{}", uuid::Uuid::new_v4().simple());
+        let client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT $1, 'Patient', md5(n::text), '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0'
+                 FROM generate_series(1, 20000) AS n",
+                &[&tenant],
+            )
+            .await
+            .expect("seed");
+        client
+            .batch_execute("ANALYZE resources")
+            .await
+            .expect("analyze");
+
+        // A range of about 1/64 of the type: over a wider share of a table
+        // this small, a sequential scan is the cheaper count.
+        let range = ReindexIdRange {
+            start: Some("40".to_string()),
+            end: Some("44".to_string()),
+        };
+        let (resource_type, after) = ("Patient", "42");
+        let (limit, lookahead, cap) = (100i64, 101i64, "1048576".to_string());
+        let tenant_id = tenant.as_str();
+        let base = || -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+            vec![&tenant_id, &resource_type]
+        };
+
+        let mut page_params = base();
+        let page_bounds = reindex_id_range_sql(&range, Some(&after), &mut page_params);
+        page_params.push(&limit);
+        let page_sql = reindex_id_range_page_sql(&page_bounds, page_params.len());
+
+        let mut capped_params = base();
+        let capped_bounds = reindex_id_range_sql(&range, Some(&after), &mut capped_params);
+        capped_params.push(&lookahead);
+        let lookahead_param = capped_params.len();
+        capped_params.push(&limit);
+        capped_params.push(&cap);
+        let capped_sql = reindex_id_range_capped_page_sql(&capped_bounds, lookahead_param);
+
+        let mut count_params = base();
+        let count_bounds = reindex_id_range_sql(&range, None, &mut count_params);
+        let count_sql = reindex_id_range_count_sql(&count_bounds);
+
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .expect("plan cache mode");
+            for (name, sql, params, sorts) in [
+                ("page", &page_sql, &page_params, false),
+                ("capped", &capped_sql, &capped_params, true),
+                ("count", &count_sql, &count_params, false),
+            ] {
+                let plan: Vec<String> = client
+                    .query(&format!("EXPLAIN {sql}"), params)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let text = plan.join("\n");
+                let scan = plan
+                    .iter()
+                    .position(|line| line.contains("using idx_resources_reindex_id on resources"))
+                    .unwrap_or_else(|| panic!("{mode} {name}: no reindex-id index scan\n{text}"));
+                // Printed `(id)::text >= …` at the top level, `id >= …` in a CTE.
+                let cond = plan[scan + 1..]
+                    .iter()
+                    .find(|line| line.trim_start().starts_with("Index Cond:"))
+                    .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"))
+                    .replace("(id)::text", "id");
+                for bound in ["id >= ", "id < "] {
+                    assert!(cond.contains(bound), "{mode} {name}: {bound}\n{text}");
+                }
+                if name != "count" {
+                    assert!(cond.contains("id > "), "{mode} {name}: cursor\n{text}");
+                }
+                assert!(
+                    sorts || !text.contains("Sort"),
+                    "{mode} {name}: must not sort\n{text}"
+                );
+            }
+        }
+        client
+            .batch_execute("RESET plan_cache_mode")
+            .await
+            .expect("reset");
+        client
+            .execute("DELETE FROM resources WHERE tenant_id = $1", &[&tenant])
+            .await
+            .expect("cleanup");
+    }
+
+    /// #1911: the cross-tenant count can be answered by an index-only scan of
+    /// the narrow v49 index `idx_resources_live_tenant`. Sequential and bitmap
+    /// scans are switched off: a table this small is cheaper to read whole,
+    /// and the synthetic rows carry no patient references, which leaves the
+    /// live-row GIN `idx_resources_patient_refs_v1` nearly empty and so a
+    /// cheap bitmap source. What the test pins is that the index is usable
+    /// for the exact statement and beats the wider `idx_resources_reindex_id`;
+    /// the natural choice without hints was measured on a ~19M-resource
+    /// corpus. Its own database keeps the `VACUUM ANALYZE` and the rows away
+    /// from the plan tests sharing `postgres`.
+    #[tokio::test]
+    async fn count_by_tenant_plans_through_the_live_tenant_index() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let backend = isolated_backend(2, &format!("live_tenant_plan_{suffix}")).await;
+        backend.init_schema().await.expect("schema");
+        let prefix = format!("live-tenant-plan-{suffix}");
+        let mut client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated,
+                      fhir_version, is_deleted)
+                 SELECT $1 || '-' || (n % 4), 'Patient', md5(n::text), '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0',
+                        n % 10 = 0
+                 FROM generate_series(1, 20000) AS n",
+                &[&prefix],
+            )
+            .await
+            .expect("seed");
+        client
+            .batch_execute("VACUUM ANALYZE resources")
+            .await
+            .expect("vacuum analyze");
+
+        let tx = client.transaction().await.expect("begin");
+        tx.batch_execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off")
+            .await
+            .expect("disable sequential and bitmap scans");
+        let plan: Vec<String> = tx
+            .query(
+                &format!(
+                    "EXPLAIN (COSTS OFF) {}",
+                    PostgresBackend::COUNT_BY_TENANT_SQL
+                ),
+                &[],
+            )
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        tx.rollback().await.expect("rollback");
+        let text = plan.join("\n");
+        assert!(
+            text.contains("Index Only Scan using idx_resources_live_tenant on resources"),
+            "count_by_tenant must read idx_resources_live_tenant\n{text}"
         );
     }
 }
@@ -839,9 +1097,23 @@ impl ResourceStorage for PostgresBackend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::postgres::PgInDbRunner;
-        Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
+        let fhir_version = self.config().fhir_version;
+        tracing::info!(
+            runner = "postgres-indb",
+            ?fhir_version,
+            "Creating SofRunner"
+        );
+        Some(std::sync::Arc::new(
+            PgInDbRunner::new(self.pool()).with_fhir_version(fhir_version),
+        ))
     }
 
     fn package_store(&self) -> Option<std::sync::Arc<dyn crate::core::PackageStore>> {
@@ -1003,7 +1275,7 @@ impl ResourceStorage for PostgresBackend {
                     &transaction,
                     tenant_id,
                     !self.is_search_offloaded(),
-                    resource_type != "SearchParameter",
+                    resource_type == "SearchParameter",
                 )
                 .await?;
             self.index_resource_guarded(
@@ -1095,8 +1367,12 @@ impl ResourceStorage for PostgresBackend {
                 .create_or_update_once(tenant, resource_type, id, resource.clone(), fhir_version)
                 .await;
             match result {
+                // `NotFound`: `update` lost the row to a delete, or another
+                // PUT restored the tombstone first (upstream v0.2.8).
                 Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }))
-                | Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))
+                | Err(StorageError::Resource(
+                    ResourceError::AlreadyExists { .. } | ResourceError::NotFound { .. },
+                ))
                     if attempt < ATTEMPTS =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(
@@ -1282,7 +1558,7 @@ impl ResourceStorage for PostgresBackend {
                     &transaction,
                     tenant_id,
                     !self.is_search_offloaded(),
-                    resource_type != "SearchParameter",
+                    resource_type == "SearchParameter",
                 )
                 .await?;
             self.index_resource_guarded(
@@ -1659,16 +1935,20 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
-        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
-                "SELECT tenant_id, COUNT(*)::bigint FROM resources \
-                 WHERE is_deleted = FALSE GROUP BY tenant_id",
-                &[],
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter. It
+        // scans every live row, so it can run for seconds; `query_owned` keeps
+        // its session out of the pool until PostgreSQL answers, even if this
+        // caller is dropped first (#1826), and bounds it with the count's own
+        // budget, below the HTTP request timeout by default, so REST callers
+        // get a `504` rather than a `408` (#1911).
+        let rows = self
+            .query_owned(
+                Self::COUNT_BY_TENANT_SQL,
+                "Failed to count by tenant",
+                self.config()
+                    .effective_count_by_tenant_statement_timeout_ms(),
             )
-            .await
-            .or_query_error("Failed to count by tenant")?;
+            .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let tid: String = row.get(0);
@@ -1676,6 +1956,35 @@ impl ResourceStorage for PostgresBackend {
             out.push((tid, n.max(0) as u64));
         }
         Ok(out)
+    }
+
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // The grouped count already spans every tenant in one query, so it is
+        // complete discovery of live resources; the request budget is moot.
+        Ok(crate::core::TenantDiscovery::from_grouped_counts(
+            self.count_by_tenant().await?,
+            crate::core::CountBasis::LiveResources,
+        ))
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // `EXISTS` stops at the first live row. `idx_resources_reindex_id`
+        // (`(tenant_id, resource_type, id) WHERE is_deleted = FALSE`) leads with
+        // `tenant_id` and holds live rows only, so this is one index probe
+        // rather than the cross-tenant `GROUP BY` of `count_by_tenant` (#1912).
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let row = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE)",
+                &[&tenant_id],
+            )
+            .await
+            .or_query_error("Failed to probe tenant resources")?;
+        Ok(row.get(0))
     }
 
     fn supports_type_counts(&self) -> bool {
@@ -1852,6 +2161,31 @@ impl ResourceStorage for PostgresBackend {
         )
         .await
         .or_query_error("purge provider submissions")?;
+        // Bulk Data Submit consumer state, export jobs and the secondary-sync
+        // failure ledger all carry `tenant_id`; `bulk_submission_changes`
+        // keeps the full prior body of every updated resource (#2279). Children
+        // first, then parents, even though most of them cascade.
+        for sql in [
+            "DELETE FROM bulk_submission_changes WHERE tenant_id = $1",
+            "DELETE FROM bulk_entry_results WHERE tenant_id = $1",
+            "DELETE FROM bulk_manifest_file_progress WHERE tenant_id = $1",
+            "DELETE FROM bulk_submit_files WHERE tenant_id = $1",
+            "DELETE FROM bulk_manifests WHERE tenant_id = $1",
+            "DELETE FROM bulk_submissions WHERE tenant_id = $1",
+            "DELETE FROM secondary_sync_failures WHERE tenant_id = $1",
+            // Export progress/files have no `tenant_id`; they hang off the job.
+            "DELETE FROM bulk_export_files WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+            "DELETE FROM bulk_export_progress WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+            "DELETE FROM bulk_export_jobs WHERE tenant_id = $1",
+        ] {
+            tx.execute(sql, &[&id])
+                .await
+                .or_query_error("purge bulk state")?;
+        }
+        // SQL query terminology relations are tenant-keyed rows (#2185).
+        super::sof_terminology::purge_tenant_in_txn(&tx, id).await?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit().await.or_query_error("purge commit")?;
         client.mark_settled();
@@ -1867,6 +2201,97 @@ impl ResourceStorage for PostgresBackend {
             );
         }
         Ok(removed.max(0) as u64)
+    }
+}
+
+// ============================================================================
+// Owned Reads
+// ============================================================================
+
+impl PostgresBackend {
+    /// Runs one parameterless read on a pooled session that a spawned task,
+    /// not the caller, owns until PostgreSQL has answered it (#1826), under a
+    /// statement budget of its own (#1911).
+    ///
+    /// tokio-postgres keeps a sent request running after its future is
+    /// dropped, and the pool's `RecyclingMethod::Fast` re-pools a dropped
+    /// client without waiting for it. A caller abandoned mid-statement (the
+    /// REST `TimeoutLayer`, a disconnected UI request) would therefore hand
+    /// the next checkout a session still busy on the server, and that
+    /// checkout's statement would queue behind it. Here dropping the caller
+    /// drops only the `JoinHandle`: the task keeps the session checked out
+    /// until the response arrives — `statement_timeout_ms` bounds how long —
+    /// and only then returns it to the pool. Nothing is cancelled, so no late
+    /// cancel can reach a session a later checkout already holds. The cost
+    /// is that an abandoned statement keeps its pool slot until it settles.
+    ///
+    /// The read runs in its own `READ ONLY` transaction opened with `SET
+    /// LOCAL statement_timeout = statement_timeout_ms`, so the budget covers
+    /// this statement alone and ends with the transaction: the session goes
+    /// back to the pool with the pool-wide `statement_timeout` it was opened
+    /// with. When the budget expires PostgreSQL ends the statement with
+    /// `57014`, classified as [`BackendError::Timeout`]. Three round trips
+    /// (`BEGIN` + `SET LOCAL`, the read, `COMMIT`/`ROLLBACK`) are noise beside
+    /// a read worth owning.
+    ///
+    /// The session goes back to the pool once the transaction is closed:
+    /// `COMMIT` after rows, `ROLLBACK` after a server `ERROR` (the budget
+    /// expiring included). Any other failure (a closed socket, a `FATAL`
+    /// termination, a failed `BEGIN` or close) — or the task itself being
+    /// dropped, as at runtime shutdown — leaves the [`GuardedClient`]
+    /// unsettled, which rolls back and discards the session instead of
+    /// re-pooling it.
+    ///
+    /// Only [`ResourceStorage::count_by_tenant`] uses this today. Other raw
+    /// `get_client()` reads that callers can abandon (`count_all_types`,
+    /// `count_by_types`, `latest_write_marker`, `list_tenants`) are follow-ups.
+    async fn query_owned(
+        &self,
+        sql: &'static str,
+        context: &'static str,
+        statement_timeout_ms: u64,
+    ) -> StorageResult<Vec<tokio_postgres::Row>> {
+        // A number from validated configuration, never request text.
+        let begin =
+            format!("BEGIN READ ONLY; SET LOCAL statement_timeout = {statement_timeout_ms}");
+        let mut client = self.guarded_client().await?;
+        let owner = tokio::spawn(async move {
+            if let Err(error) = client.batch_execute(&begin).await {
+                // Transaction state unknown: leave it unsettled.
+                return Err(error);
+            }
+            let result = client.query(sql, &[]).await;
+            let server_error = |error: &tokio_postgres::Error| {
+                error.as_db_error().is_some_and(|db| {
+                    db.parsed_severity() == Some(tokio_postgres::error::Severity::Error)
+                })
+            };
+            let close = match &result {
+                Ok(_) => Some("COMMIT"),
+                Err(error) if server_error(error) => Some("ROLLBACK"),
+                // Closed socket or FATAL: nothing to close on this session.
+                Err(_) => None,
+            };
+            if let Some(close) = close {
+                match client.batch_execute(close).await {
+                    Ok(()) => client.mark_settled(),
+                    // Rows already read stand; the session is discarded.
+                    Err(error) if result.is_ok() => {
+                        tracing::warn!("{context}: {close} failed; discarding session: {error}");
+                    }
+                    Err(_) => {}
+                }
+            }
+            drop(client);
+            result
+        });
+        match owner.await {
+            Ok(result) => result.or_query_error(context),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(internal_error(format!(
+                "{context}: query task ended: {error}"
+            ))),
+        }
     }
 }
 
@@ -2120,8 +2545,13 @@ impl PostgresBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
-    /// Returns `NotFound` if no deleted row is present — the caller has already
-    /// established one exists, so that only happens under a concurrent write.
+    /// The tombstone is re-read inside the transaction, under the same
+    /// per-resource advisory lock every other write path takes, so two PUTs
+    /// racing onto one tombstone serialize: the winner restores it, and the
+    /// loser finds no deleted row and reports `NotFound`, which
+    /// `create_or_update` turns into a fresh read-and-retry (landing on
+    /// `update`). Returns `NotFound` only under such a concurrent write — the
+    /// caller has already established a tombstone exists.
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -2192,7 +2622,7 @@ impl PostgresBackend {
                     &transaction,
                     tenant_id,
                     !self.is_search_offloaded(),
-                    resource_type != "SearchParameter",
+                    resource_type == "SearchParameter",
                 )
                 .await?;
             self.index_resource_guarded(
@@ -3299,18 +3729,27 @@ impl InstanceHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is exactly `[version]`,
+        // written for this instance (its `resource_id` is the id); any other
+        // cursor is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
-                if let Ok(version_int) = version_str.parse::<i64>() {
-                    sql.push_str(&format!(
-                        " AND CAST(version_id AS INTEGER) < ${}",
-                        param_index
-                    ));
-                    query_params.push(Box::new(version_int));
-                    param_index += 1;
-                }
+            let [CursorValue::String(version_str)] = cursor.sort_values() else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != id {
+                return Err(invalid_cursor(cursor));
             }
+            let version_int = version_str
+                .parse::<i64>()
+                .map_err(|_| invalid_cursor(cursor))?;
+            // Without the cast PostgreSQL infers int4 from the left
+            // side, and the i64 bind fails with WrongType (#2398).
+            sql.push_str(&format!(
+                " AND CAST(version_id AS INTEGER) < ${}::bigint",
+                param_index
+            ));
+            query_params.push(Box::new(version_int));
+            param_index += 1;
         }
 
         // Order by version descending (newest first) and limit
@@ -3594,6 +4033,81 @@ impl InstanceHistoryProvider for PostgresBackend {
     }
 }
 
+/// The boundary instant of a type/system history or `modified_since` cursor,
+/// as the `DateTime<Utc>` its `$n::timestamptz` parameter must bind as
+/// (#2398): `tokio_postgres` will not bind a `String` to `TIMESTAMPTZ` (see
+/// `bulk_export::push_export_window`). The string was written by
+/// `DateTime::to_rfc3339` from the row's `last_updated`, which prints as many
+/// fractional digits as the value has, so it round-trips PostgreSQL's
+/// microseconds exactly. Cursors are unkeyed base64 JSON any client can craft,
+/// so one whose timestamp does not parse is a bad request (400), not a server
+/// fault (#1120). The timestamp is position 0 of every type history, system
+/// history and `modified_since` cursor; a cursor of the wrong shape is refused
+/// at the call site before this runs (#2402).
+fn cursor_timestamp(cursor: &PageCursor, value: &str) -> StorageResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| invalid_cursor(cursor))
+}
+
+#[cfg(test)]
+mod history_cursor_timestamp_tests {
+    use super::*;
+    use crate::error::SearchError;
+
+    fn cursor() -> PageCursor {
+        PageCursor::new(
+            vec![
+                CursorValue::String("not-a-timestamp".to_string()),
+                CursorValue::String("x".to_string()),
+            ],
+            "Patient",
+        )
+    }
+
+    #[test]
+    fn cursor_timestamp_round_trips_to_rfc3339_exactly() {
+        let cursor = cursor();
+        let whole_second = DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for sub_second in [
+            chrono::Duration::zero(),
+            chrono::Duration::milliseconds(789),
+            chrono::Duration::microseconds(789_012),
+            chrono::Duration::microseconds(1),
+        ] {
+            let instant = whole_second + sub_second;
+            // The encoding the history readers use for the next cursor.
+            assert_eq!(
+                cursor_timestamp(&cursor, &instant.to_rfc3339()).unwrap(),
+                instant,
+                "{}",
+                instant.to_rfc3339()
+            );
+        }
+
+        // An offset is converted to the same UTC instant.
+        assert_eq!(
+            cursor_timestamp(&cursor, "2001-02-03T05:05:06.789012+01:00").unwrap(),
+            cursor_timestamp(&cursor, "2001-02-03T04:05:06.789012Z").unwrap(),
+        );
+    }
+
+    #[test]
+    fn cursor_timestamp_rejects_unparseable_value_as_invalid_cursor() {
+        let cursor = cursor();
+        for value in ["not-a-timestamp", "", "2001-02-03"] {
+            match cursor_timestamp(&cursor, value) {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor.encode(), "{value:?}");
+                }
+                other => panic!("{value:?}: expected InvalidCursor, got {other:?}"),
+            }
+        }
+    }
+}
+
 // ============================================================================
 // TypeHistoryProvider Implementation
 // ============================================================================
@@ -3611,7 +4125,8 @@ impl TypeHistoryProvider for PostgresBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = $1 AND resource_type = $2",
         );
@@ -3640,27 +4155,38 @@ impl TypeHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, id, version), all descending; any other shape is a bad
+        // request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(resource_id)),
-                ) = (sort_values.first(), sort_values.get(1))
-                {
-                    sql.push_str(&format!(
-                        " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND id < ${}))",
-                        param_index, param_index, param_index + 1
-                    ));
-                    query_params.push(Box::new(timestamp.clone()));
-                    query_params.push(Box::new(resource_id.clone()));
-                    param_index += 2;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            // Another type's history cursor has this shape too, and would skip
+            // versions of this one.
+            if cursor.resource_id() != resource_type {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            // The version is bound as bigint: a bare parameter next to the int4
+            // CAST would be inferred as int4, which tokio_postgres will not
+            // bind an i64 to.
+            let (t, i, v) = (param_index, param_index + 1, param_index + 2);
+            sql.push_str(&format!(
+                " AND (last_updated < ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (id < ${i} OR (id = ${i} AND CAST(version_id AS INTEGER) < ${v}::bigint))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_id.clone()));
+            query_params.push(Box::new(*cursor_version));
+            param_index += 3;
         }
 
-        // Order by last_updated descending (newest first), then by id for consistency
+        // Order by last_updated descending (newest first), then by id and version
         let limit = params.pagination.count as i64 + 1;
         sql.push_str(&format!(
             " ORDER BY last_updated DESC, id DESC, CAST(version_id AS INTEGER) DESC LIMIT ${}",
@@ -3679,7 +4205,7 @@ impl TypeHistoryProvider for PostgresBackend {
             .or_query_error("Failed to query type history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String)> = None; // (last_updated, id)
+        let mut last_entry: Option<(String, String, i64)> = None; // (last_updated, id, version)
 
         for row in &rows {
             if entries.len() >= params.pagination.count as usize {
@@ -3692,6 +4218,8 @@ impl TypeHistoryProvider for PostgresBackend {
             let last_updated: DateTime<Utc> = row.get(3);
             let is_deleted: bool = row.get(4);
             let fhir_version_str: String = row.get(5);
+            // int4: reading it as i64 would panic.
+            let version_key: i32 = row.get(6);
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
@@ -3718,7 +4246,7 @@ impl TypeHistoryProvider for PostgresBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated.to_rfc3339(), row_id));
+            last_entry = Some((last_updated.to_rfc3339(), row_id, i64::from(version_key)));
 
             entries.push(HistoryEntry {
                 resource,
@@ -3731,9 +4259,13 @@ impl TypeHistoryProvider for PostgresBackend {
         let has_more = rows.len() > params.pagination.count as usize;
 
         // Build page info
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, id, version))) = (has_more, last_entry) {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(id),
+                    CursorValue::Number(version),
+                ],
                 resource_type.to_string(),
             );
             PageInfo::with_next(cursor)
@@ -3782,7 +4314,8 @@ impl SystemHistoryProvider for PostgresBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = $1",
         );
@@ -3809,29 +4342,42 @@ impl SystemHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id, version), all descending; any other
+        // shape is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 3 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(res_type)),
-                    Some(CursorValue::String(res_id)),
-                ) = (sort_values.first(), sort_values.get(1), sort_values.get(2))
-                {
-                    sql.push_str(&format!(
-                        " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND (resource_type < ${} OR (resource_type = ${} AND id < ${}))))",
-                        param_index, param_index, param_index + 1, param_index + 1, param_index + 2
-                    ));
-                    query_params.push(Box::new(timestamp.clone()));
-                    query_params.push(Box::new(res_type.clone()));
-                    query_params.push(Box::new(res_id.clone()));
-                    param_index += 3;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "system" {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            // The version is bound as bigint, as in history_type.
+            let (t, r, i, v) = (
+                param_index,
+                param_index + 1,
+                param_index + 2,
+                param_index + 3,
+            );
+            sql.push_str(&format!(
+                " AND (last_updated < ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (resource_type < ${r} OR (resource_type = ${r} AND (id < ${i} OR (id = ${i} AND CAST(version_id AS INTEGER) < ${v}::bigint))))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_type.clone()));
+            query_params.push(Box::new(cursor_id.clone()));
+            query_params.push(Box::new(*cursor_version));
+            param_index += 4;
         }
 
-        // Order by last_updated descending (newest first)
+        // Order by last_updated descending (newest first), then by
+        // resource_type, id and version
         let limit = params.pagination.count as i64 + 1;
         sql.push_str(&format!(
             " ORDER BY last_updated DESC, resource_type DESC, id DESC, CAST(version_id AS INTEGER) DESC LIMIT ${}",
@@ -3850,7 +4396,7 @@ impl SystemHistoryProvider for PostgresBackend {
             .or_query_error("Failed to query system history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String, String)> = None;
+        let mut last_entry: Option<(String, String, String, i64)> = None;
 
         for row in &rows {
             if entries.len() >= params.pagination.count as usize {
@@ -3864,6 +4410,8 @@ impl SystemHistoryProvider for PostgresBackend {
             let last_updated: DateTime<Utc> = row.get(4);
             let is_deleted: bool = row.get(5);
             let fhir_version_str: String = row.get(6);
+            // int4: reading it as i64 would panic.
+            let version_key: i32 = row.get(7);
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
@@ -3890,7 +4438,12 @@ impl SystemHistoryProvider for PostgresBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated.to_rfc3339(), row_resource_type, row_id));
+            last_entry = Some((
+                last_updated.to_rfc3339(),
+                row_resource_type,
+                row_id,
+                i64::from(version_key),
+            ));
 
             entries.push(HistoryEntry {
                 resource,
@@ -3901,20 +4454,21 @@ impl SystemHistoryProvider for PostgresBackend {
 
         let has_more = rows.len() > params.pagination.count as usize;
 
-        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
-        {
-            let cursor = PageCursor::new(
-                vec![
-                    CursorValue::String(timestamp),
-                    CursorValue::String(resource_type),
-                    CursorValue::String(id),
-                ],
-                "system".to_string(),
-            );
-            PageInfo::with_next(cursor)
-        } else {
-            PageInfo::end()
-        };
+        let page_info =
+            if let (true, Some((timestamp, resource_type, id, version))) = (has_more, last_entry) {
+                let cursor = PageCursor::new(
+                    vec![
+                        CursorValue::String(timestamp),
+                        CursorValue::String(resource_type),
+                        CursorValue::String(id),
+                        CursorValue::Number(version),
+                    ],
+                    "system".to_string(),
+                );
+                PageInfo::with_next(cursor)
+            } else {
+                PageInfo::end()
+            };
 
         Ok(Page::new(entries, page_info))
     }
@@ -3969,28 +4523,38 @@ impl DifferentialHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id), all ascending, with or without a
+        // type filter; any other shape is a bad request, never "no cursor"
+        // (#2402).
         if let Some(cursor) = pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (Some(CursorValue::String(timestamp)), Some(CursorValue::String(res_id))) =
-                    (sort_values.first(), sort_values.get(1))
-                {
-                    sql.push_str(&format!(
-                        " AND (last_updated > ${}::timestamptz OR (last_updated = ${}::timestamptz AND id > ${}))",
-                        param_index, param_index, param_index + 1
-                    ));
-                    query_params.push(Box::new(timestamp.clone()));
-                    query_params.push(Box::new(res_id.clone()));
-                    param_index += 2;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "modified_since" {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            let (t, r, i) = (param_index, param_index + 1, param_index + 2);
+            sql.push_str(&format!(
+                " AND (last_updated > ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (resource_type > ${r} OR (resource_type = ${r} AND id > ${i}))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_type.clone()));
+            query_params.push(Box::new(cursor_id.clone()));
+            param_index += 3;
         }
 
-        // Order by last_updated ascending (oldest first for sync)
+        // Order by last_updated ascending (oldest first for sync), then by
+        // resource_type and id: ids are only unique within a type
         let limit = pagination.count as i64 + 1;
         sql.push_str(&format!(
-            " ORDER BY last_updated ASC, id ASC LIMIT ${}",
+            " ORDER BY last_updated ASC, resource_type ASC, id ASC LIMIT ${}",
             param_index
         ));
         query_params.push(Box::new(limit));
@@ -4006,7 +4570,7 @@ impl DifferentialHistoryProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to query modified resources: {}", e)))?;
 
         let mut resources = Vec::new();
-        let mut last_entry: Option<(String, String)> = None;
+        let mut last_entry: Option<(String, String, String)> = None; // (last_updated, type, id)
 
         for row in &rows {
             if resources.len() >= pagination.count as usize {
@@ -4035,15 +4599,20 @@ impl DifferentialHistoryProvider for PostgresBackend {
                 fhir_version,
             );
 
-            last_entry = Some((last_updated.to_rfc3339(), row_id));
+            last_entry = Some((last_updated.to_rfc3339(), row_resource_type, row_id));
             resources.push(resource);
         }
 
         let has_more = rows.len() > pagination.count as usize;
 
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
+        {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(resource_type),
+                    CursorValue::String(id),
+                ],
                 "modified_since".to_string(),
             );
             PageInfo::with_next(cursor)
@@ -4115,6 +4684,23 @@ impl PurgableStorage for PostgresBackend {
         .await
         .or_query_error("Failed to purge search index")?;
 
+        // The bulk-submit change log keeps this resource's prior body; blank it
+        // (the row stays so submission counters remain coherent) (#2279).
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL \
+             WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge change-log content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures \
+             WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge sync failures")?;
+
         // Delete from FTS table
         let _ = tx
             .execute(
@@ -4177,6 +4763,21 @@ impl PurgableStorage for PostgresBackend {
         )
         .await
         .or_query_error("Failed to purge search index")?;
+
+        // See `purge`: blank prior bodies kept by the bulk-submit change log.
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL \
+             WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge change-log content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge sync failures")?;
 
         // Delete from FTS table
         let _ = tx
@@ -4471,26 +5072,100 @@ impl BundleProvider for PostgresBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
-        use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
-        use std::collections::HashMap;
+        // Work out which locks the bundle needs from its entries, before
+        // BEGIN (#1637). Most bundles take the tenant gate shared plus a key
+        // for each explicit id they address, so bundles that touch different
+        // resources run at the same time; a bundle that writes a
+        // SearchParameter, addresses an entry by search criteria, cannot be
+        // classified or is too large for the lock table takes the exclusive
+        // gate, as every bundle once did.
+        let lock_mode = plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS);
+        match &lock_mode {
+            BundleLockMode::Shared(plan) => tracing::debug!(
+                lock_mode = "shared",
+                resource_keys = plan.resources.len(),
+                entries = entries.len(),
+                "transaction bundle lock plan"
+            ),
+            BundleLockMode::Exclusive(reason) => tracing::debug!(
+                lock_mode = "exclusive",
+                reason = ?reason,
+                entries = entries.len(),
+                "transaction bundle lock plan"
+            ),
+        }
+        self.run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)
+            .await
+    }
+}
 
-        // Start a transaction. A bundle whose every key is known up front runs
-        // under the shared tenant gate with those keys locked, so bundles over
-        // disjoint resources commit side by side; the rest keep the exclusive
-        // gate (see `plan_bundle_locks`).
-        let mut entries = entries;
+/// Names the bundle entry responsible for a transaction error.
+///
+/// A conflict found while flushing buffered creates belongs to the entry whose
+/// `create` produced the row, not to whichever entry happened to be in flight
+/// when the flush ran. Everything else belongs to the entry that raised it.
+fn attribute_entry_error(
+    tx: &super::transaction::PostgresTransaction,
+    create_entry_index: &[usize],
+    fallback: usize,
+    error: &StorageError,
+) -> (usize, String) {
+    match tx.deferred_conflict() {
+        Some(conflict) => (
+            create_entry_index
+                .get(conflict.ordinal)
+                .copied()
+                .unwrap_or(fallback),
+            format!(
+                "Entry processing failed: {}/{} already exists",
+                conflict.resource_type, conflict.id
+            ),
+        ),
+        None => (fallback, format!("Entry processing failed: {}", error)),
+    }
+}
+
+impl PostgresBackend {
+    /// Runs a transaction Bundle under `lock_mode`: begins the transaction the
+    /// mode describes, processes the entries in order and commits.
+    ///
+    /// The mode is chosen by the caller (`plan_bundle_locks`) rather than here,
+    /// so a test can run a Bundle under a plan the planner would never have
+    /// produced and see how a planner/executor disagreement ends.
+    pub(super) async fn run_transaction_bundle(
+        &self,
+        tenant: &TenantContext,
+        entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
+        lock_mode: BundleLockMode,
+    ) -> Result<BundleResult, TransactionError> {
+        use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
+
         let options = TransactionOptions::new().fhir_version(fhir_version);
-        let begun = match self.plan_bundle_locks(&mut entries) {
-            Some(plan) => self.begin_bundle_transaction(tenant, options, plan).await,
-            None => self.begin_transaction(tenant, options).await,
+
+        // Start a transaction
+        let begun = match lock_mode {
+            BundleLockMode::Shared(plan) => {
+                self.begin_bundle_transaction(tenant, options, plan).await
+            }
+            BundleLockMode::Exclusive(_) => self.begin_transaction(tenant, options).await,
         };
-        let mut tx = begun.map_err(|e| TransactionError::RolledBack {
-            reason: format!("Failed to begin transaction: {}", e),
-        })?;
+        let mut tx = begun
+            // Losing the tenant write gate, or a resource key of the plan, to a
+            // statement timeout, a lock timeout, a deadlock or a full lock
+            // table ends the bundle as `Transient` (a retryable 503, #1637);
+            // other begin failures stay `RolledBack`.
+            .map_err(super::lock_protocol::bundle_begin_error)?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
+        // Set when an entry failed for a reason that is not its own: a
+        // criteria lock wait that PostgreSQL ended (a retryable `Transient`),
+        // or a resource the lock plan did not cover (a server error). Neither
+        // is reported against the entry as a `BundleError` (#1637).
+        let mut aborted: Option<TransactionError> = None;
 
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -4520,18 +5195,32 @@ impl BundleProvider for PostgresBackend {
         // n-th `create` call back to the entry that made it.
         let mut create_entry_index: Vec<usize> = Vec::with_capacity(entries.len());
 
-        // Build a map of fullUrl -> assigned reference for reference resolution.
-        // A conditional entry that matched is known now, so `urn:uuid`
-        // references to it resolve regardless of entry order.
-        let mut reference_map: HashMap<String, String> = HashMap::new();
-        for target in targets.values() {
-            if let (Some(full_url), Some(identity)) = (
-                entries[target.entry_index].full_url.as_ref(),
-                target.identity(),
-            ) {
-                reference_map.insert(full_url.clone(), identity);
+        // Pin the identity of every entry an earlier entry (or itself)
+        // references by `urn:uuid`, so forward references resolve (#1934);
+        // the rest resolve as their entries run. The state then refuses a
+        // second write to one identity (R4 transaction rules).
+        let mut entries = entries;
+        let references = match crate::core::transaction::pin_forward_references(
+            &mut entries,
+            &targets,
+            &mut PostgresBundleMatches {
+                backend: self,
+                tenant,
+                tx: &mut tx,
+            },
+        )
+        .await
+        {
+            Ok(references) => references,
+            Err((index, error)) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(TransactionError::BundleError {
+                    index,
+                    message: error.to_string(),
+                });
             }
-        }
+        };
+        let mut bundle_state = BundleTransactionState::new(references);
 
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
@@ -4544,10 +5233,23 @@ impl BundleProvider for PostgresBackend {
 
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
-            // Resolve references in this entry's resource before processing
-            if let Some(ref mut resource) = entry.resource {
-                resolve_bundle_references(resource, &reference_map);
-            }
+            let used_references = entry
+                .resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let delete_target = (entry.method == BundleMethod::Delete)
+                .then(|| {
+                    targets
+                        .get(&idx)
+                        .and_then(|target| target.identity())
+                        .or_else(|| {
+                            self.parse_url(&entry.url)
+                                .ok()
+                                .map(|(kind, id)| format!("{kind}/{id}"))
+                        })
+                })
+                .flatten();
 
             let creates_before = tx.creates_seen();
             let result = self
@@ -4581,7 +5283,11 @@ impl BundleProvider for PostgresBackend {
                         break;
                     }
 
-                    if !search_param_overlay_changed {
+                    // A delete that found nothing to delete is a `204` like a
+                    // real one, but changed nothing (#2523).
+                    if !search_param_overlay_changed
+                        && entry_result.effect != crate::core::BundleEntryEffect::NotFound
+                    {
                         search_param_overlay_changed =
                             match entry_result.status {
                                 // Created (POST, or PUT-as-create): only overlay-affecting
@@ -4617,28 +5323,43 @@ impl BundleProvider for PostgresBackend {
                             };
                     }
 
-                    // A create (POST, or a conditional PUT that created) with a
-                    // fullUrl records the assigned identity for later references.
-                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
-                        if let Some(ref full_url) = entry.full_url {
-                            if let Some(ref location) = entry_result.location {
-                                let reference = location
-                                    .split("/_history")
-                                    .next()
-                                    .unwrap_or(location)
-                                    .to_string();
-                                reference_map.insert(full_url.clone(), reference);
-                            }
-                        }
+                    if let Err(message) =
+                        bundle_state.record(entry, &entry_result, delete_target, used_references)
+                    {
+                        error_info = Some((idx, message));
+                        break;
                     }
 
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
+                    if let Some(transient) = super::lock_protocol::transient_bundle_error(&e) {
+                        // The criteria lock wait that PostgreSQL ended --
+                        // deadlock victim, timeout, full lock table -- changed
+                        // nothing and an unchanged retry can succeed: a
+                        // retryable 503, not an entry failure. No other
+                        // statement's failure is marked this way, so a timeout
+                        // on an index or full-text write stays a BundleError.
+                        aborted = Some(transient);
+                    } else if let Some(reason) = tx.plan_violation() {
+                        // The planner and the executor disagreed about what the
+                        // Bundle touches. That is the server's defect, so it is
+                        // a 500, not a 400 telling the client its entry is
+                        // wrong; the reason is for the log.
+                        aborted = Some(TransactionError::RolledBack {
+                            reason: reason.to_string(),
+                        });
+                    } else {
+                        error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
+                    }
                     break;
                 }
             }
+        }
+
+        if let Some(aborted) = aborted {
+            let _ = Box::new(tx).rollback().await;
+            return Err(aborted);
         }
 
         // Send whatever is still buffered before committing, so a conflict in
@@ -4684,107 +5405,7 @@ impl BundleProvider for PostgresBackend {
             entries: results,
         })
     }
-}
 
-/// Above this many explicitly named resources a bundle takes the exclusive
-/// gate instead of one advisory lock per resource: the shared lock table holds
-/// `max_locks_per_transaction` (default 64) per connection, and a few
-/// concurrent bundles naming thousands of resources each would exhaust it.
-const MAX_PLANNED_BUNDLE_LOCKS: usize = 256;
-
-impl PostgresBackend {
-    /// The keys a transaction bundle will touch, when they can all be known
-    /// before BEGIN; `None` keeps the exclusive tenant gate.
-    ///
-    /// The exclusive gate made every transaction bundle wait for every other
-    /// write in its tenant. Under the benchmark's 16 concurrent importers that
-    /// queue outlasted the 30 s `statement_timeout`, and 4-5% of bundles came
-    /// back 500 "rolled back" while the server used half a core. What it buys
-    /// is needed only where a bundle's write set depends on what it finds:
-    ///
-    /// * conditional entries (`ifNoneExist`, `PUT/DELETE/PATCH [type]?…`) —
-    ///   their target is a search result, and two bundles racing on the same
-    ///   criteria must not both miss and create;
-    /// * SearchParameter writes, which change how every other write indexes.
-    ///
-    /// Every other entry names its key: `PUT`/`PATCH`/`DELETE`/`GET` by URL,
-    /// and `POST` by the id it will be created under. A `POST` without one is
-    /// given its server id here, before BEGIN, so the plan can list it as
-    /// fresh — exactly the id `Transaction::create` would have generated.
-    /// A malformed entry also returns `None`: the bundle then runs as before
-    /// and fails with the error it always did.
-    pub(super) fn plan_bundle_locks(
-        &self,
-        entries: &mut [BundleEntry],
-    ) -> Option<super::transaction::LockPlan> {
-        let mut plan = super::transaction::LockPlan::default();
-        for entry in entries.iter_mut() {
-            if entry.criteria.is_some() || entry.if_none_exist.is_some() {
-                return None;
-            }
-            let key = match entry.method {
-                BundleMethod::Post => {
-                    let resource = entry.resource.as_mut()?.as_object_mut()?;
-                    let resource_type = resource.get("resourceType")?.as_str()?.to_string();
-                    match resource.get("id") {
-                        Some(Value::String(id)) => {
-                            let id = id.clone();
-                            plan.locked.push((resource_type.clone(), id.clone()));
-                            (resource_type, id)
-                        }
-                        Some(_) => return None,
-                        None => {
-                            let id = crate::types::new_resource_id();
-                            resource.insert("id".to_string(), Value::String(id.clone()));
-                            plan.fresh.push((resource_type.clone(), id.clone()));
-                            (resource_type, id)
-                        }
-                    }
-                }
-                BundleMethod::Get
-                | BundleMethod::Put
-                | BundleMethod::Patch
-                | BundleMethod::Delete => {
-                    let key = self.parse_url(&entry.url).ok()?;
-                    plan.locked.push(key.clone());
-                    key
-                }
-            };
-            if key.0 == "SearchParameter" {
-                return None;
-            }
-        }
-        (plan.locked.len() <= MAX_PLANNED_BUNDLE_LOCKS).then_some(plan)
-    }
-}
-
-/// Names the bundle entry responsible for a transaction error.
-///
-/// A conflict found while flushing buffered creates belongs to the entry whose
-/// `create` produced the row, not to whichever entry happened to be in flight
-/// when the flush ran. Everything else belongs to the entry that raised it.
-fn attribute_entry_error(
-    tx: &super::transaction::PostgresTransaction,
-    create_entry_index: &[usize],
-    fallback: usize,
-    error: &StorageError,
-) -> (usize, String) {
-    match tx.deferred_conflict() {
-        Some(conflict) => (
-            create_entry_index
-                .get(conflict.ordinal)
-                .copied()
-                .unwrap_or(fallback),
-            format!(
-                "Entry processing failed: {}/{} already exists",
-                conflict.resource_type, conflict.id
-            ),
-        ),
-        None => (fallback, format!("Entry processing failed: {}", error)),
-    }
-}
-
-impl PostgresBackend {
     /// Process a single bundle entry within a transaction.
     ///
     /// `target` is the pre-pass resolution of a URL-borne conditional entry
@@ -4845,9 +5466,37 @@ impl PostgresBackend {
                             OFFLOADED_CONDITIONAL_REFUSAL,
                         ));
                     }
-                    let matches = self
+                    let mut matches = self
                         .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
                         .await?;
+                    // Nothing matched, so this entry is about to create. A
+                    // Bundle that shares the tenant gate with others (#1637)
+                    // takes the lock for these criteria if it is free,
+                    // searches again, and creates only on a miss. If another
+                    // Bundle holds it, this one waits for that Bundle to end
+                    // without taking the lock and searches again: a match is
+                    // that Bundle's resource and needs no lock, so the Bundles
+                    // that waited go on together (#1747). Only if it still
+                    // misses does it take the lock and search a third time. A
+                    // match needs no lock, as nothing is written. Under the
+                    // exclusive gate nobody can interleave and this is
+                    // skipped.
+                    if matches.is_empty() {
+                        let lock = tx.lock_criteria(&resource_type, criteria).await?;
+                        if lock != super::transaction::CriteriaLock::Unneeded {
+                            matches = self
+                                .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                                .await?;
+                        }
+                        if lock == super::transaction::CriteriaLock::Waited
+                            && matches.is_empty()
+                            && tx.hold_criteria(&resource_type, criteria).await?
+                        {
+                            matches = self
+                                .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                                .await?;
+                        }
+                    }
                     if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
                         return Ok(gated);
                     }
@@ -4897,18 +5546,18 @@ impl PostgresBackend {
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
-                        // A deleted resource is brought back to life by an
-                        // update (FHIR http.html#delete), continuing its
-                        // version chain; inserting it afresh would collide
-                        // with the soft-deleted row.
-                        if let Some(restored) =
-                            tx.restore_deleted(&resource_type, &id, resource.clone()).await?
-                        {
-                            return Ok(BundleEntryResult::created(restored));
-                        }
-                        // Create new resource with specified ID
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
+                        // A deleted id is restored, as the same PUT outside a
+                        // Bundle is; only an id never stored creates (#2145).
+                        if let Some(deleted) = tx
+                            .read_including_deleted(&resource_type, &id)
+                            .await?
+                            .filter(|r| r.is_deleted())
+                        {
+                            let restored = tx.restore(&deleted, resource_with_id).await?;
+                            return Ok(BundleEntryResult::created(restored));
+                        }
                         let created = tx.create(&resource_type, resource_with_id).await?;
                         Ok(BundleEntryResult::created(created))
                     }
@@ -4921,7 +5570,7 @@ impl PostgresBackend {
                             tx.delete(&target.resource_type, existing.id()).await?;
                             crate::core::conditional_delete_entry(existing)
                         }
-                        None => BundleEntryResult::deleted(),
+                        None => BundleEntryResult::delete_not_found(),
                     });
                 }
 
@@ -4941,8 +5590,19 @@ impl PostgresBackend {
                     }
                 }
 
-                tx.delete(&resource_type, &id).await?;
-                Ok(BundleEntryResult::deleted())
+                // Nothing to delete — never there, or already deleted — is a
+                // `204` no-op (#2523), the entry MongoDB and a conditional no-match
+                // already answer, not a failure of the whole Bundle. The
+                // transaction's `delete` returns `NotFound` from its existence
+                // check, before it writes anything. With `ifMatch` the gate above
+                // has already answered an absent resource.
+                match tx.delete(&resource_type, &id).await {
+                    Ok(()) => Ok(BundleEntryResult::deleted()),
+                    Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
+                        Ok(BundleEntryResult::delete_not_found())
+                    }
+                    Err(e) => Err(e),
+                }
             }
             BundleMethod::Patch => {
                 // A conditional patch (`PATCH [type]?[criteria]`) was resolved,
@@ -5008,54 +5668,66 @@ impl PostgresBackend {
 
     /// Parse a FHIR URL into resource type and ID.
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
-        let path = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .map(|s| s.find('/').map(|i| &s[i..]).unwrap_or(s))
-            .unwrap_or(url);
-
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        if parts.len() >= 2 {
-            let len = parts.len();
-            Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
-        } else {
-            Err(StorageError::Validation(
-                crate::error::ValidationError::InvalidReference {
-                    reference: url.to_string(),
-                    message: "URL must be in format ResourceType/id".to_string(),
-                },
-            ))
-        }
+        parse_resource_url(url)
     }
 }
 
-/// Recursively resolves urn:uuid references in a JSON value using the reference map.
-fn resolve_bundle_references(
-    value: &mut serde_json::Value,
-    reference_map: &std::collections::HashMap<String, String>,
-) {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(ref_str)) = map.get("reference") {
-                if ref_str.starts_with("urn:uuid:") {
-                    if let Some(resolved) = reference_map.get(ref_str) {
-                        map.insert("reference".to_string(), Value::String(resolved.clone()));
-                    }
-                }
-            }
-            for v in map.values_mut() {
-                resolve_bundle_references(v, reference_map);
-            }
+/// The open transaction's conditional search, lent to reference pinning.
+struct PostgresBundleMatches<'a> {
+    backend: &'a PostgresBackend,
+    tenant: &'a TenantContext,
+    tx: &'a mut super::transaction::PostgresTransaction,
+}
+
+#[async_trait]
+impl crate::core::transaction::BundleMatchSource for PostgresBundleMatches<'_> {
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>> {
+        // With search offloaded the local index is empty, so a match here
+        // would be meaningless; the POST arm refuses the entry (#511).
+        if self.backend.is_search_offloaded() {
+            return Ok(None);
         }
-        Value::Array(arr) => {
-            for item in arr {
-                resolve_bundle_references(item, reference_map);
-            }
-        }
-        _ => {}
+        self.backend
+            .find_matching_resources_in_tx(self.tenant, self.tx, resource_type, criteria)
+            .await
+            .map(Some)
+    }
+
+    fn note_minted(&mut self, resource_type: &str, id: &str) {
+        self.tx.note_pinned_mint(resource_type, id);
+    }
+}
+
+/// Parse a FHIR URL into resource type and ID.
+///
+/// The one parser of an instance-addressed entry URL. The transaction Bundle
+/// executor reads an entry's identity with it, and the lock plan derived before
+/// `BEGIN` (`bundle_lock_plan`) reads the same entry with the same function, so
+/// a planned key and an executed key cannot disagree.
+pub(super) fn parse_resource_url(url: &str) -> StorageResult<(String, String)> {
+    let path = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .map(|s| s.find('/').map(|i| &s[i..]).unwrap_or(s))
+        .unwrap_or(url);
+
+    let path = path.trim_start_matches('/');
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if parts.len() >= 2 {
+        let len = parts.len();
+        Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
+    } else {
+        Err(StorageError::Validation(
+            crate::error::ValidationError::InvalidReference {
+                reference: url.to_string(),
+                message: "URL must be in format ResourceType/id".to_string(),
+            },
+        ))
     }
 }
 
@@ -5165,17 +5837,42 @@ fn decode_reindex_page_row(
 
 #[async_trait]
 impl ReindexSource for PostgresBackend {
-    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
+    fn with_id_range(
+        self: Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<Arc<dyn ReindexSource>> {
+        Ok(Arc::new(RangedPostgresReindexSource {
+            backend: self,
+            range,
+        }))
+    }
 
-        let rows = client
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        // The listing yields a few dozen types, but it has to read every live
+        // row of the tenant to find them, so its cost follows the tenant's
+        // size. A system-level `$reindex` lists first, and a failed listing
+        // fails the whole job before it counts or indexes anything (#2040).
+        // Lift the timeout for this one statement, as `count_resources` does;
+        // the session keeps it afterwards.
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin resource type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for resource type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE",
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to query resource types: {}", e)))?;
+            .or_query_error("Failed to query resource types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish resource type listing")?;
 
         let types: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
         Ok(types)
@@ -5211,6 +5908,18 @@ impl ReindexSource for PostgresBackend {
             .await
             .or_query_error("Failed to finish reindex count")?;
         Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    /// Only with search offloaded (#1250): on `postgres-es` the page read
+    /// and the write in flight touch disjoint stores — the write goes to
+    /// Elasticsearch and this backend's own writer is a no-op — and the
+    /// `(last_updated, id)` keyset has no phase whose fetch must observe an
+    /// earlier page's writes, so every continuation cursor may run ahead.
+    /// Standalone PostgreSQL keeps the serial loop: its writer never touches
+    /// `resources` either, but that overlap is unmeasured and not what #1250
+    /// asked for.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.is_search_offloaded()
     }
 
     async fn fetch_resources_page(
@@ -5414,6 +6123,276 @@ impl ReindexSource for PostgresBackend {
             next_cursor,
             skipped: Vec::new(),
         })
+    }
+}
+
+impl PostgresBackend {
+    /// Live resources of `resource_type` with an id in `range` (#1767),
+    /// counted over `idx_resources_reindex_id`. The statement timeout is
+    /// lifted for the count as in [`ReindexSource::count_resources`]: a
+    /// range open on one side can still cover most of a large type.
+    async fn count_reindex_range(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        range: &ReindexIdRange,
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, None, &mut params);
+        let sql = reindex_id_range_count_sql(&bounds);
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin reindex count")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for reindex count")?;
+        let row = tx
+            .query_one(&sql, &params)
+            .await
+            .or_query_error("Failed to count resources")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish reindex count")?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    /// One page of an id-range view (#1767). It walks
+    /// `idx_resources_reindex_id (tenant_id, resource_type, id COLLATE "C")`
+    /// in id order with the last id read as the cursor, so the range and the
+    /// cursor are both bounds of that index and each page reads only its own
+    /// rows. The unranged walk's `(last_updated, id)` order would leave the
+    /// range a filter over the whole type. A byte-capped page follows the
+    /// unranged capped page's rule: it never exceeds `max_bytes` unless it
+    /// holds exactly one resource.
+    ///
+    /// Ids never change, so a resource updated during the run cannot move
+    /// behind the cursor. One created behind it is indexed by its own write,
+    /// or, when ingest defers indexing, by the deferred rebuild that ingest
+    /// schedules for its types.
+    async fn fetch_reindex_id_range_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+        range: &ReindexIdRange,
+    ) -> StorageResult<ResourcePage> {
+        if limit == 0 {
+            return Ok(ResourcePage {
+                resources: Vec::new(),
+                next_cursor: None,
+                skipped: Vec::new(),
+            });
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
+        let count_limit = i64::from(limit);
+        let lookahead = count_limit + 1;
+        let byte_cap = max_bytes.to_string();
+        let sql = if max_bytes == 0 {
+            params.push(&count_limit);
+            reindex_id_range_page_sql(&bounds, params.len())
+        } else {
+            params.push(&lookahead);
+            let lookahead_param = params.len();
+            params.push(&count_limit);
+            params.push(&byte_cap);
+            reindex_id_range_capped_page_sql(&bounds, lookahead_param)
+        };
+
+        let client = self.get_client().await?;
+        let rows = query_cached(&client, &sql, &params)
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources page: {}", e)))?;
+        let has_more = if max_bytes == 0 {
+            rows.len() == limit as usize
+        } else {
+            rows.first().is_some_and(|row| row.get::<_, bool>(5))
+        };
+        let resources: Vec<StoredResource> = rows
+            .iter()
+            .map(|row| decode_reindex_page_row(row, tenant, resource_type))
+            .collect();
+        let next_cursor = if has_more {
+            resources.last().map(|r| r.id().to_string())
+        } else {
+            None
+        };
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+}
+
+/// Appends the `id` bounds of an id-range page or count to a statement whose
+/// parameters so far are `params` (#1767): `id >= start`, `id < end` and,
+/// for a continuation page, `id > after_id`. Every bound compares
+/// `id COLLATE "C"`, byte by byte as [`ReindexIdRange`] does, not in the
+/// database's collation, and so matches `idx_resources_reindex_id`.
+fn reindex_id_range_sql<'a>(
+    range: &'a ReindexIdRange,
+    after_id: Option<&'a &'a str>,
+    params: &mut Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+) -> String {
+    let mut sql = String::new();
+    for (op, value) in [(">=", range.start.as_ref()), ("<", range.end.as_ref())] {
+        if let Some(value) = value {
+            params.push(value);
+            sql.push_str(&format!(" AND id COLLATE \"C\" {op} ${}", params.len()));
+        }
+    }
+    if let Some(after_id) = after_id {
+        params.push(after_id);
+        sql.push_str(&format!(" AND id COLLATE \"C\" > ${}", params.len()));
+    }
+    sql
+}
+
+/// The id-range count over `bounds` from [`reindex_id_range_sql`].
+fn reindex_id_range_count_sql(bounds: &str) -> String {
+    format!(
+        "/* hfs_reindex_id_range_count */
+         SELECT COUNT(*) FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}"
+    )
+}
+
+/// The uncapped id-range page over `bounds` from [`reindex_id_range_sql`],
+/// with the page size bound to `${limit_param}`.
+fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
+    format!(
+        "/* hfs_reindex_id_range */
+         SELECT id, version_id, data, last_updated, fhir_version FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
+         ORDER BY id COLLATE \"C\" LIMIT ${limit_param}"
+    )
+}
+
+/// The byte-capped id-range page over `bounds` from [`reindex_id_range_sql`]:
+/// the unranged capped page's statement in id order. Binds the lookahead
+/// (`limit + 1`) at `${lookahead_param}`, then the page size and the byte cap
+/// in the two parameters after it.
+fn reindex_id_range_capped_page_sql(bounds: &str, lookahead_param: usize) -> String {
+    let count_param = lookahead_param + 1;
+    let cap_param = lookahead_param + 2;
+    format!(
+        r#"/* hfs_reindex_id_range_capped */
+WITH keys AS MATERIALIZED (
+    SELECT id FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
+    ORDER BY id COLLATE "C" LIMIT ${lookahead_param}
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, octet_length(r.data::text)::bigint AS content_bytes
+    FROM keys k
+    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+),
+ranked AS MATERIALIZED (
+    SELECT id,
+           row_number() OVER (ORDER BY id COLLATE "C") AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY id COLLATE "C" ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id FROM ranked
+    WHERE ordinal <= ${count_param} AND (ordinal = 1 OR running_bytes <= ${cap_param}::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+ORDER BY a.id COLLATE "C"
+"#
+    )
+}
+
+/// An id-range view of a [`PostgresBackend`] (#1767): its count and pages
+/// read only ids in `range`, walking `idx_resources_reindex_id` rather than
+/// the unranged `(last_updated, id)` order. Its cursor is the last id read.
+struct RangedPostgresReindexSource {
+    backend: Arc<PostgresBackend>,
+    range: ReindexIdRange,
+}
+
+#[async_trait]
+impl ReindexSource for RangedPostgresReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_range(tenant, resource_type, &self.range)
+            .await
+    }
+
+    /// As the unranged source (#1250): only with search offloaded, where the
+    /// id-ordered page read and the Elasticsearch write in flight touch
+    /// disjoint stores.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.backend.is_search_offloaded()
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_id_range_page(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                &self.range,
+            )
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let in_range: Vec<String> = ids
+            .iter()
+            .filter(|id| self.range.contains(id))
+            .cloned()
+            .collect();
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, &in_range)
+            .await
     }
 }
 
@@ -5938,7 +6917,7 @@ impl PostgresBackend {
                 return Ok::<_, StorageError>(None);
             };
             let extractor = self
-                .authoritative_extractor(&transaction, tenant_id, true)
+                .authoritative_extractor(&transaction, tenant_id)
                 .await?;
             Ok::<_, StorageError>(Some((resolved, live, extractor)))
         }
@@ -6264,6 +7243,48 @@ impl ReindexTarget for PostgresBackend {
                 Err(error)
             }
         }
+    }
+
+    /// Lists the ids this index holds entries for: `search_index` (contained
+    /// rows are keyed by their container's id) and `resource_fts`. The cursor
+    /// is the last id returned, ordered `COLLATE "C"` like the id ranges.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut client = self.guarded_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT resource_id FROM ( \
+                     SELECT resource_id FROM search_index \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                     UNION \
+                     SELECT resource_id FROM resource_fts \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                 ) ids \
+                 ORDER BY resource_id COLLATE \"C\" LIMIT $4",
+                &[&tenant_id, &resource_type, &cursor, &limit],
+            )
+            .await
+            .or_query_error("Failed to list indexed resource ids")?;
+        client.mark_settled();
+        let ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        let next = if ids.len() as i64 >= limit {
+            ids.last().cloned()
+        } else {
+            None
+        };
+        Ok((ids, next))
     }
 
     /// Rebuilds one identity from this backend's current resource row. The
@@ -8107,5 +9128,606 @@ impl PostgresBackend {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
         }
+    }
+}
+
+/// Session ownership of the cross-tenant `count_by_tenant` aggregate (#1826).
+///
+/// Execution is held with a lock, not a sleep: a separate raw session runs
+/// `LOCK TABLE resources IN ACCESS EXCLUSIVE MODE` inside an open transaction,
+/// so the count's `SELECT` waits in PostgreSQL until that transaction ends or
+/// `statement_timeout` fires. The fixture is a few rows in a per-test database
+/// (the lock would stall every test sharing a database) and a one- or
+/// two-session pool; these tests prove which session the pool hands out, not
+/// how fast a count runs.
+#[cfg(test)]
+mod count_by_tenant_ownership_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
+    use tokio::time::{Duration, Instant, timeout};
+    use tokio_postgres::NoTls;
+
+    /// The count's text as PostgreSQL reports it in `pg_stat_activity.query`.
+    const COUNT_SQL_PREFIX: &str = PostgresBackend::COUNT_BY_TENANT_SQL;
+
+    /// How long a checkout is given to prove the pool is *not* handing out a
+    /// session. Long enough for an idle session to be returned at once, short
+    /// enough to keep the tests quick.
+    const NOT_HANDED_OUT: Duration = Duration::from_millis(500);
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = crate::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL 16 testcontainer");
+                SharedPg {
+                    host: container.get_host().await.expect("host").to_string(),
+                    port: container.get_host_port_ipv4(5432).await.expect("port"),
+                    _container: container,
+                }
+            })
+            .await
+    }
+
+    /// A raw session outside the backend's pool (blocker / observer).
+    async fn raw(dbname: &str) -> tokio_postgres::Client {
+        let pg = shared_pg().await;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&pg.host)
+            .port(pg.port)
+            .user("postgres")
+            .password("postgres")
+            .dbname(dbname)
+            .application_name("count_ownership_observer");
+        let (client, connection) = config.connect(NoTls).await.expect("raw connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// A schema-initialized database of its own, served by a pool of
+    /// `pool_size` sessions with the given `statement_timeout` and the default
+    /// `count_by_tenant` budget.
+    async fn isolated(pool_size: usize, statement_timeout_ms: u64) -> (PostgresBackend, String) {
+        isolated_with_budget(
+            pool_size,
+            statement_timeout_ms,
+            PostgresConfig::default().count_by_tenant_statement_timeout_ms,
+        )
+        .await
+    }
+
+    /// [`isolated`] with an explicit `count_by_tenant` budget (#1911).
+    async fn isolated_with_budget(
+        pool_size: usize,
+        statement_timeout_ms: u64,
+        count_by_tenant_statement_timeout_ms: u64,
+    ) -> (PostgresBackend, String) {
+        let pg = shared_pg().await;
+        let dbname = format!("count_own_{}", uuid::Uuid::new_v4().simple());
+        raw("postgres")
+            .await
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create isolated database");
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .join("data");
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: pool_size,
+            statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let schema_backend = PostgresBackend::new(PostgresConfig {
+            max_connections: 5,
+            ..config.clone()
+        })
+        .await
+        .expect("connect for schema");
+        schema_backend.init_schema().await.expect("init schema");
+        drop(schema_backend);
+        let backend = PostgresBackend::new(config).await.expect("backend");
+        // Two tenants with live rows, and one soft-deleted row that the
+        // aggregate must not count.
+        let alpha = TenantContext::new(TenantId::new("alpha"), TenantPermissions::full_access());
+        let beta = TenantContext::new(TenantId::new("beta"), TenantPermissions::full_access());
+        for _ in 0..3 {
+            backend
+                .create(
+                    &alpha,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("seed alpha");
+        }
+        let gone = backend
+            .create(
+                &beta,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed beta");
+        backend
+            .create(
+                &beta,
+                "Observation",
+                json!({"resourceType": "Observation"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed beta");
+        backend
+            .delete(&beta, "Patient", gone.id())
+            .await
+            .expect("soft delete");
+        (backend, dbname)
+    }
+
+    fn expected_counts() -> Vec<(String, u64)> {
+        vec![("alpha".to_string(), 3), ("beta".to_string(), 1)]
+    }
+
+    fn sorted(mut counts: Vec<(String, u64)>) -> Vec<(String, u64)> {
+        counts.sort();
+        counts
+    }
+
+    /// Opens a transaction holding an exclusive lock on `resources`; every
+    /// count queues behind it until `ROLLBACK`. Returns the blocker's pid.
+    async fn block_resources(blocker: &tokio_postgres::Client) -> i32 {
+        blocker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("lock resources");
+        blocker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("blocker pid")
+            .get(0)
+    }
+
+    /// Waits until the backend's count is waiting on the blocker's lock and
+    /// returns the pid of the pooled session running it.
+    async fn blocked_count_pid(observer: &tokio_postgres::Client, blocker_pid: i32) -> i32 {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let row = observer
+                    .query_opt(
+                        "SELECT pid FROM pg_stat_activity \
+                         WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                           AND application_name = 'hfs' AND starts_with(query, $2)",
+                        &[&blocker_pid, &COUNT_SQL_PREFIX],
+                    )
+                    .await
+                    .expect("inspect pg_stat_activity");
+                if let Some(row) = row {
+                    return row.get::<_, i32>(0);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("count reached the lock")
+    }
+
+    /// `(state, wait_event_type, query)` of `pid`, or `None` once it is gone.
+    async fn activity(
+        observer: &tokio_postgres::Client,
+        pid: i32,
+    ) -> Option<(String, Option<String>, String)> {
+        observer
+            .query_opt(
+                "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE pid = $1",
+                &[&pid],
+            )
+            .await
+            .expect("inspect pg_stat_activity")
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+    }
+
+    /// `(pid, state, wait_event_type)` of every backend session in the database.
+    async fn hfs_sessions(observer: &tokio_postgres::Client) -> Vec<(i32, String, Option<String>)> {
+        observer
+            .query(
+                "SELECT pid, state, wait_event_type FROM pg_stat_activity \
+                 WHERE application_name = 'hfs' AND datname = current_database() ORDER BY pid",
+                &[],
+            )
+            .await
+            .expect("inspect pg_stat_activity")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    }
+
+    async fn checkout_pid(client: &deadpool_postgres::Client) -> i32 {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("checkout pid")
+            .get(0)
+    }
+
+    /// A caller abandons a count that is still running in PostgreSQL. The
+    /// session stays owned until the statement settles: the pool never lists
+    /// it as available or hands it to the next checkout, and once the count
+    /// finishes the same session is reused, idle, by a later query that is
+    /// not disturbed by any late cleanup.
+    async fn abandoned_count_is_not_handed_out(pool_size: usize) {
+        let (backend, dbname) = isolated(pool_size, 30_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+        caller.abort();
+        assert!(
+            caller.await.expect_err("caller aborted").is_cancelled(),
+            "the caller was dropped before the count settled"
+        );
+
+        // Observe first, assert after, so a failing run still prints what the
+        // pool did (the before/after evidence for #1826).
+        let status = backend.pool().status();
+        let count_activity = activity(&observer, count_pid).await;
+        let started = Instant::now();
+        let next = match timeout(NOT_HANDED_OUT, backend.get_client()).await {
+            Err(_) => None,
+            Ok(client) => {
+                let client = client.expect("checkout");
+                let waited = started.elapsed();
+                // A session still busy with the count would queue this query.
+                let pid = timeout(NOT_HANDED_OUT, checkout_pid(&client)).await.ok();
+                Some((waited, pid, client))
+            }
+        };
+        println!(
+            "pool_size={pool_size} after abandonment: pool {status:?}; count pid {count_pid} \
+             {count_activity:?}; next checkout {:?}; hfs sessions {:?}",
+            next.as_ref().map(|(waited, pid, _)| (waited, pid)),
+            hfs_sessions(&observer).await
+        );
+        assert_eq!(
+            status.available, 0,
+            "the busy session must not be listed as available: {status:?}"
+        );
+        let (state, wait_event_type, query) = count_activity.expect("count session connected");
+        assert_eq!(state, "active");
+        assert_eq!(wait_event_type.as_deref(), Some("Lock"));
+        assert!(query.starts_with(COUNT_SQL_PREFIX), "{query}");
+        // Only a checkout that cannot be the busy session may succeed.
+        let mut other_sessions = Vec::new();
+        match next {
+            None => assert_eq!(pool_size, 1, "a free slot should have been usable"),
+            Some((_, pid, client)) => {
+                let pid = pid.expect("next checkout answered at once");
+                assert_ne!(pid, count_pid, "busy session handed out");
+                other_sessions.push(client);
+            }
+        }
+
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        let started = Instant::now();
+        let reused = loop {
+            let client = timeout(Duration::from_secs(10), backend.get_client())
+                .await
+                .expect("settled session returned to the pool")
+                .expect("checkout");
+            if checkout_pid(&client).await == count_pid {
+                break client;
+            }
+            // A pool of two may hand out the other session first; keep it
+            // checked out so the next checkout must yield the settled one.
+            other_sessions.push(client);
+        };
+        println!(
+            "pool_size={pool_size}: settled session {count_pid} reused after {:?}; \
+             pool status {:?}",
+            started.elapsed(),
+            backend.pool().status()
+        );
+        // The reused session runs a later statement to completion: nothing
+        // late cancels it.
+        reused
+            .batch_execute("SELECT pg_sleep(0.2)")
+            .await
+            .expect("later statement on the reused session is not cancelled");
+        drop(reused);
+        drop(other_sessions);
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_count_is_not_handed_out_single_session_pool() {
+        abandoned_count_is_not_handed_out(1).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_count_is_not_handed_out_two_session_pool() {
+        abandoned_count_is_not_handed_out(2).await;
+    }
+
+    /// A count that completes returns its session to the pool idle and
+    /// reusable, with no cleanup pending.
+    #[tokio::test]
+    async fn completed_count_returns_settled_session() {
+        let (backend, dbname) = isolated(1, 30_000).await;
+        let observer = raw(&dbname).await;
+        let pid = checkout_pid(&backend.get_client().await.expect("checkout")).await;
+
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+        let status = backend.pool().status();
+        assert_eq!((status.size, status.available), (1, 1), "{status:?}");
+        let (state, _, query) = activity(&observer, pid).await.expect("session kept");
+        assert_eq!(state, "idle");
+        // The count runs in its own budgeted transaction (#1911), closed
+        // before the session is returned.
+        assert_eq!(query, "COMMIT");
+        timeout(Duration::from_secs(1), backend.wait_postgres_cleanup())
+            .await
+            .expect("no cleanup pending");
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("idle session handed out at once")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+        assert_eq!(session_statement_timeout(&client).await, "30s");
+    }
+
+    /// `statement_timeout` ends a blocked count. With its caller waiting, the
+    /// count reports a timeout; with its caller gone, the session is still
+    /// held until the timeout settles it, then reused while the blocker
+    /// still holds its lock.
+    #[tokio::test]
+    async fn statement_timeout_settles_count_session() {
+        let (backend, dbname) = isolated(1, 1_500).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let error = backend
+            .count_by_tenant()
+            .await
+            .expect_err("count must hit statement_timeout");
+        assert!(
+            matches!(error, StorageError::Backend(BackendError::Timeout { .. })),
+            "statement_timeout is a Timeout, got {error:?}"
+        );
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("timed-out session is idle again")
+            .expect("checkout");
+        let pid = checkout_pid(&client).await;
+        drop(client);
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        assert_eq!(blocked_count_pid(&observer, blocker_pid).await, pid);
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            timeout(NOT_HANDED_OUT, backend.get_client()).await.is_err(),
+            "busy session handed out before statement_timeout"
+        );
+        let client = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("statement_timeout settles the abandoned count")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+        client
+            .batch_execute("SELECT 1")
+            .await
+            .expect("session usable after timeout");
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+    }
+
+    /// A count whose server session is terminated fails (caller waiting) or
+    /// is discarded (caller gone); the closed session is never recycled and
+    /// the pool recovers with a new one.
+    #[tokio::test]
+    async fn terminated_count_session_is_discarded() {
+        let (backend, dbname) = isolated(1, 30_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        for abandon in [false, true] {
+            let counting = backend.clone();
+            let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+            let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+            if abandon {
+                caller.abort();
+            }
+            let terminated: bool = observer
+                .query_one("SELECT pg_terminate_backend($1)", &[&count_pid])
+                .await
+                .expect("terminate count session")
+                .get(0);
+            assert!(terminated);
+            let joined = caller.await;
+            if !abandon {
+                joined
+                    .expect("caller joined")
+                    .expect_err("terminated count fails");
+            }
+            let client = timeout(Duration::from_secs(10), backend.get_client())
+                .await
+                .expect("pool recovers")
+                .expect("checkout");
+            assert_ne!(
+                checkout_pid(&client).await,
+                count_pid,
+                "closed session recycled (abandon={abandon})"
+            );
+            timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+                .await
+                .expect("closed session discarded");
+        }
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    /// The session's own `statement_timeout`, as `SHOW` reports it.
+    async fn session_statement_timeout(client: &deadpool_postgres::Client) -> String {
+        client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("SHOW statement_timeout")
+            .get(0)
+    }
+
+    /// The count-specific budget (#1911) ends a blocked count well inside the
+    /// general `statement_timeout`, reports `Timeout`, and stays inside the
+    /// count's transaction: the same pooled session comes back idle, with its
+    /// general timeout, and runs a statement longer than the budget.
+    #[tokio::test]
+    async fn count_budget_ends_a_blocked_count_without_leaking_to_the_session() {
+        let (backend, dbname) = isolated_with_budget(1, 30_000, 1_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+        let pid = checkout_pid(&backend.get_client().await.expect("checkout")).await;
+
+        let started = Instant::now();
+        let error = backend
+            .count_by_tenant()
+            .await
+            .expect_err("count must hit its budget");
+        let elapsed = started.elapsed();
+        println!("count budget 1000 ms (general 30000 ms) ended the count after {elapsed:?}");
+        match &error {
+            StorageError::Backend(BackendError::Timeout {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert!(
+                    message.starts_with("Failed to count by tenant"),
+                    "the error names the operation: {message}"
+                );
+            }
+            other => panic!("the budget is a Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(10),
+            "the count budget, not the 30 s session timeout, ended it: {elapsed:?}"
+        );
+
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("timed-out session is idle again")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+        let (state, _, _) = activity(&observer, pid).await.expect("session kept");
+        assert_eq!(state, "idle", "the count's transaction was closed");
+        assert_eq!(session_statement_timeout(&client).await, "30s");
+        client
+            .batch_execute("SELECT pg_sleep(1.5)")
+            .await
+            .expect("a statement longer than the count budget runs on the reused session");
+        drop(client);
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    /// With its caller gone, a budgeted count still owns its session until
+    /// the budget settles it (#1826 + #1911): the pool does not hand it out
+    /// early, and afterwards the same session is reused idle, outside any
+    /// transaction and with its general timeout, while the lock is still held.
+    #[tokio::test]
+    async fn count_budget_settles_an_abandoned_count_before_reuse() {
+        let (backend, dbname) = isolated_with_budget(1, 30_000, 2_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+        caller.abort();
+        assert!(caller.await.expect_err("caller aborted").is_cancelled());
+
+        let status = backend.pool().status();
+        assert_eq!(status.available, 0, "busy session listed: {status:?}");
+        assert!(
+            timeout(NOT_HANDED_OUT, backend.get_client()).await.is_err(),
+            "busy session handed out before its budget expired"
+        );
+        let client = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("the budget settles the abandoned count")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, count_pid);
+        let (state, _, _) = activity(&observer, count_pid).await.expect("session kept");
+        assert_eq!(state, "idle");
+        assert_eq!(session_statement_timeout(&client).await, "30s");
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+        drop(client);
+        timeout(Duration::from_secs(1), backend.wait_postgres_cleanup())
+            .await
+            .expect("no exceptional cleanup pending");
+
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
     }
 }

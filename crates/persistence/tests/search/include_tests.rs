@@ -437,6 +437,25 @@ async fn test_revinclude_filtered() {
 }
 
 // ============================================================================
+// _revinclude reference forms (#2296)
+// ============================================================================
+
+/// `_revinclude` includes relative, versioned and absolute-URL references.
+/// SQLite matches absolute URLs through `search_index.value_reference_target`
+/// (schema v48), so it has no divergence from the shared suite.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_revinclude_matches_every_reference_form() {
+    let backend = create_sqlite_backend();
+    super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
+        &[],
+    )
+    .await;
+}
+
+// ============================================================================
 // Edge Cases
 // ============================================================================
 

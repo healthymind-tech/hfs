@@ -5,9 +5,11 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
+use mongodb::action::Action;
 use mongodb::{
     Cursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
+    options::Hint,
 };
 use regex::escape as regex_escape;
 use serde_json::Value;
@@ -26,7 +28,9 @@ use crate::types::{
 };
 
 use super::MongoBackend;
-use super::schema::RESOURCES_IDENTITY_INDEX;
+use super::deferred_index::SEARCH_ROWS_PENDING_FIELD;
+use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
+use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
     COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
 };
@@ -35,6 +39,71 @@ use super::search_index_catalog::{
 /// bounded to a matched set (#1040). Keeps each aggregate command well under
 /// the 16 MB BSON limit (10 000 UUID-length ids ≈ 0.5 MB).
 const SORT_ID_CHUNK: usize = 10_000;
+
+/// Page size when the query carries no `_count`.
+const DEFAULT_PAGE_SIZE: u32 = 100;
+
+mod search_access;
+mod search_plan;
+use search_access::{CandidateSource, PredicateAccess, matching_index_ids, with_hint_fallback};
+pub(super) use search_plan::DEFAULT_PROBE_TIMEOUT_MS;
+use search_plan::{
+    BatchSelection, NoTotalPagePolicy, PageTotalExecution, ProbeFacts, SearchFilterPlan,
+    SearchFilterPurpose, SearchPipeline, plan_execution, record_filter_strategy,
+    record_total_strategy,
+};
+
+/// Ids per page while draining the matches of a reference-value read.
+const REFERENCE_VALUES_PAGE: u32 = 1000;
+
+/// Ids per `$in` filter when reading their reference rows.
+const REFERENCE_VALUES_CHUNK: usize = 1000;
+
+/// What a search page reads from each `resources` document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowShape {
+    /// The whole document, body included.
+    Full,
+    /// Only what the page cursor and the caller's ids need (#2294).
+    IdOnly,
+}
+
+impl RowShape {
+    fn projection(self) -> Option<Document> {
+        match self {
+            RowShape::Full => None,
+            RowShape::IdOnly => Some(doc! { "_id": 0, "id": 1, "last_updated": 1 }),
+        }
+    }
+}
+
+/// Whether `query` is the plain single-type filter the id-only paths serve:
+/// no sort, offset, `_contained`, includes, total, summary, elements,
+/// compartment, list or reverse chains. `id_page` additionally admits a
+/// forward cursor (a malformed or backward one keeps the full path).
+fn id_only_eligible(query: &SearchQuery, id_page: bool) -> bool {
+    if !query.sort.is_empty()
+        || query.offset.is_some()
+        || query.contained != crate::types::ContainedMode::Off
+        || !query.includes.is_empty()
+        || query.total.is_some()
+        || query.summary.is_some()
+        || !query.elements.is_empty()
+        || query.compartment.is_some()
+        || !query.list.is_empty()
+        || !query.reverse_chains.is_empty()
+    {
+        return false;
+    }
+    match &query.cursor {
+        None => true,
+        Some(cursor) => {
+            id_page
+                && PageCursor::decode(cursor)
+                    .is_ok_and(|cursor| cursor.direction() == CursorDirection::Next)
+        }
+    }
+}
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -251,12 +320,35 @@ const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
 const MAX_RESULT_ID_SET: usize = 300_000;
 
+#[cfg(test)]
+tokio::task_local! {
+    static RESULT_ID_CAP_OVERRIDE: usize;
+}
+
+/// The id-set cap in force: `MAX_RESULT_ID_SET`, or a lower value a test
+/// installed with `with_result_id_cap` for the duration of one future.
+fn result_id_cap() -> usize {
+    #[cfg(test)]
+    if let Ok(cap) = RESULT_ID_CAP_OVERRIDE.try_with(|cap| *cap) {
+        return cap;
+    }
+    MAX_RESULT_ID_SET
+}
+
+/// Runs `future` with the id-set cap lowered to `cap`, so a test can cross it
+/// with a handful of resources.
+#[cfg(test)]
+async fn with_result_id_cap<F: std::future::Future>(cap: usize, future: F) -> F::Output {
+    RESULT_ID_CAP_OVERRIDE.scope(cap, future).await
+}
+
 /// Targets a reference `:identifier` search may resolve to (#1408). They
 /// travel in one `$in`, two entries each; 10 000 stays near 1 MB, well under
 /// the 16 MB BSON limit. Past it the search is refused, never truncated.
 const MAX_IDENTIFIER_TARGETS: usize = 10_000;
 
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
+    search_deadline::check()?;
     let mut docs = Vec::new();
     while cursor
         .advance()
@@ -272,13 +364,14 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
 }
 
 /// Orders `(resource_id, keys)` pairs the way the server's
-/// `{ missing0: 1, key0: <order>, missing1: 1, key1: <order>, …, _id: 1 }`
+/// `{ missing0: 1, key0: <order>, missing1: 1, key1: <order>, …, _id: <order> }`
 /// sort would: key by key, each in its own direction, a missing key after
-/// every present one in either direction, ties on every key broken by id
-/// ascending. `keys` and `directions` are parallel. Returns the ids.
+/// every present one in either direction, ties on every key broken by id in
+/// `id_direction`. `keys` and `directions` are parallel. Returns the ids.
 fn order_sort_keys(
     mut keyed: Vec<(String, Vec<Option<Bson>>)>,
     directions: &[crate::types::SortDirection],
+    id_direction: crate::types::SortDirection,
 ) -> Vec<String> {
     use crate::types::SortDirection;
     use std::cmp::Ordering;
@@ -298,7 +391,10 @@ fn order_sort_keys(
             })
             .find(|ordering| ordering.is_ne())
             .unwrap_or(Ordering::Equal)
-            .then_with(|| id_a.cmp(id_b))
+            .then_with(|| match id_direction {
+                SortDirection::Ascending => id_a.cmp(id_b),
+                SortDirection::Descending => id_b.cmp(id_a),
+            })
     });
     keyed.into_iter().map(|(id, _)| id).collect()
 }
@@ -342,10 +438,36 @@ fn sort_key_type_rank(value: &Bson) -> u8 {
     }
 }
 
+/// Collects the string `field` of every document a cursor yields. Used instead
+/// of `distinct`, whose reply is one BSON document and fails once the ids
+/// exceed 16 MB (about 345,000 UUID-length ids), however few rows a request
+/// asks for.
+async fn collect_id_set(
+    mut cursor: Cursor<Document>,
+    field: &str,
+) -> StorageResult<HashSet<String>> {
+    search_deadline::check()?;
+    let mut ids = HashSet::new();
+    while cursor
+        .advance()
+        .await
+        .or_query_error("Failed to advance an id cursor")?
+    {
+        let document = cursor
+            .deserialize_current()
+            .or_query_error("Failed to deserialize an id row")?;
+        if let Ok(id) = document.get_str(field) {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
 async fn read_cursor_batch(
     cursor: &mut Cursor<Document>,
     limit: usize,
 ) -> StorageResult<Vec<Document>> {
+    search_deadline::check()?;
     let mut docs = Vec::with_capacity(limit);
     while docs.len() < limit {
         if !cursor
@@ -361,6 +483,19 @@ async fn read_cursor_batch(
         docs.push(doc);
     }
     Ok(docs)
+}
+
+/// Appends a cursor condition the way `build_resource_filter` does when given
+/// the cursor, keeping one `$and` level so command shapes are unchanged.
+fn with_cursor_condition(mut filter: Document, condition: Option<Document>) -> Document {
+    let Some(condition) = condition else {
+        return filter;
+    };
+    if let Ok(conditions) = filter.get_array_mut("$and") {
+        conditions.push(Bson::Document(condition));
+        return filter;
+    }
+    doc! { "$and": [filter, condition] }
 }
 
 /// Drops the probe row a cursor page over-fetches (`limit(page_size + 1)`)
@@ -575,6 +710,91 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// Metadata predicates stay on resources, alongside tenant and deletion scope.
+fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
+    let has_missing = filter.contains_key("missing_params")
+        || filter.get_array("$and").is_ok_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition
+                    .as_document()
+                    .is_some_and(|condition| missing_metadata_hint(condition).is_some())
+            })
+        })
+        || filter.get_array("$or").is_ok_and(|conditions| {
+            !conditions.is_empty()
+                && conditions.iter().all(|condition| {
+                    condition
+                        .as_document()
+                        .is_some_and(|condition| missing_metadata_hint(condition).is_some())
+                })
+        });
+    has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
+}
+
+/// A resource that lacks `name`: its `missing_params` lists it, or it has no
+/// `missing_params` and its rows decide (`missing_fallback_stages`). A resource
+/// created by a deferred Bundle has neither until its batch writes both, so it
+/// still carries the `search_rows_pending` marker; it is left out rather than
+/// listed as missing every parameter, as every row-driven search leaves it out
+/// until then (#1975).
+pub(super) fn missing_resource_condition(name: &str) -> Document {
+    doc! { "$or": [
+        { "missing_params": name },
+        {
+            "missing_params": { "$exists": false },
+            SEARCH_ROWS_PENDING_FIELD: { "$exists": false },
+        },
+    ] }
+}
+
+/// Resources without metadata consult the existing value index.
+fn missing_fallback_stages(presence: Document) -> Vec<Document> {
+    vec![
+        doc! { "$lookup": {
+            "from": MongoBackend::SEARCH_INDEX_COLLECTION,
+            "let": {
+                // Indexed resource IDs are strings; false cannot match one and keeps an equality seek.
+                "candidate_id": { "$cond": [
+                    { "$eq": [{ "$type": "$missing_params" }, "missing"] },
+                    "$id",
+                    false,
+                ] },
+            },
+            "pipeline": [
+                { "$match": { "$and": [presence, {
+                    "$expr": { "$eq": ["$resource_id", "$$candidate_id"] },
+                }] } },
+                { "$limit": 1 },
+                { "$project": { "_id": 1 } },
+            ],
+            "as": "_hfs_missing_present",
+        } },
+        doc! { "$match": { "_hfs_missing_present.0": { "$exists": false } } },
+        doc! { "$unset": "_hfs_missing_present" },
+    ]
+}
+
+#[cfg(test)]
+mod missing_metadata_hint_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_hint_requires_absence_in_every_cursor_alternative() {
+        let absent = doc! { "missing_params": "status" };
+        let scope = doc! { "tenant_id": "a", "resource_type": "Observation", "is_deleted": false };
+        assert!(missing_metadata_hint(&scope).is_none());
+        assert!(missing_metadata_hint(&doc! { "$and": [scope.clone(), absent.clone()] }).is_some());
+        assert!(
+            missing_metadata_hint(&doc! { "$or": [
+                { "$and": [absent.clone(), { "id": { "$gt": "a" } }] },
+                { "$and": [absent.clone(), { "id": { "$lt": "b" } }] },
+            ] })
+            .is_some()
+        );
+        assert!(missing_metadata_hint(&doc! { "$or": [absent, scope] }).is_none());
+    }
+}
+
 /// A positive `_id` filter's implied resource-id universe (#1528): every
 /// `_id` search value is itself an id, so a query carrying one already names
 /// a finite set to check everything else against — no `search_index` scan
@@ -624,22 +844,35 @@ fn positive_id_seed(query: &SearchQuery) -> Option<HashSet<String>> {
 /// population) and the #1528 seed-vs-compartment driver probe in
 /// `matching_resource_ids`, which needs the identical shape without a
 /// `resource_id` bound.
+///
+/// With `normalized` (the reference backfill is complete, so stored values
+/// carry no `/_history/` suffix) the filter is one exact match and the
+/// `_history` regex arm is dropped.
 fn compartment_membership_filter(
     tenant_id: &str,
     resource_type: &str,
     comp: &CompartmentMembership,
+    normalized: bool,
 ) -> Document {
     let base = strip_reference_version(&comp.reference);
     let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-    doc! {
+    let mut filter = doc! {
         "tenant_id": tenant_id,
         "resource_type": resource_type,
         "param_name": { "$in": Bson::Array(params) },
-        "$or": [
-            { "value_reference": &base },
-            { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
-        ],
+    };
+    if normalized {
+        filter.insert("value_reference", base);
+    } else {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "value_reference": base },
+                doc! { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
+            ],
+        );
     }
+    filter
 }
 
 /// Rejects the `_contained=true|both` constraints that select *top-level*
@@ -830,11 +1063,277 @@ impl CursorKeyset {
 
 #[async_trait]
 impl SearchProvider for MongoBackend {
+    #[tracing::instrument(skip_all, level = "debug", fields(total_plan = tracing::field::Empty, total_strategy = tracing::field::Empty, filter_strategy = tracing::field::Empty,
+        total_filter_strategy = tracing::field::Empty, probe_requests = tracing::field::Empty, probe_reuses = tracing::field::Empty))]
     async fn search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_inner(tenant, query, RowShape::Full).await;
+        };
+        search_deadline::run(timeout, self.search_inner(tenant, query, RowShape::Full)).await
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // The resolver issues plain, unsorted single-type searches. Other
+        // shapes keep the full search path rather than duplicating its
+        // result shaping here.
+        if !id_only_eligible(query, true) {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+        Ok(self
+            .search_rows(tenant, query, RowShape::IdOnly)
+            .await?
+            .resources
+            .map(|resource| resource.id().to_string()))
+    }
+
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        if self.is_search_offloaded() || query.cursor.is_some() || !id_only_eligible(query, false) {
+            return Ok(None);
+        }
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self
+                .reference_values_inner(tenant, query, reference_param)
+                .await
+                .map(Some);
+        };
+        search_deadline::run(
+            timeout,
+            self.reference_values_inner(tenant, query, reference_param),
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn search_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<u64> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_count_inner(tenant, query).await;
+        };
+        search_deadline::run(timeout, self.search_count_inner(tenant, query)).await
+    }
+
+    fn search_param_registry(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
+    }
+}
+
+impl MongoBackend {
+    /// `search` with the deadline wrapper, reading rows in `shape`.
+    async fn search_rows(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        shape: RowShape,
+    ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_inner(tenant, query, shape).await;
+        };
+        search_deadline::run(timeout, self.search_inner(tenant, query, shape)).await
+    }
+
+    /// Every reference value of `reference_param` held by the resources that
+    /// match `query`, deduplicated (#2294). Matching ids are drained id-only;
+    /// their values come from the reference rows of the search index, except
+    /// for resources whose rows are still deferred (#1975), which are read
+    /// from their bodies exactly as the resolver would.
+    async fn reference_values_inner(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let db = self.get_database().await?;
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let extractor = self.tenant_extractor(tenant_id);
+        let param_def = {
+            let registry = self.tenant_registry(tenant_id);
+            let registry = registry.read();
+            registry
+                .get_param(&query.resource_type, reference_param)
+                .or_else(|| registry.get_param("Resource", reference_param))
+        };
+
+        let mut page_query = query.clone();
+        page_query.offset = None;
+        page_query.cursor = None;
+        page_query.count = Some(REFERENCE_VALUES_PAGE);
+        let mut seen_cursors = HashSet::new();
+        let mut values: HashSet<String> = HashSet::new();
+        loop {
+            let page = self
+                .search_rows(tenant, &page_query, RowShape::IdOnly)
+                .await?;
+            let got = page.resources.items.len();
+            let ids: Vec<String> = page
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            for chunk in ids.chunks(REFERENCE_VALUES_CHUNK) {
+                search_deadline::check()?;
+                let mut pending: HashSet<String> = HashSet::new();
+                let marked = resources
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": &query.resource_type,
+                        "id": { "$in": chunk },
+                        SEARCH_ROWS_PENDING_FIELD: { "$exists": true },
+                    })
+                    .projection(doc! { "_id": 0, "id": 1 })
+                    .search_deadline()?
+                    .await
+                    .or_query_error("Failed to read deferred search markers")?;
+                for doc in collect_documents(marked).await? {
+                    if let Ok(id) = doc.get_str("id") {
+                        pending.insert(id.to_string());
+                    }
+                }
+
+                let indexed: Vec<&str> = chunk
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !pending.contains(*id))
+                    .collect();
+                if !indexed.is_empty() {
+                    let rows = search_index
+                        .find(doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": &query.resource_type,
+                            "resource_id": { "$in": indexed },
+                            "param_name": reference_param,
+                            "value_reference": { "$exists": true },
+                        })
+                        .projection(doc! { "_id": 0, "value_reference": 1 })
+                        .search_deadline()?
+                        .await
+                        .or_query_error("Failed to read reference values")?;
+                    for doc in collect_documents(rows).await? {
+                        if let Ok(reference) = doc.get_str("value_reference") {
+                            values.insert(reference.to_string());
+                        }
+                    }
+                }
+
+                if !pending.is_empty() {
+                    let bodies = resources
+                        .find(doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": &query.resource_type,
+                            "id": { "$in": pending.iter().collect::<Vec<_>>() },
+                            "is_deleted": false,
+                        })
+                        .search_deadline()?
+                        .await
+                        .or_query_error("Failed to read deferred resources")?;
+                    for doc in collect_documents(bodies).await? {
+                        let stored =
+                            self.document_to_stored_resource(tenant, &query.resource_type, doc)?;
+                        if let Some(param_def) = &param_def {
+                            if let Ok(extracted) =
+                                extractor.extract_for_param(stored.content(), param_def)
+                            {
+                                values.extend(extracted.into_iter().filter_map(
+                                    |v| match v.value {
+                                        crate::search::IndexValue::Reference {
+                                            reference, ..
+                                        } => Some(reference),
+                                        _ => None,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !page.resources.page_info.has_next {
+                break;
+            }
+            if got == 0 {
+                return Err(internal_error(
+                    "reference value drain got an empty id page with more results".to_owned(),
+                ));
+            }
+            match page.resources.page_info.next_cursor {
+                Some(cursor) if seen_cursors.insert(cursor.clone()) => {
+                    page_query.cursor = Some(cursor);
+                }
+                _ => {
+                    return Err(internal_error(
+                        "reference value drain did not advance its page cursor".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    async fn search_inner(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        shape: RowShape,
+    ) -> StorageResult<SearchResult> {
+        search_deadline::check()?;
         reject_contained_composite(query)?;
 
         // `_contained` search uses a dedicated path (separate index rows and
@@ -846,10 +1345,12 @@ impl SearchProvider for MongoBackend {
         }
 
         self.validate_query_support(query)?;
+        let _permit = self.admit_broad_search(query).await?;
 
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
+        let missing_support = self.classify_missing(tenant_id, &query.resource_type, query);
 
         let cursor = if let Some(cursor_str) = &query.cursor {
             Some(PageCursor::decode(cursor_str).map_err(|_| {
@@ -878,78 +1379,270 @@ impl SearchProvider for MongoBackend {
             .as_ref()
             .is_some_and(|c| c.direction() == CursorDirection::Previous);
 
-        let matched_ids = self
-            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+        let mut probe_facts = ProbeFacts::default();
+        let facts = self.execution_facts(query);
+        let execution = plan_execution(query, facts);
+        execution.record();
+
+        // Only eligible estimated count summaries omit the discarded page.
+        // Exact summaries retain their existing execution unchanged.
+        if execution.page_total == PageTotalExecution::EstimateOnly {
+            if let Some((cursor, keyset)) = cursor.as_ref().zip(keyset.as_ref()) {
+                self.build_cursor_condition(cursor, keyset)?;
+            }
+            self.build_sort_document(query, previous_mode)?;
+            let total = self
+                .count_standard_with_facts(
+                    tenant,
+                    &db,
+                    query,
+                    &missing_support,
+                    facts.count_selection(),
+                    &mut probe_facts,
+                )
+                .await?;
+            probe_facts.record();
+            return Ok(
+                SearchResult::new(Page::new(Vec::new(), PageInfo::end().with_total(total)))
+                    .with_total(total),
+            );
+        }
+
+        let combine_total = execution.combines_total();
+        let index_cursor_filter =
+            self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
+        let filter_plan = self
+            .resource_filter_plan(
+                &db,
+                tenant_id,
+                query,
+                &missing_support,
+                execution.filter_purpose,
+                execution.page_policy,
+                index_cursor_filter.as_ref(),
+                &mut probe_facts,
+            )
             .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(&db, tenant_id, query, &missing_support, filter_plan)
+            .await?;
+        record_filter_strategy(
+            "filter_strategy",
+            filter_plan.as_ref(),
+            execution.filter_purpose,
+        );
 
         // Sorting by indexed search parameters (#881, #1564): the sort keys
         // live in the search index, not on the resource documents, so the
         // ordered id list is computed there and the page fetched by id.
         // Offset-paged; it has no keyset, so a cursor is already rejected above.
-        // `_id`, `_lastUpdated` and `_score` are not search-index keys, so they
-        // cannot be combined with a parameter key here.
+        // The resource id is already the last key of that order, so a final
+        // `_id` directive only sets its direction. `_lastUpdated`, `_score`, or
+        // `_id` anywhere else are not search-index keys and are refused.
         if query
             .sort
             .iter()
             .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
         {
-            if let Some(other) = query
-                .sort
+            let (directives, id_direction) = match query.sort.split_last() {
+                Some((last, rest)) if last.parameter == "_id" => (rest, last.direction),
+                _ => (
+                    query.sort.as_slice(),
+                    crate::types::SortDirection::Ascending,
+                ),
+            };
+            if let Some(other) = directives
                 .iter()
                 .find(|d| matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
             {
                 return Err(StorageError::Search(SearchError::QueryParseError {
                     message: format!(
                         "MongoDB cannot combine _sort={} with a search-parameter sort; \
-                         sort by search parameters only",
+                         sort by search parameters, optionally followed by _id",
                         other.parameter
                     ),
                 }));
             }
-            if query.sort.len() > MAX_SEARCH_PARAM_SORT_KEYS {
+            if directives.len() > MAX_SEARCH_PARAM_SORT_KEYS {
                 return Err(StorageError::Search(SearchError::QueryParseError {
                     message: format!(
                         "MongoDB supports at most {MAX_SEARCH_PARAM_SORT_KEYS} search-parameter sort keys"
                     ),
                 }));
             }
+            probe_facts.record();
             return self
-                .search_param_sorted(tenant, query, &db, tenant_id, matched_ids, &query.sort)
+                .search_param_sorted(
+                    tenant,
+                    query,
+                    &missing_support,
+                    &db,
+                    tenant_id,
+                    matched_ids,
+                    directives,
+                    id_direction,
+                )
                 .await;
         }
 
-        let filter = self.build_resource_filter(
+        // The resource scope and the cursor condition are built once: the
+        // resource-order scan takes them apart, every other path takes them
+        // joined.
+        let scope_filter = self.build_resource_filter(
             tenant_id,
             &query.resource_type,
             query,
+            &missing_support,
             matched_ids.as_ref(),
-            cursor.as_ref().zip(keyset.as_ref()),
+            None,
         )?;
+        let cursor_condition = cursor
+            .as_ref()
+            .zip(keyset.as_ref())
+            .map(|(cursor, keyset)| self.build_cursor_condition(cursor, keyset))
+            .transpose()?;
+        let filter = with_cursor_condition(scope_filter.clone(), cursor_condition.clone());
 
         let sort = self.build_sort_document(query, previous_mode)?;
-        let page_size = query.count.unwrap_or(100).max(1) as usize;
+        let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE).max(1) as usize;
 
-        let mut find_action = resources
-            .find(filter)
-            .sort(sort)
-            .limit((page_size + 1) as i64);
-
-        if cursor.is_none() {
-            if let Some(offset) = query.offset {
-                find_action = find_action.skip(offset as u64);
+        let offset = if cursor.is_none() {
+            query.offset.unwrap_or(0)
+        } else {
+            0
+        };
+        let mut combined_total = None;
+        let docs = if let Some(SearchFilterPlan::ResourceBatches(plan)) = filter_plan {
+            self.resource_order_page(
+                &db,
+                tenant_id,
+                query,
+                &missing_support,
+                plan,
+                scope_filter,
+                cursor_condition,
+                sort.clone(),
+                offset,
+                page_size,
+                shape,
+            )
+            .await?
+        } else if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
+            let direction = sort.get_i32("id").map_err(|_| {
+                internal_error("Batched page requires an ID sort direction".to_owned())
+            })?;
+            let match_filter = if combine_total {
+                self.build_resource_filter(
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    &missing_support,
+                    None,
+                    None,
+                )?
+            } else {
+                filter.clone()
+            };
+            let matches = plan
+                .execute(
+                    &db,
+                    match_filter,
+                    if combine_total {
+                        None
+                    } else {
+                        index_cursor_filter
+                    },
+                    execution.page_selection(
+                        direction,
+                        offset,
+                        page_size + 1,
+                        if combine_total {
+                            cursor
+                                .as_ref()
+                                .zip(keyset.as_ref())
+                                .map(|(cursor, keyset)| self.build_cursor_condition(cursor, keyset))
+                                .transpose()?
+                        } else {
+                            None
+                        },
+                    ),
+                )
+                .await?;
+            if combine_total {
+                combined_total = Some(matches.count);
             }
-        }
-
-        let docs = collect_documents(
-            find_action
-                .await
-                .or_query_error("Failed to execute MongoDB search")?,
-        )
-        .await?;
+            if matches.ids.is_empty() {
+                Vec::new()
+            } else {
+                collect_documents(
+                    resources
+                        .find(doc! { "$and": [filter, { "id": { "$in": matches.ids } }] })
+                        .optional(shape.projection(), |find, projection| {
+                            find.projection(projection)
+                        })
+                        .search_deadline()?
+                        .sort(sort)
+                        .await
+                        .or_query_error("Failed to fetch matched search page")?,
+                )
+                .await?
+            }
+        } else if let Some(plan) = filter_plan {
+            let fetch_page = matches!(&plan, SearchFilterPlan::IndexIntersection(_));
+            let SearchPipeline {
+                collection,
+                stages: mut pipeline,
+                hint,
+            } = plan.pipeline(filter, Some(sort), index_cursor_filter)?;
+            if offset > 0 {
+                pipeline.push(doc! { "$skip": i64::from(offset) });
+            }
+            pipeline.push(doc! { "$limit": (page_size + 1) as i64 });
+            if fetch_page {
+                pipeline.extend(SearchFilterPlan::fetch_page(
+                    tenant_id,
+                    &query.resource_type,
+                    shape.projection(),
+                ));
+            } else if let Some(projection) = shape.projection() {
+                pipeline.push(doc! { "$project": projection });
+            }
+            let source = db.collection::<Document>(collection);
+            let cursor = with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await?
+            .or_query_error("Failed to page resource-filtered search")?;
+            collect_documents(cursor).await?
+        } else {
+            collect_documents(
+                resources
+                    .find(filter)
+                    .optional(shape.projection(), |find, projection| {
+                        find.projection(projection)
+                    })
+                    .search_deadline()?
+                    .sort(sort)
+                    .skip(u64::from(offset))
+                    .limit((page_size + 1) as i64)
+                    .await
+                    .or_query_error("Failed to execute MongoDB search")?,
+            )
+            .await?
+        };
 
         let mut resources = docs
             .into_iter()
-            .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
+            .map(|doc| match shape {
+                RowShape::Full => {
+                    self.document_to_stored_resource(tenant, &query.resource_type, doc)
+                }
+                RowShape::IdOnly => self.document_to_id_row(tenant, &query.resource_type, doc),
+            })
             .collect::<StorageResult<Vec<_>>>()?;
 
         let (has_next, has_previous) = trim_probe_row(
@@ -977,11 +1670,31 @@ impl SearchProvider for MongoBackend {
             _ => None,
         };
 
-        let total = if query.wants_total() {
-            Some(self.search_count(tenant, query).await?)
+        let total = if let Some(total) = combined_total {
+            record_total_strategy(if execution.page_total == PageTotalExecution::Estimated {
+                "combined_index_estimate"
+            } else {
+                "combined_exact"
+            });
+            Some(total)
+        } else if query.wants_total() {
+            Some(
+                self.count_standard_with_facts(
+                    tenant,
+                    &db,
+                    query,
+                    &missing_support,
+                    facts.count_selection(),
+                    &mut probe_facts,
+                )
+                .await?,
+            )
         } else {
+            record_total_strategy("omitted");
             None
         };
+
+        probe_facts.record();
 
         let page_info = PageInfo {
             next_cursor,
@@ -1030,11 +1743,12 @@ impl SearchProvider for MongoBackend {
         })
     }
 
-    async fn search_count(
+    async fn search_count_inner(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        search_deadline::check()?;
         reject_contained_composite(query)?;
         self.validate_query_support(query)?;
 
@@ -1053,44 +1767,8 @@ impl SearchProvider for MongoBackend {
                 .ok_or_else(|| internal_error("contained search returned no total".to_string()));
         }
 
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let matched_ids = self
-            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
-            .await?;
-
-        let filter = self.build_resource_filter(
-            tenant_id,
-            &query.resource_type,
-            query,
-            matched_ids.as_ref(),
-            None,
-        )?;
-
-        resources
-            .count_documents(filter)
-            .await
-            .or_query_error("Failed to count MongoDB search results")
-    }
-
-    fn search_param_registry(
-        &self,
-        tenant: &crate::tenant::TenantContext,
-    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.tenant_registry(tenant.tenant_id().as_str())
-    }
-
-    fn supports_contained_search(&self) -> bool {
-        true
-    }
-
-    fn modifiers_for_param_type(
-        &self,
-        param_type: crate::types::SearchParamType,
-    ) -> Vec<&'static str> {
-        Self::modifiers_for_type(param_type)
+        let _permit = self.admit_broad_search_for(query, true).await?;
+        self.count_standard(tenant, query).await
     }
 }
 
@@ -1222,6 +1900,134 @@ struct ComponentFilter {
     negated: bool,
 }
 
+/// The error for a composite value whose every component uses the `ne`
+/// prefix. Shared by the legacy driver probe and the filter planner, so both
+/// report the same message.
+fn all_ne_composite_error(param_name: &str) -> StorageError {
+    StorageError::Search(SearchError::InvalidComposite {
+        message: format!(
+            "composite value for parameter '{param_name}' has every component using the \
+             'ne' prefix; MongoDB needs at least one non-'ne' component to bound \
+             the search (an unbounded 'ne' arm is an existence-bounded index scan \
+             with a fetch per row)"
+        ),
+    })
+}
+
+/// Checks a candidate batch against pre-built composite component filters:
+/// `values` holds, per comma-separated value, every component's scoped
+/// `search_index` filter in declaration order. For each value and component it
+/// fetches `(resource_id, composite_group)` pairs bounded to `candidates`,
+/// intersects them across components
+/// (`composite_search::intersect_component_pairs`) and unions the surviving
+/// ids across values. Shared by [`MongoBackend::composite_pair_check`] (the
+/// legacy id collector and the ifNoneExist matcher) and the filter planner's
+/// composite membership, so every caller sees identical semantics.
+///
+/// `hint` names an index to force via `Hint::Name`. Every find is bounded by
+/// `resource_id: {$in: candidates}`. A rejected hint is an error, never a
+/// reason to run the find unhinted.
+///
+/// Each find streams into its pair set, with or without a session, so memory
+/// follows the pairs kept rather than the rows a component returns for up to
+/// `MAX_CANDIDATE_ROWS` candidates.
+async fn composite_pair_matches(
+    search_index: &mongodb::Collection<Document>,
+    values: &[Vec<Document>],
+    candidates: &HashSet<String>,
+    hint: Option<&str>,
+    mut session: Option<&mut mongodb::ClientSession>,
+) -> StorageResult<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+    let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
+
+    let mut matched: HashSet<String> = HashSet::new();
+    for component_filters in values {
+        let mut per_component_pairs: Vec<HashSet<(String, i32)>> =
+            Vec::with_capacity(component_filters.len());
+
+        for filter in component_filters {
+            let bounded = doc! {
+                "$and": [
+                    filter.clone(),
+                    { "resource_id": { "$in": candidate_ids.clone() } }
+                ]
+            };
+
+            let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
+                Some(s) => {
+                    let mut find = search_index
+                        .find(bounded)
+                        .search_deadline()?
+                        .projection(projection.clone());
+                    if let Some(name) = hint {
+                        find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                    }
+                    let mut cursor = find
+                        .session(&mut *s)
+                        .await
+                        .or_query_error("Failed to query composite component rows (session)")?;
+                    let mut out = HashSet::new();
+                    while cursor
+                        .advance(&mut *s)
+                        .await
+                        .or_query_error("Failed to advance composite component cursor")?
+                    {
+                        let doc = cursor
+                            .deserialize_current()
+                            .or_query_error("Failed to deserialize composite component row")?;
+                        if let (Ok(rid), Ok(grp)) =
+                            (doc.get_str("resource_id"), doc.get_i32("composite_group"))
+                        {
+                            out.insert((rid.to_string(), grp));
+                        }
+                    }
+                    out
+                }
+                None => {
+                    let mut find = search_index
+                        .find(bounded)
+                        .search_deadline()?
+                        .projection(projection.clone());
+                    if let Some(name) = hint {
+                        find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                    }
+                    let mut cursor = find
+                        .await
+                        .or_query_error("Failed to query composite component rows")?;
+                    search_deadline::check()?;
+                    let mut out = HashSet::new();
+                    while cursor
+                        .advance()
+                        .await
+                        .or_query_error("Failed to advance composite component cursor")?
+                    {
+                        let doc = cursor
+                            .deserialize_current()
+                            .or_query_error("Failed to deserialize composite component row")?;
+                        if let (Ok(rid), Ok(grp)) =
+                            (doc.get_str("resource_id"), doc.get_i32("composite_group"))
+                        {
+                            out.insert((rid.to_string(), grp));
+                        }
+                    }
+                    out
+                }
+            };
+            per_component_pairs.push(pairs);
+        }
+
+        let value_matches = super::composite_search::intersect_component_pairs(per_component_pairs);
+        matched.extend(value_matches);
+    }
+
+    Ok(matched)
+}
+
 /// One composite component's `search_index_contained` filter, scoped to
 /// `(tenant_id, contained_type, param_name)` instead of
 /// `(tenant_id, resource_type, param_name)`: contained rows carry the
@@ -1297,7 +2103,421 @@ fn contained_composite_value_stages(
     Ok(first)
 }
 
+/// Whether `missing_params` records `name` when absent. `_id` and
+/// `_lastUpdated` live on every resource document and `:missing` on them
+/// never reads the array, so recording them would only add index keys
+/// (#2006).
+pub(super) fn records_missing_metadata(name: &str) -> bool {
+    !matches!(name, "_id" | "_lastUpdated")
+}
+
+/// Which `:missing` parameters of one query `missing_params` answers.
+///
+/// Classified once per query by [`MongoBackend::classify_missing`] and passed
+/// through planning and execution, so every stage reads the same answer: one
+/// registry read and one extractor per query instead of one per check, and a
+/// registry reload mid-query cannot make the planner and the executor
+/// disagree (#2007). The set holds the `(name, type)` pairs that pass both
+/// the definition check and the pre-search freshness probe for the resource
+/// type (#1999).
+#[derive(Debug, Clone, Default)]
+pub(super) struct MissingSupport {
+    indexed: HashSet<(String, SearchParamType)>,
+}
+
+impl MissingSupport {
+    /// For a query with no `:missing` parameter, or one whose parameters are
+    /// all `_id` / `_lastUpdated`: nothing is answered from `missing_params`.
+    pub(super) fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether `param`'s `:missing` is answered from `missing_params`, for
+    /// either value.
+    pub(super) fn supports(&self, param: &SearchParameter) -> bool {
+        self.indexed
+            .contains(&(param.name.clone(), param.param_type))
+    }
+
+    /// Whether `param` is a `:missing=true` that `missing_params` answers on
+    /// the resource document.
+    pub(super) fn is_resource_parameter(&self, param: &SearchParameter) -> bool {
+        records_missing_metadata(&param.name)
+            && matches!(param.modifier, Some(SearchModifier::Missing))
+            && param
+                .values
+                .first()
+                .is_some_and(|value| value.value == "true")
+            && self.supports(param)
+    }
+}
+
+/// True when the query carries a predicate that lives on the resource
+/// document rather than in the search index.
+fn has_resource_level_params(query: &SearchQuery, missing_support: &MissingSupport) -> bool {
+    // The stored FHIR version (#2254) is a field of the resource document.
+    query.fhir_version.is_some()
+        || query.parameters.iter().any(|p| {
+            matches!(p.name.as_str(), "_id" | "_lastUpdated")
+                || missing_support.is_resource_parameter(p)
+        })
+}
+
 impl MongoBackend {
+    /// Classifies `query`'s `:missing` parameters against `resource_type` once.
+    pub(super) fn classify_missing(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+    ) -> MissingSupport {
+        // Until `idx_resources_missing_params` is built (#2001) every
+        // parameter takes the value-index route, as an unsupported one does:
+        // same results, no full `resources` scan, and no hint naming an
+        // index that does not exist yet.
+        if !self.missing_params_index_ready() {
+            return MissingSupport::none();
+        }
+        let params: Vec<&SearchParameter> = query
+            .parameters
+            .iter()
+            .filter(|param| matches!(param.modifier, Some(SearchModifier::Missing)))
+            .collect();
+        if params.is_empty() {
+            return MissingSupport::none();
+        }
+        let definitions: Vec<_> = {
+            let registry = self.tenant_registry(tenant_id);
+            let registry = registry.read();
+            params
+                .into_iter()
+                .filter_map(|param| {
+                    registry
+                        .get_param(resource_type, &param.name)
+                        .or_else(|| {
+                            helios_fhir::search::ABSTRACT_BASE_TYPES
+                                .iter()
+                                .find_map(|base| registry.get_param(base, &param.name))
+                        })
+                        .filter(|definition| definition.param_type == param.param_type)
+                        .map(|definition| (param, definition))
+                })
+                .collect()
+        };
+        if definitions.is_empty() {
+            return MissingSupport::none();
+        }
+        // Only parameters the pre-search probe found fresh (#1999).
+        let Some(freshness) = self.missing_freshness(tenant_id, resource_type) else {
+            return MissingSupport::none();
+        };
+        let extractor = self.tenant_extractor(tenant_id);
+        MissingSupport {
+            indexed: definitions
+                .into_iter()
+                .filter(|(param, definition)| {
+                    freshness.allows(&param.name)
+                        && extractor.supports_missing(resource_type, definition)
+                })
+                .map(|(param, _)| (param.name.clone(), param.param_type))
+                .collect(),
+        }
+    }
+
+    /// Chooses between `plan` and the candidate id set. `IndexIntersection`
+    /// and `ResourceLookups` read every live resource of the type, or run one
+    /// `$lookup` per driver row, so their cost follows the size of the type
+    /// rather than the number of matches. They are used only when the id set
+    /// exceeds `MAX_RESULT_ID_SET` and so cannot serve the search.
+    async fn plan_or_matching_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        plan: Option<SearchFilterPlan>,
+    ) -> StorageResult<(Option<SearchFilterPlan>, Option<HashSet<String>>)> {
+        match plan {
+            // Metadata-supported absence predicates already bound the resource
+            // executor. Preserve that plan rather than materializing its full
+            // ID set; ordinary type scans retain the upstream selection below.
+            Some(plan)
+                if !plan.scans_type()
+                    || query
+                        .parameters
+                        .iter()
+                        .any(|param| missing_support.is_resource_parameter(param)) =>
+            {
+                Ok((Some(plan), None))
+            }
+            plan => match self
+                .matching_resource_ids(db, tenant_id, &query.resource_type, query, missing_support)
+                .await
+            {
+                Ok(ids) => Ok((None, ids)),
+                Err(StorageError::Search(SearchError::TooManyResults { .. })) if plan.is_some() => {
+                    Ok((plan, None))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    /// Serves a resource-order page. Dense pages keep scanning; sparse positive
+    /// pages first continue within a fixed candidate budget, then try the capped
+    /// ID set if still incomplete. Pages with `:missing` or `:not` keep scanning
+    /// because their ID set is uncapped; oversized ID sets also resume the scan.
+    #[allow(clippy::too_many_arguments)]
+    async fn resource_order_page(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        plan: search_plan::ResourceBatchPlan,
+        scope_filter: Document,
+        cursor_condition: Option<Document>,
+        sort: Document,
+        offset: u32,
+        page_size: usize,
+        shape: RowShape,
+    ) -> StorageResult<Vec<Document>> {
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let projection = shape.projection();
+        let mut run = plan
+            .start_page(
+                db,
+                scope_filter.clone(),
+                cursor_condition.clone(),
+                sort.clone(),
+                offset,
+                page_size + 1,
+            )
+            .await?;
+        let ids = match run.sample(db).await? {
+            search_plan::ResourcePageSample::Complete(ids) => ids,
+            search_plan::ResourcePageSample::Dense => run.finish(db).await?,
+            search_plan::ResourcePageSample::Sparse { .. }
+                if search_plan::uses_complement_modifiers(query) =>
+            {
+                run.finish(db).await?
+            }
+            search_plan::ResourcePageSample::Sparse { live_matches } => {
+                if let Some(ids) = run.try_finish_sparse_page(db).await? {
+                    ids
+                } else {
+                    match self
+                        .sparse_page_id_set(db, tenant_id, query, missing_support)
+                        .await?
+                    {
+                        Some(id_set) => {
+                            run.record_fallback(live_matches, id_set.len());
+                            let filter = with_cursor_condition(
+                                self.build_resource_filter(
+                                    tenant_id,
+                                    &query.resource_type,
+                                    query,
+                                    missing_support,
+                                    Some(&id_set),
+                                    None,
+                                )?,
+                                cursor_condition,
+                            );
+                            return collect_documents(
+                                resources
+                                    .find(filter)
+                                    .optional(projection.clone(), |find, projection| {
+                                        find.projection(projection)
+                                    })
+                                    .search_deadline()?
+                                    .sort(sort)
+                                    .skip(u64::from(offset))
+                                    .limit((page_size + 1) as i64)
+                                    .await
+                                    .or_query_error("Failed to fetch resource-filtered page")?,
+                            )
+                            .await;
+                        }
+                        None => run.finish(db).await?,
+                    }
+                }
+            }
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = with_cursor_condition(scope_filter, cursor_condition);
+        collect_documents(
+            resources
+                .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
+                .optional(projection.clone(), |find, projection| {
+                    find.projection(projection)
+                })
+                .search_deadline()?
+                .sort(sort)
+                .await
+                .or_query_error("Failed to fetch resource-filtered page")?,
+        )
+        .await
+    }
+
+    /// The matching id set for a sparse resource-order page, or `None` when it
+    /// is too large for one filter and the scan should continue instead.
+    async fn sparse_page_id_set(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+    ) -> StorageResult<Option<HashSet<String>>> {
+        match self
+            .matching_resource_ids(db, tenant_id, &query.resource_type, query, missing_support)
+            .await
+        {
+            Ok(Some(ids)) if search_plan::id_set_fits_a_page_filter(&ids) => Ok(Some(ids)),
+            Ok(_) => Ok(None),
+            Err(StorageError::Search(SearchError::TooManyResults { .. })) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Waits for a broad-search permit when a limit is configured and `query`
+    /// is potentially broad (#1748); `None` otherwise, without waiting. The
+    /// permit is released when it is dropped, so a search that returns, fails
+    /// or is cancelled gives it back.
+    pub(super) async fn admit_broad_search(
+        &self,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<tokio::sync::SemaphorePermit<'_>>> {
+        self.admit_broad_search_for(query, false).await
+    }
+
+    async fn admit_broad_search_for(
+        &self,
+        query: &SearchQuery,
+        count_only: bool,
+    ) -> StorageResult<Option<tokio::sync::SemaphorePermit<'_>>> {
+        let Some(gate) = self.broad_search_gate() else {
+            return Ok(None);
+        };
+        let broad = if count_only {
+            super::search_admission::is_potentially_broad_count(query)
+        } else {
+            super::search_admission::is_potentially_broad(query)
+        };
+        if !broad {
+            return Ok(None);
+        }
+        search_deadline::wait(gate.acquire())
+            .await?
+            .map(Some)
+            .map_err(|_| internal_error("MongoDB broad search gate closed".to_string()))
+    }
+
+    /// Counts a standard (non-`_contained`) search. Callers have already
+    /// validated the query and taken any broad-search permit.
+    async fn count_standard(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<u64> {
+        let selection = self.execution_facts(query).count_selection();
+        let mut facts = ProbeFacts::default();
+        let db = self.get_database().await?;
+        let missing_support =
+            self.classify_missing(tenant.tenant_id().as_str(), &query.resource_type, query);
+        let result = self
+            .count_standard_with_facts(tenant, &db, query, &missing_support, selection, &mut facts)
+            .await;
+        facts.record();
+        result
+    }
+
+    /// `selection` is the batched count the request's execution facts allow.
+    async fn count_standard_with_facts(
+        &self,
+        tenant: &TenantContext,
+        db: &mongodb::Database,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        selection: BatchSelection,
+        facts: &mut ProbeFacts,
+    ) -> StorageResult<u64> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let filter_plan = self
+            .resource_filter_plan(
+                db,
+                tenant_id,
+                query,
+                missing_support,
+                SearchFilterPurpose::Count,
+                NoTotalPagePolicy::Streaming,
+                None,
+                facts,
+            )
+            .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(db, tenant_id, query, missing_support, filter_plan)
+            .await?;
+        record_filter_strategy(
+            "total_filter_strategy",
+            filter_plan.as_ref(),
+            SearchFilterPurpose::Count,
+        );
+
+        let filter = self.build_resource_filter(
+            tenant_id,
+            &query.resource_type,
+            query,
+            missing_support,
+            matched_ids.as_ref(),
+            None,
+        )?;
+
+        // Estimates share the existing bounded count execution. Only their
+        // final batch count uses index matches instead of live resources.
+        if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
+            record_total_strategy(match selection {
+                BatchSelection::EstimatedCount => "index_estimate",
+                _ => "exact_batches",
+            });
+            return Ok(plan.execute(db, filter, None, selection).await?.count);
+        }
+        if let Some(plan) = filter_plan {
+            record_total_strategy("exact_aggregation");
+            let SearchPipeline {
+                collection,
+                stages: mut pipeline,
+                hint,
+            } = plan.pipeline(filter, None, None)?;
+            pipeline.push(doc! { "$count": "total" });
+            let source = db.collection::<Document>(collection);
+            let cursor = with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await?
+            .or_query_error("Failed to count resource-filtered search results")?;
+            let documents = collect_documents(cursor).await?;
+            return match documents.first() {
+                None => Ok(0),
+                Some(document) => search_plan::parse_total(document, "total"),
+            };
+        }
+
+        record_total_strategy("exact_resources");
+        resources
+            .count_documents(filter)
+            .search_deadline()?
+            .await
+            .or_query_error("Failed to count MongoDB search results")
+    }
+
     /// Builds every component's scoped `search_index_contained` filter for a
     /// composite parameter under `_contained` (#1407) — outer index is the
     /// (comma-OR'd) value, inner index is the component, in declaration order.
@@ -1426,13 +2646,22 @@ impl MongoBackend {
                 // just the current top-level page, so the contained pipeline
                 // can discard overlaps before its offset and count stages.
                 let top_filter = if query.contained_return == ContainedReturn::Container {
+                    let missing_support =
+                        self.classify_missing(tenant_id, contained_type, &top_query);
                     let matched_ids = self
-                        .matching_resource_ids(&db, tenant_id, contained_type, &top_query)
+                        .matching_resource_ids(
+                            &db,
+                            tenant_id,
+                            contained_type,
+                            &top_query,
+                            &missing_support,
+                        )
                         .await?;
                     Some(self.build_resource_filter(
                         tenant_id,
                         contained_type,
                         &top_query,
+                        &missing_support,
                         matched_ids.as_ref(),
                         None,
                     )?)
@@ -1622,15 +2851,24 @@ impl MongoBackend {
             if !comp.params.is_empty() && !comp.reference.is_empty() {
                 let base = strip_reference_version(&comp.reference);
                 let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-                branches.push(doc! {
-                    "param_name": { "$in": Bson::Array(params) },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                });
+                // `search_index_contained` has no reference index, so only the
+                // completion marker (not index readiness) gates the exact form.
+                if self.references_marker_set() {
+                    branches.push(doc! {
+                        "param_name": { "$in": Bson::Array(params) },
+                        "value_reference": base,
+                    });
+                } else {
+                    branches.push(doc! {
+                        "param_name": { "$in": Bson::Array(params) },
+                        "$or": [
+                            { "value_reference": base },
+                            { "value_reference": {
+                                "$regex": format!("^{}/_history/", regex_escape(base))
+                            }},
+                        ],
+                    });
+                }
             }
         }
         // With no criterion at all, every contained resource of the type
@@ -1771,6 +3009,31 @@ impl MongoBackend {
             }
             ContainedReturn::Contained => doc! { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 },
         };
+        if let Some(version) = query.stored_fhir_version() {
+            // A version-restricted search (#2254) keeps the slots whose live
+            // container is stored under that version, before pagination and
+            // the total facet. Contained rows record no version of their own:
+            // a contained resource is of its container's version.
+            pipeline.push(doc! { "$lookup": {
+                "from": MongoBackend::RESOURCES_COLLECTION,
+                "localField": "_id.rid",
+                "foreignField": "id",
+                "let": { "rtype": "$_id.rtype" },
+                "pipeline": [
+                    { "$match": {
+                        "tenant_id": tenant_id,
+                        "is_deleted": false,
+                        "fhir_version": version,
+                        "$expr": { "$eq": ["$resource_type", "$$rtype"] },
+                    } },
+                    { "$limit": 1 },
+                    { "$project": { "_id": 1 } },
+                ],
+                "as": "_hfs_version_match",
+            }});
+            pipeline.push(doc! { "$match": { "_hfs_version_match": { "$ne": [] } } });
+            pipeline.push(doc! { "$project": { "_hfs_version_match": 0 } });
+        }
         pipeline.push(doc! { "$sort": sort });
         let page_stages = vec![
             doc! { "$skip": offset as i64 },
@@ -1785,6 +3048,7 @@ impl MongoBackend {
 
         let cursor = contained_rows
             .aggregate(pipeline)
+            .search_deadline()?
             .await
             .or_query_error("Failed to aggregate contained search")?;
         let docs = collect_documents(cursor).await?;
@@ -1860,6 +3124,7 @@ impl MongoBackend {
                 "is_deleted": { "$ne": true },
                 "$or": or,
             })
+            .search_deadline()?
             .hint(mongodb::options::Hint::Name(
                 RESOURCES_IDENTITY_INDEX.to_string(),
             ))
@@ -2004,7 +3269,10 @@ impl MongoBackend {
         crate::search::validate_numeric_values(query)?;
         // And a value that is empty, or has an empty alternative: `family=Zzz,`
         // is a prefix match on `""`, which is every family name (#1380).
-        crate::search::validate_value_presence(query)
+        crate::search::validate_value_presence(query)?;
+        // And a composite value with the wrong number of `$`-separated
+        // parts, refused here as on every other backend (#1236).
+        crate::search::validate_composite_values(query)
     }
 
     /// Search with `_sort` on one or more indexed parameters (#881, #1564):
@@ -2017,14 +3285,17 @@ impl MongoBackend {
     /// id sequence: the ordering, narrowed by the search-index matches and by
     /// the resource-level predicates (`_id`, `_lastUpdated`, live-only) that
     /// `resource_level_ids` resolves (#1056).
+    #[allow(clippy::too_many_arguments)]
     async fn search_param_sorted(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         db: &mongodb::Database,
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
         directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
     ) -> StorageResult<SearchResult> {
         // Any filtered sort resolves its candidate set through the resources
         // collection: that folds in the resource-level predicates (`_id`,
@@ -2035,39 +3306,90 @@ impl MongoBackend {
         let allowed: Option<HashSet<String>> = match matched_ids {
             Some(set) if set.is_empty() => Some(set),
             Some(set) => Some(
-                self.resource_level_ids(db, tenant_id, &query.resource_type, query, Some(&set))
-                    .await?,
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    Some(&set),
+                )
+                .await?,
             ),
-            None if Self::has_resource_level_params(query) => Some(
-                self.resource_level_ids(db, tenant_id, &query.resource_type, query, None)
-                    .await?,
+            None if has_resource_level_params(query, missing_support) => Some(
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    None,
+                )
+                .await?,
             ),
             None => None,
-        };
-
-        // Nothing can match: skip the ordering aggregation entirely.
-        let ordered: Vec<String> = if allowed.as_ref().is_some_and(|set| set.is_empty()) {
-            Vec::new()
-        } else {
-            self.param_sorted_ids(
-                db,
-                tenant_id,
-                &query.resource_type,
-                directives,
-                allowed.as_ref(),
-            )
-            .await?
         };
 
         let page_size = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let has_previous = offset > 0;
-        let mut page_ids: Vec<String> = ordered
-            .iter()
-            .skip(offset)
-            .take(page_size + 1)
-            .cloned()
-            .collect();
+        let mut total: Option<u64> = None;
+        let mut page_ids: Vec<String> = match allowed.as_ref() {
+            // No filter at all: these sorts have no cursor, so the offset is
+            // the only way to page and it is bounded by the id-set cap
+            // (#2285). Only the window is computed, never the whole type.
+            None => {
+                let reach = offset.saturating_add(page_size);
+                if reach > result_id_cap() {
+                    return Err(StorageError::Search(SearchError::TooManyResults {
+                        count: reach,
+                        max: result_id_cap(),
+                    }));
+                }
+                if query.wants_total() {
+                    total = Some(
+                        self.count_live_resources(db, tenant_id, &query.resource_type)
+                            .await?,
+                    );
+                }
+                self.param_sorted_window(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    directives,
+                    id_direction,
+                    offset,
+                    page_size + 1,
+                )
+                .await?
+            }
+            Some(allowed) => {
+                // Nothing can match: skip the ordering aggregation entirely.
+                let ordered: Vec<String> = if allowed.is_empty() {
+                    Vec::new()
+                } else {
+                    self.param_sorted_ids(
+                        db,
+                        tenant_id,
+                        &query.resource_type,
+                        directives,
+                        id_direction,
+                        allowed,
+                    )
+                    .await?
+                };
+                // `ordered` is exactly the sequence the page is cut from, so
+                // its length is the total by construction.
+                if query.wants_total() {
+                    total = Some(ordered.len() as u64);
+                }
+                ordered
+                    .into_iter()
+                    .skip(offset)
+                    .take(page_size + 1)
+                    .collect()
+            }
+        };
         let has_next = page_ids.len() > page_size;
         page_ids.truncate(page_size);
 
@@ -2077,6 +3399,7 @@ impl MongoBackend {
             tenant_id,
             &query.resource_type,
             query,
+            missing_support,
             Some(&id_set),
             None,
         )?;
@@ -2084,6 +3407,7 @@ impl MongoBackend {
         let docs = collect_documents(
             resources_coll
                 .find(filter)
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to execute MongoDB search")?,
         )
@@ -2098,13 +3422,6 @@ impl MongoBackend {
         let resources: Vec<StoredResource> =
             page_ids.iter().filter_map(|id| by_id.remove(id)).collect();
 
-        // `ordered` is exactly the sequence the page was cut from, so its
-        // length is the total by construction — no second resolution.
-        let total = if query.wants_total() {
-            Some(ordered.len() as u64)
-        } else {
-            None
-        };
         let page_info = PageInfo {
             next_cursor: None,
             previous_cursor: None,
@@ -2150,15 +3467,6 @@ impl MongoBackend {
         })
     }
 
-    /// True when the query carries a predicate that lives on the resource
-    /// document rather than in the search index.
-    fn has_resource_level_params(query: &SearchQuery) -> bool {
-        query
-            .parameters
-            .iter()
-            .any(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
-    }
-
     /// Ids of the live resources that satisfy the resource-level predicates
     /// (`_id`, `_lastUpdated`) within `matched_ids` — also the liveness
     /// filter for every filtered parameter sort. This is the same predicate
@@ -2170,61 +3478,72 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         matched_ids: Option<&HashSet<String>>,
     ) -> StorageResult<HashSet<String>> {
-        let filter =
-            self.build_resource_filter(tenant_id, resource_type, query, matched_ids, None)?;
+        let filter = self.build_resource_filter(
+            tenant_id,
+            resource_type,
+            query,
+            missing_support,
+            matched_ids,
+            None,
+        )?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let cursor = resources
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
+            .limit(result_id_cap() as i64 + 1)
             .await
             .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
-        let docs = collect_documents(cursor).await?;
-        Ok(docs
-            .into_iter()
-            .filter_map(|d| d.get_str("id").ok().map(ToString::to_string))
-            .collect())
+        let ids = collect_id_set(cursor, "id").await?;
+        if ids.len() > result_id_cap() {
+            return Err(StorageError::Search(SearchError::TooManyResults {
+                count: ids.len(),
+                max: result_id_cap(),
+            }));
+        }
+        Ok(ids)
     }
 
-    /// Distinct `resource_id`s in the search index matching `filter`.
+    /// The number of live resources of the type: the total of an unfiltered
+    /// parameter sort, whose ordering is never materialized.
+    async fn count_live_resources(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .count_documents(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_owned()))
+            .await
+            .or_query_error("Failed to count live resources")
+    }
+
+    /// Distinct `resource_id`s in the search index matching `filter`, grouped
+    /// by an aggregation and streamed through a cursor (see [`collect_id_set`]).
     async fn distinct_resource_ids(
         &self,
         search_index: &mongodb::Collection<Document>,
         filter: Document,
     ) -> StorageResult<HashSet<String>> {
-        Ok(search_index
-            .distinct("resource_id", filter)
+        let cursor = search_index
+            .aggregate(vec![
+                doc! { "$match": filter },
+                doc! { "$group": { "_id": "$resource_id" } },
+            ])
+            .search_deadline()?
+            .allow_disk_use(true)
             .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect())
-    }
-
-    /// Every live resource id of the type — the universe `:missing=true` and
-    /// `:not` complement against (#881).
-    async fn all_resource_ids(
-        &self,
-        db: &mongodb::Database,
-        tenant_id: &str,
-        resource_type: &str,
-    ) -> StorageResult<HashSet<String>> {
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        Ok(resources
-            .distinct(
-                "id",
-                doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "is_deleted": false,
-                },
-            )
-            .await
-            .or_query_error("Failed to enumerate resource ids")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect())
+            .or_query_error("Failed to query search_index")?;
+        collect_id_set(cursor, "_id").await
     }
 
     /// Resource ids ordered by one or more indexed search parameters (#881,
@@ -2233,22 +3552,24 @@ impl MongoBackend {
     /// smallest value for an ascending key and the largest for a descending
     /// one (the SQL backends' MIN/MAX). A resource without a value for a key
     /// sorts after every resource with one, for that key, in either
-    /// direction; resources that tie on every key are in id order, so those
-    /// with no value for any key come last in id order.
+    /// direction; resources that tie on every key use `id_direction`, including
+    /// those with no value for any key, which come last.
     ///
     /// With `allowed` — the ids the query matched — the aggregation is
     /// bounded to that set (`resource_id: {$in: chunk}`, hinted onto
     /// `idx_search_composite`) and the keys are ordered client-side, so the
     /// cost is proportional to the result set rather than to the resource
-    /// type (#1040). Without `allowed` (no filter at all) the ordering is
-    /// still computed over the whole type.
+    /// type (#1040). With no filter at all, `param_sorted_window` serves the
+    /// page instead.
+    #[allow(clippy::too_many_arguments)]
     async fn param_sorted_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         directives: &[crate::types::SortDirective],
-        allowed: Option<&HashSet<String>>,
+        id_direction: crate::types::SortDirection,
+        allowed: &HashSet<String>,
     ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
 
@@ -2256,66 +3577,158 @@ impl MongoBackend {
         let directions: Vec<SortDirection> = directives.iter().map(|d| d.direction).collect();
         let key_names: Vec<String> = (0..directives.len()).map(|i| format!("key{i}")).collect();
 
-        if let Some(allowed) = allowed {
-            // Bounded path (#1040): one `$match`+`$group` per chunk of the
-            // candidate set, then order the keys client-side. Chunks are cut
-            // from a sorted view of the set so the sequence of commands is
-            // deterministic for a given query.
-            let mut candidates: Vec<&String> = allowed.iter().collect();
-            candidates.sort();
-            let mut keys_by_id: HashMap<String, Vec<Option<Bson>>> =
-                HashMap::with_capacity(allowed.len());
-            for chunk in candidates.chunks(SORT_ID_CHUNK) {
-                let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
-                let mut row_filter = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": Bson::Array(ids) },
-                };
-                add_sort_key_row_filter(&mut row_filter, directives);
-                let pipeline = vec![
-                    doc! { "$match": row_filter },
-                    doc! { "$group": sort_key_group(directives) },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to sort by search parameter")?;
-                for d in collect_documents(cursor).await? {
-                    if let Ok(id) = d.get_str("_id") {
-                        let keys = key_names
-                            .iter()
-                            .map(|name| d.get(name).filter(|key| **key != Bson::Null).cloned())
-                            .collect();
-                        keys_by_id.insert(id.to_string(), keys);
-                    }
+        // Bounded path (#1040): one `$match`+`$group` per chunk of the
+        // candidate set, then order the keys client-side. Chunks are cut
+        // from a sorted view of the set so the sequence of commands is
+        // deterministic for a given query.
+        let mut candidates: Vec<&String> = allowed.iter().collect();
+        candidates.sort();
+        let mut keys_by_id: HashMap<String, Vec<Option<Bson>>> =
+            HashMap::with_capacity(allowed.len());
+        for chunk in candidates.chunks(SORT_ID_CHUNK) {
+            let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+            let mut row_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": { "$in": Bson::Array(ids) },
+            };
+            add_sort_key_row_filter(&mut row_filter, directives);
+            let pipeline = vec![
+                doc! { "$match": row_filter },
+                doc! { "$group": sort_key_group(directives) },
+            ];
+            let cursor = search_index
+                .aggregate(pipeline)
+                .search_deadline()?
+                .allow_disk_use(true)
+                .hint(mongodb::options::Hint::Name(
+                    SEARCH_COMPOSITE_INDEX.to_string(),
+                ))
+                .await
+                .or_query_error("Failed to sort by search parameter")?;
+            for d in collect_documents(cursor).await? {
+                if let Ok(id) = d.get_str("_id") {
+                    let keys = key_names
+                        .iter()
+                        .map(|name| d.get(name).filter(|key| **key != Bson::Null).cloned())
+                        .collect();
+                    keys_by_id.insert(id.to_string(), keys);
                 }
             }
-            // A candidate with no row for any key has no value for every
-            // key, which orders it last in id order.
-            let keyed: Vec<(String, Vec<Option<Bson>>)> = allowed
-                .iter()
-                .map(|id| {
-                    let keys = keys_by_id
-                        .remove(id)
-                        .unwrap_or_else(|| vec![None; directives.len()]);
-                    (id.clone(), keys)
-                })
-                .collect();
-            // `allowed` is live-only by construction — `search_param_sorted`
-            // resolves every filtered candidate set through the resources
-            // collection with `is_deleted: false` — so no liveness pass is
-            // needed here.
-            return Ok(order_sort_keys(keyed, &directions));
         }
+        // A candidate with no row for any key has no value for every
+        // key, which orders it last in id order.
+        let keyed: Vec<(String, Vec<Option<Bson>>)> = allowed
+            .iter()
+            .map(|id| {
+                let keys = keys_by_id
+                    .remove(id)
+                    .unwrap_or_else(|| vec![None; directives.len()]);
+                (id.clone(), keys)
+            })
+            .collect();
+        // `allowed` is live-only by construction — `search_param_sorted`
+        // resolves every filtered candidate set through the resources
+        // collection with `is_deleted: false` — so no liveness pass is
+        // needed here.
+        Ok(order_sort_keys(keyed, &directions, id_direction))
+    }
 
-        // Unfiltered sort: the ordering is still computed over the whole
-        // type. `missingN` puts a resource without a value for key N after
-        // those with one in either direction; MongoDB would otherwise sort a
-        // null key first when ascending.
+    /// One page window of a parameter sort with no filter at all: the ids at
+    /// positions `offset..offset + take` of the sequence `param_sorted_ids`
+    /// would produce for the whole type, without building that sequence
+    /// (#2285). Resources with a value for some sort key come first, cut
+    /// from a server-side top-k; resources with none follow in id order and
+    /// are read only when the window reaches them. The caller bounds
+    /// `offset + take` by the id-set cap.
+    #[allow(clippy::too_many_arguments)]
+    async fn param_sorted_window(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        let end = offset.saturating_add(take);
+        let cap = result_id_cap();
+        let mut limit = end.max(1);
+        // Keyed ids in sort order, live only, and whether they are all of them.
+        let (keyed, keyed_complete) = loop {
+            let rows = self
+                .top_param_sorted_ids(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    directives,
+                    id_direction,
+                    limit,
+                )
+                .await?;
+            let returned = rows.len();
+            let live = self
+                .live_ids_among(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    &rows.iter().cloned().collect(),
+                )
+                .await?;
+            let live_rows: Vec<String> = rows.into_iter().filter(|id| live.contains(id)).collect();
+            let complete = returned < limit;
+            if complete || live_rows.len() >= end {
+                break (live_rows, complete);
+            }
+            // Stale search rows (#1056) crowded the top-k: ask for more.
+            if limit > cap.saturating_mul(2) {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: limit,
+                    max: cap,
+                }));
+            }
+            limit = limit.saturating_mul(2);
+        };
+
+        let mut window: Vec<String> = keyed.iter().skip(offset).take(take).cloned().collect();
+        if window.len() < take && keyed_complete {
+            let tail_skip = offset.saturating_sub(keyed.len());
+            let tail = self
+                .unkeyed_live_ids(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    &keyed.iter().cloned().collect(),
+                    id_direction,
+                    tail_skip,
+                    take - window.len(),
+                )
+                .await?;
+            window.extend(tail);
+        }
+        Ok(window)
+    }
+
+    /// The first `limit` resource ids of the whole type that have a value for
+    /// some sort key, in sort order. The `$limit` after the `$sort` lets
+    /// MongoDB keep only the top `limit` rows. The ids may include resources
+    /// that are no longer live; the caller checks them.
+    async fn top_param_sorted_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
+
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        // `missingN` puts a resource without a value for key N after those
+        // with one in either direction; MongoDB would otherwise sort a null
+        // key first when ascending.
         let mut row_filter = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
@@ -2324,48 +3737,109 @@ impl MongoBackend {
         let mut missing = Document::new();
         let mut sort = Document::new();
         for (index, directive) in directives.iter().enumerate() {
-            let key = &key_names[index];
+            let key = format!("key{index}");
             missing.insert(
                 format!("missing{index}"),
                 doc! { "$cond": [{ "$eq": [format!("${key}"), Bson::Null] }, 1, 0] },
             );
             sort.insert(format!("missing{index}"), 1);
-            let order = match directive.direction {
+            sort.insert(
+                key,
+                match directive.direction {
+                    SortDirection::Ascending => 1,
+                    SortDirection::Descending => -1,
+                },
+            );
+        }
+        sort.insert(
+            "_id",
+            match id_direction {
                 SortDirection::Ascending => 1,
                 SortDirection::Descending => -1,
-            };
-            sort.insert(key.clone(), order);
-        }
-        sort.insert("_id", 1);
+            },
+        );
         let pipeline = vec![
             doc! { "$match": row_filter },
             doc! { "$group": sort_key_group(directives) },
             doc! { "$addFields": missing },
             doc! { "$sort": sort },
+            doc! { "$limit": limit as i64 },
             doc! { "$project": { "_id": 1 } },
         ];
         let cursor = search_index
             .aggregate(pipeline)
+            .search_deadline()?
+            .allow_disk_use(true)
             .await
             .or_query_error("Failed to sort by search parameter")?;
         let docs = collect_documents(cursor).await?;
-        let mut ordered: Vec<String> = docs
+        Ok(docs
             .into_iter()
             .filter_map(|d| d.get_str("_id").ok().map(ToString::to_string))
-            .collect();
+            .collect())
+    }
 
-        // A search-index row whose resource is gone (deleted, or a stale
-        // entry) must not occupy a slot in the sequence: the page fetch would
-        // drop it and the page would come back short (#1056).
-        let live = self.all_resource_ids(db, tenant_id, resource_type).await?;
-        ordered.retain(|id| live.contains(id));
+    /// Skips `skip` and then returns up to `take` live resource ids of the
+    /// type that have no value for any sort key, in id order (reversed when
+    /// `id_direction` is descending). Walks the live resources by id in
+    /// batches and drops those in `keyed`, the complete set of live
+    /// resources that have a sort key, so no query is made per batch and
+    /// memory stays bounded by `skip + take`.
+    #[allow(clippy::too_many_arguments)]
+    async fn unkeyed_live_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        keyed: &HashSet<String>,
+        id_direction: crate::types::SortDirection,
+        skip: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
 
-        // Resources without a value for any sort key come last.
-        let keyed: HashSet<String> = ordered.iter().cloned().collect();
-        let mut unkeyed: Vec<String> = live.into_iter().filter(|id| !keyed.contains(id)).collect();
-        unkeyed.sort();
-        ordered.extend(unkeyed);
-        Ok(ordered)
+        let wanted = skip.saturating_add(take);
+        // Small windows read one 512-id batch; a deep one reads fewer, larger
+        // batches. Setting the cursor's batch size also stops the server from
+        // sending most of the type in its first reply.
+        let batch_size = wanted.clamp(CANDIDATE_BATCH_SIZE, SORT_ID_CHUNK);
+        let mut cursor = db
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .projection(doc! { "_id": 0, "id": 1 })
+            .sort(doc! { "id": match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            } })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+            .batch_size(batch_size as u32)
+            .await
+            .or_query_error("Failed to open the unkeyed resource cursor")?;
+
+        let mut unkeyed: Vec<String> = Vec::new();
+        loop {
+            let batch = read_cursor_batch(&mut cursor, batch_size).await?;
+            let docs_read = batch.len();
+            if docs_read == 0 {
+                break;
+            }
+            unkeyed.extend(
+                batch
+                    .iter()
+                    .filter_map(|doc| doc.get_str("id").ok())
+                    .filter(|id| !keyed.contains(*id))
+                    .map(ToString::to_string),
+            );
+            if unkeyed.len() >= wanted || docs_read < batch_size {
+                break;
+            }
+        }
+        Ok(unkeyed.into_iter().skip(skip).take(take).collect())
     }
 
     async fn matching_resource_ids(
@@ -2374,6 +3848,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
     ) -> StorageResult<Option<HashSet<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
@@ -2467,11 +3942,9 @@ impl MongoBackend {
 
         // :missing=true and :not require complementing against the full resource
         // universe. When no normal params exist to drive paging, fall back to the
-        // complement-only path that materialises the universe via distinct() —
-        // unless a positive `_id` seed already names a finite universe: driving
-        // from it instead avoids both the id-set cap and MongoDB's own
-        // `distinct` result-size limit, either of which `all_resource_ids`
-        // can hit at the scale a resolved chain/`_has`/`_list` produces (#1528).
+        // complement-only path, which walks the universe in bounded batches and
+        // stops at the id-set cap (#2285) — unless a positive `_id` seed already
+        // names a finite universe: driving from it instead is cheaper still (#1528).
         if normal.is_empty() {
             if let Some(seed) = id_seed {
                 // #1528 review finding 4: a compartment's own membership is
@@ -2490,10 +3963,15 @@ impl MongoBackend {
                     && not_params.is_empty()
                     && let Some(comp) = compartment
                 {
-                    let probe_filter =
-                        compartment_membership_filter(tenant_id, resource_type, comp);
+                    let probe_filter = compartment_membership_filter(
+                        tenant_id,
+                        resource_type,
+                        comp,
+                        self.references_normalized(),
+                    );
                     let count = search_index
                         .count_documents(probe_filter)
+                        .search_deadline()?
                         .limit(seed.len() as u64 + 1)
                         .await
                         .or_query_error(
@@ -2506,10 +3984,10 @@ impl MongoBackend {
                             .unwrap_or_default();
                         let confirmed: HashSet<String> =
                             members.into_iter().filter(|id| seed.contains(id)).collect();
-                        if confirmed.len() > MAX_RESULT_ID_SET {
+                        if confirmed.len() > result_id_cap() {
                             return Err(StorageError::Search(SearchError::TooManyResults {
                                 count: confirmed.len(),
-                                max: MAX_RESULT_ID_SET,
+                                max: result_id_cap(),
                             }));
                         }
                         return Ok(Some(confirmed));
@@ -2517,6 +3995,7 @@ impl MongoBackend {
                 }
                 return self
                     .seeded_matching_resource_ids(
+                        db,
                         &search_index,
                         tenant_id,
                         resource_type,
@@ -2524,6 +4003,7 @@ impl MongoBackend {
                         &HashMap::new(),
                         &missing,
                         &not_params,
+                        missing_support,
                         compartment,
                         seed,
                     )
@@ -2538,6 +4018,7 @@ impl MongoBackend {
                     resource_type,
                     &missing,
                     &not_params,
+                    missing_support,
                     query,
                 )
                 .await;
@@ -2561,11 +4042,13 @@ impl MongoBackend {
                 };
             }
         }
-        let normal_filter = |i: usize| -> StorageResult<Document> {
-            match identifier_filters.get(&i) {
-                Some(filter) => Ok(filter.clone()),
-                None => self.build_search_index_filter(tenant_id, resource_type, normal[i]),
-            }
+        let normal_predicate = |i: usize| -> StorageResult<(Document, PredicateAccess)> {
+            let filter = match identifier_filters.get(&i) {
+                Some(filter) => filter.clone(),
+                None => self.build_search_index_filter(tenant_id, resource_type, normal[i])?,
+            };
+            let access = PredicateAccess::new(&filter, normal[i], self.search_indexes_ready());
+            Ok((filter, access))
         };
 
         // #1206: a composite's probe must run over its component filters
@@ -2607,12 +4090,18 @@ impl MongoBackend {
             // one query per 512-id chunk even when the sibling parameter is
             // far more selective).
             (Some(seed), true) => {
-                let filter = normal_filter(0)?;
-                let count = search_index
-                    .count_documents(filter)
-                    .limit(seed.len() as u64 + 1)
-                    .await
-                    .or_query_error("Failed to probe search_index against the _id seed")?;
+                let (filter, access) = normal_predicate(0)?;
+                let count = with_hint_fallback(access.discovery_hint(), |hint| {
+                    let probe = search_index
+                        .count_documents(filter.clone())
+                        .limit(seed.len() as u64 + 1);
+                    match hint {
+                        Some(hint) => probe.hint(hint),
+                        None => probe,
+                    }
+                })
+                .await?
+                .or_query_error("Failed to probe search_index against the _id seed")?;
                 if count == 0 {
                     return Ok(Some(HashSet::new()));
                 }
@@ -2681,12 +4170,18 @@ impl MongoBackend {
                             }
                         }
                     } else {
-                        let filter = normal_filter(i)?;
-                        let count = search_index
-                            .count_documents(filter)
-                            .limit(probe_limit)
-                            .await
-                            .or_query_error("Failed to probe search_index for driver selection")?;
+                        let (filter, access) = normal_predicate(i)?;
+                        let count = with_hint_fallback(access.discovery_hint(), |hint| {
+                            let probe = search_index
+                                .count_documents(filter.clone())
+                                .limit(probe_limit);
+                            match hint {
+                                Some(hint) => probe.hint(hint),
+                                None => probe,
+                            }
+                        })
+                        .await?
+                        .or_query_error("Failed to probe search_index for driver selection")?;
                         if count == 0 {
                             return Ok(Some(HashSet::new()));
                         }
@@ -2708,6 +4203,7 @@ impl MongoBackend {
                 let seed = id_seed.expect("Driver::Seed implies a positive _id seed");
                 return self
                     .seeded_matching_resource_ids(
+                        db,
                         &search_index,
                         tenant_id,
                         resource_type,
@@ -2715,6 +4211,7 @@ impl MongoBackend {
                         &identifier_filters,
                         &missing,
                         &not_params,
+                        missing_support,
                         compartment,
                         seed,
                     )
@@ -2727,17 +4224,24 @@ impl MongoBackend {
         // result cached, so `driver_idx` pointing at a composite always finds
         // an entry here; a plain param never has one and falls through to
         // the ordinary per-value filter builder.
-        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
-            filter
-        } else {
-            normal_filter(driver_idx)?
-        };
+        let (driver_filter, access) =
+            if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+                (filter, PredicateAccess::default())
+            } else {
+                normal_predicate(driver_idx)?
+            };
 
-        let mut driver_cursor = search_index
-            .find(driver_filter)
-            .projection(doc! { "resource_id": 1, "_id": 0 })
-            .await
-            .or_query_error("Failed to open driver cursor")?;
+        let mut driver_cursor = with_hint_fallback(access.discovery_hint(), |hint| {
+            let find = search_index
+                .find(driver_filter.clone())
+                .projection(doc! { "resource_id": 1, "_id": 0 });
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to open driver cursor")?;
 
         let mut confirmed: HashSet<String> = HashSet::new();
 
@@ -2767,6 +4271,7 @@ impl MongoBackend {
 
             let candidates = self
                 .retain_matching_candidates(
+                    db,
                     &search_index,
                     tenant_id,
                     resource_type,
@@ -2774,19 +4279,19 @@ impl MongoBackend {
                     &identifier_filters,
                     &missing,
                     &not_params,
+                    missing_support,
                     compartment,
                     Some(driver_idx),
-                    false,
                     candidates,
                 )
                 .await?;
 
             confirmed.extend(candidates);
 
-            if confirmed.len() > MAX_RESULT_ID_SET {
+            if confirmed.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: confirmed.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
 
@@ -2798,31 +4303,14 @@ impl MongoBackend {
         Ok(Some(confirmed))
     }
 
-    /// The per-batch body every check in `matching_resource_ids` shares:
-    /// intersects `candidates` against every normal parameter other than
-    /// `skip_idx` (already proven by whichever cursor selected them — a
-    /// normal parameter's driver cursor, or a chunk of the `_id` seed),
-    /// every `:missing`/`:not` parameter, and the compartment membership
-    /// filter, bounded to `candidates` throughout.
-    ///
-    /// `hint` selects the query shape (#1528): `false` reproduces exactly
-    /// the unhinted `distinct` shape every driver-selected normal parameter
-    /// has used since #1040/#1083. That shape is left unchanged here by
-    /// scope decision — the driver path itself is out of scope for this fix
-    /// and stays as today pending a follow-up, not because there is nothing
-    /// for the planner to get wrong. `true` is used only when the `_id` seed
-    /// itself drives (`seeded_matching_resource_ids`): `distinct` cannot take
-    /// a hint, and this same shape — a candidate chunk checked against a
-    /// sibling predicate — measured 1,655,936 keys examined unhinted against
-    /// 8,191 hinted onto `idx_search_composite`, against the real
-    /// 11.2M-resource corpus (#999) — so this shape lifts
-    /// `tenant_id`/`resource_type`/`resource_id: {"$in": …}` to the top
-    /// level (required so the date `$or` shape from `scoped_date_alternatives`
-    /// still has a fully-bound prefix in every arm) and hints
-    /// `idx_search_composite` explicitly.
+    /// Checks a bounded batch using the same membership access as batched plans.
+    /// An explicit `_id` seed takes the conservative first-predicate path.
+    /// The plain driver is already proven; a composite driver still needs its
+    /// grouped pair check because its cursor proves only one component.
     #[allow(clippy::too_many_arguments)]
     async fn retain_matching_candidates(
         &self,
+        db: &mongodb::Database,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
@@ -2830,24 +4318,21 @@ impl MongoBackend {
         identifier_filters: &HashMap<usize, Document>,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         compartment: Option<&CompartmentMembership>,
         skip_idx: Option<usize>,
-        hint: bool,
         mut candidates: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
+        search_deadline::check()?;
+        let source = if skip_idx.is_some() {
+            CandidateSource::IndexedPredicate
+        } else {
+            CandidateSource::Unfiltered
+        };
         for (i, param) in normal.iter().enumerate() {
             if candidates.is_empty() {
-                continue;
+                break;
             }
-            // A composite's driver arm only proves ONE component matched
-            // (its most selective one) — every composite in `normal`,
-            // including the driver, still needs the grouped pair check to
-            // confirm every component matched within the same
-            // `composite_group` (#1206). This already queries `find` bounded
-            // to `candidates`, never `distinct`, but (#1528 review finding 5)
-            // still takes the same `idx_search_composite` hint as every other
-            // check here when `hint` is set, for the same planner-risk reason
-            // (#999) documented on this function's `hint` parameter.
             if param.param_type == SearchParamType::Composite {
                 let passing = self
                     .composite_pair_check(
@@ -2856,7 +4341,7 @@ impl MongoBackend {
                         resource_type,
                         param,
                         &candidates,
-                        hint.then_some(SEARCH_COMPOSITE_INDEX),
+                        Some(SEARCH_COMPOSITE_INDEX),
                         None,
                     )
                     .await?;
@@ -2866,208 +4351,86 @@ impl MongoBackend {
             if Some(i) == skip_idx {
                 continue;
             }
-            let param_filter = match identifier_filters.get(&i) {
+            let filter = match identifier_filters.get(&i) {
                 Some(filter) => filter.clone(),
                 None => self.build_search_index_filter(tenant_id, resource_type, param)?,
             };
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let passing: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "$and": [ param_filter ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to intersect search_index against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let bounded = doc! {
-                    "$and": [
-                        param_filter,
-                        { "resource_id": { "$in": candidate_ids } }
-                    ]
-                };
-                search_index
-                    .distinct("resource_id", bounded)
-                    .await
-                    .or_query_error("Failed to intersect search_index")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let access = PredicateAccess::new(&filter, param, self.search_indexes_ready());
+            let passing = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                source.membership_hint(access, i),
+            )
+            .await?;
             candidates.retain(|id| passing.contains(id));
         }
 
-        // :missing — check per batch against surviving candidates.
         for param in missing {
             if candidates.is_empty() {
                 break;
             }
+            if missing_support.is_resource_parameter(param) {
+                candidates = self
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        Some(&candidates),
+                        None,
+                    )
+                    .await?;
+                continue;
+            }
             let wants_missing = param
                 .values
                 .first()
-                .map(|v| v.value == "true")
-                .unwrap_or(false);
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let with_entry: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "param_name": &param.name,
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to check :missing against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                search_index
-                    .distinct(
-                        "resource_id",
-                        doc! {
-                            "tenant_id": tenant_id,
-                            "resource_type": resource_type,
-                            "param_name": &param.name,
-                            "resource_id": { "$in": candidate_ids },
-                        },
-                    )
-                    .await
-                    .or_query_error("Failed to check :missing")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
-            if wants_missing {
-                candidates.retain(|id| !with_entry.contains(id));
-            } else {
-                candidates.retain(|id| with_entry.contains(id));
-            }
+                .is_some_and(|value| value.value == "true");
+            let with_entry = matching_index_ids(
+                search_index,
+                &candidates,
+                &missing_presence_filter(tenant_id, resource_type, param),
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
+            candidates.retain(|id| with_entry.contains(id) != wants_missing);
         }
 
-        // :not — per the spec, includes resources with no value for the
-        // parameter at all (#881). Check per batch against surviving candidates.
+        // :not includes resources with no value for the parameter.
         for param in not_params {
             if candidates.is_empty() {
                 break;
             }
             let mut positive = (*param).clone();
             positive.modifier = None;
-            let pos_filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let matching: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "$and": [ pos_filter ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to check :not against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let bounded = doc! {
-                    "$and": [
-                        pos_filter,
-                        { "resource_id": { "$in": candidate_ids } }
-                    ]
-                };
-                search_index
-                    .distinct("resource_id", bounded)
-                    .await
-                    .or_query_error("Failed to check :not")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            let matching = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
             candidates.retain(|id| !matching.contains(id));
         }
 
-        // Compartment — checked per batch against surviving candidates.
         if let Some(comp) = compartment
             && !candidates.is_empty()
         {
-            let base = strip_reference_version(&comp.reference);
-            let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let in_comp: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "param_name": { "$in": Bson::Array(params) },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error(
-                        "Failed to check compartment membership against the _id seed",
-                    )?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let comp_filter = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "param_name": { "$in": Bson::Array(params) },
-                    "resource_id": { "$in": candidate_ids },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                };
-                search_index
-                    .distinct("resource_id", comp_filter)
-                    .await
-                    .or_query_error("Failed to check compartment membership")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let filter = compartment_membership_filter(
+                tenant_id,
+                resource_type,
+                comp,
+                self.references_normalized(),
+            );
+            let in_comp = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
             candidates.retain(|id| in_comp.contains(id));
         }
 
@@ -3079,13 +4442,14 @@ impl MongoBackend {
     /// `_id=X&code:missing=true`, a compartment-only query — `normal` is
     /// `&[]` there) and when the driver competition in `matching_resource_ids`
     /// picks it over every normal parameter's own probe. Every check runs in
-    /// chunks of `CANDIDATE_BATCH_SIZE`, hinted onto `idx_search_composite`
-    /// (see `retain_matching_candidates`), so a seed of hundreds of thousands
-    /// of ids — realistic once a chain, `_has` or `_list` resolves to one
-    /// (#1528) — never falls back to an unindexed scan.
+    /// chunks of `CANDIDATE_BATCH_SIZE`. The first predicate uses candidate-ID
+    /// access; later eligible tokens share the batched planner's value-index
+    /// policy. Every check stays bounded to that chunk, even for a large seed
+    /// resolved by a chain, `_has` or `_list`.
     #[allow(clippy::too_many_arguments)]
     async fn seeded_matching_resource_ids(
         &self,
+        db: &mongodb::Database,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
@@ -3093,6 +4457,7 @@ impl MongoBackend {
         identifier_filters: &HashMap<usize, Document>,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         compartment: Option<&CompartmentMembership>,
         seed: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
@@ -3104,6 +4469,7 @@ impl MongoBackend {
             let candidates: HashSet<String> = chunk.iter().map(|id| (*id).clone()).collect();
             let candidates = self
                 .retain_matching_candidates(
+                    db,
                     search_index,
                     tenant_id,
                     resource_type,
@@ -3111,19 +4477,19 @@ impl MongoBackend {
                     identifier_filters,
                     missing,
                     not_params,
+                    missing_support,
                     compartment,
                     None,
-                    true,
                     candidates,
                 )
                 .await?;
 
             confirmed.extend(candidates);
 
-            if confirmed.len() > MAX_RESULT_ID_SET {
+            if confirmed.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: confirmed.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
         }
@@ -3131,6 +4497,18 @@ impl MongoBackend {
         Ok(confirmed)
     }
 
+    /// Resolves a query made only of `:missing`, `:not` and an optional
+    /// compartment (no positive parameter to drive from). It walks a driver
+    /// cursor in `CANDIDATE_BATCH_SIZE` batches and filters each batch with
+    /// `retain_matching_candidates`, so memory is bounded by the id-set cap
+    /// plus one batch however large the type is (#2285). Past the cap it
+    /// returns `TooManyResults`, which `plan_or_matching_ids` turns into a
+    /// plan when one exists.
+    ///
+    /// The driver is, in order of preference: the compartment's membership
+    /// rows, the presence rows of a `:missing=false` parameter, or a covered
+    /// scan of the live resources of the type. The first two can name
+    /// deleted or stale resources, so their batches are checked for liveness.
     #[allow(clippy::too_many_arguments)]
     async fn matching_resource_ids_complement_only(
         &self,
@@ -3140,81 +4518,138 @@ impl MongoBackend {
         resource_type: &str,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
-        let has_compartment = query
+        let compartment = query
             .compartment
             .as_ref()
-            .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
-        let mut matched: Option<HashSet<String>> = None;
+            .filter(|c| !c.params.is_empty() && !c.reference.is_empty());
+        let presence_driver = missing.iter().find(|param| {
+            !missing_support.is_resource_parameter(param)
+                && !param
+                    .values
+                    .first()
+                    .is_some_and(|value| value.value == "true")
+        });
+        let rows_filter = match (compartment, presence_driver) {
+            (Some(comp), _) => Some(compartment_membership_filter(
+                tenant_id,
+                resource_type,
+                comp,
+                self.references_normalized(),
+            )),
+            (None, Some(param)) => Some(missing_presence_filter(tenant_id, resource_type, param)),
+            (None, None) => None,
+        };
+        let (mut cursor, id_field) = match &rows_filter {
+            Some(filter) => (
+                search_index
+                    .find(filter.clone())
+                    .search_deadline()?
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                    .await
+                    .or_query_error("Failed to open complement driver cursor")?,
+                "resource_id",
+            ),
+            None => (
+                db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "is_deleted": false,
+                    })
+                    .search_deadline()?
+                    .projection(doc! { "id": 1, "_id": 0 })
+                    .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_owned()))
+                    .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                    .await
+                    .or_query_error("Failed to open complement driver cursor")?,
+                "id",
+            ),
+        };
 
-        for param in missing {
-            let wants_missing = param
-                .values
-                .first()
-                .map(|v| v.value == "true")
-                .unwrap_or(false);
-            let with_entry = self
-                .distinct_resource_ids(
-                    search_index,
-                    missing_presence_filter(tenant_id, resource_type, param),
-                )
-                .await?;
-            let ids = if wants_missing {
-                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                all.difference(&with_entry).cloned().collect::<HashSet<_>>()
-            } else {
-                with_entry
-            };
-            if ids.is_empty() {
-                return Ok(Some(HashSet::new()));
+        let mut confirmed: HashSet<String> = HashSet::new();
+        loop {
+            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let docs_read = batch.len();
+            if docs_read == 0 {
+                break;
             }
-            matched = Some(match matched {
-                Some(current) => current.intersection(&ids).cloned().collect(),
-                None => ids,
-            });
-            if matched.as_ref().is_some_and(|s| s.is_empty()) {
-                return Ok(matched);
+            let mut candidates: HashSet<String> = batch
+                .iter()
+                .filter_map(|doc| doc.get_str(id_field).ok().map(ToString::to_string))
+                .collect();
+            if rows_filter.is_some() {
+                candidates = self
+                    .live_ids_among(db, tenant_id, resource_type, &candidates)
+                    .await?;
+            }
+            if !candidates.is_empty() {
+                let kept = self
+                    .retain_matching_candidates(
+                        db,
+                        search_index,
+                        tenant_id,
+                        resource_type,
+                        &[],
+                        &HashMap::new(),
+                        missing,
+                        not_params,
+                        missing_support,
+                        compartment,
+                        None,
+                        candidates,
+                    )
+                    .await?;
+                confirmed.extend(kept);
+            }
+            if confirmed.len() > result_id_cap() {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: confirmed.len(),
+                    max: result_id_cap(),
+                }));
+            }
+            if docs_read < CANDIDATE_BATCH_SIZE {
+                break;
             }
         }
+        Ok(Some(confirmed))
+    }
 
-        for param in not_params {
-            let mut positive = (*param).clone();
-            positive.modifier = None;
-            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-            let matching = self.distinct_resource_ids(search_index, filter).await?;
-            let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-            let ids = all.difference(&matching).cloned().collect::<HashSet<_>>();
-            if ids.is_empty() {
-                return Ok(Some(HashSet::new()));
-            }
-            matched = Some(match matched {
-                Some(current) => current.intersection(&ids).cloned().collect(),
-                None => ids,
-            });
-            if matched.as_ref().is_some_and(|s| s.is_empty()) {
-                return Ok(matched);
-            }
+    /// The subset of `candidates` that is live in the resources collection.
+    async fn live_ids_among(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        candidates: &HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
         }
-
-        if has_compartment {
-            if let Some(comp) = &query.compartment {
-                if let Some(ids) = self
-                    .compartment_resource_ids(search_index, tenant_id, resource_type, comp)
-                    .await?
-                {
-                    if ids.is_empty() {
-                        return Ok(Some(HashSet::new()));
-                    }
-                    matched = Some(match matched {
-                        Some(current) => current.intersection(&ids).cloned().collect(),
-                        None => ids,
-                    });
-                }
-            }
+        let mut sorted: Vec<&String> = candidates.iter().collect();
+        sorted.sort();
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut live = HashSet::new();
+        for chunk in sorted.chunks(SORT_ID_CHUNK) {
+            let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+            let cursor = resources
+                .find(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "is_deleted": false,
+                    "id": { "$in": Bson::Array(ids) },
+                })
+                .search_deadline()?
+                .projection(doc! { "_id": 0, "id": 1 })
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+                .await
+                .or_query_error("Failed to check candidate liveness")?;
+            live.extend(collect_id_set(cursor, "id").await?);
         }
-
-        Ok(matched)
+        Ok(live)
     }
 
     /// Returns the resource IDs that are members of the compartment described by
@@ -3236,17 +4671,85 @@ impl MongoBackend {
             return Ok(None);
         }
 
-        let filter = compartment_membership_filter(tenant_id, resource_type, comp);
+        let filter = compartment_membership_filter(
+            tenant_id,
+            resource_type,
+            comp,
+            self.references_normalized(),
+        );
+        Ok(Some(
+            self.distinct_resource_ids(search_index, filter).await?,
+        ))
+    }
 
-        let ids = search_index
-            .distinct("resource_id", filter)
-            .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect::<HashSet<_>>();
-
-        Ok(Some(ids))
+    pub(super) async fn metadata_missing_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        candidates: Option<&HashSet<String>>,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> StorageResult<HashSet<String>> {
+        let mut scope =
+            doc! { "tenant_id": tenant_id, "resource_type": resource_type, "is_deleted": false };
+        if let Some(ids) = candidates {
+            scope.insert(
+                "id",
+                doc! { "$in": ids.iter().cloned().collect::<Vec<_>>() },
+            );
+        }
+        let mut stages =
+            vec![doc! { "$match": { "$and": [scope, missing_resource_condition(&param.name)] } }];
+        stages.extend(missing_fallback_stages(missing_presence_filter(
+            tenant_id,
+            resource_type,
+            param,
+        )));
+        stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        // A bounded candidate set is a few identity seeks; left to itself the
+        // planner may walk the shared `missing_params` index instead, reading
+        // every absent key of the type for each batch (#2233).
+        let options = mongodb::options::AggregateOptions::builder()
+            .hint(
+                candidates
+                    .is_some()
+                    .then(|| Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())),
+            )
+            .build();
+        match session {
+            Some(session) => {
+                let mut cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .session(&mut *session)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                let mut ids = HashSet::new();
+                while cursor
+                    .advance(&mut *session)
+                    .await
+                    .or_query_error("Failed to advance missing metadata cursor")?
+                {
+                    let doc = cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize missing metadata: {e}"))
+                    })?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Ok(ids)
+            }
+            None => {
+                let cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                collect_id_set(cursor, "id").await
+            }
+        }
     }
 
     pub(super) fn build_search_index_filter(
@@ -3268,6 +4771,22 @@ impl MongoBackend {
             return Err(StorageError::Search(SearchError::QueryParseError {
                 message: format!("Search parameter '{}' has no values", param.name),
             }));
+        }
+
+        if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            if param
+                .values
+                .first()
+                .is_some_and(|value| value.value == "true")
+            {
+                // Absence cannot drive a positive value-index scan. Search
+                // handles it against resources; transactional callers must not invert it.
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: "missing=true".to_owned(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
+            return Ok(missing_presence_filter(tenant_id, resource_type, param));
         }
 
         let mut filter = doc! {
@@ -3406,8 +4925,10 @@ impl MongoBackend {
             *counts.entry(component.param_type).or_default() += 1;
         }
         for value in &param.values {
-            let component_values =
-                super::composite_search::split_composite_value(&value.value, &param.components)?;
+            let component_values = crate::search::composite_value::split_composite_value(
+                &value.value,
+                &param.components,
+            )?;
 
             let mut per_component = Vec::with_capacity(param.components.len());
             let mut seen = HashMap::<SearchParamType, i32>::new();
@@ -3548,6 +5069,7 @@ impl MongoBackend {
                         Some(s) => {
                             collection
                                 .find_one(legacy)
+                                .search_deadline()?
                                 .hint(mongodb::options::Hint::Name(probe_index.to_string()))
                                 .session(s)
                                 .await
@@ -3555,6 +5077,7 @@ impl MongoBackend {
                         None => {
                             collection
                                 .find_one(legacy)
+                                .search_deadline()?
                                 .hint(mongodb::options::Hint::Name(probe_index.to_string()))
                                 .await
                         }
@@ -3609,6 +5132,7 @@ impl MongoBackend {
                 ];
                 let cursor = search_index
                     .aggregate(pipeline)
+                    .search_deadline()?
                     .session(&mut *s)
                     .await
                     .or_query_error(
@@ -3623,6 +5147,7 @@ impl MongoBackend {
             }
             None => search_index
                 .count_documents(filter)
+                .search_deadline()?
                 .limit(limit)
                 .await
                 .or_query_error("Failed to probe search_index for composite driver"),
@@ -3688,15 +5213,7 @@ impl MongoBackend {
                 }
             }
             if !has_driver_candidate {
-                return Err(StorageError::Search(SearchError::InvalidComposite {
-                    message: format!(
-                        "composite value for parameter '{}' has every component using the \
-                         'ne' prefix; MongoDB needs at least one non-'ne' component to bound \
-                         the search (an unbounded 'ne' arm is an existence-bounded index scan \
-                         with a fetch per row)",
-                        param.name
-                    ),
-                }));
+                return Err(all_ne_composite_error(&param.name));
             }
             if let Some((filter_doc, count)) = best {
                 if count > 0 {
@@ -3735,12 +5252,13 @@ impl MongoBackend {
     /// ifNoneExist matcher in `storage.rs` (with a transaction session).
     ///
     /// `hint` (#1528 review finding 5) names an index to force via
-    /// `Hint::Name` — passed as `Some("idx_search_composite")` only when this
-    /// is called from the `_id`-seeded path (`retain_matching_candidates`
-    /// with `hint: true`), where an unhinted planner risk is already measured
-    /// (#999) for this same "bounded batch check" query shape; `None`
-    /// everywhere else (the driver-path call here and the `storage.rs`
-    /// ifNoneExist call), unchanged.
+    /// `Hint::Name`. Candidate membership uses `idx_search_composite` to
+    /// seek through the bounded IDs; transactional conditional matching
+    /// retains its own access selection.
+    ///
+    /// The queries themselves live in [`composite_pair_matches`], which the
+    /// filter planner's composite membership (`search_plan`) calls with the
+    /// same hint, so both paths share one implementation.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn composite_pair_check(
         &self,
@@ -3750,85 +5268,18 @@ impl MongoBackend {
         param: &SearchParameter,
         candidates: &HashSet<String>,
         hint: Option<&str>,
-        mut session: Option<&mut mongodb::ClientSession>,
+        session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         if candidates.is_empty() {
             return Ok(HashSet::new());
         }
 
-        let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param)?;
-        let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-        let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
-
-        let mut matched: HashSet<String> = HashSet::new();
-        for component_filters in per_value_filters {
-            let mut per_component_pairs: Vec<HashSet<(String, i32)>> =
-                Vec::with_capacity(component_filters.len());
-
-            for component_filter in component_filters {
-                let bounded = doc! {
-                    "$and": [
-                        component_filter.filter,
-                        { "resource_id": { "$in": candidate_ids.clone() } }
-                    ]
-                };
-
-                let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
-                    Some(s) => {
-                        let mut find = search_index.find(bounded).projection(projection.clone());
-                        if let Some(name) = hint {
-                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
-                        }
-                        let mut cursor = find
-                            .session(&mut *s)
-                            .await
-                            .or_query_error("Failed to query composite component rows (session)")?;
-                        let mut out = HashSet::new();
-                        while cursor
-                            .advance(&mut *s)
-                            .await
-                            .or_query_error("Failed to advance composite component cursor")?
-                        {
-                            let doc = cursor
-                                .deserialize_current()
-                                .or_query_error("Failed to deserialize composite component row")?;
-                            if let (Ok(rid), Ok(grp)) =
-                                (doc.get_str("resource_id"), doc.get_i32("composite_group"))
-                            {
-                                out.insert((rid.to_string(), grp));
-                            }
-                        }
-                        out
-                    }
-                    None => {
-                        let mut find = search_index.find(bounded).projection(projection.clone());
-                        if let Some(name) = hint {
-                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
-                        }
-                        let cursor = find
-                            .await
-                            .or_query_error("Failed to query composite component rows")?;
-                        collect_documents(cursor)
-                            .await?
-                            .into_iter()
-                            .filter_map(|d| {
-                                let rid = d.get_str("resource_id").ok()?.to_string();
-                                let grp = d.get_i32("composite_group").ok()?;
-                                Some((rid, grp))
-                            })
-                            .collect()
-                    }
-                };
-                per_component_pairs.push(pairs);
-            }
-
-            let value_matches =
-                super::composite_search::intersect_component_pairs(per_component_pairs);
-            matched.extend(value_matches);
-        }
-
-        Ok(matched)
+        let values: Vec<Vec<Document>> = self
+            .composite_component_filters(tenant_id, resource_type, param)?
+            .into_iter()
+            .map(|value| value.into_iter().map(|c| c.filter).collect())
+            .collect();
+        composite_pair_matches(search_index, &values, candidates, hint, session).await
     }
 
     fn build_index_value_filter(
@@ -4108,6 +5559,7 @@ impl MongoBackend {
 
         let mut cursor = search_index
             .find(lookup)
+            .search_deadline()?
             .projection(doc! { "resource_type": 1, "resource_id": 1, "_id": 0 })
             .await
             .or_query_error("Failed to resolve :identifier targets")?;
@@ -4142,6 +5594,7 @@ impl MongoBackend {
             resource_type,
             &param.name,
             found,
+            self.references_normalized(),
         )))
     }
 
@@ -4152,13 +5605,16 @@ impl MongoBackend {
         resource_type: &str,
         param_name: &str,
         targets: impl IntoIterator<Item = String>,
+        normalized: bool,
     ) -> Document {
         let mut references: Vec<Bson> = Vec::new();
         for target in targets {
-            references.push(Bson::RegularExpression(bson::Regex {
-                pattern: format!("^{}/_history/", regex_escape(&target)),
-                options: String::new(),
-            }));
+            if !normalized {
+                references.push(Bson::RegularExpression(bson::Regex {
+                    pattern: format!("^{}/_history/", regex_escape(&target)),
+                    options: String::new(),
+                }));
+            }
             references.push(Bson::String(target));
         }
         doc! {
@@ -4193,6 +5649,24 @@ impl MongoBackend {
         param: &SearchParameter,
         value: &SearchValue,
         reference_targets: &[String],
+    ) -> StorageResult<Document> {
+        self.build_reference_filter_for(
+            param,
+            value,
+            reference_targets,
+            self.references_normalized(),
+        )
+    }
+
+    /// [`Self::build_reference_filter`] with the storage shape made explicit:
+    /// `normalized` means stored `value_reference` values carry no version
+    /// suffix and absolute URLs are indexed under `value_reference_target`.
+    fn build_reference_filter_for(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+        reference_targets: &[String],
+        normalized: bool,
     ) -> StorageResult<Document> {
         if value.prefix != SearchPrefix::Eq {
             return Err(StorageError::Search(SearchError::QueryParseError {
@@ -4280,6 +5754,9 @@ impl MongoBackend {
             // Version-agnostic, like every other backend: a versioned search
             // value names the resource, not one version of it.
             let base = strip_reference_version(reference);
+            if normalized {
+                return Ok(doc! { "value_reference": base });
+            }
             return Ok(doc! {
                 "$or": [
                     { "value_reference": base },
@@ -4303,6 +5780,27 @@ impl MongoBackend {
                     }
                 ]
             });
+        }
+
+        if normalized {
+            // Exact point lookups only: `Target/id` (and the bare id) on
+            // `value_reference`, plus the same `Target/id` on the side field
+            // that absolute URLs are reduced to.
+            let mut in_values: Vec<Bson> = vec![Bson::String(value.value.clone())];
+            let mut target_values: Vec<Bson> = Vec::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            for target in reference_targets {
+                if !seen.insert(target.as_str()) {
+                    continue;
+                }
+                let qualified = format!("{target}/{}", value.value);
+                in_values.push(Bson::String(qualified.clone()));
+                target_values.push(Bson::String(qualified));
+            }
+            return Ok(doc! { "$or": [
+                { "value_reference": { "$in": in_values } },
+                { "value_reference_target": { "$in": target_values } },
+            ] });
         }
 
         let escaped_id = regex_escape(&value.value);
@@ -4493,6 +5991,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         matched_ids: Option<&HashSet<String>>,
         cursor: Option<(&PageCursor, &CursorKeyset)>,
     ) -> StorageResult<Document> {
@@ -4502,11 +6001,20 @@ impl MongoBackend {
             "is_deleted": false,
         }];
 
+        // A version-restricted search (#2254) matches only resources stored
+        // under that version. Such queries never reach the planner's
+        // index-driven arms (`resource_filter_plan` returns `None` for them),
+        // so every page and count built from this filter applies the
+        // predicate before its limit.
+        if let Some(version) = query.stored_fhir_version() {
+            conditions.push(doc! { "fhir_version": version });
+        }
+
         if let Some(ids) = matched_ids {
-            if ids.len() > MAX_RESULT_ID_SET {
+            if ids.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: ids.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
             let id_values = ids.iter().cloned().map(Bson::String).collect::<Vec<_>>();
@@ -4516,6 +6024,10 @@ impl MongoBackend {
         }
 
         for param in &query.parameters {
+            if missing_support.is_resource_parameter(param) {
+                conditions.push(missing_resource_condition(&param.name));
+                continue;
+            }
             match param.name.as_str() {
                 "_id" => {
                     conditions.push(self.build_resource_id_condition(param)?);
@@ -4650,6 +6162,29 @@ impl MongoBackend {
         cursor: &PageCursor,
         keyset: &CursorKeyset,
     ) -> StorageResult<Document> {
+        self.build_cursor_condition_on_field(cursor, keyset, keyset.field.as_str())
+    }
+
+    /// Only ID cursors can be evaluated against search-index rows. Timestamp
+    /// cursors depend on resource metadata and must retain their existing path.
+    fn build_index_cursor_filter(
+        &self,
+        cursor: Option<(&PageCursor, &CursorKeyset)>,
+    ) -> StorageResult<Option<Document>> {
+        match cursor {
+            Some((cursor, keyset)) if keyset.field == CursorKeysetField::Id => self
+                .build_cursor_condition_on_field(cursor, keyset, "resource_id")
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn build_cursor_condition_on_field(
+        &self,
+        cursor: &PageCursor,
+        keyset: &CursorKeyset,
+        field: &str,
+    ) -> StorageResult<Document> {
         let invalid = || {
             StorageError::Search(SearchError::InvalidCursor {
                 cursor: cursor.encode(),
@@ -4677,7 +6212,6 @@ impl MongoBackend {
         // `build_sort_document`), so the tie-break is `$lt` going forward.
         let id_op = if previous { "$gt" } else { "$lt" };
 
-        let field = keyset.field.as_str();
         let id = cursor.resource_id().to_string();
 
         if keyset.field == CursorKeysetField::Id {
@@ -4738,6 +6272,35 @@ impl MongoBackend {
         }
 
         Ok(sort)
+    }
+
+    /// A body-less row for id-only reads: the id and `last_updated` the page
+    /// cursor needs, with `Null` content. Never leaves the id-only paths.
+    fn document_to_id_row(
+        &self,
+        tenant: &TenantContext,
+        fallback_resource_type: &str,
+        doc: Document,
+    ) -> StorageResult<StoredResource> {
+        let id = doc
+            .get_str("id")
+            .map_err(|e| internal_error(format!("Missing resource id in search result: {}", e)))?
+            .to_string();
+        let last_updated = doc
+            .get_datetime("last_updated")
+            .map(bson_to_chrono)
+            .unwrap_or_else(|_| Utc::now());
+        Ok(StoredResource::from_storage(
+            fallback_resource_type,
+            id,
+            String::new(),
+            tenant.tenant_id().clone(),
+            Value::Null,
+            last_updated,
+            last_updated,
+            None,
+            FhirVersion::default_enabled(),
+        ))
     }
 
     fn document_to_stored_resource(
@@ -4972,6 +6535,7 @@ impl MongoBackend {
     ) -> StorageResult<(Vec<String>, bool)> {
         let mut cursor = search_index
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
             .batch_size(1000)
             .await
@@ -5025,6 +6589,158 @@ impl IncludeProvider for MongoBackend {
     }
 }
 
+/// Upper bound on one absolute-reference regex pattern, in bytes. Larger id
+/// sets are split across several patterns, one `$or` arm each.
+const REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES: usize = 16 * 1024;
+
+/// The `$or` predicate over `value_reference` that a `_revinclude` directive
+/// matches for a page of `(resource_type, id)` targets.
+///
+/// Stored references keep whatever form the resource carried, so each target
+/// can appear as:
+/// - `Type/id` or a bare `id` (exact strings), and `Type/id/_history/N` (one
+///   anchored prefix regex per target) — together the first arm's `$in`;
+/// - `http(s)://host/.../Type/id[/_history/N]` — one arm per chunk of ids:
+///   `$and` of the anchored `^https?://` prefix and a type-qualified
+///   alternation over the page's ids (split when the pattern would exceed
+///   [`REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES`]).
+///
+/// The alternation lives in a separate `$and` clause on purpose: MongoDB drops
+/// index bounds for any regex containing `|`, so inside one `$in` it scans the
+/// whole `(tenant, type, param)` key range. As the second clause it is only a
+/// filter over the keys the prefix clause bounds to the absolute-reference
+/// range (measured: 50k keys instead of 200k, ~12x faster at 500 ids). The
+/// type is part of the pattern so `http://x/Practitioner/1` does not match a
+/// `Patient/1` target (#1083, #2296).
+///
+/// With `normalized` (version suffixes stripped at write time, absolute URLs
+/// reduced to `value_reference_target`) the filter is two exact `$in` arms and
+/// no regex at all.
+fn revinclude_reference_filter<'a>(
+    targets: impl IntoIterator<Item = (&'a str, &'a str)>,
+    normalized: bool,
+) -> Document {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut by_type: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (resource_type, id) in targets {
+        by_type.entry(resource_type).or_default().insert(id);
+    }
+
+    let mut exact: BTreeSet<String> = BTreeSet::new();
+    for (resource_type, ids) in &by_type {
+        for id in ids {
+            exact.insert(format!("{resource_type}/{id}"));
+            exact.insert((*id).to_string());
+        }
+    }
+    if normalized {
+        let qualified: Vec<Bson> = by_type
+            .iter()
+            .flat_map(|(resource_type, ids)| {
+                ids.iter()
+                    .map(move |id| Bson::String(format!("{resource_type}/{id}")))
+            })
+            .collect();
+        let in_values: Vec<Bson> = exact.into_iter().map(Bson::String).collect();
+        return doc! { "$or": [
+            { "value_reference": { "$in": in_values } },
+            { "value_reference_target": { "$in": qualified } },
+        ] };
+    }
+    let mut in_values: Vec<Bson> = exact.into_iter().map(Bson::String).collect();
+    for (resource_type, ids) in &by_type {
+        for id in ids {
+            in_values.push(Bson::RegularExpression(bson::Regex {
+                pattern: format!(
+                    "^{}/{}/_history/",
+                    regex_escape(resource_type),
+                    regex_escape(id)
+                ),
+                options: String::new(),
+            }));
+        }
+    }
+    let mut arms: Vec<Document> =
+        vec![doc! { "value_reference": { "$in": Bson::Array(in_values) } }];
+
+    const SUFFIX: &str = ")(?:/_history/[^/]*)?$";
+    let absolute_arm = |pattern: String| {
+        doc! { "$and": [
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern: "^https?://".to_string(),
+                options: String::new(),
+            }) },
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern,
+                options: String::new(),
+            }) },
+        ] }
+    };
+    for (resource_type, ids) in &by_type {
+        let prefix = format!("^https?://.*/{}/(?:", regex_escape(resource_type));
+        let mut alternation = String::new();
+        for id in ids {
+            let escaped = regex_escape(id);
+            if !alternation.is_empty()
+                && prefix.len() + alternation.len() + escaped.len() + SUFFIX.len() + 1
+                    > REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES
+            {
+                arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+                alternation.clear();
+            }
+            if !alternation.is_empty() {
+                alternation.push('|');
+            }
+            alternation.push_str(&escaped);
+        }
+        if !alternation.is_empty() {
+            arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+        }
+    }
+
+    doc! { "$or": arms }
+}
+
+/// Splits the normalized two-field `$or` of [`revinclude_reference_filter`]
+/// into one filter per field (each merged with `base`); any other shape stays
+/// a single filter.
+fn split_revinclude_queries(base: &Document, reference_filter: Document) -> Vec<Document> {
+    let normalized_arms = match reference_filter.get_array("$or") {
+        Ok(arms)
+            if arms.len() == 2
+                && arms.iter().all(|arm| {
+                    arm.as_document().is_some_and(|d| {
+                        d.contains_key("value_reference")
+                            || d.contains_key("value_reference_target")
+                    })
+                })
+                && arms[1]
+                    .as_document()
+                    .is_some_and(|d| d.contains_key("value_reference_target")) =>
+        {
+            Some(arms.clone())
+        }
+        _ => None,
+    };
+    match normalized_arms {
+        Some(arms) => arms
+            .into_iter()
+            .filter_map(|arm| arm.as_document().cloned())
+            .map(|arm| {
+                let mut query = base.clone();
+                query.extend(arm);
+                query
+            })
+            .collect(),
+        None => {
+            let mut query = base.clone();
+            query.extend(reference_filter);
+            vec![query]
+        }
+    }
+}
+
 #[async_trait]
 impl RevincludeProvider for MongoBackend {
     async fn resolve_revincludes(
@@ -5053,31 +6769,45 @@ impl RevincludeProvider for MongoBackend {
                 continue;
             }
 
-            let mut reference_values: Vec<String> = Vec::with_capacity(resources.len() * 2);
-            for resource in resources {
-                reference_values.push(format!("{}/{}", resource.resource_type(), resource.id()));
-                reference_values.push(resource.id().to_string());
-            }
-            reference_values.sort();
-            reference_values.dedup();
-
-            if reference_values.is_empty() {
-                continue;
-            }
-
-            let bson_values: Vec<Bson> = reference_values.into_iter().map(Bson::String).collect();
             let index_filter = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": &revinclude.source_type,
                 "param_name": &revinclude.search_param,
-                "value_reference": { "$in": Bson::Array(bson_values) },
             };
+            let reference_filter = revinclude_reference_filter(
+                resources
+                    .iter()
+                    .map(|resource| (resource.resource_type(), resource.id())),
+                self.references_normalized(),
+            );
 
             // Bounded, streamed id resolution (#1061) — see
             // `referring_resource_ids`. `reference_values` above is already
             // bounded by the page; this is what previously was not.
-            let (matching_ids, index_truncated) =
-                Self::referring_resource_ids(&search_index, index_filter, limit).await?;
+            //
+            // Normalized mode: one query per field instead of a two-field
+            // `$or`. On a real server the `$or` made the planner pick
+            // `idx_search_composite` and scan every `subject` row of the type
+            // (1500 documents examined for 4 matches), while each arm alone
+            // uses its own value index. Ids are merged and capped here.
+            let queries = split_revinclude_queries(&index_filter, reference_filter);
+            let mut matching_ids: Vec<String> = Vec::new();
+            let mut index_truncated = false;
+            for query in queries {
+                let (ids, truncated) =
+                    Self::referring_resource_ids(&search_index, query, limit).await?;
+                index_truncated |= truncated;
+                for id in ids {
+                    if matching_ids.contains(&id) {
+                        continue;
+                    }
+                    if matching_ids.len() >= limit {
+                        index_truncated = true;
+                        break;
+                    }
+                    matching_ids.push(id);
+                }
+            }
 
             if matching_ids.is_empty() {
                 continue;
@@ -5094,6 +6824,7 @@ impl RevincludeProvider for MongoBackend {
             let docs = collect_documents(
                 resources_collection
                     .find(resource_filter)
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to fetch revinclude resources")?,
             )
@@ -6073,7 +7804,7 @@ mod value_list_tests {
         });
 
         let filter = backend
-            .build_resource_filter("t1", "Patient", &query, None, None)
+            .build_resource_filter("t1", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("valid filter");
 
         let and_arms = filter.get_array("$and").expect("$and array");
@@ -6117,7 +7848,7 @@ mod value_list_tests {
             });
 
         let filter = backend
-            .build_resource_filter("t1", "Patient", &query, None, None)
+            .build_resource_filter("t1", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("valid filter");
 
         let and_arms = filter.get_array("$and").expect("$and array");
@@ -6298,6 +8029,23 @@ mod composite_component_filter_tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_composite_with_the_wrong_number_of_parts() {
+        let backend = backend();
+        let query =
+            |v: &str| SearchQuery::new("Observation").with_parameter(code_value_quantity_param(v));
+        match backend.validate_query_support(&query("8302-2")) {
+            Err(StorageError::Search(SearchError::InvalidComposite { message })) => {
+                assert!(
+                    message.contains("has 1 component(s)") && message.contains("expects 2"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidComposite, got {other:?}"),
+        }
+        assert!(backend.validate_query_support(&query("8302-2$150")).is_ok());
     }
 
     #[test]
@@ -6527,6 +8275,30 @@ mod reference_filter_tests {
         }
     }
 
+    #[test]
+    fn normalized_reference_filters_use_exact_arms_only() {
+        let backend = backend_with_subject_targets();
+        let param = subject_param("123");
+        let value = &param.values[0];
+        let targets = vec!["Patient".to_string(), "Group".to_string()];
+        assert_eq!(
+            backend
+                .build_reference_filter_for(&param, value, &targets, true)
+                .unwrap(),
+            doc! { "$or": [
+                { "value_reference": { "$in": ["123", "Patient/123", "Group/123"] } },
+                { "value_reference_target": { "$in": ["Patient/123", "Group/123"] } },
+            ] }
+        );
+        let qualified = subject_param("Patient/123/_history/2");
+        assert_eq!(
+            backend
+                .build_reference_filter_for(&qualified, &qualified.values[0], &[], true)
+                .unwrap(),
+            doc! { "value_reference": "Patient/123" }
+        );
+    }
+
     fn or_arms(filter: &Document) -> Vec<Document> {
         filter
             .get_array("$or")
@@ -6699,7 +8471,7 @@ mod metadata_param_modifier_tests {
     fn condition(backend: &MongoBackend, param: SearchParameter) -> Document {
         let query = SearchQuery::new("Patient").with_parameter(param);
         let filter = backend
-            .build_resource_filter("t", "Patient", &query, None, None)
+            .build_resource_filter("t", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("filter should build");
         filter.get_array("$and").expect("$and array")[1]
             .as_document()
@@ -6977,7 +8749,11 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["a", "b", "c"]
         );
     }
@@ -6990,7 +8766,11 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed.clone()), &[SortDirection::Descending]),
+            order_sort_keys(
+                one_key(keyed.clone()),
+                &[SortDirection::Descending],
+                SortDirection::Ascending
+            ),
             vec!["c", "b", "a"]
         );
 
@@ -6998,13 +8778,57 @@ mod sort_key_order_tests {
         // the server's `{key: -1, _id: 1}` semantics.
         let tied = vec![("z".to_string(), dt(100)), ("y".to_string(), dt(100))];
         assert_eq!(
-            order_sort_keys(one_key(tied.clone()), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(tied.clone()),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["y", "z"]
         );
         assert_eq!(
-            order_sort_keys(one_key(tied), &[SortDirection::Descending]),
+            order_sort_keys(
+                one_key(tied),
+                &[SortDirection::Descending],
+                SortDirection::Ascending
+            ),
             vec!["y", "z"]
         );
+    }
+
+    /// A trailing `_id` directive sets the tie-break direction; it never
+    /// overrides a key, and a missing key still sorts after present ones.
+    #[test]
+    fn ties_break_by_id_in_the_requested_direction() {
+        let keyed = vec![
+            keys("b", &[Some(dt(100))]),
+            keys("c", &[Some(dt(100))]),
+            keys("a", &[Some(dt(200))]),
+            keys("y", &[None]),
+            keys("z", &[None]),
+        ];
+        for (key_direction, id_direction, expected) in [
+            (
+                SortDirection::Ascending,
+                SortDirection::Descending,
+                ["c", "b", "a", "z", "y"],
+            ),
+            (
+                SortDirection::Descending,
+                SortDirection::Descending,
+                ["a", "c", "b", "z", "y"],
+            ),
+            (
+                SortDirection::Descending,
+                SortDirection::Ascending,
+                ["a", "b", "c", "y", "z"],
+            ),
+        ] {
+            assert_eq!(
+                order_sort_keys(keyed.clone(), &[key_direction], id_direction),
+                expected,
+                "{key_direction:?} then id {id_direction:?}"
+            );
+        }
     }
 
     #[test]
@@ -7015,7 +8839,11 @@ mod sort_key_order_tests {
             ("id-b".to_string(), Bson::String("b".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-b", "id-ba", "id-c"]
         );
 
@@ -7024,7 +8852,11 @@ mod sort_key_order_tests {
             ("id-B".to_string(), Bson::String("B".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(one_key(case_sensitive), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(case_sensitive),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-B", "id-a"]
         );
     }
@@ -7037,7 +8869,11 @@ mod sort_key_order_tests {
             ("id-8".to_string(), Bson::Int64(8)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-6.5", "id-7", "id-8"]
         );
     }
@@ -7052,7 +8888,8 @@ mod sort_key_order_tests {
         assert_eq!(
             order_sort_keys(
                 keyed.clone(),
-                &[SortDirection::Ascending, SortDirection::Ascending]
+                &[SortDirection::Ascending, SortDirection::Ascending],
+                SortDirection::Ascending
             ),
             vec!["sort-c", "sort-b", "sort-a"]
         );
@@ -7060,14 +8897,16 @@ mod sort_key_order_tests {
         assert_eq!(
             order_sort_keys(
                 keyed.clone(),
-                &[SortDirection::Ascending, SortDirection::Descending]
+                &[SortDirection::Ascending, SortDirection::Descending],
+                SortDirection::Ascending
             ),
             vec!["sort-c", "sort-a", "sort-b"]
         );
         assert_eq!(
             order_sort_keys(
                 keyed,
-                &[SortDirection::Descending, SortDirection::Ascending]
+                &[SortDirection::Descending, SortDirection::Ascending],
+                SortDirection::Ascending
             ),
             vec!["sort-b", "sort-a", "sort-c"]
         );
@@ -7102,7 +8941,7 @@ mod sort_key_order_tests {
                 "neither",
             ];
             assert_eq!(
-                order_sort_keys(keyed.clone(), &directions),
+                order_sort_keys(keyed.clone(), &directions, SortDirection::Ascending),
                 expected,
                 "{directions:?}"
             );
@@ -7364,6 +9203,82 @@ mod cursor_keyset_tests {
         let desc = keyset(&["-_id"]).unwrap();
         let next_desc = backend().build_cursor_condition(&cursor, &desc).unwrap();
         assert_eq!(next_desc, doc! { "id": { "$lt": "p-5" } });
+    }
+
+    #[test]
+    fn id_cursor_bounds_candidates_before_resource_lookups() {
+        let backend = backend();
+        let next = PageCursor::new(vec![CursorValue::String("p-5".into())], "p-5");
+        let previous = PageCursor::previous(vec![CursorValue::String("p-5".into())], "p-5");
+        let filter = doc! {"tenant_id": "t", "resource_type": "Patient", "param_name": "gender"};
+        for (sort, cursor, operator) in [
+            ("_id", &next, "$gt"),
+            ("_id", &previous, "$lt"),
+            ("-_id", &next, "$lt"),
+            ("-_id", &previous, "$gt"),
+        ] {
+            let keyset = keyset(&[sort]).unwrap();
+            let boundary = backend
+                .build_index_cursor_filter(Some((cursor, &keyset)))
+                .unwrap();
+            assert_eq!(boundary, Some(doc! {"resource_id": {operator: "p-5"}}));
+            let live = doc! {"tenant_id": "t", "resource_type": "Patient", "is_deleted": false};
+            let resource_filter = doc! {"$and": [
+                live, backend.build_cursor_condition(cursor, &keyset).unwrap(),
+            ]};
+            let query =
+                SearchQuery::new("Patient").with_sort(crate::types::SortDirective::parse(sort));
+            let sort_document = backend
+                .build_sort_document(&query, cursor.direction() == CursorDirection::Previous)
+                .unwrap();
+            let SearchPipeline {
+                stages: pipeline, ..
+            } = SearchFilterPlan::ResourceLookups {
+                index_filter: Some(filter.clone().into()),
+                stages: Vec::new(),
+            }
+            .pipeline(
+                resource_filter.clone(),
+                Some(sort_document),
+                boundary.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                pipeline[0],
+                doc! {"$match": {"$and": [filter.clone(), boundary.unwrap()]}}
+            );
+            assert!(pipeline[1].contains_key("$group"));
+            assert!(pipeline[2].contains_key("$sort"));
+            let lookup = pipeline[3].get_document("$lookup").unwrap();
+            let checks = lookup.get_array("pipeline").unwrap()[0]
+                .as_document()
+                .unwrap();
+            assert_eq!(
+                checks,
+                &doc! {"$match": {"$and": [
+                    resource_filter, {"$expr": {"$eq": ["$id", "$$candidate_id"]}},
+                ]}}
+            );
+        }
+    }
+
+    #[test]
+    fn index_cursor_filter_excludes_timestamp_cursors_and_first_pages() {
+        let backend = backend();
+        assert_eq!(backend.build_index_cursor_filter(None).unwrap(), None);
+        let cursor = PageCursor::new(
+            vec![CursorValue::String("2026-01-02T03:04:05Z".into())],
+            "p-5",
+        );
+        for sort in ["_lastUpdated", "-_lastUpdated"] {
+            let keyset = keyset(&[sort]).unwrap();
+            assert_eq!(
+                backend
+                    .build_index_cursor_filter(Some((&cursor, &keyset)))
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     /// `_lastUpdated` keeps `id` (descending) as the tie-break, in both
@@ -7822,6 +9737,46 @@ mod modifier_parity_filter_tests {
         );
     }
 
+    #[test]
+    fn normalized_identifier_targets_are_an_exact_in() {
+        let built = MongoBackend::identifier_targets_filter(
+            "t1",
+            "Observation",
+            "subject",
+            vec!["Patient/p.1".to_string()],
+            true,
+        );
+        assert_eq!(
+            built,
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Observation",
+                "param_name": "subject",
+                "value_reference": { "$in": ["Patient/p.1"] },
+            }
+        );
+    }
+
+    #[test]
+    fn normalized_compartment_filter_has_no_regex() {
+        let comp = CompartmentMembership {
+            reference: "Patient/p1/_history/2".to_string(),
+            params: vec!["subject".to_string()],
+        };
+        assert_eq!(
+            compartment_membership_filter("t1", "Observation", &comp, true),
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Observation",
+                "param_name": { "$in": ["subject"] },
+                "value_reference": "Patient/p1",
+            }
+        );
+        assert!(
+            compartment_membership_filter("t1", "Observation", &comp, false).contains_key("$or")
+        );
+    }
+
     /// Each resolved target is matched exactly or at any version — never as a
     /// prefix of another id (`Patient/p1` must not admit `Patient/p10`).
     #[test]
@@ -7831,6 +9786,7 @@ mod modifier_parity_filter_tests {
             "Observation",
             "subject",
             vec!["Patient/p.1".to_string()],
+            false,
         );
         assert_eq!(
             built,
@@ -7845,5 +9801,243 @@ mod modifier_parity_filter_tests {
                 ]}}
             )
         );
+    }
+}
+
+/// The broad search gate on the backend; how a query is classified is tested
+/// beside the classifier in `search_admission`.
+#[cfg(test)]
+mod search_admission_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::TotalMode;
+
+    #[tokio::test]
+    async fn broad_searches_wait_but_plain_pages_do_not() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut broad = SearchQuery::new("Patient");
+        broad.total = Some(TotalMode::Accurate);
+        let held = backend.admit_broad_search(&broad).await.unwrap();
+        let waiting = backend.admit_broad_search(&broad);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(
+            backend
+                .admit_broad_search(&SearchQuery::new("Patient"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let other = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        assert!(other.admit_broad_search(&broad).await.unwrap().is_none());
+        drop(held);
+        assert!(waiting.await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn permit_returns_on_error_and_cancellation() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut query = SearchQuery::new("Patient");
+        query.total = Some(TotalMode::Accurate);
+        let result: Result<(), ()> = async {
+            let _permit = backend.admit_broad_search(&query).await.unwrap();
+            Err(())
+        }
+        .await;
+        assert!(result.is_err());
+        assert_eq!(backend.broad_search_gate().unwrap().available_permits(), 1);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), async {
+            let _permit = backend.admit_broad_search(&query).await.unwrap();
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(backend.broad_search_gate().unwrap().available_permits(), 1);
+        let held = backend.admit_broad_search(&query).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                backend.admit_broad_search(&query)
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+        assert!(backend.admit_broad_search(&query).await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod revinclude_reference_filter_tests {
+    use super::*;
+
+    fn arms(filter: &Document) -> Vec<Document> {
+        filter
+            .get_array("$or")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().clone())
+            .collect()
+    }
+
+    fn in_values(arm: &Document) -> Vec<Bson> {
+        arm.get_document("value_reference")
+            .unwrap()
+            .get_array("$in")
+            .unwrap()
+            .clone()
+    }
+
+    fn strings(values: &[Bson]) -> Vec<String> {
+        values
+            .iter()
+            .filter_map(|v| match v {
+                Bson::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn history_patterns(values: &[Bson]) -> Vec<String> {
+        values
+            .iter()
+            .filter_map(|v| match v {
+                Bson::RegularExpression(r) => Some(r.pattern.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(prefix pattern, alternation pattern)` of one absolute arm.
+    fn absolute(arm: &Document) -> (String, String) {
+        let and = arm.get_array("$and").unwrap();
+        let pattern = |i: usize| match and[i]
+            .as_document()
+            .unwrap()
+            .get("value_reference")
+            .unwrap()
+        {
+            Bson::RegularExpression(r) => {
+                assert!(r.options.is_empty());
+                r.pattern.clone()
+            }
+            other => panic!("expected a regex, got {other:?}"),
+        };
+        (pattern(0), pattern(1))
+    }
+
+    #[test]
+    fn normalized_revinclude_filter_is_two_exact_in_arms() {
+        let filter = revinclude_reference_filter([("Patient", "p1"), ("Patient", "p2")], true);
+        assert_eq!(
+            filter,
+            doc! { "$or": [
+                { "value_reference": { "$in": ["Patient/p1", "Patient/p2", "p1", "p2"] } },
+                { "value_reference_target": { "$in": ["Patient/p1", "Patient/p2"] } },
+            ] }
+        );
+    }
+
+    #[test]
+    fn single_target_yields_exact_history_and_absolute_arms() {
+        let filter = revinclude_reference_filter([("Patient", "p1")], false);
+        let arms = arms(&filter);
+        assert_eq!(arms.len(), 2);
+        let values = in_values(&arms[0]);
+        assert_eq!(strings(&values), vec!["Patient/p1", "p1"]);
+        assert_eq!(
+            history_patterns(&values),
+            vec!["^Patient/p1/_history/".to_string()]
+        );
+        assert_eq!(
+            absolute(&arms[1]),
+            (
+                "^https?://".to_string(),
+                "^https?://.*/Patient/(?:p1)(?:/_history/[^/]*)?$".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn duplicates_collapse_and_types_stay_separate() {
+        let filter = revinclude_reference_filter(
+            [
+                ("Patient", "p1"),
+                ("Patient", "p1"),
+                ("Patient", "p2"),
+                ("Practitioner", "p1"),
+            ],
+            false,
+        );
+        let arms = arms(&filter);
+        assert_eq!(
+            strings(&in_values(&arms[0])),
+            vec!["Patient/p1", "Patient/p2", "Practitioner/p1", "p1", "p2"]
+        );
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert_eq!(
+            alternations,
+            vec![
+                "^https?://.*/Patient/(?:p1|p2)(?:/_history/[^/]*)?$".to_string(),
+                "^https?://.*/Practitioner/(?:p1)(?:/_history/[^/]*)?$".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn alternation_never_sits_in_the_in_list() {
+        // A regex containing `|` inside `$in` loses its index bounds.
+        let filter = revinclude_reference_filter([("Patient", "a"), ("Patient", "b")], false);
+        let arms = arms(&filter);
+        assert!(
+            history_patterns(&in_values(&arms[0]))
+                .iter()
+                .all(|p| !p.contains('|'))
+        );
+    }
+
+    #[test]
+    fn regex_metacharacters_in_ids_are_escaped() {
+        let filter = revinclude_reference_filter([("Patient", "p.1(a)")], false);
+        let arms = arms(&filter);
+        assert_eq!(
+            history_patterns(&in_values(&arms[0])),
+            vec![r"^Patient/p\.1\(a\)/_history/".to_string()]
+        );
+        assert!(absolute(&arms[1]).1.contains(r"(?:p\.1\(a\))"));
+    }
+
+    #[test]
+    fn large_pages_split_absolute_pattern_below_the_cap() {
+        let ids: Vec<String> = (0..4000).map(|i| format!("patient-{i:06}")).collect();
+        let filter =
+            revinclude_reference_filter(ids.iter().map(|id| ("Patient", id.as_str())), false);
+        let arms = arms(&filter);
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert!(alternations.len() > 1, "expected the pattern to be chunked");
+        assert!(
+            alternations
+                .iter()
+                .all(|p| p.len() <= REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES)
+        );
+        for id in &ids {
+            let escaped = regex_escape(id);
+            assert_eq!(
+                alternations
+                    .iter()
+                    .filter(|p| p.contains(escaped.as_str()))
+                    .count(),
+                1,
+                "{id} must appear in exactly one chunk"
+            );
+        }
     }
 }

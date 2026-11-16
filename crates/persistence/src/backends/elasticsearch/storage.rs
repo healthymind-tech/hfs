@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -19,16 +19,18 @@ use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
 use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMarker};
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult, ValidationError};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex_prepare::{PrepareEnv, extract_range, tokio_multi_thread_runtime};
 use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{DatePrecision, StoredResource};
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
+use super::search::query_builder::HIT_SOURCE_FIELDS;
 use super::search_impl::{
     EsFailureClass, MAX_SEARCH_RETRIES, RETRY_BASE_DELAY_MS, ReadOp, classify_es_failure,
     is_index_not_found, send_read_with_retry,
@@ -38,6 +40,10 @@ use super::search_impl::{
 /// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
 /// Small resources hit this count first, so a load does not pay one refresh
 /// wait per handful of documents; large ones hit the byte budget first (#1125).
+/// Smallest page the writer sends to the prepare pool (#1250); below it
+/// the pool's hand-off costs more than the extraction it would spread.
+const REINDEX_POOL_MIN_PAGE: usize = 16;
+
 const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
@@ -61,6 +67,16 @@ pub(super) fn is_transient_bulk_status(status: u64) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+/// Rounds a contained-document sweep is repeated on its own (each round is
+/// itself [`send_write_with_retry`]'s attempts) before it fails the write.
+const SWEEP_ATTEMPTS: u32 = 4;
+
+/// Wait before the first repeat of a failed sweep; doubles, then jittered.
+const SWEEP_BACKOFF_BASE_MS: u64 = 200;
+
+/// Upper bound on one wait between sweep rounds.
+const SWEEP_BACKOFF_MAX_MS: u64 = 3_000;
+
 /// Attempts an operation Elasticsearch answers `429` gets, the first included,
 /// before it is reported as a transient failure.
 const BULK_MAX_ATTEMPTS: u32 = 5;
@@ -79,6 +95,20 @@ fn backoff_delay(resend: u32) -> Duration {
     BULK_BACKOFF_BASE
         .saturating_mul(1u32 << doublings)
         .min(BULK_BACKOFF_MAX)
+}
+
+/// A uniform draw from `[0, 1)`, for jitter. Taken from a v4 UUID (the crate
+/// already depends on it) rather than from a new RNG dependency: its first 48
+/// bits are random and fit an `f64` mantissa exactly.
+fn jitter_fraction() -> f64 {
+    let bits = (uuid::Uuid::new_v4().as_u128() >> 80) as u64;
+    bits as f64 / (1u64 << 48) as f64
+}
+
+/// `base_ms` spread over `[base_ms / 2, 3 * base_ms / 2)`, so writers that were
+/// all released by the same event do not retry in lockstep.
+fn jittered_ms(base_ms: u64) -> u64 {
+    base_ms / 2 + (jitter_fraction() * base_ms as f64) as u64
 }
 
 /// Groups consecutive operations, given their sizes in bytes, into `_bulk`
@@ -170,7 +200,20 @@ fn internal_error(message: String) -> StorageError {
 ///
 /// Distinct from [`internal_error`] because the caller must never confuse it
 /// with "the resource is not there": we never got an answer at all.
-fn unavailable_error(message: String) -> StorageError {
+///
+/// `context` names the operation and is the only text the client sees, beside a
+/// fixed "temporarily unavailable; retry" sentence. `detail` (the transport error,
+/// or the Elasticsearch status and response body) goes to the log and never into
+/// the client text (#2385).
+fn unavailable_error(context: &str, detail: &dyn std::fmt::Display) -> StorageError {
+    StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
+}
+
+/// An `Unavailable` around `message`, which is already client text: the message
+/// of an `Unavailable` this backend built, or a transient bulk failure, which
+/// `send_bulk_index` builds with `elasticsearch_unavailable_message`. It is not
+/// logged again, so it must only wrap text that was logged where it was built.
+fn unavailable_client_text(message: String) -> StorageError {
     StorageError::Backend(BackendError::Unavailable {
         backend_name: "elasticsearch".to_string(),
         message,
@@ -436,11 +479,44 @@ fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: 
     }
 }
 
+/// Version and last-updated the primary stamped on a resource sent here.
+fn primary_write_meta(resource: &Value) -> Option<(String, Option<DateTime<Utc>>)> {
+    let version = resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)?;
+    let last_updated = resource
+        .pointer("/meta/lastUpdated")
+        .and_then(Value::as_str)
+        .and_then(|instant| DateTime::parse_from_rfc3339(instant).ok())
+        .map(|instant| instant.with_timezone(&Utc));
+    Some((version, last_updated))
+}
+
+fn missing_primary_version(resource_type: &str, id: &str) -> StorageError {
+    StorageError::Validation(ValidationError::InvalidResource {
+        message: format!(
+            "Elasticsearch is a search secondary and cannot assign versions; \
+             {resource_type}/{id} has no versionId from the primary"
+        ),
+        details: Vec::new(),
+    })
+}
+
+/// The search document for one stored resource. `last_updated` is the
+/// resource's own `meta.lastUpdated` instant — the one the primary store
+/// holds and the one `_lastUpdated` searches and sorts answer from — never
+/// the time the document is built: the same builder serves the write paths
+/// and the `$reindex` page writer, and indexing the build time made every
+/// resource of a rebuilt type look modified at the rebuild (#1593).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_es_document(
     tenant_id: &str,
     resource_type: &str,
     resource_id: &str,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     content: &Value,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
@@ -576,6 +652,9 @@ pub(crate) fn build_es_document(
                 if let Some(ri) = ref_id {
                     ref_doc["resource_id"] = json!(ri);
                 }
+                if let Some(target) = crate::types::absolute_reference_target(reference) {
+                    ref_doc["reference_target"] = json!(target);
+                }
                 if let Some(d) = display {
                     ref_doc["display"] = json!(d);
                 }
@@ -597,7 +676,7 @@ pub(crate) fn build_es_document(
         "resource_id": resource_id,
         "tenant_id": tenant_id,
         "version_id": version_id,
-        "last_updated": Utc::now().to_rfc3339(),
+        "last_updated": last_updated.to_rfc3339(),
         "fhir_version": fhir_version.as_mime_param(),
         "is_deleted": false,
         "content": content,
@@ -636,6 +715,7 @@ pub(crate) fn build_es_contained_document(
     local_id: &str,
     contained_content: &Value,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
 ) -> Value {
@@ -645,6 +725,7 @@ pub(crate) fn build_es_contained_document(
         contained_type,
         &synthetic_id,
         version_id,
+        last_updated,
         contained_content,
         fhir_version,
         extracted_values,
@@ -787,10 +868,13 @@ async fn send_write_once(
         // cost of the write, not a fault), as `send_bulk_index` found for a
         // lone document (#1125).
         Err(e) if e.is_timeout() => {
-            return WriteAttempt::Failed(unavailable_error(format!(
-                "Failed to {what}: no answer within {} ms: {e}",
-                backend.request_timeout_ms()
-            )));
+            return WriteAttempt::Failed(unavailable_error(
+                &format!(
+                    "Failed to {what}: no answer within {} ms",
+                    backend.request_timeout_ms()
+                ),
+                &e,
+            ));
         }
         Err(e) => return WriteAttempt::Retryable(format!("Elasticsearch unreachable: {e}")),
     };
@@ -873,6 +957,10 @@ async fn send_write_once(
 /// it later (the composite's own retry, a `$reindex`) can succeed. A rejection
 /// is [`BackendError::Internal`].
 ///
+/// The exhausted-retry message names only the write. The last failure (the
+/// transport error, or the Elasticsearch status and response body) goes to the
+/// log through [`unavailable_error`], not to the client (#2385).
+///
 /// Under `write_refresh=wait_for` every attempt that reaches the cluster also
 /// waits for the next refresh, so a resend after a gateway error can pay that
 /// wait again; attempts Elasticsearch itself rejected did not wait for one.
@@ -908,7 +996,7 @@ async fn send_write_with_retry(
         }
 
         if attempt < MAX_SEARCH_RETRIES {
-            let delay_ms = RETRY_BASE_DELAY_MS << attempt;
+            let delay_ms = jittered_ms(RETRY_BASE_DELAY_MS << attempt);
             tracing::warn!(
                 attempt = attempt + 1,
                 max = MAX_SEARCH_RETRIES + 1,
@@ -922,9 +1010,10 @@ async fn send_write_with_retry(
     }
 
     let attempts = MAX_SEARCH_RETRIES + 1;
-    Err(unavailable_error(format!(
-        "Failed to {what} after {attempts} attempts: {last_failure}"
-    )))
+    Err(unavailable_error(
+        &format!("Failed to {what} after {attempts} attempts"),
+        &last_failure,
+    ))
 }
 
 /// Indexes one document under `doc_id` with the given refresh policy.
@@ -987,8 +1076,40 @@ impl ElasticsearchBackend {
              (its own document is already written; repeat the write or reindex the \
              resource to bring them back in step)"
         );
-        delete_by_query_scoped(self, &pattern, body, &what).await?;
-        Ok(())
+        // At most `contained_sweep_concurrency` sweeps run at once (a permit is
+        // held for the request only, not for the back-off between attempts). A
+        // sweep the cluster throttles or cannot take is repeated on its own,
+        // with jittered exponential back-off, `SWEEP_ATTEMPTS` times before it
+        // fails the write: the container's own document is already written,
+        // and repeating the whole event (document, sweep, contained documents)
+        // for a failure of the sweep alone multiplies the load of a throttled
+        // cluster.
+        let mut attempt = 0u32;
+        loop {
+            let result = {
+                let _permit = self.contained_sweeps.acquire().await.map_err(|_| {
+                    internal_error("the contained sweep gate was closed".to_string())
+                })?;
+                delete_by_query_scoped(self, &pattern, body.clone(), &what).await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if is_unavailable(&e) && attempt + 1 < SWEEP_ATTEMPTS => {
+                    let delay_ms = jittered_ms(SWEEP_BACKOFF_BASE_MS << attempt.min(5))
+                        .min(SWEEP_BACKOFF_MAX_MS);
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        max = SWEEP_ATTEMPTS,
+                        delay_ms,
+                        error = %e,
+                        "Contained-document sweep failed; repeating the sweep alone"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Extracts and indexes a container's `contained[]` resources as separate
@@ -1004,6 +1125,7 @@ impl ElasticsearchBackend {
         resource: &Value,
         fhir_version: FhirVersion,
         version_id: &str,
+        last_updated: DateTime<Utc>,
         delete_first: bool,
     ) -> StorageResult<()> {
         if delete_first {
@@ -1020,6 +1142,7 @@ impl ElasticsearchBackend {
                 &contained.local_id,
                 &contained.content,
                 version_id,
+                last_updated,
                 fhir_version,
                 &contained.values,
             );
@@ -1047,24 +1170,12 @@ impl ElasticsearchBackend {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl ResourceStorage for ElasticsearchBackend {
-    fn backend_name(&self) -> &'static str {
-        "elasticsearch"
-    }
-
-    async fn readiness_check(&self) -> Result<(), BackendError> {
-        <Self as crate::core::Backend>::health_check(self).await
-    }
-
-    fn bulk_write_concurrency(&self) -> usize {
-        // One index request per resource; ES absorbs parallel writers.
-        8
-    }
-
-    async fn create(
+    /// A single-document create. Elasticsearch is always a search secondary,
+    /// so `meta.versionId` and `meta.lastUpdated` come from the primary when
+    /// present. A body with neither still starts at version 1 and now — the
+    /// path integration tests use to seed an index — and logs a warning.
+    async fn index_new(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1081,7 +1192,18 @@ impl ResourceStorage for ElasticsearchBackend {
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
 
-        let version_id = "1";
+        let (version_id, now) = match primary_write_meta(&resource) {
+            Some((version, last_updated)) => (version, last_updated.unwrap_or_else(Utc::now)),
+            None => {
+                tracing::warn!(
+                    resource_type,
+                    id,
+                    "Elasticsearch create has no primary meta.versionId; indexing as version 1"
+                );
+                ("1".to_string(), Utc::now())
+            }
+        };
+        let version_id = version_id.as_str();
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -1099,12 +1221,14 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
-        // Build ES document
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
         let doc = build_es_document(
             tenant_id,
             resource_type,
             &id,
             version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1141,12 +1265,12 @@ impl ResourceStorage for ElasticsearchBackend {
                 &resource,
                 fhir_version,
                 version_id,
+                now,
                 false,
             )
             .await?;
         }
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             &id,
@@ -1170,7 +1294,11 @@ impl ResourceStorage for ElasticsearchBackend {
     /// cost N refresh waits — the ~1.4k-resource conformance seed took over
     /// twenty minutes and the server never came up — while one bulk request
     /// costs one.
-    async fn create_many(
+    ///
+    /// Each document takes the resource's own `meta.versionId` and
+    /// `meta.lastUpdated` when the primary stamped them; otherwise version 1
+    /// and the batch instant, with a warning.
+    async fn index_many(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1196,8 +1324,11 @@ impl ResourceStorage for ElasticsearchBackend {
         }
 
         let tenant_id = tenant.tenant_id().as_str();
-        let version_id = "1";
         let extractor = self.tenant_extractor(tenant_id);
+        // One instant for the batch: indexed as every document's
+        // `last_updated` and returned as each stored resource's
+        // `meta.lastUpdated` (#1593).
+        let now = Utc::now();
 
         // Every document each resource contributes — its own, plus one per
         // `contained` entry — addressed by (index, doc id). Built up front so
@@ -1205,6 +1336,8 @@ impl ResourceStorage for ElasticsearchBackend {
         // out in a few requests.
         struct Prepared {
             id: String,
+            version_id: String,
+            last_updated: DateTime<Utc>,
             resource: Value,
             docs: Vec<(String, String, Value)>,
         }
@@ -1224,6 +1357,19 @@ impl ResourceStorage for ElasticsearchBackend {
                     );
                     obj.insert("id".to_string(), Value::String(id.clone()));
                 }
+                let (version_id, last_updated) = match primary_write_meta(&resource) {
+                    Some((version, last_updated)) => {
+                        (version, last_updated.unwrap_or(now))
+                    }
+                    None => {
+                        tracing::warn!(
+                            resource_type,
+                            id,
+                            "Elasticsearch create_many has no primary meta.versionId; indexing as version 1"
+                        );
+                        ("1".to_string(), now)
+                    }
+                };
                 let extracted_values = extractor
                     .extract(&resource, resource_type)
                     .unwrap_or_default();
@@ -1234,7 +1380,8 @@ impl ResourceStorage for ElasticsearchBackend {
                         tenant_id,
                         resource_type,
                         &id,
-                        version_id,
+                        &version_id,
+                        last_updated,
                         &resource,
                         fhir_version,
                         &extracted_values,
@@ -1255,13 +1402,20 @@ impl ResourceStorage for ElasticsearchBackend {
                             &contained.contained_type,
                             &contained.local_id,
                             &contained.content,
-                            version_id,
+                            &version_id,
+                            last_updated,
                             fhir_version,
                             &contained.values,
                         ),
                     ));
                 }
-                Prepared { id, resource, docs }
+                Prepared {
+                    id,
+                    version_id,
+                    last_updated,
+                    resource,
+                    docs,
+                }
             })
             .collect();
 
@@ -1295,7 +1449,6 @@ impl ResourceStorage for ElasticsearchBackend {
             .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
             .await;
 
-        let now = Utc::now();
         prepared
             .into_iter()
             .zip(failures)
@@ -1304,11 +1457,11 @@ impl ResourceStorage for ElasticsearchBackend {
                 None => Ok(StoredResource::from_storage(
                     resource_type,
                     &p.id,
-                    version_id,
+                    &p.version_id,
                     tenant.tenant_id().clone(),
                     p.resource,
-                    now,
-                    now,
+                    p.last_updated,
+                    p.last_updated,
                     None,
                     fhir_version,
                 )),
@@ -1316,7 +1469,12 @@ impl ResourceStorage for ElasticsearchBackend {
             .collect()
     }
 
-    async fn create_or_update(
+    /// PUT semantics. When the primary stamped `meta.versionId`, that version
+    /// and `meta.lastUpdated` are indexed and the existence GET is skipped;
+    /// the write is new exactly when the primary's version is 1.
+    /// Without them this backend still counts its own versions — the seed
+    /// path used by tests — and logs a warning.
+    async fn upsert(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1326,68 +1484,81 @@ impl ResourceStorage for ElasticsearchBackend {
     ) -> StorageResult<(StoredResource, bool)> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check if document exists
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        // Deciding "this resource is new, start at version 1" requires knowing that
-        // it does not already exist. Only Elasticsearch saying so establishes that
-        // (`"found": false`, or the index does not exist) — the same two answers
-        // `read` accepts, through the same retried request (#1364). If the
-        // existence check failed, or was answered by something else with a bare
-        // 404, we must not guess "new" — doing so would reset the version of a
-        // resource that does exist, silently clobbering its history.
-        let op = ReadOp::Get { doc_id: &doc_id };
-        let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
+        let (version_id, now, is_new) =
+            if let Some((version, last_updated)) = primary_write_meta(&resource) {
+                // The primary assigns versions, so its version 1 is a create.
+                let is_new = version == "1";
+                (version, last_updated.unwrap_or_else(Utc::now), is_new)
+            } else {
+                tracing::warn!(
+                    resource_type,
+                    id,
+                    "Elasticsearch create_or_update has no primary meta.versionId; \
+                 fetching the existing document to increment its version"
+                );
+                // Deciding "this resource is new, start at version 1" requires knowing that
+                // it does not already exist. Only Elasticsearch saying so establishes that
+                // (`"found": false`, or the index does not exist) — the same two answers
+                // `read` accepts, through the same retried request (#1364). If the
+                // existence check failed, or was answered by something else with a bare
+                // 404, we must not guess "new" — doing so would reset the version of a
+                // resource that does exist, silently clobbering its history.
+                let op = ReadOp::Get { doc_id: &doc_id };
+                let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
 
-        let (version_id, is_new) = match existing {
-            Some(body) => {
-                let source = body.get("_source");
-                // Belt-and-braces tenant guard, mirroring `read` (see below).
-                //
-                // After the #384 fix an injective `index_name` already guarantees
-                // this index belongs to exactly one tenant, so this check should
-                // never fire. It is kept because this is the one place the backend
-                // reads *foreign state* to make a *write* decision, and a future
-                // regression in the naming derivation would otherwise silently
-                // resume deriving one tenant's version from another's document.
-                //
-                // A mismatch is treated as **absent**, not as an error. An index
-                // upgraded from the pre-fix layout can still hold documents left
-                // behind by a colliding tenant; erroring would brick the rightful
-                // owner on exactly those ids, permanently, with no operator
-                // remedy. Treating them as absent is self-healing — the foreign
-                // document is overwritten and leaves an index it never belonged
-                // in — and is correct on the merits: from this tenant's
-                // perspective the resource genuinely does not exist. Resetting the
-                // version is harmless because Elasticsearch keeps no history and,
-                // in every supported composite mode, the primary is authoritative
-                // for version assignment (writes always land there first).
-                let doc_tenant = source
-                    .and_then(|s| s.get("tenant_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if doc_tenant != tenant_id {
-                    tracing::warn!(
-                        tenant = %tenant_id,
-                        found_tenant = %doc_tenant,
-                        resource_type,
-                        id,
-                        "Elasticsearch document at this address belongs to another tenant; \
-                         treating as absent and overwriting (see issue #384)"
-                    );
-                    ("1".to_string(), true)
-                } else {
-                    let current_version: u64 = source
-                        .and_then(|s| s.get("version_id"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    ((current_version + 1).to_string(), false)
-                }
-            }
-            None => ("1".to_string(), true),
-        };
+                let (version_id, is_new) = match existing {
+                    Some(body) => {
+                        let source = body.get("_source");
+                        // Belt-and-braces tenant guard, mirroring `read` (see below).
+                        //
+                        // After the #384 fix an injective `index_name` already guarantees
+                        // this index belongs to exactly one tenant, so this check should
+                        // never fire. It is kept because this is the one place the backend
+                        // reads *foreign state* to make a *write* decision, and a future
+                        // regression in the naming derivation would otherwise silently
+                        // resume deriving one tenant's version from another's document.
+                        //
+                        // A mismatch is treated as **absent**, not as an error. An index
+                        // upgraded from the pre-fix layout can still hold documents left
+                        // behind by a colliding tenant; erroring would brick the rightful
+                        // owner on exactly those ids, permanently, with no operator
+                        // remedy. Treating them as absent is self-healing — the foreign
+                        // document is overwritten and leaves an index it never belonged
+                        // in — and is correct on the merits: from this tenant's
+                        // perspective the resource genuinely does not exist. Resetting the
+                        // version is harmless because Elasticsearch keeps no history and,
+                        // in every supported composite mode, the primary is authoritative
+                        // for version assignment (writes always land there first).
+                        let doc_tenant = source
+                            .and_then(|s| s.get("tenant_id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if doc_tenant != tenant_id {
+                            tracing::warn!(
+                                tenant = %tenant_id,
+                                found_tenant = %doc_tenant,
+                                resource_type,
+                                id,
+                                "Elasticsearch document at this address belongs to another tenant; \
+                                 treating as absent and overwriting (see issue #384)"
+                            );
+                            ("1".to_string(), true)
+                        } else {
+                            let current_version: u64 = source
+                                .and_then(|s| s.get("version_id"))
+                                .and_then(|v| v.as_str())
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            ((current_version + 1).to_string(), false)
+                        }
+                    }
+                    None => ("1".to_string(), true),
+                };
+                (version_id, Utc::now(), is_new)
+            };
 
         // Ensure resource has correct type and id
         let mut resource = resource;
@@ -1405,11 +1576,14 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1437,11 +1611,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok((
             StoredResource::from_storage(
                 resource_type,
@@ -1456,6 +1630,62 @@ impl ResourceStorage for ElasticsearchBackend {
             ),
             is_new,
         ))
+    }
+}
+
+#[async_trait]
+impl ResourceStorage for ElasticsearchBackend {
+    fn backend_name(&self) -> &'static str {
+        "elasticsearch"
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // One index request per resource; ES absorbs parallel writers.
+        8
+    }
+
+    async fn create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.index_new(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        Some(self)
+    }
+
+    /// `_bulk` requests of at most [`BULK_OPS_PER_REQUEST`] operations; see
+    /// [`ElasticsearchBackend::index_many`].
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.index_many(tenant, resource_type, resources, fhir_version)
+            .await
+    }
+
+    async fn create_or_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.upsert(tenant, resource_type, id, resource, fhir_version)
+            .await
     }
 
     async fn read(
@@ -1540,11 +1770,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1575,11 +1809,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             id,
@@ -1672,8 +1906,9 @@ impl ResourceStorage for ElasticsearchBackend {
     /// Every stored resource of the tenant, counted per type in one
     /// aggregation over the tenant's indices — what the dashboard needs from
     /// a composite whose primary keeps no counts (#1280). Contained documents
-    /// are synthetic copies and do not count; a tenant with no indices is an
-    /// empty list, a failed request an error, never zeros (#1364).
+    /// are synthetic copies and do not count; a tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — is an empty list, a failed request an error, never zeros (#1364).
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let tenant_id = tenant.tenant_id().as_str();
         let pattern = tenant_index_pattern(self, tenant_id);
@@ -1682,7 +1917,7 @@ impl ResourceStorage for ElasticsearchBackend {
             "query": stored_documents_of(tenant_id),
             "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "types")?
@@ -1700,8 +1935,15 @@ impl ResourceStorage for ElasticsearchBackend {
         true
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        // Index documents, exact relative to the index only: it may lag or
+        // omit the primary store (#1518, #1850).
+        Some(crate::core::CountBasis::IndexedLiveDocuments)
+    }
+
     /// Stored resources of `resource_type` per UTC day of their `last_updated`
     /// — the day of each resource's current version, as the contract asks.
+    /// A missing index is an empty list (its 404 is read as such).
     async fn count_by_day(
         &self,
         tenant: &TenantContext,
@@ -1724,7 +1966,10 @@ impl ResourceStorage for ElasticsearchBackend {
                 "min_doc_count": 1
             } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+        // The concrete index never answers zero shards on a real cluster (a
+        // missing one is a 404, a closed one an error); the wrapper keeps this
+        // read uniform with the glob reads should one ever do so (#1906).
+        let Some(body) = send_aggregation_search(self, &index, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "days")?
@@ -1748,7 +1993,9 @@ impl ResourceStorage for ElasticsearchBackend {
 
     /// The newest `last_updated` across the tenant's documents, plus how many
     /// were written since `recent_since` when asked — one aggregation request
-    /// over the tenant's indices, no scan.
+    /// over the tenant's indices, no scan. A tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — has no latest write and, when asked, `0` recent ones.
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1769,7 +2016,7 @@ impl ResourceStorage for ElasticsearchBackend {
             }},
             "aggs": aggs
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Some(WriteMarker {
                 latest: None,
                 recent_writes: recent_since.map(|_| 0),
@@ -1828,8 +2075,36 @@ impl ResourceStorage for ElasticsearchBackend {
     }
 }
 
+/// Builds one page of the reindex walk: `search_after` keyset pagination over a
+/// total sort order, excluding contained docs (synthetic, rebuilt from their
+/// container), returning only the hit fields the parser reads.
+fn reindex_page_body(tenant_id: &str, limit: u32, cursor: Option<&str>) -> StorageResult<Value> {
+    let mut body = json!({
+        "size": limit,
+        "query": { "bool": {
+            "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_deleted": false } }
+            ],
+            "must_not": [ { "term": { "is_contained": true } } ]
+        }},
+        "_source": HIT_SOURCE_FIELDS,
+        "sort": [
+            { "last_updated": "asc" },
+            { "resource_id": "asc" }
+        ]
+    });
+
+    if let Some(raw) = cursor {
+        let after: Value = serde_json::from_str(raw)
+            .map_err(|e| internal_error(format!("Malformed reindex cursor: {e}")))?;
+        body["search_after"] = after;
+    }
+    Ok(body)
+}
+
 /// Parses a StoredResource from an ES `_source` document.
-fn parse_stored_resource(
+pub(super) fn parse_stored_resource(
     source: &Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
@@ -1986,6 +2261,16 @@ impl ElasticsearchBackend {
     ///   the same way. Its message names the error's `type` and `reason`.
     /// - Anything else on the whole request (connection refused, `5xx`, an
     ///   unreadable response) fails its operations as transient.
+    ///
+    /// The message of a transient failure is client text: it is built by
+    /// [`crate::error::elasticsearch_unavailable_message`] once per batch (per
+    /// status for item failures), so the transport error or Elasticsearch's
+    /// response body goes to the log and not into the message (#2385). The one
+    /// exception is the "Not sent" text of a page cut short by a stalled
+    /// cluster, which names no Elasticsearch answer and follows the timeout
+    /// that was logged. A permanent failure is an `Internal`, which REST
+    /// answers with a fixed text, and keeps Elasticsearch's answer in its
+    /// message; bulk-ingest receipts still carry that message.
     async fn send_bulk_index(
         &self,
         ops: &[(usize, &str, &str, &Value)],
@@ -2137,9 +2422,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) if e.is_timeout() => {
-                        let message = format!(
-                            "Bulk index request for a single document timed out after {} ms: {e}",
-                            self.request_timeout_ms()
+                        // One log line for the whole batch and the rest of the
+                        // page: `message` is the client text they all share.
+                        let message = crate::error::elasticsearch_unavailable_message(
+                            &format!(
+                                "Bulk index request for a single document timed out after {} ms",
+                                self.request_timeout_ms()
+                            ),
+                            &e,
                         );
                         fail_batch(&mut failures, &message, true);
                         // A lone document timing out means the cluster, not the
@@ -2163,7 +2453,10 @@ impl ElasticsearchBackend {
                     Err(e) => {
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to send bulk index request: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to send bulk index request",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2187,14 +2480,27 @@ impl ElasticsearchBackend {
                         split(&mut queue, batch, reason);
                     } else {
                         let body = response.text().await.unwrap_or_default();
-                        let message = if too_large {
-                            format!("Document too large for a bulk request (status 413): {body}")
+                        if too_large {
+                            // Permanent, so an `Internal` whose message is not
+                            // client text: it keeps the body.
+                            fail_batch(
+                                &mut failures,
+                                &format!(
+                                    "Document too large for a bulk request (status 413): {body}"
+                                ),
+                                false,
+                            );
                         } else {
-                            format!(
-                                "Bulk index request for a single document timed out (status {status}): {body}"
-                            )
-                        };
-                        fail_batch(&mut failures, &message, timed_out);
+                            // Transient, so an `Unavailable`: the body goes to the
+                            // log, one line for the batch (#2385).
+                            let message = crate::error::elasticsearch_unavailable_message(
+                                &format!(
+                                    "Bulk index request for a single document timed out (status {status})"
+                                ),
+                                &body,
+                            );
+                            fail_batch(&mut failures, &message, true);
+                        }
                     }
                     continue;
                 }
@@ -2207,23 +2513,28 @@ impl ElasticsearchBackend {
                             depth: batch.depth,
                         });
                     } else {
-                        fail_batch(
-                            &mut failures,
+                        let message = crate::error::elasticsearch_unavailable_message(
                             &format!(
-                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times: {body}"
+                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times"
                             ),
-                            true,
+                            &body,
                         );
+                        fail_batch(&mut failures, &message, true);
                     }
                     continue;
                 }
                 if !(200..300).contains(&status) {
                     let body = response.text().await.unwrap_or_default();
-                    fail_batch(
-                        &mut failures,
-                        &format!("Bulk index request failed (status {status}): {body}"),
-                        is_transient_bulk_status(u64::from(status)),
-                    );
+                    let transient = is_transient_bulk_status(u64::from(status));
+                    let message = if transient {
+                        crate::error::elasticsearch_unavailable_message(
+                            &format!("Bulk index request failed (status {status})"),
+                            &body,
+                        )
+                    } else {
+                        format!("Bulk index request failed (status {status}): {body}")
+                    };
+                    fail_batch(&mut failures, &message, transient);
                     continue;
                 }
 
@@ -2234,9 +2545,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) => {
+                        // reqwest's `Display` appends ` for url (...)` here
+                        // too, so the detail goes to the log.
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to read bulk index response: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to read bulk index response",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2244,7 +2560,14 @@ impl ElasticsearchBackend {
                 };
                 let items = payload.get("items").and_then(Value::as_array);
                 let mut throttled: Vec<usize> = Vec::new();
-                let mut throttle_message: Option<String> = None;
+                // The first throttled item's error, for the log line if the
+                // resends run out.
+                let mut throttle_error: Option<String> = None;
+                // The client text of the transient item failures of this
+                // batch, built (and logged) once per status rather than once
+                // per document (#2385).
+                let mut transient_texts: std::collections::HashMap<u64, String> =
+                    std::collections::HashMap::new();
                 for (item_position, &position) in batch.ops.iter().enumerate() {
                     let item = items
                         .and_then(|items| items.get(item_position))
@@ -2260,21 +2583,33 @@ impl ElasticsearchBackend {
                         .and_then(|v| v.get("error"))
                         .map(describe_item_error)
                         .unwrap_or_else(|| "no item in bulk response".to_string());
-                    let message =
-                        format!("Failed to index document (status {item_status}): {error}");
                     if item_status == 429 {
                         throttled.push(position);
-                        throttle_message.get_or_insert(message);
+                        throttle_error.get_or_insert(error);
                         continue;
                     }
                     // A missing item (status 0) means the response did not
                     // account for the document, not that it was rejected.
-                    fail(
-                        &mut failures,
-                        ops[position].0,
-                        &message,
-                        item_status == 0 || is_transient_bulk_status(item_status),
-                    );
+                    if item_status == 0 || is_transient_bulk_status(item_status) {
+                        // The item's error (type, reason, often the index name)
+                        // is Elasticsearch's answer: it goes to the log.
+                        let text = transient_texts.entry(item_status).or_insert_with(|| {
+                            crate::error::elasticsearch_unavailable_message(
+                                &format!("Failed to index document (status {item_status})"),
+                                &error,
+                            )
+                        });
+                        fail(&mut failures, ops[position].0, text, true);
+                    } else {
+                        // A rejection of the document itself is permanent, so an
+                        // `Internal`; its type and reason stay in the message.
+                        fail(
+                            &mut failures,
+                            ops[position].0,
+                            &format!("Failed to index document (status {item_status}): {error}"),
+                            false,
+                        );
+                    }
                 }
                 if !throttled.is_empty() {
                     if batch.resends + 1 < BULK_MAX_ATTEMPTS {
@@ -2284,9 +2619,13 @@ impl ElasticsearchBackend {
                             depth: batch.depth,
                         });
                     } else {
-                        let message = format!(
-                            "{} (throttled {BULK_MAX_ATTEMPTS} times)",
-                            throttle_message.unwrap_or_default()
+                        // One text, one log line, for every throttled document
+                        // of the batch.
+                        let message = crate::error::elasticsearch_unavailable_message(
+                            &format!(
+                                "Failed to index document (status 429, throttled {BULK_MAX_ATTEMPTS} times)"
+                            ),
+                            &throttle_error.unwrap_or_default(),
                         );
                         for position in throttled {
                             fail(&mut failures, ops[position].0, &message, true);
@@ -2322,8 +2661,275 @@ impl ElasticsearchBackend {
     }
 }
 
+impl ElasticsearchBackend {
+    /// One page: extract every resource's documents (on the prepare pool
+    /// when the page is large enough and the runtime allows, #1250), make
+    /// sure each index touched exists, then send the documents in `_bulk`
+    /// requests. `stats.extract` is the extraction, `stats.insert` the
+    /// `_bulk` round trips, `inserted_entries` the documents sent;
+    /// `pool_sub_batches` says whether the page ran on the pool. `refresh`
+    /// is the rebuild's policy or, for composite sync, the ordinary write one.
+    async fn write_search_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+        refresh: Option<Refresh>,
+    ) -> Vec<StorageResult<usize>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let extractor = self.tenant_extractor(tenant_id);
+
+        // Every document each resource contributes, plus the value count its
+        // successful outcome reports and the index types it touched.
+        struct Prepared {
+            values: usize,
+            docs: Vec<(String, String, Value)>,
+            failure: Option<String>,
+            types: Vec<String>,
+        }
+        let prepare = |i: usize| -> Prepared {
+            let resource = &resources[i];
+            let resource_type = resource.resource_type();
+            let id = resource.id();
+            if resource.version_id().is_empty() {
+                return Prepared {
+                    values: 0,
+                    docs: Vec::new(),
+                    failure: Some(format!(
+                        "Elasticsearch is a search secondary and cannot assign versions; \
+                         {resource_type}/{id} has no versionId from the primary"
+                    )),
+                    types: Vec::new(),
+                };
+            }
+            let content = resource.content();
+            let fhir_version = resource.fhir_version();
+            let extracted_values = match extractor.extract(content, resource_type) {
+                Ok(values) => values,
+                Err(e) => {
+                    return Prepared {
+                        values: 0,
+                        docs: Vec::new(),
+                        failure: Some(format!("Search parameter extraction failed: {e}")),
+                        types: Vec::new(),
+                    };
+                }
+            };
+            let mut types = vec![resource_type.to_string()];
+            let mut docs = vec![(
+                self.index_name(tenant_id, resource_type),
+                Self::document_id(resource_type, id),
+                build_es_document(
+                    tenant_id,
+                    resource_type,
+                    id,
+                    resource.version_id(),
+                    resource.last_modified(),
+                    content,
+                    fhir_version,
+                    &extracted_values,
+                ),
+            )];
+            for contained in extractor.extract_contained(content) {
+                types.push(contained.contained_type.clone());
+                docs.push((
+                    self.index_name(tenant_id, &contained.contained_type),
+                    Self::document_id(
+                        &contained.contained_type,
+                        &contained_resource_id(id, &contained.local_id),
+                    ),
+                    build_es_contained_document(
+                        tenant_id,
+                        resource_type,
+                        id,
+                        &contained.contained_type,
+                        &contained.local_id,
+                        &contained.content,
+                        resource.version_id(),
+                        resource.last_modified(),
+                        fhir_version,
+                        &contained.values,
+                    ),
+                ));
+            }
+            Prepared {
+                values: extracted_values.len(),
+                docs,
+                failure: None,
+                types,
+            }
+        };
+
+        // Extraction is pure CPU and, page after page, what HFS spends its
+        // one busy core on during a rebuild (#1250). A page of at least
+        // `REINDEX_POOL_MIN_PAGE` resources on a multi-thread runtime goes to
+        // the prepare pool, in input order; anything smaller, a
+        // current-thread runtime, a width-1 configuration or a pool already
+        // busy with another page extracts inline, exactly as before.
+        let n = resources.len();
+        let multi_thread = tokio_multi_thread_runtime();
+        self.log_reindex_writer_configuration(multi_thread);
+        let started = Instant::now();
+        let (prepared, on_pool) = if multi_thread && n >= REINDEX_POOL_MIN_PAGE {
+            let env = PrepareEnv {
+                pool: self.reindex_prepare_pool(),
+                gate: self.reindex_prepare_gate(),
+            };
+            extract_range(&env, 0..n, &prepare)
+        } else {
+            ((0..n).map(&prepare).collect(), false)
+        };
+        stats.extract += started.elapsed();
+        stats.sub_batches += 1;
+        stats.pool_sub_batches += u64::from(on_pool);
+
+        // Ensure every index touched exists, once each — not once per resource.
+        let mut ensured = std::collections::HashSet::new();
+        for ty in prepared.iter().flat_map(|p| p.types.iter()) {
+            if ensured.insert(ty.as_str())
+                && let Err(e) = schema::ensure_index(self, tenant_id, ty).await
+            {
+                // Keep whether it was an outage: the rebuild retries an
+                // unreachable cluster, not a rejected resource (#1125).
+                let message = error_detail(&e);
+                let unavailable = is_unavailable(&e);
+                return resources
+                    .iter()
+                    .map(|_| {
+                        Err(if unavailable {
+                            unavailable_client_text(message.clone())
+                        } else {
+                            internal_error(message.clone())
+                        })
+                    })
+                    .collect();
+            }
+        }
+
+        let ops: Vec<(usize, &str, &str, &Value)> = prepared
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                p.docs
+                    .iter()
+                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
+            })
+            .collect();
+        let documents = ops.len() as u64;
+        let send_started = Instant::now();
+        let failures = self.send_bulk_index(&ops, prepared.len(), refresh).await;
+        stats.insert += send_started.elapsed();
+        stats.inserted_entries += documents;
+        stats.db_wait = Some(stats.insert);
+
+        prepared
+            .into_iter()
+            .zip(failures)
+            .map(|(p, failure)| match (p.failure, failure) {
+                (Some(message), _) => Err(internal_error(message)),
+                // `$reindex` retries a run only for transient failures, so a
+                // rejection must not pass for an outage or the reverse.
+                (None, Some(failure)) if failure.transient => {
+                    Err(unavailable_client_text(failure.message))
+                }
+                (None, Some(failure)) => Err(internal_error(failure.message)),
+                (None, None) => Ok(p.values),
+            })
+            .collect()
+    }
+}
+
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
+    /// Lists the distinct resource ids the type has documents for: top-level
+    /// documents by `resource_id`, contained documents by their container's
+    /// `container_id`, in id order. The cursor is the last id returned.
+    ///
+    /// Contained documents live in their own type's index, so the search runs
+    /// over the whole tenant pattern; the `tenant_id` term is what bounds it
+    /// to the tenant (see `clear_search_index_for_types`).
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let composite = |field: &str| {
+            let mut c = json!({
+                "size": limit,
+                "sources": [{ "id": { "terms": { "field": field } } }]
+            });
+            if let Some(after) = cursor {
+                c["after"] = json!({ "id": after });
+            }
+            json!({ "composite": c })
+        };
+        let body = json!({
+            "size": 0,
+            "query": { "term": { "tenant_id": tenant_id } },
+            "aggs": {
+                "top": {
+                    "filter": { "bool": {
+                        "filter": [{ "term": { "resource_type": resource_type } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    "aggs": { "ids": composite("resource_id") }
+                },
+                "contained": {
+                    "filter": { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "term": { "container_type": resource_type } }
+                    ] } },
+                    "aggs": { "ids": composite("container_id") }
+                }
+            }
+        });
+
+        // A tenant with no indices has nothing indexed. A failed read is an
+        // error, never "no ids": that would let the sweep conclude there is
+        // nothing to remove.
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok((Vec::new(), None));
+        };
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for agg in ["top", "contained"] {
+            let buckets = body
+                .pointer(&format!("/aggregations/{agg}/ids/buckets"))
+                .and_then(|b| b.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            any_full |= buckets.len() >= limit as usize;
+            merged.extend(
+                buckets
+                    .iter()
+                    .filter_map(|b| b.pointer("/key/id").and_then(|k| k.as_str()))
+                    .map(str::to_string),
+            );
+        }
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
+    /// Elasticsearch upserts documents by `_id`, so a page rebuild keeps the
+    /// document of a `contained[]` entry the resource has since dropped; the
+    /// driver deletes the page's entries first for a writer that answers
+    /// `false` (#2278).
+    fn page_write_replaces_all_entries(&self) -> bool {
+        false
+    }
+
     /// Deletes the resource's document and every contained document derived
     /// from it; see [`Self::delete_search_entries_for_resources`].
     ///
@@ -2419,135 +3025,44 @@ impl ReindexTarget for ElasticsearchBackend {
     /// Under `refresh=wait_for` the saving is larger still: that policy blocks
     /// each write until the next scheduled refresh, so per-document writes cost
     /// one refresh wait each while a bulk request costs one for the page.
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
+    /// path and the composite ingest sink's never diverge.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
-        if resources.is_empty() {
-            return Vec::new();
-        }
-        let tenant_id = tenant.tenant_id().as_str();
-        let extractor = self.tenant_extractor(tenant_id);
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
 
-        // Every document each resource contributes, plus the value count its
-        // successful outcome reports.
-        struct Prepared {
-            values: usize,
-            docs: Vec<(String, String, Value)>,
-            failure: Option<String>,
-        }
-        let mut types_touched: Vec<String> = Vec::new();
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let resource_type = resource.resource_type();
-                let id = resource.id();
-                let content = resource.content();
-                let fhir_version = resource.fhir_version();
-                let extracted_values = match extractor.extract(content, resource_type) {
-                    Ok(values) => values,
-                    Err(e) => {
-                        return Prepared {
-                            values: 0,
-                            docs: Vec::new(),
-                            failure: Some(format!("Search parameter extraction failed: {e}")),
-                        };
-                    }
-                };
-                types_touched.push(resource_type.to_string());
-                let mut docs = vec![(
-                    self.index_name(tenant_id, resource_type),
-                    Self::document_id(resource_type, id),
-                    build_es_document(
-                        tenant_id,
-                        resource_type,
-                        id,
-                        resource.version_id(),
-                        content,
-                        fhir_version,
-                        &extracted_values,
-                    ),
-                )];
-                for contained in extractor.extract_contained(content) {
-                    types_touched.push(contained.contained_type.clone());
-                    docs.push((
-                        self.index_name(tenant_id, &contained.contained_type),
-                        Self::document_id(
-                            &contained.contained_type,
-                            &contained_resource_id(id, &contained.local_id),
-                        ),
-                        build_es_contained_document(
-                            tenant_id,
-                            resource_type,
-                            id,
-                            &contained.contained_type,
-                            &contained.local_id,
-                            &contained.content,
-                            resource.version_id(),
-                            fhir_version,
-                            &contained.values,
-                        ),
-                    ));
-                }
-                Prepared {
-                    values: extracted_values.len(),
-                    docs,
-                    failure: None,
-                }
-            })
-            .collect();
+    /// The rebuild's page, under
+    /// [`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh);
+    /// see `ElasticsearchBackend::write_search_page`.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        self.write_search_page(tenant, resources, stats, self.reindex_refresh_param())
+            .await
+    }
 
-        // Ensure every index touched exists, once each — not once per resource.
-        let mut ensured = std::collections::HashSet::new();
-        for ty in types_touched {
-            if ensured.insert(ty.clone())
-                && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
-            {
-                // Keep whether it was an outage: the rebuild retries an
-                // unreachable cluster, not a rejected resource (#1125).
-                let message = error_detail(&e);
-                let unavailable = is_unavailable(&e);
-                return resources
-                    .iter()
-                    .map(|_| {
-                        Err(if unavailable {
-                            unavailable_error(message.clone())
-                        } else {
-                            internal_error(message.clone())
-                        })
-                    })
-                    .collect();
-            }
-        }
-
-        let ops: Vec<(usize, &str, &str, &Value)> = prepared
-            .iter()
-            .enumerate()
-            .flat_map(|(i, p)| {
-                p.docs
-                    .iter()
-                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
-            })
-            .collect();
-        let failures = self
-            .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
-            .await;
-
-        prepared
-            .into_iter()
-            .zip(failures)
-            .map(|(p, failure)| match (p.failure, failure) {
-                (Some(message), _) => Err(internal_error(message)),
-                // `$reindex` retries a run only for transient failures, so a
-                // rejection must not pass for an outage or the reverse.
-                (None, Some(failure)) if failure.transient => {
-                    Err(unavailable_error(failure.message))
-                }
-                (None, Some(failure)) => Err(internal_error(failure.message)),
-                (None, None) => Ok(p.values),
-            })
-            .collect()
+    /// Composite sync of writes the primary just made: the same `_bulk`
+    /// page, under the ordinary write refresh policy, so a search right
+    /// after a transaction bundle sees it even when rebuilds skip the
+    /// refresh wait.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_page(tenant, resources, &mut stats, self.write_refresh_param())
+            .await
     }
 
     async fn write_search_entries(
@@ -2555,6 +3070,12 @@ impl ReindexTarget for ElasticsearchBackend {
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
+        if resource.version_id().is_empty() {
+            return Err(missing_primary_version(
+                resource.resource_type(),
+                resource.id(),
+            ));
+        }
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = resource.resource_type();
         let resource_id = resource.id();
@@ -2566,14 +3087,16 @@ impl ReindexTarget for ElasticsearchBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
 
-        // The document carries version_id and fhir_version, neither of which is
-        // recoverable from the resource JSON — which is why ReindexTarget hands
-        // over the whole StoredResource rather than just its content.
+        // The document carries version_id, last_updated and fhir_version, none
+        // of which is recoverable from the resource JSON — which is why
+        // ReindexTarget hands over the whole StoredResource rather than just
+        // its content.
         let doc = build_es_document(
             tenant_id,
             resource_type,
             resource_id,
             resource.version_id(),
+            resource.last_modified(),
             content,
             fhir_version,
             &extracted_values,
@@ -2601,6 +3124,7 @@ impl ReindexTarget for ElasticsearchBackend {
             content,
             fhir_version,
             resource.version_id(),
+            resource.last_modified(),
             true,
         )
         .await?;
@@ -2715,26 +3239,7 @@ impl ReindexSource for ElasticsearchBackend {
         // `search_after` keyset pagination over a total sort order. Excludes
         // contained docs, which are synthetic and get rebuilt from their
         // container rather than being reindexed in their own right.
-        let mut body = json!({
-            "size": limit,
-            "query": { "bool": {
-                "filter": [
-                    { "term": { "tenant_id": tenant_id } },
-                    { "term": { "is_deleted": false } }
-                ],
-                "must_not": [ { "term": { "is_contained": true } } ]
-            }},
-            "sort": [
-                { "last_updated": "asc" },
-                { "resource_id": "asc" }
-            ]
-        });
-
-        if let Some(raw) = cursor {
-            let after: Value = serde_json::from_str(raw)
-                .map_err(|e| internal_error(format!("Malformed reindex cursor: {e}")))?;
-            body["search_after"] = after;
-        }
+        let body = reindex_page_body(tenant_id, limit, cursor)?;
 
         // Only a missing index is an empty page. A failed page is an error, never
         // "the last page": that would end the walk early and silently truncate
@@ -2832,7 +3337,10 @@ fn stored_documents_of(tenant_id: &str) -> Value {
     }})
 }
 
-fn aggregation_buckets<'a>(body: &'a Value, name: &str) -> StorageResult<&'a Vec<Value>> {
+pub(super) fn aggregation_buckets<'a>(
+    body: &'a Value,
+    name: &str,
+) -> StorageResult<&'a Vec<Value>> {
     body.pointer(&format!("/aggregations/{name}/buckets"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -2849,18 +3357,192 @@ fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
         .ok_or_else(|| internal_error(format!("Aggregation bucket carries no doc_count: {bucket}")))
 }
 
+/// Whether a 2xx search answer is the cluster saying it searched nothing: an
+/// index pattern that matched no index (`allow_no_indices` defaults to true)
+/// answers `200` with `_shards.total: 0` and no `aggregations` at all (#1906).
+///
+/// Only that exact shape counts — `_shards.total` present and `0`, no failed
+/// shard, not timed out, no `aggregations` key. Anything else missing its
+/// aggregations (no `_shards`, shards searched, a shard failure, a timeout)
+/// stays a malformed answer and an error, never "no data" (#1364).
+///
+/// Accepted edge: under the default `expand_wildcards=open`, a tenant glob
+/// matching only closed indices also searches zero shards and reads as empty,
+/// the same answer as a tenant with no index. A closed *concrete* index is
+/// not this case: it answers a non-2xx `index_closed_exception`.
+fn searched_no_shards(body: &Value) -> bool {
+    let Some(shards) = body.get("_shards") else {
+        return false;
+    };
+    let total_is_zero = shards.get("total").and_then(Value::as_u64) == Some(0);
+    let none_failed = match shards.get("failed") {
+        None => true,
+        Some(failed) => failed.as_u64() == Some(0),
+    };
+    let timed_out = body.get("timed_out").and_then(Value::as_bool) == Some(true);
+    total_is_zero && none_failed && !timed_out && body.get("aggregations").is_none()
+}
+
+/// An aggregation `_search` over `index`: `send_read_with_retry`, plus a
+/// zero-shard answer read as "no index" (`None`) like the 404 it stands for
+/// (#1906). The count reads use this; the shared classifier, and the FHIR
+/// search paths that already read `hits` from such an answer, are untouched.
+pub(super) async fn send_aggregation_search(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    let answer = send_read_with_retry(backend, ReadOp::Search, index, body).await?;
+    Ok(answer.filter(|body| !searched_no_shards(body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
         chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable,
+        is_unavailable, jittered_ms, searched_no_shards,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
     use crate::search::extractor::ExtractedValue;
+    use chrono::{DateTime, Utc};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sweep_backend(server: &MockServer, permits: usize) -> super::ElasticsearchBackend {
+        super::ElasticsearchBackend::new(super::super::backend::ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 5_000,
+            index_prefix: "hfs".to_string(),
+            contained_sweep_concurrency: permits,
+            ..Default::default()
+        })
+        .expect("lazy client")
+    }
+
+    fn deleted_none() -> serde_json::Value {
+        json!({ "deleted": 0, "version_conflicts": 0, "failures": [], "timed_out": false })
+    }
+
+    /// Many sweeps at once never exceed the configured number in flight.
+    #[tokio::test]
+    async fn sweeps_in_flight_are_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(deleted_none()),
+            )
+            .mount(&server)
+            .await;
+        let run = |permits: usize| {
+            let server = &server;
+            async move {
+                let backend = std::sync::Arc::new(sweep_backend(server, permits));
+                let started = Instant::now();
+                let tasks: Vec<_> = (0..12)
+                    .map(|i| {
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            backend
+                                .delete_contained_docs("t", "Patient", &i.to_string())
+                                .await
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.unwrap().expect("sweep");
+                }
+                started.elapsed()
+            }
+        };
+        // 12 sweeps of 150 ms through 3 permits take four rounds.
+        let limited = run(3).await;
+        assert!(
+            limited >= Duration::from_millis(570),
+            "at most 3 sweeps at once: {limited:?}"
+        );
+        // Through 12 permits they overlap completely.
+        let unlimited = run(12).await;
+        assert!(
+            unlimited < limited,
+            "all at once is faster: {unlimited:?} vs {limited:?}"
+        );
+    }
+
+    /// A sweep the cluster throttles beyond the write retries is repeated on
+    /// its own, after a back-off; nothing else is sent again, and the write is
+    /// not failed.
+    #[tokio::test]
+    async fn a_throttled_sweep_is_repeated_alone() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": { "type": "too_many_scroll_contexts_exception", "reason": "too many" },
+                "status": 429
+            })))
+            .up_to_n_times(4)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(deleted_none()))
+            .mount(&server)
+            .await;
+        let backend = sweep_backend(&server, 0);
+        backend
+            .delete_contained_docs("t", "Patient", "1")
+            .await
+            .expect("the sweep is repeated until it is taken");
+        let all = server.received_requests().await.unwrap();
+        assert_eq!(all.len(), 5, "4 refusals and the sweep that went through");
+        assert!(
+            all.iter()
+                .all(|r| r.url.path().ends_with("/_delete_by_query"))
+        );
+    }
+
+    /// Retry waits are spread, not the same for every writer.
+    #[test]
+    fn retry_waits_are_jittered_within_half_to_one_and_a_half_times() {
+        let waits: std::collections::HashSet<u64> = (0..200).map(|_| jittered_ms(200)).collect();
+        assert!(waits.iter().all(|w| (100..300).contains(w)), "{waits:?}");
+        assert!(waits.len() > 20, "varies: {} distinct", waits.len());
+    }
+
+    /// A fixed resource instant, nowhere near "now".
+    fn test_instant() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-28T19:39:53.005Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #1593: the document's `last_updated` is the resource's own instant,
+    /// never the time the document was built — the same builder serves the
+    /// `$reindex` page writer, where "now" is the rebuild time.
+    #[test]
+    fn document_carries_the_resources_own_last_updated() {
+        let doc = build_es_document(
+            "t1",
+            "Patient",
+            "p1",
+            "3",
+            test_instant(),
+            &json!({ "resourceType": "Patient", "id": "p1" }),
+            FhirVersion::default(),
+            &[],
+        );
+        assert_eq!(doc["last_updated"], json!("2026-09-28T19:39:53.005+00:00"));
+        assert_eq!(doc["version_id"], json!("3"));
+    }
 
     fn index_date(raw: &str) -> Option<String> {
         let origin = ValueOrigin {
@@ -2957,6 +3639,7 @@ mod tests {
             "Patient",
             "p1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Patient", "id": "p1" }),
             FhirVersion::default(),
             &[
@@ -3012,6 +3695,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[
@@ -3063,6 +3747,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[
@@ -3175,12 +3860,13 @@ mod tests {
 
     #[test]
     fn a_page_wide_error_keeps_the_detail_unavailable_does_not_display() {
+        let text = "Failed to check index existence: the search index is temporarily unavailable; retry the request";
         let outage = StorageError::Backend(BackendError::Unavailable {
             backend_name: "elasticsearch".to_string(),
-            message: "Failed to check index existence for hfs_t_patient: timed out".to_string(),
+            message: text.to_string(),
         });
         assert!(is_unavailable(&outage));
-        assert!(error_detail(&outage).contains("timed out"));
+        assert_eq!(error_detail(&outage), text);
 
         let rejection = StorageError::Backend(BackendError::Internal {
             backend_name: "elasticsearch".to_string(),
@@ -3189,5 +3875,50 @@ mod tests {
         });
         assert!(!is_unavailable(&rejection));
         assert!(error_detail(&rejection).contains("mapper_parsing_exception"));
+    }
+
+    /// #1906: a cluster-stated zero-shard answer without aggregations — what a
+    /// tenant glob matching no index gets — is the only 2xx read as "no index".
+    #[test]
+    fn searched_no_shards_is_only_a_clean_zero_shard_answer() {
+        let zero = json!({
+            "took": 0,
+            "timed_out": false,
+            "_shards": { "total": 0, "successful": 0, "skipped": 0, "failed": 0 },
+            "hits": { "total": { "value": 0, "relation": "eq" }, "max_score": null, "hits": [] }
+        });
+        assert!(searched_no_shards(&zero));
+        // `failed` and `timed_out` may be absent.
+        assert!(searched_no_shards(&json!({ "_shards": { "total": 0 } })));
+
+        let mut searched = zero.clone();
+        searched["_shards"] = json!({ "total": 2, "successful": 2, "skipped": 0, "failed": 0 });
+        assert!(!searched_no_shards(&searched), "shards were searched");
+
+        assert!(
+            !searched_no_shards(&json!({ "hits": { "total": { "value": 3 } } })),
+            "no _shards at all is a malformed answer"
+        );
+        assert!(
+            !searched_no_shards(&json!({ "_shards": { "failed": 0 } })),
+            "no _shards.total"
+        );
+
+        let mut failed = zero.clone();
+        failed["_shards"]["failed"] = json!(1);
+        assert!(!searched_no_shards(&failed), "a shard failure");
+        failed["_shards"]["failed"] = json!("1");
+        assert!(!searched_no_shards(&failed), "an unreadable failed count");
+
+        let mut timed_out = zero.clone();
+        timed_out["timed_out"] = json!(true);
+        assert!(!searched_no_shards(&timed_out), "a timeout");
+
+        let mut with_aggs = zero.clone();
+        with_aggs["aggregations"] = json!({ "types": { "buckets": [] } });
+        assert!(
+            !searched_no_shards(&with_aggs),
+            "an answer with aggregations is read as such"
+        );
     }
 }

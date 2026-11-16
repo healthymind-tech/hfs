@@ -642,11 +642,17 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             .await
             .unwrap_or_default();
         if let Some(list) = supp_props.get(&code) {
-            for (prop, value) in list {
+            for property in list {
                 resp.properties.push(PropertyValue {
-                    code: prop.clone(),
-                    value_type: "string".into(),
-                    value: value.clone(),
+                    code: property.code.clone(),
+                    // A whole stored Coding (upstream #2095) stays a Coding;
+                    // every other supplement value is reported as a string.
+                    value_type: if property.value_type == "Coding" {
+                        "Coding".into()
+                    } else {
+                        "string".into()
+                    },
+                    value: property.value.clone(),
                     description: None,
                 });
             }
@@ -735,7 +741,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
         let value_part = if prop.value_type == "coding" {
             json!({"name": "value", "valueCoding": {"system": system, "code": prop.value}})
         } else {
-            property_value_part(&prop.value_type, &prop.value)
+            property_value_part(&prop.value_type, &prop.value)?
         };
         let mut parts = vec![json!({"name": "code", "valueCode": prop.code}), value_part];
         if let Some(desc) = prop.description {

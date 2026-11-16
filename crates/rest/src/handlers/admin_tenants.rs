@@ -6,7 +6,8 @@
 //! handlers add one, backed by [`ResourceStorage`]'s tenant-registry methods:
 //!
 //! - `GET  /admin/tenants` — list tenants (registered ∪ data-discovered) with
-//!   their optional display name, creation date, and current resource count.
+//!   their optional display name, creation date, and current resource count
+//!   (or, on S3, whether they hold data; see [`list_tenants_handler`]).
 //! - `POST /admin/tenants` — register (provision) a new tenant.
 //! - `DELETE /admin/tenants/{id}` — deregister a tenant and, when asked, tear
 //!   down its data.
@@ -21,19 +22,24 @@
 use std::collections::HashMap;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
-use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
-use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
+use helios_auth::Principal;
+use helios_persistence::core::{
+    ErasedScope, ResourceStorage, WriteEvent, WriteObserver, delete_tenant_outputs_everywhere,
+};
+use helios_persistence::tenant::{SYSTEM_TENANT, TenantContext, TenantId, TenantPermissions};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
 
+use crate::audit::AttributeToPrincipal;
 use crate::error::{RestError, RestResult};
+use crate::handlers::tenant_inventory::TenantInventory;
 use crate::state::AppState;
 
 // The tenant-id length cap and reserved-name list that used to live here are
@@ -122,18 +128,38 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
 /// of the **registry** (tenants explicitly provisioned via `POST`, which carry a
 /// `created_at` and optional `display_name`) and tenants merely **discovered**
 /// from stored data (`registered: false`, `created_at: null`) so nothing with
-/// data is hidden. Each row carries the current non-deleted `resources` count.
-/// The internal system tenant is never listed.
+/// data is hidden. The internal system tenant is never listed.
+///
+/// Discovery uses [`ResourceStorage::discover_tenants`] (#1913), never an
+/// exhaustive per-resource count, so each row's data column depends on what the
+/// backend can prove:
+///
+/// - **Counted** (SQLite, PostgreSQL, MongoDB): `resources` is the current
+///   non-deleted count. This payload is unchanged and has no
+///   `resources_evidence` / `has_data` fields.
+/// - **Presence** (S3 prefix-per-tenant): `resources` is `null` on every row,
+///   `has_data` says whether the tenant holds any stored object (a live
+///   resource, a history version or a delete tombstone), and the response
+///   carries `resources_evidence: "presence"`. Counting would list every
+///   resource object of every tenant.
+/// - **Unsupported** (S3 bucket-per-tenant): only registered tenants are
+///   listed, with `resources: null` and `has_data: null` (unknown, not empty),
+///   and `resources_evidence: "unsupported"`.
+///
+/// Uncounted responses also carry `discovery_complete`; when it is `false`
+/// (always for Unsupported), tenants that hold data but were never registered
+/// may be missing, so `tenant_count` is provisional.
 ///
 /// Each row also carries `canonical` — whether the id satisfies
 /// [`TenantId::parse`]. It is `true` for everything this API can create, so the
 /// field only ever matters for ids that predate the canonical validator (issue
 /// #385): those were stored under a wider (or absent) charset and are no longer
 /// reachable through any ingress. This is how an operator finds them. Rows with
-/// `canonical: false` and a non-zero `resources` count are the ones needing
-/// attention — the data is still there, but requests naming that tenant are now
-/// rejected. `DELETE /admin/tenants/{id}` still accepts them, deliberately, so
-/// they can be cleaned up.
+/// `canonical: false` that hold data (a non-zero `resources` count, or
+/// `has_data: true`) are the ones needing attention — the data is still there,
+/// but requests naming that tenant are now rejected. `DELETE
+/// /admin/tenants/{id}` still accepts them, deliberately, so they can be
+/// cleaned up.
 pub async fn list_tenants_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -142,60 +168,95 @@ where
     debug!("Processing admin list-tenants request");
 
     let registered = state.storage().list_tenants().await?;
-    let counts: HashMap<String, u64> = state
-        .storage()
-        .count_by_tenant()
-        .await?
-        .into_iter()
-        .collect();
+    let inventory = TenantInventory::discover(state.storage()).await?;
 
     // `new` (unchecked) then `is_canonical`, not `parse().is_ok()`, to say
     // plainly what this is: reporting on a value that is already stored, never
     // admitting one.
     let is_canonical = |id: &str| helios_persistence::tenant::TenantId::new(id).is_canonical();
 
-    let mut seen = std::collections::HashSet::new();
     let mut tenants = Vec::new();
-    for rec in &registered {
-        seen.insert(rec.id.clone());
-        tenants.push(json!({
-            "id": rec.id,
-            "display_name": rec.display_name,
-            "created_at": rec.created_at,
-            "registered": true,
-            "canonical": is_canonical(&rec.id),
-            "resources": counts.get(&rec.id).copied().unwrap_or(0),
-        }));
-    }
-    // Tenants that have data but were never registered — surfaced so the roster
-    // is complete. They have no creation date or name until registered.
-    let mut discovered: Vec<(&String, &u64)> = counts
-        .iter()
-        .filter(|(id, _)| id.as_str() != SYSTEM_TENANT && !seen.contains(id.as_str()))
-        .collect();
-    discovered.sort_by(|a, b| a.0.cmp(b.0));
-    for (id, n) in discovered {
-        tenants.push(json!({
-            "id": id,
-            "display_name": null,
-            "created_at": null,
-            "registered": false,
-            "canonical": is_canonical(id),
-            "resources": n,
-        }));
+    match &inventory {
+        TenantInventory::Counted(counts) => {
+            let counts: HashMap<&str, u64> =
+                counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+            let mut seen = std::collections::HashSet::new();
+            for rec in &registered {
+                seen.insert(rec.id.as_str());
+                tenants.push(json!({
+                    "id": rec.id,
+                    "display_name": rec.display_name,
+                    "created_at": rec.created_at,
+                    "registered": true,
+                    "canonical": is_canonical(&rec.id),
+                    "resources": counts.get(rec.id.as_str()).copied().unwrap_or(0),
+                }));
+            }
+            // Tenants that have data but were never registered — surfaced so
+            // the roster is complete. They have no creation date or name until
+            // registered.
+            let mut discovered: Vec<(&str, u64)> = counts
+                .iter()
+                .filter(|(id, _)| **id != SYSTEM_TENANT && !seen.contains(*id))
+                .map(|(id, n)| (*id, *n))
+                .collect();
+            discovered.sort_by(|a, b| a.0.cmp(b.0));
+            for (id, n) in discovered {
+                tenants.push(json!({
+                    "id": id,
+                    "display_name": null,
+                    "created_at": null,
+                    "registered": false,
+                    "canonical": is_canonical(id),
+                    "resources": n,
+                }));
+            }
+        }
+        TenantInventory::Presence { .. } | TenantInventory::Unsupported => {
+            // No number exists for these rows; `has_data` carries what
+            // discovery proved instead.
+            for rec in &registered {
+                tenants.push(json!({
+                    "id": rec.id,
+                    "display_name": rec.display_name,
+                    "created_at": rec.created_at,
+                    "registered": true,
+                    "canonical": is_canonical(&rec.id),
+                    "resources": null,
+                    "has_data": inventory.has_data(&rec.id),
+                }));
+            }
+            let registered_ids: std::collections::HashSet<&str> =
+                registered.iter().map(|rec| rec.id.as_str()).collect();
+            for id in inventory
+                .holding()
+                .filter(|id| *id != SYSTEM_TENANT && !registered_ids.contains(id))
+            {
+                tenants.push(json!({
+                    "id": id,
+                    "display_name": null,
+                    "created_at": null,
+                    "registered": false,
+                    "canonical": is_canonical(id),
+                    "resources": null,
+                    "has_data": true,
+                }));
+            }
+        }
     }
 
     let non_canonical = tenants
         .iter()
         .filter(|t| t["canonical"] == json!(false))
         .count();
-    let body = json!({
+    let mut body = json!({
         "tenant_count": tenants.len(),
         // Surfaced at the top level so an operator does not have to scan the
         // rows to learn whether the upgrade stranded anything.
         "non_canonical_count": non_canonical,
         "tenants": tenants,
     });
+    inventory.label(&mut body);
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
@@ -206,6 +267,7 @@ where
 /// already registered; `400` for an invalid id.
 pub async fn create_tenant_handler<S>(
     State(state): State<AppState<S>>,
+    principal: Option<Extension<Principal>>,
     Json(body): Json<CreateTenantBody>,
 ) -> RestResult<Response>
 where
@@ -247,6 +309,8 @@ where
 
     audit(
         &state,
+        principal.as_deref(),
+        &id,
         AuditAction::Create,
         "0",
         format!("Registered tenant {id}"),
@@ -268,17 +332,36 @@ where
 pub struct DeleteTenantQuery {
     /// When `true`, also permanently delete the tenant's stored data (resources,
     /// history, search index). Defaults to `false` — deregister only.
+    ///
+    /// With `true` the purge runs even when the tenant is no longer registered
+    /// and holds no live resource, so a retry finishes an interrupted purge
+    /// (#2309).
     #[serde(default)]
     pub purge: bool,
 }
 
 /// `DELETE /admin/tenants/{id}`
 ///
-/// Removes a tenant's registration. With `?purge=true`, additionally tears down
-/// the tenant's stored data (destructive, irreversible). Returns `200` with what
-/// happened; `404` if the tenant was neither registered nor had any data.
+/// - Removes a tenant's registration, and with `?purge=true` also tears down its
+///   data (destructive, irreversible).
+/// - Answers `200` with `{ id, deregistered, purged, resources_removed }`.
+/// - Without `purge`: `404` if the tenant is neither registered nor holds a live
+///   resource.
+/// - With `purge`: never `404` for a valid id (#2309). The live-resource probe
+///   cannot see data left by a purge that failed part-way (MongoDB, S3 and
+///   composite purges are not one transaction), or by a tenant holding only
+///   delete tombstones, history and bulk state. So the purge always runs: a retry
+///   finishes it, and an id that holds nothing answers `200` with
+///   `deregistered: false` and `resources_removed: 0`. The exception is S3 in
+///   bucket-per-tenant mode: an id with no bucket assigned answers `400`, as
+///   `POST /admin/tenants` does for such an id.
+/// - `resources_removed` is what this call's purge removed (current-version rows,
+///   delete tombstones included), so a retry after the resources were already
+///   deleted reports `0`.
+/// - An invalid or reserved id answers `400` before anything is read or deleted.
 pub async fn delete_tenant_handler<S>(
     State(state): State<AppState<S>>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<DeleteTenantQuery>,
 ) -> RestResult<Response>
@@ -286,32 +369,60 @@ where
     S: ResourceStorage + Send + Sync,
 {
     require_registry(state.storage())?;
-    // Validate BEFORE the existence probe below. `__system__` has data (the
-    // AuditEvent trail), so probing first would let a reserved id past the 404
-    // check and straight into `deregister_tenant` + `purge_tenant_data` — the
-    // create path validated but this one never did (issue #317). Validating
-    // first also means a reserved id reports 400 rather than a misleading 404.
+    // Validate BEFORE anything is read or deleted. `__system__` has data (the
+    // AuditEvent trail), so a reserved id that got past this point would reach
+    // `deregister_tenant` + `purge_tenant_data` — the create path validated but
+    // this one never did (issue #317). With `?purge=true` there is no existence
+    // probe below, so this is the only thing keeping a reserved id out of the
+    // purge at this layer (the storage-layer `ensure_mutable_tenant` is the
+    // backstop). Validating first also means a reserved id reports 400 rather
+    // than a misleading 404.
     validate_tenant_id(&id)?;
 
-    // Establish what exists before mutating so we can 404 on a no-op and report
-    // accurately. A tenant may be registered, have data, both, or neither.
-    let was_registered = state.storage().get_tenant(&id).await?.is_some();
-    let had_data = state
-        .storage()
-        .count_by_tenant()
-        .await?
-        .into_iter()
-        .any(|(t, n)| t == id && n > 0);
+    // Without `purge`, a request that would change nothing is a 404. A tenant
+    // may be registered, have live data, both, or neither.
+    //
+    // With `purge`, there is no probe (#2309). `tenant_has_resources` sees live
+    // resources only, so a tenant whose earlier purge failed after its
+    // resources were deleted (or that holds only tombstones/history) would 404
+    // here and keep its leftovers. `purge_tenant_data` is idempotent and a
+    // no-op on a tenant holding nothing.
+    if !query.purge {
+        // "Has data" is asked of this tenant alone. It used to be read off the
+        // cross-tenant `count_by_tenant`, so deleting one tenant counted every
+        // tenant in the store — and timed out on a large one (#1912).
+        // `tenant_has_resources` gives the answer that aggregate gave for this
+        // id, at a cost bounded by the tenant.
+        let was_registered = state.storage().get_tenant(&id).await?.is_some();
+        let had_data = state
+            .storage()
+            .tenant_has_resources(&TenantContext::new(
+                TenantId::new(id.clone()),
+                TenantPermissions::full_access(),
+            ))
+            .await?;
 
-    if !was_registered && !had_data {
-        return Err(RestError::NotFound {
-            resource_type: "Tenant".to_string(),
-            id: id.clone(),
-        });
+        if !was_registered && !had_data {
+            return Err(RestError::NotFound {
+                resource_type: "Tenant".to_string(),
+                id: id.clone(),
+            });
+        }
     }
 
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
+        // Output files first (#2279): once the purge below drops the job rows
+        // the expiry sweeps cannot find the files. A failure here fails the
+        // request before any row is touched, and a retried `?purge=true`
+        // (never a 404, #2309) runs both again.
+        delete_tenant_outputs_everywhere(
+            [state.bulk_export_output(), state.bulk_submit_output()]
+                .into_iter()
+                .flatten(),
+            &id,
+        )
+        .await?;
         let removed = state.storage().purge_tenant_data(&id).await?;
         // The tenant's data is gone; consumers holding figures for it (the
         // dashboard counters) treat them as stale (#1078).
@@ -325,7 +436,9 @@ where
     };
     // Reported after the purge's `Erased`: consumers holding state for the
     // tenant (the dashboard counters) drop it, and a later use of the tenant
-    // rebuilds it from storage (#1078).
+    // rebuilds it from storage (#1078). Also sent when nothing was registered (a
+    // data-only tenant, or a purge retry); every observer treats that as a no-op
+    // for a tenant it does not know.
     state.write_observer().on_write(&WriteEvent::TenantRemoved {
         tenant: TenantId::new(id.clone()),
     });
@@ -333,6 +446,8 @@ where
     debug!(tenant = %id, purge = query.purge, "Deleted tenant");
     audit(
         &state,
+        principal.as_deref(),
+        &id,
         AuditAction::Delete,
         "0",
         format!(
@@ -353,17 +468,28 @@ where
 
 /// Emits a handler-level audit event when an audit sink is configured. Tenant
 /// maintenance is administrative and (for delete) destructive, so every mutation
-/// is recorded.
-async fn audit<S>(state: &AppState<S>, action: AuditAction, outcome: &str, desc: String)
-where
+/// is recorded, attributed to the administrator and tagged with the tenant it
+/// changed (#1515).
+async fn audit<S>(
+    state: &AppState<S>,
+    principal: Option<&Principal>,
+    tenant: &str,
+    action: AuditAction,
+    outcome: &str,
+    desc: String,
+) where
     S: ResourceStorage + Send + Sync,
 {
     if let Some(sink) = state.audit_sink() {
-        let event = AuditEventBuilder::new(state.audit_source_observer())
+        let mut builder = AuditEventBuilder::new(state.audit_source_observer())
             .action(action)
             .outcome(outcome)
-            .outcome_desc(desc)
-            .build();
-        sink.record(event).await;
+            .outcome_desc(desc);
+        if let Some(principal) = principal {
+            builder = builder.principal(principal);
+        }
+        // After the principal: an administrator's token may be bound to its
+        // own tenant, but the event describes the tenant that was changed.
+        sink.record(builder.tenant(tenant).build()).await;
     }
 }

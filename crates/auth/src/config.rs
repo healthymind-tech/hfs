@@ -55,7 +55,11 @@ pub enum NonCompartmentPolicy {
 }
 
 /// Configuration for the authentication and authorization subsystem.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (#2149): the web client secret and the outbound
+/// bearer token print as `[redacted]`, and every URL goes through
+/// [`redact_url`].
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Master switch — when false, all auth is bypassed.
     pub enabled: bool,
@@ -91,6 +95,15 @@ pub struct AuthConfig {
     pub expected_audience: Option<String>,
     /// JWT claim name used to extract the tenant ID.
     pub tenant_claim: String,
+    /// JWT claim carrying the SMART launch patient (`HFS_AUTH_PATIENT_CLAIM`,
+    /// default `patient`).
+    pub patient_claim: String,
+    /// JWT claim carrying the SMART launch encounter (`HFS_AUTH_ENCOUNTER_CLAIM`,
+    /// default `encounter`).
+    pub encounter_claim: String,
+    /// JWT claim carrying the SMART `fhirUser` (`HFS_AUTH_FHIR_USER_CLAIM`,
+    /// default `fhirUser`).
+    pub fhir_user_claim: String,
     /// Comma-separated list of allowed JWT signing algorithms.
     pub allowed_algorithms: Vec<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
@@ -143,6 +156,135 @@ pub struct AuthConfig {
     pub smart_end_session_endpoint: Option<String>,
 }
 
+/// Returns `url` without anything that can carry a credential: userinfo,
+/// query, and fragment are each replaced by a `[redacted]` marker; a value
+/// that does not parse as a URL is replaced wholesale (#2149).
+///
+/// Same output shape as `helios_observability::redact::redact_url`, but built
+/// on the `url` parser `reqwest` already brings in, so this crate keeps no
+/// workspace dependencies. Parsing is stricter than that helper's string
+/// scan: `https://u:a?b@host/` (a password holding `?`) does not parse and is
+/// redacted whole rather than cut at the `?`.
+pub(crate) fn redact_url(url: &str) -> String {
+    const REDACTED: &str = "[redacted]";
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return REDACTED.to_owned();
+    };
+    let userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    let query = parsed.query().is_some();
+    let fragment = parsed.fragment().is_some();
+    if parsed.set_username("").is_err() || parsed.set_password(None).is_err() {
+        return REDACTED.to_owned();
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut out = parsed.to_string();
+    if userinfo {
+        match out.find("://") {
+            Some(at) => out.insert_str(at + 3, "[redacted]@"),
+            None => return REDACTED.to_owned(),
+        }
+    }
+    if query {
+        out.push_str("?[redacted]");
+    }
+    if fragment {
+        out.push_str("#[redacted]");
+    }
+    out
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            enabled,
+            mode,
+            clock_skew_secs,
+            patient_non_compartment,
+            smart_capabilities,
+            smart_scopes_supported,
+            smart_token_auth_methods,
+            smart_grant_types,
+            jwks_max_age_secs,
+            jwks_url,
+            expected_issuer,
+            expected_audience,
+            tenant_claim,
+            patient_claim,
+            encounter_claim,
+            fhir_user_claim,
+            allowed_algorithms,
+            jwks_min_refresh_interval,
+            smart_token_endpoint,
+            smart_authorize_endpoint,
+            smart_jwks_url,
+            smart_introspection_endpoint,
+            smart_management_endpoint,
+            smart_registration_endpoint,
+            smart_revocation_endpoint,
+            outbound_bearer_token,
+            web_client_id,
+            web_client_secret,
+            web_redirect_uri,
+            web_scopes,
+            web_cookie_secure,
+            smart_end_session_endpoint,
+        } = self;
+        let url = |value: &Option<String>| value.as_deref().map(redact_url);
+        f.debug_struct("AuthConfig")
+            .field("enabled", enabled)
+            .field("mode", mode)
+            .field("clock_skew_secs", clock_skew_secs)
+            .field("patient_non_compartment", patient_non_compartment)
+            .field("smart_capabilities", smart_capabilities)
+            .field("smart_scopes_supported", smart_scopes_supported)
+            .field("smart_token_auth_methods", smart_token_auth_methods)
+            .field("smart_grant_types", smart_grant_types)
+            .field("jwks_max_age_secs", jwks_max_age_secs)
+            .field("jwks_url", &url(jwks_url))
+            .field("expected_issuer", expected_issuer)
+            .field("expected_audience", expected_audience)
+            .field("tenant_claim", tenant_claim)
+            .field("patient_claim", patient_claim)
+            .field("encounter_claim", encounter_claim)
+            .field("fhir_user_claim", fhir_user_claim)
+            .field("allowed_algorithms", allowed_algorithms)
+            .field("jwks_min_refresh_interval", jwks_min_refresh_interval)
+            .field("smart_token_endpoint", &url(smart_token_endpoint))
+            .field("smart_authorize_endpoint", &url(smart_authorize_endpoint))
+            .field("smart_jwks_url", &url(smart_jwks_url))
+            .field(
+                "smart_introspection_endpoint",
+                &url(smart_introspection_endpoint),
+            )
+            .field("smart_management_endpoint", &url(smart_management_endpoint))
+            .field(
+                "smart_registration_endpoint",
+                &url(smart_registration_endpoint),
+            )
+            .field("smart_revocation_endpoint", &url(smart_revocation_endpoint))
+            .field(
+                "outbound_bearer_token",
+                &outbound_bearer_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("web_client_id", web_client_id)
+            .field(
+                "web_client_secret",
+                &web_client_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("web_redirect_uri", &url(web_redirect_uri))
+            .field("web_scopes", web_scopes)
+            .field("web_cookie_secure", web_cookie_secure)
+            .field(
+                "smart_end_session_endpoint",
+                &url(smart_end_session_endpoint),
+            )
+            .finish()
+    }
+}
+
 impl AuthConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
@@ -188,6 +330,11 @@ impl AuthConfig {
             expected_audience: env::var("HFS_AUTH_AUDIENCE").ok(),
             tenant_claim: env::var("HFS_AUTH_TENANT_CLAIM")
                 .unwrap_or_else(|_| "tenant_id".to_string()),
+            // A blank value falls back to the default: an empty claim name
+            // would match a `""` key.
+            patient_claim: claim_name_from_env("HFS_AUTH_PATIENT_CLAIM", "patient"),
+            encounter_claim: claim_name_from_env("HFS_AUTH_ENCOUNTER_CLAIM", "encounter"),
+            fhir_user_claim: claim_name_from_env("HFS_AUTH_FHIR_USER_CLAIM", "fhirUser"),
             allowed_algorithms: env::var("HFS_AUTH_ALGORITHMS")
                 .unwrap_or_else(|_| "RS256,RS384,ES256,ES384".to_string())
                 .split(',')
@@ -295,6 +442,14 @@ impl AuthConfig {
     }
 }
 
+/// Reads a claim-name variable, treating a blank value as unset.
+fn claim_name_from_env(key: &str, default: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -310,6 +465,9 @@ impl Default for AuthConfig {
             expected_issuer: None,
             expected_audience: None,
             tenant_claim: "tenant_id".to_string(),
+            patient_claim: "patient".to_string(),
+            encounter_claim: "encounter".to_string(),
+            fhir_user_claim: "fhirUser".to_string(),
             allowed_algorithms: vec![
                 "RS256".to_string(),
                 "RS384".to_string(),
@@ -356,6 +514,45 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[test]
+    fn redact_url_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://user:pw-s3cret@idp.example/jwks?key=q-s3cret#f-s3cret"),
+            "https://[redacted]@idp.example/jwks?[redacted]#[redacted]"
+        );
+        assert_eq!(
+            redact_url("https://idp.example/realms/x/certs"),
+            "https://idp.example/realms/x/certs"
+        );
+        // A password containing `?` would otherwise be read as host:port.
+        assert_eq!(redact_url("https://u:a?b@idp.example/"), "[redacted]");
+        assert_eq!(redact_url("not a url"), "[redacted]");
+    }
+
+    #[test]
+    fn debug_redacts_secrets_and_url_credentials() {
+        let config = AuthConfig {
+            jwks_url: Some("https://jwks-user:jwks-s3cret@idp.example/certs".to_string()),
+            smart_token_endpoint: Some("https://idp.example/token?code=tok-q-s3cret".to_string()),
+            outbound_bearer_token: Some("outbound-s3cret".to_string()),
+            web_client_id: Some("hfs-web".to_string()),
+            web_client_secret: Some("client-s3cret".to_string()),
+            ..AuthConfig::default()
+        };
+        let out = format!("{config:?}");
+        for secret in [
+            "jwks-s3cret",
+            "jwks-user",
+            "tok-q-s3cret",
+            "outbound-s3cret",
+            "client-s3cret",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("hfs-web"), "{out}");
+        assert!(out.contains("idp.example/certs"), "{out}");
+    }
+
     const AUTH_ENV_KEYS: &[&str] = &[
         "HFS_AUTH_ENABLED",
         "HFS_AUTH_MODE",
@@ -366,6 +563,9 @@ mod tests {
         "HFS_AUTH_ISSUER",
         "HFS_AUTH_AUDIENCE",
         "HFS_AUTH_TENANT_CLAIM",
+        "HFS_AUTH_PATIENT_CLAIM",
+        "HFS_AUTH_ENCOUNTER_CLAIM",
+        "HFS_AUTH_FHIR_USER_CLAIM",
         "HFS_AUTH_ALGORITHMS",
         "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
         "HFS_SMART_TOKEN_ENDPOINT",
@@ -395,6 +595,9 @@ mod tests {
         let config = AuthConfig::from_env();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(
             config.allowed_algorithms,
@@ -456,10 +659,42 @@ mod tests {
     }
 
     #[test]
+    fn test_from_env_launch_context_claim_names() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        unsafe {
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", "launch_patient");
+            env::set_var("HFS_AUTH_ENCOUNTER_CLAIM", "launch_encounter");
+            env::set_var("HFS_AUTH_FHIR_USER_CLAIM", "fhir_user");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.patient_claim, "launch_patient");
+        assert_eq!(config.encounter_claim, "launch_encounter");
+        assert_eq!(config.fhir_user_claim, "fhir_user");
+
+        // A blank value is as absent as a missing one.
+        unsafe {
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", "  ");
+            env::set_var("HFS_AUTH_ENCOUNTER_CLAIM", "");
+            env::set_var("HFS_AUTH_FHIR_USER_CLAIM", "\t");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
+
+        clear_auth_env();
+    }
+
+    #[test]
     fn test_default_config() {
         let config = AuthConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(config.allowed_algorithms.len(), 4);
     }

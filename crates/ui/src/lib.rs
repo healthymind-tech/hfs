@@ -17,7 +17,7 @@
 //!
 //! All user-visible text is resolved from the Fluent catalogs in `locales/`
 //! against the locale negotiated per request by [`i18n::negotiate_locale`]
-//! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
+//! (see `crates/ui/docs/multi-language.md`); templates hold catalog keys, not prose.
 //!
 //! ## Dashboard data
 //!
@@ -49,6 +49,7 @@ mod history;
 mod i18n;
 mod login;
 mod lookup;
+mod navigation;
 mod rail_state;
 mod search_params;
 mod sql_artifact_duplicate;
@@ -64,16 +65,22 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+// Public but hidden: the coordinator's counters and view are what #1849's
+// integration tests and evidence harnesses observe.
+#[doc(hidden)]
+pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
 pub use admin_login::ADMIN_COOKIE;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
+pub use tenants::register_tenant_purge_output;
 
 #[doc(hidden)]
 pub use conformance::{
-    Caller, ConformanceSource, RecordedExportCall, SqlExportParameter, SqlExportRequest,
-    SqlExportStatus, SqlExportSubject, StaticConformanceSource, sql_export_parameters_body,
+    Caller, ConformanceSource, RecordedExportCall, SqlExportFailure, SqlExportParameter,
+    SqlExportRequest, SqlExportStatus, SqlExportSubject, StaticConformanceSource,
+    sql_export_parameters_body,
 };
 
 /// The locale plumbing, re-exported out of the private `i18n` module.
@@ -167,6 +174,10 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// The background tenant inventory over `tenants` (#1850): one
+    /// cross-tenant discovery cache and single-flight refresh per mounted
+    /// app. `None` exactly when `tenants` is.
+    tenant_inventory: Option<Arc<tenant_inventory::TenantInventory>>,
     /// Tenant provisioning jobs started from the tenants page (#581).
     provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
@@ -220,6 +231,22 @@ struct WebState {
     /// The administrator sign-in (`HFS_ADMIN_PASSWORD`) guarding the admin
     /// pages, as installed with [`set_admin_gate`]; `Open` when none was.
     admin_gate: helios_admin_auth::AdminGate,
+}
+
+impl WebState {
+    /// The tenant inventory, when it does not already hear this UI's purge
+    /// and deregistration events through the server's write-observer fan-out
+    /// (see the subscription in [`mount_with_conformance_source_and_runtime`]).
+    /// Handlers notify the inventory directly through this, so each event
+    /// reaches it exactly once.
+    fn unobserved_tenant_inventory(&self) -> Option<&Arc<tenant_inventory::TenantInventory>> {
+        let observed = self
+            .write_observer
+            .as_deref()
+            .and_then(|observer| observer.fan_out())
+            .is_some();
+        self.tenant_inventory.as_ref().filter(|_| !observed)
+    }
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -474,8 +501,11 @@ pub(crate) struct UserSummary {
     /// Primary line: the IdP's `name`, else `preferred_username`, else
     /// `email`, else the subject.
     display: String,
-    /// Secondary line: the email when the IdP sent one, else the subject —
-    /// something that still identifies the account when the name is generic.
+    /// Secondary line: the email when the IdP sent one, else the
+    /// `preferred_username` unless it is already the display name, else the
+    /// subject — something that still identifies the account when the name
+    /// is generic. Entra ID sends no `email` for a user without a mailbox, and
+    /// its `sub` is an opaque per-application value (#1874).
     secondary: String,
     /// One or two letters for the avatar when there is no photo: the first
     /// letters of the first two words of the display name.
@@ -495,6 +525,12 @@ impl UserSummary {
         let secondary = principal
             .email
             .clone()
+            .or_else(|| {
+                principal
+                    .preferred_username
+                    .clone()
+                    .filter(|username| *username != display)
+            })
             .unwrap_or_else(|| principal.subject.clone());
         Some(Self {
             initials: initials_of(&display),
@@ -837,6 +873,12 @@ struct ChartSeriesView {
     href: Option<String>,
     /// Whether this series holds the focus â€” picks the link's label.
     focused: bool,
+    /// The series has no storage history yet (#1603): `polyline` covers only
+    /// the buckets its counters recorded, drawn dashed, and `end_x`/`end_y`
+    /// mark its current point so a lone bucket is still visible.
+    partial: bool,
+    end_x: i64,
+    end_y: i64,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -881,6 +923,9 @@ struct LegendEntry {
     color: usize,
     href: Option<String>,
     focused: bool,
+    /// The series' history is still loading (#1603): the entry says so next
+    /// to its total, which is a real figure.
+    partial: bool,
 }
 
 /// One option in the chart's type picker: a link that toggles the type in or
@@ -919,7 +964,8 @@ struct WindowEntry {
 /// - [`Figures::Unsupported`] — [`Self::Unsupported`], undated.
 /// - [`Figures::Exact`] — [`Self::Live`], dated with its `read_at`.
 /// - [`Figures::Approximate`] — [`Self::Approximate`], dated with its
-///   `read_at`.
+///   `read_at`; [`Self::HistoryLoading`] instead when a charted series has
+///   no storage history yet (#1603).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DashboardNotice {
     /// Exact figures ([`Figures::Exact`]). Its line carries only the "as of"
@@ -932,6 +978,11 @@ enum DashboardNotice {
     /// Measured figures that are not an exact storage match
     /// ([`Figures::Approximate`]).
     Approximate,
+    /// Approximate, and at least one charted series has no storage history
+    /// behind it yet (#1603): its line shows only the writes recorded since
+    /// the counters' base was read, so the note says so. Same slug as
+    /// [`Self::Approximate`] — it is the same reading, said more precisely.
+    HistoryLoading,
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
@@ -950,6 +1001,7 @@ impl DashboardNotice {
             DashboardNotice::Live => None,
             DashboardNotice::Pending => Some("chart-pending-note"),
             DashboardNotice::Approximate => Some("chart-approximate-note"),
+            DashboardNotice::HistoryLoading => Some("chart-approximate-history-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
             DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
         }
@@ -961,7 +1013,7 @@ impl DashboardNotice {
         match self {
             DashboardNotice::Live => "live",
             DashboardNotice::Pending => "pending",
-            DashboardNotice::Approximate => "approximate",
+            DashboardNotice::Approximate | DashboardNotice::HistoryLoading => "approximate",
             DashboardNotice::Sample => "sample",
             DashboardNotice::Unsupported => "unsupported",
         }
@@ -974,7 +1026,10 @@ impl DashboardNotice {
     fn is_warning(self) -> bool {
         !matches!(
             self,
-            DashboardNotice::Live | DashboardNotice::Approximate | DashboardNotice::Unsupported
+            DashboardNotice::Live
+                | DashboardNotice::Approximate
+                | DashboardNotice::HistoryLoading
+                | DashboardNotice::Unsupported
         )
     }
 
@@ -1024,6 +1079,11 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
         SnapshotState::Ready(snapshot) => {
             let kind = match snapshot.figures {
                 Figures::Exact { .. } => DashboardNotice::Live,
+                Figures::Approximate { .. }
+                    if snapshot.series.iter().any(|s| s.recorded_from.is_some()) =>
+                {
+                    DashboardNotice::HistoryLoading
+                }
                 Figures::Approximate { .. } => DashboardNotice::Approximate,
                 Figures::Pending => DashboardNotice::Pending,
                 Figures::Unsupported => DashboardNotice::Unsupported,
@@ -1250,9 +1310,6 @@ struct SearchPage {
     /// How-to page for the unconfigured state (docs live in the book).
     docs_url: &'static str,
     resource_types: Vec<String>,
-    /// The saved-query controls are the Saved Queries page's job, not this
-    /// page's (see `partials/search-builder.html`).
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1261,7 +1318,7 @@ struct SearchPage {
     /// This request's resolved rail selection (`rail_state`): explicit
     /// `?type=` when given, else the stored `rails.search.last` when it still
     /// resolves, else `Patient`. Exposed as `data-selected-type` so
-    /// `saved-queries.js` never falls back to a hardcoded default on initial
+    /// `search-builder.js` never falls back to a hardcoded default on initial
     /// load or `popstate` — the same contract `ResourcesPage` already
     /// carries.
     selected_type: String,
@@ -1269,7 +1326,7 @@ struct SearchPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1301,9 +1358,6 @@ struct ResourcesPage {
     /// that left resources unindexed (#1125): results may miss stored
     /// resources, so the page head says so.
     rebuild: Option<ReindexActivity>,
-    /// The search-builder partial's save controls are the Saved Queries page's
-    /// job, not this one's.
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1313,7 +1367,7 @@ struct ResourcesPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1344,41 +1398,6 @@ struct TerminologyPage {
     active_page: &'static str,
 }
 
-/// Saved FHIR queries page (#234). The shell is server-rendered; the list is
-/// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
-/// the same per-user document (and fetch pattern) the theme toggle uses.
-#[derive(Template)]
-#[template(path = "pages/queries.html")]
-struct QueriesPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    /// The version's resource types for the picker rail, from the spec
-    /// CompartmentDefinitions already vendored for the compartment viewer.
-    resource_types: Vec<String>,
-    show_save: bool,
-    /// Whether the rail's counts are approximate (see [`RailCounts`]).
-    rail_counts_approximate: bool,
-    /// The type rail (#541), server-rendered from `resource_types` and the
-    /// dashboard snapshot's counts.
-    rail_entries: Vec<RailEntry>,
-    /// This request's resolved rail selection — see `SearchPage`'s field of
-    /// the same name.
-    selected_type: String,
-    /// The "Recently used" group's rows, server-rendered by
-    /// `partials/rail_recent.html`.
-    recent_entries: Vec<rail_state::ResolvedRailEntry>,
-    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
-    rail_page: &'static str,
-    /// `rail_state::MAX_RECENT`, carried the same way.
-    max_recent: usize,
-    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
-    /// of the same name); this page opens with no type context, so it is
-    /// always `None`.
-    builder_url: Option<String>,
-}
-
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
 /// storage backends seed their registries from; the write half lands
 /// behind #235.
@@ -1389,6 +1408,22 @@ struct SearchParametersPage {
     i18n: I18n,
     active_page: &'static str,
     view: search_params::SpView,
+    editor_return_to: String,
+}
+
+impl SearchParametersPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("SearchParameter", id, &self.editor_return_to)
+    }
+}
+
+fn conformance_editor_href(resource_type: &str, id: &str, origin: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if !id.is_empty() {
+        query.append_pair("id", id);
+    }
+    navigation::with_return(&format!("/ui/editor?{}", query.finish()), Some(origin))
 }
 
 /// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
@@ -1450,8 +1485,6 @@ struct PackageDetailPage {
 struct JsonViewFragment {
     i18n: I18n,
     json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -1464,6 +1497,13 @@ struct CompartmentsPage {
     i18n: I18n,
     active_page: &'static str,
     view: compartments::CmpView,
+    editor_return_to: String,
+}
+
+impl CompartmentsPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("CompartmentDefinition", id, &self.editor_return_to)
+    }
 }
 
 /// The compartments page when no definitions could be fetched (#320): the
@@ -1474,6 +1514,11 @@ struct CompartmentsDegradedPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The fetch failed with `501`: the backend cannot list the definitions
+    /// (#1821).
+    unsupported: bool,
+    /// The fetch succeeded with no definitions stored (#1838).
+    empty: bool,
 }
 
 #[derive(Template)]
@@ -1492,7 +1537,7 @@ struct ParamOption {
     targets: String,
 }
 
-/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// Parameter suggestions for the search builder (`/ui/resources/params`),
 /// rendered from the same registry snapshot the SearchParameter viewer
 /// reads. An HTML fragment the page swaps per resource type â€” hypermedia,
 /// not a UI-facing JSON API.
@@ -1905,8 +1950,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui", get(index))
         // Resources workspace (#282): the type filter + search + edit modal.
         .route("/ui/resources", get(resources))
-        .route("/ui/queries", get(queries))
-        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/resources/params", get(resources_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
@@ -2070,7 +2114,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/status", get(status))
         .route("/ui/history", get(history_page))
         // The diff is computed server-side (the decision in
-        // docs/history-diff-rendering.md); the browser posts the two versions
+        // crates/ui/docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route(
@@ -2079,6 +2123,11 @@ pub fn mount_with_conformance_source_and_runtime(
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
+        .route("/ui/bulk-export/active/{id}", get(bulk_export::detail_page))
+        .route(
+            "/ui/bulk-export/active/{id}/detail",
+            get(bulk_export::detail_fragment),
+        )
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
             "/ui/bulk-export/active/{id}/cancel",
@@ -2087,6 +2136,10 @@ pub fn mount_with_conformance_source_and_runtime(
         .route(
             "/ui/bulk-export/active/{id}/retry",
             axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/rerun",
+            axum::routing::post(bulk_export::rerun),
         )
         .route(
             "/ui/bulk-export/active/{id}/delete",
@@ -2164,13 +2217,20 @@ pub fn mount_with_conformance_source_and_runtime(
         router = router.route("/ui/search", get(search));
     }
 
-    // Every other path under the mount is a page that does not exist: answer
-    // with the shell-wrapped not-found page. Without this the request fell
-    // through to the FHIR app, which treated `ui` as a resource type and
-    // answered a JSON OperationOutcome — no title, no language, no way back.
-    // Static segments win over the wildcard, so `/ui/assets/*` still reaches
-    // the embedded asset service.
-    router = router.route("/ui/{*rest}", get(ui_not_found));
+    // One inventory per mounted app, never process-global (#1850). It also
+    // follows purges and deregistrations made outside this UI (the
+    // `/admin/tenants` API) when the server's observer is its fan-out; the
+    // subscription holds the inventory weakly, and the fan-out drops it on a
+    // later subscription once this app is torn down.
+    let tenant_inventory = tenants
+        .clone()
+        .map(tenant_inventory::TenantInventory::over_storage);
+    if let (Some(inventory), Some(fan_out)) = (
+        tenant_inventory.as_ref(),
+        write_observer.as_deref().and_then(|o| o.fan_out()),
+    ) {
+        fan_out.subscribe(inventory.observer());
+    }
 
     let state = WebState {
         version: hfs_version,
@@ -2179,6 +2239,7 @@ pub fn mount_with_conformance_source_and_runtime(
         conformance: source,
         nl: Arc::new(nl),
         tenants,
+        tenant_inventory,
         provisioning: Default::default(),
         settings,
         bulk_provider,
@@ -2201,6 +2262,7 @@ pub fn mount_with_conformance_source_and_runtime(
     };
 
     router
+        .route("/ui/{*rest}", axum::routing::any(ui_not_found))
         .merge(assets)
         // With authentication on and no browser sign-in installed, nothing a
         // browser sends can be authenticated, so the handlers that reach the
@@ -2235,6 +2297,13 @@ pub fn mount_with_conformance_source_and_runtime(
             },
             helios_admin_auth::guard,
         ))
+        // Every self-call a page makes on the user's behalf carries the
+        // browser's credential, else the signed-in session's bearer, ahead
+        // of the outbound service credential (#1671).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            scope_request_authorization,
+        ))
         // Outermost of the UI layers so it runs first: with a login installed
         // it stamps the signed-in Principal that `resolve_prefs` keys the
         // per-user settings on, or turns the request away to `/ui/login`
@@ -2255,7 +2324,69 @@ pub fn mount_with_conformance_source_and_runtime(
             })
             .fallback_service(fhir_app.clone()),
         )
-        .fallback_service(fhir_app)
+        .fallback(move |request: axum::extract::Request| {
+            let fhir_app = fhir_app.clone();
+            async move {
+                if let Some(location) = lowercase_ui_prefix(request.uri()) {
+                    return axum::response::Redirect::permanent(&location).into_response();
+                }
+                match tower::ServiceExt::oneshot(fhir_app, request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                }
+            }
+        })
+}
+
+/// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
+/// the shell, never the FHIR API's answer for an unknown resource type.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        i18n.t("nav-home"),
+    )
+}
+
+/// The same address with its `/ui` prefix lowercased, when the request wrote
+/// that prefix in another case (`/UI/nope`, `/Ui`); `None` for every other
+/// path, including a correctly cased `/ui…` one (#1673).
+fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
+    let path = uri.path();
+    let prefix = path.get(..3)?;
+    let at_boundary = path.len() == 3 || path.as_bytes()[3] == b'/';
+    if !at_boundary || prefix == "/ui" || !prefix.eq_ignore_ascii_case("/ui") {
+        return None;
+    }
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!("/ui{}{query}", &path[3..]))
+}
+
+/// Middleware (#1671): runs the rest of the request with its own credential
+/// in scope for every self-call — the browser's `Authorization`, else the
+/// signed-in session's bearer — so a page never depends on the outbound
+/// service token while its user has a valid session. Assets make no
+/// self-calls and skip the session lookup.
+async fn scope_request_authorization(
+    State(state): State<WebState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/ui/assets/") {
+        return next.run(request).await;
+    }
+    let authorization = login::caller_for(&state, request.headers(), "")
+        .await
+        .authorization;
+    conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
 /// Middleware: tell a HTS console served from the same origin that this
@@ -2632,9 +2763,15 @@ async fn index(
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
+            // Deduplicated and capped at what the chart can plot, so a
+            // repeated or overlong list cannot become a distinct cached
+            // snapshot of its own (#2186).
+            let mut seen = std::collections::HashSet::new();
             csv.split(',')
                 .map(str::trim)
                 .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .filter(|t| seen.insert(*t))
+                .take(CHART_MAX_SERIES)
                 .map(str::to_string)
                 .collect()
         })
@@ -2762,8 +2899,8 @@ enum DashRegion {
     Chart,
 }
 
-/// One resource-type rail item â€” the primitive Resources, Search, and Saved
-/// Queries share for their type picker (#541): a real link the server marks
+/// One resource-type rail item â€” the primitive Resources and Search
+/// share for their type picker (#541): a real link the server marks
 /// current, with an optional instance count. `count` is `None` when no
 /// dashboard provider is registered; the partial then omits the whole count
 /// span rather than mixing real counts with blanks.
@@ -2774,8 +2911,8 @@ struct RailEntry {
     current: bool,
 }
 
-/// Builds the shared type-rail entries for Resources, Search, and Saved
-/// Queries: one entry per resource type, linking back to `base` with
+/// Builds the shared type-rail entries for Resources and Search:
+/// one entry per resource type, linking back to `base` with
 /// `?type=<name>`, marked `current` against `selected`. `available` is the
 /// dashboard snapshot's per-type totals (`None` when no provider answered â€”
 /// every entry then gets `count: None`, never a fabricated zero).
@@ -2837,7 +2974,7 @@ fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
     counts.is_some_and(|c| c.approximate)
 }
 
-/// For a type rail (Resources, Search, Saved Queries): the stored `last`
+/// For a type rail (Resources, Search): the stored `last`
 /// when it still names one of `resource_types`, else `fallback`. Only
 /// consulted when the request carried no explicit selection at all — an
 /// explicit one always wins outright, valid or not (see
@@ -2971,23 +3108,14 @@ async fn prune_gone_recents(
     rail: rail_state::RailState,
     live_ids: &std::collections::HashSet<String>,
 ) -> rail_state::RailState {
-    let mut verdicts = Vec::new();
-    for entry in &rail.recent {
-        if live_ids.contains(&entry.id) {
-            continue;
-        }
-        let verdict = state
-            .conformance
-            .resource_exists(resource_type, &entry.id, version, tenant)
-            .await;
-        if let Err(error) = &verdict {
-            tracing::debug!(
-                "existence check failed for {resource_type}/{}: {error}",
-                entry.id
-            );
-        }
-        verdicts.push((entry.id.clone(), verdict));
-    }
+    let candidates = rail
+        .recent
+        .iter()
+        .filter(|entry| !live_ids.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .collect();
+    let verdicts =
+        resource_existence_verdicts(state, tenant, version, resource_type, candidates).await;
     match rail.prune_gone(&verdicts) {
         Some(next) => {
             rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
@@ -2995,6 +3123,33 @@ async fn prune_gone_recents(
         }
         None => rail,
     }
+}
+
+/// Check only explicit candidates, once per ID. Search results are not an
+/// existence verdict: only the source's definitive absence permits pruning.
+async fn resource_existence_verdicts(
+    state: &WebState,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    candidates: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut checked = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for id in candidates {
+        if !checked.insert(id.clone()) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!("existence check failed for {resource_type}/{id}: {error}");
+        }
+        verdicts.push((id, verdict));
+    }
+    verdicts
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -3040,7 +3195,6 @@ async fn search(
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
-        show_save: false,
         rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
@@ -3055,66 +3209,6 @@ async fn search(
 /// rail's own links round-trip through `/ui/search?type=Observation` (#541).
 #[derive(Deserialize, Default)]
 struct SearchQuery {
-    #[serde(rename = "type")]
-    resource_type: Option<String>,
-}
-
-/// Saved FHIR queries page.
-async fn queries(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    Query(query): Query<QueriesQuery>,
-    settings: rail_state::RequestSettings,
-) -> Response {
-    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
-    let rail = record_type_selection(
-        &state,
-        &settings.user_key,
-        &rt.id,
-        rail_state::RailPage::Queries,
-        settings.rail(rail_state::RailPage::Queries, &rt.id),
-        explicit_type,
-        &resource_types,
-    )
-    .await;
-    let selected_type = explicit_type
-        .map(str::to_string)
-        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
-    let counts = rail_counts(&live);
-    let rail_entries = build_rail_entries(
-        "/ui/queries",
-        &resource_types,
-        counts,
-        Some(selected_type.as_str()),
-        &I18n::new(locale).lang(),
-    );
-    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
-    render(QueriesPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "queries",
-        resource_types,
-        show_save: true,
-        rail_counts_approximate: rail_counts_approximate(counts),
-        rail_entries,
-        selected_type,
-        recent_entries,
-        rail_page: rail_state::RailPage::Queries.key(),
-        max_recent: rail_state::MAX_RECENT,
-        builder_url: None,
-    })
-}
-
-/// Query string for the Saved Queries page: an optional pre-selected type, so
-/// the rail's own links round-trip through `/ui/queries?type=Observation` (#541).
-#[derive(Deserialize, Default)]
-struct QueriesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
 }
@@ -3227,7 +3321,6 @@ async fn resources(
         rebuild: live
             .as_ref()
             .and_then(|snapshot| snapshot.reindex_active.clone()),
-        show_save: false,
         rail_counts_approximate,
         rail_entries,
         recent_entries,
@@ -3235,24 +3328,6 @@ async fn resources(
         max_recent: rail_state::MAX_RECENT,
         builder_url,
     })
-}
-
-/// The not-found page for any `/ui/...` path no route answers.
-async fn ui_not_found(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-) -> Response {
-    let i18n = I18n::new(locale);
-    let back_label = i18n.t("nav-home");
-    render_not_found(
-        current_status(&state, rv.0, &rt),
-        i18n,
-        "",
-        "/ui",
-        back_label,
-    )
 }
 
 /// Terminology setup state (#611). The sidebar links here when the environment
@@ -3357,7 +3432,7 @@ struct ParamsCatalogQuery {
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
 /// `DomainResource`-level ones), from the selected version's snapshot.
-async fn query_params_catalog(
+async fn resources_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
     rv: RequestVersion,
@@ -3516,13 +3591,14 @@ async fn search_parameters(
     rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.sp_catalog.invalidate(&rt.id, fhir_version);
     }
@@ -3555,6 +3631,7 @@ async fn search_parameters(
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
+        editor_return_to: uri.to_string(),
     })
 }
 
@@ -3608,8 +3685,6 @@ async fn render_json_view(
     render(JsonViewFragment {
         i18n: I18n::new(locale),
         json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
     })
 }
 
@@ -3706,6 +3781,7 @@ async fn package_detail_page(
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -3723,6 +3799,9 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
+    /// An explicit `?vd=` the rail's filter excludes: the main pane says so,
+    /// with a link that clears the filter and keeps the selection (#1780).
+    selection_filtered: bool,
     /// The guided-form card, alongside the JSON editor (#843): the same
     /// `pane=form` fragment `POST /ui/editor/render` would render for
     /// `selected`'s document, built inline instead of fetched — the page's
@@ -3762,6 +3841,7 @@ struct SelectedVd {
 /// appear alongside a failure message, and the page's own "nothing has run
 /// yet" state is distinct from both — the invalid combinations simply have
 /// no constructor.
+#[derive(Clone)]
 enum RunResultsState {
     /// A successful run — its table, plus how long the `$sql-run` call took
     /// in whole milliseconds.
@@ -3786,6 +3866,33 @@ enum RunResultsState {
     Empty,
 }
 
+/// Which half of a run partial a render emits. Every partial writes the
+/// `#run-notice` element first and the results markup after it; the
+/// Library-backed pages place those two halves in different parts of the
+/// document, so a full-page render asks for each half separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunPart {
+    /// Both halves in one render: the `/run` fragments and the View
+    /// Definitions page.
+    Both,
+    /// Only `#run-notice`: the SQL card of a Library-backed page.
+    Notice,
+    /// Only the results markup: the foot of a Library-backed page.
+    Results,
+}
+
+impl RunPart {
+    /// Whether this render emits `#run-notice`.
+    fn notice(self) -> bool {
+        matches!(self, Self::Both | Self::Notice)
+    }
+
+    /// Whether this render emits the results markup.
+    fn results(self) -> bool {
+        matches!(self, Self::Both | Self::Results)
+    }
+}
+
 /// The `$sql-run` preview card and its failure notice (#752, generalized to
 /// share one partial across View Definitions, SQL Queries, and SQL Views in
 /// #839): `partials/sql_run_results.html`'s markup is written once and
@@ -3801,18 +3908,21 @@ enum RunResultsState {
 /// partial itself never hardcodes one page's ids or i18n keys: every field
 /// below but `i18n`/`fragment`/`state` only names where this render's
 /// fragment endpoint, form, and i18n keys live — never resource data.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/sql_run_results.html")]
 struct RunResultsPartial {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The surface's own `POST …/run` fragment endpoint — the `Empty` arm's
     /// `hx-post` load trigger targets it (the surface's own textarea, wired
     /// outside this partial, posts to the identical URL on every edit).
     run_href: &'static str,
     /// The id of the `<form>` the surface's editable fields live in. The
-    /// `Empty` arm's shell sits outside that form, so it reaches back in via
-    /// `hx-include="#{form_id}"` for its own initial-load request.
+    /// `Empty` arm's shell names that form via `hx-include="#{form_id}"` for
+    /// its own initial-load request (View Definitions renders the shell
+    /// outside the form; the Library pages render it inside).
     form_id: &'static str,
     /// The results card's `<h3>` key.
     heading_key: &'static str,
@@ -3837,8 +3947,98 @@ const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
 const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
 const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
 
+/// Navigation for paired SQL editors. The incoming Cancel destination and
+/// the current page used by onward links are deliberately separate.
+#[derive(Clone)]
+struct SqlEditorNavigation {
+    return_to: Option<String>,
+    current_path: String,
+    cancel_href: String,
+    new_href: String,
+}
+
+impl SqlEditorNavigation {
+    fn new(
+        base: &str,
+        selection: &str,
+        id: &str,
+        is_new: bool,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        let return_to = navigation::safe_ui_return(requested);
+        let current_path =
+            sql_editor_path(base, selection, if is_new { "new" } else { id }, current);
+        let cancel_href = return_to.clone().unwrap_or_else(|| {
+            if is_new || id.is_empty() {
+                base.to_string()
+            } else {
+                current_path.clone()
+            }
+        });
+        let new_href =
+            navigation::with_return(&format!("{base}?{selection}=new"), Some(&current_path));
+        Self {
+            return_to,
+            current_path,
+            cancel_href,
+            new_href,
+        }
+    }
+
+    fn saved_href(&self, base: &str, selection: &str, id: &str) -> String {
+        let own = sql_editor_path(base, selection, id, Some(&self.current_path));
+        let mut url = reqwest::Url::parse(&format!("https://hfs.invalid{own}"))
+            .expect("validated editor path");
+        url.query_pairs_mut().append_pair("saved", "1");
+        let own = format!(
+            "{}{}{}",
+            url.path(),
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
+        );
+        navigation::with_return(&own, self.return_to.as_deref())
+    }
+}
+
+/// Preserve the current section's query context, replacing its selection and
+/// stripping the previous caller before this editor becomes another caller.
+fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>) -> String {
+    let mut pairs = vec![];
+    let mut fragment = String::new();
+    if let Some(current) = navigation::safe_ui_return(current) {
+        let url = reqwest::Url::parse(&format!("https://hfs.invalid{current}"))
+            .expect("validated UI path");
+        if url.path() == base {
+            fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+            pairs.extend(
+                url.query_pairs()
+                    .filter(|(key, _)| {
+                        key != "return_to"
+                            && key != "saved"
+                            && key != selection
+                            && !(selection == "lib" && key == "deleted")
+                    })
+                    .map(|(key, value)| (key.into_owned(), value.into_owned())),
+            );
+        }
+    }
+    if !id.is_empty() {
+        pairs.insert(0, (selection.to_string(), id.to_string()));
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    if query.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{query}{fragment}")
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
+    return_to: Option<String>,
     vd: Option<String>,
     filter: Option<String>,
     saved: Option<String>,
@@ -3930,6 +4130,7 @@ fn invalid_form_pane(
         pretty: text,
         error_count: 0,
         orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
@@ -4000,15 +4201,19 @@ async fn resolve_vd_by_id(
 
 /// For View Definitions: the "Recently used" group's rows, resolved against
 /// this render's own page of the server-paged rail search so
-/// label/meta/href/current match what the list already shows. "The group
-/// is never itself filtered by `?filter=`" falls out for free: an id the
+/// label/meta/href/current match what the list already shows. An id the
 /// current page/filter excludes is simply absent from `summaries` (and so
 /// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_views::VdSummary],
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -4025,11 +4230,22 @@ fn resolve_vd_recents(
             )
         })
         .collect();
-    rail.resolve_recents(
+    let mut recents = rail.resolve_recents(
         &live,
         |id| format!("/ui/sql/view-definitions?vd={id}"),
         None,
-    )
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+/// Header the SQL rails' filter inputs send while filtering as you type
+/// (#1275). Such a request re-renders the page only to swap the rail, so it
+/// must not record the echoed `?vd=`/`?lib=` as a user pick.
+const RAIL_FILTER_HEADER: &str = "x-rail-filter";
+
+fn is_live_rail_filter(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RAIL_FILTER_HEADER)
 }
 
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
@@ -4040,15 +4256,20 @@ fn resolve_vd_recents(
 /// carried over into `name:contains` — it was never a documented part of
 /// #649 and has no standard FHIR search expression (see
 /// [`sql_views::rail_search_params`] for why).
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let live_filter = is_live_rail_filter(&headers);
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
     // stale or hand-edited `?page=` is a navigation mistake, not an error.
     let page = query
@@ -4077,7 +4298,12 @@ async fn sql_view_definitions_page(
         )
         .await
     {
-        Ok(page) => (page.resources, page.has_next, None),
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
         Err(error) => {
             tracing::warn!("ViewDefinition search failed: {error}");
             (Vec::new(), false, Some(error))
@@ -4112,15 +4338,21 @@ async fn sql_view_definitions_page(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    rail_state::RailPage::ViewDefinitions,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?vd=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    record_snapshot_selection(
+                        &state,
+                        &settings.user_key,
+                        &rt.id,
+                        rail_state::RailPage::ViewDefinitions,
+                        rail_before,
+                        entry,
+                    )
+                    .await
+                };
                 (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
             None => {
@@ -4139,6 +4371,11 @@ async fn sql_view_definitions_page(
                 (None, None, rail)
             }
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -4150,6 +4387,12 @@ async fn sql_view_definitions_page(
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
             None => None,
         };
+        if resolved
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved = match fallback_id.as_deref() {
@@ -4165,6 +4408,11 @@ async fn sql_view_definitions_page(
             None => (None, None, rail_before),
         }
     };
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter));
 
     // Existence sweep (#1014): a recent id off this render's own page and
     // not the current selection is checked against the server, and a
@@ -4188,8 +4436,12 @@ async fn sql_view_definitions_page(
     )
     .await;
 
-    let recent_entries =
-        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
 
     // `?saved=1` (Save's own redirect) runs the just-stored definition
     // through $sql-run once, server-side, so the nojs path shows results
@@ -4213,7 +4465,21 @@ async fn sql_view_definitions_page(
     // whichever document `selected` already resolved above.
     let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
 
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&uri.to_string()),
+    );
+    let prev_href =
+        prev_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    let next_href =
+        next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
     render(SqlViewDefinitionsPage {
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: "sql-view-definitions",
@@ -4228,6 +4494,7 @@ async fn sql_view_definitions_page(
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -4289,6 +4556,10 @@ async fn run_sql_preview(
 
 #[derive(Deserialize)]
 struct SqlVdSaveForm {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    current_path: Option<String>,
     /// Empty for a create; the stored id for an update.
     #[serde(default)]
     id: String,
@@ -4309,6 +4580,14 @@ async fn sql_view_definitions_save(
     rt: RequestTenant,
     axum::Form(form): axum::Form<SqlVdSaveForm>,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        &form.id,
+        form.id.is_empty(),
+        form.return_to.as_deref(),
+        form.current_path.as_deref(),
+    );
     let error_page = |save_error: String, json: String, is_new: bool, id: String| {
         // #843: the guided-form panel keeps up with whatever the user
         // submitted — parses it exactly like `editor::render_body` would, so
@@ -4326,6 +4605,8 @@ async fn sql_view_definitions_save(
             ),
         };
         SqlViewDefinitionsPage {
+            navigation: navigation.clone(),
+            selection_filtered: false,
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -4350,6 +4631,7 @@ async fn sql_view_definitions_save(
             run_results: RunResultsPartial {
                 i18n: I18n::new(locale),
                 fragment: false,
+                part: RunPart::Both,
                 run_href: VD_RUN_HREF,
                 form_id: VD_EDITOR_FORM_ID,
                 heading_key: VD_RESULTS_HEADING_KEY,
@@ -4435,8 +4717,10 @@ async fn sql_view_definitions_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!(
-                "/ui/sql/view-definitions?vd={stored_id}&saved=1"
+            axum::response::Redirect::to(&navigation.saved_href(
+                "/ui/sql/view-definitions",
+                "vd",
+                stored_id,
             ))
             .into_response()
         }
@@ -4481,6 +4765,7 @@ async fn sql_view_definitions_run(
         render(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -5116,7 +5401,7 @@ struct LibParamsCard {
 /// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
 /// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
 /// from* only needs the classification; the Columns card's own origin
-/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// lookup ([`resolve_column_sources`]) is what needs a ViewDefinition's
 /// document itself, to read its `select[].column[]` list.
 async fn resolve_table_reference(
     state: &WebState,
@@ -5169,10 +5454,82 @@ async fn resolve_table_reference(
                     let target = sql_libraries::classify_table_artifact("Library", lib);
                     (target, Some(lib.clone()))
                 }
-                None => (TableTarget::NotFound, None),
+                None => match resolve_terminology_reference(state, reference).await {
+                    Some((target, artifact)) => (target, Some(artifact)),
+                    None => (TableTarget::NotFound, None),
+                },
             }
         }
     }
+}
+
+/// Resolves a canonical `reference` that names no stored ViewDefinition or
+/// Library on the terminology server (`HFS_TERMINOLOGY_SERVER`), mirroring
+/// `crates/rest/.../sof/terminology.rs`'s own `fetch_relation` (#1824): first
+/// as a value set to expand (`POST ValueSet/$expand`, `count=0` — only
+/// whether it expands matters here, never its rows), then as a concept map
+/// (`GET ConceptMap?url=[&version=]`). `None` when no terminology server is
+/// configured, it knows neither, or it cannot be reached within the same
+/// 2500ms budget the editor's own `$expand` picker uses — the row then shows
+/// as not found, which is what `$sql-run` would report too.
+async fn resolve_terminology_reference(
+    state: &WebState,
+    reference: &str,
+) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
+    use helios_sof::sqlquery::TerminologyKind;
+    let base = state.terminology.as_deref()?.trim_end_matches('/');
+    let client = editor::terminology_client();
+    let timeout = std::time::Duration::from_millis(2500);
+
+    let expand = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": reference},
+            {"name": "count", "valueInteger": 0}
+        ]
+    });
+    if let Ok(response) = client
+        .post(format!("{base}/ValueSet/$expand"))
+        .header("Content-Type", "application/fhir+json")
+        .header("Accept", "application/fhir+json")
+        .json(&expand)
+        .timeout(timeout)
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(value_set) = response.json::<serde_json::Value>().await
+        && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
+    {
+        let target = sql_libraries::classify_terminology_artifact(
+            TerminologyKind::ValueSet,
+            &value_set,
+            reference,
+        );
+        return Some((target, value_set));
+    }
+
+    let (canonical, version) = sql_libraries::split_canonical_version(reference);
+    let mut query = vec![("url", canonical)];
+    if let Some(version) = version {
+        query.push(("version", version));
+    }
+    let response = client
+        .get(format!("{base}/ConceptMap"))
+        .query(&query)
+        .header("Accept", "application/fhir+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())?;
+    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
+    let target = sql_libraries::classify_terminology_artifact(
+        TerminologyKind::ConceptMap,
+        &concept_map,
+        reference,
+    );
+    Some((target, concept_map))
 }
 
 /// Resolves every dependency in `deps` via [`resolve_table_reference`],
@@ -5181,8 +5538,8 @@ async fn resolve_table_reference(
 /// once per render (#842's own "no redundant requests"). Returns each
 /// dependency's own [`sql_libraries::TableRow`] paired with the resolved
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
-/// former; [`resolve_view_definition_dependencies`] filters the latter down
-/// to the ViewDefinitions the Columns card needs.
+/// former; [`resolve_column_sources`] turns the pair into the table schemas
+/// the Columns card needs.
 async fn resolve_table_rows(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -5217,13 +5574,13 @@ async fn resolve_table_rows(
     rows
 }
 
-/// Resolves every dependency in `deps` down to the ViewDefinitions among
-/// them — the Columns card's own origin lookup (#842/04): `(label,
-/// resolved document)` for each dependency [`resolve_table_rows`] resolved
-/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
-/// that fails to resolve, or resolves to a SQL View or anything else, is
-/// simply absent — SQL Views never contribute a column origin (#842's own
-/// "out of scope" rule).
+/// Resolves every dependency in `deps` down to the table schemas the
+/// Columns card's own origin lookup reads (#842/04): `(label, schema)` for
+/// each dependency [`resolve_table_rows`] resolved to a ViewDefinition, a
+/// ValueSet or a ConceptMap (#1824), in declaration order
+/// ([`sql_libraries::column_sources`]). A dependency that fails to resolve,
+/// or resolves to a SQL View or anything else, is simply absent — SQL Views
+/// never contribute a column origin (#842's own "out of scope" rule).
 ///
 /// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
 /// performs the identical fetch [`resolve_table_rows`] does for the Tables
@@ -5231,23 +5588,14 @@ async fn resolve_table_rows(
 /// ran at all — a good run's own dependency resolution "happens once per
 /// dependency", not once per keystroke that leaves the run unable to
 /// happen.
-async fn resolve_view_definition_dependencies(
+async fn resolve_column_sources(
     state: &WebState,
     version: helios_fhir::FhirVersion,
     tenant: &str,
     deps: &[sql_libraries::TableDependency],
     libraries: &[serde_json::Value],
-) -> Vec<(String, serde_json::Value)> {
-    resolve_table_rows(state, version, tenant, deps, libraries)
-        .await
-        .into_iter()
-        .filter_map(|(row, doc)| match (row.target, doc) {
-            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
-                Some((row.label, doc))
-            }
-            _ => None,
-        })
-        .collect()
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    sql_libraries::column_sources(resolve_table_rows(state, version, tenant, deps, libraries).await)
 }
 
 /// [`analyze_tables`]'s pure result: everything the Tables panel needs from
@@ -5387,13 +5735,16 @@ struct TableRowView {
 /// message. `sql_libraries` itself never localizes (matching every other
 /// pure-model/view split in this module), so this is the one place a
 /// [`sql_libraries::TableTarget`] variant becomes catalog text.
-fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> TableRowView {
     match row.target {
         sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
             label: row.label,
             chip: i18n.t("lib-tables-kind-view-definition"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/view-definitions?vd={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/view-definitions?vd={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -5401,7 +5752,23 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
             label: row.label,
             chip: i18n.t("sql-views-chip"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/views?lib={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/views?lib={id}"),
+                Some(origin),
+            )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::Terminology { kind, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t(match kind {
+                helios_sof::sqlquery::TerminologyKind::ValueSet => "lib-tables-kind-value-set",
+                helios_sof::sqlquery::TerminologyKind::ConceptMap => "lib-tables-kind-concept-map",
+            }),
+            chip_class: "type",
+            // The artifact lives on the terminology server, which has no
+            // page of its own on this UI to link to.
+            link_href: None,
             link_label: Some(name),
             detail: None,
         },
@@ -5454,7 +5821,7 @@ struct UsedByRowView {
 /// each group already sorted by its own producer, name for artifacts
 /// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
 /// exports ([`sql_export::jobs_for_used_by`])).
-fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis, origin: &str) -> Vec<UsedByRowView> {
     let mut rows: Vec<UsedByRowView> = analysis
         .used_by_artifacts
         .iter()
@@ -5467,7 +5834,10 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
             };
             UsedByRowView {
                 chip: i18n.t(chip_key),
-                href: format!("{base_href}?lib={}", artifact.id),
+                href: navigation::with_return(
+                    &format!("{base_href}?lib={}", artifact.id),
+                    Some(origin),
+                ),
                 label: artifact.name.clone(),
             }
         })
@@ -5502,6 +5872,7 @@ struct AddTableFormState {
 /// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
+    origin: String,
     add: AddTableFormState,
     /// `true` only for the `/run` fragment's own OOB companion (#842) — see
     /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
@@ -5539,11 +5910,11 @@ fn build_tables_card(
     table_options_href: String,
     options: TablesCardOptions,
 ) -> LibTablesCard {
-    let used_by = used_by_view(&i18n, &analysis);
+    let used_by = used_by_view(&i18n, &analysis, &options.origin);
     let rows = analysis
         .rows
         .into_iter()
-        .map(|row| table_row_view(&i18n, row))
+        .map(|row| table_row_view(&i18n, row, &options.origin))
         .collect();
     let unknown_rows: Vec<UnknownTableRowView> = analysis
         .unknown
@@ -5700,11 +6071,13 @@ fn build_columns_card(
 /// (if any) is left untouched, and only its meta is relabelled "last
 /// successful run" — see [`unknown_tables_notice`] for how its own fields
 /// are built.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/lib_run_unknown_tables.html")]
 struct UnknownTablesNotice {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The *first* unknown table's own 1-based line — `data-error-line`,
     /// the same attribute [`sql_views::extract_error_line`]'s own findings
     /// already tint via `sql-editor.js`.
@@ -5767,6 +6140,7 @@ fn unknown_tables_notice(
     UnknownTablesNotice {
         i18n,
         fragment,
+        part: RunPart::Both,
         first_line: tables[0].position.line,
         message,
         diagnostics_json: serde_json::to_string(&diagnostics).unwrap_or_default(),
@@ -5785,9 +6159,21 @@ fn unknown_tables_notice(
 /// ([`SqlLibraryPage::run_results`]) that must show the identical notice
 /// in place of results (`?…&saved=1`, the `document` endpoint's own no-JS
 /// echo).
+#[derive(Clone)]
 enum LibRunNotice {
     Standard(RunResultsPartial),
     UnknownTables(UnknownTablesNotice),
+}
+
+impl LibRunNotice {
+    /// The same notice restricted to one half of its markup ([`RunPart`]).
+    fn with_part(mut self, part: RunPart) -> Self {
+        match &mut self {
+            Self::Standard(partial) => partial.part = part,
+            Self::UnknownTables(notice) => notice.part = part,
+        }
+        self
+    }
 }
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
@@ -5797,6 +6183,12 @@ enum LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    /// Delete signals are candidates for the next authoritative render.
+    delete_redirect: String,
+    /// An incomplete fetch or a still-existing/unverifiable off-list candidate
+    /// prevents claiming that the collection is empty.
+    collection_unverified: bool,
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -5827,6 +6219,9 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
+    /// An explicit `?lib=` the rail's filter excludes (#1780), as on View
+    /// Definitions.
+    selection_filtered: bool,
     /// The Details card's guided-form panel (#840), alongside its own JSON
     /// editor — the same shape View Definitions' `form_pane` is, built
     /// inline from the document `selected.json` already shows so the page's
@@ -5851,11 +6246,15 @@ struct SqlLibraryPage {
     /// alongside a selection, so this needs no further gate of its own in
     /// the template).
     columns_card: Option<LibColumnsCard>,
-    /// The `$sql-run` preview card and its failure notice — either the
-    /// shared `partials/sql_run_results.html` markup or the unknown-table
-    /// lint's own notice (#842/04, [`LibRunNotice`]). `fragment: false` on
-    /// the `Standard` arm here — the page's own render has nothing to
-    /// swap into.
+    /// The `$sql-run` preview's `#run-notice` half ([`RunPart::Notice`]),
+    /// rendered inside the SQL card between the editor and the Save row.
+    run_notice: LibRunNotice,
+    /// The `$sql-run` preview card — either the shared
+    /// `partials/sql_run_results.html` markup or the unknown-table
+    /// lint's own notice (#842/04, [`LibRunNotice`]), restricted to the
+    /// results half ([`RunPart::Results`]) and rendered after the tables
+    /// panel. `fragment: false` on the `Standard` arm here — the page's
+    /// own render has nothing to swap into.
     run_results: LibRunNotice,
     save_error: Option<String>,
     saved: bool,
@@ -5885,7 +6284,10 @@ struct SelectedLib {
 
 #[derive(Deserialize, Default)]
 struct SqlLibQuery {
+    return_to: Option<String>,
     lib: Option<String>,
+    /// Untrusted hint from a successful DELETE; always verify it.
+    deleted: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
     /// `$sql-run` results server-side. There is no `?run=1` — the live
@@ -5999,16 +6401,18 @@ fn resolve_lib_of_kind(
 /// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. "The group is never itself filtered by `?filter=`"
-/// falls out for free: an id the current filter excludes is simply absent
+/// list already shows. An id the current filter excludes is simply absent
 /// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
-/// `{name, meta}` snapshot instead.
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
 fn resolve_lib_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_libraries::LibSummary],
     base_href: &str,
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -6025,7 +6429,9 @@ fn resolve_lib_recents(
             )
         })
         .collect();
-    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6035,11 +6441,13 @@ async fn sql_library_page(
     rv: RequestVersion,
     rt: RequestTenant,
     query: SqlLibQuery,
+    current_path: String,
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
+    live_filter: bool,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
         Ok(resources) => (resources, None),
         Err(error) => {
@@ -6047,20 +6455,46 @@ async fn sql_library_page(
             (Vec::new(), Some(error))
         }
     };
+    let stored_rail = settings.rail(kind.page, &rt.id);
+    let is_new = query.lib.as_deref() == Some("new");
+    // Five recent IDs, plus an explicit selection and a deletion hint: at
+    // most seven reads. Even IDs still returned by search must be checked.
+    let candidates = stored_rail
+        .recent
+        .iter()
+        .map(|entry| entry.id.clone())
+        .chain(query.lib.iter().filter(|id| id.as_str() != "new").cloned())
+        .chain(query.deleted.iter().cloned())
+        .collect();
+    let verdicts = resource_existence_verdicts(&state, &rt.id, rv.0, "Library", candidates).await;
+    let gone: std::collections::HashSet<&str> = verdicts
+        .iter()
+        .filter_map(|(id, verdict)| matches!(verdict, Ok(false)).then_some(id.as_str()))
+        .collect();
+    libraries.retain(|lib| {
+        !lib.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| gone.contains(id))
+    });
+    let collection_unverified = degraded.is_some()
+        || verdicts.iter().any(|(id, verdict)| {
+            !matches!(verdict, Ok(false))
+                && !libraries.iter().any(|lib| {
+                    lib.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+        });
+    let rail_before = stored_rail
+        .prune_gone(&verdicts)
+        .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| e.name.to_lowercase().contains(&needle));
-        }
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
         s
     };
 
-    let rail_before = settings.rail(kind.page, &rt.id);
-    let is_new = query.lib.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (the `?lib=new` exception):
-        // nothing here reads or writes `rails.<page>`.
+        // "Create New" never records a selection. The existence sweep
+        // may still have cleaned a confirmed deletion from this rail.
         (
             Some(SelectedLib {
                 id: String::new(),
@@ -6084,15 +6518,13 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?lib=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    rail_before.select(entry).unwrap_or(rail_before)
+                };
                 (
                     Some(SelectedLib {
                         id,
@@ -6106,22 +6538,15 @@ async fn sql_library_page(
                     rail,
                 )
             }
-            None => {
-                // A stale or mistyped explicit id is pruned from the
-                // registry; the page itself keeps its current "no selection"
-                // render either way.
-                let rail = prune_stale_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    &explicit_id,
-                )
-                .await;
-                (None, None, rail)
-            }
+            // Absence from a filtered, incomplete or failed list is not
+            // evidence of deletion. The existence sweep already decided it.
+            None => (None, None, rail_before),
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -6129,6 +6554,12 @@ async fn sql_library_page(
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved =
             stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved =
@@ -6155,11 +6586,28 @@ async fn sql_library_page(
         }
     };
 
+    if rail != stored_rail {
+        rail_state::persist(
+            &state.settings,
+            &settings.user_key,
+            &rt.id,
+            kind.page,
+            &rail,
+        )
+        .await;
+    }
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter));
+
     let recent_entries = resolve_lib_recents(
         &rail,
         &summaries,
         kind.base_href,
         selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
     );
 
     // `?saved=1` (Save's own redirect) runs the just-stored Library through
@@ -6170,6 +6618,14 @@ async fn sql_library_page(
     // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
     // 1` handling in `sql_view_definitions_page`).
     let i18n = I18n::new(locale);
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&current_path),
+    );
     // Owned, not borrowed: `selected` itself moves into the response below,
     // in the same expression that still needs this id for `export_href`.
     let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
@@ -6220,7 +6676,10 @@ async fn sql_library_page(
                 kind,
                 analysis,
                 table_options_href(&selected_id),
-                TablesCardOptions::default(),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    ..Default::default()
+                },
             ))
         }
         None => None,
@@ -6271,6 +6730,7 @@ async fn sql_library_page(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,
@@ -6312,7 +6772,7 @@ async fn sql_library_page(
             match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
                     // #842/04's own NF1: the Columns card's origin lookup
-                    // resolves dependencies to ViewDefinitions only after a
+                    // resolves dependencies to table schemas only after a
                     // run has actually succeeded — and only the ones the
                     // SQL actually reads (`dependencies_used_by_sql`), so a
                     // stale, no-longer-queried label never manufactures a
@@ -6322,15 +6782,10 @@ async fn sql_library_page(
                         .map(|s| s.sql.as_str())
                         .unwrap_or_default();
                     let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
-                    let view_definitions = resolve_view_definition_dependencies(
-                        &state, rv.0, &rt.id, &used_deps, &libraries,
-                    )
-                    .await;
-                    let columns = sql_libraries::analyze_columns(
-                        &table.columns,
-                        &raw_rows,
-                        &view_definitions,
-                    );
+                    let sources =
+                        resolve_column_sources(&state, rv.0, &rt.id, &used_deps, &libraries).await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &sources);
                     (
                         standard_notice(RunResultsState::Success(table, ms)),
                         columns,
@@ -6361,6 +6816,10 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &selected_id),
+        collection_unverified,
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: kind.active_page,
@@ -6387,7 +6846,8 @@ async fn sql_library_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
@@ -6396,8 +6856,17 @@ async fn sql_library_page(
     })
 }
 
+fn sql_library_delete_redirect(base: &str, id: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("deleted", id)
+        .finish();
+    format!("{base}?{query}")
+}
+
 #[derive(Default)]
 struct SqlLibSaveForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     /// The decoded SQL pane; re-embedded as the base64 attachment on save.
@@ -6424,6 +6893,8 @@ fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6519,6 +6990,7 @@ async fn render_lib_document_page(
     rt: &RequestTenant,
     kind: &LibraryKind,
     user_key: &str,
+    navigation: SqlEditorNavigation,
     json: String,
     sql: String,
     is_new: bool,
@@ -6565,6 +7037,7 @@ async fn render_lib_document_page(
                 analysis,
                 table_options_href(&id),
                 TablesCardOptions {
+                    origin: navigation.current_path.clone(),
                     add: add_table,
                     ..Default::default()
                 },
@@ -6573,6 +7046,7 @@ async fn render_lib_document_page(
                 LibRunNotice::Standard(RunResultsPartial {
                     i18n,
                     fragment: false,
+                    part: RunPart::Both,
                     run_href: kind.run_href,
                     form_id: LIB_EDITOR_FORM_ID,
                     heading_key: kind.results_heading_key,
@@ -6590,6 +7064,7 @@ async fn render_lib_document_page(
             LibRunNotice::Standard(RunResultsPartial {
                 i18n,
                 fragment: false,
+                part: RunPart::Both,
                 run_href: kind.run_href,
                 form_id: LIB_EDITOR_FORM_ID,
                 heading_key: kind.results_heading_key,
@@ -6605,6 +7080,10 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &id),
+        collection_unverified: false,
+        navigation,
+        selection_filtered: false,
         status: current_status(state, version, rt),
         i18n,
         active_page: kind.active_page,
@@ -6638,7 +7117,8 @@ async fn render_lib_document_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error,
         saved: false,
         // Neither a save nor a navigation — there is nothing new to record
@@ -6658,6 +7138,14 @@ async fn sql_library_save(
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        &form.id,
+        form.id.is_empty(),
+        Some(&form.return_to),
+        Some(&form.current_path),
+    );
     // A form-validation error re-renders in place: nothing has run
     // server-side, no rail to repaint, and the submitted text is kept
     // rather than lost — [`render_lib_document_page`]'s own shape, shared
@@ -6681,6 +7169,7 @@ async fn sql_library_save(
             &rt,
             kind,
             &user_key,
+            navigation.clone(),
             json,
             sql,
             is_new,
@@ -6833,7 +7322,7 @@ async fn sql_library_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
+            axum::response::Redirect::to(&navigation.saved_href(kind.base_href, "lib", stored_id))
                 .into_response()
         }
         Err(error) => render(
@@ -6853,6 +7342,8 @@ async fn sql_library_save(
 
 #[derive(Default)]
 struct SqlLibRunForm {
+    return_to: String,
+    current_path: String,
     /// The Library id the posted document was opened from, empty for an
     /// unsaved one — only ever used to gate the Export action's `href`
     /// (#839); a stored Library is never read back through it, so a
@@ -6889,6 +7380,8 @@ fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6955,9 +7448,9 @@ struct LibRunFragment {
 ///
 /// Builds the `/run` fragment's own Columns update for a *successful* run
 /// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
-/// `deps` the SQL actually reads down to their ViewDefinitions
+/// `deps` the SQL actually reads down to their table schemas
 /// (`sql_libraries::dependencies_used_by_sql`,
-/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// [`resolve_column_sources`]), and analyzes `table`/
 /// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
 /// Query and a SQL View share this identical "good run" shape, differing
 /// only in whether declared parameters were involved getting here — called
@@ -6974,16 +7467,11 @@ async fn columns_fragment_for_success(
     raw_rows: &[serde_json::Value],
     sql: &str,
     deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let libraries = state
-        .conformance
-        .fetch("Library", version, tenant)
-        .await
-        .unwrap_or_default();
-    let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, &libraries).await;
-    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    let sources = resolve_column_sources(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &sources);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
 
@@ -7019,6 +7507,7 @@ async fn sql_library_run(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,
@@ -7115,12 +7604,17 @@ async fn sql_library_run(
     let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    // The Library collection is read at most once per request: the Tables
+    // card and the Columns card both resolve against it.
+    let mut libraries: Option<Vec<serde_json::Value>> = None;
     let tables_card = if tables_signature != form.tables_sig {
-        let libraries = state
-            .conformance
-            .fetch("Library", rv.0, &rt.id)
-            .await
-            .unwrap_or_default();
+        let libraries = libraries.insert(
+            state
+                .conformance
+                .fetch("Library", rv.0, &rt.id)
+                .await
+                .unwrap_or_default(),
+        );
         let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
         let analysis = analyze_tables(
             &state,
@@ -7129,7 +7623,7 @@ async fn sql_library_run(
             &resource,
             &deps,
             &unknown_tables,
-            &libraries,
+            libraries,
             &jobs,
         )
         .await;
@@ -7139,6 +7633,12 @@ async fn sql_library_run(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 oob: true,
                 ..Default::default()
             },
@@ -7172,8 +7672,18 @@ async fn sql_library_run(
                         kind = kind.code,
                         "ran a Library preview"
                     );
+                    let libs = match libraries.as_deref() {
+                        Some(libs) => libs,
+                        None => libraries.insert(
+                            state
+                                .conformance
+                                .fetch("Library", rv.0, &rt.id)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                    };
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -7215,8 +7725,18 @@ async fn sql_library_run(
                     kind = kind.code,
                     "ran a Library preview"
                 );
+                let libs = match libraries.as_deref() {
+                    Some(libs) => libs,
+                    None => libraries.insert(
+                        state
+                            .conformance
+                            .fetch("Library", rv.0, &rt.id)
+                            .await
+                            .unwrap_or_default(),
+                    ),
+                };
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)
@@ -7246,6 +7766,8 @@ async fn sql_library_run(
 
 #[derive(Default)]
 struct SqlLibDocumentForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     sql: String,
@@ -7294,6 +7816,8 @@ fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -7433,6 +7957,14 @@ async fn document_whole_error_response(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 form.json.clone(),
                 form.sql.clone(),
                 form.id.is_empty(),
@@ -7499,6 +8031,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7543,6 +8083,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7697,6 +8245,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         // Closed again after a successful add (#842) —
                         // mirrors `apply_add_parameter`'s own rule.
                         add: AddTableFormState::default(),
@@ -7714,6 +8268,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7754,6 +8316,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         add,
                         oob: false,
                         data_document: None,
@@ -7769,6 +8337,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7826,6 +8402,12 @@ async fn apply_remove_table(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 data_document: Some(updated_pretty),
                 ..Default::default()
             },
@@ -7840,6 +8422,14 @@ async fn apply_remove_table(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 updated_pretty,
                 form.sql,
                 form.id.is_empty(),
@@ -7943,6 +8533,8 @@ async fn sql_library_document(
     }
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_queries_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -7950,18 +8542,23 @@ async fn sql_queries_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_QUERY_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -8031,6 +8628,8 @@ async fn sql_queries_document(
     .await
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_views_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -8038,18 +8637,23 @@ async fn sql_views_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_VIEW_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -8466,13 +9070,14 @@ async fn compartments_page(
     rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.compartments.invalidate(&rt.id, fhir_version);
     }
@@ -8515,6 +9120,7 @@ async fn compartments_page(
             i18n: I18n::new(locale),
             active_page: "compartments",
             view,
+            editor_return_to: uri.to_string(),
         }),
         // No definitions means the self-fetch degraded (an outage, or auth
         // without an outbound token, #320) â€” a warning, not a 404. The failed
@@ -8523,6 +9129,8 @@ async fn compartments_page(
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
+            unsupported: state.compartments.listing_unsupported(&rt.id, fhir_version),
+            empty: state.compartments.listing_empty(&rt.id, fhir_version),
         }),
     }
 }
@@ -8814,6 +9422,13 @@ fn dash_state(
     for series in &snapshot.series {
         series.resource_type.hash(&mut hasher);
         series.total.hash(&mut hasher);
+        // History arriving changes how the line is drawn even when every
+        // point keeps its value (nothing written in the window), so it must
+        // change the digest too (#1603).
+        series
+            .recorded_from
+            .map(|t| t.timestamp())
+            .hash(&mut hasher);
         for point in &series.points {
             point.bucket_start.timestamp().hash(&mut hasher);
             point.delta.hash(&mut hasher);
@@ -9162,6 +9777,7 @@ fn build_dashboard(
                 color: i % SERIES_COLORS + 1,
                 href,
                 focused,
+                partial: s.recorded_from.is_some(),
             }
         })
         .collect();
@@ -9306,6 +9922,25 @@ fn build_chart(
         n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    // Where each series' measurements begin (#1603): the index of the bucket
+    // holding `recorded_from`, or 0 when the whole window is history. Points
+    // before it are not drawn, tipped or tabled.
+    let bucket = window.bucket_seconds();
+    let known_from: Vec<usize> = plotted
+        .iter()
+        .map(|s| match s.recorded_from {
+            None => 0,
+            Some(from) => {
+                let floor = from.timestamp() - from.timestamp().rem_euclid(bucket);
+                // At least the current point is always a measurement.
+                s.points
+                    .iter()
+                    .position(|p| p.bucket_start.timestamp() >= floor)
+                    .unwrap_or(s.points.len() - 1)
+            }
+        })
+        .collect();
+
     if plotted.is_empty() {
         return ChartView {
             has_data: false,
@@ -9330,8 +9965,9 @@ fn build_chart(
     // unless a series is focused, in which case the axis fits that series.
     let peak = plotted
         .iter()
-        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
-        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .zip(&known_from)
+        .filter(|(s, _)| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
@@ -9348,26 +9984,34 @@ fn build_chart(
 
     let series: Vec<ChartSeriesView> = plotted
         .iter()
+        .zip(&known_from)
         .enumerate()
-        .map(|(si, s)| ChartSeriesView {
-            resource_type: s.resource_type.clone(),
-            color: si % SERIES_COLORS + 1,
-            polyline: s
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            emphasis: match focus {
-                None => "",
-                Some(f) if f == s.resource_type => " series--focused",
-                Some(_) => " series--receded",
-            },
-            // build_dashboard fills the focus link in; geometry stays the
-            // only concern here.
-            href: None,
-            focused: focus == Some(s.resource_type.as_str()),
+        .map(|(si, (s, &from))| {
+            let last = s.points.len() - 1;
+            ChartSeriesView {
+                resource_type: s.resource_type.clone(),
+                color: si % SERIES_COLORS + 1,
+                polyline: s
+                    .points
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                emphasis: match focus {
+                    None => "",
+                    Some(f) if f == s.resource_type => " series--focused",
+                    Some(_) => " series--receded",
+                },
+                // build_dashboard fills the focus link in; geometry stays the
+                // only concern here.
+                href: None,
+                focused: focus == Some(s.resource_type.as_str()),
+                partial: s.recorded_from.is_some(),
+                end_x: x_at(last as i64),
+                end_y: y_at(s.points[last].cumulative),
+            }
         })
         .collect();
 
@@ -9394,7 +10038,11 @@ fn build_chart(
                 label,
                 values: plotted
                     .iter()
-                    .map(|s| {
+                    .zip(&known_from)
+                    .map(|(s, &from)| {
+                        if (idx as usize) < from {
+                            return UNMEASURED.to_string();
+                        }
                         s.points
                             .get(idx as usize)
                             .map(|p| grouped(p.cumulative, lang))
@@ -9415,12 +10063,19 @@ fn build_chart(
         "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
         "series": plotted
             .iter()
+            .zip(&known_from)
             .enumerate()
-            .map(|(si, s)| serde_json::json!({
+            .map(|(si, (s, &from))| serde_json::json!({
                 "type": s.resource_type,
                 "color": si % SERIES_COLORS + 1,
-                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
-                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+                // `null` before the series' measurements begin (#1603); the
+                // script shows a dash there, never a number.
+                "values": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then_some(p.cumulative))
+                    .collect::<Vec<_>>(),
+                "ys": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then(|| y_at(p.cumulative)))
+                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     })
@@ -9438,6 +10093,10 @@ fn build_chart(
         pick_label,
     }
 }
+
+/// What the chart's table shows for a bucket a series has no measurement
+/// for (#1603): a dash, never a number.
+const UNMEASURED: &str = "—";
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
 fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
@@ -9549,6 +10208,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
             resource_type: resource_type.to_string(),
             total: cumulative,
             points,
+            recorded_from: None,
         }
     };
 
@@ -10194,10 +10854,10 @@ mod tests {
         assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
     }
 
-    fn render_queries_page() -> String {
+    fn render_search_page(lang: &str) -> String {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        QueriesPage {
+        let rail_entries = build_rail_entries("/ui/search", &resource_types, None, None, "en");
+        SearchPage {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
@@ -10210,49 +10870,52 @@ mod tests {
                 bearer_only_auth: false,
                 fhir_base: String::new(),
             },
-            i18n: i18n("en"),
-            active_page: "queries",
-            show_save: true,
+            i18n: i18n(lang),
+            active_page: "search",
+            nl: NlSearch::default(),
+            docs_url: NL_SEARCH_DOCS,
             rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
             recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
+            rail_page: rail_state::RailPage::Search.key(),
             max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()
-        .expect("queries page renders")
+        .expect("search page renders")
     }
 
     /// #1643: the builder's condition parameter is a typeahead, so every page
-    /// hosting the builder loads `typeahead.js` before `saved-queries.js`, and
+    /// hosting the builder loads `typeahead.js` before `search-builder.js`, and
     /// the empty-state text reaches the script through `data-msg-param-none`.
     #[test]
     fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
         assert!(Assets::get("typeahead.js").is_some());
-        let queries = render_queries_page();
         let search = include_str!("../templates/pages/search.html");
         let resources = include_str!("../templates/pages/resources.html");
-        for (name, html) in [
-            ("queries", queries.as_str()),
-            ("search", search),
-            ("resources", resources),
-        ] {
+        for (name, html) in [("search", search), ("resources", resources)] {
             let typeahead = html
                 .find("/ui/assets/typeahead.js")
                 .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
             let builder = html
-                .find("/ui/assets/saved-queries.js")
-                .unwrap_or_else(|| panic!("{name} page loads saved-queries.js"));
+                .find("/ui/assets/search-builder.js")
+                .unwrap_or_else(|| panic!("{name} page loads search-builder.js"));
             assert!(typeahead < builder, "{name}: typeahead.js must load first");
+            let codec = html
+                .find("/ui/assets/fhir-search-value.js")
+                .expect("codec loads");
+            assert!(
+                codec < builder,
+                "{name}: the search-value codec must load first"
+            );
         }
     }
 
     #[test]
     fn typeahead_builder_partial_renders_the_no_match_text() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
     }
 
@@ -10260,7 +10923,7 @@ mod tests {
     /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
     #[test]
     fn builder_renders_the_unknown_param_messages() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(
             r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
         ));
@@ -10271,22 +10934,23 @@ mod tests {
     }
 
     #[test]
-    fn queries_page_renders_shell_and_marks_nav_current() {
-        let html = render_queries_page();
+    fn search_page_renders_builder_and_recent_shell() {
+        let html = render_search_page("en");
 
         assert!(html.contains(r#"id="saved-query-form""#));
-        assert!(html.contains(r#"id="saved-queries""#));
+        assert!(!html.contains(r#"id="saved-queries""#));
         assert!(html.contains("/ui/assets/fhir-search-value.js"));
-        assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(html.contains("/ui/assets/search-builder.js"));
         assert!(
-            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            html.find("/ui/assets/fhir-search-value.js")
+                < html.find("/ui/assets/search-builder.js"),
             "the FHIR search-value codec must load before its consumer"
         );
-        // Search Builder: the featured GET URL input, both submit intents,
+        // Search Builder: the featured GET URL input, Run,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
         assert!(html.contains(r#"data-intent="run""#));
-        assert!(html.contains(r#"data-intent="save""#));
+        assert!(!html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
         // The Recent panel closes from an explicit X as well as outside
         // click / Esc (addbox.js covers details.menu too).
@@ -10296,7 +10960,7 @@ mod tests {
         for resource_type in ["Patient", "Observation"] {
             let attributes =
                 format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
-            let href = format!(r#"href="/ui/queries?type={resource_type}""#);
+            let href = format!(r#"href="/ui/search?type={resource_type}""#);
             assert!(
                 html.contains(&attributes),
                 "{resource_type} rail attributes"
@@ -10304,57 +10968,28 @@ mod tests {
             assert!(html.contains(&href), "{resource_type} rail link");
         }
         assert!(!html.contains(r#"class="count""#));
-        // Saved Queries has no nav entry any more (#282 folded search / editor
-        // / history / saved-queries into Resources); the route still renders.
-        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
-        // The delete-confirm string reaches the script with its {name} slot.
-        assert!(html.contains("{name}"));
     }
 
     #[test]
-    fn queries_page_renders_in_the_negotiated_locale() {
-        let resource_types = vec!["Patient".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        let html = QueriesPage {
-            status: Status {
-                version: "1.2.3",
-                checked_at: 42,
-                fhir_version: helios_fhir::FhirVersion::R4,
-                tenant_id: "default".to_string(),
-                tenant_display: None,
-                show_tenant_picker: true,
-                terminology: TerminologyNavigation::Unconfigured,
-                user: None,
-                bearer_only_auth: false,
-                fhir_base: String::new(),
-            },
-            i18n: i18n("es"),
-            active_page: "queries",
-            show_save: true,
-            rail_counts_approximate: false,
-            resource_types,
-            selected_type: String::new(),
-            rail_entries,
-            recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
-            max_recent: rail_state::MAX_RECENT,
-            builder_url: None,
-        }
-        .render()
-        .expect("queries page renders");
-
-        assert!(html.contains("Consultas guardadas"));
+    fn shared_builder_renders_in_the_negotiated_locale() {
+        let html = render_search_page("es");
+        assert!(html.contains("Buscar"));
+        assert!(html.contains(r#"data-msg-saved="Guardadas""#));
     }
 
-    /// The saved-queries script owns a structural read-modify-write against
+    /// The shared search builder owns a structural read-modify-write against
     /// the shared settings document, so â€” unlike theme.js â€” it must use the
     /// conditional-request cycle: capture the ETag, send If-Match, and absorb
     /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
     /// covered in helios-rest's `user_settings` tests.
     #[test]
-    fn saved_queries_script_is_wired_to_user_settings() {
-        let file = Assets::get("saved-queries.js").expect("saved-queries.js embedded");
-        let source = std::str::from_utf8(&file.data).expect("saved-queries.js is UTF-8");
+    fn search_builder_script_is_wired_to_user_settings() {
+        assert!(
+            Assets::get("saved-queries.js").is_none(),
+            "retired asset has no alias"
+        );
+        let file = Assets::get("search-builder.js").expect("search-builder.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("search-builder.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("savedQueries"));
         assert!(source.contains("If-Match"));
@@ -10362,13 +10997,12 @@ mod tests {
             source.contains("412"),
             "recovers from optimistic-lock races"
         );
-        assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
         // Results render in-page from the FHIR API itself, and the builder's
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
-        assert!(source.contains("/ui/queries/params"));
+        assert!(source.contains("/ui/resources/params"));
     }
 
     #[test]
@@ -10669,6 +11303,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             available: vec![helios_observability::dashboard::TypeCount {
                 resource_type: "Patient".to_string(),
@@ -10728,6 +11363,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             ..DashboardSnapshot::default()
         };
@@ -10755,6 +11391,7 @@ mod tests {
                 point_at(1_752_454_800, 0, 0),
                 point_at(1_752_458_400, 0, 0),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&empty_type),
@@ -11126,6 +11763,7 @@ mod tests {
             resource_type: "Patient".to_string(),
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -11154,6 +11792,7 @@ mod tests {
                 point_at(1_752_503_460, -6, 4),
                 point_at(1_752_503_520, 0, 4),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -11176,6 +11815,142 @@ mod tests {
                 "y {y} escaped the plot"
             );
         }
+    }
+
+    /// #1603: a series whose window history is not loaded plots only the
+    /// buckets its counters recorded — from the bucket holding
+    /// `recorded_from` to the current one — dashed and with its current point
+    /// marked. The earlier buckets are not drawn, tipped or tabled as numbers:
+    /// before the fix they were a flat line at today's total.
+    #[test]
+    fn a_series_without_history_plots_only_its_recorded_buckets() {
+        // Three one-minute buckets; the counters' base was read 10 s into the
+        // second, so the first bucket is not a measurement.
+        let series = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 7_699_987,
+            points: vec![
+                point_at(1_752_503_400, 0, 7_699_987),
+                point_at(1_752_503_460, 0, 7_699_987),
+                point_at(1_752_503_520, 0, 7_699_987),
+            ],
+            recorded_from: DateTime::from_timestamp(1_752_503_470, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        let pairs: Vec<&str> = s.polyline.split(' ').collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the first bucket is not drawn: {}",
+            s.polyline
+        );
+        // x of the second of three buckets: 40 + 1020 / 2.
+        assert!(pairs[0].starts_with("550,"), "{}", s.polyline);
+        assert_eq!(format!("{},{}", s.end_x, s.end_y), pairs[1]);
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["values"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["ys"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["values"][1], 7_699_987);
+        assert_eq!(chart.table.len(), 3);
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "7,699,987");
+
+        // The same points with their history loaded are the whole line.
+        let seeded = DashboardSeries {
+            recorded_from: None,
+            ..series
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&seeded),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        assert!(!chart.series[0].partial);
+        assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
+        assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A `recorded_from` past the last bucket (a skewed clock) still plots
+    /// the current point: the total is always a measurement.
+    #[test]
+    fn a_series_recorded_from_the_future_keeps_its_current_point() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 0, 5), point_at(1_752_503_460, 0, 5)],
+            recorded_from: DateTime::from_timestamp(1_752_507_000, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        assert_eq!(s.polyline, format!("{},{}", s.end_x, s.end_y));
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "5");
+    }
+
+    /// #1603: history still loading is said next to the series' total in the
+    /// legend and by the notice line — under the "approximate" slug, since it
+    /// is the same reading said more precisely — and it changes the refresh
+    /// digest, so the whole line is drawn as soon as the history lands even
+    /// when no point changes value.
+    #[test]
+    fn history_loading_is_said_in_the_legend_and_the_note() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::seconds(30);
+        let now = read_at + Duration::seconds(5);
+        let snapshot = |loading: bool| DashboardSnapshot {
+            series: vec![
+                DashboardSeries {
+                    resource_type: "Observation".to_string(),
+                    total: 9,
+                    points: vec![point_at(1_752_503_340, 0, 9), point_at(1_752_503_400, 0, 9)],
+                    recorded_from: loading.then_some(reconciled_at),
+                },
+                DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 2,
+                    points: vec![point_at(1_752_503_340, 0, 2), point_at(1_752_503_400, 0, 2)],
+                    recorded_from: None,
+                },
+            ],
+            figures: Figures::Approximate {
+                read_at,
+                reconciled_at,
+            },
+            ..Default::default()
+        };
+
+        let dash = build_dashboard(&snapshot(true), false, &[], None, "en");
+        assert!(dash.legend[0].partial && !dash.legend[1].partial);
+        assert!(dash.chart.series[0].partial && !dash.chart.series[1].partial);
+
+        let line = dashboard_notice(&SnapshotState::Ready(snapshot(true)), now);
+        assert_eq!(line.kind, DashboardNotice::HistoryLoading);
+        assert_eq!(line.kind.slug(), "approximate");
+        assert_eq!(line.kind.key(), Some("chart-approximate-history-note"));
+        assert!(!line.kind.is_warning() && !line.kind.is_waiting());
+        assert!(line.as_of.is_some(), "a measured reading is dated");
+        let settled = dashboard_notice(&SnapshotState::Ready(snapshot(false)), now);
+        assert_eq!(settled.kind, DashboardNotice::Approximate);
+
+        assert_ne!(
+            dash_state(&snapshot(true), &[], false, now),
+            dash_state(&snapshot(false), &[], false, now),
+            "history arriving must redraw the line"
+        );
     }
 }
 
@@ -11273,6 +12048,20 @@ mod user_summary_tests {
         );
 
         assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn without_an_email_the_secondary_line_is_the_username() {
+        // Entra ID: a user without a mailbox has no `email`, and `sub` is an
+        // opaque pairwise value; `preferred_username` is the sign-in name.
+        let mut entra = principal();
+        entra.name = Some("Demo User".to_string());
+        entra.preferred_username = Some("demo@contoso.example".to_string());
+        entra.email = None;
+        entra.subject = "AAAAAAAAAAAAAAAAAAAAAIkzqFVrSaSaFHy782bbtaQ".to_string();
+        let summary = UserSummary::from_session(Some(&entra)).unwrap();
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@contoso.example");
     }
 
     #[test]

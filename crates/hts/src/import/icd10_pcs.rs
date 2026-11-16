@@ -270,7 +270,12 @@ fn read_sources(path: &Path) -> Result<PcsSources, HtsError> {
         })?;
 
         let names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|e| e.name().ok().map(|n| n.into_owned()))
+            })
             .collect();
         let codes_name = names
             .iter()
@@ -918,7 +923,7 @@ GZ11ZZZ Psychological Tests, Personality and Behavioral\r\n";
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("icd10pcsCodesFile.pdf", opts).unwrap();
             zip.write_all(b"%PDF-1.4 not really").unwrap();
             zip.start_file("codes_addenda_2025.txt", opts).unwrap();

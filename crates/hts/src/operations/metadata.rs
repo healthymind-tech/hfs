@@ -379,6 +379,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "CodeSystem",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": code_system_search_params,
                     "operation": [
                         {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
@@ -389,6 +390,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ValueSet",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
@@ -398,6 +400,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ConceptMap",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
@@ -539,6 +542,9 @@ mod tests {
         assert!(types.contains(&"CodeSystem"));
         assert!(types.contains(&"ValueSet"));
         assert!(types.contains(&"ConceptMap"));
+        for resource in resources {
+            assert_eq!(resource["updateCreate"], true, "{}", resource["type"]);
+        }
     }
 
     #[test]

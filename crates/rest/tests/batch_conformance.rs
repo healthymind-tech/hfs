@@ -1472,7 +1472,8 @@ mod conditional_entries {
 
         let entry = &body["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/p1");
+        // Versioned, as the transaction arm answers it (#2517).
+        assert_eq!(entry["response"]["location"], "Patient/p1/_history/2");
         assert_eq!(entry["resource"]["id"], "p1");
         assert_eq!(family_of(&backend, "p1").await, "Updated");
         assert_eq!(
@@ -1929,6 +1930,91 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before + 1);
     }
 
+    /// A transaction bundle with a conditional PUT and a sibling create: the
+    /// first bundle creates the matched-nothing Patient, the second updates it
+    /// in place, and the sibling create lands both times. This is the shape
+    /// an application sends when it addresses resources by identifier.
+    fn transaction_with_conditional_put(family: &str) -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "request": { "method": "POST", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                },
+                {
+                    "fullUrl": "urn:uuid:patient",
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=http://example.org|12345"
+                    },
+                    "resource": {
+                        "resourceType": "Patient",
+                        "identifier": [{"system": "http://example.org", "value": "12345"}],
+                        "name": [{"family": family}]
+                    }
+                },
+                {
+                    "request": { "method": "POST", "url": "Observation" },
+                    "resource": {
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "test"},
+                        "subject": {"reference": "urn:uuid:patient"}
+                    }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conditional_put_creates_then_updates_in_place() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(&server, transaction_with_conditional_put("First")).await;
+        response.assert_status(StatusCode::OK);
+        let first: Value = response.json();
+        assert_eq!(
+            first["entry"][1]["response"]["status"], "201 Created",
+            "{first}"
+        );
+        let patient_id = first["entry"][1]["resource"]["id"]
+            .as_str()
+            .expect("created patient id")
+            .to_string();
+        assert_eq!(
+            first["entry"][2]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}")),
+            "a reference to the conditional PUT resolves to the resource it created"
+        );
+        assert_eq!(patient_count(&backend).await, before + 2);
+
+        let response = post_bundle(&server, transaction_with_conditional_put("Second")).await;
+        response.assert_status(StatusCode::OK);
+        let second: Value = response.json();
+        assert_eq!(
+            second["entry"][1]["response"]["status"], "200 OK",
+            "{second}"
+        );
+        assert_eq!(second["entry"][1]["resource"]["id"], json!(patient_id));
+        assert_eq!(
+            second["entry"][1]["resource"]["name"][0]["family"],
+            "Second"
+        );
+        assert_eq!(
+            second["entry"][2]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}")),
+            "a reference to the conditional PUT resolves to the resource it matched"
+        );
+        assert_eq!(
+            patient_count(&backend).await,
+            before + 3,
+            "the second bundle adds only its sibling create"
+        );
+    }
+
     #[tokio::test]
     async fn a_transaction_conditional_put_with_several_matches_is_412_and_rolls_back() {
         let (server, backend) = create_test_server().await;
@@ -2067,6 +2153,83 @@ mod conditional_entries {
         .await;
 
         response.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
+    /// The text of the first issue of a failed bundle's OperationOutcome.
+    fn outcome_text(body: &Value) -> &str {
+        body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("outcome text: {body}"))
+    }
+
+    /// #922: the overlap message names both entries by the client's Bundle
+    /// index. `DELETE` sorts before `PUT` in the server's processing order, so
+    /// the `DELETE` the client sent second is the first entry the executor sees
+    /// and the conditional `PUT` the client sent first is its second; the two
+    /// orders disagree about both entries.
+    #[tokio::test]
+    async fn the_overlap_message_names_the_clients_entry_indices() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![
+                put_entry(CRITERIA_URL, "ByCriteria"),
+                delete_entry("Patient/p1"),
+            ]),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        let text = outcome_text(&body);
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT "),
+            "the failing entry is the client's entry 0: {text}"
+        );
+        assert!(
+            text.contains("which entry 1 (DELETE Patient/p1) also addresses"),
+            "the entry it collides with is the client's entry 1: {text}"
+        );
+        assert_eq!(
+            family_of(&backend, "p1").await,
+            "Nguyen",
+            "neither write may land"
+        );
+    }
+
+    /// #922: the same, for two conditional entries that resolve to one
+    /// resource — the client sent the `PUT` first and the `DELETE` second, and
+    /// the executor sees them the other way round.
+    #[tokio::test]
+    async fn the_overlap_message_between_two_conditional_entries_names_the_clients_indices() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![
+                put_entry(CRITERIA_URL, "Again"),
+                delete_entry(CRITERIA_URL),
+            ]),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        let text = outcome_text(&body);
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT "),
+            "the failing entry is the client's entry 0: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "which entry 1 (DELETE {CRITERIA_URL}) also addresses"
+            )),
+            "the entry it collides with is the client's entry 1: {text}"
+        );
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
     }
 
@@ -2297,6 +2460,43 @@ mod conditional_entries {
             before,
             "sibling POST rolled back"
         );
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
+    /// #922: the `412` for an unsatisfied `ifMatch` names the client's entry,
+    /// not the entry's place in the server's processing order. `DELETE` sorts
+    /// before `POST` and `PUT`, so each case puts the guarded entry where the
+    /// two orders disagree about it.
+    #[tokio::test]
+    async fn a_stale_if_match_names_the_clients_entry_index() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let mut guarded_delete = delete_entry(CRITERIA_URL);
+        guarded_delete["request"]["ifMatch"] = json!("W/\"999\"");
+        let mut guarded_put = put_entry(CRITERIA_URL, "Guarded");
+        guarded_put["request"]["ifMatch"] = json!("W/\"999\"");
+
+        let cases = [
+            // The guarded DELETE is the client's entry 1 and the executor's
+            // entry 0.
+            (vec![sibling_post(), guarded_delete], 1),
+            // The guarded PUT is the client's entry 0 and the executor's
+            // entry 1.
+            (vec![guarded_put, delete_entry("Patient/other")], 0),
+        ];
+        for (entries, client_index) in cases {
+            let response = post_bundle(&server, transaction(entries)).await;
+
+            response.assert_status(StatusCode::PRECONDITION_FAILED);
+            let body: Value = response.json();
+            assert_eq!(body["issue"][0]["code"], "conflict", "{body}");
+            assert!(
+                outcome_text(&body)
+                    .starts_with(&format!("Transaction failed at entry {client_index}: ")),
+                "the guarded entry is the client's entry {client_index}: {body}"
+            );
+        }
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
     }
 
@@ -2846,6 +3046,461 @@ mod search_entries {
         assert_eq!(
             entry["resource"]["resourceType"].as_str().unwrap(),
             "Patient"
+        );
+    }
+}
+
+// =============================================================================
+// GET history and vread entries (#2380)
+// =============================================================================
+
+/// A `GET` entry whose URL is a history interaction is answered like the same
+/// direct request: a vread entry carries the requested version, and a history
+/// entry carries the `history` Bundle. Before #2380 the instance forms were
+/// read as the current version of `[type]/[id]`, `Patient/_history` was a read
+/// of a Patient whose id is `_history`, and `_history` a search of a resource
+/// type of that name.
+mod history_entries {
+    use super::*;
+    use chrono::{SecondsFormat, Utc};
+    use std::time::Duration;
+
+    /// PUTs a Patient named `family` (a create the first time, an update after).
+    async fn put_patient(server: &TestServer, id: &str, family: &str) {
+        let response = server
+            .put(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": family}]
+            }))
+            .await;
+        assert!(
+            response.status_code().is_success(),
+            "PUT Patient/{id}: {} {}",
+            response.status_code(),
+            response.text()
+        );
+    }
+
+    /// Creates `id` and updates it twice: versions 1, 2 and 3, families `V1`,
+    /// `V2` and `V3`, written over HTTP like `rest_conformance`'s helper.
+    ///
+    /// Returns an instant strictly between versions 1 and 2, form-urlencoded as
+    /// a `_since` value. The pauses keep it away from both writes: SQLite
+    /// compares `last_updated` as a string, so an instant that is close to a
+    /// write could land on either side of it.
+    async fn seed_versioned_patient(server: &TestServer, id: &str) -> String {
+        put_patient(server, id, "V1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let between = Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        put_patient(server, id, "V2").await;
+        put_patient(server, id, "V3").await;
+        url::form_urlencoded::byte_serialize(between.as_bytes()).collect()
+    }
+
+    /// The direct request for `path` (with its leading `/`).
+    async fn direct_response(server: &TestServer, path: &str) -> axum_test::TestResponse {
+        server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+    }
+
+    /// The direct request's status and JSON body.
+    async fn direct_get(server: &TestServer, path: &str) -> (StatusCode, Value) {
+        let response = direct_response(server, path).await;
+        (response.status_code(), response.json())
+    }
+
+    /// A bundle of `GET` entries, one per URL.
+    fn gets(kind: &str, urls: &[&str]) -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": kind,
+            "entry": urls
+                .iter()
+                .map(|url| json!({"request": {"method": "GET", "url": url}}))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn status(entry: &Value) -> &str {
+        entry["response"]["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("entry without a status: {entry}"))
+    }
+
+    /// The first issue's code of an entry's `response.outcome`.
+    fn outcome_code(entry: &Value) -> &str {
+        entry["response"]["outcome"]["issue"][0]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("entry without an outcome code: {entry}"))
+    }
+
+    fn outcome_text(entry: &Value) -> &str {
+        entry["response"]["outcome"]["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("entry without an outcome text: {entry}"))
+    }
+
+    fn entry_versions(history: &Value) -> Vec<String> {
+        history["entry"]
+            .as_array()
+            .expect("a history Bundle has entries")
+            .iter()
+            .map(|e| {
+                e["resource"]["meta"]["versionId"]
+                    .as_str()
+                    .expect("entry versionId")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn has_link(history: &Value, relation: &str) -> bool {
+        history["link"]
+            .as_array()
+            .is_some_and(|links| links.iter().any(|l| l["relation"] == relation))
+    }
+
+    #[tokio::test]
+    async fn history_and_vread_entries_answer_like_the_direct_requests() {
+        let (server, backend) = create_test_server().await;
+        let since = seed_versioned_patient(&server, "p1").await;
+        seed_patient(&backend, "p2", "Other").await;
+
+        let paths = [
+            "Patient/p1/_history/1".to_string(),
+            "Patient/p1/_history?_count=2".to_string(),
+            format!("Patient/p1/_history?_since={since}"),
+            "Patient/_history".to_string(),
+            "_history".to_string(),
+        ];
+        let urls: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let body = post_batch(&server, gets("batch", &urls)).await;
+        let entries = body["entry"].as_array().expect("response entries");
+        assert_eq!(entries.len(), paths.len(), "{body}");
+
+        for (path, entry) in paths.iter().zip(entries) {
+            assert_eq!(status(entry), "200 OK", "{path}: {entry}");
+            let (direct_status, direct_body) = direct_get(&server, &format!("/{path}")).await;
+            assert_eq!(direct_status, StatusCode::OK, "direct {path}");
+            assert_eq!(
+                entry["resource"], direct_body,
+                "{path}: the entry is not the direct response"
+            );
+        }
+
+        // The vread is version 1, not the current version, with the etag and
+        // lastModified of a read entry.
+        let vread = &entries[0];
+        assert_eq!(vread["resource"]["resourceType"], "Patient");
+        assert_eq!(vread["resource"]["name"][0]["family"], "V1", "{vread}");
+        assert_eq!(vread["response"]["etag"], "W/\"1\"");
+        assert!(vread["response"]["lastModified"].is_string(), "{vread}");
+        let direct = direct_response(&server, "/Patient/p1/_history/1").await;
+        assert_eq!(
+            direct
+                .header("etag")
+                .to_str()
+                .expect("the direct vread has an ETag"),
+            vread["response"]["etag"].as_str().unwrap()
+        );
+
+        // Instance history, paged: 2 of 3 versions and a next link. `total` is
+        // whatever the backend reports, which the equality with the direct
+        // response above already pins.
+        let paged = &entries[1]["resource"];
+        assert_eq!(paged["type"], "history");
+        assert_eq!(paged["entry"].as_array().unwrap().len(), 2);
+        assert!(has_link(paged, "next"), "{paged}");
+
+        // `_since` keeps the versions written after the instant.
+        let since_page = &entries[2]["resource"];
+        assert_eq!(since_page["type"], "history");
+        let mut versions = entry_versions(since_page);
+        versions.sort();
+        assert_eq!(versions, ["2", "3"]);
+
+        // Type and system history span every Patient: 3 versions of p1, 1 of p2.
+        for (index, level) in [(3, "type"), (4, "system")] {
+            let history = &entries[index]["resource"];
+            assert_eq!(history["type"], "history", "{level}");
+            assert_eq!(history["total"], 4, "{level}: {history}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vread_entry_of_a_missing_or_deleted_version_is_that_entrys_error() {
+        let (server, backend) = create_test_server().await;
+        seed_versioned_patient(&server, "p1").await;
+        seed_patient(&backend, "p2", "Other").await;
+
+        // The DELETE writes version 4, the tombstone.
+        server
+            .delete("/Patient/p1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let urls = [
+            "Patient/p1/_history/999",
+            "Patient/p1/_history/4",
+            "Patient/p2",
+        ];
+        let body = post_batch(&server, gets("batch", &urls)).await;
+        let entries = body["entry"].as_array().expect("response entries");
+
+        assert_eq!(status(&entries[0]), "404 Not Found", "{}", entries[0]);
+        assert_eq!(outcome_code(&entries[0]), "not-found");
+        assert_eq!(status(&entries[1]), "410 Gone", "{}", entries[1]);
+        assert_eq!(status(&entries[2]), "200 OK", "{}", entries[2]);
+
+        // Each outcome is the direct response's.
+        for (url, entry) in urls.iter().zip(entries).take(2) {
+            let (direct_status, direct_body) = direct_get(&server, &format!("/{url}")).await;
+            assert!(
+                status(entry).starts_with(&direct_status.as_u16().to_string()),
+                "{url}: entry {} vs direct {direct_status}",
+                status(entry)
+            );
+            assert_eq!(
+                outcome_code(entry),
+                direct_body["issue"][0]["code"].as_str().unwrap(),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_history_parameter_is_that_entrys_400_and_siblings_succeed() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let urls = [
+            "Patient/p1/_history?_at=2020-01-01",
+            "Patient/p1",
+            "Patient/_history?_sort=_lastUpdated",
+            "_history?_list=x",
+        ];
+        let body = post_batch(&server, gets("batch", &urls)).await;
+        let entries = body["entry"].as_array().expect("response entries");
+
+        for index in [0, 2, 3] {
+            let entry = &entries[index];
+            assert_eq!(status(entry), "400 Bad Request", "{}: {entry}", urls[index]);
+            assert_eq!(outcome_code(entry), "not-supported", "{}", urls[index]);
+            let (direct_status, direct_body) =
+                direct_get(&server, &format!("/{}", urls[index])).await;
+            assert_eq!(direct_status, StatusCode::BAD_REQUEST, "{}", urls[index]);
+            assert_eq!(
+                outcome_text(entry),
+                direct_body["issue"][0]["details"]["text"].as_str().unwrap(),
+                "{}: the entry says what the direct request says",
+                urls[index]
+            );
+        }
+        assert_eq!(status(&entries[1]), "200 OK", "{}", entries[1]);
+    }
+
+    #[tokio::test]
+    async fn bundle_prefer_handling_strict_applies_to_history_entries() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let urls = ["Patient/p1/_history?_snice=x"];
+        let strict = post_batch_with_prefer(&server, gets("batch", &urls), "handling=strict").await;
+        let entry = &strict["entry"][0];
+        assert_eq!(status(entry), "400 Bad Request", "{entry}");
+        assert_eq!(outcome_code(entry), "invalid");
+        assert!(outcome_text(entry).contains("_snice"), "{entry}");
+
+        // An absent Prefer is lenient: the unknown key is ignored.
+        let lenient = post_batch(&server, gets("batch", &urls)).await;
+        let entry = &lenient["entry"][0];
+        assert_eq!(status(entry), "200 OK", "{entry}");
+        assert_eq!(entry["resource"]["type"], "history");
+    }
+
+    #[tokio::test]
+    async fn format_in_a_history_entry_url_is_ignored() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(&server, gets("batch", &["Patient/p1/_history?_format=xml"])).await;
+        let entry = &body["entry"][0];
+        assert_eq!(status(entry), "200 OK", "{entry}");
+
+        // A Bundle response is always JSON, so the entry is the JSON Bundle,
+        // not an XML string...
+        let history = &entry["resource"];
+        assert_eq!(history["resourceType"], "Bundle", "{entry}");
+        assert_eq!(history["type"], "history");
+        // ...and, as on a direct request, `_format` is carried by its links.
+        let self_link = history["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("a self link");
+        assert!(self_link.contains("_format=xml"), "{self_link}");
+    }
+
+    #[tokio::test]
+    async fn history_url_that_is_none_of_the_shapes_is_a_400_entry() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let urls = [
+            "Patient/p1/_history/1/extra",
+            "_history/x",
+            "Patient/_history/x",
+        ];
+        let body = post_batch(&server, gets("batch", &urls)).await;
+        for (url, entry) in urls.iter().zip(body["entry"].as_array().unwrap()) {
+            assert_eq!(status(entry), "400 Bad Request", "{url}: {entry}");
+            assert_eq!(outcome_code(entry), "value", "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_type_history_entry_is_404_like_the_direct_request() {
+        let (server, _backend) = create_test_server().await;
+
+        let urls = ["Patinet/_history", "Patinet/1/_history/1"];
+        let body = post_batch(&server, gets("batch", &urls)).await;
+        for (url, entry) in urls.iter().zip(body["entry"].as_array().unwrap()) {
+            assert_eq!(status(entry), "404 Not Found", "{url}: {entry}");
+            assert_eq!(outcome_code(entry), "not-supported", "{url}");
+            let (direct_status, direct_body) = direct_get(&server, &format!("/{url}")).await;
+            assert_eq!(direct_status, StatusCode::NOT_FOUND, "{url}");
+            assert_eq!(
+                direct_body["issue"][0]["code"], "not-supported",
+                "direct {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_history_entry_sees_the_bundles_own_writes() {
+        let (server, _backend) = create_test_server().await;
+        put_patient(&server, "t1", "Old").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "request": {"method": "PUT", "url": "Patient/t1"},
+                    "resource": {
+                        "resourceType": "Patient",
+                        "id": "t1",
+                        "name": [{"family": "New"}]
+                    }
+                },
+                {"request": {"method": "GET", "url": "Patient/t1/_history"}}
+            ]
+        });
+        let body = post_batch(&server, bundle).await;
+        assert_eq!(body["type"], "transaction-response", "{body}");
+
+        let history = &body["entry"][1];
+        assert_eq!(status(history), "200 OK", "{history}");
+        assert_eq!(history["resource"]["type"], "history");
+        assert_eq!(history["resource"]["total"], 2, "{history}");
+        assert_eq!(
+            history["resource"]["entry"][0]["resource"]["name"][0]["family"], "New",
+            "the history runs after the write and lists it first: {history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_vread_entry_answers_the_version() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "p1").await;
+
+        let body = post_batch(&server, gets("transaction", &["Patient/p1/_history/1"])).await;
+        let entry = &body["entry"][0];
+        assert_eq!(status(entry), "200 OK", "{entry}");
+        assert_eq!(entry["resource"]["name"][0]["family"], "V1", "{entry}");
+    }
+
+    #[tokio::test]
+    async fn transaction_with_a_refused_history_parameter_fails_whole_before_writing() {
+        let (server, _backend) = create_test_server().await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "request": {"method": "POST", "url": "Patient"},
+                    "resource": {"resourceType": "Patient", "name": [{"family": "Never"}]}
+                },
+                {"request": {"method": "GET", "url": "Patient/_history?_at=2020-01-01"}}
+            ]
+        });
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            response.text()
+        );
+        let outcome: Value = response.json();
+        assert_eq!(outcome["resourceType"], "OperationOutcome", "{outcome}");
+        assert_eq!(outcome["issue"][0]["code"], "not-supported", "{outcome}");
+
+        let (_, search) = direct_get(&server, "/Patient?family=Never").await;
+        assert_eq!(
+            search["entry"].as_array().map_or(0, Vec::len),
+            0,
+            "the POST must not have been applied: {search}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_vread_of_a_missing_version_is_that_entrys_404_and_the_writes_commit() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        // A vread entry runs after the writes, as a search entry does (#478),
+        // so a version that is not there cannot roll the transaction back.
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "request": {"method": "POST", "url": "Patient"},
+                    "resource": {"resourceType": "Patient", "name": [{"family": "Kept"}]}
+                },
+                {"request": {"method": "GET", "url": "Patient/p1/_history/999"}}
+            ]
+        });
+        let body = post_batch(&server, bundle).await;
+        assert_eq!(status(&body["entry"][0]), "201 Created", "{body}");
+        assert_eq!(status(&body["entry"][1]), "404 Not Found", "{body}");
+        assert_eq!(outcome_code(&body["entry"][1]), "not-found");
+
+        let (_, search) = direct_get(&server, "/Patient?family=Kept").await;
+        assert_eq!(
+            search["entry"].as_array().map_or(0, Vec::len),
+            1,
+            "the POST committed: {search}"
         );
     }
 }

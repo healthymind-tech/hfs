@@ -91,18 +91,31 @@ pub fn access_polymorphic_element(
             // Handle special cases for all potential typed fields
             // This covers patterns like value.unit -> valueQuantity.unit
             for (key, value) in obj.iter() {
-                // Only a data-type suffix makes a choice variant
-                // (valueQuantity, not a sibling such as periodUnit).
-                if key.starts_with(first_part)
-                    && key.len() > first_part.len()
-                    && is_choice_type_suffix(&key[first_part.len()..])
-                    && let EvaluationResult::Object {
-                        map: inner_obj,
-                        type_info: _,
-                    } = value
-                    && let Some(result) = access_polymorphic_element(inner_obj, rest, version)
-                {
-                    return Some(result);
+                // Check if key starts with the first part and has a type suffix
+                if key.starts_with(first_part) && key.len() > first_part.len() {
+                    // Extract the type suffix (need uppercase letter after base name)
+                    if let Some(c) = key.chars().nth(first_part.len()) {
+                        if c.is_uppercase()
+                            && crate::resource_type::is_valid_fhir_type_suffix(
+                                &key[first_part.len()..],
+                                &version,
+                            )
+                        {
+                            // This is a potential choice element with type suffix
+                            if let EvaluationResult::Object {
+                                map: inner_obj,
+                                type_info: _,
+                            } = value
+                            {
+                                // Try to resolve the rest of the path
+                                if let Some(result) =
+                                    access_polymorphic_element(inner_obj, rest, version)
+                                {
+                                    return Some(result);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -180,7 +193,29 @@ fn get_polymorphic_fields(
     // `Person.deceased[x]` is R5+ only), and consulting the wrong table makes
     // the variant present in the data invisible here. See issue #309.
     let mut consulted_field_types = false;
-    if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
+    let resource_type = match obj.get("resourceType") {
+        Some(EvaluationResult::String(rt, _, _)) => Some(rt.as_str()),
+        _ => None,
+    };
+
+    // Only a declared choice element (`<base>[x]`) of the resource may resolve
+    // through a typed variant. Without this, every missing member matched any
+    // camelCase sibling that extends its name: `DiagnosticReport.conclusion`
+    // returned `conclusionCode`, `Procedure.status` returned `statusReason`,
+    // and the non-element `Patient.birth` returned `birthDate` (#2477).
+    //
+    // The verdict is taken across every compiled-in version, not only
+    // `version`, so the #309 defence below still holds: `Person.deceased[x]`
+    // is R5+ only, yet a caller evaluating R5 data against the R4 table must
+    // keep resolving it. A resource type no compiled table knows (`None`)
+    // keeps the old permissive behaviour.
+    if let Some(parent_type) = resource_type
+        && choice_declared_in_any_version(parent_type, base_name) == Some(false)
+    {
+        return matches;
+    }
+
+    if let Some(resource_type) = resource_type
         && let Some(table) = helios_fhir::field_types(version)
     {
         consulted_field_types = true;
@@ -196,20 +231,20 @@ fn get_polymorphic_fields(
         // extraction path is most of them: a union expression tries each of its
         // branches against every resource. It cost 11.5% of the FHIR server's
         // CPU on the benchmark's import suite.
-        let parent_type = resource_type.as_str();
+        let parent_type = resource_type;
         let start = table.partition_point(|&(p, f, _, _)| (p, f) < (parent_type, base_name));
-        for &(parent, field, _ty, _is_collection) in &table[start..] {
+        for &(parent, field, ty, _is_collection) in &table[start..] {
             if parent != parent_type {
                 break;
             }
             let Some(suffix) = field.strip_prefix(base_name) else {
                 break;
             };
-            // Only a data-type suffix names a variant: the table also holds
-            // siblings that share the prefix (`CapabilityStatement.
-            // implementationGuide` next to `implementation`; cpb-16 saw the
-            // guide list as an implementation).
-            if !is_choice_type_suffix(suffix) {
+            // A typed variant's suffix is its type, capitalised
+            // (`valueQuantity` → `Quantity`, `deceasedBoolean` → `boolean`).
+            // A sibling element that merely extends the name does not satisfy
+            // this (`conclusionCode` is a `CodeableConcept`).
+            if !is_variant_suffix(suffix, ty) {
                 continue;
             }
             if matches.iter().any(|(n, _)| n == field) {
@@ -243,14 +278,18 @@ fn get_polymorphic_fields(
                 continue;
             }
             if field_name.starts_with(base_name) && field_name.len() > base_name.len() {
-                let type_suffix = &field_name[base_name.len()..];
-                // Only a FHIR data-type suffix makes a choice variant:
-                // `Timing.repeat.periodUnit` / `periodMax` are siblings of
-                // `period`, not `period[x]` (tim-5 `period >= 0` compared
-                // the unit code "d" with 0).
-                if is_choice_type_suffix(type_suffix) {
-                    let converted_value = convert_fhir_field_to_fhirpath_type(value, type_suffix);
-                    matches.push((field_name.clone(), converted_value));
+                if let Some(c) = field_name.chars().nth(base_name.len()) {
+                    // The suffix must name a FHIR type: a field that merely
+                    // extends the name (`forEachOrNull` next to `forEach`) is
+                    // a different element, not a typed variant of it.
+                    let type_suffix = &field_name[base_name.len()..];
+                    if c.is_uppercase()
+                        && crate::resource_type::is_valid_fhir_type_suffix(type_suffix, &version)
+                    {
+                        let converted_value =
+                            convert_fhir_field_to_fhirpath_type(value, type_suffix);
+                        matches.push((field_name.clone(), converted_value));
+                    }
                 }
             }
         }
@@ -274,71 +313,81 @@ fn get_polymorphic_fields(
     matches
 }
 
-/// The type names a choice element `x[x]` can carry as its JSON suffix
-/// (FHIR R4–R6 data types allowed in `[x]` elements).
-const CHOICE_TYPE_SUFFIXES: &[&str] = &[
-    "Address",
-    "Age",
-    "Annotation",
-    "Attachment",
-    "Availability",
-    "Base64Binary",
-    "Boolean",
-    "Canonical",
-    "Code",
-    "CodeableConcept",
-    "CodeableReference",
-    "Coding",
-    "ContactDetail",
-    "ContactPoint",
-    "Contributor",
-    "Count",
-    "DataRequirement",
-    "Date",
-    "DateTime",
-    "Decimal",
-    "Distance",
-    "Dosage",
-    "Duration",
-    "Expression",
-    "ExtendedContactDetail",
-    "HumanName",
-    "Id",
-    "Identifier",
-    "Instant",
-    "Integer",
-    "Integer64",
-    "Markdown",
-    "Meta",
-    "Money",
-    "Oid",
-    "ParameterDefinition",
-    "Period",
-    "PositiveInt",
-    "Quantity",
-    "Range",
-    "Ratio",
-    "RatioRange",
-    "Reference",
-    "RelatedArtifact",
-    "SampledData",
-    "Signature",
-    "String",
-    "Time",
-    "Timing",
-    "TriggerDefinition",
-    "UnsignedInt",
-    "Uri",
-    "Url",
-    "UsageContext",
-    "Uuid",
-    "Xhtml",
-];
+/// True when `suffix` is `ty` with its first letter capitalised — the shape
+/// the generator gives every choice variant (`value` + `Quantity`,
+/// `deceased` + `Boolean` for type `boolean`).
+fn is_variant_suffix(suffix: &str, ty: &str) -> bool {
+    let (mut s, mut t) = (suffix.chars(), ty.chars());
+    match (s.next(), t.next()) {
+        (Some(a), Some(b)) if a.is_ascii_uppercase() && a == b.to_ascii_uppercase() => {
+            s.as_str() == t.as_str()
+        }
+        _ => false,
+    }
+}
 
-/// Whether `suffix` (the part after a choice element's base name) is a FHIR
-/// data type, i.e. names a `[x]` variant rather than a sibling element.
-fn is_choice_type_suffix(suffix: &str) -> bool {
-    CHOICE_TYPE_SUFFIXES.contains(&suffix)
+/// Whether `base` is a declared choice element (`<base>[x]`) of `parent` in
+/// `table`: `None` when `table` has no rows for `parent` at all.
+///
+/// The generator emits a choice element as a bare row typed with the choice
+/// enum (`("Patient", "deceased", "PatientDeceased")`) followed by one row per
+/// typed variant. A backbone element's bare row has the same `<Parent><Base>`
+/// type shape, so a variant row is required as well.
+fn is_declared_choice(
+    table: &[(&'static str, &'static str, &'static str, bool)],
+    parent: &str,
+    base: &str,
+) -> Option<bool> {
+    let start = table.partition_point(|&(p, _, _, _)| p < parent);
+    if table.get(start).is_none_or(|&(p, _, _, _)| p != parent) {
+        return None;
+    }
+    let at = start + table[start..].partition_point(|&(p, f, _, _)| p == parent && f < base);
+    let Some(&(p, f, ty, _)) = table.get(at) else {
+        return Some(false);
+    };
+    if p != parent || f != base || !is_choice_enum(ty, parent, base) {
+        return Some(false);
+    }
+    let has_variant = table[at + 1..]
+        .iter()
+        .take_while(|&&(p, f, _, _)| p == parent && f.starts_with(base))
+        .any(|&(_, f, ty, _)| is_variant_suffix(&f[base.len()..], ty));
+    Some(has_variant)
+}
+
+/// True when `ty` is `<Parent><Base>` with `base`'s first letter capitalised,
+/// the name the generator gives a choice element's enum.
+fn is_choice_enum(ty: &str, parent: &str, base: &str) -> bool {
+    ty.strip_prefix(parent)
+        .is_some_and(|rest| is_variant_suffix(rest, base))
+}
+
+/// [`is_declared_choice`] across every FHIR version compiled in: `Some(true)`
+/// if any version declares `parent.base[x]`, `Some(false)` if some version
+/// knows `parent` and none declares it, `None` if no version knows `parent`.
+fn choice_declared_in_any_version(parent: &str, base: &str) -> Option<bool> {
+    let mut known = false;
+    for version in [
+        #[cfg(feature = "R4")]
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ] {
+        let Some(table) = helios_fhir::field_types(version) else {
+            continue;
+        };
+        match is_declared_choice(table, parent, base) {
+            Some(true) => return Some(true),
+            Some(false) => known = true,
+            None => {}
+        }
+    }
+    known.then_some(false)
 }
 
 /// Converts a FHIR field value to the appropriate FHIRPath type based on the field suffix.

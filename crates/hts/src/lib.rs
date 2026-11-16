@@ -83,3 +83,4 @@ pub(crate) mod ucum;
 pub(crate) mod ucum_validate;
 pub mod version_order;
 pub mod write_guard;
+pub mod vcl;

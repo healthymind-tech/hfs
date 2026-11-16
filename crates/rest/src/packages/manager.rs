@@ -1743,7 +1743,7 @@ impl PackageManager {
             .detail("package", package.to_string())
             .detail("tenant", tenant.to_string());
         builder = builder.agent(
-            who.unwrap_or("hfs-package-manager").to_string(),
+            who.unwrap_or("hfs-package-manager"),
             None,
             who.is_some(),
         );

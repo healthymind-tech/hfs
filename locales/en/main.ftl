@@ -81,9 +81,10 @@ terminology-no-results = No matching concepts found.
 action-search = Search
 action-save = Save
 action-cancel = Cancel
+action-back = Back
 action-retry = Retry
 
-## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
+## Errors (mirrors OperationOutcome text; see crates/ui/docs/multi-language.md §5)
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
@@ -164,6 +165,33 @@ tenants-error-not-purged = Tenant '{ $id }' was deregistered but its data was NO
 tenants-error-list = Failed to list tenants: { $detail }
 tenants-error-count = Failed to count resources: { $detail }
 tenants-field-name-placeholder = Acme Health
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registered · discovery incomplete
+   *[other] { $count } registered · discovery incomplete
+}
+tenants-stat-resources-sub-stale = across all tenants · may be out of date
+tenants-stat-pending = Counting…
+tenants-stat-unavailable = Not available right now
+tenants-stat-unsupported = Not available on this storage
+tenants-counts-pending = Counting resources across tenants…
+tenants-counts-refreshing = Updating resource counts; showing counts from { $time }.
+tenants-counts-ready = Resources counted at { $time }.
+tenants-counts-partial = Resources counted at { $time }, but not every tenant could be checked.
+tenants-counts-stale = Counts from { $time } may be out of date: the latest count failed.
+tenants-counts-unavailable = Resource counts are not available right now.
+tenants-counts-unsupported = This storage cannot count resources per tenant.
+tenants-counts-presence = This storage reports which tenants hold data, not how many resources.
+tenants-counts-approx-pointers = Counts are approximate: storage pointers, deleted resources included.
+tenants-counts-approx-index = Counts come from the search index and may lag recent writes.
+tenants-counts-refresh = Refresh
+tenants-count-pending = Counting…
+tenants-count-unknown = Not known
+tenants-count-unsupported = Not counted on this storage
+tenants-count-unavailable = Count unavailable
+tenants-count-present = has data
+tenants-count-present-note = Holds data; this storage does not count it
+tenants-count-stale = may be out of date
+tenants-count-approx = approximate, not an exact count of live resources
 
 tenant-heading = Tenants
 tenant-all = All tenants
@@ -203,6 +231,8 @@ chart-pending-retry = Retry now
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+chart-approximate-history-note = Approximate: counted from recent writes and still being reconciled with storage. A dashed line shows only the writes recorded since the counters were read from storage; its earlier history is still loading.
+chart-legend-history-loading = history loading
 # #1078: the storage backend cannot count resources at all (e.g. an S3
 # primary). Shown in the chart area; the notice line below explains it.
 chart-counts-unsupported = Resource counts are not available for this storage backend.
@@ -247,12 +277,24 @@ history-tab-type = Type Feed
 history-tab-system = System Feed
 history-versions-label = Versions
 history-current = current
+history-op-create = created
+history-op-update = updated
+history-op-patch = patched
+history-op-delete = deleted
+history-op-version = version
 history-from = From
 history-to = To
 history-show-metadata = Show metadata changes
 history-empty = Load a resource, then pick two versions to compare.
 history-load-error = Could not load that resource's history.
 history-not-found = No history for that resource — check the type and id.
+history-feed-resource = Resource
+history-feed-version = Version
+history-feed-interaction = Interaction
+history-feed-when = When
+history-feed-more = Load more
+history-feed-empty = No history entries yet.
+history-feed-error = Could not load the history feed.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } metadata change hidden
@@ -263,27 +305,10 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Saved Queries
-
-queries-heading = Saved Queries
-queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a Query
-queries-type-label = Resource type
-queries-type-placeholder = e.g. Patient
-queries-name-label = Name
-queries-name-placeholder = e.g. Smiths in Boston
-queries-query-label = Query string
-queries-query-placeholder = e.g. name=smith&address-city=Boston
-queries-empty = No saved queries yet. Save one above to get started.
-queries-never-run = Never run
 queries-run = Run
-queries-rename = Rename
 queries-delete = Delete
-queries-rename-prompt = New name
-queries-confirm-delete = Delete "{ $name }"?
-queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
 
 ## SearchParameter viewer (#238)
 
@@ -291,6 +316,8 @@ sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-degraded = Search parameters could not be loaded from this server right now — the self-call to /SearchParameter failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+sp-degraded-unsupported = Search parameters cannot be listed on this storage backend — the self-call to /SearchParameter answered 501 Not Implemented because the backend has no search for this type.
+sp-empty = No search parameters are stored on this server for this FHIR version, so there is nothing to list.
 sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
@@ -351,6 +378,8 @@ cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
 cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-degraded-unsupported = Compartment definitions cannot be listed on this storage backend — the self-call to /CompartmentDefinition answered 501 Not Implemented because the backend has no search for this type.
+cmp-empty = No compartment definitions are stored on this server for this FHIR version, so there is nothing to list.
 cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
@@ -390,7 +419,6 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
@@ -406,6 +434,7 @@ queries-match-is = is
 queries-or = + or
 plain-pill = In plain English
 plain-find = Find {"{type}"} records
+plain-read = Open {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = and
@@ -534,20 +563,36 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Will be saved as { $target }
+editor-id-exists = { $target } already exists. Saving will add a new version of it.
+editor-id-exists-confirm = Save new version
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+unsaved-leave-confirm = You have unsaved changes. Discard them and leave this page?
+unsaved-leave-action = Discard and leave
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-load-not-found = No { $type } with id { $id } exists on this server — check the id, or go back to the list.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
-editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-source-hint = Edit here or in the guided form: both always show the same document.
+editor-format = Format
+editor-format-title = Format the document (Shift+Alt+F)
+editor-format-invalid = Fix the JSON syntax errors before formatting.
 
 editor-add = Add Element
 editor-add-close = Close
 editor-add-added = added
 editor-add-undo = Undo
+editor-collection-add = Add
+editor-add-undo-pending = Undo is unavailable while the form is updating.
+editor-add-undo-unavailable = Undo is no longer available after the document changed.
+editor-update-failed = The form update failed. Retry the changed field before adding or removing an element.
 editor-add-elements = Elements
 editor-add-extensions = Extensions
 editor-must-support-badge = MS
@@ -600,7 +645,6 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
 json-view-toggle-fold = Toggle JSON section
-editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
 
@@ -735,6 +779,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items
@@ -744,6 +793,11 @@ ui-combobox-removed = Removed
 ui-combobox-loading = Loading suggestions…
 ui-combobox-results-updated = Suggestions available:
 ui-combobox-error = Suggestions could not be loaded. Try again.
+ui-combobox-name-now = now { $name }
+ui-combobox-footer-total = { $count } matches · scroll for more
+ui-combobox-footer-more = More matches · scroll for more
+ui-combobox-footer-end = End of results
+ui-combobox-loading-more = Loading more matches…
 editor-orphans-title = These issues have no field yet — add the elements to fix them
 editor-hint-date = FHIR date: YYYY, YYYY-MM, or YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD, or a full timestamp with timezone (2024-05-17T14:30:00+02:00)
@@ -853,14 +907,25 @@ bulk-export-error = Error
 bulk-export-cancel = Cancel
 bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
+bulk-export-run-again = Run again
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-view-files = View files
+bulk-export-more-actions = More actions
 bulk-export-delete = Delete
 bulk-export-delete-aria = Delete export { $name }
 bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.
 bulk-export-delete-confirm = Delete export
 bulk-export-delete-cancel = Keep export
 bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
+bulk-export-detail-job-heading = Job
+bulk-export-detail-field-scope = Scope
+bulk-export-detail-field-started = Started
+bulk-export-detail-field-duration = Duration
+bulk-export-detail-outputs-heading = Output files
+bulk-export-detail-col-type = Resource type
+bulk-export-detail-col-files = Files
+bulk-export-detail-outputs-empty = The export produced no output files.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement
@@ -959,6 +1024,7 @@ vd-results-meta = { $rows } rows · { $ms } ms
 # #752: the results meta after a failed run — the previous table stays on
 # screen, relabelled.
 vd-results-stale = last successful run
+vd-results-running = Running query…
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
@@ -998,6 +1064,10 @@ vd-fix-set-string = Set to "{ $value }"
 ## client-side (never sent by `/complete` itself, which is not locale-aware).
 vd-complete-required = required
 
+## `data-msg-quickfix` on `#vd-editor-grid`: the accessible name of the quick-fix
+## menu Ctrl+. opens next to the cursor when several fixes apply.
+vd-quickfix-menu = Quick fixes
+
 ## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
 ## picks whichever of these renders `#vd-editor-grid`'s own
 ## `data-msg-save-errors-one`/`-other` and substitutes the real count for the
@@ -1027,6 +1097,9 @@ sql-queries-filter = Filter queries
 sql-views-filter = Filter views
 sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
+sql-rail-no-match = No matches for “{ $filter }”.
+sql-rail-clear-filter = Clear the filter
+sql-rail-selection-filtered = Not in the list filtered by “{ $filter }”.
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
@@ -1117,10 +1190,12 @@ lib-tables-empty = No tables declared yet.
 # The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
 # same chip the title row and *Used by* already show for that kind.
 lib-tables-kind-view-definition = ViewDefinition
+lib-tables-kind-value-set = ValueSet
+lib-tables-kind-concept-map = ConceptMap
 lib-tables-target-not-found = Not found
-lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
+lib-tables-target-not-found-detail = No ViewDefinition, SQL View, ValueSet or ConceptMap answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
-lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
+lib-tables-target-not-a-table-detail = Only a ViewDefinition, a SQL View, a ValueSet or a ConceptMap can be read.
 lib-tables-add-table-label = Table
 # The always-visible add row's own search field placeholder (#1238).
 lib-tables-add-table-placeholder = Add a table…
@@ -1223,9 +1298,8 @@ sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:
 sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
 sql-export-advanced = Advanced
-sql-export-advanced-meta = tracking id · CSV header
 sql-export-field-tracking-id = Tracking id
-sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-field-tracking-id-hint = Optional label for your own records, for any format. Shown on the export's details page and returned as clientTrackingId when the export completes.
 sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
 sql-export-field-header = Include a header row
 sql-export-field-header-hint = (CSV only — ignored for other formats)
@@ -1312,7 +1386,6 @@ sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
-sql-export-file-fallback = File { $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->
@@ -2465,3 +2538,10 @@ tenants-delete-impact = { $count ->
     } Deregistering removes it from the tenant registry; its stored data is kept unless it is purged through the API.
 tenants-delete-type-id = Type { $id } to confirm
 tenants-delete-submit = Deregister
+batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Select a query or view
+sql-library-select-lede = Choose an item from the list or create a new one.
+sql-library-unavailable-title = The selection is unavailable
+sql-library-unavailable-lede = The available queries and views could not be verified.

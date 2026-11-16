@@ -323,6 +323,7 @@ fn read_ndc_files(path: &Path) -> Result<std::collections::HashMap<String, Strin
             .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
         let name = entry
             .name()
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry name: {e}")))?
             .rsplit('/')
             .next()
             .unwrap_or_default()
@@ -415,7 +416,7 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
                 .by_index(i)
                 .ok()
                 .map(|e| {
-                    let n = e.name().to_ascii_lowercase();
+                    let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                     n == "product.txt" || n.ends_with("/product.txt")
                 })
                 .unwrap_or(false)
@@ -713,7 +714,7 @@ mod tests {
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("product.txt", zip::write::FileOptions::default())
+                zip.start_file("product.txt", zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(sample_product_txt().as_bytes()).unwrap();
                 zip.finish().unwrap();
@@ -870,7 +871,8 @@ mod tests {
                     ("Products_excluded.txt", products_excluded),
                     ("Packages_excluded.txt", packages_excluded),
                 ] {
-                    zip.start_file(name, zip::write::FileOptions::default()).unwrap();
+                    zip.start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
                     zip.write_all(text.as_bytes()).unwrap();
                 }
                 zip.finish().unwrap();

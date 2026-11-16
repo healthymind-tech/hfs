@@ -1001,7 +1001,7 @@ async fn supplements_reach_lookup_helpers_after_import() {
                 .await
                 .unwrap()
                 .into_iter()
-                .flat_map(|(c, v)| v.into_iter().map(move |(k, x)| (c.clone(), k, x)))
+                .flat_map(|(c, v)| v.into_iter().map(move |pv| (c.clone(), pv.code, pv.value)))
                 .collect();
             p.sort();
             let mut entries: Vec<String> = b

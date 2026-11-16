@@ -6,7 +6,7 @@
 //! - [`ResourceStorage`] - Core CRUD operations
 //! - [`VersionedStorage`] - Version-aware operations
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
-//! - [`SearchProvider`], [`MultiTypeSearchProvider`], [`ChainedSearchProvider`] - Search capability
+//! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
 //! - [`CapabilityProvider`] - Runtime capability discovery
 //!
@@ -27,7 +27,6 @@
 //!             ├── MultiTypeSearchProvider
 //!             ├── IncludeProvider
 //!             ├── RevincludeProvider
-//!             ├── ChainedSearchProvider
 //!             ├── TerminologySearchProvider
 //!             └── TextSearchProvider
 //!
@@ -108,6 +107,7 @@ pub mod cluster_change_feed;
 pub mod package_jobs;
 pub mod cluster_job_store;
 pub mod event_fanout;
+pub mod database_url;
 pub mod history;
 pub mod package_registry;
 pub mod patch;
@@ -116,9 +116,11 @@ pub mod preconditions;
 pub mod retention;
 pub mod search;
 pub mod sof_runner;
+pub mod sof_terminology;
 pub mod storage;
 pub mod subscription_delivery;
 pub mod subscription_state;
+pub mod tenant_discovery;
 pub mod transaction;
 pub mod user_settings;
 pub mod versioned;
@@ -135,6 +137,7 @@ pub use bulk_export::{
 };
 pub use bulk_export_output::{
     DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+    delete_tenant_outputs_everywhere,
 };
 pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
@@ -147,9 +150,9 @@ pub use bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
     EntryCountSummary, EntryResultContinuation, EntryResultCursor, EntryResultPage,
     IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
-    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
-    merge_resource,
+    PagedEntryResult, ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    UnindexedEntry, merge_resource,
 };
 pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
@@ -194,18 +197,22 @@ pub use preconditions::{
 };
 pub use retention::{ExpiredResource, RetentionStorage};
 pub use search::{
-    ChainedSearchProvider, DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID,
-    IncludeProvider, MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider,
-    SearchProvider, SearchResult, TerminologySearchProvider, TextSearchProvider,
-    include_truncation_outcome, is_include_truncation_marker,
-    resolve_includes_iterate_continuation, resolve_includes_iterative,
+    DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,
+    MultiTypeSearchProvider, RevincludeProvider, SearchProvider, SearchResult,
+    TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
+    is_include_truncation_marker, resolve_includes_iterate_continuation,
+    resolve_includes_iterative,
 };
-pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
-    ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
+};
+pub use tenant_discovery::{
+    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, TenantDataEvidence, TenantDiscovery,
 };
 pub use subscription_delivery::{
     ClaimedDelivery, DeliveryId, DeliveryLease, DeliveryLeaseError, DeliveryRecord, DeliveryState,
@@ -215,9 +222,10 @@ pub use subscription_state::{
     HydratedResource, SubscriptionHydrationSource, SubscriptionStateRecord, SubscriptionStateStore,
 };
 pub use transaction::{
-    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
-    BundleType, ConditionalTransaction, IsolationLevel, LockingStrategy, PatchCandidateValidator,
-    Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleEntryTarget, BundleMethod,
+    BundleProvider, BundleResult, BundleType, ConditionalTransaction, IsolationLevel,
+    LockingStrategy, PatchCandidateValidator, Transaction, TransactionOptions, TransactionProvider,
+    parse_bundle_entry_target,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,

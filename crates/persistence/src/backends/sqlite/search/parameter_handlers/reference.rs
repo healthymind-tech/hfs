@@ -8,6 +8,31 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 pub struct ReferenceHandler;
 
 impl ReferenceHandler {
+    /// The `Type/id` a relative reference search value is matched against in
+    /// `value_reference_target` (schema v48), the column that holds the
+    /// `Type/id` of a reference stored as an absolute http(s) URL. The version
+    /// is stripped, and a `:Type` modifier qualifies a bare id. `None` when the
+    /// value cannot match an absolute stored reference through that column: an
+    /// absolute search value (it already matches `value_reference` as
+    /// written), a bare id (its `LIKE '%/id'` already spans absolute forms) or
+    /// a modifier that does not compare references.
+    pub(crate) fn target_base(
+        value: &SearchValue,
+        modifier: Option<&SearchModifier>,
+    ) -> Option<String> {
+        let full = match modifier {
+            None | Some(SearchModifier::Not) => value.value.clone(),
+            Some(SearchModifier::Type(type_name)) if !value.value.contains('/') => {
+                format!("{type_name}/{}", value.value)
+            }
+            Some(SearchModifier::Type(_)) => value.value.clone(),
+            Some(_) => return None,
+        };
+        let base = strip_reference_version(&full);
+        (base.contains('/') && !base.starts_with("http://") && !base.starts_with("https://"))
+            .then(|| base.to_string())
+    }
+
     /// Builds SQL for a reference parameter value.
     ///
     /// Reference values can be:
@@ -122,7 +147,8 @@ impl ReferenceHandler {
     /// [`Self::build_reference_condition`]).
     pub(crate) fn versioned_reference_predicate(param_num: usize) -> String {
         format!(
-            "(value_reference >= ?{p} \
+            "(value_reference IS NOT NULL \
+              AND value_reference >= ?{p} \
               AND value_reference < ?{p} || '/_history0' \
               AND (value_reference = ?{p} \
                    OR value_reference >= ?{p} || '/_history/'))",
@@ -196,17 +222,13 @@ impl ReferenceHandler {
             // range would also capture a different resource whose id merely
             // extends this one (`<base>-4`, `<base>.5`) (#1030 review).
             //
-            // It is written as ONE range, `[base, base || '/_history0')`, that
-            // the index can seek, AND-ed with the exact match set as a residual.
-            // The range covers everything that starts with `base`, so the
-            // residual only has to throw out the `<base>-4`-style neighbours
-            // that fall inside it. The earlier `= base OR (range)` form was
-            // never planned as two index probes: SQLite's OR optimisation
-            // passed it over, the partial `idx_search_reference` index was then
-            // unusable (nothing in the WHERE implied `value_reference IS NOT
-            // NULL`), and `Observation?subject=Patient/x` walked every
-            // `search_index` row of the type through `idx_search_composite` —
-            // ~1 s per call on a 7.6M-row index, against ~0.1 ms for the seek.
+            // The planner gets one bounded range, `[base, base || '/_history0')`,
+            // which holds the base and every versioned form of it, and the
+            // exact test runs on the rows inside it; it also drops ids that
+            // only extend this one (`<base>-4`), which sort inside the range.
+            // `idx_search_reference` is partial (`WHERE value_reference IS NOT
+            // NULL`): with only the OR, SQLite never used it and read every row
+            // of the parameter, or seeked with no upper bound (#1955).
             SqlFragment::with_params(
                 Self::versioned_reference_predicate(param_num),
                 vec![SqlParam::string(base)],

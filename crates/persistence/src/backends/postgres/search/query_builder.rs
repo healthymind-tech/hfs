@@ -35,7 +35,7 @@ fn quantity_implicit_precision(num_str: &str) -> f64 {
 ///
 /// Without this, `?name=100%` is a wildcard rather than a literal — the value is
 /// interpolated straight into the pattern. Paired with `ESCAPE '\'` at the call
-/// site. (`chain_builder.rs` already does this; the main builder did not.)
+/// site.
 fn like_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -219,8 +219,7 @@ fn unvalidated<T>(parsed: Result<T, crate::search::NumberValueError>) -> Option<
 /// off) against the numeric column `col`, advancing `next` by exactly the
 /// number of binds returned.
 ///
-/// The unchained `number` builder and the chain builder's number terminal
-/// (`chain_builder.rs`, #1306) both call this, so they share
+/// Every `number` value goes through here, so it shares
 /// [`numeric_predicate`]'s per-prefix table and its implicit-precision range.
 ///
 /// Returns `None`, leaving `next` untouched, when `raw` is not a number (see
@@ -242,10 +241,8 @@ pub(crate) fn number_predicate(
 /// against the `value_quantity_*` columns, advancing `next` by exactly the
 /// number of binds returned.
 ///
-/// `table` qualifies the columns: empty for the unchained builder, whose
-/// subquery has a single unaliased `search_index`, and `"si2."`-style for the
-/// chain builder's terminals (`chain_builder.rs`, #1306). Both call this, so a
-/// chained quantity means what the unchained one does, units included.
+/// `table` qualifies the columns: empty for a subquery with a single
+/// unaliased `search_index`, `"si2."`-style for an aliased one.
 ///
 /// Returns `None`, leaving `next` untouched, when the number part is not a
 /// number (see [`parse_search_number`]); as with [`number_predicate`], every
@@ -257,6 +254,34 @@ pub(crate) fn quantity_predicate(
     raw_value: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
+    let predicate = quantity_predicate_parts(table, prefix, raw_value, next)?;
+    Some((predicate.combined(), predicate.params))
+}
+
+/// Quantity alternatives share one parse and bind vector. Ordinary callers
+/// retain their OR predicate; the broad code/quantity path can scan each
+/// alternative independently without recovering structure from generated SQL.
+struct QuantityPredicate {
+    raw: String,
+    canonical: Option<String>,
+    params: Vec<SqlParam>,
+}
+
+impl QuantityPredicate {
+    fn combined(&self) -> String {
+        match &self.canonical {
+            Some(canonical) => format!("(({}) OR ({canonical}))", self.raw),
+            None => format!("({})", self.raw),
+        }
+    }
+}
+
+fn quantity_predicate_parts(
+    table: &str,
+    prefix: SearchPrefix,
+    raw_value: &str,
+    next: &mut usize,
+) -> Option<QuantityPredicate> {
     /// Binds one float and returns its placeholder number.
     fn bind(v: f64, params: &mut Vec<SqlParam>, next: &mut usize) -> usize {
         *next += 1;
@@ -294,7 +319,7 @@ pub(crate) fn quantity_predicate(
     // comparison. Skipped for non-convertible units; `ne` also uses this
     // branch (negated range) so it matches the raw-OR-canonical `eq`
     // semantics inverted, same as SQLite's `build_canonical_condition`.
-    let mut predicate = format!("({raw})");
+    let mut canonical = None;
     if let Some(c) = code {
         if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
             let canon = |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
@@ -353,14 +378,18 @@ pub(crate) fn quantity_predicate(
             if let Some(range) = range {
                 *next += 1;
                 params.push(SqlParam::text(&cunit));
-                predicate = format!(
-                    "(({raw}) OR ({range} AND {table}value_quantity_canonical_unit = ${next}))"
-                );
+                canonical = Some(format!(
+                    "{range} AND {table}value_quantity_canonical_unit = ${next}"
+                ));
             }
         }
     }
 
-    Some((predicate, params))
+    Some(QuantityPredicate {
+        raw,
+        canonical,
+        params,
+    })
 }
 
 /// Returns the `[start, end)` timestamp range for a date search value at its
@@ -408,9 +437,8 @@ pub(crate) fn match_nothing() -> SqlFragment {
 /// column, advancing `next` by exactly the number of binds returned.
 ///
 /// This is the single place a date search value becomes SQL on Postgres. The
-/// unchained `date` and `_lastUpdated` builders, the composite date component
-/// and the chain builder's terminals (`chain_builder.rs`, #1290) all call it,
-/// so they cannot drift:
+/// `date` and `_lastUpdated` builders and the composite date component all
+/// call it, so they cannot drift:
 ///
 /// - the value is read by [`FhirDateValue`], the grammar and precision range
 ///   every backend shares, and compared through the [`DatePredicate`] it
@@ -703,6 +731,13 @@ impl SqlFragment {
 /// PostgreSQL search query builder.
 pub struct PostgresQueryBuilder;
 
+/// True for a relative `Type/id` search value (not an absolute URL), the only
+/// form that can match a stored absolute reference through
+/// `value_reference_target` (#2394).
+fn is_relative_type_id(value: &str) -> bool {
+    !value.starts_with("http://") && !value.starts_with("https://")
+}
+
 impl PostgresQueryBuilder {
     /// Builds a search query for finding matching resource IDs.
     ///
@@ -755,14 +790,40 @@ impl PostgresQueryBuilder {
                 // longer holds. Rebuilding in emission order is what keeps the
                 // placeholders ascending and `SqlFragment::params` in the order
                 // the caller binds them.
+                let adaptive_pair = members.len() == 2
+                    && query.parameters[members[0]].name == "code"
+                    && query.parameters[members[1]].name == "value-quantity";
+                let mut quantity_union = None;
                 let mut built: Vec<(usize, SqlFragment)> = Vec::with_capacity(members.len());
                 for &member in members {
-                    let fragment = Self::build_parameter_condition(
-                        &query.parameters[member],
-                        current_offset,
-                        layout,
-                    )
-                    .expect("a foldable occurrence builds: the plan pass built it");
+                    let parameter = &query.parameters[member];
+                    let fragment = if adaptive_pair && parameter.name == "value-quantity" {
+                        let value = &parameter.values[0];
+                        let mut next = current_offset;
+                        let predicate =
+                            quantity_predicate_parts("", value.prefix, &value.value, &mut next)
+                                .expect("an eligible quantity parsed in the plan pass");
+                        quantity_union = predicate.canonical.as_ref().map(|canonical| {
+                            format!(
+                                "({} UNION {})",
+                                Self::quantity_membership_arm(&parameter.name, &predicate.raw),
+                                Self::quantity_membership_arm(&parameter.name, canonical),
+                            )
+                        });
+                        SqlFragment::with_params(
+                            format!(
+                                "id IN ({})",
+                                Self::quantity_membership_arm(
+                                    &parameter.name,
+                                    &predicate.combined()
+                                )
+                            ),
+                            predicate.params,
+                        )
+                    } else {
+                        Self::build_parameter_condition(parameter, current_offset, layout)
+                            .expect("a foldable occurrence builds: the plan pass built it")
+                    };
                     current_offset += fragment.params.len();
                     built.push((member, fragment));
                 }
@@ -781,11 +842,13 @@ impl PostgresQueryBuilder {
 
                 match arms {
                     Some(arms) => {
-                        let sql = if members.len() == 2
-                            && query.parameters[members[0]].name == "code"
-                            && query.parameters[members[1]].name == "value-quantity"
-                        {
-                            Self::adaptive_code_quantity_membership(&built[0].1, &built[1].1, &arms)
+                        let sql = if adaptive_pair {
+                            Self::adaptive_code_quantity_membership(
+                                &built[0].1,
+                                &built[1].1,
+                                &arms,
+                                quantity_union.as_deref(),
+                            )
                         } else {
                             format!(
                                 "{}{})",
@@ -958,6 +1021,7 @@ impl PostgresQueryBuilder {
         code: &SqlFragment,
         quantity: &SqlFragment,
         arms: &[String],
+        quantity_union: Option<&str>,
     ) -> String {
         const BROAD_TOKEN_ROWS: usize = 1024;
         let quantity_guard = if quantity.params.len() == 1 {
@@ -970,13 +1034,17 @@ impl PostgresQueryBuilder {
             String::new()
         };
         let original = code.clone().and(quantity.clone());
+        // A single raw OR canonical access produced millions of bitmap
+        // rechecks on the issue corpus (#2077). Separate candidate streams
+        // preserve both alternatives and deduplicate their overlap before the
+        // code intersection. Rare codes retain the original OR conjunction.
         format!(
             "id IN (WITH policy AS MATERIALIZED (SELECT EXISTS({code_arm} OFFSET {BROAD_TOKEN_ROWS} LIMIT 1){quantity_guard} AS broad) \
              SELECT resource_id FROM ({code_arm} INTERSECT {quantity_arm}) AS intersection_ids WHERE (SELECT broad FROM policy) \
              UNION ALL SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
              AND ({original}) AND NOT (SELECT broad FROM policy))",
             code_arm = arms[0],
-            quantity_arm = arms[1],
+            quantity_arm = quantity_union.unwrap_or(&arms[1]),
             original = original.sql,
         )
     }
@@ -1034,7 +1102,7 @@ impl PostgresQueryBuilder {
         // Intersect broad independently scoped ID sets before joining resources,
         // retaining the original live-resource conjunction for rare codes.
         // Only this measured gt/lt pair is eligible; unrelated conjunctions retain
-        // their existing plans, and the quantity arm's raw/canonical OR survives.
+        // their existing plans, and both raw/canonical alternatives survive.
         if layout == IndexLayout::Denormalized
             && query.resource_type == "Observation"
             && query.parameters.len() == 2
@@ -1112,7 +1180,7 @@ impl PostgresQueryBuilder {
             format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
-                 AND value_reference = ${p1})"
+                 AND (value_reference = ${p1} OR value_reference_target = ${p1}))"
             ),
             vec![SqlParam::text(&base)],
         ))
@@ -1209,7 +1277,9 @@ impl PostgresQueryBuilder {
                     let mut staged: Vec<SqlParam> = Vec::new();
                     let mut predicates: Vec<String> = Vec::new();
                     let mut ok = parts.len() == param.components.len();
-                    for (part, component) in parts.iter().zip(&param.components) {
+                    for (position, (part, component)) in
+                        parts.iter().zip(&param.components).enumerate()
+                    {
                         if !ok {
                             break;
                         }
@@ -1222,7 +1292,8 @@ impl PostgresQueryBuilder {
                         ) {
                             Some((sql, ps)) => {
                                 staged.extend(ps);
-                                predicates.push(sql);
+                                predicates
+                                    .push(Self::unfolded_composite_predicate(param, position, sql));
                             }
                             None => ok = false,
                         }
@@ -1241,7 +1312,7 @@ impl PostgresQueryBuilder {
                         "(resource_type, resource_id, contained_local_id) IN \
                          (SELECT resource_type, resource_id, contained_local_id FROM search_index \
                          WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 \
-                         AND param_name = {} AND ({}) \
+                         AND param_name = {} AND composite_group IS NOT NULL AND ({}) \
                          GROUP BY resource_type, resource_id, contained_local_id, composite_group \
                          HAVING {})",
                         sql_string_literal(&param.name),
@@ -1358,7 +1429,10 @@ impl PostgresQueryBuilder {
                     .join(", ");
                 offset += 1;
                 branches.push((
-                    format!("(param_name IN ({in_list}) AND value_reference = ${offset})"),
+                    format!(
+                        "(param_name IN ({in_list}) AND (value_reference = ${offset} \
+                         OR value_reference_target = ${offset}))"
+                    ),
                     false,
                 ));
                 params.push(SqlParam::text(strip_reference_version(&comp.reference)));
@@ -1449,23 +1523,8 @@ impl PostgresQueryBuilder {
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
             (None, SearchParamType::Composite) if !param.components.is_empty() => {
-                // These rows retain the instance group, but not component
-                // positions. Equal types can therefore satisfy the wrong slot
-                // (A$B also matching B$A), even within one group (#1407).
-                if param
-                    .components
-                    .iter()
-                    .enumerate()
-                    .any(|(position, component)| {
-                        param.components[..position]
-                            .iter()
-                            .any(|earlier| earlier.param_type == component.param_type)
-                    })
-                {
-                    return Some(
-                        "composite parameters with repeated component types are".to_string(),
-                    );
-                }
+                // Unfolded rows retain their per-type component slots. The
+                // search gate refuses ambiguous older NULL-slot rows (#1407).
                 true
             }
             (_, SearchParamType::Composite) => {
@@ -2505,6 +2564,9 @@ impl PostgresQueryBuilder {
 
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
+            // A part-count mismatch is a 400 from the search gate
+            // (`crate::search::validate_composite_values`, #1236) before any query is
+            // built; this branch is defence in depth.
             if parts.len() != param.components.len() {
                 value_conditions.push("1 = 0".to_string());
                 continue;
@@ -2622,7 +2684,7 @@ impl PostgresQueryBuilder {
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
-                 AND composite_group IS NOT NULL AND {})",
+                 AND is_contained = FALSE AND composite_group IS NOT NULL AND {})",
                 sql_string_literal(&param.name),
                 conjunction
             ));
@@ -2670,6 +2732,9 @@ impl PostgresQueryBuilder {
 
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
+            // A part-count mismatch is a 400 from the search gate
+            // (`crate::search::validate_composite_values`, #1236) before any query is
+            // built; this branch is defence in depth.
             if parts.len() != param.components.len() {
                 value_conditions.push("1 = 0".to_string());
                 continue;
@@ -2685,13 +2750,24 @@ impl PostgresQueryBuilder {
 
             for (idx, (part, component)) in parts.iter().zip(param.components.iter()).enumerate() {
                 let cv = Self::parse_component_value(part, component.param_type);
-                // 1-based, and the same order the extractor assigns slots from.
-                let slot = (idx + 1).min(u8::MAX as usize) as u8;
+                let ordinal = param.components[..=idx]
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count();
+                // The search gate bounds this to the extractor's u8 contract.
+                let slot = u8::try_from(ordinal).unwrap_or(u8::MAX);
+                let repeated = param
+                    .components
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count()
+                    > 1;
                 match Self::build_composite_component_transitional(
                     &cv,
                     component.param_type,
                     next,
                     slot,
+                    repeated,
                 ) {
                     Some((sql, params)) => {
                         next += params.len();
@@ -2730,7 +2806,7 @@ impl PostgresQueryBuilder {
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
-                 AND ({}) \
+                 AND is_contained = FALSE AND composite_group IS NOT NULL AND ({}) \
                  GROUP BY resource_id, composite_group HAVING {})",
                 sql_string_literal(&param.name),
                 prefilter,
@@ -2807,63 +2883,64 @@ impl PostgresQueryBuilder {
         }
     }
 
-    /// A component predicate that matches **both** composite layouts, for use
-    /// while a database is being promoted from legacy to denormalized.
-    ///
-    /// Promotion rewrites resources one page at a time, so for the length of the
-    /// run the table holds both shapes at once and reads must still be correct
-    /// against each. For most component types the two shapes are already
-    /// indistinguishable to a read: only Token and Number have `_2` columns
-    /// (`CompositeRow::place`), so a slot-2 component of any other type writes
-    /// the base columns either way and needs nothing special.
-    ///
-    /// Token and Number in slot 2 are the exception, and getting them wrong is
-    /// silent. A promoted token+token row puts component 2 in `value_token_code_2`,
-    /// which the legacy `HAVING` never reads — so the plain legacy form stops
-    /// matching a resource the moment it is rewritten, and 24 of the 46 R4
-    /// composites pair two components of the same type. That is a false
-    /// *negative*: the resource simply disappears from composite search until
-    /// the marker flips.
-    ///
-    /// The repair is to read the `_2` column when it is populated and fall back
-    /// to the base column when it is not:
-    ///
-    /// ```sql
-    /// (code_2 = $1 OR (code_2 IS NULL AND system_2 IS NULL AND code = $2))
-    /// ```
-    ///
-    /// The `IS NULL` guard is what keeps this from introducing a false
-    /// *positive*. Simply OR-ing the two columns would let a denormalized row
-    /// satisfy a query with its components **swapped** — component 1 matching via
-    /// `_2` and component 2 via the base column — which is a different clinical
-    /// fact than the one asked for. Component 1 therefore always reads the base
-    /// columns only, and component 2 reads the base columns only on rows that
-    /// have no slot-2 payload at all, i.e. legacy rows.
+    /// Slot constraints apply only to repeated families. Mixed-type legacy
+    /// composites remain unambiguous even before component slots were stored.
+    fn unfolded_composite_predicate(
+        param: &SearchParameter,
+        position: usize,
+        sql: String,
+    ) -> String {
+        let family = param.components[position].param_type;
+        if param
+            .components
+            .iter()
+            .filter(|c| c.param_type == family)
+            .count()
+            < 2
+        {
+            return sql;
+        }
+        let slot = param.components[..=position]
+            .iter()
+            .filter(|c| c.param_type == family)
+            .count();
+        format!("(composite_slot = {slot} AND ({sql}))")
+    }
+
+    /// Legacy reads accept slotted unfolded rows and folded transitional rows.
+    /// Only the family's own second payload proves a NULL-slot row is folded;
+    /// an unrelated `_2` payload must never enable the base-column fallback.
     fn build_composite_component_transitional(
         value: &SearchValue,
         param_type: SearchParamType,
         offset: usize,
         slot: u8,
+        repeated: bool,
     ) -> Option<(String, Vec<SqlParam>)> {
-        // Slot 1 is the base columns under either layout.
-        if slot < 2 {
+        if !repeated {
             return Self::build_composite_component(value, param_type, offset, 1);
         }
-        // Only Token and Number ever occupy a `_2` column.
-        let guard = match param_type {
-            SearchParamType::Token => "value_token_code_2 IS NULL AND value_token_system_2 IS NULL",
-            SearchParamType::Number => "value_number_2 IS NULL",
-            _ => return Self::build_composite_component(value, param_type, offset, 1),
-        };
-
-        let (denorm_sql, denorm_params) =
-            Self::build_composite_component(value, param_type, offset, slot)?;
-        let (legacy_sql, legacy_params) =
-            Self::build_composite_component(value, param_type, offset + denorm_params.len(), 1)?;
-
-        let sql = format!("(({denorm_sql}) OR ({guard} AND ({legacy_sql})))");
-        let mut params = denorm_params;
-        params.extend(legacy_params);
+        let (unfolded, mut params) = Self::build_composite_component(value, param_type, offset, 1)?;
+        let mut sql = format!("(composite_slot = {slot} AND ({unfolded}))");
+        if slot <= 2 {
+            let folded = match param_type {
+                SearchParamType::Token => {
+                    Some("(value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)")
+                }
+                SearchParamType::Number => Some("value_number_2 IS NOT NULL"),
+                _ => None,
+            };
+            if let Some(folded) = folded {
+                let (predicate, folded_params) = Self::build_composite_component(
+                    value,
+                    param_type,
+                    offset + params.len(),
+                    slot,
+                )?;
+                sql = format!("({sql} OR (composite_slot IS NULL AND {folded} AND ({predicate})))");
+                params.extend(folded_params);
+            }
+        }
         Some((sql, params))
     }
 
@@ -3042,6 +3119,13 @@ impl PostgresQueryBuilder {
         Self::or_values(&param.name, conditions)
     }
 
+    fn quantity_membership_arm(name: &str, predicate: &str) -> String {
+        format!(
+            "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {predicate}",
+            sql_string_literal(name),
+        )
+    }
+
     fn build_quantity_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
         // Running placeholder counter: the outer builder advances by the
@@ -3059,9 +3143,8 @@ impl PostgresQueryBuilder {
 
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
-                    sql_string_literal(&param.name),
-                    predicate
+                    "id IN ({})",
+                    Self::quantity_membership_arm(&param.name, &predicate)
                 ),
                 params,
             ));
@@ -3281,14 +3364,24 @@ impl PostgresQueryBuilder {
         // together — see `build_token_condition` for why (an OR'd sublink is left as
         // a re-executable SubPlan instead of being pulled up into a semi-join). The
         // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
-        Some(SqlFragment::with_params(
-            format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
-                sql_string_literal(&param.name),
-                conditions.join(" OR ")
-            ),
-            params,
-        ))
+        let membership = format!(
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
+            sql_string_literal(&param.name),
+            conditions.join(" OR ")
+        );
+        // `:not` negates the whole membership (#2494), as the token builder
+        // does and as SQLite's `resource_key NOT IN (...)` does: resources with
+        // no index row for the parameter match, and a comma list means "not A
+        // and not B". `resource_id` is never NULL, so the negation is safe. The
+        // `NOT (` prefix also keeps the fragment out of the `id IN (` shortcuts
+        // (`simple_membership_arm`, `single_index_predicate`), which would
+        // otherwise treat it as a positive match.
+        let sql = if matches!(param.modifier.as_ref(), Some(SearchModifier::Not)) {
+            format!("NOT ({membership})")
+        } else {
+            membership
+        };
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// The bare row predicate for one value of a reference search (every form
@@ -3358,7 +3451,13 @@ impl PostgresQueryBuilder {
                     let exact = *param_num + 1;
                     *param_num += 1;
                     params.push(SqlParam::text(&base));
-                    format!("value_reference = ${exact}")
+                    if is_relative_type_id(&base) {
+                        // A relative `Type/id` also matches the absolute
+                        // reference stored with that target (#2394).
+                        format!("(value_reference = ${exact} OR value_reference_target = ${exact})")
+                    } else {
+                        format!("value_reference = ${exact}")
+                    }
                 } else {
                     // Bare logical id: compare with the final reference segment.
                     // The explicit NULL check matches the v42 partial index.
@@ -3813,8 +3912,8 @@ mod tests {
                     (offset + 1..=offset + 7).collect::<Vec<_>>()
                 );
 
-                // Both original arms, including tenant/type and the raw OR
-                // canonical quantity comparison, are copied without rewriting.
+                // The rare-code fallback retains both original scoped arms,
+                // including the complete raw OR canonical quantity predicate.
                 let mut next = offset;
                 for param in [
                     query
@@ -3868,6 +3967,83 @@ mod tests {
                     matches!(&fragment.params[0], SqlParam::Text(value) if value == "other-code")
                 );
                 assert!(matches!(fragment.params[1], SqlParam::Float(value) if value == 75.0));
+            }
+        }
+    }
+
+    #[test]
+    fn observation_code_quantity_unit_alternatives_keep_bindings_and_fallback() {
+        for prefix in [SearchPrefix::Gt, SearchPrefix::Lt] {
+            for (value, converted, param_count) in [
+                ("150||cm", true, 5),
+                ("150|cm", true, 5),
+                ("150|http://unitsofmeasure.org|cm", true, 6),
+                ("150||widgets", false, 3),
+                ("150", false, 2),
+            ] {
+                for reversed in [false, true] {
+                    let mut query = observation_code_quantity_query();
+                    query.parameters[0].values = vec![SearchValue::eq("8302-2")];
+                    query.parameters[1].values = vec![SearchValue::new(prefix, value)];
+                    if reversed {
+                        query.parameters.reverse();
+                    }
+                    for offset in [2, 4] {
+                        let fragment =
+                            PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                        assert_eq!(fragment.params.len(), param_count, "{prefix:?} {value}");
+                        assert_eq!(
+                            bind_numbers(&fragment.sql, offset),
+                            (offset + 1..=offset + param_count).collect::<Vec<_>>()
+                        );
+                        assert_eq!(fragment.sql.contains(" INTERSECT (SELECT "), converted);
+                        assert_eq!(
+                            fragment.sql.matches(" UNION SELECT ").count(),
+                            usize::from(converted)
+                        );
+                        assert!(
+                            matches!(&fragment.params[0], SqlParam::Text(code) if code == "8302-2")
+                        );
+                        assert!(
+                            matches!(&fragment.params[1], SqlParam::Float(number) if *number == 150.0)
+                        );
+                        if converted {
+                            assert!(
+                                matches!(&fragment.params[2], SqlParam::Text(unit) if unit == "cm")
+                            );
+                            assert!(
+                                matches!(&fragment.params[param_count - 2], SqlParam::Float(number) if *number == 1.5)
+                            );
+                            assert!(
+                                matches!(&fragment.params[param_count - 1], SqlParam::Text(unit) if unit == "m")
+                            );
+                        }
+                        let code = PostgresQueryBuilder::build_parameter_condition(
+                            query
+                                .parameters
+                                .iter()
+                                .find(|param| param.name == "code")
+                                .unwrap(),
+                            offset,
+                            IndexLayout::Denormalized,
+                        )
+                        .unwrap();
+                        let quantity = PostgresQueryBuilder::build_parameter_condition(
+                            query
+                                .parameters
+                                .iter()
+                                .find(|param| param.name == "value-quantity")
+                                .unwrap(),
+                            offset + code.params.len(),
+                            IndexLayout::Denormalized,
+                        )
+                        .unwrap();
+                        assert!(fragment.sql.contains(&format!(
+                            "AND ({}) AND NOT (SELECT broad FROM policy)",
+                            code.and(quantity).sql
+                        )));
+                    }
+                }
             }
         }
     }
@@ -4683,14 +4859,14 @@ mod tests {
             .expect("fragment");
 
         assert!(
-            frag.sql.contains("value_token_code_2 = $4"),
+            frag.sql.contains("value_token_code_2 = $6"),
             "component 2 must read the denormalized _2 column: {}",
             frag.sql
         );
         assert!(
             frag.sql
-                .contains("value_token_code_2 IS NULL AND value_token_system_2 IS NULL"),
-            "the fallback must be guarded on the row having no slot-2 payload: {}",
+                .contains("composite_slot IS NULL AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)"),
+            "the folded branch requires its own family's slot-2 payload: {}",
             frag.sql
         );
         // Component 1 must NEVER read `_2`. If it did, a denormalized row whose
@@ -4702,7 +4878,7 @@ mod tests {
             .next()
             .expect("component 1's MAX arm");
         assert!(
-            !comp_one_arm.contains("_2"),
+            !comp_one_arm.contains("value_token_code_2 ="),
             "component 1's HAVING arm must read only the base columns, got `{}` in: {}",
             comp_one_arm,
             frag.sql
@@ -4711,6 +4887,72 @@ mod tests {
         assert!(
             frag.sql
                 .contains("GROUP BY resource_id, composite_group HAVING")
+        );
+    }
+
+    #[test]
+    fn composite_unfolded_slots_follow_family_order_at_offsets_two_and_four() {
+        let parameter = SearchParameter {
+            name: "token-quantity-token".into(),
+            param_type: SearchParamType::Composite,
+            components: [
+                SearchParamType::Token,
+                SearchParamType::Quantity,
+                SearchParamType::Token,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(position, param_type)| CompositeSearchComponent {
+                param_type,
+                param_name: format!("axis-{position}"),
+            })
+            .collect(),
+            values: vec![SearchValue::eq("A$gt5$B")],
+            ..Default::default()
+        };
+        let query = SearchQuery::new("Observation").with_parameter(parameter.clone());
+        for offset in [2, 4] {
+            let fragment =
+                PostgresQueryBuilder::build_search_query_for(&query, offset, IndexLayout::Legacy)
+                    .unwrap();
+            assert!(
+                fragment.sql.contains("composite_slot = 1")
+                    && fragment.sql.contains("composite_slot = 2"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                !fragment.sql.contains("composite_slot = 3"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                !fragment.sql.contains("value_quantity_value_2"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                fragment
+                    .sql
+                    .contains("is_contained = FALSE AND composite_group IS NOT NULL")
+            );
+            assert_eq!(
+                bind_numbers(&fragment.sql, offset),
+                (offset + 1..=offset + fragment.params.len()).collect::<Vec<_>>()
+            );
+        }
+        let fragment =
+            PostgresQueryBuilder::build_contained(&contained_query(vec![parameter])).unwrap();
+        assert!(
+            fragment.sql.contains("composite_slot = 1")
+                && fragment.sql.contains("composite_slot = 2"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("value_token_code_2"),
+            "{}",
+            fragment.sql
         );
     }
 
@@ -5143,7 +5385,7 @@ mod tests {
             frag.sql,
             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
              AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
-             AND composite_group IS NOT NULL \
+             AND is_contained = FALSE AND composite_group IS NOT NULL \
              AND (value_token_code = $3) AND (value_quantity_value > $4))",
             "{}",
             frag.sql
@@ -5168,7 +5410,7 @@ mod tests {
             format!(
                 "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
                  AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
-                 AND composite_group IS NOT NULL \
+                 AND is_contained = FALSE AND composite_group IS NOT NULL \
                  AND (value_token_system IN ($3, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = $4) \
                  AND (value_quantity_value > $5))"
             ),
@@ -5278,7 +5520,7 @@ mod tests {
 
         assert_eq!(
             pred,
-            "param_name = 'combo-code-value-quantity' AND composite_group IS NOT NULL \
+            "param_name = 'combo-code-value-quantity' AND is_contained = FALSE AND composite_group IS NOT NULL \
              AND (value_token_code = $3) AND (value_quantity_value > $4)"
         );
         // It has to stand alone against `search_index`.
@@ -6021,14 +6263,15 @@ mod tests {
         let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(placeholders(filter), vec![1, 2, 3, 4]);
+        assert_eq!(placeholders(filter), vec![1, 2, 3, 4, 4]);
         assert_eq!(frag.params.len(), 2);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
         assert_eq!(
             having,
             "bool_or(param_name = 'code' AND (value_token_code = $3)) AND \
-             bool_or(param_name IN ('subject', 'performer') AND value_reference = $4)"
+             bool_or(param_name IN ('subject', 'performer') AND \
+             (value_reference = $4 OR value_reference_target = $4))"
         );
         assert!(
             matches!(&frag.params[1], SqlParam::Text(s) if s == "Patient/p1"),
@@ -6068,7 +6311,7 @@ mod tests {
     }
 
     #[test]
-    fn contained_composite_repeated_types_are_refused_before_querying() {
+    fn contained_composite_repeated_types_are_supported_and_modifiers_still_refused() {
         use crate::types::CompositeSearchComponent;
 
         let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
@@ -6099,18 +6342,11 @@ mod tests {
                 let parameter = composite("custom-pair", &types);
                 let mut query = contained_query(vec![parameter.clone()]);
                 query.contained = mode;
-                let SearchError::InvalidComposite { message } =
-                    PostgresQueryBuilder::reject_unsupported_contained(&query).unwrap_err()
-                else {
-                    panic!("expected InvalidComposite");
-                };
-                assert!(message.contains("'custom-pair'"), "{message}");
-                assert!(message.contains("_contained"), "{message}");
-                assert!(message.contains("repeated component types"), "{message}");
+                assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
                 query.contained = ContainedMode::Off;
                 assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
 
-                // Existing modifier errors take precedence over repeated types.
+                // Modifiers remain unsupported for composites.
                 query.contained = mode;
                 query.parameters[0].modifier = Some(SearchModifier::Exact);
                 let error = PostgresQueryBuilder::reject_unsupported_contained(&query)
@@ -6272,7 +6508,8 @@ mod tests {
                 "p1"
             )),
             (
-                "(param_name = 'subject' AND ((value_reference = $3)))".to_string(),
+                "(param_name = 'subject' AND (((value_reference = $3 OR value_reference_target = $3))))"
+                    .to_string(),
                 1
             )
         );
@@ -6329,7 +6566,7 @@ mod tests {
                 "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
                  resource_id, contained_local_id FROM search_index WHERE tenant_id = $1 AND \
                  is_contained = TRUE AND contained_type = $2 AND param_name = \
-                 'code-value-quantity' AND ((value_token_code = $4) OR ("
+                 'code-value-quantity' AND composite_group IS NOT NULL AND ((value_token_code = $4) OR ("
             ),
             "{}",
             frag.sql
@@ -7552,6 +7789,95 @@ mod tests {
         assert_eq!(frag.params.len(), 2);
     }
 
+    fn reference_not_sql(values: &[&str]) -> (String, SqlFragment) {
+        let build = |modifier| {
+            let param = SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: values
+                    .iter()
+                    .map(|v| SearchValue::new(SearchPrefix::Eq, *v))
+                    .collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            PostgresQueryBuilder::build_search_query(
+                &SearchQuery::new("Observation").with_parameter(param),
+                2,
+            )
+            .expect("reference condition")
+        };
+        (build(None).sql, build(Some(SearchModifier::Not)))
+    }
+
+    #[test]
+    fn reference_not_negates_the_whole_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    #[test]
+    fn reference_not_comma_list_is_one_negated_sublink() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1", "Group/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.sql.matches("id IN (SELECT").count(), 1);
+        assert_eq!(negated.params.len(), 2);
+    }
+
+    #[test]
+    fn reference_not_bare_id_negates_the_bare_id_predicate() {
+        let (positive, negated) = reference_not_sql(&["p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert!(
+            negated.sql.starts_with("NOT (id IN (SELECT"),
+            "{}",
+            negated.sql
+        );
+    }
+
+    #[test]
+    fn reference_not_is_not_an_index_only_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert!(PostgresQueryBuilder::single_index_predicate(&positive).is_some());
+        assert_eq!(
+            PostgresQueryBuilder::single_index_predicate(&negated.sql),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_reference_not_is_not_folded_into_an_intersect() {
+        let not = |v: &str| reference_param("subject", Some(SearchModifier::Not), v);
+        let query = SearchQuery::new("Observation")
+            .with_parameter(not("Patient/p1"))
+            .with_parameter(not("Patient/p2"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("two :not");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert_eq!(
+            frag.sql.matches("NOT (id IN (SELECT").count(),
+            2,
+            "{}",
+            frag.sql
+        );
+    }
+
+    #[test]
+    fn reference_positive_and_not_are_not_folded_into_an_intersect() {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(reference_param("subject", None, "Patient/p1"))
+            .with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Not),
+                "Patient/p2",
+            ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("mixed");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert!(frag.sql.contains("NOT (id IN (SELECT"), "{}", frag.sql);
+        assert_eq!(frag.sql.matches("id IN (SELECT").count(), 2, "{}", frag.sql);
+    }
+
     #[test]
     fn reference_or_list_is_a_single_sublink() {
         let param = SearchParameter {
@@ -7608,7 +7934,7 @@ mod tests {
         );
         assert!(
             frag.sql.contains(&format!(
-                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR value_reference = $4"
+                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR (value_reference = $4 OR value_reference_target = $4)"
             )),
             "each OR arm must use its assigned placeholder: {}",
             frag.sql
@@ -7725,14 +8051,14 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
 
         assert!(
-            frag.sql.contains("value_reference = $3"),
+            frag.sql
+                .contains("(value_reference = $3 OR value_reference_target = $3)"),
             "must be an equality on the bound base: {}",
             frag.sql
         );
         assert!(
-            !frag.sql.contains("LIKE") && !frag.sql.contains(" OR "),
-            "no disjunction: an OR is index-usable only when every arm is, and \
-             the `/_history/%` arm was the one that never matched: {}",
+            !frag.sql.contains("LIKE") && frag.sql.matches(" OR ").count() == 1,
+            "only the two-column OR (both arms indexed, #2394), no LIKE arm: {}",
             frag.sql
         );
         assert_eq!(frag.params.len(), 1);
