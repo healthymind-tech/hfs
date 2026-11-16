@@ -131,3 +131,24 @@ Rollback is the pre-upgrade dump: once v47+ has run, a pre-merge image built
 from `hm/p3-pgops` or later refuses to start against the database (by design,
 see `HFS_PG_ALLOW_NEWER_SCHEMA`); images older than that would start and
 silently miss the new columns, so never roll back by image tag alone.
+
+## 6. Executed: v0.2.8 + v0.2.9 (2026-11-16, branch `hm/upstream-merge`)
+
+Option B was taken: one merge of `v0.2.8` into a branch off production
+(`1413d673a`), then `origin/hm/main` (`b75c853c5`), then `v0.2.9` as a
+second merge commit. 168 conflicted paths for v0.2.8, 26 for v0.2.9; the
+fork's `docs/ops/` stays here (`.gitignore` now ignores `/docs/*` except
+these pages). Every decision where both sides had built the same thing, the
+test numbers, the migration rehearsal on the production dump and the
+deploy/rollback notes are in `hfs-eval/eval/results-upstream/REPORT.md`.
+
+Lessons for the next weekly merge:
+
+- auto-merged `Cargo.toml` files can silently drop a dependency the fork still
+  uses (roxmltree in `helios-fhirpath`); `cargo check --workspace --all-targets`
+  with the production features catches it;
+- upstream tests often assume upstream's harness (shared PG database per
+  suite, single-connection backends, statement_timeout ending lock waits);
+  those are adapted or ignored with a reason naming the fork commit;
+- regenerate the validator schema packs after every merge that touches the
+  converter (`generate-schema-packs R4 R4B R5`).

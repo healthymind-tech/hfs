@@ -14,7 +14,7 @@ HFS processes starting together never migrate twice.
 
 | Track | Recorded in | Numbering | Owner |
 |---|---|---|---|
-| Upstream ladder | `schema_version(version)` — one row | `v1 → v2 → … → SCHEMA_VERSION` (55 in this build, upstream v0.2.8) | upstream HeliosSoftware/hfs |
+| Upstream ladder | `schema_version(version)` — one row | `v1 → v2 → … → SCHEMA_VERSION` (55 in this build, upstream v0.2.8 and v0.2.9) | upstream HeliosSoftware/hfs |
 | Fork migrations | `hm_schema_migrations(name, applied_at, note)` | by **name**, e.g. `hm-0001-search-parameter-epochs` | healthymind fork |
 
 At startup:
