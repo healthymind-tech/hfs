@@ -1082,15 +1082,23 @@ impl PackageManager {
 
         let owners = self.owner_map(tenant).await?;
         let ctx = Self::ctx(tenant);
-        // Side by side when asked, or when a newer version of this package
-        // stays installed (the plan never downgrades it).
+        // Side by side when asked, or when another version of this package
+        // stays installed: a newer one (the plan never downgrades it), or an
+        // older major the plan keeps for the packages built on it (TW NGS
+        // 1.0.0 brings genomics-reporting 3.0.0 while mCODE 3.0.0 needs the
+        // installed 2.0.0 — writing 3.0.0 under the plain ids replaced 2.0.0's
+        // definitions while 2.0.0 stayed listed as installed).
+        let replaced: &[String] = match action {
+            NodeAction::Upgrade { from } => from,
+            _ => &[],
+        };
         let side_by_side = options.mode == InstallMode::SideBySide
             || self
                 .installed_pairs(tenant)
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|(n, v)| n == name && super::version::compare(v, version).is_gt());
+                .any(|(n, v)| n == name && v != version && !replaced.contains(v));
         let mut rows: Vec<PackageResourceRecord> = Vec::new();
         let mut written: BTreeMap<String, u64> = BTreeMap::new();
         let mut failures = 0u64;

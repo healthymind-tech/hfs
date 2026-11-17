@@ -1017,3 +1017,81 @@ async fn an_older_major_dependency_is_installed_side_by_side() {
         "2.0.0 is still the registered one: {issues:?}"
     );
 }
+
+/// The reverse order of the case above (line V, found on a production copy):
+/// a package built on the older major is installed first, then a package
+/// needing the newer major (TW NGS 1.0.0 brings genomics-reporting 3.0.0
+/// while mCODE 3.0.0 needs the installed 2.0.0). The newer release is
+/// installed side by side and must not overwrite the older one's
+/// definitions; the dependent's base keeps meaning the older release.
+#[tokio::test]
+async fn a_newer_major_dependency_does_not_overwrite_the_older_one_still_needed() {
+    let (server, _cache) = server(true);
+    let core = |version: &str, element: &str| {
+        package(
+            "acme.core",
+            version,
+            json!({"hl7.fhir.r4.core": "4.0.1"}),
+            &[(
+                "StructureDefinition-acme-core-patient.json",
+                profile("acme-core-patient", version, element),
+            )],
+        )
+    };
+    let mut on_core = profile("acme-on-core", "1.0.0", "name");
+    on_core["baseDefinition"] = json!("http://acme.org/StructureDefinition/acme-core-patient");
+    let old_user = package(
+        "acme.olduser",
+        "1.0.0",
+        json!({"hl7.fhir.r4.core": "4.0.1", "acme.core": "1.0.0"}),
+        &[("StructureDefinition-acme-on-core.json", on_core)],
+    );
+    let new_user = package(
+        "acme.newuser",
+        "1.0.0",
+        json!({"hl7.fhir.r4.core": "4.0.1", "acme.core": "2.0.0"}),
+        &[],
+    );
+    for p in [core("1.0.0", "birthDate"), core("2.0.0", "gender"), old_user, new_user] {
+        upload(&server, p, "").await.assert_status(StatusCode::OK);
+    }
+    let job = install(&server, "acme.olduser#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let job = install(&server, "acme.newuser#1.0.0").await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let list: Value = server.get("/admin/packages").await.json();
+    let mut installed: Vec<String> = list["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| format!("{}#{}", p["name"].as_str().unwrap(), p["version"].as_str().unwrap()))
+        .collect();
+    installed.sort();
+    assert_eq!(
+        installed,
+        ["acme.core#1.0.0", "acme.core#2.0.0", "acme.newuser#1.0.0", "acme.olduser#1.0.0"]
+    );
+    // The dependent is judged on 1.0.0's base (birthDate), not 2.0.0's (gender).
+    let issues = validate(
+        &server,
+        "acme-on-core",
+        json!({"resourceType": "Patient", "name": [{"family": "x"}], "birthDate": "2000-01-01"}),
+    )
+    .await;
+    assert!(!has_error(&issues), "1.0.0 base needs birthDate only: {issues:?}");
+    let issues = validate(
+        &server,
+        "acme-on-core",
+        json!({"resourceType": "Patient", "name": [{"family": "x"}], "gender": "male"}),
+    )
+    .await;
+    assert!(has_error(&issues), "1.0.0 base requires birthDate: {issues:?}");
+    // An unversioned claim of the core profile means the newest release.
+    let issues = validate(
+        &server,
+        "acme-core-patient",
+        json!({"resourceType": "Patient", "birthDate": "2000-01-01"}),
+    )
+    .await;
+    assert!(has_error(&issues), "2.0.0 requires gender: {issues:?}");
+}
