@@ -5945,8 +5945,11 @@ mod postgres_integration {
         "INSERT INTO subscription_state (tenant_id, subscription_id) VALUES ($1, 'seed-sub')",
         "INSERT INTO subscription_notification_events (tenant_id, subscription_id, event_number, bundle) \
          VALUES ($1, 'seed-sub', 1, '{}'::jsonb)",
-        "INSERT INTO subscription_delivery_outbox (tenant_id, subscription_id, notification_type, bundle) \
-         VALUES ($1, 'seed-sub', 'event-notification', '{}'::jsonb)",
+        // Due a century out: the outbox claim is cross-tenant by design (one
+        // worker pool serves every tenant), so a due seed row — the kept
+        // tenant's survives this test — would be claimed by the outbox suite.
+        "INSERT INTO subscription_delivery_outbox (tenant_id, subscription_id, notification_type, bundle, next_attempt_at) \
+         VALUES ($1, 'seed-sub', 'event-notification', '{}'::jsonb, NOW() + INTERVAL '100 years')",
         "INSERT INTO subscription_ws_tokens (token, tenant_id, subscription_id, expires_at) \
          VALUES ($1 || '-tok', $1, 'seed-sub', NOW() + INTERVAL '1 hour')",
         "INSERT INTO resource_change_feed (tenant_id, resource_type, resource_id) VALUES ($1, 'Patient', 'seed-p')",
@@ -39766,6 +39769,24 @@ mod postgres_integration {
                 .expect("postgres backs a delivery outbox")
         }
 
+        /// Completes every delivery claimable right now, so an outbox test
+        /// starts from an empty due queue. `claim_next` is deliberately
+        /// cross-tenant (one worker pool serves every tenant, the lease
+        /// carries the tenant), so a due row left behind by anything else that
+        /// shares the database — another suite, an aborted earlier run — would
+        /// otherwise be claimed in place of the test's own row. Callers hold
+        /// `SUBSCRIPTION_OUTBOX_TEST_LOCK`.
+        async fn drain_outbox(outbox: &Arc<dyn SubscriptionDeliveryOutbox>) {
+            let worker = WorkerId::new(format!("outbox-drain-{}", uuid::Uuid::new_v4()));
+            while let Some(claimed) = outbox
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                outbox.complete(&claimed.lease).await.unwrap();
+            }
+        }
+
         fn delivery(sub: &str) -> NewDelivery {
             NewDelivery {
                 subscription_id: sub.to_string(),
@@ -39945,6 +39966,7 @@ mod postgres_integration {
         async fn postgres_integration_cluster_outbox_claim_exclusive_across_handles() {
             let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
             let handles = harness::two_handles(create_backend).await;
+            drain_outbox(&outbox_of(&handles.a)).await;
             let tenant = create_tenant("outbox-claim");
 
             outbox_of(&handles.a)
@@ -39992,6 +40014,7 @@ mod postgres_integration {
         async fn postgres_integration_cluster_outbox_reclaimed_after_worker_death() {
             let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
             let tenant = create_tenant("outbox-durable");
+            drain_outbox(&outbox_of(&create_backend().await)).await;
 
             let stale = {
                 let dying = create_backend().await;
@@ -40046,6 +40069,7 @@ mod postgres_integration {
             let handles = harness::two_handles(create_backend).await;
             let tenant = create_tenant("outbox-retry");
             let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+            drain_outbox(&a).await;
 
             let id = a.enqueue(&tenant, delivery("sub-1")).await.unwrap();
             let worker = WorkerId::new(format!("outbox-retry-{}", uuid::Uuid::new_v4()));
