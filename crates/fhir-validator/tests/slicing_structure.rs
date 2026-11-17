@@ -856,3 +856,45 @@ fn a_profile_whose_base_is_not_installed_is_validated_by_its_snapshot() {
             .any(|e| e.severity == Severity::Error && e.path.contains("gender")),
     );
 }
+
+/// DaVinci DTR 2.1.0 `dtr-qpackage-input-parameters`: the `order` parameter's
+/// resource lists several resource types, each with its own profile
+/// (Appointment | … | ServiceRequest). A ServiceRequest there was judged as
+/// an Appointment (the first type): "participant is required", app-3.
+#[test]
+fn a_resource_slot_with_several_typed_profiles_judges_by_resource_type() {
+    const APPT: &str = "http://example.org/StructureDefinition/appt";
+    const SR: &str = "http://example.org/StructureDefinition/sr";
+    const PARAMS: &str = "http://example.org/StructureDefinition/params";
+    let appt = sd(APPT, "Appointment", vec![
+        ed("Appointment", json!({"min": 0, "max": "*"})),
+        ed("Appointment.description", json!({"min": 1, "max": "1", "type": [{"code": "string"}]})),
+    ]);
+    let sr = sd(SR, "ServiceRequest", vec![
+        ed("ServiceRequest", json!({"min": 0, "max": "*"})),
+        ed("ServiceRequest.priority", json!({"min": 1, "max": "1", "type": [{"code": "code"}]})),
+    ]);
+    let params = sd(PARAMS, "Parameters", vec![
+        ed("Parameters", json!({"min": 0, "max": "*"})),
+        ed("Parameters.parameter", json!({"min": 1, "max": "*", "type": [{"code": "BackboneElement"}],
+            "slicing": {"discriminator": [{"type": "value", "path": "name"}], "rules": "open"}})),
+        ed("Parameters.parameter:order", json!({"sliceName": "order", "min": 0, "max": "*", "type": [{"code": "BackboneElement"}]})),
+        ed("Parameters.parameter:order.name", json!({"min": 1, "max": "1", "type": [{"code": "string"}], "fixedString": "order"})),
+        ed("Parameters.parameter:order.resource", json!({"min": 1, "max": "1", "type": [
+            {"code": "Appointment", "profile": [APPT]}, {"code": "ServiceRequest", "profile": [SR]}]})),
+    ]);
+    let r = resolver(&[appt, sr, params]);
+    let with = |resource: Value| json!({"resourceType": "Parameters", "parameter": [{"name": "order", "resource": resource}]});
+    let ok = with(json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/p"}, "priority": "routine"}));
+    let errors = validate(&r, &ok, &[PARAMS]);
+    assert!(errors.iter().all(|e| e.severity != Severity::Error), "{errors:#?}");
+    let bad = with(json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/p"}}));
+    let errors = validate(&r, &bad, &[PARAMS]);
+    assert!(
+        errors.iter().any(|e| e.severity == Severity::Error && e.path.contains("priority")),
+        "the ServiceRequest profile applies: {errors:#?}"
+    );
+    assert!(errors.iter().all(|e| !e.path.contains("description")), "{errors:#?}");
+}

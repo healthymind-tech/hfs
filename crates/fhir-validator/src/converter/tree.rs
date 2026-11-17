@@ -328,6 +328,24 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
                 element.schema.type_profiles = Some(t.profile.clone());
             }
         }
+        _ if is_resource_slot(ed) => {
+            // A resource slot narrowed to several resource types, each with
+            // its own profile (DTR's `Parameters.parameter:order.resource`:
+            // Appointment | Encounter | … | ServiceRequest). The element stays
+            // `Resource` (its schema follows the data's `resourceType`) and
+            // the profiles of every listed type apply to a resource of that
+            // type only (see `with_type_profiles`). Taking the first type
+            // judged a ServiceRequest as an Appointment.
+            element.schema.type_ = Some("Resource".to_string());
+            let profiles: Vec<String> = ed
+                .types
+                .iter()
+                .flat_map(|t| t.profile.iter().cloned())
+                .collect();
+            if !profiles.is_empty() {
+                element.schema.type_profiles = Some(profiles);
+            }
+        }
         _ => {
             // Multiple types without `[x]` should not occur; take the first.
             warnings.push(format!(
@@ -342,6 +360,17 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
         }
     }
     apply_value_keywords(&mut element.schema, ed, warnings);
+}
+
+/// An element holding a resource (`….resource`, `….contained`) whose types
+/// are all resource types.
+fn is_resource_slot(ed: &Ed) -> bool {
+    let last = ed.path.rsplit('.').next().unwrap_or_default();
+    matches!(last, "resource" | "contained")
+        && ed
+            .types
+            .iter()
+            .all(|t| t.effective_code().starts_with(|c: char| c.is_ascii_uppercase()))
 }
 
 /// Binding, constraints, fixed/pattern — the keywords that apply to a value

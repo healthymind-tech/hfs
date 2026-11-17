@@ -1543,12 +1543,19 @@ fn with_type_profiles<'a>(
     if profiles.is_empty() || !value.is_object() {
         return elset.clone();
     }
-    let resolved: Vec<(String, Arc<FhirSchema>)> = profiles
+    let mut resolved: Vec<(String, Arc<FhirSchema>)> = profiles
         .iter()
         .filter_map(|p| ctx.resolver.resolve(p).map(|s| (p.clone(), s)))
         .collect();
     if resolved.is_empty() {
         return elset.clone();
+    }
+    // A slot listing several resource types with their own profiles: only
+    // the profiles of the resource's own type are candidates.
+    if let Some(rt) = value.get("resourceType").and_then(Value::as_str)
+        && resolved.iter().any(|(_, s)| s.type_.as_deref() == Some(rt))
+    {
+        resolved.retain(|(_, s)| s.type_.as_deref() == Some(rt));
     }
     if let Some(rt) = value.get("resourceType").and_then(Value::as_str) {
         let types: Vec<String> = resolved
