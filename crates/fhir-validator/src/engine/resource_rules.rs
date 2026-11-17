@@ -135,6 +135,20 @@ pub(crate) fn resource_rule_errors(resource: &Value) -> Vec<ValidationError> {
         .unwrap_or_default()
         .to_string();
     identifier_values(resource, root.clone(), &mut errors);
+    // Coding.system is a URI naming the code system: a relative value
+    // (`ICUBeds`, `#local`) names nothing (TERMINOLOGY_TX_SYSTEM_RELATIVE).
+    for (path, coding) in crate::terminology::codings(resource, &root) {
+        if let Some(system) = coding.get("system").and_then(Value::as_str)
+            && !system.is_empty()
+            && !is_absolute(system)
+        {
+            err(
+                &mut errors,
+                format!("{path}.system"),
+                "Coding.system must be an absolute reference, not a local reference".to_string(),
+            );
+        }
+    }
     let mut found = Vec::new();
     resources(resource, root, false, &mut found);
     for (path, res, contained) in found {
@@ -622,6 +636,17 @@ mod tests {
             .into_iter()
             .map(|e| format!("{} {}", e.path, e.message))
             .collect()
+    }
+
+    #[test]
+    fn coding_systems_must_be_absolute() {
+        let errors = messages(json!({"resourceType": "Measure", "status": "draft",
+            "subjectCodeableConcept": {"coding": [{"system": "ICUBeds", "code": "x"}]},
+            "topic": [{"coding": [{"system": "http://loinc.org", "code": "8302-2"}, {"system": "urn:oid:1.2.3", "code": "y"}]}]}));
+        assert_eq!(
+            errors,
+            vec!["Measure.subjectCodeableConcept.coding.0.system Coding.system must be an absolute reference, not a local reference"]
+        );
     }
 
     #[test]

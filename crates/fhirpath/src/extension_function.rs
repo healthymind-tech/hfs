@@ -51,6 +51,30 @@ pub fn extension_function(
         return Ok(EvaluationResult::Empty);
     }
 
+    // A collection (`item.extension(url)` over several items,
+    // `descendants().extension(url)` as SDC's sdc-pop-2 writes it): the
+    // extensions of every element, in order. Before, a collection base
+    // always answered empty.
+    if let EvaluationResult::Collection { items, .. } = invocation_base {
+        let mut found = Vec::new();
+        for item in items {
+            match extension_function(item, args)? {
+                EvaluationResult::Empty => {}
+                EvaluationResult::Collection { items, .. } => found.extend(items),
+                one => found.push(one),
+            }
+        }
+        return Ok(match found.len() {
+            0 => EvaluationResult::Empty,
+            1 => found.pop().expect("one item"),
+            _ => EvaluationResult::Collection {
+                items: found,
+                has_undefined_order: false,
+                type_info: None,
+            },
+        });
+    }
+
     // A FHIR primitive (e.g. `Patient.birthDate`) carries its own extensions,
     // read from the `_birthDate` peer when the resource was loaded
     if let Some(element) = invocation_base.primitive_element() {
@@ -68,26 +92,18 @@ pub fn extension_function(
         type_info: _,
     } = invocation_base
     {
-        // Case 1: Check for direct extension array on this element
-        if let Some(EvaluationResult::Collection {
-            items: extensions, ..
-        }) = obj.get("extension")
-        {
-            // Destructure
-            let result = find_extension_by_url(extensions, extension_url)?;
-            if !matches!(result, EvaluationResult::Empty) {
-                return Ok(result);
-            }
-        }
-
-        // Case 2: Check for modifierExtension
-        if let Some(EvaluationResult::Collection {
-            items: mod_extensions,
-            ..
-        }) = obj.get("modifierExtension")
-        {
-            // Destructure
-            let result = find_extension_by_url(mod_extensions, extension_url)?;
+        // Case 1: direct extensions on this element; Case 2: modifier
+        // extensions. A single extension may be held as one object.
+        for key in ["extension", "modifierExtension"] {
+            let result = match obj.get(key) {
+                Some(EvaluationResult::Collection { items, .. }) => {
+                    find_extension_by_url(items, extension_url)?
+                }
+                Some(one @ EvaluationResult::Object { .. }) => {
+                    find_extension_by_url(std::slice::from_ref(one), extension_url)?
+                }
+                _ => EvaluationResult::Empty,
+            };
             if !matches!(result, EvaluationResult::Empty) {
                 return Ok(result);
             }
@@ -198,6 +214,50 @@ mod tests {
 
         // Verify the result matches the extension
         assert_eq!(result, extension);
+    }
+
+    /// `item.extension(url)` / `descendants().extension(url)`: a collection
+    /// base yields the matching extensions of every element (SDC sdc-pop-2
+    /// failed on a Questionnaire whose items carry the extension).
+    #[test]
+    fn test_extension_function_on_a_collection() {
+        let ext = |url: &str| {
+            let mut m = HashMap::new();
+            m.insert("url".to_string(), EvaluationResult::string(url.to_string()));
+            EvaluationResult::Object { map: m, type_info: None }
+        };
+        let element = |exts: Vec<EvaluationResult>| {
+            let mut m = HashMap::new();
+            m.insert(
+                "extension".to_string(),
+                EvaluationResult::Collection { items: exts, has_undefined_order: false, type_info: None },
+            );
+            EvaluationResult::Object { map: m, type_info: None }
+        };
+        let base = EvaluationResult::Collection {
+            items: vec![
+                element(vec![ext("http://x/a")]),
+                element(vec![ext("http://x/b")]),
+                element(vec![ext("http://x/a")]),
+            ],
+            has_undefined_order: false,
+            type_info: None,
+        };
+        let url = [EvaluationResult::string("http://x/a".to_string())];
+        match extension_function(&base, &url).unwrap() {
+            EvaluationResult::Collection { items, .. } => assert_eq!(items.len(), 2),
+            other => panic!("expected two extensions, got {other:?}"),
+        }
+        let one = EvaluationResult::Collection {
+            items: vec![element(vec![ext("http://x/b")])],
+            has_undefined_order: false,
+            type_info: None,
+        };
+        assert_eq!(
+            extension_function(&one, &[EvaluationResult::string("http://x/b".to_string())]).unwrap(),
+            ext("http://x/b")
+        );
+        assert_eq!(extension_function(&one, &url).unwrap(), EvaluationResult::Empty);
     }
 
     #[test]

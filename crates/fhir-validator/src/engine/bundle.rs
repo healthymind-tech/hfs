@@ -252,6 +252,21 @@ fn msg_cannot(reference: &str, location: &str, found: &str, source: &str) -> Str
     )
 }
 
+/// `(type, id)` of an http(s) URL ending in `/{Type}/{id}` (history and
+/// query stripped).
+fn restful_type_id(full_url: &str) -> Option<(&str, &str)> {
+    if !(full_url.starts_with("http://") || full_url.starts_with("https://")) {
+        return None;
+    }
+    let url = strip_history(full_url.split(['?', '#']).next().unwrap_or(full_url));
+    let mut tail = url.rsplit('/');
+    let (id, ty) = (tail.next()?, tail.next()?);
+    (ty.starts_with(|c: char| c.is_ascii_uppercase())
+        && ty.chars().all(|c| c.is_ascii_alphabetic())
+        && !id.is_empty())
+    .then_some((ty, id))
+}
+
 /// Every `Reference.reference` inside `value` (not descending into nested
 /// resources' own Bundles), with its dotted path below `prefix`.
 fn collect_references<'v>(value: &'v Value, path: &mut String, out: &mut Vec<(String, &'v str)>) {
@@ -405,10 +420,29 @@ pub(super) fn bundle_rules_with(
 
     // fullUrl vs type/id: an http(s) fullUrl ending in `/{Type}/{id}`
     // is a RESTful URL and must name the entry's own type and id.
+    // Documents and messages identify their entries by fullUrl.
+    let identified = matches!(
+        bundle.get("type").and_then(Value::as_str),
+        Some("document" | "message")
+    );
     for (index, entry) in &indexed {
-        let (Some(full_url), Some(ty), Some(id)) =
-            (entry.full_url, entry.resource_type(), entry.id())
-        else {
+        let (Some(full_url), Some(ty)) = (entry.full_url, entry.resource_type()) else {
+            continue;
+        };
+        let Some(id) = entry.id() else {
+            // A RESTful fullUrl names an id the resource lacks
+            // (BUNDLE_BUNDLE_ENTRY_NOID), in a document or message (the HL7
+            // validator does not report it in search results; transactions
+            // create resources whose id the server assigns).
+            if identified
+                && restful_type_id(full_url).is_some_and(|(t, _)| t == ty && is_resource_type(t))
+            {
+                out.push(error(
+                    ErrorKind::BundleEntryMismatch,
+                    format!("Bundle.entry.{index}"),
+                    format!("The fullUrl '{full_url}' looks like a RESTful server URL, but the resource has no id"),
+                ));
+            }
             continue;
         };
         if !(full_url.starts_with("http://") || full_url.starts_with("https://")) {
