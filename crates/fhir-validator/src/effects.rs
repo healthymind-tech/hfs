@@ -1354,12 +1354,19 @@ pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<Code
             // Quantity binds via its system+code pair — treated as a Coding.
             value.is_object().then(|| CodedValue::Coding(value.clone()))
         }
+        // Another declared type (Expression, Reference, …) is no coded value:
+        // a binding on a choice (`value[x]` of SDC 3.0.0's
+        // itemExtractionContext: code | Expression, bound to resource-types)
+        // applies to its coded branch only.
+        Some(other) if other.starts_with(|c: char| c.is_ascii_uppercase()) => None,
         _ => match value {
             Value::String(s) => Some(CodedValue::Code(s.clone())),
             Value::Object(o) if o.contains_key("coding") || o.contains_key("text") => {
                 Some(CodedValue::CodeableConcept(value.clone()))
             }
-            Value::Object(_) => Some(CodedValue::Coding(value.clone())),
+            Value::Object(o) if o.contains_key("code") || o.contains_key("system") => {
+                Some(CodedValue::Coding(value.clone()))
+            }
             _ => None,
         },
     }
@@ -1400,6 +1407,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// A binding on a choice applies to its coded branches only: SDC 3.0.0's
+    /// itemExtractionContext (`value[x]`: code | Expression, bound to
+    /// resource-types) judged the Expression as a Coding.
+    #[test]
+    fn only_coded_shapes_are_coded_values() {
+        let expression = serde_json::json!({"language": "application/x-fhir-query", "expression": "Patient?_id=1"});
+        assert!(coded_value(&expression, Some("Expression")).is_none());
+        assert!(coded_value(&expression, None).is_none());
+        let coding = serde_json::json!({"system": "http://x", "code": "a"});
+        assert!(matches!(coded_value(&coding, None), Some(CodedValue::Coding(_))));
+        assert!(matches!(coded_value(&serde_json::json!("Patient"), Some("code")), Some(CodedValue::Code(_))));
+        assert!(matches!(
+            coded_value(&serde_json::json!({"text": "t"}), None),
+            Some(CodedValue::CodeableConcept(_))
+        ));
+    }
 
     #[test]
     fn an_ig_rebinding_supersedes_the_core_extensible_binding() {
