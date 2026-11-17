@@ -452,12 +452,14 @@ impl ValidationService {
         match self.mode {
             ValidationMode::Off => Ok(()),
             ValidationMode::Log => {
-                for issue in &issues {
+                for issue in issues.iter().filter(|i| i.severity != Severity::Information) {
+                    let severity = if issue.severity == Severity::Error { "error" } else { "warning" };
                     warn!(
                         tenant = %tenant,
                         resource_type = %resource_type,
                         path = %issue.path,
                         kind = ?issue.kind,
+                        severity = severity,
                         "validation (log mode): {}",
                         issue.message
                     );
@@ -477,7 +479,7 @@ impl ValidationService {
                     })
                 } else {
                     // Warnings only: proceed, but leave a trace.
-                    for issue in &issues {
+                    for issue in issues.iter().filter(|i| i.severity != Severity::Information) {
                         warn!(
                             tenant = %tenant,
                             resource_type = %resource_type,
@@ -2467,6 +2469,7 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
     let severity = match error.severity {
         Severity::Error => IssueSeverity::Error,
         Severity::Warning => IssueSeverity::Warning,
+        Severity::Information => IssueSeverity::Information,
     };
     // The profile behind the rule, as the HL7 validator names it.
     let text = error.hl7_message.as_deref().unwrap_or(&error.message);

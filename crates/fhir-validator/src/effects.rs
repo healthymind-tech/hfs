@@ -1075,7 +1075,14 @@ async fn execute_terminology(
                         ));
                     } else {
                         // Elsewhere the code just cannot be checked
-                        // (UNKNOWN_CODESYSTEM, a warning).
+                        // (UNKNOWN_CODESYSTEM): a warning, whatever the
+                        // binding strength — the HL7 validator warns the
+                        // same on required, extensible, preferred, example
+                        // and unbound Codings. On meta.tag / meta.security
+                        // (local tag systems are normal there) it is
+                        // information.
+                        let on_meta_label = path.contains(".meta.tag.")
+                            || path.contains(".meta.security.");
                         errors.push(
                             ValidationError::new(
                                 ErrorKind::UnknownCodeSystem,
@@ -1085,7 +1092,11 @@ async fn execute_terminology(
                                     coding.get("version").and_then(Value::as_str),
                                 ),
                             )
-                            .with_severity(Severity::Warning),
+                            .with_severity(if on_meta_label {
+                                Severity::Information
+                            } else {
+                                Severity::Warning
+                            }),
                         );
                     }
                 }

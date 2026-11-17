@@ -108,6 +108,10 @@ pub enum Severity {
     #[default]
     Error,
     Warning,
+    /// Informational note: no finding (an unknown code system on
+    /// `meta.tag`/`meta.security`, which the HL7 validator reports as
+    /// information). Never logged as a log-mode finding.
+    Information,
 }
 
 /// One validation issue, shaped for the conformance contract.
