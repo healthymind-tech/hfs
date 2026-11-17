@@ -489,6 +489,14 @@ pub(crate) fn msg_constraints_not_evaluable(detail: &str) -> String {
     format!("FHIRPath constraints could not be evaluated: {detail}")
 }
 
+/// [helios] the base profile of a constraint profile is not installed; the
+/// profile's own snapshot is used.
+pub(crate) fn msg_unknown_base_profile(base: &str, profile: &str) -> String {
+    format!(
+        "The base profile '{base}' of '{profile}' could not be found; the resource was validated against the snapshot of '{profile}' only"
+    )
+}
+
 /// [helios] a schema reference could not be resolved (reference validator
 /// throws `could not resolve ["…"]`; we report and continue).
 pub(crate) fn msg_unknown_schema(reference: &str) -> String {

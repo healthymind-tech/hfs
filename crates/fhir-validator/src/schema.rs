@@ -428,12 +428,47 @@ pub fn pin_binding_versions(
         return None;
     }
     let mut out = schema.clone();
-    walk(&mut out, pins).then_some(out)
+    let mut changed = walk(&mut out, pins);
+    // The base definition, when the package context names its version (a
+    // profile of an IG built on an older release of another installed IG).
+    if let Some(base) = out.base.as_mut()
+        && !base.contains('|')
+        && base.contains("://")
+        && let Some(v) = pins.get(base.as_str())
+    {
+        *base = format!("{base}|{v}");
+        changed = true;
+    }
+    changed.then_some(out)
 }
 
 #[cfg(test)]
 mod pin_tests {
     use super::*;
+
+    #[test]
+    fn an_unversioned_base_is_pinned_to_its_package_context() {
+        let schema = FhirSchema {
+            url: Some("https://emr/Encounter".into()),
+            base: Some("https://twcore/StructureDefinition/Encounter-twcore".into()),
+            ..Default::default()
+        };
+        let pins: std::collections::HashMap<String, String> = [(
+            "https://twcore/StructureDefinition/Encounter-twcore".to_string(),
+            "0.3.2".to_string(),
+        )]
+        .into();
+        let pinned = pin_binding_versions(&schema, &pins).expect("changed");
+        assert_eq!(
+            pinned.base.as_deref(),
+            Some("https://twcore/StructureDefinition/Encounter-twcore|0.3.2")
+        );
+        let versioned = FhirSchema {
+            base: Some("https://twcore/StructureDefinition/Encounter-twcore|1.0.0".into()),
+            ..schema
+        };
+        assert!(pin_binding_versions(&versioned, &pins).is_none());
+    }
 
     #[test]
     fn unversioned_bindings_are_pinned_everywhere_and_versioned_ones_kept() {

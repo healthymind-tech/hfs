@@ -648,6 +648,21 @@ pub(super) fn add_schemas_to_set(
     {
         match ctx.resolver.resolve(&base) {
             Some(base_schema) => add_schemas_to_set(ctx, set, base_schema, &base),
+            // A profile whose base profile is not installed (mCODE 3.0.0 on
+            // US Core 5.0.1's `us-core-observation-clinical-test` when only
+            // US Core 7 is there) still carries its own snapshot, which
+            // states every inherited constraint: validate against that and
+            // say what is missing, instead of failing the resource.
+            None if schema.derivation.as_deref() == Some("constraint")
+                && base.contains("://")
+                && !base.starts_with("http://hl7.org/fhir/StructureDefinition/") =>
+            {
+                ctx.error_with_severity(
+                    ErrorKind::UnknownSchema,
+                    errors::msg_unknown_base_profile(&base, &schema.url.clone().unwrap_or_default()),
+                    Severity::Warning,
+                )
+            }
             None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&base)),
         }
     }
@@ -1802,6 +1817,7 @@ fn sub_extension_urls(definition: &FhirSchema) -> HashSet<&str> {
         .iter()
         .flatten()
         .filter_map(|(_, e)| e.url.as_deref())
+        .map(|u| u.split('|').next().unwrap_or(u))
         .collect();
     let slices = definition
         .elements
@@ -2490,6 +2506,21 @@ fn compile_extensions(
         let Some(extensions) = &layer.extensions else {
             continue;
         };
+        // Several slices of one extension url (DaVinci CRD's
+        // EncounterCategory / ServiceCategory, both `ext-request-category`)
+        // are told apart by a second `value` discriminator, decided by the
+        // required binding each slice puts on `value[x]`.
+        let bare_url = |e: &FhirSchema| {
+            e.url
+                .as_deref()
+                .map(|u| u.split('|').next().unwrap_or(u).to_string())
+        };
+        let mut url_count: HashMap<String, usize> = HashMap::new();
+        for entry in extensions.values() {
+            if let Some(u) = bare_url(entry) {
+                *url_count.entry(u).or_default() += 1;
+            }
+        }
         for (ext_name, entry) in extensions {
             let Some(url) = entry.url.clone() else {
                 continue;
@@ -2499,14 +2530,31 @@ fn compile_extensions(
                 ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&url));
             }
             let merged = merge_extension_schema(entry, resolved.as_deref());
+            // A versioned type profile (`…/extension-x|2.2.1`, as DaVinci PAS
+            // declares its extension slices) names the definition; the
+            // instance's `Extension.url` carries the bare canonical.
+            let bare = url.split('|').next().unwrap_or(&url).to_string();
+            let value_binding = (url_count.get(&bare).copied().unwrap_or(0) > 1)
+                .then(|| required_value_binding(entry))
+                .flatten();
+            let match_ = match value_binding {
+                Some(value_set) => Match {
+                    type_: Some("binding".to_string()),
+                    value: Some(serde_json::json!({
+                        "path": "value", "valueSet": value_set, "pattern": { "url": bare },
+                    })),
+                    resolve_ref: None,
+                },
+                None => Match {
+                    type_: Some("pattern".to_string()),
+                    value: Some(serde_json::json!({ "url": bare })),
+                    resolve_ref: None,
+                },
+            };
             slices.insert(
                 ext_name.clone(),
                 Slice {
-                    match_: Some(Match {
-                        type_: Some("pattern".to_string()),
-                        value: Some(serde_json::json!({ "url": url })),
-                        resolve_ref: None,
-                    }),
+                    match_: Some(match_),
                     min: entry.min,
                     max: entry.max,
                     order: None,
@@ -2529,6 +2577,25 @@ fn compile_extensions(
         };
         add_schemas_to_set(ctx, elset, Arc::new(synthetic), "extension");
     }
+}
+
+/// The value set of a required binding an extension slice puts on its
+/// `value[x]` (on the choice declarer or one typed branch).
+fn required_value_binding(entry: &FhirSchema) -> Option<String> {
+    let elements = entry.elements.as_ref()?;
+    elements
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() == "value"
+                || k.strip_prefix("value")
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+        })
+        .find_map(|(_, el)| {
+            el.binding
+                .as_ref()
+                .filter(|b| b.strength.as_deref() == Some("required"))
+                .map(|b| b.value_set.clone())
+        })
 }
 
 /// Shallow overlay merge for extension slice schemas, mirroring the

@@ -643,3 +643,216 @@ fn real_examples_sweep() {
     }
     std::fs::write(out, serde_json::to_vec_pretty(&Value::Object(report)).unwrap()).unwrap();
 }
+
+const SCOPE_EXT: &str = "http://example.org/StructureDefinition/scope";
+const SCOPED_PATIENT: &str = "http://example.org/StructureDefinition/scoped-patient";
+
+/// DaVinci PAS 2.2.1 declares its extension slices with a versioned type
+/// profile (`extension-careTeamClaimScope|2.2.1`); the instance's
+/// `Extension.url` is the bare canonical. The slice must still match it
+/// (it was reported as "a matching slice is required, but not found").
+#[test]
+fn extension_slices_with_a_versioned_type_profile_match_the_bare_url() {
+    let ext = json!({
+        "resourceType": "StructureDefinition", "url": SCOPE_EXT, "version": "2.2.1", "name": "Scope",
+        "status": "active", "kind": "complex-type", "abstract": false, "type": "Extension",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension", "derivation": "constraint",
+        "context": [{"type": "element", "expression": "Patient"}],
+        "snapshot": {"element": [
+            ed("Extension", json!({"min": 0, "max": "*"})),
+            ed("Extension.extension", json!({"min": 0, "max": "0"})),
+            ed("Extension.url", json!({"min": 1, "max": "1", "fixedUri": SCOPE_EXT})),
+            ed("Extension.value[x]", json!({"min": 1, "max": "1", "type": [{"code": "boolean"}]})),
+        ]}
+    });
+    let profile = sd(
+        SCOPED_PATIENT,
+        "Patient",
+        vec![
+            ed("Patient", json!({"min": 0, "max": "*"})),
+            ed(
+                "Patient.extension",
+                json!({"min": 1, "max": "*", "type": [{"code": "Extension"}],
+                       "slicing": {"discriminator": [{"type": "value", "path": "url"}], "rules": "open"}}),
+            ),
+            ed(
+                "Patient.extension:scope",
+                json!({"sliceName": "scope", "min": 1, "max": "1",
+                       "type": [{"code": "Extension", "profile": [format!("{SCOPE_EXT}|2.2.1")]}]}),
+            ),
+        ],
+    );
+    let r = resolver(&[ext, profile]);
+    let with = json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueBoolean": true}]});
+    let errors = validate(&r, &with, &[SCOPED_PATIENT]);
+    let mut slicing = errors_of(&errors, ErrorKind::SliceCardinality);
+    slicing.extend(errors_of(&errors, ErrorKind::SliceUnmatched));
+    assert!(slicing.is_empty(), "{errors:#?}");
+    // The slice still applies its definition: a string value is no boolean.
+    let wrong = json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueString": "x"}]});
+    assert!(
+        validate(&r, &wrong, &[SCOPED_PATIENT]).iter().any(|e| e.severity == Severity::Error),
+        "the matched slice's value type must be checked"
+    );
+    let without = json!({"resourceType": "Patient", "extension": [{"url": "http://example.org/other", "valueBoolean": true}]});
+    assert_eq!(
+        errors_of(&validate(&r, &without, &[SCOPED_PATIENT]), ErrorKind::SliceCardinality).len(),
+        1
+    );
+}
+
+const CATEGORY_EXT: &str = "http://example.org/StructureDefinition/request-category";
+const CATEGORIZED: &str = "http://example.org/StructureDefinition/categorized-request";
+
+/// DaVinci CRD 2.2.1 `profile-devicerequest`: `extension` sliced by `url`
+/// *and* `value`, two slices of one extension told apart only by the
+/// required binding on `value[x]` (EncounterCategory → v3-ActEncounterCode,
+/// ServiceCategory → X12 service types). The HL7 validator decides the
+/// `value` discriminator by value-set membership; the url alone made every
+/// item match both slices ("Element matches more than one slice", "max
+/// allowed = 1, but found 2").
+#[tokio::test]
+async fn url_and_bound_value_discriminators_split_by_value_set_membership() {
+    use async_trait::async_trait;
+    use helios_fhir_validator::{
+        CodedValue, EffectHandlers, TerminologyError, TerminologyProvider, TxCheck, TxVerdict,
+    };
+    /// `HH` is in `/encounter`, `18` in `/service`.
+    struct Members;
+    #[async_trait]
+    impl TerminologyProvider for Members {
+        async fn validate_code(&self, _: &str, _: &CodedValue) -> Result<bool, TerminologyError> {
+            unreachable!("asked through check()")
+        }
+        async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+            checks
+                .iter()
+                .map(|c| match c {
+                    TxCheck::InValueSet(vs, CodedValue::CodeableConcept(cc)) => {
+                        let code = cc["coding"][0]["code"].as_str().unwrap_or_default();
+                        Ok(TxVerdict::member(
+                            (vs.ends_with("/encounter") && code == "HH")
+                                || (vs.ends_with("/service") && code == "18"),
+                        ))
+                    }
+                    _ => Ok(TxVerdict::valid()),
+                })
+                .collect()
+        }
+    }
+    let ext = json!({
+        "resourceType": "StructureDefinition", "url": CATEGORY_EXT, "name": "RequestCategory",
+        "status": "active", "kind": "complex-type", "abstract": false, "type": "Extension",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Extension", "derivation": "constraint",
+        "context": [{"type": "element", "expression": "DeviceRequest"}],
+        "snapshot": {"element": [
+            ed("Extension", json!({"min": 0, "max": "*"})),
+            ed("Extension.extension", json!({"min": 0, "max": "0"})),
+            ed("Extension.url", json!({"min": 1, "max": "1", "fixedUri": CATEGORY_EXT})),
+            ed("Extension.value[x]", json!({"min": 1, "max": "1", "type": [{"code": "CodeableConcept"}]})),
+        ]}
+    });
+    let slice = |name: &str, vs: &str| {
+        vec![
+            ed(
+                &format!("DeviceRequest.extension:{name}"),
+                json!({"sliceName": name, "min": 0, "max": "1",
+                       "type": [{"code": "Extension", "profile": [CATEGORY_EXT]}]}),
+            ),
+            ed(&format!("DeviceRequest.extension:{name}.url"), json!({"min": 1, "max": "1"})),
+            ed(
+                &format!("DeviceRequest.extension:{name}.value[x]"),
+                json!({"min": 0, "max": "1", "type": [{"code": "CodeableConcept"}],
+                       "binding": {"strength": "required", "valueSet": vs}}),
+            ),
+        ]
+    };
+    let mut elements = vec![
+        ed("DeviceRequest", json!({"min": 0, "max": "*"})),
+        ed(
+            "DeviceRequest.extension",
+            json!({"min": 0, "max": "*", "type": [{"code": "Extension"}],
+                   "slicing": {"discriminator": [{"type": "value", "path": "url"}, {"type": "value", "path": "value"}],
+                               "rules": "open"}}),
+        ),
+    ];
+    elements.extend(slice("EncounterCategory", "http://example.org/ValueSet/encounter"));
+    elements.extend(slice("ServiceCategory", "http://example.org/ValueSet/service"));
+    let r = resolver(&[ext, sd(CATEGORIZED, "DeviceRequest", elements)]);
+    let category = |system: &str, code: &str| {
+        json!({"url": CATEGORY_EXT, "valueCodeableConcept": {"coding": [{"system": system, "code": code}]}})
+    };
+    let request = |exts: Vec<Value>| {
+        json!({"resourceType": "DeviceRequest", "status": "active", "intent": "order",
+               "codeCodeableConcept": {"text": "oxygen"}, "subject": {"reference": "Patient/p"},
+               "extension": exts})
+    };
+    let opts = ValidationOptions {
+        profiles: vec![CATEGORIZED.to_string()],
+        check_extension_context: true,
+        ..Default::default()
+    };
+    let run = |resource: Value| {
+        let r = Arc::clone(&r);
+        let opts = opts.clone();
+        async move {
+            let handlers = EffectHandlers {
+                terminology: Some(&Members),
+                ..Default::default()
+            };
+            Validator::new(r)
+                .validate(&resource, FhirVersion::R4, &opts, &handlers)
+                .await
+        }
+    };
+    let slicing = |errors: &[ValidationError]| {
+        let mut out = errors_of(errors, ErrorKind::SliceUnmatched);
+        out.extend(errors_of(errors, ErrorKind::SliceCardinality));
+        out
+    };
+    let one_each = run(request(vec![
+        category("http://terminology.hl7.org/CodeSystem/v3-ActCode", "HH"),
+        category("https://codesystem.x12.org/005010/1365", "18"),
+    ]))
+    .await;
+    assert!(slicing(&one_each).is_empty(), "{one_each:#?}");
+    let two_encounter = run(request(vec![
+        category("http://terminology.hl7.org/CodeSystem/v3-ActCode", "HH"),
+        category("http://terminology.hl7.org/CodeSystem/v3-ActCode", "HH"),
+    ]))
+    .await;
+    assert_eq!(slicing(&two_encounter).len(), 1, "{two_encounter:#?}");
+}
+
+/// mCODE 3.0.0's ECOG profile builds on US Core 5.0.1's
+/// `us-core-observation-clinical-test`, which is not installed when only US
+/// Core 7 is. The profile's snapshot still states every inherited
+/// constraint, so the HL7 validator validates against it; a missing base is
+/// a warning, not an error that rejects the resource.
+#[test]
+fn a_profile_whose_base_is_not_installed_is_validated_by_its_snapshot() {
+    let mut profile = sd(
+        "http://example.org/StructureDefinition/child",
+        "Patient",
+        vec![
+            ed("Patient", json!({"min": 0, "max": "*"})),
+            ed("Patient.gender", json!({"min": 1, "max": "1", "type": [{"code": "code"}]})),
+        ],
+    );
+    profile["baseDefinition"] = json!("http://example.org/StructureDefinition/absent-parent");
+    let r = resolver(&[profile]);
+    let ok = json!({"resourceType": "Patient", "gender": "male"});
+    let errors = validate(&r, &ok, &["http://example.org/StructureDefinition/child"]);
+    assert!(
+        errors.iter().all(|e| e.severity != Severity::Error),
+        "{errors:#?}"
+    );
+    assert!(errors.iter().any(|e| e.kind == ErrorKind::UnknownSchema && e.severity == Severity::Warning));
+    // The snapshot's own constraints still apply.
+    let missing = json!({"resourceType": "Patient"});
+    assert!(
+        validate(&r, &missing, &["http://example.org/StructureDefinition/child"])
+            .iter()
+            .any(|e| e.severity == Severity::Error && e.path.contains("gender")),
+    );
+}

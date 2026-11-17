@@ -14,7 +14,9 @@
 //! the value sets it wrote itself, then those of its resolved dependencies
 //! (breadth first, nearest wins). Every StructureDefinition the package wrote
 //! is keyed by `url|version`. A value set no package in the context carries
-//! is not pinned (the binding stays unversioned, as before).
+//! is not pinned (the binding stays unversioned, as before). The same pins
+//! carry the versions of the StructureDefinitions in the context, which fix
+//! the version of a profile's (unversioned) base definition.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use helios_persistence::core::{PackageRecord, PackageStore, TARGET_HFS};
 use serde_json::Value;
 
-/// Value set url → version.
+/// Value set (or StructureDefinition) url → version.
 pub type Pins = HashMap<String, String>;
 
 /// `StructureDefinition url|version` (or `url` when it has no version) →
@@ -57,6 +59,13 @@ pub async fn compute(store: &dyn PackageStore, tenant: &str) -> Result<ProfilePi
                 }
             }
             "StructureDefinition" if r.target == TARGET_HFS => {
+                // A profile's base is pinned like a binding: EMR 0.2.0
+                // builds on TW Core 0.3.2 while TW Core 1.0.0 is installed
+                // next to it, and the HL7 validator layers the 0.3.2
+                // definition (its snapshot was generated from it).
+                if let Some(v) = &r.version {
+                    value_sets.entry(key.clone()).or_default().push((url.clone(), v.clone()));
+                }
                 profiles.entry(key).or_default().push((url, r.version));
             }
             _ => {}
@@ -71,18 +80,36 @@ pub fn assemble(
     value_sets: &HashMap<String, Vec<(String, String)>>,
     profiles: &HashMap<String, Vec<(String, Option<String>)>>,
 ) -> ProfilePins {
+    let installed: HashSet<String> = packages
+        .iter()
+        .map(|p| format!("{}#{}", p.name, p.version))
+        .collect();
     let deps: HashMap<String, Vec<String>> = packages
         .iter()
         .map(|p| {
+            let declared = p.document.get("dependencies").and_then(Value::as_object);
             let resolved = p
                 .document
                 .get("resolved")
                 .and_then(Value::as_object)
                 .map(|m| {
-                    m.values()
-                        .filter_map(Value::as_str)
-                        .filter(|v| v.contains('#'))
-                        .map(str::to_string)
+                    m.iter()
+                        .filter_map(|(name, v)| {
+                            // The version the package declares, when it is
+                            // installed, is the one the IG was built on —
+                            // even if the install resolved the dependency
+                            // elsewhere (older installers satisfied DTR's
+                            // SDC 3.0.0 with 4.0.0) or not at all (mCODE's
+                            // genomics-reporting 2.0.0, installed later).
+                            if let Some(want) = declared.and_then(|d| d.get(name)).and_then(Value::as_str) {
+                                let key = format!("{name}#{want}");
+                                if installed.contains(&key) {
+                                    return Some(key);
+                                }
+                            }
+                            let v = v.as_str()?;
+                            v.contains('#').then(|| v.to_string())
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -172,5 +199,39 @@ mod tests {
         let tw = &pins["https://twcore/Patient|1.0.0"];
         assert_eq!(tw.get(smoking).map(String::as_str), Some("1.1.0"), "via the dependency");
         assert_eq!(tw.get("https://twcore/ValueSet/a").map(String::as_str), Some("1.0.0"));
+    }
+
+    #[test]
+    fn profiles_pin_their_base_definitions_also_through_a_declared_dependency() {
+        let mut mcode = package(
+            "hl7.fhir.us.mcode",
+            "3.0.0",
+            json!({"hl7.fhir.uv.genomics-reporting": "missing", "hl7.fhir.r4.core": "embedded"}),
+        );
+        mcode.document["dependencies"] = json!({"hl7.fhir.uv.genomics-reporting": "2.0.0"});
+        let packages = vec![
+            mcode,
+            package("hl7.fhir.uv.genomics-reporting", "2.0.0", json!({})),
+            package("hl7.fhir.uv.genomics-reporting", "3.0.0", json!({})),
+        ];
+        let variant = "http://hl7.org/fhir/uv/genomics-reporting/StructureDefinition/variant";
+        let mut canonicals = HashMap::new();
+        for v in ["2.0.0", "3.0.0"] {
+            canonicals.insert(
+                format!("hl7.fhir.uv.genomics-reporting#{v}"),
+                vec![(variant.to_string(), v.to_string())],
+            );
+        }
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "hl7.fhir.us.mcode#3.0.0".to_string(),
+            vec![("http://mcode/genomic-variant".to_string(), Some("3.0.0".to_string()))],
+        );
+        let pins = assemble(&packages, &canonicals, &profiles);
+        assert_eq!(
+            pins["http://mcode/genomic-variant|3.0.0"].get(variant).map(String::as_str),
+            Some("2.0.0"),
+            "the declared 2.0.0 is installed, so mCODE means it"
+        );
     }
 }

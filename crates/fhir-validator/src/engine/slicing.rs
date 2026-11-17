@@ -51,6 +51,17 @@ const DEFAULT_SLICE: &str = "@default";
 /// `value`/`pattern` discriminator answered by a required binding).
 const BINDING_MATCH: &str = "binding";
 
+/// The precondition of a binding-matched slice compiled from several
+/// discriminators: the constants of the others (`{"url": ...}`), which an
+/// item must partially match before its value-set membership counts.
+fn binding_pattern(slice: &Slice) -> Option<&Value> {
+    let m = slice.match_.as_ref()?;
+    if m.type_.as_deref() != Some(BINDING_MATCH) {
+        return None;
+    }
+    m.value.as_ref()?.get("pattern")
+}
+
 /// `(path, valueSet)` of a binding-matched slice.
 fn binding_of(slice: &Slice) -> Option<(&str, &str)> {
     let m = slice.match_.as_ref()?;
@@ -291,6 +302,14 @@ pub(super) fn validate_slices<'a>(
                     let values = binding_slices
                         .iter()
                         .map(|b| {
+                            let precondition = mark
+                                .slicing
+                                .slices
+                                .get(&b.name)
+                                .and_then(binding_pattern);
+                            if precondition.is_some_and(|p| !is_partial_match(item, p)) {
+                                return Value::Null;
+                            }
                             values_at(item, &b.path)
                                 .first()
                                 .map_or(Value::Null, |v| (*v).clone())
@@ -617,14 +636,16 @@ fn parents_at<'v>(item: &'v Value, path: &str) -> (Vec<&'v Value>, Option<String
     (current, Some(last))
 }
 
-/// The values at `path` (arrays flattened; `$this` is the item).
+/// The values at `path` (arrays flattened; `$this` is the item). A last
+/// step naming a choice element (`value`) reads its typed key
+/// (`valueCodeableConcept`).
 fn values_at<'v>(item: &'v Value, path: &str) -> Vec<&'v Value> {
     let (parents, last) = parents_at(item, path);
     match last {
         None => parents,
         Some(last) => parents
             .iter()
-            .filter_map(|p| p.get(&last))
+            .filter_map(|p| p.get(&last).or_else(|| choice_value(p, &last)))
             .flat_map(|v| match v {
                 Value::Array(items) => items.iter().collect::<Vec<_>>(),
                 other => vec![other],
@@ -667,6 +688,17 @@ fn type_matches(item: &Value, path: &str, codes: &[&str]) -> bool {
             .iter()
             .any(|code| obj.contains_key(&choice_key(&last, code)))
     })
+}
+
+/// The value of choice element `base` in `obj` under its typed key
+/// (`value` → `valueCodeableConcept`), when exactly one such key exists.
+fn choice_value<'v>(obj: &'v Value, base: &str) -> Option<&'v Value> {
+    let mut found = obj.as_object()?.iter().filter(|(k, _)| {
+        k.strip_prefix(base)
+            .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    });
+    let (_, value) = found.next()?;
+    found.next().is_none().then_some(value)
 }
 
 fn choice_key(base: &str, code: &str) -> String {
