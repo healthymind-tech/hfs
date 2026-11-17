@@ -210,6 +210,39 @@ async fn one_terminology_call_per_resource() {
     );
 }
 
+/// An unknown (non-HL7) code system is a warning wherever the Coding sits,
+/// whatever the binding strength (required, extensible, preferred, example,
+/// none), as the HL7 validator reports it, and only information on
+/// `meta.tag` / `meta.security`: local tag systems such as
+/// `https://hfs.gugulu.tw/tags` were logged as findings in production log
+/// mode. Never an error.
+#[tokio::test]
+async fn unknown_code_systems_warn_and_tags_are_information() {
+    let mut tx = Scripted::new();
+    tx.unknown_systems = &["https://local.example/tags", "https://local.example/cs"];
+    let handlers = EffectHandlers {
+        terminology: Some(&tx),
+        ..Default::default()
+    };
+    let coding = |system: &str| json!({"coding": [{"system": system, "code": "x"}]});
+    let obs = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"tag": [{"system": "https://local.example/tags", "code": "t"}],
+                 "security": [{"system": "https://local.example/tags", "code": "s"}]},
+        "category": [coding("https://local.example/cs")],          // preferred
+        "code": coding("https://local.example/cs"),                // example
+        "interpretation": [coding("https://local.example/cs")],    // extensible
+        "method": coding("https://local.example/cs"),              // example
+        "subject": {"reference": "Patient/p"}});
+    let issues = run(&obs, &handlers).await;
+    let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
+    assert_eq!(unknown.len(), 6, "{issues:#?}");
+    for u in &unknown {
+        let expected = if u.path.contains(".meta.") { Severity::Information } else { Severity::Warning };
+        assert_eq!(u.severity, expected, "{u:?}");
+    }
+    assert!(issues.iter().all(|e| e.severity != Severity::Error), "{issues:#?}");
+}
+
 /// An unresolvable code system in the HL7 namespaces is an error on
 /// `Coding.system` (HL7 validator Type_Specific_Checks_DT_URL_Resolve); a
 /// `system|version` there never resolves; elsewhere an unknown system is a
