@@ -572,6 +572,11 @@ impl ValidationService {
     /// profiles under them (after a package install or uninstall; at start
     /// the pins are set before the profiles are registered).
     pub fn set_binding_pins(&self, tenant: &str, pins: crate::packages::pins::ProfilePins) {
+        // Called after every package install and uninstall: the terminology
+        // server's content changed with it.
+        if let Some(terminology) = &self.terminology {
+            terminology.invalidate();
+        }
         let changed = {
             let mut all = self.binding_pins.write().expect("binding pins lock");
             let new = Arc::new(pins);
@@ -2313,6 +2318,18 @@ impl RemoteTerminologyProvider {
 
 #[async_trait]
 impl TerminologyProvider for RemoteTerminologyProvider {
+    /// Drop every cached answer (verdicts, unknown value sets, code-system
+    /// content, composes): after a package install an "unknown code system"
+    /// answered minutes ago may be wrong now (mCODE's
+    /// us-core-observation-category arrives with US Core 5.0.1).
+    fn invalidate(&self) {
+        self.cache.clear();
+        self.unknown_value_sets.clear();
+        self.contentless_systems.clear();
+        self.value_set_composes.clear();
+        self.unverifiable.clear();
+    }
+
     async fn validate_code(
         &self,
         value_set: &str,

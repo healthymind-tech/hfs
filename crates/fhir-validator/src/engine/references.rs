@@ -129,7 +129,9 @@ pub(super) fn check_reference<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: 
                 {
                     continue; // another core type
                 }
-                match ctx.resolver().resolve(bare) {
+                // The versioned canonical (a target profile pinned to its
+                // package's release) resolves to that release when installed.
+                match ctx.resolver().resolve(url) {
                     Some(schema) if schema.type_.as_deref() == Some(target_type) => {
                         candidates.push(url.clone());
                     }

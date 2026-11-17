@@ -396,20 +396,47 @@ pub fn pin_binding_versions(
             b.value_set = format!("{}|{v}", b.value_set);
             changed = true;
         }
-        let mut each = |map: &mut IndexMap<String, Arc<FhirSchema>>| {
+        // Reference target profiles and type profiles mean the release of
+        // the package context too (TW IDIR 0.1.1 targets TW Core 0.1.1's
+        // Patient-twcore while TW Core 1.0.0 is installed).
+        let pin_list = |list: &mut Option<Vec<String>>| -> bool {
+            let mut any = false;
+            for url in list.iter_mut().flatten() {
+                if !url.contains('|')
+                    && let Some(v) = pins.get(url.as_str())
+                {
+                    *url = format!("{url}|{v}");
+                    any = true;
+                }
+            }
+            any
+        };
+        changed |= pin_list(&mut s.refers);
+        changed |= pin_list(&mut s.type_profiles);
+        let mut each = |map: &mut IndexMap<String, Arc<FhirSchema>>, extension_entries: bool| {
             for child in map.values_mut() {
                 let mut c = (**child).clone();
-                if walk(&mut c, pins) {
+                let mut child_changed = walk(&mut c, pins);
+                // An extension entry's `url` names the extension definition.
+                if extension_entries
+                    && let Some(url) = c.url.as_mut()
+                    && !url.contains('|')
+                    && let Some(v) = pins.get(url.as_str())
+                {
+                    *url = format!("{url}|{v}");
+                    child_changed = true;
+                }
+                if child_changed {
                     *child = Arc::new(c);
                     changed = true;
                 }
             }
         };
         if let Some(m) = s.elements.as_mut() {
-            each(m);
+            each(m, false);
         }
         if let Some(m) = s.extensions.as_mut() {
-            each(m);
+            each(m, true);
         }
         if let Some(slicing) = s.slicing.as_mut() {
             for slice in slicing.slices.values_mut() {
@@ -468,6 +495,27 @@ mod pin_tests {
             ..schema
         };
         assert!(pin_binding_versions(&versioned, &pins).is_none());
+        // Reference target profiles are pinned the same way.
+        let mut elements = IndexMap::new();
+        elements.insert(
+            "subject".to_string(),
+            Arc::new(FhirSchema {
+                refers: Some(vec![
+                    "https://twcore/StructureDefinition/Encounter-twcore".into(),
+                    "http://hl7.org/fhir/StructureDefinition/Group".into(),
+                ]),
+                ..Default::default()
+            }),
+        );
+        let with_ref = FhirSchema { elements: Some(elements), ..Default::default() };
+        let pinned = pin_binding_versions(&with_ref, &pins).expect("changed");
+        assert_eq!(
+            pinned.elements.unwrap()["subject"].refers.as_deref(),
+            Some(&[
+                "https://twcore/StructureDefinition/Encounter-twcore|0.3.2".to_string(),
+                "http://hl7.org/fhir/StructureDefinition/Group".to_string()
+            ][..])
+        );
     }
 
     #[test]

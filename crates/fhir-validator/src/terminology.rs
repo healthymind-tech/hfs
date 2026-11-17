@@ -461,6 +461,10 @@ impl CompositeTerminologyProvider {
 
 #[async_trait]
 impl TerminologyProvider for CompositeTerminologyProvider {
+    fn invalidate(&self) {
+        self.remote.invalidate();
+    }
+
     async fn validate_code(
         &self,
         value_set: &str,

@@ -135,6 +135,11 @@ pub enum CodedValue {
 /// Checks coded-value membership in a ValueSet (`$validate-code`).
 #[async_trait]
 pub trait TerminologyProvider: Send + Sync {
+    /// Forget cached answers: the terminology changed (a package install or
+    /// uninstall added or removed code systems and value sets). The default
+    /// caches nothing.
+    fn invalidate(&self) {}
+
     /// `Ok(true)` = the coded value is in the ValueSet.
     async fn validate_code(
         &self,
