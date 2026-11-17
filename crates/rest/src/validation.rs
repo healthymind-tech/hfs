@@ -453,11 +453,13 @@ impl ValidationService {
             ValidationMode::Off => Ok(()),
             ValidationMode::Log => {
                 for issue in issues.iter().filter(|i| i.severity != Severity::Information) {
+                    let severity = if issue.severity == Severity::Error { "error" } else { "warning" };
                     warn!(
                         tenant = %tenant,
                         resource_type = %resource_type,
                         path = %issue.path,
                         kind = ?issue.kind,
+                        severity = severity,
                         "validation (log mode): {}",
                         issue.message
                     );
