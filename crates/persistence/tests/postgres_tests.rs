@@ -3501,27 +3501,43 @@ mod postgres_integration {
         };
         let size = |backend: &PostgresBackend| backend.pool_status().max_size;
 
+        // The budget is half of the server's `max_connections`: read it rather
+        // than assume the testcontainer's default of 100, so the test holds on
+        // any server it is pointed at (`HFS_TEST_PG_HOST`).
+        let server: usize = {
+            let probe = PostgresBackend::new(config_with(1, false))
+                .await
+                .expect("Failed to create PostgresBackend");
+            let client = probe.get_client().await.expect("probe client");
+            let row = client
+                .query_one("SELECT current_setting('max_connections')::int", &[])
+                .await
+                .expect("read max_connections");
+            row.get::<_, i32>(0) as usize
+        };
+        let half = server / 2;
+
         // Two pools that each want everything, like `hfs` with the database
         // audit sink. Pools of concurrent tests in this binary only shrink what
         // is left, so the two never exceed half together; each keeps at least one.
-        let first = PostgresBackend::new(config_with(64, true))
+        let first = PostgresBackend::new(config_with(server, true))
             .await
             .expect("Failed to create PostgresBackend");
-        assert!((1..=50).contains(&size(&first)), "{}", size(&first));
-        let second = PostgresBackend::new(config_with(64, true))
+        assert!((1..=half).contains(&size(&first)), "{} of {server}", size(&first));
+        let second = PostgresBackend::new(config_with(server, true))
             .await
             .expect("Failed to create PostgresBackend");
         let (a, b) = (size(&first), size(&second));
         assert!(a >= 1 && b >= 1, "{a} + {b}");
-        assert!(a + b <= 50 || a + b == 2, "{a} + {b} exceed half of 100");
+        assert!(a + b <= half || a + b == 2, "{a} + {b} exceed half of {server}");
 
         // An explicit size is kept, even above what the budget leaves (it only
         // warns once the pools add up to more than the server accepts).
-        let explicit = PostgresBackend::new(config_with(51, false))
+        let explicit = PostgresBackend::new(config_with(half + 1, false))
             .await
             .expect("Failed to create PostgresBackend");
-        assert_eq!(size(&explicit), 51);
-        assert_eq!(explicit.config().max_connections, 51);
+        assert_eq!(size(&explicit), half + 1);
+        assert_eq!(explicit.config().max_connections, half + 1);
     }
 
     /// Creates a tenant with a unique ID suffix to isolate tests sharing the same database.
