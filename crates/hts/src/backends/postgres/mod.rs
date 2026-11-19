@@ -84,6 +84,7 @@ pub(crate) struct PgMeta {
     pub(super) cs_version: RwLock<HashMap<String, Option<String>>>,
     pub(super) cs_content: RwLock<HashMap<String, Option<String>>>,
     pub(super) case_insensitive: RwLock<HashMap<String, bool>>,
+    #[allow(clippy::type_complexity)]
     pub(super) prop_codes: RwLock<HashMap<(String, String), Arc<Vec<String>>>>,
     /// `(0 = inactive | 1 = abstract, system url, code)` → flag.
     pub(super) concept_flags: RwLock<HashMap<(u8, String, String), bool>>,
@@ -758,6 +759,7 @@ pub(crate) trait CachedQuery {
     ) -> impl std::future::Future<Output = Result<tokio_postgres::Row, tokio_postgres::Error>> + Send + 'a;
 }
 
+#[allow(clippy::manual_async_fn)]
 impl CachedQuery for PgClient {
     fn cq<'a>(
         &'a self,

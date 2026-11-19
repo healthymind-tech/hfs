@@ -333,7 +333,8 @@ fn constraint_params(sets: &[Vec<(String, String)>]) -> Result<Vec<(String, Stri
     }
     let single: Vec<&(String, String)> = sets
         .iter()
-        .filter_map(|c| (c.len() == 1).then(|| &c[0]))
+        .filter(|&c| c.len() == 1)
+        .map(|c| &c[0])
         .collect();
     if single.len() == sets.len() && single.iter().all(|(p, _)| *p == single[0].0) {
         let values: Vec<&str> = single.iter().map(|(_, v)| v.as_str()).collect();
@@ -622,6 +623,7 @@ where
 }
 
 /// The stored current version of `ty/id`, as JSON.
+#[allow(clippy::result_large_err)]
 async fn stored<S>(
     state: &AppState<S>,
     parts: &mut axum::http::request::Parts,

@@ -546,6 +546,7 @@ where
 ///
 /// The text contains only locally derived i32 keys and fixed namespaces,
 /// never tenant or resource strings.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 fn shared_write_locks_sql(gate: i32, keys: &[i32]) -> String {
     use std::fmt::Write;
     let mut sql = String::with_capacity(keys.len() * 12 + 256);

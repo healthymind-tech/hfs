@@ -25,7 +25,7 @@ pub(super) fn check_attachment(
             // primitive's own (regex) error; malformed padding or length
             // inside the alphabet is reported here.
             // (So is a length that is no multiple of 4.)
-            let alphabet = compact.len() % 4 == 0
+            let alphabet = compact.len().is_multiple_of(4)
                 && compact
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));

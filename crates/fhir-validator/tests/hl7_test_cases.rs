@@ -104,7 +104,7 @@ async fn typeless_choice_element_keeps_the_base_types() {
     let url = "http://example.org/StructureDefinition/obs-bound-value";
     let ok = validate_with(
         &obs(json!({"value": 98, "system": "http://unitsofmeasure.org", "code": "%"})),
-        &[sd.clone()],
+        std::slice::from_ref(&sd),
         &[url],
     )
     .await;
@@ -330,11 +330,11 @@ async fn profile_children_of_a_primitive_apply_to_its_sidecar() {
     };
     let translated = json!({"system": "http://example.org/cs", "code": "x", "display": "X",
         "_display": {"extension": [{"url": "http://example.org/ext", "valueString": "x"}]}});
-    let issues = validate_with(&obs(translated), &[sd.clone()], &[url]).await;
+    let issues = validate_with(&obs(translated), std::slice::from_ref(&sd), &[url]).await;
     assert!(errors(&issues).is_empty(), "{issues:#?}");
 
     let plain = json!({"system": "http://example.org/cs", "code": "x", "display": "X"});
-    let issues = validate_with(&obs(plain), &[sd.clone()], &[url]).await;
+    let issues = validate_with(&obs(plain), std::slice::from_ref(&sd), &[url]).await;
     let errs = errors(&issues);
     assert_eq!(errs.len(), 1, "{issues:#?}");
     assert_eq!(errs[0].path, "Observation.code.coding.0.display.extension");
@@ -467,15 +467,36 @@ async fn min_and_max_values() {
             .count()
     };
     assert_eq!(
-        count(validate_with(&obs(5.0, "kg", "2025-06-01"), &[sd.clone()], &[url]).await),
+        count(
+            validate_with(
+                &obs(5.0, "kg", "2025-06-01"),
+                std::slice::from_ref(&sd),
+                &[url]
+            )
+            .await
+        ),
         0
     );
     assert_eq!(
-        count(validate_with(&obs(-1.0, "g", "2025-06-01"), &[sd.clone()], &[url]).await),
+        count(
+            validate_with(
+                &obs(-1.0, "g", "2025-06-01"),
+                std::slice::from_ref(&sd),
+                &[url]
+            )
+            .await
+        ),
         1
     );
     assert_eq!(
-        count(validate_with(&obs(11000.0, "g", "2025-06-01"), &[sd.clone()], &[url]).await),
+        count(
+            validate_with(
+                &obs(11000.0, "g", "2025-06-01"),
+                std::slice::from_ref(&sd),
+                &[url]
+            )
+            .await
+        ),
         1
     );
     assert_eq!(
@@ -1208,11 +1229,11 @@ async fn string_length_bounds() {
     let count = |issues: Vec<ValidationError>| errors(&issues).len();
     let p = |id: &str, family: &str| json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]});
     assert_eq!(
-        count(validate_with(&p("abc", "Smith"), &[sd.clone()], &[url]).await),
+        count(validate_with(&p("abc", "Smith"), std::slice::from_ref(&sd), &[url]).await),
         0
     );
     assert_eq!(
-        count(validate_with(&p("ab", "Smith"), &[sd.clone()], &[url]).await),
+        count(validate_with(&p("ab", "Smith"), std::slice::from_ref(&sd), &[url]).await),
         1
     );
     assert_eq!(
@@ -1263,7 +1284,7 @@ async fn an_item_matching_two_slices() {
     let url = "http://example.org/StructureDefinition/overlap";
     let both = validate_with(
         &obs(json!({"system": "http://example.org/cs", "code": "x"})),
-        &[sd.clone()],
+        std::slice::from_ref(&sd),
         &[url],
     )
     .await;
@@ -1298,7 +1319,7 @@ async fn fixed_complex_values_per_child() {
     let p = |t: Value| json!({"resourceType": "Practitioner", "telecom": [t]});
     let issues = validate_with(
         &p(json!({"system": "phone", "value": "555", "use": "home"})),
-        &[sd.clone()],
+        std::slice::from_ref(&sd),
         &[url],
     )
     .await;
@@ -1797,7 +1818,7 @@ async fn conforms_to_in_invariants() {
     let ck1 = |issues: &[ValidationError]| issues.iter().any(|e| e.message.contains("ck-1"));
     let bad = validate_with(
         &json!({"resourceType": "Patient", "gender": "bad"}),
-        &[sd.clone()],
+        std::slice::from_ref(&sd),
         &[url],
     )
     .await;

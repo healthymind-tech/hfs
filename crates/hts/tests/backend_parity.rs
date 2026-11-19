@@ -959,7 +959,6 @@ async fn stored_expansion_first_and_cached_shape() {
 /// supplement), and the base CodeSystem's inline concept entries.
 #[tokio::test(flavor = "multi_thread")]
 async fn supplements_reach_lookup_helpers_after_import() {
-    use helios_hts::traits::CodeSystemOperations;
     let _g = SERIAL.lock().await;
     let bs = backends().await;
     let base = json!({

@@ -379,6 +379,7 @@ fn error(kind: ErrorKind, path: String, message: String) -> ValidationError {
 
 /// The Bundle-level rules (see the module docs). Nested Bundles are judged
 /// when the walk validates them on their own; only the root is checked here.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 pub(super) fn bundle_rules(bundle: &Value) -> Vec<ValidationError> {
     bundle_rules_with(bundle, &|t: &str| {
         t.starts_with(|c: char| c.is_ascii_uppercase())

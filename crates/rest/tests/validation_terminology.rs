@@ -95,7 +95,7 @@ async fn validate_code_in_system(
     let found = state
         .known
         .get(&url)
-        .is_some_and(|codes| codes.iter().any(|c| *c == code));
+        .is_some_and(|codes| codes.contains(&code));
     let mut parameter = vec![json!({ "name": "result", "valueBoolean": found })];
     if !found {
         parameter.push(json!({"name": "issues", "resource": {"resourceType": "OperationOutcome",

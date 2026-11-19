@@ -23977,7 +23977,7 @@ mod postgres_integration {
                 .unwrap();
             // Newest first, with a three-way tie in the middle.
             let at = match i {
-                2 | 3 | 4 => "2026-01-10T00:00:00Z".to_string(),
+                2..=4 => "2026-01-10T00:00:00Z".to_string(),
                 _ => format!("2026-01-{:02}T00:00:00Z", 20 - i),
             };
             pin_last_updated(&backend, id, instant(&at)).await;

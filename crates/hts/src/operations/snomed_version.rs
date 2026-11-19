@@ -500,7 +500,10 @@ mod tests {
         // …unless that edition is stored with URI versions.
         let us = "http://snomed.info/sct/731000124108/version/20250301".to_string();
         assert_eq!(
-            map_version("http://snomed.info/sct/731000124108", &[us.clone()]),
+            map_version(
+                "http://snomed.info/sct/731000124108",
+                std::slice::from_ref(&us)
+            ),
             Some(us)
         );
     }

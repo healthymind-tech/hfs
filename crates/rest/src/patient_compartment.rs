@@ -228,7 +228,7 @@ impl PatientCompartment {
             });
             return Ok(());
         }
-        if self.1.iter().any(|t| *t == query.resource_type) {
+        if self.1.contains(&query.resource_type) {
             // A shared reference type: searched unfiltered (its includes are
             // still confined by `retain_members`).
             return Ok(());

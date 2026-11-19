@@ -56,6 +56,7 @@ pub struct RangeRule {
 #[derive(Debug, Default, Clone)]
 pub struct ModelRows {
     /// `(code, active, primitive, display, first term)`.
+    #[allow(clippy::type_complexity)]
     pub concepts: Vec<(String, bool, bool, Option<String>, Option<String>)>,
     /// `(source, group, type, value, concrete)`; is-a included.
     pub relationships: Vec<(String, i32, String, String, bool)>,

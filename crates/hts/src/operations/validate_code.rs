@@ -1600,6 +1600,7 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
 ///
 /// Drives the IG `extensions/validate-code-inactive` and
 /// `extensions/validate-code-inactive-display` fixtures.
+#[allow(clippy::too_many_arguments)]
 async fn apply_concept_extension_status<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,

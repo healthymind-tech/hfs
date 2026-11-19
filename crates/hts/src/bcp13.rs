@@ -110,6 +110,7 @@ pub fn validate_mimetypes_code(
 /// keep syntax validation. Subsets, exclusions, modifiers and CodeSystem version
 /// pins still require normal terminology evaluation; syntax alone cannot
 /// establish their meaning.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 pub fn validate_stored_mimetypes_code(
     url: &str,
     compose_json: Option<&str>,
@@ -127,6 +128,7 @@ pub fn validate_stored_mimetypes_code(
     validate_mimetypes_code(url, req)
 }
 
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 fn compose_includes_all_bcp13(compose: &serde_json::Value) -> bool {
     let Some(compose) = compose.as_object() else {
         return false;
@@ -168,6 +170,7 @@ fn compose_includes_all_bcp13(compose: &serde_json::Value) -> bool {
         })
 }
 
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 fn has_no_elements(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => true,

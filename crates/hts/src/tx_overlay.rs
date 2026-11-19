@@ -43,6 +43,7 @@ const MAX_DEPTH: usize = 8;
 /// store" for a key.
 #[derive(Default)]
 pub struct TxOverlayCache {
+    #[allow(clippy::type_complexity)]
     inner: Mutex<(
         HashMap<u64, Option<Arc<AppState<SqliteTerminologyBackend>>>>,
         VecDeque<u64>,

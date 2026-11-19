@@ -537,6 +537,7 @@ async fn execute_constraints(
 
     // Select, filter, and dedup — preserving deferred order.
     let mut seen: HashSet<(String, String)> = HashSet::new();
+    #[allow(clippy::type_complexity)]
     let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity, bool)> = Vec::new();
     for d in deferred {
         let Deferred::Constraint {

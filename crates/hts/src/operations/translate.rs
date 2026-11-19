@@ -397,6 +397,7 @@ struct MapMatch {
     /// R5 `relationship` code.
     relationship: String,
     /// R4 `equivalence` code when the map states one (else derived).
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     equivalence: Option<String>,
     no_map: bool,
     /// `originMap` canonical.
@@ -455,6 +456,7 @@ fn r4_equivalence_code(code: &str) -> Option<&str> {
 }
 
 /// The R4 `equivalence` code for an R5 relationship.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 fn relationship_to_equivalence(rel: &str) -> &'static str {
     match rel {
         "equivalent" => "equivalent",

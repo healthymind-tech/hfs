@@ -308,7 +308,12 @@ async fn snomed_lookup_details<B: TerminologyBackend>(
     let module_display = match &module {
         Some(m) => state
             .backend()
-            .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &[m.clone()])
+            .snomed_concepts(
+                &ctx,
+                SNOMED_URL,
+                version.as_deref(),
+                std::slice::from_ref(m),
+            )
             .await
             .ok()
             .and_then(|r| r.get(m).and_then(|i| i.display.clone())),

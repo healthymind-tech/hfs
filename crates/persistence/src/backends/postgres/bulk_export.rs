@@ -1357,6 +1357,7 @@ fn export_cursor(last_updated: &DateTime<Utc>, id: &str) -> String {
 /// page is a slice of them plus a primary-key read of its rows.
 struct CandidateSet {
     used: std::time::Instant,
+    #[allow(clippy::type_complexity)]
     by_type: std::collections::HashMap<String, Arc<Vec<(DateTime<Utc>, String)>>>,
 }
 

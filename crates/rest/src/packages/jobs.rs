@@ -478,7 +478,7 @@ impl JobTable {
                 Err(e) => tracing::warn!(error = %e, "listing mirrored package jobs failed"),
             }
         }
-        views.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        views.sort_by_key(|view| std::cmp::Reverse(view.created_at));
         views.truncate(MAX_JOBS);
         views
     }

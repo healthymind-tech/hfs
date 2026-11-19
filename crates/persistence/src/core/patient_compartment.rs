@@ -90,6 +90,7 @@ impl PatientCompartmentMatcher {
         })
     }
 
+    /// The codes of the search parameters that link a resource to the patient.
     pub fn param_codes(&self) -> impl Iterator<Item = &str> {
         self.params.iter().map(|param| param.code.as_str())
     }

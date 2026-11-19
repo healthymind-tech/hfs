@@ -1150,7 +1150,7 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
             // without narrowing the types: no restriction.
             if let Some(branch) = ctx.path.last_key().map(str::to_string)
                 && !choices.is_empty()
-                && !choices.iter().any(|c| *c == branch)
+                && !choices.contains(&branch)
             {
                 let branch = branch.as_str();
                 let rendered = ctx.path.render_dotted();

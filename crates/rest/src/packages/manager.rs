@@ -1318,6 +1318,7 @@ impl PackageManager {
         Ok(search_parameters)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_terminology(
         &self,
         job: &Job,

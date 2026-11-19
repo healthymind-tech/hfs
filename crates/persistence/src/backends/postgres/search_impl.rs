@@ -1687,7 +1687,7 @@ impl SearchProvider for PostgresBackend {
                     .filter(|_| COUNT_FROM_INDEX_ALONE);
                 let single = match single {
                     Some(pred) if super::null_timestamp_facts::enabled() => {
-                        match super::null_timestamp_facts::param_name_of(&pred) {
+                        match super::null_timestamp_facts::param_name_of(pred) {
                             Some(param)
                                 if super::null_timestamp_facts::param_has_no_null_rows(
                                     &client,

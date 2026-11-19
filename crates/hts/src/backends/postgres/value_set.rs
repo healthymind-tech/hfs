@@ -1965,6 +1965,7 @@ async fn compute_expansion(
 /// database, and the warnings (unknown systems, unresolved references,
 /// cycles, depth limit) are returned for `expansion.parameter`. SQLite's
 /// `InlineResolutionContext` path.
+#[allow(clippy::too_many_arguments)]
 async fn compute_expansion_inline(
     client: &super::PgClient,
     meta: &super::PgMeta,

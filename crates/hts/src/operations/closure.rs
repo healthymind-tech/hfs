@@ -45,6 +45,7 @@ pub struct ClosureTable {
     /// The concepts in the table, in the order they were added.
     concepts: Vec<(String, String)>,
     /// `(version added, narrower (system, code), wider (system, code))`.
+    #[allow(clippy::type_complexity)]
     entries: Vec<(u64, (String, String), (String, String))>,
     /// The request-supplied code systems the table was started with.
     #[cfg(feature = "sqlite")]
@@ -85,6 +86,7 @@ async fn subsumption<B: TerminologyBackend>(
 }
 
 /// The ConceptMap for `name` at `version` holding `entries`.
+#[allow(clippy::type_complexity)]
 fn closure_concept_map(
     name: &str,
     version: u64,

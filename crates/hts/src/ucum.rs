@@ -169,7 +169,7 @@ fn resolve_atom(symbol: &str) -> Option<(Option<&'static str>, &'static str)> {
     if let Some((k, _)) = m.base.get_key_value(symbol) {
         return Some((None, k.as_str()));
     }
-    for (p, _) in m.prefixes.iter() {
+    for p in m.prefixes.keys() {
         if let Some(rest) = symbol.strip_prefix(p.as_str()) {
             let metric = m
                 .units

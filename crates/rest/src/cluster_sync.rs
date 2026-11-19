@@ -60,7 +60,7 @@ pub async fn run_profile_sync<S>(
     loop {
         ticker.tick().await;
         polls = polls.wrapping_add(1);
-        if polls % PRUNE_EVERY == 0
+        if polls.is_multiple_of(PRUNE_EVERY)
             && let Err(e) = feed.prune(FEED_RETENTION).await
         {
             debug!(error = %e, "pruning the cluster change feed failed");

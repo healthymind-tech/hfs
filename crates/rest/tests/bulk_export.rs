@@ -26,8 +26,8 @@ use helios_rest::bulk_export_auth::BearerScopeAuth;
 use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
 use serde_json::{Value, json};
 
-/// Builds a test server with the bulk-export subsystem wired in, plus the
-/// SQLite backend and the local-FS output store (for driving a worker).
+// Builds a test server with the bulk-export subsystem wired in, plus the
+// SQLite backend and the local-FS output store (for driving a worker).
 thread_local! {
     /// Export batch size for the next server a test builds on this thread
     /// (the `#[tokio::test]` runtime is single-threaded).

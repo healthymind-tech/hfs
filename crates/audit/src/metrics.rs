@@ -43,11 +43,13 @@ pub fn record_dropped(sink: &str, reason: &'static str, count: u64) {
 }
 
 /// Count one retried write on `sink`.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 pub(crate) fn record_retry(sink: &str) {
     metrics::counter!(WRITE_RETRIES, "sink" => sink.to_string()).increment(1);
 }
 
 /// Publish the current backlog of `sink`.
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 pub(crate) fn set_queue_depth(sink: &str, depth: usize) {
     metrics::gauge!(QUEUE_DEPTH, "sink" => sink.to_string()).set(depth as f64);
 }

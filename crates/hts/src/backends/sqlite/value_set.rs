@@ -2756,6 +2756,7 @@ fn expand_inline_plain_fts(
 /// evaluated by `apply_compose_filters` and the text filter is then applied in
 /// Rust over the (already bounded) result set.  Explicit `concept[]` lists are
 /// also filtered in Rust since they are already small.
+#[allow(clippy::too_many_arguments)]
 fn expand_inline_filtered(
     conn: &Connection,
     compose: &serde_json::Value,
