@@ -2084,7 +2084,9 @@ async fn init_auth_with_audit(
         .await
         {
             Ok((authorize, token, end_session)) => {
-                auth_config.smart_authorize_endpoint.get_or_insert(authorize);
+                auth_config
+                    .smart_authorize_endpoint
+                    .get_or_insert(authorize);
                 auth_config.smart_token_endpoint.get_or_insert(token);
                 if auth_config.smart_end_session_endpoint.is_none() {
                     auth_config.smart_end_session_endpoint = end_session;

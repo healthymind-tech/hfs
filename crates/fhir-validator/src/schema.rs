@@ -507,14 +507,19 @@ mod pin_tests {
                 ..Default::default()
             }),
         );
-        let with_ref = FhirSchema { elements: Some(elements), ..Default::default() };
+        let with_ref = FhirSchema {
+            elements: Some(elements),
+            ..Default::default()
+        };
         let pinned = pin_binding_versions(&with_ref, &pins).expect("changed");
         assert_eq!(
             pinned.elements.unwrap()["subject"].refers.as_deref(),
-            Some(&[
-                "https://twcore/StructureDefinition/Encounter-twcore|0.3.2".to_string(),
-                "http://hl7.org/fhir/StructureDefinition/Group".to_string()
-            ][..])
+            Some(
+                &[
+                    "https://twcore/StructureDefinition/Encounter-twcore|0.3.2".to_string(),
+                    "http://hl7.org/fhir/StructureDefinition/Group".to_string()
+                ][..]
+            )
         );
     }
 
@@ -531,7 +536,10 @@ mod pin_tests {
         };
         let mut elements = IndexMap::new();
         elements.insert("smoking".to_string(), leaf("http://ips/ValueSet/smoking"));
-        elements.insert("status".to_string(), leaf("http://hl7.org/fhir/ValueSet/obs|4.0.1"));
+        elements.insert(
+            "status".to_string(),
+            leaf("http://hl7.org/fhir/ValueSet/obs|4.0.1"),
+        );
         elements.insert("other".to_string(), leaf("http://x/ValueSet/unpinned"));
         let mut slices = IndexMap::new();
         slices.insert(
@@ -556,16 +564,33 @@ mod pin_tests {
             ..Default::default()
         };
         let mut pins = std::collections::HashMap::new();
-        pins.insert("http://ips/ValueSet/smoking".to_string(), "1.1.0".to_string());
-        pins.insert("http://hl7.org/fhir/ValueSet/obs".to_string(), "9".to_string());
+        pins.insert(
+            "http://ips/ValueSet/smoking".to_string(),
+            "1.1.0".to_string(),
+        );
+        pins.insert(
+            "http://hl7.org/fhir/ValueSet/obs".to_string(),
+            "9".to_string(),
+        );
         let pinned = pin_binding_versions(&schema, &pins).expect("changed");
         let vs = |s: &FhirSchema, k: &str| {
-            s.elements.as_ref().unwrap()[k].binding.as_ref().unwrap().value_set.clone()
+            s.elements.as_ref().unwrap()[k]
+                .binding
+                .as_ref()
+                .unwrap()
+                .value_set
+                .clone()
         };
         assert_eq!(vs(&pinned, "smoking"), "http://ips/ValueSet/smoking|1.1.0");
-        assert_eq!(vs(&pinned, "status"), "http://hl7.org/fhir/ValueSet/obs|4.0.1");
+        assert_eq!(
+            vs(&pinned, "status"),
+            "http://hl7.org/fhir/ValueSet/obs|4.0.1"
+        );
         assert_eq!(vs(&pinned, "other"), "http://x/ValueSet/unpinned");
-        let slice = pinned.slicing.as_ref().unwrap().slices["s"].schema.clone().unwrap();
+        let slice = pinned.slicing.as_ref().unwrap().slices["s"]
+            .schema
+            .clone()
+            .unwrap();
         assert_eq!(
             slice.binding.as_ref().unwrap().value_set,
             "http://ips/ValueSet/smoking|1.1.0"

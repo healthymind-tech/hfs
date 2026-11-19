@@ -152,6 +152,7 @@ pub mod build_info;
 pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
+pub mod cluster_sync;
 pub mod config;
 mod dashboard;
 pub mod error;
@@ -171,7 +172,6 @@ pub mod routing;
 pub mod state;
 pub mod tenant;
 pub mod terminology;
-pub mod cluster_sync;
 pub mod validation;
 pub mod validation_cache;
 
@@ -216,8 +216,8 @@ pub(crate) mod test_support {
 
 // Re-export commonly used types
 pub use config::{
-    JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode,
-    SubscriptionsFanoutMode, TenantRoutingMode,
+    JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode, SubscriptionsFanoutMode,
+    TenantRoutingMode,
 };
 pub use error::{RestError, RestResult};
 pub use middleware::auth::AuthMiddlewareState;
@@ -1091,7 +1091,10 @@ where
         tokio::spawn(async move {
             match packages::pins::compute(store.as_ref(), &tenant).await {
                 Ok(pins) => {
-                    info!(profiles = pins.len(), "binding version pins of installed profiles loaded");
+                    info!(
+                        profiles = pins.len(),
+                        "binding version pins of installed profiles loaded"
+                    );
                     validation.set_binding_pins(&tenant, pins);
                     while validation.is_rehydrating() {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1116,8 +1119,9 @@ where
     // Shared database: one package install at a time across every instance,
     // and every job visible and cancellable from every instance.
     let package_manager = match storage_arc.package_job_coordinator() {
-        Some(coordinator) => package_manager
-            .with_coordinator(coordinator, cluster_sync::instance_id().to_string()),
+        Some(coordinator) => {
+            package_manager.with_coordinator(coordinator, cluster_sync::instance_id().to_string())
+        }
         None => package_manager,
     };
     let package_manager = Arc::new(package_manager);

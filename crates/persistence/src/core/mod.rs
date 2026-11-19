@@ -114,12 +114,12 @@ pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod cluster_change_feed;
-pub mod package_jobs;
 pub mod cluster_job_store;
-pub mod event_fanout;
 pub mod database_url;
 pub mod empty_elements;
+pub mod event_fanout;
 pub mod history;
+pub mod package_jobs;
 pub mod package_registry;
 pub mod patch;
 pub mod patient_compartment;
@@ -196,8 +196,8 @@ pub use cluster_job_store::{
     ClusterJobId, ClusterJobLease, ClusterJobRecord, ClusterJobState, ClusterJobStore,
     ClusterLeaseError, JobKind,
 };
-pub use event_fanout::{EventFanout, FanoutEnvelope, FanoutKind, LifecycleOp};
 pub use empty_elements::drop_empty_elements;
+pub use event_fanout::{EventFanout, FanoutEnvelope, FanoutKind, LifecycleOp};
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -215,9 +215,9 @@ pub use preconditions::{
 };
 pub use retention::{ExpiredResource, RetentionStorage};
 pub use search::{
-    DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,
-    MultiTypeSearchProvider, RevincludeProvider, SearchProvider, SearchResult,
-    TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
+    DistinctMetaValue, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider,
+    MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider, SearchProvider,
+    SearchResult, TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
@@ -228,16 +228,16 @@ pub use storage::{
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
     ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
 };
-pub use tenant_discovery::{
-    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
-    PresenceBasis, TenantDataEvidence, TenantDiscovery,
-};
 pub use subscription_delivery::{
     ClaimedDelivery, DeliveryId, DeliveryLease, DeliveryLeaseError, DeliveryRecord, DeliveryState,
     NewDelivery, SubscriptionDeliveryOutbox,
 };
 pub use subscription_state::{
     HydratedResource, SubscriptionHydrationSource, SubscriptionStateRecord, SubscriptionStateStore,
+};
+pub use tenant_discovery::{
+    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, TenantDataEvidence, TenantDiscovery,
 };
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleEntryTarget, BundleMethod,

@@ -33,7 +33,11 @@ pub fn check(m: &SnomedModel, code: &str) -> Checked {
         Ok(e) => e,
         Err(e) => return Checked::Invalid(format!("Not a valid expression: {e}")),
     };
-    if let Some(id) = expr.concept_ids().into_iter().find(|id| m.idx(id).is_none()) {
+    if let Some(id) = expr
+        .concept_ids()
+        .into_iter()
+        .find(|id| m.idx(id).is_none())
+    {
         return Checked::Invalid(format!("Not a valid expression: Concept {id} not found"));
     }
     if let Err(reason) = mrcm::check(m, &expr.body) {
@@ -42,7 +46,11 @@ pub fn check(m: &SnomedModel, code: &str) -> Checked {
     let plain = scg::render_plain(&expr);
     let normal_form = (scg::strip_terms(code) != plain).then_some(plain);
     let display = scg::render_with_terms(&expr, &mut term_of(m));
-    Checked::Valid { expr, display, normal_form }
+    Checked::Valid {
+        expr,
+        display,
+        normal_form,
+    }
 }
 
 /// The model's view of a checked expression.
@@ -84,9 +92,9 @@ pub fn implicit(m: &SnomedModel, url: &str) -> Option<Result<Implicit, HtsError>
                 }
             } else if let Some(e) = q.strip_prefix("ecl/") {
                 let e = percent_decode(e);
-                ecl::parse(&e)
-                    .map(Implicit::Ecl)
-                    .map_err(|err| HtsError::VsInvalid(format!("The ECL '{e}' is not valid: {err}")))
+                ecl::parse(&e).map(Implicit::Ecl).map_err(|err| {
+                    HtsError::VsInvalid(format!("The ECL '{e}' is not valid: {err}"))
+                })
             } else {
                 missing()
             }
@@ -125,7 +133,9 @@ pub fn in_implicit(m: &SnomedModel, imp: &Implicit, v: &Virtual) -> bool {
 
 /// Whether the expression is in the SNOMED CT part of `vs`'s compose.
 pub fn in_value_set(m: &SnomedModel, vs: &Value, e: &Expression, v: &Virtual) -> bool {
-    let Some(compose) = vs.get("compose") else { return false };
+    let Some(compose) = vs.get("compose") else {
+        return false;
+    };
     let matches = |inc: &Value| -> bool {
         if inc.get("system").and_then(Value::as_str) != Some(SNOMED_URL) {
             return false;
@@ -181,7 +191,11 @@ pub fn subsumes(m: &SnomedModel, a: &str, b: &str) -> Result<&'static str, HtsEr
     let side = |code: &str| -> Result<Virtual, HtsError> {
         match check(m, code) {
             Checked::Valid { expr, .. } => virtual_of(m, &expr).ok_or_else(|| {
-                coded("code-invalid", "invalid-code", format!("Invalid expression '{code}'"))
+                coded(
+                    "code-invalid",
+                    "invalid-code",
+                    format!("Invalid expression '{code}'"),
+                )
             }),
             Checked::Invalid(reason) => Err(coded(
                 "code-invalid",
@@ -205,13 +219,24 @@ pub fn subsumes(m: &SnomedModel, a: &str, b: &str) -> Result<&'static str, HtsEr
 /// Rewrite the `$lookup` response of the focus concept of `expr` into the
 /// expression's: its code and display, a single preferred designation, and
 /// a property per refinement attribute.
-pub fn lookup_response(m: &SnomedModel, code: &str, display: &str, expr: &Expression, focus: Value) -> Value {
+pub fn lookup_response(
+    m: &SnomedModel,
+    code: &str,
+    display: &str,
+    expr: &Expression,
+    focus: Value,
+) -> Value {
     let mut params: Vec<Value> = focus
         .get("parameter")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    params.retain(|p| !matches!(p.get("name").and_then(Value::as_str), Some("designation" | "display" | "code")));
+    params.retain(|p| {
+        !matches!(
+            p.get("name").and_then(Value::as_str),
+            Some("designation" | "display" | "code")
+        )
+    });
     params.push(json!({"name": "code", "valueCode": code}));
     params.push(json!({"name": "display", "valueString": display}));
     params.push(json!({"name": "designation", "part": [
@@ -221,15 +246,21 @@ pub fn lookup_response(m: &SnomedModel, code: &str, display: &str, expr: &Expres
         {"name": "value", "valueString": display},
     ]}));
     let mut term = term_of(m);
-    for a in expr.body.ungrouped.iter().chain(expr.body.groups.iter().flatten()) {
+    for a in expr
+        .body
+        .ungrouped
+        .iter()
+        .chain(expr.body.groups.iter().flatten())
+    {
         let (value, description) = match &a.value {
             scg::AttributeValue::Concept(c) => (
                 c.id.clone(),
                 c.term.clone().or_else(|| term(&c.id)).unwrap_or_default(),
             ),
-            scg::AttributeValue::Expression(x) => {
-                (scg::render_sub_plain(x), scg::render_sub_with_terms(x, &mut term))
-            }
+            scg::AttributeValue::Expression(x) => (
+                scg::render_sub_plain(x),
+                scg::render_sub_with_terms(x, &mut term),
+            ),
             scg::AttributeValue::Concrete(c) => (c.render(), c.render()),
         };
         let mut parts = vec![json!({"name": "code", "valueCode": a.name.id})];

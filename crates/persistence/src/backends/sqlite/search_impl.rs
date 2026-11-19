@@ -3475,7 +3475,8 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let (sql, params) = reference_values_statement(&tenant, &query, "patient", &HashMap::new()).unwrap();
+        let (sql, params) =
+            reference_values_statement(&tenant, &query, "patient", &HashMap::new()).unwrap();
         let conn = backend.get_connection().unwrap();
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

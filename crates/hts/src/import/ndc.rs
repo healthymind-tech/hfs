@@ -69,7 +69,11 @@ struct NdcPackage {
 /// 5-4-1 → `0`+package). `None` for anything else.
 pub fn ndc_11_digit(code: &str) -> Option<String> {
     let parts: Vec<&str> = code.split('-').collect();
-    if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+    if parts.len() != 3
+        || !parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
         return None;
     }
     let (l, p, k) = (parts[0], parts[1], parts[2]);
@@ -344,7 +348,10 @@ fn read_ndc_files(path: &Path) -> Result<std::collections::HashMap<String, Strin
 }
 
 /// Parse `package.txt` / `Packages_excluded.txt`.
-fn parse_package_txt(text: &str, inactive: bool) -> Result<(Vec<NdcPackage>, Vec<String>), HtsError> {
+fn parse_package_txt(
+    text: &str,
+    inactive: bool,
+) -> Result<(Vec<NdcPackage>, Vec<String>), HtsError> {
     let mut lines = text.lines();
     let header = lines
         .next()
@@ -373,7 +380,10 @@ fn parse_package_txt(text: &str, inactive: bool) -> Result<(Vec<NdcPackage>, Vec
         let get = |i: usize| f.get(i).map(|s| s.trim()).unwrap_or("");
         let code = get(i_package);
         if code.is_empty() {
-            errors.push(format!("package line {}: missing NDCPACKAGECODE — skipped", n + 2));
+            errors.push(format!(
+                "package line {}: missing NDCPACKAGECODE — skipped",
+                n + 2
+            ));
             continue;
         }
         out.push(NdcPackage {
@@ -660,7 +670,11 @@ mod tests {
         assert_eq!(ndc_11_digit("0777-3105-02").as_deref(), Some("00777310502"));
         assert_eq!(ndc_11_digit("49281-121-65").as_deref(), Some("49281012165"));
         assert_eq!(ndc_11_digit("12345-6789-1").as_deref(), Some("12345678901"));
-        assert_eq!(ndc_11_digit("0777-3105"), None, "product codes have no 11-digit form");
+        assert_eq!(
+            ndc_11_digit("0777-3105"),
+            None,
+            "product codes have no 11-digit form"
+        );
         assert_eq!(ndc_11_digit("07773105-02"), None);
     }
 
@@ -879,7 +893,9 @@ mod tests {
             }
             let backend = SqliteTerminologyBackend::in_memory().unwrap();
             let ctx = TenantContext::system();
-            import_ndc(&backend, &ctx, tmp.path(), 2, false).await.unwrap();
+            import_ndc(&backend, &ctx, tmp.path(), 2, false)
+                .await
+                .unwrap();
             for (code, active) in [
                 ("0002-1200-30", true),
                 ("00002120030", true),

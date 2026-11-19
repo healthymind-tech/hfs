@@ -146,7 +146,11 @@ impl std::fmt::Display for SyntaxError {
 
 /// Parse an expression.
 pub fn parse(text: &str) -> Result<Expression, SyntaxError> {
-    let mut p = Parser { s: text.as_bytes(), text, pos: 0 };
+    let mut p = Parser {
+        s: text.as_bytes(),
+        text,
+        pos: 0,
+    };
     p.ws();
     let status = if p.eat_str("===") {
         Some(DefinitionStatus::Equivalent)
@@ -172,7 +176,10 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn err(&self, message: &str) -> SyntaxError {
-        SyntaxError { offset: self.pos, message: message.to_string() }
+        SyntaxError {
+            offset: self.pos,
+            message: message.to_string(),
+        }
     }
 
     fn ws(&mut self) {
@@ -213,7 +220,10 @@ impl Parser<'_> {
     }
 
     fn sub_expression(&mut self) -> Result<SubExpression, SyntaxError> {
-        let mut e = SubExpression { focus: vec![self.concept_ref()?], ..Default::default() };
+        let mut e = SubExpression {
+            focus: vec![self.concept_ref()?],
+            ..Default::default()
+        };
         loop {
             self.ws();
             if !self.eat(b'+') {
@@ -406,7 +416,10 @@ pub fn render_plain(e: &Expression) -> String {
 
 /// Render `e` with a term after every concept: the one written, or what
 /// `term_of` gives for the id.
-pub fn render_with_terms(e: &Expression, term_of: &mut dyn FnMut(&str) -> Option<String>) -> String {
+pub fn render_with_terms(
+    e: &Expression,
+    term_of: &mut dyn FnMut(&str) -> Option<String>,
+) -> String {
     let mut out = String::new();
     match e.status {
         Some(DefinitionStatus::Equivalent) => out.push_str("==="),
@@ -427,7 +440,11 @@ pub fn render_sub_with_terms(
     term_of: &mut dyn FnMut(&str) -> Option<String>,
 ) -> String {
     let mut out = String::new();
-    render_sub(e, &mut |c: &ConceptRef| c.term.clone().or_else(|| term_of(&c.id)), &mut out);
+    render_sub(
+        e,
+        &mut |c: &ConceptRef| c.term.clone().or_else(|| term_of(&c.id)),
+        &mut out,
+    );
     out
 }
 
@@ -443,12 +460,13 @@ fn render_sub(
     term: &mut dyn FnMut(&ConceptRef) -> Option<String>,
     out: &mut String,
 ) {
-    let concept = |c: &ConceptRef, out: &mut String, term: &mut dyn FnMut(&ConceptRef) -> Option<String>| {
-        out.push_str(&c.id);
-        if let Some(t) = term(c) {
-            let _ = write!(out, "|{t}|");
-        }
-    };
+    let concept =
+        |c: &ConceptRef, out: &mut String, term: &mut dyn FnMut(&ConceptRef) -> Option<String>| {
+            out.push_str(&c.id);
+            if let Some(t) = term(c) {
+                let _ = write!(out, "|{t}|");
+            }
+        };
     for (i, f) in e.focus.iter().enumerate() {
         if i > 0 {
             out.push('+');
@@ -459,7 +477,9 @@ fn render_sub(
         return;
     }
     out.push(':');
-    let attrs = |set: &[Attribute], out: &mut String, term: &mut dyn FnMut(&ConceptRef) -> Option<String>| {
+    let attrs = |set: &[Attribute],
+                 out: &mut String,
+                 term: &mut dyn FnMut(&ConceptRef) -> Option<String>| {
         for (i, a) in set.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -517,8 +537,14 @@ mod tests {
     fn parses_and_renders_nested_refinements() {
         let e = parse("367430006:{405813007=(85562004:272741003=24028007)}").unwrap();
         assert_eq!(e.body.groups.len(), 1);
-        assert!(matches!(e.body.groups[0][0].value, AttributeValue::Expression(_)));
-        assert_eq!(render_plain(&e), "367430006:{405813007=(85562004:272741003=24028007)}");
+        assert!(matches!(
+            e.body.groups[0][0].value,
+            AttributeValue::Expression(_)
+        ));
+        assert_eq!(
+            render_plain(&e),
+            "367430006:{405813007=(85562004:272741003=24028007)}"
+        );
     }
 
     #[test]
@@ -527,14 +553,23 @@ mod tests {
         assert_eq!(e.body.focus[0].term.as_deref(), Some("Lung"));
         assert_eq!(render_plain(&e), "39607008:272741003=24028007");
         let shown = render_with_terms(&e, &mut |_| Some("x".into()));
-        assert_eq!(shown, "39607008|Lung|:272741003|Laterality|=24028007|Right|");
+        assert_eq!(
+            shown,
+            "39607008|Lung|:272741003|Laterality|=24028007|Right|"
+        );
     }
 
     #[test]
     fn a_group_may_follow_the_attribute_set_without_a_comma() {
         let e = parse("373873005:1142139005=#2{1142135004=#500}").unwrap();
-        assert_eq!(render_plain(&e), "373873005:1142139005=#2,{1142135004=#500}");
-        assert_ne!(render_plain(&e), strip_terms("373873005:1142139005=#2{1142135004=#500}"));
+        assert_eq!(
+            render_plain(&e),
+            "373873005:1142139005=#2,{1142135004=#500}"
+        );
+        assert_ne!(
+            render_plain(&e),
+            strip_terms("373873005:1142139005=#2{1142135004=#500}")
+        );
     }
 
     #[test]
@@ -548,8 +583,13 @@ mod tests {
     fn concrete_values() {
         let e = parse("373873005:{1142135004=#2.5,1142139005=#-3}").unwrap();
         let g = &e.body.groups[0];
-        assert!(matches!(&g[0].value, AttributeValue::Concrete(Concrete::Decimal(s, _)) if s == "2.5"));
-        assert!(matches!(g[1].value, AttributeValue::Concrete(Concrete::Integer(-3))));
+        assert!(
+            matches!(&g[0].value, AttributeValue::Concrete(Concrete::Decimal(s, _)) if s == "2.5")
+        );
+        assert!(matches!(
+            g[1].value,
+            AttributeValue::Concrete(Concrete::Integer(-3))
+        ));
     }
 
     #[test]

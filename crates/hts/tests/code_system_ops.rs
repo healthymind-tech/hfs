@@ -267,7 +267,11 @@ async fn validate_code_accepts_a_versioned_canonical_url() {
         ("code", "valueCode", "leg"),
     ]);
     let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "conflicting versions: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "conflicting versions: {body}"
+    );
 }
 
 // ── $subsumes ─────────────────────────────────────────────────────────────────

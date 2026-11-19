@@ -401,7 +401,13 @@ impl JobTable {
         let Some((coordinator, owner)) = self.mirror.get() else {
             return;
         };
-        let jobs: Vec<Arc<Job>> = self.jobs.lock().expect("job table").iter().cloned().collect();
+        let jobs: Vec<Arc<Job>> = self
+            .jobs
+            .lock()
+            .expect("job table")
+            .iter()
+            .cloned()
+            .collect();
         for job in jobs {
             let version = job.version.load(Ordering::SeqCst);
             let view = job.view();
@@ -410,19 +416,29 @@ impl JobTable {
                     Ok(()) => {
                         written.insert(view.id.clone(), version);
                     }
-                    Err(e) => tracing::warn!(job = %view.id, error = %e, "mirroring a package job failed"),
+                    Err(e) => {
+                        tracing::warn!(job = %view.id, error = %e, "mirroring a package job failed")
+                    }
                 }
             }
             if !view.status.is_terminal()
                 && !job.cancelled()
-                && coordinator.cancel_requested(&view.id).await.unwrap_or(false)
+                && coordinator
+                    .cancel_requested(&view.id)
+                    .await
+                    .unwrap_or(false)
             {
                 job.cancel();
                 job.log("cancel requested through another instance");
             }
         }
-        let live: std::collections::HashSet<String> =
-            self.jobs.lock().expect("job table").iter().map(|j| j.view().id).collect();
+        let live: std::collections::HashSet<String> = self
+            .jobs
+            .lock()
+            .expect("job table")
+            .iter()
+            .map(|j| j.view().id)
+            .collect();
         written.retain(|id, _| live.contains(id));
     }
 
@@ -620,7 +636,10 @@ mod tests {
 
         job.finish(JobStatus::Cancelled, None);
         a.flush_mirror(&mut written).await;
-        assert_eq!(b.view_shared(&id).await.unwrap().status, JobStatus::Cancelled);
+        assert_eq!(
+            b.view_shared(&id).await.unwrap().status,
+            JobStatus::Cancelled
+        );
         let (accepted, _) = b.cancel_shared(&id).await.unwrap();
         assert!(!accepted, "a finished job cannot be cancelled");
     }

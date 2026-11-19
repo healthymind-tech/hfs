@@ -121,7 +121,10 @@ impl JwksCache {
     async fn refresh(&self) -> Result<(), AuthError> {
         let response = self.fetcher.fetch(&self.jwks_url).await?;
 
-        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL).min(self.max_ttl);
+        let ttl = response
+            .max_age
+            .unwrap_or(DEFAULT_CACHE_TTL)
+            .min(self.max_ttl);
 
         {
             let mut keys = self.keys.write().await;

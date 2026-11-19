@@ -563,7 +563,13 @@ pub async fn types_outside_the_patient_compartment_are_not_reachable(server: &Te
     let r = get(server, P1_READ, "/Practitioner").await;
     assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
     assert_forbidden(
-        &put(server, P1_WRITE, "/Practitioner/pr1", json!({"resourceType": "Practitioner", "id": "pr1"})).await,
+        &put(
+            server,
+            P1_WRITE,
+            "/Practitioner/pr1",
+            json!({"resourceType": "Practitioner", "id": "pr1"}),
+        )
+        .await,
         "write of a shared type",
     );
     assert_forbidden(&get(server, P1_READ, "/Binary").await, "Binary search");

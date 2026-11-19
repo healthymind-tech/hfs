@@ -304,7 +304,10 @@ fn truncated_copy_check(
         return Ok(None);
     }
     let codes = serde_json::to_string(
-        &cs.concepts.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+        &cs.concepts
+            .iter()
+            .map(|c| c.code.as_str())
+            .collect::<Vec<_>>(),
     )
     .map_err(|e| HtsError::Internal(e.to_string()))?;
     let missing: i64 = conn

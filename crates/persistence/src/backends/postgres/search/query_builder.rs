@@ -2425,10 +2425,8 @@ impl PostgresQueryBuilder {
         // A long list (`code:in=<ValueSet>` after expansion, or an explicit
         // `code=a,b,…`) binds two arrays instead of one OR arm per value.
         if let Some((predicate, params)) = Self::token_list_array_predicate(param, offset) {
-            let mut combined = SqlFragment::with_params(
-                Self::index_membership(&param.name, &predicate),
-                params,
-            );
+            let mut combined =
+                SqlFragment::with_params(Self::index_membership(&param.name, &predicate), params);
             if let Some(SearchModifier::Not) = param.modifier {
                 let sql = format!("NOT ({})", combined.sql);
                 combined = SqlFragment::with_params(sql, combined.params);
@@ -7987,7 +7985,9 @@ mod tests {
     }
 
     fn system_codes(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("http://snomed.info/sct|{i}")).collect()
+        (0..n)
+            .map(|i| format!("http://snomed.info/sct|{i}"))
+            .collect()
     }
 
     /// A long `system|code` list binds one system and one code array per
@@ -8015,7 +8015,10 @@ mod tests {
         let other_len =
             PostgresQueryBuilder::build_token_condition(&token_list(None, &system_codes(12)), 2)
                 .unwrap();
-        assert_eq!(other_len.sql, frag.sql, "statement text independent of length");
+        assert_eq!(
+            other_len.sql, frag.sql,
+            "statement text independent of length"
+        );
     }
 
     #[test]
@@ -8023,7 +8026,8 @@ mod tests {
         let mut values = system_codes(10);
         values.push("http://loinc.org|1".to_string());
         values.push("http://snomed.info/sct|1".to_string());
-        let frag = PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
+        let frag =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
         assert!(frag.sql.contains(" OR "), "{}", frag.sql);
         match frag.params.as_slice() {
             [
@@ -8042,8 +8046,13 @@ mod tests {
     #[test]
     fn a_long_code_only_list_matches_any_system() {
         let values: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
-        let frag = PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
-        assert!(frag.sql.contains("value_token_code = ANY($3::text[])"), "{}", frag.sql);
+        let frag =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &values), 2).unwrap();
+        assert!(
+            frag.sql.contains("value_token_code = ANY($3::text[])"),
+            "{}",
+            frag.sql
+        );
         assert!(!frag.sql.contains("value_token_system"), "{}", frag.sql);
         assert!(matches!(frag.params.as_slice(), [SqlParam::TextArray(c)] if c.len() == 20));
     }
@@ -8071,7 +8080,8 @@ mod tests {
         // a code-only value among system|code values
         let mut mixed = system_codes(20);
         mixed.push("bare".into());
-        let mixed = PostgresQueryBuilder::build_token_condition(&token_list(None, &mixed), 2).unwrap();
+        let mixed =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &mixed), 2).unwrap();
         assert!(!mixed.sql.contains("ANY("), "{}", mixed.sql);
         // `system|` and `|code` forms
         let mut partial = system_codes(20);
@@ -8081,7 +8091,8 @@ mod tests {
         assert!(!partial.sql.contains("ANY("), "{}", partial.sql);
         let mut nosys = system_codes(20);
         nosys.push("|x".into());
-        let nosys = PostgresQueryBuilder::build_token_condition(&token_list(None, &nosys), 2).unwrap();
+        let nosys =
+            PostgresQueryBuilder::build_token_condition(&token_list(None, &nosys), 2).unwrap();
         assert!(!nosys.sql.contains("ANY("), "{}", nosys.sql);
         // other modifiers
         let text = PostgresQueryBuilder::build_token_condition(

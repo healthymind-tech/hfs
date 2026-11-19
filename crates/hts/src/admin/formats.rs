@@ -283,7 +283,10 @@ fn detect_dir(path: &Path) -> Detection {
             found.push((ImportFormat::Loinc, rel.clone(), false));
         } else if file.ends_with(".rrf") {
             // Other RxNorm tables: covered by RXNCONSO.RRF above.
-        } else if let Some(f) = detect(&path.join(rel)).format.as_deref().and_then(parse_format)
+        } else if let Some(f) = detect(&path.join(rel))
+            .format
+            .as_deref()
+            .and_then(parse_format)
         {
             found.push((f, rel.clone(), true));
         }
@@ -346,7 +349,10 @@ fn detect_dir(path: &Path) -> Detection {
                         growth_estimate_bytes: Some(fi.estimate_growth(size)),
                         ..Default::default()
                     };
-                    let first = found.iter().find(|(f, _, _)| *f == format).map(|(_, r, _)| r);
+                    let first = found
+                        .iter()
+                        .find(|(f, _, _)| *f == format)
+                        .map(|(_, r, _)| r);
                     inner.evidence = Some(match (format, &chosen) {
                         (ImportFormat::Rxnorm, Some(dir)) if !dir.is_empty() => {
                             inner.import_path = Some(dir.clone());
@@ -706,7 +712,11 @@ mod tests {
     #[test]
     fn loinc_release_directory_is_loinc_not_rxnorm() {
         let dir = tree(
-            &["2.80/loincupload.properties", "2.80/._Loinc_2.80.zip", "2.80/._loincupload.properties"],
+            &[
+                "2.80/loincupload.properties",
+                "2.80/._Loinc_2.80.zip",
+                "2.80/._loincupload.properties",
+            ],
             &[("2.80/Loinc_2.80.zip", LOINC_ZIP)],
         );
         std::fs::write(
@@ -818,14 +828,21 @@ mod tests {
         );
         let d = detect(dir.path());
         assert_eq!(d.format.as_deref(), Some("icd10-cm"), "{d:?}");
-        assert_eq!(d.import_path.as_deref(), Some("icd10cm-table-index-2025.zip"));
+        assert_eq!(
+            d.import_path.as_deref(),
+            Some("icd10cm-table-index-2025.zip")
+        );
         assert!(d.evidence.unwrap().ends_with("icd-10-cm-tabular-2025.xml"));
 
         let dir = tree(
             &[],
             &[(
                 "icd10pcs_tables_2025.zip",
-                &["icd10pcsCodesFile.pdf", "codes_addenda_2025.txt", "icd10pcs_codes_2025.txt"],
+                &[
+                    "icd10pcsCodesFile.pdf",
+                    "codes_addenda_2025.txt",
+                    "icd10pcs_codes_2025.txt",
+                ],
             )],
         );
         let d = detect(dir.path());
@@ -835,7 +852,11 @@ mod tests {
 
         // Unpacked: the tabular XML / the codes file is the source.
         let dir = tree(
-            &["icd10cm_tabular_2025.xml", "icd10cm_index_2025.xml", "icd10cm_tabular_2025.pdf"],
+            &[
+                "icd10cm_tabular_2025.xml",
+                "icd10cm_index_2025.xml",
+                "icd10cm_tabular_2025.pdf",
+            ],
             &[],
         );
         let d = detect(dir.path());
@@ -863,7 +884,10 @@ mod tests {
         let d = detect(dir.path());
         assert_eq!(d.format, None, "{d:?}");
         let evidence = d.evidence.unwrap();
-        assert!(evidence.contains("loinc") && evidence.contains("snomed-rf2"), "{evidence}");
+        assert!(
+            evidence.contains("loinc") && evidence.contains("snomed-rf2"),
+            "{evidence}"
+        );
 
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(detect(empty.path()).format, None);

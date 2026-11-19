@@ -1254,14 +1254,8 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             stats.errors.extend(parsed.parse_errors.iter().cloned());
             let res: Result<(), HtsError> = async {
                 for cs in &parsed.code_systems {
-                    write_code_system(
-                        &tx,
-                        cs,
-                        &mut stats,
-                        parsed.fresh_load,
-                        !parsed.chunked,
-                    )
-                    .await?;
+                    write_code_system(&tx, cs, &mut stats, parsed.fresh_load, !parsed.chunked)
+                        .await?;
                 }
                 for vs in &parsed.value_sets {
                     write_value_set(&tx, vs, &mut stats).await?;
@@ -2448,7 +2442,10 @@ mod pool_tuning_tests {
         let pool = cfg.pool.unwrap();
         assert_eq!(pool.max_size, 1, "a zero size is clamped to one");
         assert_eq!(pool.timeouts.wait, Some(std::time::Duration::from_secs(30)));
-        assert_eq!(pool.timeouts.create, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            pool.timeouts.create,
+            Some(std::time::Duration::from_secs(5))
+        );
         assert_eq!(cfg.options.as_deref(), Some("-c statement_timeout=60000"));
     }
 

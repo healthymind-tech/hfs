@@ -39,9 +39,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 pub use auth::{AdminAuth, CookieSpec, Denial, Granted, LoginOutcome, Via};
-pub use store::{AdminSessionStore, StoredSession};
 pub use client::IpNet;
 pub use settings::{AdminSettings, CookieSecure, DEFAULT_USER, Secret};
+pub use store::{AdminSessionStore, StoredSession};
 
 /// Whether, and how, administrative endpoints admit a request.
 #[derive(Clone, Debug)]

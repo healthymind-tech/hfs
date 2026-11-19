@@ -355,7 +355,10 @@ mod matched_route_tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let inner = Router::new()
-            .route("/{resource_type}/{id}/_p3_route_test", get(|| async { "ok" }))
+            .route(
+                "/{resource_type}/{id}/_p3_route_test",
+                get(|| async { "ok" }),
+            )
             .route_layer(axum::middleware::from_fn(expose_matched_path));
         let app = Router::new()
             .fallback_service(inner)
@@ -377,7 +380,10 @@ mod matched_route_tests {
                 && l.ends_with(" 1")),
             "{text}"
         );
-        assert!(!text.contains("Patient/42"), "no concrete ids in labels: {text}");
+        assert!(
+            !text.contains("Patient/42"),
+            "no concrete ids in labels: {text}"
+        );
     }
 }
 

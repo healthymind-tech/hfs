@@ -645,7 +645,9 @@ mod tests {
             "topic": [{"coding": [{"system": "http://loinc.org", "code": "8302-2"}, {"system": "urn:oid:1.2.3", "code": "y"}]}]}));
         assert_eq!(
             errors,
-            vec!["Measure.subjectCodeableConcept.coding.0.system Coding.system must be an absolute reference, not a local reference"]
+            vec![
+                "Measure.subjectCodeableConcept.coding.0.system Coding.system must be an absolute reference, not a local reference"
+            ]
         );
     }
 

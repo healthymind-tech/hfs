@@ -42,5 +42,8 @@ fn memoized_root_chains_give_the_same_results() {
         evaluate(&ast, &memo, None).unwrap(),
         EvaluationResult::integer(2)
     );
-    assert!(!memo.root_memo.as_ref().unwrap().lock().is_empty(), "memo used");
+    assert!(
+        !memo.root_memo.as_ref().unwrap().lock().is_empty(),
+        "memo used"
+    );
 }

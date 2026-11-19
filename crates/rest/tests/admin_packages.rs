@@ -713,19 +713,30 @@ async fn core_terminology_reaches_the_terminology_server_once() {
     let cache = tempfile::tempdir().unwrap();
     let server = hts_server(&hts, cache.path());
     // Offline with an empty cache: the startup sync gives up quietly.
-    upload(&server, core, "").await.assert_status(StatusCode::OK);
+    upload(&server, core, "")
+        .await
+        .assert_status(StatusCode::OK);
     upload(&server, base_v1(), "")
         .await
         .assert_status(StatusCode::OK);
     let job = install(&server, "acme.base#1.0.0").await;
     assert_eq!(job["status"], "succeeded", "{job}");
     let stored = store.lock().unwrap().clone();
-    let has = |t: &str, url: &str| stored.iter().any(|r| r["resourceType"] == t && r["url"] == url);
-    assert!(has("CodeSystem", "http://hl7.org/fhir/days-of-week"), "{stored:?}");
+    let has = |t: &str, url: &str| {
+        stored
+            .iter()
+            .any(|r| r["resourceType"] == t && r["url"] == url)
+    };
+    assert!(
+        has("CodeSystem", "http://hl7.org/fhir/days-of-week"),
+        "{stored:?}"
+    );
     assert!(has("ValueSet", "http://hl7.org/fhir/ValueSet/days-of-week"));
     assert!(has("ConceptMap", "http://hl7.org/fhir/ConceptMap/cm"));
     assert!(
-        !stored.iter().any(|r| r["resourceType"] == "StructureDefinition"),
+        !stored
+            .iter()
+            .any(|r| r["resourceType"] == "StructureDefinition"),
         "only terminology goes to the terminology server"
     );
     // acme.base's own CodeSystem + the three core resources it lacked.
@@ -1052,7 +1063,12 @@ async fn a_newer_major_dependency_does_not_overwrite_the_older_one_still_needed(
         json!({"hl7.fhir.r4.core": "4.0.1", "acme.core": "2.0.0"}),
         &[],
     );
-    for p in [core("1.0.0", "birthDate"), core("2.0.0", "gender"), old_user, new_user] {
+    for p in [
+        core("1.0.0", "birthDate"),
+        core("2.0.0", "gender"),
+        old_user,
+        new_user,
+    ] {
         upload(&server, p, "").await.assert_status(StatusCode::OK);
     }
     let job = install(&server, "acme.olduser#1.0.0").await;
@@ -1064,12 +1080,23 @@ async fn a_newer_major_dependency_does_not_overwrite_the_older_one_still_needed(
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| format!("{}#{}", p["name"].as_str().unwrap(), p["version"].as_str().unwrap()))
+        .map(|p| {
+            format!(
+                "{}#{}",
+                p["name"].as_str().unwrap(),
+                p["version"].as_str().unwrap()
+            )
+        })
         .collect();
     installed.sort();
     assert_eq!(
         installed,
-        ["acme.core#1.0.0", "acme.core#2.0.0", "acme.newuser#1.0.0", "acme.olduser#1.0.0"]
+        [
+            "acme.core#1.0.0",
+            "acme.core#2.0.0",
+            "acme.newuser#1.0.0",
+            "acme.olduser#1.0.0"
+        ]
     );
     // The dependent is judged on 1.0.0's base (birthDate), not 2.0.0's (gender).
     let issues = validate(
@@ -1078,14 +1105,20 @@ async fn a_newer_major_dependency_does_not_overwrite_the_older_one_still_needed(
         json!({"resourceType": "Patient", "name": [{"family": "x"}], "birthDate": "2000-01-01"}),
     )
     .await;
-    assert!(!has_error(&issues), "1.0.0 base needs birthDate only: {issues:?}");
+    assert!(
+        !has_error(&issues),
+        "1.0.0 base needs birthDate only: {issues:?}"
+    );
     let issues = validate(
         &server,
         "acme-on-core",
         json!({"resourceType": "Patient", "name": [{"family": "x"}], "gender": "male"}),
     )
     .await;
-    assert!(has_error(&issues), "1.0.0 base requires birthDate: {issues:?}");
+    assert!(
+        has_error(&issues),
+        "1.0.0 base requires birthDate: {issues:?}"
+    );
     // An unversioned claim of the core profile means the newest release.
     let issues = validate(
         &server,

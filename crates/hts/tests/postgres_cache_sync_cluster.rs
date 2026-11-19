@@ -102,7 +102,11 @@ async fn update_via_one_replica_reaches_the_other_replicas_lookup() {
     assert_eq!(lookup_display(&control).await.as_deref(), Some("Old"));
 
     let (status, body) = a
-        .put_fhir(&format!("/CodeSystem/{id}"), code_system("New", Some(&id)), None)
+        .put_fhir(
+            &format!("/CodeSystem/{id}"),
+            code_system("New", Some(&id)),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(lookup_display(&a).await.as_deref(), Some("New"));
@@ -161,5 +165,8 @@ async fn out_of_band_sql_write_moves_the_epoch() {
         .await
         .unwrap();
     let after = backend.terminology_epoch().await.unwrap();
-    assert!(after > before, "trigger must bump the epoch ({before} -> {after})");
+    assert!(
+        after > before,
+        "trigger must bump the epoch ({before} -> {after})"
+    );
 }

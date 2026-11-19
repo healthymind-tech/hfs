@@ -237,10 +237,17 @@ async fn unknown_code_systems_warn_and_tags_are_information() {
     let unknown = of_kind(&issues, ErrorKind::UnknownCodeSystem);
     assert_eq!(unknown.len(), 6, "{issues:#?}");
     for u in &unknown {
-        let expected = if u.path.contains(".meta.") { Severity::Information } else { Severity::Warning };
+        let expected = if u.path.contains(".meta.") {
+            Severity::Information
+        } else {
+            Severity::Warning
+        };
         assert_eq!(u.severity, expected, "{u:?}");
     }
-    assert!(issues.iter().all(|e| e.severity != Severity::Error), "{issues:#?}");
+    assert!(
+        issues.iter().all(|e| e.severity != Severity::Error),
+        "{issues:#?}"
+    );
 }
 
 /// An unresolvable code system in the HL7 namespaces is an error on

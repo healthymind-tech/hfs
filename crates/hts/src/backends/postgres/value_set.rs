@@ -3778,7 +3778,10 @@ pub(crate) async fn record_dependencies(
     };
     let own = parse(
         client
-            .query("SELECT compose_json FROM value_sets WHERE id = $1", &[&vs_id])
+            .query(
+                "SELECT compose_json FROM value_sets WHERE id = $1",
+                &[&vs_id],
+            )
             .await
             .map_err(db)?,
     );
@@ -3814,7 +3817,10 @@ pub(crate) async fn record_dependencies(
         );
     }
     client
-        .execute("DELETE FROM value_set_dependencies WHERE value_set_id = $1", &[&vs_id])
+        .execute(
+            "DELETE FROM value_set_dependencies WHERE value_set_id = $1",
+            &[&vs_id],
+        )
         .await
         .map_err(db)?;
     if !deps.is_empty() {
@@ -5058,7 +5064,9 @@ fn finish_validate_code_response(
         None => {
             // Fragment short-circuit: unknown code in a fragment CS becomes a
             // single warning (result=true) per IG `fragment/validation-*-bad-code`.
-            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg) && code_unknown_in_cs {
+            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg)
+                && code_unknown_in_cs
+            {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(

@@ -705,7 +705,15 @@ impl SqliteTransaction {
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
             )
             .map_err(|e| internal_error(format!("Failed to prepare resource restore: {}", e)))?
-            .execute(params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str])
+            .execute(params![
+                tenant_id,
+                resource_type,
+                id,
+                version_id,
+                data_bytes,
+                last_updated,
+                fhir_version_str
+            ])
             .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
         } else {
             // Insert the resource

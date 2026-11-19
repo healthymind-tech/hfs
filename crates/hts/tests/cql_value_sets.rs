@@ -17,7 +17,8 @@ use axum::http::StatusCode;
 use common::TestApp;
 use serde_json::{Value, json};
 
-const VS_URL: &str = "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113883.3.464.1003.103.12.1001";
+const VS_URL: &str =
+    "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113883.3.464.1003.103.12.1001";
 const VS_ID: &str = "2.16.840.1.113883.3.464.1003.103.12.1001";
 const LOCAL_CS: &str = "http://hts.test/cql/icd";
 const CPT: &str = "http://www.ama-assn.org/go/cpt";
@@ -66,7 +67,13 @@ fn codes(body: &Value) -> Vec<String> {
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|c| format!("{}|{}", c["system"].as_str().unwrap_or(""), c["code"].as_str().unwrap_or("")))
+        .map(|c| {
+            format!(
+                "{}|{}",
+                c["system"].as_str().unwrap_or(""),
+                c["code"].as_str().unwrap_or("")
+            )
+        })
         .collect();
     v.sort();
     v
@@ -136,7 +143,10 @@ async fn validate_code_puts_result_first() {
         let (st, body) = app.get_fhir(&path).await;
         assert_eq!(st, StatusCode::OK, "{path}: {body}");
         assert_eq!(body["parameter"][0]["name"], "result", "{path}: {body}");
-        assert!(body["parameter"][0]["valueBoolean"].is_boolean(), "{path}: {body}");
+        assert!(
+            body["parameter"][0]["valueBoolean"].is_boolean(),
+            "{path}: {body}"
+        );
     }
     let (st, body) = app
         .post_fhir(

@@ -120,7 +120,11 @@ impl SmartConfiguration {
                 .smart_token_auth_methods
                 .clone()
                 .unwrap_or_else(|| {
-                    owned(&["client_secret_basic", "client_secret_post", "private_key_jwt"])
+                    owned(&[
+                        "client_secret_basic",
+                        "client_secret_post",
+                        "private_key_jwt",
+                    ])
                 }),
             code_challenge_methods_supported: owned(&["S256"]),
             token_endpoint_auth_signing_alg_values_supported: owned(&["RS384", "ES384"]),
@@ -214,14 +218,26 @@ mod tests {
             assert!(smart.capabilities.contains(&cap.to_string()), "{cap}");
         }
         assert_eq!(smart.response_types_supported, vec!["code"]);
-        assert!(smart.grant_types_supported.contains(&"refresh_token".to_string()));
-        assert!(!smart.code_challenge_methods_supported.contains(&"plain".to_string()));
+        assert!(
+            smart
+                .grant_types_supported
+                .contains(&"refresh_token".to_string())
+        );
+        assert!(
+            !smart
+                .code_challenge_methods_supported
+                .contains(&"plain".to_string())
+        );
     }
 
     #[test]
     fn backend_only_deployments_do_not_claim_a_launch() {
         let smart = SmartConfiguration::from_config(&AuthConfig::default());
-        assert!(!smart.capabilities.contains(&"launch-standalone".to_string()));
+        assert!(
+            !smart
+                .capabilities
+                .contains(&"launch-standalone".to_string())
+        );
         assert_eq!(smart.grant_types_supported, vec!["client_credentials"]);
         assert!(smart.response_types_supported.is_empty());
     }
@@ -237,6 +253,9 @@ mod tests {
         let smart = SmartConfiguration::from_config(&config);
         assert_eq!(smart.capabilities, vec!["launch-ehr"]);
         assert_eq!(smart.scopes_supported, vec!["system/*.rs"]);
-        assert_eq!(smart.token_endpoint_auth_methods_supported, vec!["private_key_jwt"]);
+        assert_eq!(
+            smart.token_endpoint_auth_methods_supported,
+            vec!["private_key_jwt"]
+        );
     }
 }

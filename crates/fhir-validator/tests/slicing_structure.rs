@@ -57,7 +57,11 @@ fn resolver(sds: &[Value]) -> Arc<dyn SchemaResolver> {
     ]))
 }
 
-fn validate(resolver: &Arc<dyn SchemaResolver>, resource: &Value, profiles: &[&str]) -> Vec<ValidationError> {
+fn validate(
+    resolver: &Arc<dyn SchemaResolver>,
+    resource: &Value,
+    profiles: &[&str],
+) -> Vec<ValidationError> {
     let opts = ValidationOptions {
         profiles: profiles.iter().map(|p| p.to_string()).collect(),
         check_extension_context: true,
@@ -72,7 +76,13 @@ fn errors_of(errors: &[ValidationError], kind: ErrorKind) -> Vec<String> {
     errors
         .iter()
         .filter(|e| e.kind == kind && e.severity == Severity::Error)
-        .map(|e| format!("{}: {}", e.path, e.hl7_message.as_deref().unwrap_or(&e.message)))
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.path,
+                e.hl7_message.as_deref().unwrap_or(&e.message)
+            )
+        })
         .collect()
 }
 
@@ -114,7 +124,11 @@ fn entry_bundle_sds() -> Vec<Value> {
             ),
         ],
     );
-    vec![loose(PRACTITIONER, "Practitioner"), loose(PATIENT, "Patient"), bundle]
+    vec![
+        loose(PRACTITIONER, "Practitioner"),
+        loose(PATIENT, "Patient"),
+        bundle,
+    ]
 }
 
 /// Regression (stream L): EMPD `Bundle-bun-01-ep` reported
@@ -131,15 +145,24 @@ fn profile_discriminators_do_not_count_resources_of_another_type() {
             "name": [{"text": "B"}], "gender": "female"}}
     ]});
     let errors = validate(&r, &bundle, &[ENTRY_BUNDLE]);
-    assert!(errors_of(&errors, ErrorKind::SliceCardinality).is_empty(), "{errors:#?}");
+    assert!(
+        errors_of(&errors, ErrorKind::SliceCardinality).is_empty(),
+        "{errors:#?}"
+    );
 
     // Without the Practitioner the slice minimum fails, and the Patient
     // does not stand in for it.
     let mut no_doctor = bundle.clone();
     no_doctor["entry"].as_array_mut().unwrap().pop();
-    let slices = errors_of(&validate(&r, &no_doctor, &[ENTRY_BUNDLE]), ErrorKind::SliceCardinality);
+    let slices = errors_of(
+        &validate(&r, &no_doctor, &[ENTRY_BUNDLE]),
+        ErrorKind::SliceCardinality,
+    );
     assert_eq!(slices.len(), 1, "{slices:#?}");
-    assert!(slices[0].contains("Bundle.entry:Practitioner"), "{slices:#?}");
+    assert!(
+        slices[0].contains("Bundle.entry:Practitioner"),
+        "{slices:#?}"
+    );
 }
 
 /// A resource claiming a profile of another resource type is rejected
@@ -152,10 +175,17 @@ fn a_profile_of_another_resource_type_is_rejected() {
     let errors = validate(&r, &patient, &[]);
     let wrong = errors_of(&errors, ErrorKind::Type);
     assert_eq!(wrong.len(), 1, "{errors:#?}");
-    assert!(wrong[0].contains("Specified profile type was 'Practitioner'"), "{wrong:#?}");
+    assert!(
+        wrong[0].contains("Specified profile type was 'Practitioner'"),
+        "{wrong:#?}"
+    );
     // The right type is fine.
     let ok = json!({"resourceType": "Practitioner", "meta": {"profile": [PRACTITIONER]}});
-    assert!(validate(&r, &ok, &[]).iter().all(|e| e.severity != Severity::Error));
+    assert!(
+        validate(&r, &ok, &[])
+            .iter()
+            .all(|e| e.severity != Severity::Error)
+    );
 }
 
 const OCCUPATION: &str = "http://example.org/StructureDefinition/occupation";
@@ -194,11 +224,17 @@ fn type_discriminator_on_this_matches_non_resource_items() {
                "code": {"coding": [{"system": "http://loinc.org", "code": code}]}})
     };
     let errors = validate(&r, &obs("21847-9"), &[OCCUPATION]);
-    assert!(errors_of(&errors, ErrorKind::SliceCardinality).is_empty(), "{errors:#?}");
+    assert!(
+        errors_of(&errors, ErrorKind::SliceCardinality).is_empty(),
+        "{errors:#?}"
+    );
     // A coding of the type with the wrong code joins the slice and fails
     // its fixed code (as in the Java validator).
     let errors = validate(&r, &obs("11111-1"), &[OCCUPATION]);
-    assert!(!errors_of(&errors, ErrorKind::FixedValue).is_empty(), "{errors:#?}");
+    assert!(
+        !errors_of(&errors, ErrorKind::FixedValue).is_empty(),
+        "{errors:#?}"
+    );
 }
 
 const TREAT: &str = "http://example.org/StructureDefinition/treat";
@@ -419,7 +455,10 @@ fn resolve_discriminators_need_a_resolvable_conforming_target() {
     let errors = validate(&r, &composition("Observation/o"), &[DOC]);
     let slices = errors_of(&errors, ErrorKind::SliceCardinality);
     assert_eq!(slices.len(), 1, "{errors:#?}");
-    assert!(slices[0].contains("Composition.section.entry:result"), "{slices:#?}");
+    assert!(
+        slices[0].contains("Composition.section.entry:result"),
+        "{slices:#?}"
+    );
 
     // Inside a Bundle, the target entry is found and judged.
     let bundle = |value: Value| {
@@ -435,7 +474,10 @@ fn resolve_discriminators_need_a_resolvable_conforming_target() {
     obs.insert("valueQuantity".into(), json!({"value": 1}));
     good["entry"][0]["resource"]["meta"] = json!({"profile": [DOC]});
     let errors = validate(&r, &good, &[]);
-    assert!(errors_of(&errors, ErrorKind::SliceCardinality).is_empty(), "{errors:#?}");
+    assert!(
+        errors_of(&errors, ErrorKind::SliceCardinality).is_empty(),
+        "{errors:#?}"
+    );
 
     // A target that does not conform to the target profile fills nothing.
     let mut bad = good.clone();
@@ -474,19 +516,32 @@ fn exists_discriminators_split_by_presence() {
     )]);
     let patient = |ids: Value| json!({"resourceType": "Patient", "identifier": ids});
     let none = validate(&r, &patient(json!([{"value": "1"}])), &[EXISTS]);
-    assert_eq!(errors_of(&none, ErrorKind::SliceCardinality).len(), 1, "{none:#?}");
+    assert_eq!(
+        errors_of(&none, ErrorKind::SliceCardinality).len(),
+        1,
+        "{none:#?}"
+    );
     let one = validate(
         &r,
         &patient(json!([{"value": "1"}, {"value": "2", "period": {"start": "2020"}}])),
         &[EXISTS],
     );
-    assert!(errors_of(&one, ErrorKind::SliceCardinality).is_empty(), "{one:#?}");
+    assert!(
+        errors_of(&one, ErrorKind::SliceCardinality).is_empty(),
+        "{one:#?}"
+    );
     let two = validate(
         &r,
-        &patient(json!([{"value": "1", "period": {"start": "2020"}}, {"value": "2", "period": {"start": "2021"}}])),
+        &patient(
+            json!([{"value": "1", "period": {"start": "2020"}}, {"value": "2", "period": {"start": "2021"}}]),
+        ),
         &[EXISTS],
     );
-    assert_eq!(errors_of(&two, ErrorKind::SliceCardinality).len(), 1, "{two:#?}");
+    assert_eq!(
+        errors_of(&two, ErrorKind::SliceCardinality).len(),
+        1,
+        "{two:#?}"
+    );
 }
 
 /// IPS `Bundle-bundle-minimal`: entries with `urn:uuid:` fullUrls whose
@@ -531,7 +586,11 @@ fn ig_env() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 fn ig_resolver(dir: &std::path::Path) -> Arc<dyn SchemaResolver> {
     let mut registry = SchemaRegistry::new();
     for pkg in std::fs::read_dir(dir).expect("packages dir").flatten() {
-        if pkg.file_name().to_string_lossy().starts_with("hl7.fhir.r4.core") {
+        if pkg
+            .file_name()
+            .to_string_lossy()
+            .starts_with("hl7.fhir.r4.core")
+        {
             continue;
         }
         let Ok(files) = std::fs::read_dir(pkg.path().join("package")) else {
@@ -559,12 +618,22 @@ fn example(corpus: &std::path::Path, file: &str) -> Value {
 }
 
 /// The structural errors HFS reports on one example, as `path: message`.
-fn example_errors(r: &Arc<dyn SchemaResolver>, corpus: &std::path::Path, file: &str) -> Vec<String> {
+fn example_errors(
+    r: &Arc<dyn SchemaResolver>,
+    corpus: &std::path::Path,
+    file: &str,
+) -> Vec<String> {
     let errors = validate(r, &example(corpus, file), &[]);
     errors
         .iter()
         .filter(|e| e.severity == Severity::Error)
-        .map(|e| format!("{}: {}", e.path, e.hl7_message.as_deref().unwrap_or(&e.message)))
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.path,
+                e.hl7_message.as_deref().unwrap_or(&e.message)
+            )
+        })
         .collect()
 }
 
@@ -595,20 +664,46 @@ fn real_examples_agree_with_the_java_validator() {
     }
     // Java: required resolve()-sliced section entries are missing.
     for (file, slice) in [
-        ("tw.gov.mohw.emr/Composition-com-ep.json", "entry:MedicationRequest"),
-        ("tw.gov.mohw.nhi.ngs/Composition-com-min.json", "entry:diagnosticReport"),
-        ("tw.gov.mohw.nhi.empd/Composition-com-01-ep.json", "entry:MedicationRequest"),
-        ("hl7.fhir.uv.ips/Composition-composition-minimal.json", "entry:problem"),
+        (
+            "tw.gov.mohw.emr/Composition-com-ep.json",
+            "entry:MedicationRequest",
+        ),
+        (
+            "tw.gov.mohw.nhi.ngs/Composition-com-min.json",
+            "entry:diagnosticReport",
+        ),
+        (
+            "tw.gov.mohw.nhi.empd/Composition-com-01-ep.json",
+            "entry:MedicationRequest",
+        ),
+        (
+            "hl7.fhir.uv.ips/Composition-composition-minimal.json",
+            "entry:problem",
+        ),
     ] {
         let errors = example_errors(&r, &corpus, file);
-        assert!(errors.iter().any(|e| e.contains(slice)), "{file}: {errors:#?}");
+        assert!(
+            errors.iter().any(|e| e.contains(slice)),
+            "{file}: {errors:#?}"
+        );
     }
     // Java: the IPS Composition entry does not conform, references written
     // relative to urn:uuid fullUrls resolve nowhere, entries are orphans.
     let errors = example_errors(&r, &corpus, "hl7.fhir.uv.ips/Bundle-bundle-minimal.json");
-    assert!(errors.iter().any(|e| e.contains("Bundle.entry:composition")), "{errors:#?}");
-    assert!(errors.iter().any(|e| e.contains("isn't reachable")), "{errors:#?}");
-    assert!(errors.iter().any(|e| e.contains("Can't find 'Patient/")), "{errors:#?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Bundle.entry:composition")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("isn't reachable")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("Can't find 'Patient/")),
+        "{errors:#?}"
+    );
 }
 
 /// Structural errors on every corpus example, written as JSON
@@ -641,7 +736,11 @@ fn real_examples_sweep() {
             report.insert(rel, json!(errors));
         }
     }
-    std::fs::write(out, serde_json::to_vec_pretty(&Value::Object(report)).unwrap()).unwrap();
+    std::fs::write(
+        out,
+        serde_json::to_vec_pretty(&Value::Object(report)).unwrap(),
+    )
+    .unwrap();
 }
 
 const SCOPE_EXT: &str = "http://example.org/StructureDefinition/scope";
@@ -683,20 +782,28 @@ fn extension_slices_with_a_versioned_type_profile_match_the_bare_url() {
         ],
     );
     let r = resolver(&[ext, profile]);
-    let with = json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueBoolean": true}]});
+    let with =
+        json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueBoolean": true}]});
     let errors = validate(&r, &with, &[SCOPED_PATIENT]);
     let mut slicing = errors_of(&errors, ErrorKind::SliceCardinality);
     slicing.extend(errors_of(&errors, ErrorKind::SliceUnmatched));
     assert!(slicing.is_empty(), "{errors:#?}");
     // The slice still applies its definition: a string value is no boolean.
-    let wrong = json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueString": "x"}]});
+    let wrong =
+        json!({"resourceType": "Patient", "extension": [{"url": SCOPE_EXT, "valueString": "x"}]});
     assert!(
-        validate(&r, &wrong, &[SCOPED_PATIENT]).iter().any(|e| e.severity == Severity::Error),
+        validate(&r, &wrong, &[SCOPED_PATIENT])
+            .iter()
+            .any(|e| e.severity == Severity::Error),
         "the matched slice's value type must be checked"
     );
     let without = json!({"resourceType": "Patient", "extension": [{"url": "http://example.org/other", "valueBoolean": true}]});
     assert_eq!(
-        errors_of(&validate(&r, &without, &[SCOPED_PATIENT]), ErrorKind::SliceCardinality).len(),
+        errors_of(
+            &validate(&r, &without, &[SCOPED_PATIENT]),
+            ErrorKind::SliceCardinality
+        )
+        .len(),
         1
     );
 }
@@ -759,7 +866,10 @@ async fn url_and_bound_value_discriminators_split_by_value_set_membership() {
                 json!({"sliceName": name, "min": 0, "max": "1",
                        "type": [{"code": "Extension", "profile": [CATEGORY_EXT]}]}),
             ),
-            ed(&format!("DeviceRequest.extension:{name}.url"), json!({"min": 1, "max": "1"})),
+            ed(
+                &format!("DeviceRequest.extension:{name}.url"),
+                json!({"min": 1, "max": "1"}),
+            ),
             ed(
                 &format!("DeviceRequest.extension:{name}.value[x]"),
                 json!({"min": 0, "max": "1", "type": [{"code": "CodeableConcept"}],
@@ -776,12 +886,16 @@ async fn url_and_bound_value_discriminators_split_by_value_set_membership() {
                                "rules": "open"}}),
         ),
     ];
-    elements.extend(slice("EncounterCategory", "http://example.org/ValueSet/encounter"));
-    elements.extend(slice("ServiceCategory", "http://example.org/ValueSet/service"));
+    elements.extend(slice(
+        "EncounterCategory",
+        "http://example.org/ValueSet/encounter",
+    ));
+    elements.extend(slice(
+        "ServiceCategory",
+        "http://example.org/ValueSet/service",
+    ));
     let r = resolver(&[ext, sd(CATEGORIZED, "DeviceRequest", elements)]);
-    let category = |system: &str, code: &str| {
-        json!({"url": CATEGORY_EXT, "valueCodeableConcept": {"coding": [{"system": system, "code": code}]}})
-    };
+    let category = |system: &str, code: &str| json!({"url": CATEGORY_EXT, "valueCodeableConcept": {"coding": [{"system": system, "code": code}]}});
     let request = |exts: Vec<Value>| {
         json!({"resourceType": "DeviceRequest", "status": "active", "intent": "order",
                "codeCodeableConcept": {"text": "oxygen"}, "subject": {"reference": "Patient/p"},
@@ -836,7 +950,10 @@ fn a_profile_whose_base_is_not_installed_is_validated_by_its_snapshot() {
         "Patient",
         vec![
             ed("Patient", json!({"min": 0, "max": "*"})),
-            ed("Patient.gender", json!({"min": 1, "max": "1", "type": [{"code": "code"}]})),
+            ed(
+                "Patient.gender",
+                json!({"min": 1, "max": "1", "type": [{"code": "code"}]}),
+            ),
         ],
     );
     profile["baseDefinition"] = json!("http://example.org/StructureDefinition/absent-parent");
@@ -847,13 +964,21 @@ fn a_profile_whose_base_is_not_installed_is_validated_by_its_snapshot() {
         errors.iter().all(|e| e.severity != Severity::Error),
         "{errors:#?}"
     );
-    assert!(errors.iter().any(|e| e.kind == ErrorKind::UnknownSchema && e.severity == Severity::Warning));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == ErrorKind::UnknownSchema && e.severity == Severity::Warning)
+    );
     // The snapshot's own constraints still apply.
     let missing = json!({"resourceType": "Patient"});
     assert!(
-        validate(&r, &missing, &["http://example.org/StructureDefinition/child"])
-            .iter()
-            .any(|e| e.severity == Severity::Error && e.path.contains("gender")),
+        validate(
+            &r,
+            &missing,
+            &["http://example.org/StructureDefinition/child"]
+        )
+        .iter()
+        .any(|e| e.severity == Severity::Error && e.path.contains("gender")),
     );
 }
 
@@ -866,35 +991,77 @@ fn a_resource_slot_with_several_typed_profiles_judges_by_resource_type() {
     const APPT: &str = "http://example.org/StructureDefinition/appt";
     const SR: &str = "http://example.org/StructureDefinition/sr";
     const PARAMS: &str = "http://example.org/StructureDefinition/params";
-    let appt = sd(APPT, "Appointment", vec![
-        ed("Appointment", json!({"min": 0, "max": "*"})),
-        ed("Appointment.description", json!({"min": 1, "max": "1", "type": [{"code": "string"}]})),
-    ]);
-    let sr = sd(SR, "ServiceRequest", vec![
-        ed("ServiceRequest", json!({"min": 0, "max": "*"})),
-        ed("ServiceRequest.priority", json!({"min": 1, "max": "1", "type": [{"code": "code"}]})),
-    ]);
-    let params = sd(PARAMS, "Parameters", vec![
-        ed("Parameters", json!({"min": 0, "max": "*"})),
-        ed("Parameters.parameter", json!({"min": 1, "max": "*", "type": [{"code": "BackboneElement"}],
-            "slicing": {"discriminator": [{"type": "value", "path": "name"}], "rules": "open"}})),
-        ed("Parameters.parameter:order", json!({"sliceName": "order", "min": 0, "max": "*", "type": [{"code": "BackboneElement"}]})),
-        ed("Parameters.parameter:order.name", json!({"min": 1, "max": "1", "type": [{"code": "string"}], "fixedString": "order"})),
-        ed("Parameters.parameter:order.resource", json!({"min": 1, "max": "1", "type": [
-            {"code": "Appointment", "profile": [APPT]}, {"code": "ServiceRequest", "profile": [SR]}]})),
-    ]);
+    let appt = sd(
+        APPT,
+        "Appointment",
+        vec![
+            ed("Appointment", json!({"min": 0, "max": "*"})),
+            ed(
+                "Appointment.description",
+                json!({"min": 1, "max": "1", "type": [{"code": "string"}]}),
+            ),
+        ],
+    );
+    let sr = sd(
+        SR,
+        "ServiceRequest",
+        vec![
+            ed("ServiceRequest", json!({"min": 0, "max": "*"})),
+            ed(
+                "ServiceRequest.priority",
+                json!({"min": 1, "max": "1", "type": [{"code": "code"}]}),
+            ),
+        ],
+    );
+    let params = sd(
+        PARAMS,
+        "Parameters",
+        vec![
+            ed("Parameters", json!({"min": 0, "max": "*"})),
+            ed(
+                "Parameters.parameter",
+                json!({"min": 1, "max": "*", "type": [{"code": "BackboneElement"}],
+            "slicing": {"discriminator": [{"type": "value", "path": "name"}], "rules": "open"}}),
+            ),
+            ed(
+                "Parameters.parameter:order",
+                json!({"sliceName": "order", "min": 0, "max": "*", "type": [{"code": "BackboneElement"}]}),
+            ),
+            ed(
+                "Parameters.parameter:order.name",
+                json!({"min": 1, "max": "1", "type": [{"code": "string"}], "fixedString": "order"}),
+            ),
+            ed(
+                "Parameters.parameter:order.resource",
+                json!({"min": 1, "max": "1", "type": [
+            {"code": "Appointment", "profile": [APPT]}, {"code": "ServiceRequest", "profile": [SR]}]}),
+            ),
+        ],
+    );
     let r = resolver(&[appt, sr, params]);
     let with = |resource: Value| json!({"resourceType": "Parameters", "parameter": [{"name": "order", "resource": resource}]});
-    let ok = with(json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
-        "subject": {"reference": "Patient/p"}, "priority": "routine"}));
+    let ok = with(
+        json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/p"}, "priority": "routine"}),
+    );
     let errors = validate(&r, &ok, &[PARAMS]);
-    assert!(errors.iter().all(|e| e.severity != Severity::Error), "{errors:#?}");
-    let bad = with(json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
-        "subject": {"reference": "Patient/p"}}));
+    assert!(
+        errors.iter().all(|e| e.severity != Severity::Error),
+        "{errors:#?}"
+    );
+    let bad = with(
+        json!({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/p"}}),
+    );
     let errors = validate(&r, &bad, &[PARAMS]);
     assert!(
-        errors.iter().any(|e| e.severity == Severity::Error && e.path.contains("priority")),
+        errors
+            .iter()
+            .any(|e| e.severity == Severity::Error && e.path.contains("priority")),
         "the ServiceRequest profile applies: {errors:#?}"
     );
-    assert!(errors.iter().all(|e| !e.path.contains("description")), "{errors:#?}");
+    assert!(
+        errors.iter().all(|e| !e.path.contains("description")),
+        "{errors:#?}"
+    );
 }

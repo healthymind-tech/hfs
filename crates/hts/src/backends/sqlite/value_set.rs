@@ -7081,8 +7081,11 @@ pub(crate) fn record_dependencies(conn: &Connection, vs_id: &str) -> Result<(), 
             }
         }
     }
-    conn.execute("DELETE FROM value_set_dependencies WHERE value_set_id = ?1", [vs_id])
-        .map_err(db)?;
+    conn.execute(
+        "DELETE FROM value_set_dependencies WHERE value_set_id = ?1",
+        [vs_id],
+    )
+    .map_err(db)?;
     let mut insert = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO value_set_dependencies (value_set_id, dep_url) VALUES (?1, ?2)",
@@ -8056,7 +8059,9 @@ fn finish_validate_code_response(
             // pair), result=true, and the `UNKNOWN_CODE_IN_FRAGMENT` message-id —
             // the missing code might still be valid in a different fragment of
             // the same system.
-            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg) && code_unknown_in_cs {
+            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg)
+                && code_unknown_in_cs
+            {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(

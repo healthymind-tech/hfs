@@ -302,11 +302,8 @@ pub(super) fn validate_slices<'a>(
                     let values = binding_slices
                         .iter()
                         .map(|b| {
-                            let precondition = mark
-                                .slicing
-                                .slices
-                                .get(&b.name)
-                                .and_then(binding_pattern);
+                            let precondition =
+                                mark.slicing.slices.get(&b.name).and_then(binding_pattern);
                             if precondition.is_some_and(|p| !is_partial_match(item, p)) {
                                 return Value::Null;
                             }

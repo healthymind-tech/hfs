@@ -74,7 +74,10 @@ pub fn parse_grace(value: Option<&str>, default: std::time::Duration) -> std::ti
             .parse::<u64>()
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(|_| {
-                tracing::warn!(value = raw, "shutdown timeout is not a whole number of seconds; using the default");
+                tracing::warn!(
+                    value = raw,
+                    "shutdown timeout is not a whole number of seconds; using the default"
+                );
                 default
             }),
     }

@@ -1516,7 +1516,9 @@ impl ResourceStorage for PostgresBackend {
         &self,
     ) -> Option<std::sync::Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
         use super::package_jobs::PgPackageJobCoordinator;
-        Some(std::sync::Arc::new(PgPackageJobCoordinator::new(self.pool())))
+        Some(std::sync::Arc::new(PgPackageJobCoordinator::new(
+            self.pool(),
+        )))
     }
 
     fn cluster_change_feed(
@@ -1764,13 +1766,9 @@ impl ResourceStorage for PostgresBackend {
                 Err(StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }))
                 | Err(StorageError::Resource(
                     ResourceError::AlreadyExists { .. } | ResourceError::NotFound { .. },
-                ))
-                    if attempt < ATTEMPTS =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        (attempt as u64) * 5,
-                    ))
-                    .await;
+                )) if attempt < ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis((attempt as u64) * 5))
+                        .await;
                 }
                 other => return other,
             }
@@ -10093,7 +10091,6 @@ impl PostgresBackend {
             Err(e) => Err(e),
         }
     }
-
 }
 
 /// Held while a conditional interaction checks and writes; dropping it

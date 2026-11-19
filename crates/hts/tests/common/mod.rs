@@ -57,12 +57,15 @@ async fn start_http_postgres_for_test()
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
         match container_cleanup::with_cleanup_label(
-            Postgres::default()
-                .with_tag("16-alpine")
-                .with_cmd(["-c", "fsync=off", "-c", "max_connections=2000"]),
+            Postgres::default().with_tag("16-alpine").with_cmd([
+                "-c",
+                "fsync=off",
+                "-c",
+                "max_connections=2000",
+            ]),
         )
-            .start()
-            .await
+        .start()
+        .await
         {
             Ok(c) => return c,
             Err(e) => {

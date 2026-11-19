@@ -207,7 +207,10 @@ async fn login_submit(
     let next = target(next.as_deref());
     let peer = connect.map(|c| c.0.0.ip());
     let i18n = I18n::new(locale);
-    match gate.login_shared(&headers, peer, user.trim(), &password).await {
+    match gate
+        .login_shared(&headers, peer, user.trim(), &password)
+        .await
+    {
         LoginOutcome::Success { set_cookie } => {
             let mut response = Redirect::to(&next).into_response();
             response

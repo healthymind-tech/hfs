@@ -28,11 +28,11 @@ use helios_fhir_validator::{
     TerminologyProvider, TxCheck, TxVerdict, UnknownExtensionPolicy, UnknownProfilePolicy,
     ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
-use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
-use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_observability::redact::redact_url;
 use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use helios_persistence::core::drop_empty_elements;
+use helios_persistence::core::{ExportDataProvider, ExportRequest, ResourceStorage};
+use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
@@ -162,7 +162,8 @@ pub struct ValidationService {
     cache_dirty: tokio::sync::Notify,
     /// Tenant → binding version pins of its installed profiles
     /// ([`crate::packages::pins`]), applied when a profile is registered.
-    binding_pins: RwLock<std::collections::HashMap<String, Arc<crate::packages::pins::ProfilePins>>>,
+    binding_pins:
+        RwLock<std::collections::HashMap<String, Arc<crate::packages::pins::ProfilePins>>>,
 }
 
 impl Default for ValidationService {
@@ -452,8 +453,15 @@ impl ValidationService {
         match self.mode {
             ValidationMode::Off => Ok(()),
             ValidationMode::Log => {
-                for issue in issues.iter().filter(|i| i.severity != Severity::Information) {
-                    let severity = if issue.severity == Severity::Error { "error" } else { "warning" };
+                for issue in issues
+                    .iter()
+                    .filter(|i| i.severity != Severity::Information)
+                {
+                    let severity = if issue.severity == Severity::Error {
+                        "error"
+                    } else {
+                        "warning"
+                    };
                     warn!(
                         tenant = %tenant,
                         resource_type = %resource_type,
@@ -479,7 +487,10 @@ impl ValidationService {
                     })
                 } else {
                     // Warnings only: proceed, but leave a trace.
-                    for issue in issues.iter().filter(|i| i.severity != Severity::Information) {
+                    for issue in issues
+                        .iter()
+                        .filter(|i| i.severity != Severity::Information)
+                    {
                         warn!(
                             tenant = %tenant,
                             resource_type = %resource_type,
@@ -557,15 +568,17 @@ impl ValidationService {
         let pins = {
             let all = self.binding_pins.read().expect("binding pins lock");
             all.get(tenant).and_then(|t| {
-                t.get(&crate::packages::pins::profile_key(url, schema.version.as_deref()))
-                    .or_else(|| t.get(url))
-                    .cloned()
+                t.get(&crate::packages::pins::profile_key(
+                    url,
+                    schema.version.as_deref(),
+                ))
+                .or_else(|| t.get(url))
+                .cloned()
             })
         };
         match pins {
-            Some(pins) => {
-                helios_fhir_validator::schema::pin_binding_versions(&schema, &pins).unwrap_or(schema)
-            }
+            Some(pins) => helios_fhir_validator::schema::pin_binding_versions(&schema, &pins)
+                .unwrap_or(schema),
             None => schema,
         }
     }
@@ -2121,15 +2134,12 @@ impl RemoteTerminologyProvider {
             let body = response.text().await.unwrap_or_default();
             return self.settle(check, key, &url, status, None, &body);
         }
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| {
-                TerminologyError::new(format!(
-                    "invalid $validate-code response: {}",
-                    redact_urls_in(&e.to_string())
-                ))
-            })?;
+        let body: Value = response.json().await.map_err(|e| {
+            TerminologyError::new(format!(
+                "invalid $validate-code response: {}",
+                redact_urls_in(&e.to_string())
+            ))
+        })?;
         let verdict = self.settle(check, key, &url, status, Some(&body), "");
         self.check_unverifiable(check, &body, verdict, language)
             .await
@@ -2861,7 +2871,10 @@ mod cluster_profile_change_tests {
         svc.apply_profile_change("t1", "x1", Some((v, &sd("x1", url))));
         svc.apply_profile_change("t1", "x2", Some((v, &sd("x2", url))));
         svc.apply_profile_change("t1", "x2", None);
-        assert!(resolves(&svc, "t1", url), "the surviving row still resolves");
+        assert!(
+            resolves(&svc, "t1", url),
+            "the surviving row still resolves"
+        );
     }
 }
 

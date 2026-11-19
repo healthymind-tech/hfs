@@ -97,7 +97,11 @@ pub fn spawn_cache_sync(
             match seen {
                 None => seen = Some(epoch),
                 Some(prev) if prev != epoch => {
-                    tracing::debug!(from = prev, to = epoch, "terminology epoch moved; evicting caches");
+                    tracing::debug!(
+                        from = prev,
+                        to = epoch,
+                        "terminology epoch moved; evicting caches"
+                    );
                     evict();
                     seen = Some(epoch);
                     settle = true;

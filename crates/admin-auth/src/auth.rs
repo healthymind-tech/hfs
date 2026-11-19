@@ -12,8 +12,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::client::{IpNet, client_ip};
-use crate::store::{AdminSessionStore, StoredSession};
 use crate::settings::{AdminSettings, CookieSecure, Secret, normalize_origin, strip_default_port};
+use crate::store::{AdminSessionStore, StoredSession};
 
 /// Failed attempts from one client address within [`FAILURE_WINDOW`] that
 /// lock it out for [`LOCKOUT`].
@@ -197,10 +197,7 @@ impl AdminAuth {
     /// call takes effect.
     pub fn attach_store(&self, store: Arc<dyn AdminSessionStore>) {
         if self.store.set(store).is_ok() {
-            tracing::info!(
-                "{} admin sessions are shared across instances",
-                self.prefix
-            );
+            tracing::info!("{} admin sessions are shared across instances", self.prefix);
         }
     }
 
@@ -1022,7 +1019,11 @@ mod tests {
 
     // ------------------------------------------------ cluster-shared state
 
-    fn cluster() -> (AdminAuth, AdminAuth, Arc<crate::store::testing::MemoryStore>) {
+    fn cluster() -> (
+        AdminAuth,
+        AdminAuth,
+        Arc<crate::store::testing::MemoryStore>,
+    ) {
         let store = Arc::new(crate::store::testing::MemoryStore::default());
         let (a, b) = (auth(), auth());
         a.attach_store(store.clone());
@@ -1057,7 +1058,10 @@ mod tests {
     async fn a_session_from_one_instance_works_on_another_and_signs_out_everywhere() {
         let (a, b, _store) = cluster();
         let form = headers(&[("host", "hfs.example"), ("origin", "https://hfs.example")]);
-        let cookie = signed_in_cookie(&a, a.login_shared(&form, None, "admin", "correct horse").await);
+        let cookie = signed_in_cookie(
+            &a,
+            a.login_shared(&form, None, "admin", "correct horse").await,
+        );
 
         assert_eq!(
             b.authorize(&Method::GET, &cookie, None).unwrap_err(),
@@ -1065,7 +1069,10 @@ mod tests {
             "without the store B does not know the cookie"
         );
         b.sync_request(&cookie, None).await;
-        assert_eq!(b.authorize(&Method::GET, &cookie, None).unwrap().via, Via::Session);
+        assert_eq!(
+            b.authorize(&Method::GET, &cookie, None).unwrap().via,
+            Via::Session
+        );
         assert_eq!(b.session_user(&cookie).as_deref(), Some("admin"));
 
         b.logout_shared(&cookie).await;
@@ -1114,7 +1121,10 @@ mod tests {
         let a = auth();
         assert!(!a.has_shared_store());
         let form = headers(&[("host", "hfs.example"), ("origin", "https://hfs.example")]);
-        let cookie = signed_in_cookie(&a, a.login_shared(&form, None, "admin", "correct horse").await);
+        let cookie = signed_in_cookie(
+            &a,
+            a.login_shared(&form, None, "admin", "correct horse").await,
+        );
         a.sync_request(&cookie, None).await;
         assert_eq!(a.session_user(&cookie).as_deref(), Some("admin"));
     }

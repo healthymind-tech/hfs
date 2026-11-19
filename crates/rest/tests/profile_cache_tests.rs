@@ -139,7 +139,11 @@ async fn warm_restart_registers_cached_profiles_and_reconciles_changes() {
         let state = helios_rest::AppState::new(env.backend(), env.config(false));
         let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
             .expect("server");
-        for (id, required) in [("p-a", "birthDate"), ("p-b", "birthDate"), ("p-c", "gender")] {
+        for (id, required) in [
+            ("p-a", "birthDate"),
+            ("p-b", "birthDate"),
+            ("p-c", "gender"),
+        ] {
             let response = server
                 .put(&format!("/StructureDefinition/{id}"))
                 .json(&profile(id, required))
@@ -165,7 +169,12 @@ async fn warm_restart_registers_cached_profiles_and_reconciles_changes() {
     // Warm start: all three come from the cache, nothing is converted.
     let (server, report, backend) = env.boot().await;
     assert_eq!(
-        (report.cached, report.converted, report.registered, report.removed),
+        (
+            report.cached,
+            report.converted,
+            report.registered,
+            report.removed
+        ),
         (3, 0, 3, 0),
         "{report:?}"
     );
@@ -204,7 +213,11 @@ async fn warm_restart_registers_cached_profiles_and_reconciles_changes() {
         Some("Patient.gender"),
         "the changed definition replaced the cached one"
     );
-    assert_eq!(enforced(&server, "p-b").await, None, "deleted stays deleted");
+    assert_eq!(
+        enforced(&server, "p-b").await,
+        None,
+        "deleted stays deleted"
+    );
     drop(server);
 
     // And the reconciled state was written back.
@@ -265,10 +278,7 @@ async fn cold_rehydration_only_blocks_validations_that_miss_a_definition() {
         "a core-only validation must not wait for rehydration ({:?})",
         started.elapsed()
     );
-    assert!(
-        !helios_rest::validation::has_errors(&issues),
-        "{issues:?}"
-    );
+    assert!(!helios_rest::validation::has_errors(&issues), "{issues:?}");
 
     // A missing profile does wait (here until the pass is released).
     let validation = Arc::new(validation);
@@ -288,7 +298,10 @@ async fn cold_rehydration_only_blocks_validations_that_miss_a_definition() {
         })
     };
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(!waiter.is_finished(), "a missing profile waits for the pass");
+    assert!(
+        !waiter.is_finished(),
+        "a missing profile waits for the pass"
+    );
     // Finishing the (empty) pass releases it.
     let env = Env::new();
     validation

@@ -50,9 +50,11 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| {
-                Arc::new(CoreTerminology::from_gz(R4_TX, FhirVersion::R4, "4.0"))
-            }))
+            Arc::clone(
+                TX.get_or_init(|| {
+                    Arc::new(CoreTerminology::from_gz(R4_TX, FhirVersion::R4, "4.0"))
+                }),
+            )
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
@@ -64,16 +66,20 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| {
-                Arc::new(CoreTerminology::from_gz(R5_TX, FhirVersion::R5, "5.0"))
-            }))
+            Arc::clone(
+                TX.get_or_init(|| {
+                    Arc::new(CoreTerminology::from_gz(R5_TX, FhirVersion::R5, "5.0"))
+                }),
+            )
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| {
-                Arc::new(CoreTerminology::from_gz(R6_TX, FhirVersion::R6, "6.0"))
-            }))
+            Arc::clone(
+                TX.get_or_init(|| {
+                    Arc::new(CoreTerminology::from_gz(R6_TX, FhirVersion::R6, "6.0"))
+                }),
+            )
         }
         // Feature unification can add FhirVersion variants beyond the packs
         // this crate was built with: `helios-audit`'s R5/R6 features enable

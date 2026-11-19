@@ -13,10 +13,10 @@ mod common;
 use std::io::Write;
 use std::sync::Arc;
 
+use axum::Router;
 use helios_hts::backends::SqliteTerminologyBackend;
 use helios_hts::import::loinc_csv::{backfill_loinc_properties, import_loinc_csv};
 use helios_hts::import::{BundleImportBackend, LanguageFilter};
-use axum::Router;
 use helios_hts::traits::{TerminologyBackend, ValueSetOperations};
 use helios_hts::types::{ExpandRequest, LookupRequest, ValidateCodeRequest};
 use helios_persistence::tenant::TenantContext;
@@ -39,19 +39,15 @@ async fn backends() -> Vec<(&'static str, Backend, Router, Option<tempfile::Temp
     let path = dir.path().join("hts.db");
     let sqlite = SqliteTerminologyBackend::new(path.to_str().unwrap()).unwrap();
     let config = helios_hts::config::HtsConfig::default();
-    let router = helios_hts::server::create_app(
-        &config,
-        helios_hts::state::AppState::new(sqlite.clone()),
-    );
+    let router =
+        helios_hts::server::create_app(&config, helios_hts::state::AppState::new(sqlite.clone()));
     #[allow(unused_mut)]
     let mut out: Vec<(&'static str, Backend, Router, Option<tempfile::TempDir>)> =
         vec![("sqlite", Arc::new(sqlite), router, Some(dir))];
     #[cfg(feature = "postgres")]
     {
         let url = common::fresh_pg_database().await;
-        let pg = common::pg_hts_backend(&url)
-            .await
-            .unwrap();
+        let pg = common::pg_hts_backend(&url).await.unwrap();
         let router =
             helios_hts::server::create_app(&config, helios_hts::state::AppState::new(pg.clone()));
         out.push(("postgres", Arc::new(pg), router, None));
@@ -161,10 +157,19 @@ fn full_zip() -> tempfile::NamedTempFile {
     let supplementary = supplementary_links();
     zip(&[
         ("LoincTable/Loinc.csv", LOINC_CSV),
-        ("AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv", HIERARCHY_CSV),
+        (
+            "AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv",
+            HIERARCHY_CSV,
+        ),
         ("AccessoryFiles/PartFile/Part.csv", PART_CSV),
-        ("AccessoryFiles/PartFile/LoincPartLink_Primary.csv", &primary),
-        ("AccessoryFiles/PartFile/LoincPartLink_Supplementary.csv", &supplementary),
+        (
+            "AccessoryFiles/PartFile/LoincPartLink_Primary.csv",
+            &primary,
+        ),
+        (
+            "AccessoryFiles/PartFile/LoincPartLink_Supplementary.csv",
+            &supplementary,
+        ),
     ])
 }
 
@@ -295,7 +300,11 @@ async fn assert_properties(name: &str, b: &Backend, app: &Router) {
         "{name}: CLASSTYPE"
     );
     assert_eq!(
-        expand_inline(b, vec![include(vec![filter("ORDER_OBS", "=", "Observation")])]).await,
+        expand_inline(
+            b,
+            vec![include(vec![filter("ORDER_OBS", "=", "Observation")])]
+        )
+        .await,
         ["29545-1"],
         "{name}: ORDER_OBS"
     );
@@ -316,8 +325,14 @@ async fn assert_properties(name: &str, b: &Backend, app: &Router) {
     b.import_bundle(&ctx(), &serde_json::to_vec(&vs).unwrap())
         .await
         .unwrap();
-    assert!(validates(b, "http://example.org/vs/doc-types", "34133-9").await, "{name}");
-    assert!(!validates(b, "http://example.org/vs/doc-types", "718-7").await, "{name}");
+    assert!(
+        validates(b, "http://example.org/vs/doc-types", "34133-9").await,
+        "{name}"
+    );
+    assert!(
+        !validates(b, "http://example.org/vs/doc-types", "718-7").await,
+        "{name}"
+    );
 
     // $lookup: Coding properties, without the search links.
     let term = b
@@ -336,9 +351,18 @@ async fn assert_properties(name: &str, b: &Backend, app: &Router) {
         .iter()
         .map(|p| (p.code.as_str(), p.value_type.as_str(), p.value.as_str()))
         .collect();
-    assert!(props.contains(&("SCALE_TYP", "coding", "LP32888-7")), "{name}: {props:?}");
-    assert!(props.contains(&("CLASS", "coding", "LP32519-8")), "{name}: {props:?}");
-    assert!(props.contains(&("CLASSTYPE", "string", "2")), "{name}: {props:?}");
+    assert!(
+        props.contains(&("SCALE_TYP", "coding", "LP32888-7")),
+        "{name}: {props:?}"
+    );
+    assert!(
+        props.contains(&("CLASS", "coding", "LP32519-8")),
+        "{name}: {props:?}"
+    );
+    assert!(
+        props.contains(&("CLASSTYPE", "string", "2")),
+        "{name}: {props:?}"
+    );
     assert_eq!(
         props.iter().filter(|p| p.0 == "SCALE_TYP").count(),
         1,
@@ -396,7 +420,11 @@ async fn assert_properties(name: &str, b: &Backend, app: &Router) {
         "{name}: a wrong display is still wrong: {wrong}"
     );
     // $lookup renders the part links as Codings of LOINC.
-    let lookup = get_json(app, "/CodeSystem/$lookup?system=http://loinc.org&code=34133-9").await;
+    let lookup = get_json(
+        app,
+        "/CodeSystem/$lookup?system=http://loinc.org&code=34133-9",
+    )
+    .await;
     let scale = lookup["parameter"]
         .as_array()
         .unwrap()
@@ -454,16 +482,23 @@ async fn backfill_adds_properties_to_an_existing_import_idempotently() {
         import_without_properties(&b, &full).await;
         let before = property_count(&b, "34133-9").await;
         assert!(
-            expand_inline(&b, vec![include(vec![filter("SCALE_TYP", "=", "LP32888-7")])])
-                .await
-                .is_empty(),
+            expand_inline(
+                &b,
+                vec![include(vec![filter("SCALE_TYP", "=", "LP32888-7")])]
+            )
+            .await
+            .is_empty(),
             "{name}: no properties before the backfill"
         );
         // Dry run writes nothing.
         backfill_loinc_properties(&*b, &ctx(), full.path(), 1000, true)
             .await
             .unwrap();
-        assert_eq!(property_count(&b, "34133-9").await, before, "{name}: dry run");
+        assert_eq!(
+            property_count(&b, "34133-9").await,
+            before,
+            "{name}: dry run"
+        );
         let mut counts = Vec::new();
         for _ in 0..2 {
             // Batch size 1 → several write calls; only the first clears.
@@ -474,7 +509,10 @@ async fn backfill_adds_properties_to_an_existing_import_idempotently() {
             counts.push(property_count(&b, "34133-9").await);
         }
         assert!(counts[0] > before, "{name}: {counts:?}");
-        assert_eq!(counts[0], counts[1], "{name}: a rerun replaces, not duplicates");
+        assert_eq!(
+            counts[0], counts[1],
+            "{name}: a rerun replaces, not duplicates"
+        );
         let designations = b
             .concept_designations(&ctx(), "http://loinc.org", &["LP7057-5".to_string()])
             .await
@@ -522,10 +560,19 @@ fn zip_with_short_names() -> tempfile::NamedTempFile {
     let supplementary = supplementary_links();
     zip(&[
         ("LoincTable/Loinc.csv", &loinc),
-        ("AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv", HIERARCHY_CSV),
+        (
+            "AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv",
+            HIERARCHY_CSV,
+        ),
         ("AccessoryFiles/PartFile/Part.csv", PART_CSV),
-        ("AccessoryFiles/PartFile/LoincPartLink_Primary.csv", &primary),
-        ("AccessoryFiles/PartFile/LoincPartLink_Supplementary.csv", &supplementary),
+        (
+            "AccessoryFiles/PartFile/LoincPartLink_Primary.csv",
+            &primary,
+        ),
+        (
+            "AccessoryFiles/PartFile/LoincPartLink_Supplementary.csv",
+            &supplementary,
+        ),
     ])
 }
 
@@ -562,7 +609,10 @@ async fn backfill_adds_short_names_to_an_earlier_import_once() {
         backfill_loinc_properties(&*b, &ctx(), current.path(), 1000, true)
             .await
             .unwrap();
-        assert!(designation_values(&b, "718-7").await.is_empty(), "{name}: dry run");
+        assert!(
+            designation_values(&b, "718-7").await.is_empty(),
+            "{name}: dry run"
+        );
         let before = property_count(&b, "718-7").await;
         for _ in 0..2 {
             let stats = backfill_loinc_properties(&*b, &ctx(), current.path(), 1, false)
@@ -579,7 +629,11 @@ async fn backfill_adds_short_names_to_an_earlier_import_once() {
             designation_values(&b, "29545-1").await.is_empty(),
             "{name}: a short name equal to the display is not a designation"
         );
-        assert_eq!(designation_values(&b, "LP7057-5").await, bld_before, "{name}");
+        assert_eq!(
+            designation_values(&b, "LP7057-5").await,
+            bld_before,
+            "{name}"
+        );
         assert_eq!(bld_before, vec!["Bld".to_string()], "{name}");
         assert_eq!(property_count(&b, "718-7").await, before, "{name}");
         let checked = get_json(
@@ -608,10 +662,22 @@ async fn import_stores_short_names_as_designations() {
             "{name}"
         );
         assert!(designation_values(&b, "29545-1").await.is_empty(), "{name}");
-        assert_eq!(designation_values(&b, "LP7057-5").await, vec!["Bld".to_string()], "{name}");
+        assert_eq!(
+            designation_values(&b, "LP7057-5").await,
+            vec!["Bld".to_string()],
+            "{name}"
+        );
         // Without properties the displays stay.
         import_without_properties(&b, &file).await;
-        assert_eq!(designation_values(&b, "718-7").await, vec!["Hgb Bld-mCnc".to_string()], "{name}");
-        assert_eq!(designation_values(&b, "LP7057-5").await, vec!["Bld".to_string()], "{name}");
+        assert_eq!(
+            designation_values(&b, "718-7").await,
+            vec!["Hgb Bld-mCnc".to_string()],
+            "{name}"
+        );
+        assert_eq!(
+            designation_values(&b, "LP7057-5").await,
+            vec!["Bld".to_string()],
+            "{name}"
+        );
     }
 }

@@ -31,7 +31,10 @@ use std::sync::Arc;
 
 use axum::http::{HeaderValue, header};
 use helios_admin_auth::{AdminGate, Guard, Style, is_read_only, under};
-use helios_auth::{Access, AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache, Principal, SmartPermissions};
+use helios_auth::{
+    Access, AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache, Principal,
+    SmartPermissions,
+};
 use serde_json::Value;
 
 /// The terminology resource types writes act on.
@@ -51,7 +54,11 @@ pub fn bearer_provider_from_env() -> Option<Arc<dyn AuthProvider>> {
 pub fn bearer_provider_from_lookup(
     get: impl Fn(&str) -> Option<String>,
 ) -> Option<Arc<dyn AuthProvider>> {
-    let var = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let var = |k: &str| {
+        get(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
     let jwks_url = var("HTS_AUTH_JWKS_URL")?;
     let Some(issuer) = var("HTS_AUTH_ISSUER") else {
         tracing::error!(
@@ -88,7 +95,11 @@ pub fn bearer_provider_from_lookup(
 
 /// Whether an `Authorization` value is a bearer JWT (`eyJ…`, three parts).
 fn jwt_bearer(request: &Request) -> Option<String> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let token = value.strip_prefix("Bearer ")?;
     (token.starts_with("eyJ") && token.split('.').count() == 3).then(|| value.to_string())
 }
@@ -342,16 +353,27 @@ mod tests {
         assert!(bearer_may_write(&all, &Method::POST, "/ValueSet/x/$new-op"));
 
         // Patient context and read-only scopes never write terminology.
-        assert!(!bearer_may_write(&principal("patient/*.cruds"), &Method::POST, "/CodeSystem"));
-        assert!(!bearer_may_write(&principal("system/*.rs"), &Method::POST, "/CodeSystem"));
+        assert!(!bearer_may_write(
+            &principal("patient/*.cruds"),
+            &Method::POST,
+            "/CodeSystem"
+        ));
+        assert!(!bearer_may_write(
+            &principal("system/*.rs"),
+            &Method::POST,
+            "/CodeSystem"
+        ));
     }
 
     #[test]
     fn bearer_provider_needs_an_issuer() {
         assert!(bearer_provider_from_lookup(|_| None).is_none());
-        assert!(bearer_provider_from_lookup(|k| (k == "HTS_AUTH_JWKS_URL")
-            .then(|| "https://idp/jwks".to_string()))
-        .is_none());
+        assert!(
+            bearer_provider_from_lookup(
+                |k| (k == "HTS_AUTH_JWKS_URL").then(|| "https://idp/jwks".to_string())
+            )
+            .is_none()
+        );
     }
 
     #[test]

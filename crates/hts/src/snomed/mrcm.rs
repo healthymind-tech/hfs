@@ -18,7 +18,11 @@ use super::scg::{Attribute, AttributeValue, Concrete, SubExpression, render_sub_
 /// expression: ").
 pub fn check(m: &SnomedModel, e: &SubExpression) -> Result<(), String> {
     let idx = |id: &str| m.idx(id).ok_or_else(|| format!("Concept {id} not found"));
-    let foci: Vec<u32> = e.focus.iter().map(|f| idx(&f.id)).collect::<Result<_, _>>()?;
+    let foci: Vec<u32> = e
+        .focus
+        .iter()
+        .map(|f| idx(&f.id))
+        .collect::<Result<_, _>>()?;
     let mut counts: Vec<(u32, u32)> = Vec::new();
     let all = e
         .ungrouped
@@ -110,7 +114,9 @@ fn domain<'m>(
     t: u32,
     foci: &[u32],
 ) -> Result<Option<&'m super::model::DomainRule>, String> {
-    let Some(rules) = m.domains.get(&t) else { return Ok(None) };
+    let Some(rules) = m.domains.get(&t) else {
+        return Ok(None);
+    };
     let focus_label = foci.first().map(|&f| m.label(f)).unwrap_or_default();
     let (refsets, concepts): (Vec<_>, Vec<_>) = rules.iter().partition(|r| m.is_refset(r.domain));
     for r in &refsets {
@@ -145,15 +151,22 @@ fn domain<'m>(
 
 fn value_label(m: &SnomedModel, a: &Attribute) -> String {
     match &a.value {
-        AttributeValue::Concept(c) => m.idx(&c.id).map(|i| m.label(i)).unwrap_or_else(|| c.id.clone()),
+        AttributeValue::Concept(c) => m
+            .idx(&c.id)
+            .map(|i| m.label(i))
+            .unwrap_or_else(|| c.id.clone()),
         AttributeValue::Expression(x) => format!("({})", render_sub_plain(x)),
         AttributeValue::Concrete(c) => c.render(),
     }
 }
 
 fn range(m: &SnomedModel, t: u32, a: &Attribute) -> Result<(), String> {
-    let Some(rules) = m.ranges.get(&t) else { return Ok(()) };
-    let Some(rule) = rules.first() else { return Ok(()) };
+    let Some(rules) = m.ranges.get(&t) else {
+        return Ok(());
+    };
+    let Some(rule) = rules.first() else {
+        return Ok(());
+    };
     let c = rule.constraint.trim();
     let refuse = || {
         Err(format!(
@@ -165,7 +178,9 @@ fn range(m: &SnomedModel, t: u32, a: &Attribute) -> Result<(), String> {
     if let Some(ok) = concrete_range(c, &a.value) {
         return if ok { Ok(()) } else { refuse() };
     }
-    let Ok(constraint) = ecl::parse(c) else { return Ok(()) };
+    let Ok(constraint) = ecl::parse(c) else {
+        return Ok(());
+    };
     let mut ev = Evaluator::new(m);
     let ok = match &a.value {
         AttributeValue::Concept(x) => match m.idx(&x.id) {
@@ -188,7 +203,9 @@ fn concrete_range(constraint: &str, value: &AttributeValue) -> Option<bool> {
         .iter()
         .find_map(|k| constraint.strip_prefix(k).map(|r| (&k[..k.len() - 1], r)))?;
     let inner = inner.trim_end().strip_suffix(')').unwrap_or(inner).trim();
-    let AttributeValue::Concrete(c) = value else { return Some(false) };
+    let AttributeValue::Concrete(c) = value else {
+        return Some(false);
+    };
     Some(match (kind, c) {
         ("int", Concrete::Integer(i)) => in_range(inner, *i as f64),
         ("dec", Concrete::Integer(i)) => in_range(inner, *i as f64),
@@ -207,7 +224,10 @@ fn in_range(spec: &str, x: f64) -> bool {
     }
     spec.split_whitespace().any(|r| {
         let Some((lo, hi)) = r.split_once("..") else {
-            return r.trim_start_matches('#').parse::<f64>().is_ok_and(|v| v == x);
+            return r
+                .trim_start_matches('#')
+                .parse::<f64>()
+                .is_ok_and(|v| v == x);
         };
         let bound = |s: &str, strict_mark: char| -> Option<(f64, bool)> {
             let strict = s.starts_with(strict_mark);
@@ -235,12 +255,21 @@ mod tests {
     #[test]
     fn concrete_ranges() {
         let v = |c| AttributeValue::Concrete(c);
-        assert_eq!(concrete_range("dec(>#0..)", &v(Concrete::Integer(500))), Some(true));
-        assert_eq!(concrete_range("dec(>#0..)", &v(Concrete::Integer(0))), Some(false));
+        assert_eq!(
+            concrete_range("dec(>#0..)", &v(Concrete::Integer(500))),
+            Some(true)
+        );
+        assert_eq!(
+            concrete_range("dec(>#0..)", &v(Concrete::Integer(0))),
+            Some(false)
+        );
         assert_eq!(
             concrete_range("int(>#0..)", &v(Concrete::Decimal("2.5".into(), 2.5))),
             Some(false)
         );
-        assert_eq!(concrete_range("<< 182353008", &v(Concrete::Integer(1))), None);
+        assert_eq!(
+            concrete_range("<< 182353008", &v(Concrete::Integer(1))),
+            None
+        );
     }
 }

@@ -57,7 +57,10 @@ impl Drop for PgLockGuard {
             Ok(handle) => {
                 handle.spawn(async move {
                     if let Err(e) = client
-                        .execute("SELECT pg_advisory_unlock($1, $2)", &[&LOCK_NAMESPACE, &key])
+                        .execute(
+                            "SELECT pg_advisory_unlock($1, $2)",
+                            &[&LOCK_NAMESPACE, &key],
+                        )
                         .await
                     {
                         tracing::warn!(error = %e, "releasing the package install lock failed");

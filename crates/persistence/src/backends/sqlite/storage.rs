@@ -6815,7 +6815,9 @@ mod tests {
             .filter(|s| !s.starts_with("--") && s != "SELECT 1;")
             // The tenant's stored-SearchParameter registry load (first write of
             // a tenant, outside the transaction) is not part of the create.
-            .filter(|s| !s.starts_with("SELECT data FROM resources WHERE resource_type = 'SearchParameter'"))
+            .filter(|s| {
+                !s.starts_with("SELECT data FROM resources WHERE resource_type = 'SearchParameter'")
+            })
             .collect();
         let begins = log.iter().filter(|s| s.starts_with("BEGIN")).count();
         let commits = log.iter().filter(|s| s.starts_with("COMMIT")).count();
@@ -12025,7 +12027,11 @@ mod tests {
             .expect("transaction PUT to a deleted id");
         assert_eq!(result.entries[0].status, 201, "{:?}", result.entries[0]);
 
-        let stored = backend.read(&tenant, "Patient", "lazarus").await.unwrap().unwrap();
+        let stored = backend
+            .read(&tenant, "Patient", "lazarus")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.version_id(), "3", "create 1, delete 2, resurrect 3");
         assert_eq!(stored.content()["name"][0]["family"], "Back");
         let history = backend

@@ -659,7 +659,10 @@ pub(super) fn add_schemas_to_set(
             {
                 ctx.error_with_severity(
                     ErrorKind::UnknownSchema,
-                    errors::msg_unknown_base_profile(&base, &schema.url.clone().unwrap_or_default()),
+                    errors::msg_unknown_base_profile(
+                        &base,
+                        &schema.url.clone().unwrap_or_default(),
+                    ),
                     Severity::Warning,
                 )
             }
