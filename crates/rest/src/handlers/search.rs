@@ -21,7 +21,7 @@ use helios_persistence::core::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-use helios_persistence::error::{SearchError, StorageError};
+use helios_persistence::error::{SearchError, TerminologyFailureKind};
 use helios_persistence::search::{
     TerminologyExpander, TerminologyExpansion, param_requires_terminology, validate_modifier,
 };
@@ -36,13 +36,15 @@ use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
 use crate::extractors::{
     SearchParams, TenantExtractor, build_search_query_for_version, unknown_search_params,
+    validate_chained_params,
 };
-use crate::middleware::content_type::{FhirFormat, negotiate_format};
+use crate::middleware::content_type::{FhirFormat, get_accept_fhir_version, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
-use crate::terminology::TerminologyServiceClient;
+use crate::terminology::{ExpandedCode, ExpansionFailurePolicy, SearchTerminology};
 
 /// Handler for GET search.
 ///
@@ -59,6 +61,7 @@ pub async fn search_get_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -75,15 +78,17 @@ where
 
     let format_param = last_value(&pairs, "_format");
     let negotiated = negotiate_format(&req_headers, format_param.as_deref());
-    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let handling = Handling::from_headers(&req_headers);
 
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
-        strict,
+        handling,
+        get_accept_fhir_version(&req_headers),
     )
     .await
 }
@@ -101,6 +106,7 @@ pub async fn search_post_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawForm(form): RawForm,
 ) -> RestResult<Response>
@@ -117,15 +123,17 @@ where
     );
 
     let negotiated = negotiate_format(&req_headers, None);
-    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let handling = Handling::from_headers(&req_headers);
 
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
-        strict,
+        handling,
+        get_accept_fhir_version(&req_headers),
     )
     .await
 }
@@ -194,20 +202,155 @@ where
     execute_system_search(&state, tenant, pairs, negotiated.format).await
 }
 
+/// Whether `_in` (List/Group membership) exists in `version`: R5 and R6 only.
+pub(crate) fn membership_supported(version: helios_fhir::FhirVersion) -> bool {
+    matches!(version.as_mime_param(), "5.0" | "6.0")
+}
+
+/// Refuses the `_in` forms this server does not resolve, from the raw query
+/// pairs: a chained `_in` (`patient._in`) is never answered (nor is a `_has`
+/// terminal `_in`, which the query builder refuses), and a `CareTeam`
+/// container (`_in=CareTeam/1`, `_in:CareTeam`) is valid in the spec but not
+/// implemented. Without this a chained `_in` would
+/// slip past the unknown-parameter check (it is judged by its first segment) and
+/// reach a backend unresolved.
+pub(crate) fn validate_membership_params(
+    pairs: &[(String, String)],
+    version: helios_fhir::FhirVersion,
+) -> RestResult<()> {
+    for (key, value) in pairs {
+        let base = |name: &str| name.split(':').next().unwrap_or(name).to_string();
+        // A `_has` terminal `_in` (`_has:…:_in`, `patient._has:…:_in:List`)
+        // is refused where the `_has` is parsed, from its parsed terminal.
+        let chained = key.contains('.') && base(key.rsplit('.').next().unwrap_or(key)) == "_in";
+        if chained {
+            return Err(RestError::InvalidParameter {
+                param: key.clone(),
+                message: format!(
+                    "'_in' cannot be used in a chained or reverse-chained search ('{key}')"
+                ),
+            });
+        }
+        if membership_supported(version) && base(key) == "_in" {
+            let care_team = key.split_once(':').is_some_and(|(_, m)| m == "CareTeam")
+                || value.split(',').any(|v| v.contains("CareTeam/"));
+            if care_team {
+                return Err(RestError::NotImplemented {
+                    feature: "'_in' with a CareTeam is not supported; use a List or Group"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `_in` filters into an `_id` filter on R5/R6; otherwise returns the
+/// query unchanged.
+pub(crate) async fn resolve_membership<S>(
+    storage: &S,
+    tenant: &helios_persistence::tenant::TenantContext,
+    query: helios_persistence::types::SearchQuery,
+    version: helios_fhir::FhirVersion,
+) -> RestResult<helios_persistence::types::SearchQuery>
+where
+    S: ResourceStorage + ?Sized,
+{
+    if !membership_supported(version) || !helios_persistence::search::query_has_in(&query) {
+        return Ok(query);
+    }
+    helios_persistence::search::resolve_in(storage, tenant, &query)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Membership (_in) resolution failed");
+            RestError::from(e)
+        })
+}
+
 /// Executes a type-level search and returns a Bundle response.
+#[allow(clippy::too_many_arguments)]
 async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
-    strict: bool,
+    handling: Handling,
+    requested_version: Option<FhirVersion>,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    let bundle_json = execute_search_bundle_with(
+        state,
+        &tenant,
+        compartment,
+        resource_type,
+        pairs,
+        handling,
+        requested_version,
+    )
+    .await?;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format)
+}
+
+/// The search's `Prefer: handling` (FHIR search error handling).
+///
+/// Without the header the server still ignores, and reports, a search
+/// parameter it does not know; it refuses a result parameter whose value it
+/// cannot honour (`_sort`, `_total`). `lenient` ignores and reports both,
+/// `strict` refuses both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handling {
+    /// No `handling` preference.
+    Default,
+    /// `Prefer: handling=strict`.
+    Strict,
+    /// `Prefer: handling=lenient`.
+    Lenient,
+}
+
+impl Handling {
+    /// The preference a request's headers state.
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        match PreferHeader::from_headers(headers).handling() {
+            Some("strict") => Handling::Strict,
+            Some("lenient") => Handling::Lenient,
+            _ => Handling::Default,
+        }
+    }
+}
+
+/// [`execute_search_bundle_with`] for a caller that only distinguishes
+/// strict handling (bundle entries carry no `Prefer` of their own).
+pub(crate) async fn execute_search_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    resource_type: &str,
+    pairs: Vec<(String, String)>,
+    strict: bool,
+    requested_version: Option<FhirVersion>,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+{
+    let handling = if strict {
+        Handling::Strict
+    } else {
+        Handling::Default
+    };
+    execute_search_bundle_with(
+        state,
+        tenant,
+        compartment,
+        resource_type,
+        pairs,
+        handling,
+        requested_version,
+    )
+    .await
 }
 
 /// Executes a type-level search and returns the searchset Bundle as JSON.
@@ -215,23 +358,34 @@ where
 /// The HTTP search handlers wrap this in content negotiation; bundle
 /// processing (`GET [type]?params` entries in batch/transaction Bundles,
 /// #478) embeds the returned Bundle as an entry resource.
-pub(crate) async fn execute_search_bundle<S>(
+///
+/// Under a compartment-confined grant (`patient/` scope, #1618) `compartment`
+/// filters the query to the launch patient's compartment and drops included
+/// resources outside it; see [`PatientCompartment`].
+pub(crate) async fn execute_search_bundle_with<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
-    strict: bool,
+    handling: Handling,
+    requested_version: Option<FhirVersion>,
 ) -> RestResult<serde_json::Value>
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let strict = handling == Handling::Strict;
+    let lenient = handling == Handling::Lenient;
+    // A search resolves in the version the client named with the `fhirVersion`
+    // MIME parameter on `Accept`, else in the server default (#2254). Naming
+    // one also restricts the matches to resources stored under it (set on the
+    // query below); naming none keeps the version-blind search.
+    let fhir_version = requested_version.unwrap_or(state.config().default_fhir_version);
     // Direct requests were already judged by the router's resource-type gate
     // (`middleware::resource_type`); a `GET [type]?[params]` entry inside a
     // batch or transaction Bundle arrives here without passing through it, and
     // must not answer an unknown type with an empty `200` searchset either
-    // (#989). Searches resolve against the server default version (see the
-    // subsetting below), so the type is judged against that same version.
-    let fhir_version = state.config().default_fhir_version;
+    // (#989). The type is judged against the version the search resolves in.
     if !crate::fhir_types::is_valid_resource_type_for_version(resource_type, fhir_version) {
         return Err(RestError::UnknownResourceType {
             resource_type: resource_type.to_string(),
@@ -245,19 +399,14 @@ where
     // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
     // `_containedType` are parsed below and gated per backend capability.)
     //
-    // `_in` (R5/R6) asks whether a resource is a member of a referenced List or
-    // Group; resolving that is not implemented (#638). It cannot be left to fall
-    // through, because it *is* a registered parameter of type `reference` on
-    // those versions — so `Prefer: handling=lenient` would not drop it, and the
-    // backends would answer it with whatever their reference path makes of the
-    // spec's placeholder `Resource.id` expression: an identity test on
-    // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
-    // membership.
+    // `_in` (R5/R6) is not rejected here: it is resolved application-side into an
+    // `_id` filter below (#638). On R4/R4B it is not a search parameter at all
+    // and takes the unknown-parameter path.
     // A parameter with no value (`family=`) is ignored, per FHIR; from here on
     // it is as if the client had not sent it (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
 
-    const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
+    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
@@ -267,6 +416,8 @@ where
             message: format!("search parameter '{key}' is not supported by this server"),
         });
     }
+
+    validate_membership_params(&pairs, fhir_version)?;
 
     // A terminology-backed modifier (`:in` / `:not-in` / `:above` / `:below`)
     // the parameter's type does not define is a client error — `name:in`,
@@ -318,25 +469,10 @@ where
         }
     }
 
-    // `:not-in` requires negated value-set filtering, which no backend
-    // implements. Reject it explicitly (501) regardless of whether a terminology
-    // server is configured, rather than silently ignoring it (which would return
-    // a superset of the intended results).
-    if let Some((key, _)) = pairs
-        .iter()
-        .find(|(k, _)| k.ends_with(":not-in") && !is_chained_key(k))
-    {
-        return Err(RestError::NotImplemented {
-            feature: format!(
-                "search modifier ':not-in' is not supported ({key}); \
-                 use ':in' or remove this modifier"
-            ),
-        });
-    }
-
-    // Pre-process :in / :above / :below modifiers via the terminology server.
-    let pairs = if let Some(ts_url) = state.terminology_server_url() {
-        expand_terminology_params(pairs, ts_url).await?
+    // Pre-process :in / :not-in / :above / :below modifiers via the
+    // terminology server.
+    let expanded = if let Some(terminology) = state.search_terminology() {
+        expand_terminology_params(pairs, terminology, state.expansion_failure_policy()).await?
     } else {
         // No terminology server configured: token `:in` / `:above` / `:below`
         // cannot be satisfied. Reject them with `501` rather than silently
@@ -374,8 +510,9 @@ where
                 }
             }
         }
-        pairs
+        pairs.into_iter().map(ExpandedPair::unchanged).collect()
     };
+    let pairs: Vec<(String, String)> = expanded.iter().filter_map(|e| e.applied.clone()).collect();
 
     let mut search_params = SearchParams::from_pairs(pairs);
 
@@ -426,6 +563,53 @@ where
         search_params = SearchParams::from_pairs(retained);
     }
 
+    // A result parameter whose value the server cannot honour is a `400`, as
+    // FHIR search error handling has it, unless the client asked for lenient
+    // handling: then it is ignored and reported. `_sort=nope` and
+    // `_total=bogus` both used to answer `200`, the sort silently replaced by
+    // an id sort and the `_total` by none.
+    let mut sort_warnings = sort_warnings;
+    let mut total_ignored = false;
+    if let Some(value) =
+        crate::extractors::search_query_builder::invalid_total_value(&search_params)
+    {
+        let message =
+            format!("_total value '{value}' is not one of 'none', 'estimate' or 'accurate'");
+        if !lenient {
+            return Err(RestError::InvalidParameter {
+                param: "_total".to_string(),
+                message,
+            });
+        }
+        sort_warnings.push(format!("{message}; it was ignored"));
+        total_ignored = true;
+        let retained: Vec<(String, String)> = search_params
+            .iter()
+            .filter(|(k, _)| k.as_str() != "_total")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        search_params = SearchParams::from_pairs(retained);
+    }
+    if !lenient {
+        let unsortable = {
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
+            crate::extractors::search_query_builder::unsortable_sort_fields(
+                resource_type,
+                &search_params,
+                &registry,
+            )
+        };
+        // `_score` ranks by relevance on full-text backends and is accepted
+        // everywhere (other backends fall back to the default order).
+        if let Some((field, warning)) = unsortable.into_iter().find(|(f, _)| f != "_score") {
+            return Err(RestError::InvalidParameter {
+                param: format!("_sort={field}"),
+                message: warning.split(';').next().unwrap_or(&warning).to_string(),
+            });
+        }
+    }
+
     // Convert REST params to persistence SearchQuery. Scope the registry read
     // guard tightly so it doesn't span any await — parking_lot guards aren't
     // Send by default, which would make this async fn !Send.
@@ -436,6 +620,9 @@ where
         // `:[type]` qualifier cannot name a type only another version has.
         let built =
             build_search_query_for_version(resource_type, &search_params, &registry, fhir_version)?;
+        // A chain through a parameter the registry does not know (`subject.nosuch.name`)
+        // is a `400` here, not a silent empty searchset from the resolver.
+        validate_chained_params(resource_type, &built, &registry)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
         // `_id`, `_lastUpdated`, and registered indexed typed params sort
@@ -464,6 +651,12 @@ where
         }
         built
     };
+    query.fhir_version = requested_version;
+
+    // A `patient/` scope sees the launch patient's compartment only (#1618):
+    // the filter is ANDed with everything the client asked for, before list,
+    // chain and `_has` resolution narrow the query further.
+    compartment.confine_query(fhir_version, &mut query)?;
 
     // `_contained=true|both` requires contained-resource indexing. Gate it on the
     // backend's capability so unsupported backends return a clear 501 rather than
@@ -486,13 +679,12 @@ where
         let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
         let refused = if !query.list.is_empty() {
             Some("_list".to_string())
+        } else if helios_persistence::search::query_has_in(&query) {
+            Some("_in".to_string())
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {
-            chained.map(|p| {
-                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
-                format!("{}.{}", p.name, path.join("."))
-            })
+            chained.map(|p| p.chain_key())
         };
         if let Some(param) = refused {
             return Err(RestError::InvalidParameter {
@@ -537,6 +729,10 @@ where
         query
     };
 
+    // Resolve `_in` (R5/R6 List/Group membership) into an `_id` filter, the same
+    // way.
+    let query = resolve_membership(state.storage(), tenant.context(), query, fhir_version).await?;
+
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
     let query = if helios_persistence::search::query_has_chains(&query) {
@@ -546,8 +742,11 @@ where
         // the same code as a direct parameter's — or, without a terminology
         // server, rejects it as the guard above does a direct one (`501`).
         let expander = state
-            .terminology_server_url()
-            .map(|ts_url| ChainTerminologyExpander { ts_url });
+            .search_terminology()
+            .map(|terminology| ChainTerminologyExpander {
+                terminology,
+                policy: state.expansion_failure_policy(),
+            });
         let options = helios_persistence::search::ChainResolveOptions {
             terminology: expander.as_ref().map(|e| e as &dyn TerminologyExpander),
         };
@@ -560,35 +759,50 @@ where
         .await
         .map_err(|e| {
             warn!(error = %e, "Chained search resolution failed");
-            match e {
-                // A valid `:not-in` is unanswerable with a terminology server
-                // too: report it as the direct form is, above.
-                StorageError::Search(SearchError::TerminologyRequired { modifier, param })
-                    if modifier == "not-in" =>
-                {
-                    RestError::NotImplemented {
-                        feature: format!(
-                            "search modifier ':not-in' is not supported ({param}:not-in); \
-                             use ':in' or remove this modifier"
-                        ),
-                    }
-                }
-                e => RestError::from(e),
-            }
+            RestError::from(e)
         })?
     } else {
         query
     };
 
-    // Execute the search
-    let mut result = state
-        .storage()
-        .search(tenant.context(), &query)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Search failed");
-            RestError::from(e)
-        })?;
+    // Execute the search. `_summary=count` answers with `Bundle.total` alone
+    // (see `bundle_to_json_with_subsetting`), so it asks the backend for the
+    // count and nothing else: `search` would also fetch, decode and then drop
+    // a page of resources — on PostgreSQL a second statement to plan, ~5 ms
+    // of the 40 ms `Observation?code=...&_summary=count` took.
+    let count_only =
+        query.summary == Some(helios_persistence::types::SummaryMode::Count) && query.wants_total();
+    let mut result = if count_only {
+        let total = state
+            .storage()
+            .search_count(tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Search count failed");
+                RestError::from(e)
+            })?;
+        helios_persistence::core::SearchResult {
+            resources: helios_persistence::types::Page::new(
+                Vec::new(),
+                helios_persistence::types::PageInfo {
+                    total: Some(total),
+                    ..helios_persistence::types::PageInfo::end()
+                },
+            ),
+            included: Vec::new(),
+            total: Some(total),
+            scores: Default::default(),
+        }
+    } else {
+        state
+            .storage()
+            .search(tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Search failed");
+                RestError::from(e)
+            })?
+    };
 
     // Resolve _include/_revinclude for backends whose search() does not
     // populate includes inline (SQLite, Postgres, Elasticsearch): the Full
@@ -636,6 +850,13 @@ where
         }
     }
 
+    // An include follows references wherever they lead; under a compartment-
+    // confined grant only the launch patient's resources may come back (#1618).
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
+
     // Drain any include-truncation marker(s) (#1061) out of `included` before
     // counting or building the bundle. The marker is control-plane
     // information about the search, not an included resource, and
@@ -647,9 +868,23 @@ where
     // warnings already are.
     let truncation_messages = drain_truncation_markers(&mut result.included);
 
-    // Build the self link URL
+    // Build the self link URL from the parameters as the client sent them,
+    // less those the search ignored (see `ExpandedPair`).
     let public_base = state.public_base_url_for_request(tenant);
-    let self_link = build_search_url(&public_base, resource_type, &search_params);
+    let shown: Vec<(String, String)> = expanded
+        .into_iter()
+        .filter(|e| {
+            e.applied.as_ref().is_some_and(|(key, _)| {
+                !ignored_params.contains(key) && !(total_ignored && key == "_total")
+            })
+        })
+        .map(|e| e.original)
+        .collect();
+    let self_link = build_search_url(
+        &public_base,
+        resource_type,
+        &SearchParams::from_pairs(shown),
+    );
 
     // Counts for the debug line below, taken before `into_bundle` consumes the
     // result.
@@ -683,9 +918,6 @@ where
         elements = ?elements,
         "Search completed"
     );
-
-    // Get FHIR version from config for subsetting
-    let fhir_version = state.config().default_fhir_version;
 
     // Whether the resolved query actually requires an accurate total: either
     // requested explicitly via `_total=accurate` or implied by
@@ -852,7 +1084,20 @@ where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
     // A parameter with no value is ignored, as in a type-level search (#1380).
-    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+    // `_in` is resolved against one searched type; the multi-type path has no
+    // resolver, and strict validation is skipped here, so it must not reach a
+    // backend unresolved.
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| k.split(['.', ':']).any(|seg| seg == "_in"))
+    {
+        return Err(RestError::InvalidParameter {
+            param: key.clone(),
+            message: format!("'_in' is not supported in a system-level search ('{key}')"),
+        });
+    }
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();
@@ -1076,35 +1321,31 @@ fn is_chained_key(key: &str) -> bool {
     key.contains('.') || key.starts_with("_has:")
 }
 
-/// The REST layer's terminology server, lent to the chain resolver: expands a
+/// The REST layer's terminology service, lent to the chain resolver: expands a
 /// terminology-backed modifier on the terminal parameter of a chained / `_has`
 /// search exactly as [`expand_terminology_params`] does a direct parameter's —
-/// same requests, same empty-expansion sentinel, same fail-open policy.
+/// same requests, same empty-expansion sentinel, same failure policy.
 struct ChainTerminologyExpander<'a> {
-    ts_url: &'a str,
+    terminology: &'a SearchTerminology,
+    policy: ExpansionFailurePolicy,
 }
 
 #[async_trait::async_trait]
 impl TerminologyExpander for ChainTerminologyExpander<'_> {
     async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion {
-        // The direct form of the terminal parameter; its name does not matter.
-        let key = format!("terminal:{modifier}");
-        let pairs = vec![(key.clone(), value.to_string())];
-        match expand_terminology_params(pairs, self.ts_url).await {
-            Ok(pairs) => match pairs.into_iter().next() {
-                Some((k, _)) if k == key => TerminologyExpansion::Unchanged,
-                Some((_, tokens)) => TerminologyExpansion::Tokens(tokens),
-                None => TerminologyExpansion::Dropped,
-            },
-            // `:not-in` only, which the resolver rejects itself.
-            Err(_) => TerminologyExpansion::Unchanged,
+        match rewrite_terminology_modifier(self.terminology, self.policy, modifier, value).await {
+            Rewrite::Tokens(tokens) => TerminologyExpansion::Tokens(tokens),
+            Rewrite::NegatedTokens(tokens) => TerminologyExpansion::NegatedTokens(tokens),
+            Rewrite::Unchanged => TerminologyExpansion::Unchanged,
+            Rewrite::Dropped => TerminologyExpansion::Dropped,
+            Rewrite::Failed { kind, message } => TerminologyExpansion::Failed { kind, message },
         }
     }
 }
 
-/// Rewrites the terminology-backed modifiers — `:in`, and `:above` / `:below`
-/// on a token — of direct parameters into plain token parameters, using the
-/// terminology server at `ts_url`.
+/// Rewrites the terminology-backed modifiers — `:in`, `:not-in`, and
+/// `:above` / `:below` on a token — of direct parameters into plain token
+/// parameters, using the server's terminology service.
 ///
 /// Only called when a terminology server is configured. Without one the caller
 /// (`execute_search_bundle`) rejects these modifiers with a `501` instead —
@@ -1121,10 +1362,17 @@ impl TerminologyExpander for ChainTerminologyExpander<'_> {
 /// `subject.name:in` is a `400` instead of a search for `subject.name=<codes>`
 /// (#1365).
 ///
-/// **`:in`** — The ValueSet at the given URL is expanded, and the parameter is
-/// replaced with a plain token parameter whose value is the expanded codes
-/// joined by commas (FHIR OR semantics).
-/// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`
+/// **`:in`** — The ValueSet at the given canonical (`url` or `url|version`) is
+/// expanded, and the parameter is replaced with a plain token parameter whose
+/// value is the expanded codes joined by commas (FHIR OR semantics).
+/// Example: `code:in=http://example.org/vs` → `code=http://cs|A,http://cs|B`.
+/// An empty expansion is replaced by a sentinel value that matches nothing.
+///
+/// **`:not-in`** — Expanded the same way, and replaced with a `:not` token
+/// parameter over the codes: `code:not=http://cs|A,http://cs|B`, which the
+/// backends answer at the resource level ("no value of `code` is in the
+/// set", #473). An empty expansion excludes nothing, so the parameter is
+/// dropped.
 ///
 /// **`:below` / `:above`** — For a `system|code` value, the code is expanded to
 /// itself plus its descendants (`is-a`) / ancestors (`generalizes`), and the
@@ -1132,161 +1380,202 @@ impl TerminologyExpander for ChainTerminologyExpander<'_> {
 /// reference form, which is structural: it is passed through with its modifier
 /// for the backend to resolve natively.
 ///
-/// **`:not-in`** — Returns `Err(RestError::NotImplemented)`, a `501`. Silently
-/// dropping a negation filter would return all resources instead of the
-/// expected subset, which is worse than an honest error. (The caller rejects
-/// `:not-in` itself before getting here; this arm keeps the function safe to
-/// call on its own.)
+/// A comma-separated value (`code:in=vs1,vs2`) is the union of its
+/// alternatives' expansions.
 ///
-/// All other parameters pass through unchanged. An empty expansion is replaced
-/// by a sentinel value that matches nothing. If an expansion *fails*, the
-/// parameter is dropped with a warning and the search continues without that
-/// filter (fail-open), so an unreachable terminology server or a single bad
-/// ValueSet URL does not abort the entire search.
+/// All other parameters pass through unchanged. If an expansion *fails* —
+/// unknown ValueSet, terminology server unreachable, expansion over the code
+/// cap — the configured [`ExpansionFailurePolicy`] decides: `Closed` (the
+/// default) fails the search with an error whose status reflects the cause,
+/// `Empty` makes the parameter match nothing, and `Open` drops the parameter
+/// and lets the search continue without the filter, which returns a superset
+/// of what was asked for.
 async fn expand_terminology_params(
     pairs: Vec<(String, String)>,
-    ts_url: &str,
-) -> Result<Vec<(String, String)>, RestError> {
-    let client = TerminologyServiceClient::new(ts_url.to_string());
-    let mut result: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    terminology: &SearchTerminology,
+    policy: ExpansionFailurePolicy,
+) -> Result<Vec<ExpandedPair>, RestError> {
+    let mut result: Vec<ExpandedPair> = Vec::with_capacity(pairs.len());
 
     for (key, value) in pairs {
+        let original = (key.clone(), value.clone());
         if is_chained_key(&key) {
-            result.push((key, value));
-        } else if let Some(param_name) = key.strip_suffix(":in") {
-            // Expand the ValueSet and join codes with commas for OR token search.
-            match client.expand_value_set(&value).await {
-                Ok(codes) if !codes.is_empty() => {
-                    let token_list = codes
-                        .iter()
-                        .map(|c| c.as_token())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    debug!(
-                        param = %param_name,
-                        vs_url = %value,
-                        codes = %codes.len(),
-                        "Expanded ValueSet for :in modifier"
-                    );
-                    result.push((param_name.to_string(), token_list));
-                }
-                Ok(_) => {
-                    // Empty expansion — no code can match; use a sentinel value
-                    // that will match nothing in the token index.
-                    warn!(
-                        param = %key,
-                        vs_url = %value,
-                        "ValueSet $expand returned empty expansion for :in modifier; \
-                         injecting sentinel value so no resources match"
-                    );
-                    result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
-                }
-                Err(e) => {
-                    warn!(
-                        param = %key,
-                        vs_url = %value,
-                        error = %e,
-                        "ValueSet $expand failed for :in modifier; skipping parameter (fail-open)"
-                    );
-                    // Omit the param — searches continue without this filter.
-                }
-            }
-        } else if let Some(param_name) = key.strip_suffix(":not-in") {
-            // :not-in requires negated value-set filtering which the current
-            // SQLite search backend does not support.  Return an explicit error
-            // rather than silently dropping the parameter — a silent drop would
-            // return all resources when the client expects a filtered subset.
-            return Err(RestError::NotImplemented {
-                feature: format!(
-                    "search modifier ':not-in' is not supported (param: {param_name}, \
-                     ValueSet: {value}); use ':in' or remove this modifier"
-                ),
-            });
-        } else if let Some((param_name, op)) = key
-            .strip_suffix(":below")
-            .map(|p| (p, "is-a"))
-            .or_else(|| key.strip_suffix(":above").map(|p| (p, "generalizes")))
-        {
-            // Token hierarchy: `code:below=system|code` expands to the code and
-            // its descendants (is-a) / ancestors (generalizes) via the
-            // terminology server. A bare value with no `system|code` is left
-            // untouched — that is the URI form, resolved natively by the backend.
-            if let Some((system, code)) = value.split_once('|') {
-                let modifier = if op == "is-a" { ":below" } else { ":above" };
-                expand_subsumption_into(
-                    &mut result,
-                    &client,
-                    param_name,
-                    &key,
-                    system,
-                    code,
-                    op,
-                    modifier,
-                )
-                .await;
-            } else {
-                result.push((key, value));
-            }
-        } else {
-            result.push((key, value));
+            result.push(ExpandedPair::unchanged(original));
+            continue;
         }
+        let Some((param_name, modifier)) = key
+            .split_once(':')
+            .and_then(|(name, m)| SearchModifier::parse(m).map(|m| (name, m)))
+            .filter(|(_, m)| {
+                matches!(
+                    m,
+                    SearchModifier::In
+                        | SearchModifier::NotIn
+                        | SearchModifier::Above
+                        | SearchModifier::Below
+                )
+            })
+        else {
+            result.push(ExpandedPair::unchanged(original));
+            continue;
+        };
+
+        let applied =
+            match rewrite_terminology_modifier(terminology, policy, &modifier, &value).await {
+                Rewrite::Tokens(tokens) => Some((param_name.to_string(), tokens)),
+                Rewrite::NegatedTokens(tokens) => Some((format!("{param_name}:not"), tokens)),
+                Rewrite::Unchanged => Some((key, value)),
+                Rewrite::Dropped => None,
+                Rewrite::Failed { kind, message } => {
+                    return Err(SearchError::TerminologyFailure {
+                        modifier: modifier.to_string(),
+                        param: param_name.to_string(),
+                        kind,
+                        message,
+                    }
+                    .into());
+                }
+            };
+        result.push(ExpandedPair { original, applied });
     }
 
     Ok(result)
+}
+
+/// One search parameter as the client sent it and as the search applies it.
+///
+/// Terminology expansion rewrites `code:in=<ValueSet>` into the expanded
+/// `code=<system|code,…>` (or a sentinel that matches nothing), which is what
+/// the query needs and not what the client asked for. The self link — and the
+/// paging links built from it — must carry the client's own parameter: they
+/// used to show the rewrite, `code=__hts_empty_expansion__` or a thousand
+/// codes long, and a next page re-sent that instead of re-expanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedPair {
+    /// The pair as the client sent it.
+    original: (String, String),
+    /// The pair the search applies; `None` when the parameter is dropped.
+    applied: Option<(String, String)>,
+}
+
+impl ExpandedPair {
+    fn unchanged(pair: (String, String)) -> Self {
+        Self {
+            applied: Some(pair.clone()),
+            original: pair,
+        }
+    }
 }
 
 /// Sentinel token that cannot match any indexed code, used to force an empty
 /// result when a terminology expansion legitimately yields no codes.
 const HTS_EMPTY_EXPANSION: &str = "__hts_empty_expansion__";
 
-/// Expands a token hierarchy modifier (`:below`/`:above`) and inserts the
-/// resulting comma-joined token list under `param_name`. Mirrors the `:in`
-/// policy: empty expansion → sentinel (match nothing); request error →
-/// fail-open (drop the filter).
-#[allow(clippy::too_many_arguments)]
-async fn expand_subsumption_into(
-    result: &mut Vec<(String, String)>,
-    client: &TerminologyServiceClient,
-    param_name: &str,
-    key: &str,
-    system: &str,
-    code: &str,
-    op: &str,
-    modifier: &str,
-) {
-    match client.expand_subsumption(system, code, op).await {
-        Ok(codes) if !codes.is_empty() => {
-            let token_list = codes
-                .iter()
-                .map(|c| c.as_token())
-                .collect::<Vec<_>>()
-                .join(",");
+/// What a terminology-backed modifier's value was rewritten into.
+enum Rewrite {
+    /// A plain token OR list, with the modifier removed.
+    Tokens(String),
+    /// A token OR list to be searched with `:not` (from `:not-in`).
+    NegatedTokens(String),
+    /// Not the terminology server's (a structural `:below` / `:above`).
+    Unchanged,
+    /// The parameter is to be dropped.
+    Dropped,
+    /// The expansion failed and the search is to fail with it.
+    Failed {
+        kind: TerminologyFailureKind,
+        message: String,
+    },
+}
+
+/// Expands `value` for `modifier` (`:in`, `:not-in`, token `:above` /
+/// `:below`) through `terminology`, applying `policy` to a failure. See
+/// [`expand_terminology_params`] for the rewrite rules.
+async fn rewrite_terminology_modifier(
+    terminology: &SearchTerminology,
+    policy: ExpansionFailurePolicy,
+    modifier: &SearchModifier,
+    value: &str,
+) -> Rewrite {
+    let subsumption_op = match modifier {
+        SearchModifier::In | SearchModifier::NotIn => None,
+        SearchModifier::Below => Some("is-a"),
+        SearchModifier::Above => Some("generalizes"),
+        _ => return Rewrite::Unchanged,
+    };
+    let alternatives = helios_persistence::search::split_unescaped_commas(value);
+    // A hierarchy modifier whose value is not a `system|code` is the uri /
+    // reference form, resolved natively by the backend.
+    if subsumption_op.is_some() && alternatives.iter().any(|a| !a.contains('|')) {
+        return Rewrite::Unchanged;
+    }
+
+    let mut tokens: Vec<String> = Vec::new();
+    for alternative in &alternatives {
+        let expansion = match subsumption_op {
+            None => terminology.expand_value_set(alternative).await,
+            Some(op) => {
+                let (system, code) = alternative
+                    .rsplit_once('|')
+                    .expect("checked above: every alternative contains a '|'");
+                terminology.expand_subsumption(system, code, op).await
+            }
+        };
+        match expansion {
+            Ok(codes) => {
+                debug!(
+                    modifier = %modifier,
+                    value = %alternative,
+                    codes = codes.len(),
+                    "Expanded terminology-backed search modifier"
+                );
+                tokens.extend(codes.iter().map(ExpandedCode::as_token));
+            }
+            Err(e) => {
+                warn!(
+                    modifier = %modifier,
+                    value = %alternative,
+                    error = %e,
+                    policy = ?policy,
+                    "Terminology expansion for search modifier failed"
+                );
+                return match policy {
+                    ExpansionFailurePolicy::Closed => Rewrite::Failed {
+                        kind: e.kind(),
+                        message: e.client_message(alternative),
+                    },
+                    ExpansionFailurePolicy::Empty => {
+                        Rewrite::Tokens(HTS_EMPTY_EXPANSION.to_string())
+                    }
+                    ExpansionFailurePolicy::Open => Rewrite::Dropped,
+                };
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        return if *modifier == SearchModifier::NotIn {
+            // Nothing to exclude: the parameter does not constrain the search.
+            debug!(value = %value, "Empty expansion for :not-in; parameter excludes nothing");
+            Rewrite::Dropped
+        } else {
+            // No code can match; use a sentinel value that matches nothing in
+            // the token index.
             debug!(
-                param = %param_name,
-                system = %system,
-                code = %code,
                 modifier = %modifier,
-                codes = codes.len(),
-                "Expanded token hierarchy modifier"
+                value = %value,
+                "Empty expansion; injecting sentinel value so no resources match"
             );
-            result.push((param_name.to_string(), token_list));
-        }
-        Ok(_) => {
-            warn!(
-                param = %key,
-                modifier = %modifier,
-                "Token hierarchy expansion returned no codes; injecting sentinel so no resources match"
-            );
-            result.push((param_name.to_string(), HTS_EMPTY_EXPANSION.to_string()));
-        }
-        Err(e) => {
-            warn!(
-                param = %key,
-                modifier = %modifier,
-                error = %e,
-                "Token hierarchy expansion failed; skipping parameter (fail-open)"
-            );
-        }
+            Rewrite::Tokens(HTS_EMPTY_EXPANSION.to_string())
+        };
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    let joined = tokens.join(",");
+    if *modifier == SearchModifier::NotIn {
+        Rewrite::NegatedTokens(joined)
+    } else {
+        Rewrite::Tokens(joined)
     }
 }
 
@@ -1505,6 +1794,41 @@ mod tests {
 
     // ─── expand_terminology_params ───────────────────────────────────────────
 
+    /// A terminology service for the server at `url`, uncached.
+    fn terminology(url: &str) -> SearchTerminology {
+        SearchTerminology::new(
+            crate::terminology::TerminologyServiceClient::new(url.to_string()),
+            std::time::Duration::ZERO,
+        )
+    }
+
+    async fn expand(
+        params: Vec<(String, String)>,
+        url: &str,
+        policy: ExpansionFailurePolicy,
+    ) -> Result<Vec<(String, String)>, RestError> {
+        expand_terminology_params(params, &terminology(url), policy)
+            .await
+            .map(|pairs| pairs.into_iter().filter_map(|e| e.applied).collect())
+    }
+
+    /// A mock terminology server answering every `$expand` with `expansion`;
+    /// returns its base URL.
+    async fn mock_expand_server(expansion: serde_json::Value) -> String {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/ValueSet/$expand",
+            post(move || {
+                let expansion = expansion.clone();
+                async move { Json(expansion) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
     /// Verifies that non-terminology params pass through unchanged, including
     /// repeated keys.
     #[tokio::test]
@@ -1515,10 +1839,15 @@ mod tests {
             ("_count".to_string(), "10".to_string()),
         ];
 
-        // Use a URL that won't be reachable — but only :in/:above/:below keys trigger calls.
-        let result = expand_terminology_params(params, "http://localhost:9999")
-            .await
-            .unwrap();
+        // Use a URL that won't be reachable — but only :in/:not-in/:above/:below
+        // keys trigger calls.
+        let result = expand(
+            params,
+            "http://localhost:9999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
 
         // Both repeated `name` values survive (FHIR AND semantics).
         let names: Vec<&str> = result
@@ -1532,8 +1861,7 @@ mod tests {
 
     /// #1365: a chained or `_has` key keeps its terminology modifier — the chain
     /// resolver types the terminal parameter first, then expands. (The
-    /// unreachable server would otherwise drop the `:in` keys, and `:not-in`
-    /// would be an error.)
+    /// unreachable server would otherwise make every one of these an error.)
     #[tokio::test]
     async fn test_expand_terminology_params_leaves_chained_keys_to_the_resolver() {
         let params: Vec<(String, String)> = [
@@ -1546,92 +1874,115 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let result = expand_terminology_params(params.clone(), "http://127.0.0.1:19999")
-            .await
-            .unwrap();
+        let result = expand(
+            params.clone(),
+            "http://127.0.0.1:19999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
         assert_eq!(result, params);
     }
 
-    /// Verifies that a `:not-in` parameter returns `NotImplemented` rather than
-    /// silently dropping the filter (which would return incorrect results).
+    /// An unreachable terminology server fails every terminology-backed
+    /// modifier closed by default: a `TerminologyFailure` of kind
+    /// `Unavailable` (a `503`) naming the parameter and modifier — never a
+    /// silently widened search.
     #[tokio::test]
-    async fn test_expand_terminology_params_not_in_returns_not_implemented() {
-        use crate::error::RestError;
-        let params = vec![
-            (
-                "code:not-in".to_string(),
-                "http://example.org/vs".to_string(),
-            ),
-            ("name".to_string(), "Smith".to_string()),
-        ];
-
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999").await;
-
-        // :not-in must return an explicit error, not silently drop the filter.
-        assert!(matches!(result, Err(RestError::NotImplemented { .. })));
+    async fn test_expand_terminology_params_fails_closed_on_network_error() {
+        for (key, value) in [
+            ("code:in", "http://example.org/vs"),
+            ("code:not-in", "http://example.org/vs"),
+            ("code:below", "http://snomed.info/sct|73211009"),
+            ("code:above", "http://snomed.info/sct|73211009"),
+        ] {
+            let params = vec![
+                (key.to_string(), value.to_string()),
+                ("name".to_string(), "Smith".to_string()),
+            ];
+            let result = expand(
+                params,
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Closed,
+            )
+            .await;
+            match result {
+                Err(RestError::ServiceUnavailable { message }) => {
+                    assert!(message.contains("'code'"), "{key}: {message}");
+                    assert!(
+                        message.contains(&format!("':{}'", key.split_once(':').unwrap().1)),
+                        "{key}: {message}"
+                    );
+                    assert!(message.contains("could not be reached"), "{key}: {message}");
+                }
+                other => panic!("{key}: expected 503, got {other:?}"),
+            }
+        }
     }
 
-    /// Verifies that a :in param is dropped on network error (fail-open).
+    /// `HFS_SEARCH_TERMINOLOGY_FAIL=open`: the parameter is dropped and the
+    /// rest of the search survives; `empty`: it matches nothing.
     #[tokio::test]
-    async fn test_expand_terminology_params_in_dropped_on_network_error() {
-        let params = vec![("code:in".to_string(), "http://example.org/vs".to_string())];
+    async fn test_expand_terminology_params_open_and_empty_policies_on_network_error() {
+        for key in ["code:in", "code:not-in", "code:below"] {
+            let value = if key.ends_with("in") {
+                "http://example.org/vs"
+            } else {
+                "http://snomed.info/sct|73211009"
+            };
+            let params = vec![
+                (key.to_string(), value.to_string()),
+                ("name".to_string(), "Smith".to_string()),
+            ];
 
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
+            let result = expand(
+                params.clone(),
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Open,
+            )
             .await
             .unwrap();
+            let map = as_map(&result);
+            assert_eq!(map.len(), 1, "{key}: {map:?}");
+            assert_eq!(map.get("name"), Some(&"Smith".to_string()));
 
-        // The :in key is gone; no code key was injected either (fail-open)
-        let map = as_map(&result);
-        assert!(!map.contains_key("code:in"));
-        assert!(!map.contains_key("code"));
-    }
-
-    /// A token `:below` (`system|code`) is fail-open dropped on network error.
-    #[tokio::test]
-    async fn test_expand_terminology_params_below_token_dropped_on_network_error() {
-        let params = vec![(
-            "code:below".to_string(),
-            "http://snomed.info/sct|73211009".to_string(),
-        )];
-
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
+            let result = expand(
+                params,
+                "http://127.0.0.1:19999",
+                ExpansionFailurePolicy::Empty,
+            )
             .await
             .unwrap();
-
-        let map = as_map(&result);
-        assert!(!map.contains_key("code:below"));
-        assert!(!map.contains_key("code"));
+            let map = as_map(&result);
+            assert_eq!(
+                map.get("code"),
+                Some(&HTS_EMPTY_EXPANSION.to_string()),
+                "{key}: {map:?}"
+            );
+            assert_eq!(map.get("name"), Some(&"Smith".to_string()));
+        }
     }
 
     /// Happy path: a token `:below` expands to the code and its descendants via
     /// a mock terminology server, rewriting to a comma-joined token list.
     #[tokio::test]
     async fn test_expand_terminology_params_below_success() {
-        use axum::{Json, Router, routing::post};
         use serde_json::json;
-
-        let app = Router::new().route(
-            "/ValueSet/$expand",
-            post(|| async {
-                Json(json!({
-                    "resourceType": "ValueSet",
-                    "expansion": { "contains": [
-                        { "system": "http://snomed.info/sct", "code": "73211009" },
-                        { "system": "http://snomed.info/sct", "code": "44054006" },
-                        { "system": "http://snomed.info/sct", "code": "46635009" }
-                    ]}
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [
+                { "system": "http://snomed.info/sct", "code": "73211009" },
+                { "system": "http://snomed.info/sct", "code": "44054006" },
+                { "system": "http://snomed.info/sct", "code": "46635009" }
+            ]}
+        }))
+        .await;
 
         let params = vec![(
             "code:below".to_string(),
             "http://snomed.info/sct|73211009".to_string(),
         )];
-        let result = expand_terminology_params(params, &format!("http://{addr}"))
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
             .await
             .unwrap();
 
@@ -1644,6 +1995,123 @@ mod tests {
         assert!(codes.contains("http://snomed.info/sct|46635009"));
     }
 
+    /// `:not-in` is rewritten into a `:not` token search over the expansion;
+    /// an empty expansion excludes nothing and drops the parameter.
+    #[tokio::test]
+    async fn test_expand_terminology_params_not_in_rewrites_to_not() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [
+                { "system": "http://cs", "code": "a" },
+                { "system": "http://cs", "code": "b" }
+            ]}
+        }))
+        .await;
+        let params = vec![
+            (
+                "code:not-in".to_string(),
+                "http://example.org/vs".to_string(),
+            ),
+            ("name".to_string(), "Smith".to_string()),
+        ];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                (
+                    "code:not".to_string(),
+                    "http://cs|a,http://cs|b".to_string()
+                ),
+                ("name".to_string(), "Smith".to_string()),
+            ]
+        );
+
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [] }
+        }))
+        .await;
+        let params = vec![
+            (
+                "code:not-in".to_string(),
+                "http://example.org/vs".to_string(),
+            ),
+            ("code:in".to_string(), "http://example.org/vs".to_string()),
+        ];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        // `:not-in` of nothing is dropped; `:in` of nothing matches nothing.
+        assert_eq!(
+            result,
+            vec![("code".to_string(), HTS_EMPTY_EXPANSION.to_string())]
+        );
+    }
+
+    /// The client's own pair travels with every rewrite, so the self link can
+    /// show what was asked rather than the expansion or its no-match sentinel.
+    #[tokio::test]
+    async fn test_expand_terminology_params_keeps_the_client_pair() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [] }
+        }))
+        .await;
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let expanded = expand_terminology_params(
+            vec![
+                pair("code:in", "http://example.org/vs"),
+                pair("code:not-in", "http://example.org/vs"),
+                pair("status", "final"),
+            ],
+            &terminology(&url),
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            expanded,
+            vec![
+                ExpandedPair {
+                    original: pair("code:in", "http://example.org/vs"),
+                    applied: Some(pair("code", HTS_EMPTY_EXPANSION)),
+                },
+                ExpandedPair {
+                    original: pair("code:not-in", "http://example.org/vs"),
+                    applied: None,
+                },
+                ExpandedPair::unchanged(pair("status", "final")),
+            ]
+        );
+    }
+
+    /// A comma-separated value is the union of its alternatives' expansions,
+    /// de-duplicated.
+    #[tokio::test]
+    async fn test_expand_terminology_params_unions_alternatives() {
+        use serde_json::json;
+        let url = mock_expand_server(json!({
+            "resourceType": "ValueSet",
+            "expansion": { "contains": [{ "system": "http://cs", "code": "a" }] }
+        }))
+        .await;
+        let params = vec![(
+            "code:in".to_string(),
+            "http://example.org/vs1,http://example.org/vs2".to_string(),
+        )];
+        let result = expand(params, &url, ExpansionFailurePolicy::Closed)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            vec![("code".to_string(), "http://cs|a".to_string())]
+        );
+    }
+
     /// A `:below` value without a `system|code` (the URI form) is left untouched
     /// so the backend can resolve URI hierarchy natively — no terminology call.
     #[tokio::test]
@@ -1653,9 +2121,13 @@ mod tests {
             "http://example.org/fhir/ValueSet/x".to_string(),
         )];
 
-        let result = expand_terminology_params(params, "http://127.0.0.1:19999")
-            .await
-            .unwrap();
+        let result = expand(
+            params,
+            "http://127.0.0.1:19999",
+            ExpansionFailurePolicy::Closed,
+        )
+        .await
+        .unwrap();
 
         // Unchanged — no `|`, so not treated as a token subsumption.
         assert_eq!(

@@ -8,6 +8,31 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 pub struct ReferenceHandler;
 
 impl ReferenceHandler {
+    /// The `Type/id` a relative reference search value is matched against in
+    /// `value_reference_target` (schema v48), the column that holds the
+    /// `Type/id` of a reference stored as an absolute http(s) URL. The version
+    /// is stripped, and a `:Type` modifier qualifies a bare id. `None` when the
+    /// value cannot match an absolute stored reference through that column: an
+    /// absolute search value (it already matches `value_reference` as
+    /// written), a bare id (its `LIKE '%/id'` already spans absolute forms) or
+    /// a modifier that does not compare references.
+    pub(crate) fn target_base(
+        value: &SearchValue,
+        modifier: Option<&SearchModifier>,
+    ) -> Option<String> {
+        let full = match modifier {
+            None | Some(SearchModifier::Not) => value.value.clone(),
+            Some(SearchModifier::Type(type_name)) if !value.value.contains('/') => {
+                format!("{type_name}/{}", value.value)
+            }
+            Some(SearchModifier::Type(_)) => value.value.clone(),
+            Some(_) => return None,
+        };
+        let base = strip_reference_version(&full);
+        (base.contains('/') && !base.starts_with("http://") && !base.starts_with("https://"))
+            .then(|| base.to_string())
+    }
+
     /// Builds SQL for a reference parameter value.
     ///
     /// Reference values can be:
@@ -116,6 +141,65 @@ impl ReferenceHandler {
         }
     }
 
+    /// The row predicate matching `value_reference` against the version-agnostic
+    /// base bound at `?param_num`: the base itself or any `<base>/_history/…`
+    /// form of it, as one seekable range plus a residual (see
+    /// [`Self::build_reference_condition`]).
+    pub(crate) fn versioned_reference_predicate(param_num: usize) -> String {
+        format!(
+            "(value_reference IS NOT NULL \
+              AND value_reference >= ?{p} \
+              AND value_reference < ?{p} || '/_history0' \
+              AND (value_reference = ?{p} \
+                   OR value_reference >= ?{p} || '/_history/'))",
+            p = param_num
+        )
+    }
+
+    /// The arms of a bare-id search (`patient=123`) on a parameter whose
+    /// declared targets are `targets`, each a predicate the reference index can
+    /// seek. Any one arm matching is a match.
+    ///
+    /// A bare id names a local reference to one of the parameter's target types
+    /// (FHIR search, reference parameters), so it is `T/123` (or a `_history`
+    /// version of it)
+    /// for each target `T`, the stored bare `123` itself, or — kept from the
+    /// suffix match this replaces — an absolute URL ending in `/123`. Absolute
+    /// URLs start with a lower-case scheme, which sorts above every type name,
+    /// so their arm seeks `value_reference >= 'a'` and only pays the suffix
+    /// `LIKE` on those rows.
+    ///
+    /// The suffix match, `= ? OR LIKE '%/' || ? OR LIKE '%/' || ? ||
+    /// '/_history/%'`, could not seek and read every reference row of the
+    /// parameter: ~110 ms for `Observation?patient=<id>` on 527k resources,
+    /// against ~0.1 ms for these arms. It also matched what a local reference
+    /// to a target cannot be — `Patient/ABC` for `patient=abc` (the `LIKE` is
+    /// case-insensitive) or a reference to a type outside the targets.
+    pub(crate) fn bare_id_arms(base: &str, targets: &[String], offset: usize) -> Vec<SqlFragment> {
+        let mut arms = Vec::with_capacity(targets.len() + 2);
+        let mut p = offset + 1;
+        arms.push(SqlFragment::with_params(
+            format!("value_reference = ?{p}"),
+            vec![SqlParam::string(base)],
+        ));
+        for target in targets {
+            p += 1;
+            arms.push(SqlFragment::with_params(
+                Self::versioned_reference_predicate(p),
+                vec![SqlParam::string(format!("{target}/{base}"))],
+            ));
+        }
+        p += 1;
+        arms.push(SqlFragment::with_params(
+            format!(
+                "value_reference >= 'a' AND (value_reference LIKE '%/' || ?{p} \
+                 OR value_reference LIKE '%/' || ?{p} || '/_history/%')"
+            ),
+            vec![SqlParam::string(base)],
+        ));
+        arms
+    }
+
     /// Builds a condition for a standard reference value.
     ///
     /// Reference matching is **version-agnostic** per the FHIR spec: a versioned
@@ -127,27 +211,26 @@ impl ReferenceHandler {
 
         if base.contains('/') {
             // Type/id (or absolute URL): match the base reference exactly, plus
-            // any `_history`-versioned form of it as an **indexable range**,
-            // rather than `= ? OR value_reference LIKE '…/_history/%'`. The
-            // leading-anchored LIKE defeats the index, so the old form scanned
-            // every reference row of the type; an equality plus a plain range
-            // on the same column lets the planner take two `idx_search_reference`
-            // probes (MULTI-INDEX OR) instead (#1017).
+            // any `_history`-versioned form of it.
             //
-            // The range `[base || '/_history/', base || '/_history0')` is exactly
+            // The match set is `base` itself and the range
+            // `[base || '/_history/', base || '/_history0')`, which is exactly
             // `<base>/_history/<anything>`: `'/'` (0x2F) is immediately below
             // `'0'` (0x30). It must be anchored on the `/_history/` suffix rather
             // than on `<base>` alone: FHIR ids may contain `-` (0x2D) and `.`
             // (0x2E), which sort *below* `'/'`, so a bare `[base, base || '0')`
             // range would also capture a different resource whose id merely
             // extends this one (`<base>-4`, `<base>.5`) (#1030 review).
+            //
+            // The planner gets one bounded range, `[base, base || '/_history0')`,
+            // which holds the base and every versioned form of it, and the
+            // exact test runs on the rows inside it; it also drops ids that
+            // only extend this one (`<base>-4`), which sort inside the range.
+            // `idx_search_reference` is partial (`WHERE value_reference IS NOT
+            // NULL`): with only the OR, SQLite never used it and read every row
+            // of the parameter, or seeked with no upper bound (#1955).
             SqlFragment::with_params(
-                format!(
-                    "(value_reference = ?{p} \
-                      OR (value_reference >= ?{p} || '/_history/' \
-                          AND value_reference < ?{p} || '/_history0'))",
-                    p = param_num
-                ),
+                Self::versioned_reference_predicate(param_num),
                 vec![SqlParam::string(base)],
             )
         } else {
@@ -281,8 +364,11 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "Patient/123");
         let frag = ReferenceHandler::build_sql(&value, None, 0);
 
-        // Version-agnostic via an equality plus an indexable `_history` range
-        // (#1017), bound once as `?1`.
+        // Version-agnostic via one indexable range over the base and its
+        // `_history` versions, with the exact match set as a residual, bound
+        // once as `?1`.
+        assert!(frag.sql.starts_with("(value_reference IS NOT NULL"));
+        assert!(frag.sql.contains("value_reference >= ?1 "));
         assert!(frag.sql.contains("value_reference = ?1"));
         assert!(frag.sql.contains("value_reference >= ?1 || '/_history/'"));
         assert!(frag.sql.contains("value_reference < ?1 || '/_history0'"));
@@ -307,15 +393,18 @@ mod tests {
 
     #[test]
     fn test_reference_range_bounds_match_base_and_versions_only() {
-        // The predicate is `= base OR [base/_history/, base/_history0)`. It
-        // must include the base and every `_history` version, and exclude a
+        // The predicate is `[base, base/_history0)` narrowed by the residual
+        // `= base OR >= base/_history/`, i.e. `= base OR [base/_history/,
+        // base/_history0)`. It must include the base and every `_history`
+        // version, and exclude a
         // different id that merely extends this one — including with `-` and
         // `.`, which are legal FHIR id characters that sort *below* `'/'` and
         // `'0'` (#1030 review). Mirrors SQLite's BINARY (bytewise) collation.
         let base = "Patient/123";
         let lower = format!("{base}/_history/");
         let upper = format!("{base}/_history0");
-        let matches = |s: &str| s == base || (s >= lower.as_str() && s < upper.as_str());
+        let matches =
+            |s: &str| s >= base && s < upper.as_str() && (s == base || s >= lower.as_str());
 
         // included:
         assert!(matches("Patient/123"));

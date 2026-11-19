@@ -760,6 +760,7 @@ async fn serve_with_runtime(
         shared_conformance(),
         FhirVersion::R4,
         None,
+        None,
         base.clone(),
         10 * 1024 * 1024,
         tenant_path_routing,
@@ -801,6 +802,7 @@ async fn serve_with_separate_public_base(
         self_base.clone(),
         Arc::new(helios_auth::NoOpOutboundAuthProvider),
         FhirVersion::R4,
+        None,
         None,
         public_base.to_string(),
         10 * 1024 * 1024,
@@ -3101,7 +3103,7 @@ async fn download_all_streams_a_compatible_zip_with_safe_repeated_names() {
     .enumerate()
     {
         let mut file = zip.by_index(index).unwrap();
-        assert_eq!(file.name(), expected);
+        assert_eq!(file.name().unwrap(), expected);
         let mut body = String::new();
         file.read_to_string(&mut body).unwrap();
         assert!(body.contains(r#""id":"1""#));

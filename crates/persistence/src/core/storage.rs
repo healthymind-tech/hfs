@@ -34,6 +34,7 @@ pub struct WriteMarker {
     /// leave `latest` unchanged. `None` when no bound was asked for.
     pub recent_writes: Option<u64>,
 }
+use crate::search::ReindexTarget;
 use crate::types::StoredResource;
 
 /// A registered tenant, as returned by the tenant registry.
@@ -97,6 +98,41 @@ pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(floored, 0).unwrap_or(ts)
 }
 
+/// Classifies a lost compare-and-swap on `restore_deleted`'s tombstone, from
+/// the version the re-read found (if any).
+///
+/// The guarded restore matched no row, so the tombstone the pre-read observed
+/// is gone. That re-read deliberately carries no `is_deleted` filter:
+/// "someone restored it" and "someone restored it, then re-deleted it" are the
+/// same fact for the caller. So any document still under that id means a
+/// concurrent writer moved the version on — `VersionConflict`, carrying what
+/// is *actually* stored, which `create_or_update` retries from a fresh read.
+/// No document at all means the row was hard-deleted underneath the restore:
+/// there is nothing left to converge on, and the honest answer is `NotFound`.
+///
+/// Used by MongoDB, whose restore is an optimistic CAS. PostgreSQL's restore
+/// re-reads the tombstone under the per-resource advisory lock instead, so its
+/// loser never gets as far as a CAS miss and reports `NotFound` directly.
+pub fn restore_cas_miss(
+    resource_type: &str,
+    id: &str,
+    expected_version: String,
+    actual_version: Option<String>,
+) -> StorageError {
+    match actual_version {
+        Some(actual_version) => StorageError::Concurrency(ConcurrencyError::VersionConflict {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+            expected_version,
+            actual_version,
+        }),
+        None => StorageError::Resource(ResourceError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        }),
+    }
+}
+
 /// One `(weekday, hour)` cell of write-activity, used by
 /// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
 /// heatmap.
@@ -128,6 +164,7 @@ pub mod audit {
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         resource_type: &str,
         resource_id: Option<&str>,
         count: u64,
@@ -152,6 +189,9 @@ pub mod audit {
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
         }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
+        }
         if let Some(p) = patient_ref {
             builder = builder.patient(p);
         }
@@ -175,6 +215,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
+                None,
                 "Patient",
                 Some("123"),
                 1,
@@ -207,6 +248,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 None,
+                None,
                 "Observation",
                 None,
                 15,
@@ -237,6 +279,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
+                None,
                 "Patient",
                 Some("123"),
                 0,
@@ -268,6 +311,7 @@ pub mod audit {
             record_purge_event(
                 &sink,
                 "Device/hfs",
+                None,
                 None,
                 "Observation",
                 Some("obs-1"),
@@ -467,6 +511,25 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// A tuple of (StoredResource, created: bool) where created indicates
     /// whether a new resource was created (true) or an existing one updated (false).
+    /// Restoring a soft-deleted resource counts as created.
+    ///
+    /// # Concurrency
+    ///
+    /// Unconditional PUT is last-writer-wins: two callers racing on one id —
+    /// on one instance or across instances sharing the store — must both
+    /// succeed, with distinct versions and a complete history. Implementations
+    /// decide existence with a read, write with a version-guarded
+    /// compare-and-swap, and retry a bounded number of times when the read
+    /// went stale (`VersionConflict`, `AlreadyExists`, or `NotFound` from the
+    /// write), so none of those errors reaches the caller for a race the
+    /// caller did not ask to observe.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Tenant` - If the tenant lacks create/update permission
+    /// * `StorageError::Validation` - If the resource content is invalid
+    /// * `StorageError::Concurrency(VersionConflict)` - Only after the bounded
+    ///   retries are exhausted under sustained contention
     async fn create_or_update(
         &self,
         tenant: &TenantContext,
@@ -475,6 +538,19 @@ pub trait ResourceStorage: Send + Sync {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)>;
+
+    /// When this backend's stored document *is* the search index, composite
+    /// secondary sync writes through [`ReindexTarget::write_search_entries`]
+    /// so `version_id` and `last_modified` come from the primary's
+    /// [`StoredResource`].
+    ///
+    /// Elasticsearch returns `Some(self)`. SQL, S3 and Mongo return `None`
+    /// even though they implement [`ReindexTarget`]: their search writer
+    /// rebuilds derived rows from a resource they already store, and a
+    /// secondary replica still has to `create` / `create_or_update`.
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        None
+    }
 
     /// Reads a resource by type and ID.
     ///
@@ -516,12 +592,46 @@ pub trait ResourceStorage: Send + Sync {
     /// * `StorageError::Resource(NotFound)` - If the resource doesn't exist
     /// * `StorageError::Concurrency(VersionConflict)` - If the resource was modified
     /// * `StorageError::Tenant` - If the tenant doesn't have update permission
+    ///
+    /// # Tags and security labels
+    ///
+    /// `meta.tag` and `meta.security` held by `current` are merged into
+    /// `resource` before it is stored (see
+    /// [`merge_update_meta`](crate::types::merge_update_meta), #2562), so an
+    /// update cannot remove one. [`update_verbatim`](Self::update_verbatim)
+    /// stores the body as given.
     async fn update(
         &self,
         tenant: &TenantContext,
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource>;
+
+    /// [`update`](Self::update) without the tag and security-label merge:
+    /// `resource` is stored exactly as given, so a label it leaves out is
+    /// removed.
+    ///
+    /// For writes that must remove labels or reproduce a body verbatim —
+    /// `$meta-delete`, restoring a rolled-back bulk-submit update — never for a
+    /// client's update, which merges.
+    ///
+    /// # Errors
+    ///
+    /// As [`update`](Self::update). The default answers
+    /// `BackendError::UnsupportedCapability`, for storage that cannot write a
+    /// resource verbatim.
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let _ = (tenant, current, resource);
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "update_verbatim".to_string(),
+        }))
+    }
 
     /// Deletes a resource (soft delete).
     ///
@@ -536,8 +646,13 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// * `StorageError::Resource(NotFound)` - If the resource doesn't exist
-    /// * `StorageError::Resource(Gone)` - If already deleted
+    /// * `StorageError::Resource(NotFound)` - If there is no live resource to
+    ///   delete: it never existed, or it is already deleted. Every backend
+    ///   reports both as `NotFound`, and nothing is written for either — no
+    ///   history version, no tombstone, no `lastUpdated` change. The REST layer
+    ///   answers this as a successful no-op (`204`), as FHIR's delete
+    ///   interaction asks (#2523); it is an error here so that a caller can tell
+    ///   a delete that removed something from one that did not.
     /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
     async fn delete(
         &self,
@@ -574,8 +689,7 @@ pub trait ResourceStorage: Send + Sync {
     /// # Errors
     ///
     /// * `StorageError::Resource(NotFound)` - If no live resource exists
-    ///   (never created, or already deleted; S3 reports the latter as `Gone`,
-    ///   as its `delete` does)
+    ///   (never created, or already deleted), as for [`delete`](Self::delete)
     /// * `StorageError::Concurrency(VersionConflict)` - If the current version
     ///   is not `expected_version`; nothing is deleted. S3 reports a writer
     ///   that lands after its comparison as `OptimisticLockFailure`.
@@ -708,6 +822,59 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the installed-package registry this backend persists, if any
+    /// (see [`crate::core::package_registry`]).
+    ///
+    /// SQLite and PostgreSQL keep it in their own database; composites
+    /// delegate to their primary. The default `None` makes the package
+    /// manager fall back to a JSON file in the data directory.
+    fn package_store(&self) -> Option<Arc<dyn crate::core::PackageStore>> {
+        None
+    }
+
+    /// Returns the cluster coordinator for IG package jobs (see
+    /// [`crate::core::package_jobs`]), if this backend can back one. The
+    /// default `None` keeps package jobs and their lock in process.
+    fn package_job_coordinator(
+        &self,
+    ) -> Option<Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
+        None
+    }
+
+    /// Returns the cross-instance change feed for definition resources (see
+    /// [`crate::core::cluster_change_feed`]), if this backend can back one
+    /// (a shared database that records writes by trigger).
+    ///
+    /// The default `None` leaves per-process caches built from stored
+    /// resources (the validation profile registry) instance-local.
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        None
+    }
+
+    /// Returns the unified cluster job store for this backend, if it can back
+    /// one (a shared database — see [`crate::core::cluster_job_store`]).
+    ///
+    /// The default implementation returns `None`, which keeps async job
+    /// surfaces on their process-local (single-instance) paths.
+    fn cluster_job_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        None
+    }
+
+    /// Returns the store that persists SQL-on-FHIR terminology relations
+    /// (#1824), when the backend keeps them.
+    ///
+    /// The default implementation returns `None`: SQL query dependencies on a
+    /// `ValueSet` or `ConceptMap` are then not served.
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        None
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the
@@ -719,6 +886,62 @@ pub trait ResourceStorage: Send + Sync {
     /// (#1228). Backends with a search index keep the default `None`: their
     /// index answers the lookup and a scan would only be slower.
     fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
+        None
+    }
+
+    /// Returns the shared per-subscription state store (counters, status,
+    /// stored notification bundles — see
+    /// [`crate::core::subscription_state`]), if this backend can back one.
+    ///
+    /// The default implementation returns `None`, which keeps subscription
+    /// counters on their process-local (single-instance) paths.
+    fn subscription_state_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        None
+    }
+
+    /// Returns the boot-time hydration read path for subscription/topic
+    /// resources (see [`crate::core::subscription_state`]), if this backend
+    /// can back one.
+    ///
+    /// The default implementation returns `None`.
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+        None
+    }
+
+    /// Returns the durable subscription delivery outbox (see
+    /// [`crate::core::subscription_delivery`]), if this backend can back
+    /// one.
+    ///
+    /// The default implementation returns `None`, which keeps delivery
+    /// retries on their process-local (single-instance) path.
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>> {
+        None
+    }
+
+    /// Returns the shared WebSocket binding-token store (see
+    /// [`crate::core::ws_binding_tokens`]), if this backend can back one.
+    ///
+    /// The default implementation returns `None`, which keeps binding
+    /// tokens in the process-local map.
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        None
+    }
+
+    /// Returns the cluster event fan-out for subscriptions (see
+    /// [`crate::core::event_fanout`]), if this backend can back one.
+    ///
+    /// Backends memoize the fan-out: repeated calls return the same
+    /// instance, and the first call from an async runtime context spawns
+    /// its listener. The default implementation returns `None`.
+    fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
         None
     }
 
@@ -1172,8 +1395,16 @@ pub trait ResourceStorage: Send + Sync {
 
     /// Permanently deletes all of a tenant's stored resources (current rows,
     /// history, and search index). Returns the number of current-version
-    /// resource rows removed. Invoked by the delete path only when the
-    /// teardown policy is enabled. Default: unsupported-capability error.
+    /// resource rows removed (delete tombstones included).
+    ///
+    /// The call must be safe to repeat. `DELETE /admin/tenants/{id}?purge=true`
+    /// calls it without first checking that the tenant is registered or holds
+    /// live resources (#2309), so a retry finishes a purge that failed
+    /// part-way. On a tenant that holds nothing it removes nothing and returns
+    /// `Ok(0)`. The exception is a tenant the backend cannot address at all: S3
+    /// bucket-per-tenant with no mapped bucket answers `UnmappedTenant`.
+    ///
+    /// Default: unsupported-capability error.
     async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
         Err(self.tenant_registry_unsupported())
     }
@@ -1406,8 +1637,9 @@ pub trait ConditionalStorage: ResourceStorage {
     /// `conditional_update` and `conditional_delete` are required methods,
     /// while `conditional_patch` works only once
     /// [`resolve_conditional_matches`](Self::resolve_conditional_matches) is
-    /// provided. A backend whose methods differ from that — S3 refuses all
-    /// four; SQLite, PostgreSQL and MongoDB serve patch — overrides it from its
+    /// provided. A backend whose methods differ from that — S3 serves only an
+    /// identifier-scoped create (#1435) and refuses the other three; SQLite,
+    /// PostgreSQL and MongoDB serve patch — overrides it from its
     /// declared [`BackendCapability`](crate::core::BackendCapability) list, the
     /// same list `tests/backend_capability_contract.rs` pins.
     fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
@@ -1643,6 +1875,47 @@ pub trait ConditionalStorage: ResourceStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restore that lost its CAS to a writer who left *something* under the
+    /// id converges: `create_or_update` retries a `VersionConflict`, and the
+    /// version it reports must be the one actually stored, not the stale one
+    /// the pre-read saw — that is what makes the loser's report truthful.
+    #[test]
+    fn restore_cas_miss_reports_the_version_actually_stored() {
+        let err = restore_cas_miss("Patient", "p1", "2".to_string(), Some("3".to_string()));
+
+        match err {
+            StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                resource_type,
+                id,
+                expected_version,
+                actual_version,
+            }) => {
+                assert_eq!(resource_type, "Patient");
+                assert_eq!(id, "p1");
+                assert_eq!(expected_version, "2", "the tombstone the pre-read observed");
+                assert_eq!(actual_version, "3", "what the winner left behind");
+            }
+            other => panic!("a document still under the id is a conflict, got {other:?}"),
+        }
+    }
+
+    /// The other half of the taxonomy: nothing at all under the id means the
+    /// row was hard-deleted underneath the restore. There is no version to
+    /// converge on, so retrying would spin — `NotFound` is the honest answer,
+    /// and `create_or_update` turns it into a fresh create.
+    #[test]
+    fn restore_cas_miss_reports_not_found_when_the_row_is_gone() {
+        let err = restore_cas_miss("Observation", "o1", "5".to_string(), None);
+
+        match err {
+            StorageError::Resource(ResourceError::NotFound { resource_type, id }) => {
+                assert_eq!(resource_type, "Observation");
+                assert_eq!(id, "o1");
+            }
+            other => panic!("a vanished row is NotFound, not a conflict, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_conditional_create_result_debug() {

@@ -92,6 +92,7 @@ fn server(sessions: Option<Arc<SessionStore>>) -> TestServer {
         audit_exclusion_filter: ExclusionFilter::new(vec![]),
         tenant_url_routing: false,
         sessions,
+        admin: None,
     });
     let app = Router::new()
         .route(

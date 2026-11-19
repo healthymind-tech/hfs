@@ -28,7 +28,7 @@ just handler tweaks.
 | `:contains` | string, reference, uri | string | + reference, uri |
 | `:text` | string, token, reference | token (string on ES only) | + string (all), + reference |
 | `:in` | token | token, uri | narrow to token |
-| `:not-in` | token | token, uri (returns 501) | narrow to token; decide semantics |
+| `:not-in` | token | token (expanded via the terminology server, searched as `:not`) | done in the fork |
 | `:not` | token | "all" (impl token-only) | narrow table to token |
 | `:above` / `:below` | reference, token, uri | token, uri | + reference |
 | `:of-type` | token | token (✅ `of-type` + `ofType`) | done |
@@ -73,7 +73,7 @@ handler, MongoDB handler, the backend `capabilities()` modifier lists, the
 - [x] **Phase 3** — `:code-text` on token (all backends); also filled PG token `:text`.
 - [x] **Phase 4** — `Reference.display` indexed (SQLite/PG v8→v9 migrations, ES
   mapping, Mongo); reference `:text`/`:code-text` (all backends).
-- [x] **Phase 5** — `:in`/`:not-in` token-only; `:not-in` returns 501
+- [x] **Phase 5** — `:in`/`:not-in` token-only; `:not-in` returned 501 upstream; the fork expands it and searches negated (see `crates/rest/README.md`, "Terminology-backed search modifiers")
   unconditionally.
 - [x] **Postgres `:identifier`** — implemented (was advertised but broken).
 

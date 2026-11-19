@@ -103,6 +103,50 @@ async fn home_serves_full_page_at_ui_hts() {
     );
 }
 
+/// An unknown path under the mount used to get axum's bare `404` — no body,
+/// no content-type — which a browser renders as a blank tab. It now gets the
+/// shell-wrapped not-found page: still `404`, but HTML with a title, a
+/// language, the sidebar and a way home.
+#[tokio::test]
+async fn unknown_paths_render_the_not_found_page_inside_the_shell() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/this-does-not-exist")
+                .header("Accept-Language", "de")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let ctype = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "content-type was {ctype:?}");
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"<html lang="de">"#), "{html}");
+    assert!(
+        html.contains(r#"class="sidebar""#),
+        "the shell must be present"
+    );
+    assert!(
+        html.contains(r#"href="/ui/hts""#),
+        "a way home must be offered"
+    );
+    assert!(
+        !html.contains("not-found-title"),
+        "the catalog key must resolve"
+    );
+    assert!(
+        html.contains("Nicht gefunden") || html.contains("nicht gefunden"),
+        "{html}"
+    );
+}
+
 #[tokio::test]
 async fn home_trailing_slash_redirects_to_canonical() {
     // `/ui/hts/` (trailing slash) must 308-redirect to the canonical
@@ -497,4 +541,57 @@ async fn an_upstream_restart_clears_the_ring_instead_of_plotting_a_cliff() {
         !html.contains(">900"),
         "pre-restart counters must not leak into the window totals",
     );
+}
+
+/// The HTS topbar renders the SAME shared theme switcher as HFS (one cycling
+/// button) and the same inline first-paint stamp reading the shared
+/// `hfs_theme` cookie, so a choice made in either console is the other's on
+/// its next paint — and theme.js syncs open pages live.
+#[tokio::test]
+async fn theme_switcher_and_boot_stamp_are_the_shared_ones() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(html.matches("data-theme-cycle").count(), 1);
+    assert!(html.contains(r#"aria-label="主題：跟隨系統""#), "{html}");
+    let toggle = helios_ui_chrome::theme_toggle(&ZhLabels).expect("renders");
+    assert!(
+        html.contains(toggle.trim_start()),
+        "byte-identical shared markup"
+    );
+
+    let head = &html[..html.find("</head>").expect("head")];
+    let boot = helios_ui_chrome::theme_boot().expect("boot");
+    assert!(
+        head.contains(&boot),
+        "the shared boot stamp is inline in <head>"
+    );
+    assert!(boot.contains(helios_ui_chrome::THEME_COOKIE));
+    assert!(head.contains(r#"<script src="/ui/hts/assets/theme.js" defer></script>"#));
+}
+
+/// Labels resolved straight from the shared catalog, as HTS's own would be.
+struct ZhLabels;
+
+impl helios_ui_chrome::ChromeLabels for ZhLabels {
+    fn lang(&self) -> String {
+        "zh-Hant".to_string()
+    }
+
+    fn t(&self, key: &str) -> String {
+        match key {
+            "theme-toggle-system" => "主題：跟隨系統",
+            "theme-toggle-light" => "主題：淺色",
+            "theme-toggle-dark" => "主題：深色",
+            other => other,
+        }
+        .to_string()
+    }
 }

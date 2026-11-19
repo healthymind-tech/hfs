@@ -72,12 +72,19 @@ mod bulk_export;
 mod bulk_provider;
 mod bulk_submit;
 mod login_sessions;
+mod package_registry;
+mod retention;
 mod schema;
 pub mod search;
 mod search_impl;
+mod sof_terminology;
 mod storage;
 mod sync_failures;
 mod transaction;
 mod user_settings;
+mod wal;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};
+pub use wal::WalMaintenance;
+
+pub use transaction::SqliteTransaction;

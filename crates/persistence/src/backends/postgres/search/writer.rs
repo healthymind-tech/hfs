@@ -159,7 +159,7 @@ use crate::backends::postgres::schema::IndexLayout;
 use crate::backends::postgres::storage::internal_postgres_error;
 use crate::error::StorageResult;
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
-use crate::types::strip_reference_version;
+use crate::types::{absolute_reference_target, strip_reference_version};
 
 fn postgres_error_message(error: &tokio_postgres::Error) -> String {
     error.as_db_error().map_or_else(
@@ -286,6 +286,7 @@ pub(crate) struct IndexRow {
     value_quantity_canonical_value: Option<f64>,
     value_quantity_canonical_unit: Option<String>,
     value_reference: Option<String>,
+    value_reference_target: Option<String>,
     value_reference_display: Option<String>,
     value_identifier_type_system: Option<String>,
     value_identifier_type_code: Option<String>,
@@ -422,6 +423,13 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     column!(p, rows, "value_reference", "text[]", |r: &&IndexRow| r
         .value_reference
         .clone());
+    column!(
+        p,
+        rows,
+        "value_reference_target",
+        "text[]",
+        |r: &&IndexRow| r.value_reference_target.clone()
+    );
     column!(
         p,
         rows,
@@ -627,6 +635,30 @@ pub(crate) fn answered_from_resources(param_name: &str) -> bool {
     PARAMS_ANSWERED_FROM_RESOURCES.contains(&param_name)
 }
 
+/// Longest text value stored in an indexed `search_index` column, in bytes.
+///
+/// A B-tree entry holds at most 2704 bytes (a third of a page), the key
+/// columns `(tenant_id, resource_type, param_name, value)` together; a
+/// longer value fails the whole write ("index row size … exceeds btree
+/// version 4 maximum 2704"), which made e.g. Da Vinci DTR's
+/// `OperationDefinition/questionnaire-package` (a 3 kB description)
+/// impossible to store. Values are cut at a character boundary: string
+/// search matches by prefix, so only a `:exact` or `:contains` match beyond
+/// the first 1,400 bytes of a value is lost.
+const MAX_INDEXED_TEXT: usize = 1400;
+
+/// `s`, cut to [`MAX_INDEXED_TEXT`] bytes at a character boundary.
+fn indexed_text(s: &str) -> String {
+    if s.len() <= MAX_INDEXED_TEXT {
+        return s.to_string();
+    }
+    let mut end = MAX_INDEXED_TEXT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 impl IndexRow {
     /// Flattens one extracted value into a row.
     ///
@@ -648,8 +680,8 @@ impl IndexRow {
 
         match &extracted.value {
             IndexValue::String(s) => {
-                row.value_string = Some(s.clone());
-                row.value_string_folded = Some(crate::search::fold_text(s));
+                row.value_string = Some(indexed_text(s));
+                row.value_string_folded = Some(indexed_text(&crate::search::fold_text(s)));
             }
             IndexValue::Token {
                 system,
@@ -660,7 +692,7 @@ impl IndexRow {
             } => {
                 row.value_token_system = system.clone();
                 row.value_token_code = Some(code.clone());
-                row.value_token_display = display.clone();
+                row.value_token_display = display.as_deref().map(indexed_text);
                 row.value_identifier_type_system = identifier_type_system.clone();
                 row.value_identifier_type_code = identifier_type_code.clone();
             }
@@ -715,10 +747,13 @@ impl IndexRow {
                 // able to use a `/_history/<vid>` suffix, and three of them are
                 // silently broken by one.
                 row.value_reference = Some(strip_reference_version(reference).to_string());
-                row.value_reference_display = display.clone();
+                // `Type/id` of an absolute http(s) reference, so a relative
+                // search value matches it (#2394); `None` otherwise.
+                row.value_reference_target = absolute_reference_target(reference);
+                row.value_reference_display = display.as_deref().map(indexed_text);
             }
             IndexValue::Uri(uri) => {
-                row.value_uri = Some(uri.clone());
+                row.value_uri = Some(indexed_text(uri));
             }
         }
 
@@ -775,7 +810,7 @@ impl IndexRow {
             value_token_code: row.value_token_code.clone(),
             value_token_system_2: row.value_token_system_2.clone(),
             value_token_code_2: row.value_token_code_2.clone(),
-            value_string: row.value_string.clone(),
+            value_string: row.value_string.as_deref().map(indexed_text),
             value_date: date_range.map(|(start, _)| start),
             value_date_end: date_range.map(|(_, end)| end),
             value_number: row.value_number,
@@ -830,6 +865,7 @@ struct RowKey<'a> {
     value_quantity_canonical_value: Option<u64>,
     value_quantity_canonical_unit: Option<&'a String>,
     value_reference: Option<&'a String>,
+    value_reference_target: Option<&'a String>,
     value_reference_display: Option<&'a String>,
     value_identifier_type_system: Option<&'a String>,
     value_identifier_type_code: Option<&'a String>,
@@ -873,6 +909,7 @@ impl IndexRow {
             value_quantity_canonical_value,
             value_quantity_canonical_unit,
             value_reference,
+            value_reference_target,
             value_reference_display,
             value_identifier_type_system,
             value_identifier_type_code,
@@ -908,6 +945,7 @@ impl IndexRow {
             value_quantity_canonical_value: value_quantity_canonical_value.map(f64::to_bits),
             value_quantity_canonical_unit: value_quantity_canonical_unit.as_ref(),
             value_reference: value_reference.as_ref(),
+            value_reference_target: value_reference_target.as_ref(),
             value_reference_display: value_reference_display.as_ref(),
             value_identifier_type_system: value_identifier_type_system.as_ref(),
             value_identifier_type_code: value_identifier_type_code.as_ref(),
@@ -1302,6 +1340,14 @@ impl PostgresSearchIndexWriter {
             return Ok(());
         }
 
+        for row in rows.iter().filter(|r| r.last_updated.is_none()) {
+            crate::backends::postgres::null_timestamp_facts::note_null_rows(
+                tenant_id,
+                resource_type,
+                &row.param_name,
+            );
+        }
+
         // One choke point for the de-duplication: every row this backend writes
         // for a single resource passes through here. See [`dedup_rows`].
         let kept = dedup_rows(rows.iter().map(|row| (resource_type, resource_id, row)));
@@ -1370,6 +1416,13 @@ impl PostgresSearchIndexWriter {
         let mut flat: Vec<(&str, &str, &IndexRow)> = Vec::with_capacity(total);
         for (resource_type, resource_id, rows) in batches {
             for row in rows.iter() {
+                if row.last_updated.is_none() {
+                    crate::backends::postgres::null_timestamp_facts::note_null_rows(
+                        tenant_id,
+                        resource_type,
+                        &row.param_name,
+                    );
+                }
                 flat.push((resource_type, resource_id, row));
             }
         }
@@ -1780,6 +1833,9 @@ mod tests {
             ("value_reference", |r| {
                 r.value_reference = Some("P/1".into())
             }),
+            ("value_reference_target", |r| {
+                r.value_reference_target = Some("P/1".into())
+            }),
             ("value_reference_display", |r| {
                 r.value_reference_display = Some("d".into())
             }),
@@ -1904,6 +1960,24 @@ mod tests {
     fn row_of(value: IndexValue) -> IndexRow {
         IndexRow::from_extracted(&extracted(value), "Observation", "abc", Some(Utc::now()))
             .expect("value should map to a row")
+    }
+
+    /// A value longer than a B-tree entry can hold (a 3 kB
+    /// OperationDefinition description, CJK text) is cut at a character
+    /// boundary instead of failing the write.
+    #[test]
+    fn long_text_values_fit_the_index() {
+        let long = "說明".repeat(1000); // 6,000 bytes
+        let row = row_of(IndexValue::String(long.clone()));
+        let stored = row.value_string.unwrap();
+        assert!(stored.len() <= MAX_INDEXED_TEXT, "{}", stored.len());
+        assert!(long.starts_with(&stored));
+        assert!(row.value_string_folded.unwrap().len() <= MAX_INDEXED_TEXT);
+        let row = row_of(IndexValue::Uri(format!("http://x/{}", "a".repeat(5000))));
+        assert_eq!(row.value_uri.unwrap().len(), MAX_INDEXED_TEXT);
+        // Short values are stored as they are.
+        let row = row_of(IndexValue::String("Peter".into()));
+        assert_eq!(row.value_string.as_deref(), Some("Peter"));
     }
 
     #[test]

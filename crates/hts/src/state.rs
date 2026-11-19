@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use helios_persistence::ResourceStorage;
@@ -181,6 +182,10 @@ pub struct AppState<B: TerminologyBackend> {
     /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
 
+    /// Apply stored CodeSystem supplements to `$lookup` / `$expand` without an
+    /// explicit `useSupplement` (`HTS_AUTO_SUPPLEMENTS`, default `true`).
+    pub auto_supplements: bool,
+
     /// In-process LRU-style cache for `$expand` responses.
     ///
     /// Eliminates redundant backend work when the same expansion is requested
@@ -245,7 +250,45 @@ pub struct AppState<B: TerminologyBackend> {
     /// [`AppState::clear_expand_cache`] — a newly-imported supplement
     /// might define a previously-unknown code.
     pub lookup_not_found_cache: NotFoundCache,
+
+    /// Request-scoped stores for `tx-resource` parameters the store does
+    /// not hold (see [`crate::tx_overlay`]). Dropped with the other caches.
+    #[cfg(feature = "sqlite")]
+    pub tx_overlays: Arc<crate::tx_overlay::TxOverlayCache>,
+
+    /// This state is a `tx-resource` overlay (never overlaid again).
+    pub is_tx_overlay: bool,
+
+    /// Supplements never applied automatically: in an overlay, the ones the
+    /// request supplied (a client sending a supplement asks for it with
+    /// `useSupplement`; automatic use is for the operator's own).
+    pub auto_supplements_skip: Arc<HashSet<String>>,
+
+    /// `$closure` tables by name (see [`crate::operations::closure`]).
+    pub closure_tables: crate::operations::closure::ClosureTables,
+
+    /// The FHIR `AuditEvent` trail (`HTS_AUDIT_*`), when enabled.
+    pub audit: Option<crate::audit::HtsAudit>,
+
+    /// Serialises concept-closure rebuilds started by `POST /import?finalize=true`.
+    ///
+    /// The rebuild runs as a detached task, so two finalize requests can
+    /// overlap. On PostgreSQL both would see the same system as missing its
+    /// closure and race on `concept_closure`'s primary key. Holding this lock
+    /// means the second caller finds nothing left to rebuild.
+    pub closure_rebuild_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// How long `POST /import?finalize=true` waits for the closure rebuild
+    /// before answering `202 Accepted` and letting it finish in the background.
+    /// Must stay below the router's 30 s request timeout. See
+    /// [`DEFAULT_IMPORT_FINALIZE_WAIT`].
+    pub import_finalize_wait: Duration,
 }
+
+/// Default for [`AppState::import_finalize_wait`]: comfortably inside the
+/// 30 s `TimeoutLayer` in `server::create_app`, so a slow rebuild is reported
+/// as pending instead of being cut off with a 408.
+pub const DEFAULT_IMPORT_FINALIZE_WAIT: Duration = Duration::from_secs(20);
 
 impl<B: TerminologyBackend> AppState<B> {
     /// Wrap `backend` in an `Arc` and return a ready-to-use state.
@@ -260,6 +303,7 @@ impl<B: TerminologyBackend> AppState<B> {
             resource_store_pg: None,
             terminology_importer: None,
             max_expansion_size: 10_000,
+            auto_supplements: true,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -268,7 +312,21 @@ impl<B: TerminologyBackend> AppState<B> {
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
+            #[cfg(feature = "sqlite")]
+            tx_overlays: Arc::new(crate::tx_overlay::TxOverlayCache::default()),
+            is_tx_overlay: false,
+            auto_supplements_skip: Arc::new(HashSet::new()),
+            closure_tables: Default::default(),
+            audit: None,
+            closure_rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
+            import_finalize_wait: DEFAULT_IMPORT_FINALIZE_WAIT,
         }
+    }
+
+    /// Record terminology requests and admin actions as `AuditEvent`s.
+    pub fn with_audit(mut self, audit: Option<crate::audit::HtsAudit>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Evict all cached `$expand` results and negative-cache entries, plus the
@@ -309,11 +367,26 @@ impl<B: TerminologyBackend> AppState<B> {
         if let Ok(mut neg) = self.lookup_not_found_cache.write() {
             neg.clear();
         }
+        #[cfg(feature = "sqlite")]
+        self.tx_overlays.clear();
     }
 
     /// Override the maximum expansion size (default: 10 000).
     pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
         self.max_expansion_size = limit;
+        self
+    }
+
+    /// Override [`Self::import_finalize_wait`].
+    pub fn with_import_finalize_wait(mut self, wait: Duration) -> Self {
+        self.import_finalize_wait = wait;
+        self
+    }
+
+    /// Enable / disable automatic application of stored CodeSystem supplements
+    /// (default: enabled).
+    pub fn with_auto_supplements(mut self, enabled: bool) -> Self {
+        self.auto_supplements = enabled;
         self
     }
 

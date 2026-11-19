@@ -792,6 +792,68 @@ async fn test_completed_submission_still_ingests_manifests() {
     }
 }
 
+/// #2554: a submitted line is stored without its empty objects, empty arrays
+/// and null members, as a REST write of the same body is.
+#[tokio::test]
+async fn test_submitted_resources_are_stored_without_empty_elements() {
+    let ndjson = concat!(
+        "{\"resourceType\":\"Patient\",\"id\":\"sub-empty\",\"active\":true,",
+        "\"name\":[{\"family\":\"A\",\"given\":[]},{}],\"telecom\":[],\"gender\":null}\n"
+    );
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "https://provider/patients.ndjson".to_string(),
+        ndjson.as_bytes().to_vec(),
+    );
+    let fetcher = Arc::new(MockFetcher {
+        files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider/patients.ndjson".to_string(),
+                count: Some(1),
+            }],
+            deleted: vec![],
+        },
+        manifests: std::collections::HashMap::new(),
+    });
+    let (server, backend, fetcher, output, _tmp) =
+        create_submit_server_with(fetcher, BulkSubmitConfig::default()).await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("empty-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    let stored = backend
+        .read(
+            &TenantContext::new(
+                TenantId::new("test-tenant"),
+                TenantPermissions::full_access(),
+            ),
+            "Patient",
+            "sub-empty",
+        )
+        .await
+        .unwrap()
+        .expect("Patient/sub-empty is ingested");
+    assert_eq!(
+        stored.content(),
+        &json!({
+            "resourceType": "Patient",
+            "id": "sub-empty",
+            "active": true,
+            "name": [{"family": "A"}]
+        })
+    );
+}
+
 /// `submissionStatus=stopped` aborts rather than completes.
 #[tokio::test]
 async fn test_stopped_status_aborts_submission() {
@@ -1518,6 +1580,87 @@ async fn test_import_mode_replace_applied_to_ingestion() {
             "replace must not retain unsubmitted elements, got {stored}"
         );
     }
+}
+
+/// Marks (or clears) the "owes a search-index rebuild" marker on every
+/// manifest behind `poll_path`, as deferred indexing does after a manifest.
+async fn set_index_pending(backend: &Arc<SqliteBackend>, poll_path: &str, pending: bool) {
+    let token = poll_path.rsplit('/').next().unwrap().to_string();
+    let target = backend
+        .resolve_poll_token(&token)
+        .await
+        .unwrap()
+        .expect("poll token resolves");
+    for manifest in backend
+        .list_manifests(&target.tenant, &target.submission_id)
+        .await
+        .unwrap()
+    {
+        if pending {
+            let lease = helios_persistence::core::ManifestLease {
+                tenant: target.tenant.clone(),
+                submission_id: target.submission_id.clone(),
+                manifest_id: manifest.manifest_id.clone(),
+                worker_id: WorkerId::new("marker"),
+                lease_expiry: chrono::Utc::now(),
+                lease_duration: Duration::from_secs(60),
+                fencing_token: 0,
+            };
+            backend.mark_manifest_index_pending(&lease, &[]).await.unwrap();
+        } else {
+            backend
+                .clear_manifest_index_pending(&target.tenant, &manifest.manifest_id)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Written is not searchable: while a finished submission still owes the
+/// search-index rebuild that deferred indexing postponed, the poll stays at
+/// `202` and says so; the `200` manifest follows the rebuild. The
+/// `status_waits_for_index = false` opt-out restores the old answer.
+#[tokio::test]
+async fn test_poll_waits_for_the_deferred_index_rebuild() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    assert_eq!(server.get(&poll_path).await.status_code(), StatusCode::OK);
+
+    set_index_pending(&backend, &poll_path, true).await;
+    let indexing = server.get(&poll_path).await;
+    assert_eq!(indexing.status_code(), StatusCode::ACCEPTED);
+    let progress = indexing
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(progress.starts_with("Indexing"), "{progress}");
+    assert!(
+        !progress.to_ascii_lowercase().starts_with("processing "),
+        "an indeterminate phase must not parse as a percentage: {progress}"
+    );
+    assert!(indexing.headers().get("retry-after").is_some());
+
+    set_index_pending(&backend, &poll_path, false).await;
+    assert_eq!(server.get(&poll_path).await.status_code(), StatusCode::OK);
+
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            status_waits_for_index: false,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    set_index_pending(&backend, &poll_path, true).await;
+    assert_eq!(
+        server.get(&poll_path).await.status_code(),
+        StatusCode::OK,
+        "opted out: 200 once written"
+    );
 }
 
 #[tokio::test]
@@ -2357,4 +2500,89 @@ async fn test_progress_header_stays_ascii_in_every_branch() {
         text.contains("609,191 Resources written"),
         "the count branch must still be the one under test, got: {text}"
     );
+}
+
+fn attribution_fetcher() -> Arc<MockFetcher> {
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "https://provider/attributed.ndjson?X-Amz-Signature=secret".to_string(),
+        concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"attr-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"gone\"}\n",
+            "not-json\n",
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    Arc::new(MockFetcher {
+        files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider/attributed.ndjson?X-Amz-Signature=secret".to_string(),
+                count: Some(3),
+            }],
+            deleted: vec![],
+        },
+        manifests: std::collections::HashMap::new(),
+    })
+}
+
+#[tokio::test]
+async fn error_receipts_name_the_input_file_and_line() {
+    let (server, backend, fetcher, output, _tmp) =
+        create_submit_server_with(attribution_fetcher(), BulkSubmitConfig::default()).await;
+    let tenant = TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    );
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "gone"}),
+            helios_fhir::FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "gone").await.unwrap();
+
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+    let manifest: Value = server.get(&poll_path).await.json();
+    let outcome = manifest["outcome"].as_array().expect("outcome array");
+    assert_eq!(outcome.len(), 1, "{manifest:#}");
+    let outcome_url = outcome[0]["url"].as_str().expect("outcome url");
+    let outcome_bytes = server.get(local_file_path(outcome_url)).await.text();
+    let rows: Vec<Value> = outcome_bytes
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+
+    let attributed: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row["extension"][0]["url"]
+                == "https://helios.software/StructureDefinition/bulk-submit-input"
+        })
+        .collect();
+    assert_eq!(attributed.len(), 1, "{rows:#?}");
+    assert_eq!(
+        attributed[0]["extension"][0]["extension"],
+        json!([
+            {"url": "file", "valueUrl": "https://provider/attributed.ndjson?[redacted]"},
+            {"url": "line", "valuePositiveInt": 2}
+        ]),
+        "{rows:#?}"
+    );
+
+    for row in &rows {
+        let diagnostics = row["issue"][0]["diagnostics"].as_str().unwrap_or_default();
+        if diagnostics.contains("could not be parsed") {
+            assert!(row.get("extension").is_none(), "{row:#}");
+        }
+    }
+
+    assert_eq!(manifest["output"][0]["count"], 1, "{manifest:#}");
 }

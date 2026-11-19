@@ -46,6 +46,8 @@ use helios_persistence::types::{
     SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// What every invalid value must come back as.
 const REJECTED: &str = "InvalidNumberValue";
 
@@ -224,6 +226,7 @@ fn chained(value: &str) -> SearchQuery {
                 reference_param: "result".to_string(),
                 target_type: Some("Observation".to_string()),
                 target_param: "value-quantity".to_string(),
+                has: None,
             }],
             ..Default::default()
         })
@@ -283,7 +286,7 @@ fn observation(id: Option<&str>, quantity: Option<(f64, &str)>) -> Value {
 async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
     let version = FhirVersion::default();
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "nv-patient", "name": [{"family": "Numeric"}]}),
@@ -301,7 +304,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
             prediction["probabilityDecimal"] = json!(p);
         }
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "RiskAssessment",
                 json!({
@@ -323,7 +326,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
         ("uq-none", None),
     ] {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 observation(Some(id), quantity),
@@ -333,7 +336,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
             .expect("seed observation");
     }
     backend
-        .create(
+        .seed_create(
             tenant,
             "DiagnosticReport",
             json!({

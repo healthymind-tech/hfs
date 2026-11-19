@@ -107,8 +107,11 @@ async fn the_shell_says_once_that_no_browser_sign_in_is_configured() {
     let precheck = script
         .find(r#"if (document.getElementById("auth-bearer-only"))"#)
         .expect("batch.js checks the posture before executing");
+    // The fork posts through `fhirUrl` so a proxy path prefix is honoured
+    // (hm/ui-rwd); upstream posts to a literal "/". Either is the root POST.
     let send = script
-        .find(r#"fetch("/""#)
+        .find(r#"fetch(fhirUrl("/")"#)
+        .or_else(|| script.find(r#"fetch("/""#))
         .expect("batch.js posts to the root");
     assert!(precheck < send, "the posture check runs before the POST");
 

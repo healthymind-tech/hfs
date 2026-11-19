@@ -1,0 +1,3101 @@
+{
+  "resourceType": "Bundle",
+  "type": "transaction",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:tw-lab-6690-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-6690-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "6690-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "6690-2",
+              "display": "Leukocytes"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "WBC",
+              "display": "白血球計數"
+            }
+          ],
+          "text": "白血球計數"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "白血球計數",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "10^3/uL",
+            "display": "10^3/uL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 4.0,
+                "unit": "10^3/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^3/uL"
+              },
+              "high": {
+                "value": 10.0,
+                "unit": "10^3/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^3/uL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-6690-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-789-8",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-789-8",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "789-8"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "789-8",
+              "display": "Erythrocytes"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "RBC",
+              "display": "紅血球計數"
+            }
+          ],
+          "text": "紅血球計數"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "紅血球計數",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "10^6/uL",
+            "display": "10^6/uL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 4.5,
+                "unit": "10^6/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^6/uL"
+              },
+              "high": {
+                "value": 5.9,
+                "unit": "10^6/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^6/uL"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 4.0,
+                "unit": "10^6/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^6/uL"
+              },
+              "high": {
+                "value": 5.2,
+                "unit": "10^6/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^6/uL"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-789-8"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-718-7",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-718-7",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "718-7"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "718-7",
+              "display": "Hemoglobin"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Hb",
+              "display": "血紅素"
+            }
+          ],
+          "text": "血紅素"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "血紅素",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "g/dL",
+            "display": "g/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 13.5,
+                "unit": "g/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "g/dL"
+              },
+              "high": {
+                "value": 17.5,
+                "unit": "g/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "g/dL"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 12.0,
+                "unit": "g/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "g/dL"
+              },
+              "high": {
+                "value": 16.0,
+                "unit": "g/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "g/dL"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-718-7"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-4544-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-4544-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "4544-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "4544-3",
+              "display": "Hematocrit"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Hct",
+              "display": "血球容積比"
+            }
+          ],
+          "text": "血球容積比"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "血球容積比",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "%",
+            "display": "%"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 39.0,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              },
+              "high": {
+                "value": 52.0,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 36.0,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              },
+              "high": {
+                "value": 46.0,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-4544-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-777-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-777-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "777-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "777-3",
+              "display": "Platelets"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "PLT",
+              "display": "血小板計數"
+            }
+          ],
+          "text": "血小板計數"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "血小板計數",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "10^3/uL",
+            "display": "10^3/uL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 150.0,
+                "unit": "10^3/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^3/uL"
+              },
+              "high": {
+                "value": 400.0,
+                "unit": "10^3/uL",
+                "system": "http://unitsofmeasure.org",
+                "code": "10^3/uL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-777-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-1558-6",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-1558-6",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "1558-6"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1558-6",
+              "display": "Fasting glucose"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "AC Sugar, FBS",
+              "display": "空腹血糖"
+            }
+          ],
+          "text": "空腹血糖"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "空腹血糖",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 70.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 100.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "正常範圍 — 台灣糖尿病學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-1558-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-4548-4",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-4548-4",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "4548-4"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "4548-4",
+              "display": "HbA1c"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "HbA1c",
+              "display": "糖化血色素"
+            }
+          ],
+          "text": "糖化血色素"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "糖化血色素",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "%",
+            "display": "%"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 4.0,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              },
+              "high": {
+                "value": 5.6,
+                "unit": "%",
+                "system": "http://unitsofmeasure.org",
+                "code": "%"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "正常範圍 — 台灣糖尿病學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "全血"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-4548-4"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2093-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2093-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2093-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2093-3",
+              "display": "Total Cholesterol"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "T-Chol",
+              "display": "總膽固醇"
+            }
+          ],
+          "text": "總膽固醇"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "總膽固醇",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 200.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "理想值 — 台灣血脂學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2093-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2571-8",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2571-8",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2571-8"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2571-8",
+              "display": "Triglyceride"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "TG",
+              "display": "三酸甘油酯"
+            }
+          ],
+          "text": "三酸甘油酯"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "三酸甘油酯",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 150.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "正常值 — 台灣血脂學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2571-8"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2085-9",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2085-9",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2085-9"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2085-9",
+              "display": "HDL Cholesterol"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "HDL-C",
+              "display": "高密度脂蛋白膽固醇"
+            }
+          ],
+          "text": "高密度脂蛋白"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "高密度脂蛋白",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 40.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性（越高越好） — 台灣血脂學會"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 50.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性（越高越好） — 台灣血脂學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2085-9"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2089-1",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2089-1",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2089-1"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2089-1",
+              "display": "LDL Cholesterol"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "LDL-C",
+              "display": "低密度脂蛋白膽固醇"
+            }
+          ],
+          "text": "低密度脂蛋白"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "低密度脂蛋白",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 130.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "理想值 — 台灣血脂學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2089-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-1742-6",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-1742-6",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "1742-6"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1742-6",
+              "display": "ALT (GPT)"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "ALT, GPT",
+              "display": "丙胺酸轉胺酶"
+            }
+          ],
+          "text": "丙胺酸轉胺酶"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "丙胺酸轉胺酶",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "U/L",
+            "display": "U/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 40.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 35.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-1742-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-1920-8",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-1920-8",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "1920-8"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1920-8",
+              "display": "AST (GOT)"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "AST, GOT",
+              "display": "天門冬胺酸轉胺酶"
+            }
+          ],
+          "text": "天門冬胺酸轉胺酶"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "天門冬胺酸轉胺酶",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "U/L",
+            "display": "U/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 40.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-1920-8"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-1975-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-1975-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "1975-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1975-2",
+              "display": "Total Bilirubin"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "T-Bil",
+              "display": "總膽紅素"
+            }
+          ],
+          "text": "總膽紅素"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "總膽紅素",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.2,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 1.2,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-1975-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2160-0",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2160-0",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2160-0"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2160-0",
+              "display": "Creatinine"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Cr",
+              "display": "肌酸酐"
+            }
+          ],
+          "text": "肌酸酐"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "肌酸酐",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.7,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 1.3,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.6,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 1.1,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2160-0"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-3094-0",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-3094-0",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "3094-0"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "3094-0",
+              "display": "BUN"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "BUN",
+              "display": "尿素氮"
+            }
+          ],
+          "text": "尿素氮"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "尿素氮",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 7.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 20.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-3094-0"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-33914-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-33914-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "33914-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "33914-3",
+              "display": "eGFR"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "eGFR",
+              "display": "腎絲球過濾率"
+            }
+          ],
+          "text": "腎絲球過濾率"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "腎絲球過濾率",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mL/min/{1.73_m2}",
+            "display": "mL/min/1.73m2"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 90.0,
+                "unit": "mL/min/1.73m2",
+                "system": "http://unitsofmeasure.org",
+                "code": "mL/min/{1.73_m2}"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "正常腎功能 — 台灣腎臟醫學會"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-33914-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2951-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2951-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2951-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2951-2",
+              "display": "Sodium"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Na",
+              "display": "鈉離子"
+            }
+          ],
+          "text": "鈉離子"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "鈉離子",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mmol/L",
+            "display": "mmol/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 136.0,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              },
+              "high": {
+                "value": 145.0,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2951-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2823-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2823-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2823-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2823-3",
+              "display": "Potassium"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "K",
+              "display": "鉀離子"
+            }
+          ],
+          "text": "鉀離子"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "鉀離子",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mmol/L",
+            "display": "mmol/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 3.5,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              },
+              "high": {
+                "value": 5.1,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2823-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2075-0",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2075-0",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2075-0"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2075-0",
+              "display": "Chloride"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Cl",
+              "display": "氯離子"
+            }
+          ],
+          "text": "氯離子"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "氯離子",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mmol/L",
+            "display": "mmol/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 98.0,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              },
+              "high": {
+                "value": 107.0,
+                "unit": "mmol/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "mmol/L"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2075-0"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-3016-3",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-3016-3",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "3016-3"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "3016-3",
+              "display": "TSH"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "TSH",
+              "display": "促甲狀腺激素"
+            }
+          ],
+          "text": "促甲狀腺激素"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "促甲狀腺激素",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "u[IU]/mL",
+            "display": "uIU/mL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.27,
+                "unit": "uIU/mL",
+                "system": "http://unitsofmeasure.org",
+                "code": "u[IU]/mL"
+              },
+              "high": {
+                "value": 4.2,
+                "unit": "uIU/mL",
+                "system": "http://unitsofmeasure.org",
+                "code": "u[IU]/mL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-3016-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-3053-6",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-3053-6",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "3053-6"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "3053-6",
+              "display": "Free T4"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "Free T4",
+              "display": "游離甲狀腺素"
+            }
+          ],
+          "text": "游離甲狀腺素"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "游離甲狀腺素",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "ng/dL",
+            "display": "ng/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.93,
+                "unit": "ng/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "ng/dL"
+              },
+              "high": {
+                "value": 1.7,
+                "unit": "ng/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "ng/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-3053-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-5902-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-5902-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "5902-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "5902-2",
+              "display": "PT"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "PT",
+              "display": "凝血酶原時間"
+            }
+          ],
+          "text": "凝血酶原時間"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "凝血酶原時間",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "s",
+            "display": "sec"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 9.5,
+                "unit": "sec",
+                "system": "http://unitsofmeasure.org",
+                "code": "s"
+              },
+              "high": {
+                "value": 12.5,
+                "unit": "sec",
+                "system": "http://unitsofmeasure.org",
+                "code": "s"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-5902-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-6301-6",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-6301-6",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "6301-6"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "6301-6",
+              "display": "INR"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "INR",
+              "display": "國際標準化比值"
+            }
+          ],
+          "text": "國際標準化比值"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "國際標準化比值",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "{ratio}",
+            "display": "ratio"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 0.8,
+                "unit": "ratio",
+                "system": "http://unitsofmeasure.org",
+                "code": "{ratio}"
+              },
+              "high": {
+                "value": 1.2,
+                "unit": "ratio",
+                "system": "http://unitsofmeasure.org",
+                "code": "{ratio}"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "未服用抗凝血劑 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-6301-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-3173-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-3173-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "3173-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "3173-2",
+              "display": "aPTT"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "aPTT",
+              "display": "活化部分凝血活酶時間"
+            }
+          ],
+          "text": "活化部分凝血活酶時間"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "活化部分凝血活酶時間",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "s",
+            "display": "sec"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 25.0,
+                "unit": "sec",
+                "system": "http://unitsofmeasure.org",
+                "code": "s"
+              },
+              "high": {
+                "value": 35.0,
+                "unit": "sec",
+                "system": "http://unitsofmeasure.org",
+                "code": "s"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-3173-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-6768-6",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-6768-6",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "6768-6"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "6768-6",
+              "display": "ALP"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "ALP, Alk Phos",
+              "display": "鹼性磷酸酶"
+            }
+          ],
+          "text": "鹼性磷酸酶"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "鹼性磷酸酶",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "U/L",
+            "display": "U/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 30.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              },
+              "high": {
+                "value": 120.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人參考值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-6768-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-2324-2",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-2324-2",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "2324-2"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2324-2",
+              "display": "GGT"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "γ-GT, GGT",
+              "display": "γ-麩胺醯轉移酶"
+            }
+          ],
+          "text": "γ-麩胺醯轉移酶"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "γ-麩胺醯轉移酶",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "U/L",
+            "display": "U/L"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 73.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 38.0,
+                "unit": "U/L",
+                "system": "http://unitsofmeasure.org",
+                "code": "U/L"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-2324-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-3084-1",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-3084-1",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "3084-1"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "3084-1",
+              "display": "Uric Acid"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "UA",
+              "display": "尿酸"
+            }
+          ],
+          "text": "尿酸"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "尿酸",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 3.5,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 7.2,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "male",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人男性 — 台大醫院檢驗科"
+          },
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "low": {
+                "value": 2.6,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              },
+              "high": {
+                "value": 6.0,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "gender": "female",
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "成人女性 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-3084-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:tw-lab-1988-5",
+      "resource": {
+        "resourceType": "ObservationDefinition",
+        "id": "tw-lab-1988-5",
+        "language": "zh-Hant",
+        "identifier": [
+          {
+            "system": "https://terminology.healthymind.tw/identifier/lab-test",
+            "value": "1988-5"
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1988-5",
+              "display": "CRP"
+            },
+            {
+              "system": "https://terminology.healthymind.tw/CodeSystem/lab-abbreviation",
+              "code": "CRP",
+              "display": "C反應蛋白"
+            }
+          ],
+          "text": "C反應蛋白"
+        },
+        "permittedDataType": [
+          "Quantity"
+        ],
+        "multipleResultsAllowed": false,
+        "preferredReportName": "C反應蛋白",
+        "quantitativeDetails": {
+          "unit": {
+            "system": "http://unitsofmeasure.org",
+            "code": "mg/dL",
+            "display": "mg/dL"
+          }
+        },
+        "qualifiedInterval": [
+          {
+            "category": "reference",
+            "context": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+                  "code": "normal",
+                  "display": "Normal Range"
+                }
+              ]
+            },
+            "range": {
+              "high": {
+                "value": 0.5,
+                "unit": "mg/dL",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg/dL"
+              }
+            },
+            "age": {
+              "low": {
+                "value": 18.0,
+                "unit": "a",
+                "system": "http://unitsofmeasure.org",
+                "code": "a"
+              }
+            },
+            "condition": "正常值 — 台大醫院檢驗科"
+          }
+        ],
+        "extension": [
+          {
+            "url": "https://terminology.healthymind.tw/StructureDefinition/lab-specimen-type",
+            "valueString": "血清/血漿"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ObservationDefinition/tw-lab-1988-5"
+      }
+    }
+  ]
+}

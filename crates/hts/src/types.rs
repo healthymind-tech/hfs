@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct PropertyValue {
     /// Property code (e.g. "parent", "inactive", "synonym")
     pub code: String,
-    /// FHIR property type: code | string | boolean | integer | decimal | dateTime
+    /// FHIR property type: code | Coding | string | boolean | integer | decimal | dateTime
     pub value_type: String,
     /// Serialised value (always a string for simplicity; callers cast as needed)
     pub value: String,
@@ -477,6 +477,11 @@ pub struct TranslateRequest {
     /// Point-in-time date for evaluation (ISO-8601).
     #[serde(default)]
     pub date: Option<String>,
+    /// `conceptMapVersion`: the version of the `url` ConceptMap to use.
+    /// Without it (or without `url`) each map URL contributes its default
+    /// version only (see `cm_precedence_order_by`).
+    #[serde(default)]
+    pub map_version: Option<String>,
 }
 
 /// Response from `ConceptMap/$translate`.
@@ -514,6 +519,30 @@ pub struct ResourceSearchQuery {
     pub title_mode: crate::string_search::FhirStringSearchMode,
     /// Filter by status: `draft`, `active`, `retired`, or `unknown`.
     pub status: Option<String>,
+    /// `_id`: the logical id (exact). Also matches the version-qualified
+    /// storage ids (`<id>|<version>`) that multi-version imports use.
+    #[serde(rename = "_id")]
+    pub id: Option<String>,
+    /// CodeSystem `system`: same as `url` (exact), ANDed with it.
+    #[serde(skip)]
+    pub system: Option<String>,
+    /// CodeSystem `supplements`: the supplemented canonical, `url` or
+    /// `url|version` (exact).
+    #[serde(skip)]
+    pub supplements: Option<String>,
+    /// CodeSystem `content-mode` (exact token).
+    #[serde(skip)]
+    pub content_mode: Option<String>,
+    /// Filter by publisher using FHIR `string` search semantics.
+    #[serde(skip)]
+    pub publisher: Option<String>,
+    /// Matching mode for [`Self::publisher`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub publisher_mode: crate::string_search::FhirStringSearchMode,
+    /// `_lastUpdated` predicates (each `[prefix]dateTime`), all ANDed.
+    #[serde(skip)]
+    pub last_updated: Vec<crate::string_search::DateSearch>,
     /// Maximum number of results to return (default: 20).
     #[serde(rename = "_count")]
     pub count: Option<u32>,
@@ -676,5 +705,20 @@ mod tests {
         let decoded: ExpansionContains = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.contains.len(), 1);
         assert_eq!(decoded.contains[0].code, "CHILD");
+    }
+}
+
+/// Whether a code system with `content` may hold a code it does not list: a
+/// fragment, or (as tx.fhir.org treats it) one whose content is not present
+/// — but not a code system defined by a grammar (UCUM, media types, language
+/// tags), whose codes are judged by their form.
+pub fn may_hold_unlisted_codes(content: Option<&str>, system: Option<&str>) -> bool {
+    match content {
+        Some("fragment") => true,
+        Some("not-present") => !matches!(
+            system,
+            Some("http://unitsofmeasure.org" | "urn:ietf:bcp:13" | "urn:ietf:bcp:47")
+        ),
+        _ => false,
     }
 }

@@ -29,6 +29,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
   function fhirHeaders(extra) {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -231,7 +245,7 @@
 
   function load() {
     var resource = resourceId
-      ? fetch("/" + resourceType + "/" + resourceId, { headers: fhirHeaders() })
+      ? fetch(fhirUrl("/" + resourceType + "/" + resourceId), { headers: fhirHeaders() })
           .then(function (response) {
             if (!response.ok) throw new Error(String(response.status));
             return response.json();
@@ -247,7 +261,23 @@
         if (unsaved) unsaved.reset();
         loadVersions();
       });
-    }).catch(function () { if (root.isConnected) say(messages.msgLoadError, "error"); });
+    }).catch(function (error) {
+      if (!root.isConnected) return;
+      /* Nothing loaded, so there is nothing to save or delete: `ready` stays
+         false (the action bar is inert) and the Versions rail is hidden
+         instead of showing live buttons over an empty editor. A 404 is told
+         apart from every other failure, because "no such id" and "the server
+         is down" call for different next steps (fork hm/p25-backlog). */
+      var versionsCard = document.getElementById("editor-versions");
+      if (versionsCard) versionsCard.hidden = true;
+      var code = error && /^\d{3}$/.test(error.message) ? error.message : "";
+      say(
+        code === "404" && messages.msgLoadNotFound
+          ? messages.msgLoadNotFound.replace("{type}", resourceType).replace("{id}", resourceId)
+          : messages.msgLoadError + (code ? " (HTTP " + code + ")" : ""),
+        "error"
+      );
+    });
   }
 
   /* ---- version history panel ------------------------------------------- */
@@ -256,7 +286,7 @@
 
   function loadVersions() {
     if (!versionsHost || !resourceId) return;
-    fetch("/" + resourceType + "/" + resourceId + "/_history", {
+    fetch(fhirUrl("/" + resourceType + "/" + resourceId + "/_history"), {
       headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -409,7 +439,7 @@
         // probe or dialog. A failed probe never blocks the save.
         var exists = false;
         try {
-          var probe = await fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() });
+          var probe = await fetch(fhirUrl(target.url) + "?_elements=id", { method: "GET", headers: fhirHeaders() });
           exists = window.HfsSaveTarget.existsFromStatus(probe.status);
         } catch (probeError) { exists = false; }
         if (exists && !await window.HfsConfirm.ask(
@@ -418,7 +448,7 @@
         )) return;
         if (!root.isConnected || editRevision !== revision) return;
       }
-      var response = await fetch(target.url, {
+      var response = await fetch(fhirUrl(target.url), {
         method: target.method,
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
@@ -485,7 +515,7 @@
       if (!ok || saving || deleting) return;
       deleting = true;
       updateActions();
-      fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
+      fetch(fhirUrl("/" + identity.type + "/" + identity.id), { method: "DELETE", headers: fhirHeaders() })
         .then(function (response) {
           if (!root.isConnected) return;
           if (!response.ok) {

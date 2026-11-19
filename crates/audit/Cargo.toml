@@ -25,24 +25,33 @@ cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros", "rt"] }
 async-trait = "0.1"
 
 # Time
 chrono.workspace = true
 
+# Prometheus metrics of the write path (audit_metrics)
+helios-observability = { path = "../observability", version = "0.2.9" }
+
 # Logging
 tracing = "0.1"
 
+# Prometheus series via the facade the servers' recorder listens on
+metrics = "0.24"
+
 # Error handling
 thiserror = "2"
+
+# Query entity encoding
+base64 = "0.22"
 
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
@@ -60,3 +69,6 @@ aws-config = { version = "1", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }

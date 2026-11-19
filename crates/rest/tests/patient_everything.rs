@@ -322,6 +322,42 @@ async fn capability_statement_declares_everything_on_patient() {
     );
 }
 
+/// A resource whose contained resources also reference the patient is one
+/// match (PostgreSQL used to return it once per index row; this is the SQLite
+/// side of the same guarantee).
+#[tokio::test]
+async fn a_container_is_returned_once() {
+    let server = server_with(10_000).await;
+    seed(&server).await;
+    seed_eob_with_contained(&server).await;
+    for path in [
+        "/Patient/p1/$everything",
+        "/Patient/p1/$everything?_count=3",
+    ] {
+        let (matches, pages) = walk(&server, path).await;
+        for page in &pages {
+            assert_no_duplicate_entries(page);
+        }
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|m| *m == "ExplanationOfBenefit/eob1")
+                .count(),
+            1,
+            "{path}: {matches:?}"
+        );
+    }
+    let resp = server.get("/ExplanationOfBenefit?patient=p1").await;
+    assert_eq!(resp.status_code(), StatusCode::OK);
+    let body: Value = resp.json();
+    assert_eq!(entries(&body, "match"), vec!["ExplanationOfBenefit/eob1"]);
+    let resp = server
+        .get("/ExplanationOfBenefit?patient=p1&_summary=count")
+        .await;
+    let count: Value = resp.json();
+    assert_eq!(count["total"], 1, "{count}");
+}
+
 fn sorted(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v
@@ -392,6 +428,8 @@ async fn type_level_launch_context_accepts_a_patient_reference_and_pages_within_
 }
 
 #[tokio::test]
+#[ignore = "fork keeps fail-closed SMART access (line B): a patient/ token without a usable \
+            launch patient is refused (403) rather than walking every patient"]
 async fn type_level_without_usable_launch_context_walks_every_patient() {
     let principals = [
         smart_principal(None),

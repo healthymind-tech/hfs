@@ -14,17 +14,23 @@ use axum::{
 };
 use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
-use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
+
+use crate::audit::AttributeToPrincipal;
+use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
-    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
-    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind,
-    WriteNotice, apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
+    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
+    EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
+    apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
+    decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
-use helios_persistence::error::{ResourceError, StorageError, TransactionError};
-use helios_persistence::types::SearchParameter;
+use helios_persistence::error::{
+    ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
+};
+use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -34,7 +40,10 @@ use crate::fhir_types::{
     admit_resource_type, is_valid_resource_type, is_valid_resource_type_for_version,
 };
 use crate::handlers::extract_patient_from_resource;
+use crate::handlers::history::{HistoryLevel, execute_history_bundle, parse_history_query};
+use crate::handlers::vread::execute_vread;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::state::AppState;
 
 /// Reads the request body, capped at `max_body_size` (`HFS_MAX_BODY_SIZE`,
@@ -154,6 +163,7 @@ where
         + RevincludeProvider
         + BundleProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -192,7 +202,7 @@ where
                 message: "Bundle must have a type".to_string(),
             })?;
 
-    match bundle_type {
+    let result = match bundle_type {
         "batch" => {
             process_batch(
                 &state,
@@ -221,7 +231,17 @@ where
                 bundle_type
             ),
         }),
+    };
+
+    // A large Bundle leaves gigabytes freed but kept by the allocator; hand
+    // them back once the body and its parse are gone (#2020).
+    let body_len = body.len();
+    drop(bundle);
+    drop(body);
+    if body_len >= crate::memory_trim::TRIM_AFTER_BYTES {
+        crate::memory_trim::release_free_memory();
     }
+    result
 }
 
 /// Hard ceiling on batch entry concurrency, independent of configuration.
@@ -249,8 +269,9 @@ fn batch_concurrency<S>(state: &AppState<S>, entries: &[Value]) -> usize
 where
     S: ResourceStorage + Send + Sync,
 {
-    // A StructureDefinition written by entry i is folded into the tenant
-    // profile registry by `upsert_stored_profile` (the POST and PUT arms of
+    // A StructureDefinition (or ImplementationGuide, whose `global` profiles
+    // apply from then on) written by entry i is folded into the tenant
+    // profile registry by `record_stored_resource` (the POST and PUT arms of
     // `process_batch_entry`) before entry i+1's `check_write` resolves against
     // it. That read-your-writes is the only cross-entry dependency on this
     // path, and it is a server-side conformance side effect rather than a
@@ -292,8 +313,10 @@ where
         let Ok((resource_type, id)) = parse_bundle_request_url(&method, url) else {
             return false;
         };
-        resource_type == "StructureDefinition"
-            || (!matches!(method, BundleMethod::Get) && conditional_criteria(url, &id).is_some())
+        matches!(
+            resource_type.as_str(),
+            "StructureDefinition" | "ImplementationGuide"
+        ) || (!matches!(method, BundleMethod::Get) && conditional_criteria(url, &id).is_some())
     });
     if needs_serial {
         return 1;
@@ -366,6 +389,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -374,6 +398,7 @@ where
         "Processing batch request"
     );
     let correlation = AuditCorrelation::new("batch");
+    helios_audit::context::set_bundle_type("batch");
 
     let entries = bundle
         .get("entry")
@@ -397,6 +422,9 @@ where
     let tenant = &tenant;
     let correlation = &correlation;
     let progress_ref = &progress;
+    // The Bundle request's `Prefer: handling`, which a history entry honours
+    // like a direct history read does (#2380).
+    let strict = prefer.is_strict();
 
     // Entries are independent per the FHIR spec ("the server may process the
     // entries in any order"), so they run with bounded concurrency. The stream
@@ -420,6 +448,7 @@ where
                 entry,
                 index,
                 principal,
+                strict,
                 &mut audit_target,
             )
             .await;
@@ -434,6 +463,7 @@ where
             let correlation_details = EntryAuditCorrelation::from_bundle(correlation, index);
             emit_batch_entry_audit(
                 state,
+                tenant.tenant_id(),
                 entry,
                 &result,
                 audit_target.as_ref(),
@@ -504,6 +534,7 @@ where
         + RevincludeProvider
         + BundleProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -512,6 +543,7 @@ where
         "Processing transaction request"
     );
     let correlation = AuditCorrelation::new("transaction");
+    helios_audit::context::set_bundle_type("transaction");
 
     let json_entries = bundle
         .get("entry")
@@ -519,13 +551,33 @@ where
         .cloned()
         .unwrap_or_default();
 
-    // Parse entries and track their original indices for response ordering
-    let mut indexed_entries: Vec<(usize, BundleEntry, Option<String>)> =
+    // Parse entries and track their original indices for response ordering.
+    // The fourth element is the GET entry to run after the commit, classified
+    // and scoped here, once (#2380); it is `None` for a write and for an
+    // instance read, which runs inside the storage transaction.
+    let mut parsed_entries: Vec<(usize, BundleEntry, Option<String>, Option<DeferredGet>)> =
         Vec::with_capacity(json_entries.len());
 
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((mut bundle_entry, full_url)) => {
+                // A GET entry is a search, read, vread or history read by its
+                // URL (#478, #2380). A `_history` URL that is none of the
+                // history shapes fails the whole bundle, as any malformed
+                // entry does here, before it is judged for scope.
+                let get_target = if matches!(bundle_entry.method, BundleMethod::Get) {
+                    match classify_get_entry_url(&bundle_entry.url) {
+                        Ok(target) => Some(target),
+                        Err(message) => {
+                            return Err(RestError::InvalidElementValue {
+                                message: format!("Entry {index}: {message}"),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // A query string on a non-GET entry is either conditional
                 // criteria on a type-level URL (`PUT Patient?identifier=…`) or
                 // a control parameter on an instance URL
@@ -538,8 +590,9 @@ where
                 // transaction (#859); a control parameter is dropped from the
                 // URL, because the entry addresses the instance either way.
                 //
-                // GET is exempt: a search entry is partitioned out below and
-                // runs against the committed state (#478).
+                // GET is exempt: a search, vread or history entry is
+                // partitioned out below and runs against the committed state
+                // (#478, #2380).
                 //
                 // A conditional entry first passes the per-interaction check the
                 // CapabilityStatement is built from, before anything else about
@@ -568,6 +621,12 @@ where
 
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
+                //
+                // The compartment is this entry's own: a token can confine some
+                // types and not others (`user/Observation.rs patient/*.rs`), so
+                // what one entry's scope confines says nothing of the next
+                // entry's, exactly as in a batch.
+                let mut entry_compartment = PatientCompartment::unconfined();
                 if let Some(principal) = principal {
                     let (resource_type, _) = parse_request_url(&bundle_entry.url).map_err(|e| {
                         // `value`, not its parent `invalid`: `request.url` is
@@ -579,16 +638,61 @@ where
                         }
                     })?;
                     let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
-                    SmartScopePolicy::check(principal, &resource_type, operation).map_err(
-                        |_| RestError::Forbidden {
+                    let scope = SmartScopePolicy::check(principal, &resource_type, operation)
+                        .map_err(|_| RestError::Forbidden {
                             message: format!(
                                 "Insufficient scope for {} on {} (transaction entry {})",
                                 operation, resource_type, index
                             ),
-                        },
-                    )?;
+                        })?;
+                    // A grant confined to a patient compartment (#1618) is
+                    // honoured for search, vread and instance history entries,
+                    // which run in the REST layer after the commit through the
+                    // same confined code as `GET [type]`, `GET [type]/[id]/_history/[vid]`
+                    // and `GET [type]/[id]/_history` (#2380). Every other
+                    // entry of a transaction executes inside the storage
+                    // layer, which cannot judge compartment membership, so
+                    // the bundle is refused whole — transactions are atomic.
+                    // (A type or system history entry is refused here too: it
+                    // cannot be confined at all.)
+                    if let AccessScope::PatientCompartment { patient_id } = scope {
+                        // A bare `[type]` url is a search for GET and a create
+                        // for POST, so the method decides, not the url alone:
+                        // `get_target` is `Some` for a GET only.
+                        if matches!(
+                            get_target,
+                            Some(
+                                GetEntryTarget::Search { .. }
+                                    | GetEntryTarget::Vread { .. }
+                                    | GetEntryTarget::History {
+                                        level: HistoryLevel::Instance { .. },
+                                        ..
+                                    }
+                            )
+                        ) {
+                            entry_compartment = PatientCompartment::confined_to(patient_id)
+                                .with_shared_types(
+                                    state.auth_config().patient_shared_read_types().to_vec(),
+                                );
+                        } else {
+                            return Err(RestError::Forbidden {
+                                message: format!(
+                                    "{} {} (transaction entry {}) is not available under a patient/ scope: only searches, vreads and instance history can be confined to the launch patient's compartment in a transaction; use the single-resource endpoints",
+                                    bundle_entry.method, bundle_entry.url, index
+                                ),
+                            });
+                        }
+                    }
                 }
-                indexed_entries.push((index, bundle_entry, full_url));
+                // Everything but an instance read runs after the commit (see
+                // below), with the compartment judged above.
+                let deferred = get_target
+                    .filter(|target| !matches!(target, GetEntryTarget::Read { .. }))
+                    .map(|target| DeferredGet {
+                        target,
+                        compartment: entry_compartment,
+                    });
+                parsed_entries.push((index, bundle_entry, full_url, deferred));
             }
             Err(e) => {
                 // For transactions, any parse error fails the whole bundle.
@@ -618,9 +722,9 @@ where
     // intact here, at the 501 the backend would otherwise answer from inside
     // the transaction after earlier entries had executed (#511, #859).
     if !state.storage().supports_conditional_in_transaction()
-        && let Some((index, entry, _)) = indexed_entries
+        && let Some((index, entry, _, _)) = parsed_entries
             .iter()
-            .find(|(_, entry, _)| entry.criteria.is_some() || entry.if_none_exist.is_some())
+            .find(|(_, entry, _, _)| entry.criteria.is_some() || entry.if_none_exist.is_some())
     {
         return Err(RestError::NotImplemented {
             feature: format!(
@@ -640,7 +744,7 @@ where
     // Admit every mutation before reference resolution, configurable
     // validation, or storage. A transaction with one invalid write is declined
     // whole, so none of its otherwise valid siblings can commit or delete.
-    for (index, entry, _) in &indexed_entries {
+    for (index, entry, _, _) in &parsed_entries {
         if !matches!(
             entry.method,
             BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
@@ -665,43 +769,68 @@ where
         })?;
     }
 
-    // GET search entries (`Patient?name=x`, bare `Patient`) cannot run inside
-    // the storage transaction; the spec orders GETs after all writes, so they
-    // execute against the just-committed state instead (#478). Their queries
-    // are still validated up front, where a malformed search can reject the
-    // whole bundle before anything executes.
-    let (search_entries, remaining): (Vec<_>, Vec<_>) = indexed_entries.into_iter().partition(
-        |(_, entry, _): &(usize, BundleEntry, Option<String>)| {
-            matches!(entry.method, BundleMethod::Get)
-                && parse_search_entry_url(&entry.url).is_some()
-        },
-    );
-    let mut indexed_entries = remaining;
-    for (index, entry, _) in &search_entries {
-        let (search_type, pairs) =
-            parse_search_entry_url(&entry.url).expect("partitioned on is_some");
-        let reg = state.storage().search_param_registry(tenant.context());
-        let registry = reg.read();
-        // The builder's error keeps its own variant — and so its issue code —
-        // with the entry named in front. Re-wrapping it as `BadRequest` from
-        // `client_response().2` was the same code-discard #504 removed from
-        // the per-entry paths.
-        // Against the version `execute_search_bundle` will run the entry in,
-        // so what passes here is what executes (#1366).
-        crate::extractors::build_search_query_from_pairs(
-            &search_type,
-            // As `execute_search_bundle` will (#1380).
-            &crate::extractors::drop_empty_parameters(pairs),
-            &registry,
-            state.config().default_fhir_version,
-        )
-        .map_err(|e| match e {
-            RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
-                param,
-                message: format!("entry {} search '{}': {}", index, entry.url, message),
-            },
-            other => other,
-        })?;
+    // GET entries other than an instance read (searches such as
+    // `Patient?name=x` or bare `Patient`, vreads, and history reads) cannot run
+    // inside the storage transaction, which only knows `[type]/[id]`; the spec
+    // orders GETs after all writes, so they execute against the just-committed
+    // state instead (#478, #2380). Their queries are still validated up front,
+    // where a malformed search or history parameter can reject the whole
+    // bundle before anything executes.
+    let mut indexed_entries: Vec<(usize, BundleEntry, Option<String>)> =
+        Vec::with_capacity(parsed_entries.len());
+    let mut deferred_gets: Vec<(usize, BundleEntry, DeferredGet)> = Vec::new();
+    for (index, entry, full_url, deferred) in parsed_entries {
+        match deferred {
+            Some(deferred) => deferred_gets.push((index, entry, deferred)),
+            None => indexed_entries.push((index, entry, full_url)),
+        }
+    }
+    for (index, entry, deferred) in &deferred_gets {
+        match &deferred.target {
+            GetEntryTarget::Search {
+                resource_type: search_type,
+                pairs,
+            } => {
+                let reg = state.storage().search_param_registry(tenant.context());
+                let registry = reg.read();
+                // The builder's error keeps its own variant — and so its issue
+                // code — with the entry named in front. Re-wrapping it as
+                // `BadRequest` from `client_response().2` was the same
+                // code-discard #504 removed from the per-entry paths.
+                // Against the version `execute_search_bundle` will run the
+                // entry in, so what passes here is what executes (#1366).
+                crate::extractors::build_search_query_from_pairs(
+                    search_type,
+                    // As `execute_search_bundle` will (#1380).
+                    &crate::extractors::drop_empty_parameters(pairs.clone()),
+                    &registry,
+                    state.config().default_fhir_version,
+                )
+                .map_err(|e| match e {
+                    RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                        param,
+                        message: format!("entry {} search '{}': {}", index, entry.url, message),
+                    },
+                    other => other,
+                })?;
+            }
+            // The history query is judged as `execute_history_bundle` will
+            // judge it, with the Bundle request's `Prefer: handling`, so a
+            // refused or invalid parameter fails the bundle before any write.
+            GetEntryTarget::History { pairs, .. } => {
+                parse_history_query(pairs, prefer.is_strict()).map_err(|e| match e {
+                    RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                        param,
+                        message: format!("entry {} history '{}': {}", index, entry.url, message),
+                    },
+                    other => other,
+                })?;
+            }
+            // Nothing to validate: a vread has no query, and the version it
+            // names is looked up after the commit. (An instance read is never
+            // deferred.)
+            GetEntryTarget::Vread { .. } | GetEntryTarget::Read { .. } => {}
+        }
     }
 
     // Conditional references (`Type?query`) resolve against the server's
@@ -710,17 +839,19 @@ where
     // fail the bundle (#459). They used to be stored verbatim — unsearchable
     // and unresolvable. References to entries created by this same bundle use
     // `fullUrl`s, which the storage layer resolves during processing. Runs on
-    // the write entries only — GET search entries were partitioned out above,
-    // and their query strings are searches, not conditional references.
+    // the write entries only — the deferred GET entries were partitioned out
+    // above, and their query strings are searches, not conditional references.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
-    // Write-path validation: transactions are atomic, so any invalid write
-    // entry rejects the whole bundle before anything executes.
-    for (index, entry, _) in &indexed_entries {
+    // Empty-element cleanup (#2554) and write-path validation: transactions
+    // are atomic, so any invalid write entry rejects the whole bundle before
+    // anything executes. A PATCH entry's document is not stored; its result
+    // is cleaned by the patch engine.
+    for (index, entry, _) in &mut indexed_entries {
         if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
             continue;
         }
-        let Some(resource) = &entry.resource else {
+        let Some(resource) = entry.resource.as_mut() else {
             continue;
         };
         let (resource_type, _) =
@@ -729,7 +860,7 @@ where
             })?;
         state
             .validation()
-            .check_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
+            .prepare_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
             .await?;
     }
 
@@ -745,6 +876,12 @@ where
             entry
         })
         .collect();
+
+    // StructureDefinitions a DELETE entry addresses, resolved now: once the
+    // transaction has committed the row is a tombstone, and the profile
+    // registry is keyed by the canonical url the content carried.
+    let profiles_to_unregister =
+        transaction_profiles_to_unregister(state, &tenant, &json_entries, &indexed_entries).await;
 
     // Call the persistence layer
     let patch_validator = RestPatchValidator {
@@ -762,15 +899,32 @@ where
 
     match result {
         Ok(bundle_result) => {
-            // Stored StructureDefinitions feed the tenant's profile registry.
+            // Deleted StructureDefinitions leave the tenant's profile registry.
+            for (position, deleted) in &profiles_to_unregister {
+                if bundle_result
+                    .entries
+                    .get(*position)
+                    .is_some_and(|r| r.effect == BundleEntryEffect::Deleted)
+                {
+                    for stored in deleted {
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            stored.resource_type(),
+                            stored,
+                        );
+                    }
+                }
+            }
+
+            // Stored StructureDefinitions and ImplementationGuides feed the
+            // tenant's profile registry and global profiles.
             for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
             {
                 if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
                     && let Some(resource) = &result.resource
-                    && resource.get("resourceType").and_then(Value::as_str)
-                        == Some("StructureDefinition")
                 {
-                    state.validation().upsert_stored_profile(
+                    state.validation().record_stored_resource(
                         tenant.tenant_id(),
                         fhir_version,
                         resource,
@@ -778,18 +932,23 @@ where
                 }
                 if entry.method == BundleMethod::Patch
                     && let Ok((resource_type, id)) = parse_request_url(&entry.url)
-                    && resource_type == "StructureDefinition"
+                    && matches!(
+                        resource_type.as_str(),
+                        "StructureDefinition" | "ImplementationGuide"
+                    )
                 {
                     match state
                         .storage()
                         .read(tenant.context(), &resource_type, &id)
                         .await
                     {
-                        Ok(Some(stored)) => state.validation().upsert_stored_profile(
-                            tenant.tenant_id(),
-                            stored.fhir_version(),
-                            stored.content(),
-                        ),
+                        Ok(Some(stored)) => {
+                            state.validation().record_stored_resource(
+                                tenant.tenant_id(),
+                                stored.fhir_version(),
+                                stored.content(),
+                            );
+                        }
                         Ok(None) => {
                             warn!(resource_id = %id, "committed PATCH target missing during profile refresh")
                         }
@@ -823,33 +982,32 @@ where
                 }
             }
 
-            // GET searches run against the committed state (see above). A
-            // failure here cannot roll the transaction back, so it surfaces
-            // as that entry's own error outcome rather than a misleading
-            // whole-bundle failure for writes that did commit.
-            let mut search_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
-                Vec::with_capacity(search_entries.len());
-            for (index, entry, _) in &search_entries {
-                let (search_type, pairs) =
-                    parse_search_entry_url(&entry.url).expect("partitioned on is_some");
-                let result = match crate::handlers::search::execute_search_bundle(
+            // The deferred GET entries (searches, vreads, history reads) run
+            // against the committed state (see above), through the same code
+            // the batch arm uses. A failure here cannot roll the transaction
+            // back, so it surfaces as that entry's own error outcome rather
+            // than a misleading whole-bundle failure for writes that did
+            // commit.
+            //
+            // `entry_failure` renders it through the funnel like every other
+            // entry failure. #481's second code-discarding call site was here:
+            // this loop bypasses the backend executor, so it is the first
+            // *reachable* per-entry outcome on the transaction arm.
+            //
+            // Each runs under its own compartment, as it does in a batch.
+            let mut deferred_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
+                Vec::with_capacity(deferred_gets.len());
+            for (index, entry, deferred) in deferred_gets {
+                let result = execute_get_entry(
                     state,
                     &tenant,
-                    &search_type,
-                    pairs,
-                    false,
+                    &deferred.compartment,
+                    deferred.target,
+                    prefer.is_strict(),
+                    entry.if_none_match.as_deref(),
                 )
-                .await
-                {
-                    Ok(bundle) => searchset_result(bundle),
-                    // The second of #481's two code-discarding call sites, and
-                    // the more consequential one: this loop bypasses the
-                    // backend executor, so it is the first *reachable*
-                    // per-entry outcome on the transaction arm. Rendered
-                    // through the funnel like every other entry failure.
-                    Err(e) => entry_failure(e),
-                };
-                search_results.push((*index, entry.clone(), result));
+                .await;
+                deferred_results.push((index, entry, result));
             }
 
             // Reorder results back to original entry order
@@ -859,7 +1017,7 @@ where
                     .zip(bundle_result.entries.iter())
                     .map(|((orig_idx, entry, _), result)| (*orig_idx, entry, result))
                     .collect();
-            for (orig_idx, entry, result) in &search_results {
+            for (orig_idx, entry, result) in &deferred_results {
                 ordered_results.push((*orig_idx, entry, result));
             }
             ordered_results.sort_by_key(|(idx, _, _)| *idx);
@@ -869,6 +1027,7 @@ where
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
                     state,
+                    tenant.tenant_id(),
                     entry,
                     result,
                     principal,
@@ -897,26 +1056,11 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
-            let e = match e {
-                TransactionError::BundleError { index, message } => TransactionError::BundleError {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    message,
-                },
-                TransactionError::PatchEntry {
-                    index,
-                    status,
-                    outcome,
-                } => TransactionError::PatchEntry {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    status,
-                    outcome,
-                },
-                other => other,
-            };
+            let e = with_client_entry_indices(e, |index| {
+                indexed_entries
+                    .get(index)
+                    .map_or(index, |(original, _, _)| *original)
+            });
             // Derive a sanitized reason so backend detail carried by a
             // rolled-back/internal transaction error never reaches the client
             // response, the audit trail, or the entry outcome. The raw detail is
@@ -940,11 +1084,17 @@ where
                 failure_status.as_u16(),
                 create_operation_outcome("error", failure_code, &failure_description),
             );
-            for (orig_idx, entry, _) in indexed_entries.iter().chain(&search_entries) {
+            let deferred_entries = deferred_gets.iter().map(|(index, entry, _)| (index, entry));
+            for (orig_idx, entry) in indexed_entries
+                .iter()
+                .map(|(index, entry, _)| (index, entry))
+                .chain(deferred_entries)
+            {
                 let correlation_details =
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
                     state,
+                    tenant.tenant_id(),
                     entry,
                     &failure_result,
                     principal,
@@ -958,37 +1108,51 @@ where
     }
 }
 
+/// A batch entry's `ifMatch` that held: the precondition, and the stored row it
+/// was evaluated against. The entry's write is pinned to `current`.
+struct HeldIfMatch {
+    precondition: EntityTagPrecondition,
+    current: StoredResource,
+}
+
 /// Evaluates a batch entry's `ifMatch` precondition against stored state.
 ///
-/// Returns `Some` when the entry must not proceed — either the 412 the gate
-/// produced, or a storage error rendered as an entry result. Returns `None`
-/// when there was no precondition to check, or it was satisfied.
+/// Returns `Err` when the entry must not proceed — either the 412 the gate
+/// produced, or a storage error rendered as an entry result. Returns
+/// `Ok(None)` when there was no precondition to check, and `Ok(Some(held))`
+/// when it was satisfied, carrying the row it was satisfied by.
 ///
 /// `ifMatch` is a list, satisfied when any listed tag matches (#311), and `*`
 /// requires a current representation — so a supplied `ifMatch` against an
 /// absent or deleted resource fails rather than silently creating.
 ///
-/// **This is a read-then-write check, not an atomic compare-and-swap.** The
-/// backends reach an atomic re-check through `update_with_match`, which lives on
-/// [`VersionedStorage`] — a trait the FHIR router does not bound `S` with, so
-/// this path cannot call it. The window is the same one `handlers::update`
-/// already carries for single-resource updates, with one addition worth naming:
-/// entries within a bundle now run concurrently, so two entries carrying
-/// `ifMatch` for the same id can both pass this gate and both write.
+/// **The caller writes against `held.current`, not against whatever is current
+/// when it writes** (#2527). The `PUT` arm hands it to
+/// [`ResourceStorage::update`] and the `DELETE` arm to
+/// [`delete_under_precondition`], whose compare-and-swap is keyed on its
+/// version, as `handlers::update` and `handlers::delete` do for the single
+/// requests (#1404). A writer that lands between this read and the write, from
+/// another request or from another entry of the same bundle (entries run
+/// concurrently, #505), therefore ends the entry in `VersionConflict` → 409
+/// rather than in a write over a version the client never saw; a resource
+/// deleted in that window is 404 for a `PUT`, not a revival. Before #2527 the
+/// row was dropped here and the arms wrote unconditionally.
 ///
-/// [`VersionedStorage`]: helios_persistence::core::VersionedStorage
+/// [`delete_under_precondition`]: helios_persistence::core::delete_under_precondition
 async fn check_entry_if_match<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     resource_type: &str,
     id: &str,
     if_match: Option<&str>,
-) -> Option<BundleEntryResult>
+) -> Result<Option<HeldIfMatch>, Box<BundleEntryResult>>
 where
     S: ResourceStorage + Send + Sync,
 {
     // Entries that send no precondition pay nothing — not even the read.
-    if_match?;
+    let Some(raw) = if_match else {
+        return Ok(None);
+    };
 
     let current = match state
         .storage()
@@ -1000,10 +1164,27 @@ where
         // precondition rather than a storage error — the same mapping
         // `handlers::update` and the backends' own batch arms make.
         Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-        Err(e) => return Some(entry_storage_failure(e)),
+        Err(e) => return Err(Box::new(entry_storage_failure(e))),
     };
 
-    bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+    if let Some(failure) = bundle_if_match_gate(Some(raw), current.as_ref().map(|r| r.version_id()))
+    {
+        return Err(Box::new(failure));
+    }
+
+    // The gate parsed `raw` and found it satisfied, so this parse succeeds and
+    // `current` is `Some`: `*` requires a current version and no tag matches
+    // `None`. Neither fallback can run; both fail closed rather than panic.
+    let precondition = conditional_entry_if_match(Some(raw))?;
+    let current = current.ok_or_else(|| {
+        Box::new(precondition_failed_entry(
+            "If-Match precondition failed: the resource has no current version",
+        ))
+    })?;
+    Ok(Some(HeldIfMatch {
+        precondition,
+        current,
+    }))
 }
 
 /// The notice kind a committed transaction write announces, or `None` when
@@ -1034,9 +1215,15 @@ fn transaction_write_event_type(method: BundleMethod, status: u16) -> Option<Wri
 /// The atomic transaction path returns `BundleEntryResult`s rather than
 /// `StoredResource`s, so the notice is built from the entry's method and the
 /// result's stored JSON. Only 2xx write entries announce; a POST or a PUT that
-/// created answers 201 (Create), an update answers 200 (Update). A 2xx DELETE
-/// carries no body, so its type and id come from the entry URL; a conditional
-/// delete that resolved to no id has nothing to announce.
+/// created answers 201 (Create), an update answers 200 (Update). A DELETE
+/// carries no body, so its id comes from the entry URL — or, for a conditional
+/// delete whose URL carries criteria rather than an id, from the `location`
+/// the backend names the resource it deleted through (#859, #862). It
+/// announces only when it removed a live resource: a delete of something
+/// absent or already deleted is a `204` no-op (#2523) and announces nothing,
+/// and a conditional delete that matched nothing has no location and nothing
+/// to announce. Conditional POST, PUT and PATCH entries return their resource,
+/// so they announce through the same arm as their unconditional siblings.
 fn transaction_entry_notice(
     entry: &BundleEntry,
     result: &BundleEntryResult,
@@ -1047,8 +1234,18 @@ fn transaction_entry_notice(
             let (_, notice) = super::write_event::json_notice(kind, result.resource.as_ref()?)?;
             Some(notice)
         }
-        BundleMethod::Delete if (200..300).contains(&result.status) => {
+        BundleMethod::Delete if result.effect == BundleEntryEffect::Deleted => {
             let (_, id) = parse_request_url(&entry.url).ok()?;
+            let id = if id.is_empty() {
+                entry
+                    .criteria
+                    .as_ref()
+                    .and(result.location.as_deref())
+                    .and_then(AuditTarget::from_location)?
+                    .id
+            } else {
+                id
+            };
             (!id.is_empty()).then(|| super::write_event::delete_notice(&id, None))
         }
         _ => None,
@@ -1095,6 +1292,10 @@ fn transaction_entry_write(
 /// request URL nor the response body names the entity the entry acted on: a
 /// conditional DELETE answers 204 with no body, and its URL carries criteria
 /// rather than an id. `emit_entry_audit` reads it after everything else.
+///
+/// `strict` is whether the Bundle request sent `Prefer: handling=strict`, which
+/// a history entry honours like a direct history read does (#2380).
+#[allow(clippy::too_many_arguments)]
 async fn process_batch_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -1102,6 +1303,7 @@ async fn process_batch_entry<S>(
     entry: &Value,
     index: usize,
     principal: Option<&Principal>,
+    strict: bool,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
@@ -1110,6 +1312,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -1140,7 +1343,17 @@ where
         return entry_failure(missing_url(index));
     };
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
+    let if_none_match = request.get("ifNoneMatch").and_then(|v| v.as_str());
     let if_none_exist = request.get("ifNoneExist").and_then(|v| v.as_str());
+
+    // A URL that names an operation is refused before anything reads it as a
+    // type, an id or a search: the URL parsers below keep only the first or the
+    // last two segments and would answer `GET Patient/p1/$everything` as a read
+    // of `Patient/p1` (#868). The transaction arm refuses the same URLs through
+    // `parse_bundle_entry`, with the same error.
+    if let Err(refusal) = refuse_operation_url(&method, url) {
+        return entry_failure(refusal.into_rest_error(index));
+    }
 
     // Parse the URL to extract resource type and ID
     let (resource_type, id) = match parse_bundle_request_url(&method, url) {
@@ -1150,7 +1363,23 @@ where
         }
     };
 
+    // A GET entry is a search, read, vread or history read by its URL, decided
+    // once here, as the router decides the direct request (#2380). A `_history`
+    // URL of none of the history shapes is the same 400 as a malformed URL, and
+    // like it is judged before the scope check.
+    let get_target = if matches!(method, BundleMethod::Get) {
+        match classify_get_entry_url(url) {
+            Ok(target) => Some(target),
+            Err(message) => {
+                return entry_failure(RestError::InvalidElementValue { message });
+            }
+        }
+    } else {
+        None
+    };
+
     // Enforce per-entry scope authorization
+    let mut compartment = PatientCompartment::unconfined();
     if let Some(principal) = principal {
         // The same enum-typed table the transaction arm uses. The raw-string
         // copy this replaced ended in `_ => FhirOperation::Read`, which was only
@@ -1158,17 +1387,37 @@ where
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
         let operation = bundle_method_to_fhir_operation(&method);
-        if SmartScopePolicy::check(principal, &resource_type, operation).is_err() {
-            // `forbidden` is a child of `security`; `processing` is not an
-            // ancestor of it in any supported version, so a client filtering
-            // `code is-a security` to trigger re-auth or re-consent saw a
-            // false negative on this denial and only this one (#504).
-            return entry_failure(RestError::Forbidden {
-                message: format!(
-                    "Insufficient scope for {} on {} (batch entry {})",
-                    operation, resource_type, index
-                ),
-            });
+        match SmartScopePolicy::check(principal, &resource_type, operation) {
+            Ok(AccessScope::Unrestricted) => {}
+            // A grant confined to a patient compartment (#1618): a GET entry
+            // is confined like its single-resource twin (the search filtered,
+            // the read judged on the stored payload below); a write entry is
+            // refused, since the batch arm's writes go to storage without the
+            // membership checks the single-resource handlers run.
+            Ok(AccessScope::PatientCompartment { patient_id }) => {
+                if !matches!(method, BundleMethod::Get) {
+                    return entry_failure(RestError::Forbidden {
+                        message: format!(
+                            "{method} {url} (batch entry {index}) is not available under a patient/ scope: writes in a bundle cannot be confined to the launch patient's compartment; use the single-resource endpoints"
+                        ),
+                    });
+                }
+                compartment = PatientCompartment::confined_to(patient_id).with_shared_types(
+                    state.auth_config().patient_shared_read_types().to_vec(),
+                );
+            }
+            Err(_) => {
+                // `forbidden` is a child of `security`; `processing` is not an
+                // ancestor of it in any supported version, so a client filtering
+                // `code is-a security` to trigger re-auth or re-consent saw a
+                // false negative on this denial and only this one (#504).
+                return entry_failure(RestError::Forbidden {
+                    message: format!(
+                        "Insufficient scope for {} on {} (batch entry {})",
+                        operation, resource_type, index
+                    ),
+                });
+            }
         }
     }
 
@@ -1237,46 +1486,19 @@ where
     // All declared Bundle methods are handled; parse_entry_method rejects unknown codes.
     match method {
         BundleMethod::Get => {
-            // A GET entry is either a search (`Patient?name=x`, bare
-            // `Patient`) or an instance read (`Patient/123`), per the spec's
-            // "read or search" wording for bundle GETs (#478).
-            if let Some((search_type, pairs)) = parse_search_entry_url(url) {
-                return match crate::handlers::search::execute_search_bundle(
-                    state,
-                    tenant,
-                    &search_type,
-                    pairs,
-                    false,
-                )
-                .await
-                {
-                    Ok(bundle) => searchset_result(bundle),
-                    // Rendered through the funnel like every other entry
-                    // failure. #481 wrote this as `let (status, _, details) =
-                    // e.client_response()` — the same code-discard #504
-                    // deleted everywhere else, which would have made a search
-                    // entry the one path still answering `processing`.
-                    Err(e) => entry_failure(e),
-                };
-            }
-            // Read operation
-            match state
-                .storage()
-                .read(tenant.context(), &resource_type, &id)
-                .await
-            {
-                Ok(Some(stored)) => BundleEntryResult::ok(stored),
-                // The one expression this PR changes on the arm #478/#481 is
-                // rewriting. `not-found` is the only issue-type code whose
-                // definition names HTTP 404, and all three backends already
-                // emit it for the byte-identical condition inside their own
-                // transaction executors — this entry was the outlier.
-                Ok(None) => entry_failure(RestError::NotFound {
-                    resource_type: resource_type.clone(),
-                    id: id.clone(),
-                }),
-                Err(e) => entry_storage_failure(e),
-            }
+            // A GET entry is a search (`Patient?name=x`, bare `Patient`), an
+            // instance read (`Patient/123`), a vread or a history read, per
+            // the spec's "read or search" wording for bundle GETs (#478,
+            // #2380). `classify_get_entry_url` decided which, above.
+            execute_get_entry(
+                state,
+                tenant,
+                &compartment,
+                get_target.expect("GET entries are classified above"),
+                strict,
+                if_none_match,
+            )
+            .await
         }
         BundleMethod::Post => {
             // Create operation
@@ -1320,7 +1542,12 @@ where
             // `processing`, which is the lossiest case in #504.
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);
@@ -1347,14 +1574,17 @@ where
                     .await
                 {
                     Ok(ConditionalCreateResult::Created(stored)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional POST below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1403,7 +1633,7 @@ where
         }
         BundleMethod::Put => {
             // Update operation
-            let resource = match entry.get("resource") {
+            let mut resource = match entry.get("resource") {
                 Some(r) => r.clone(),
                 None => {
                     // See the POST arm: `invalid` rather than `required`,
@@ -1436,7 +1666,12 @@ where
 
                 if let Err(e) = state
                     .validation()
-                    .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                    .prepare_write(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        &resource_type,
+                        &mut resource,
+                    )
                     .await
                 {
                     // Same funnel as the unconditional PUT below: the
@@ -1458,29 +1693,35 @@ where
                     .await
                 {
                     Ok(ConditionalUpdateResult::Updated(stored)) => {
-                        // Conditional writes announce nothing.
+                        // Announced like the unconditional PUT below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             0,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Update,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
-                        let location = format!("{}/{}", stored.resource_type(), stored.id());
-                        let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(location);
-                        result
+                        // The versioned location, as the transaction path's
+                        // `conditional_update_entry` answers it (#2517).
+                        conditional_update_entry(stored)
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
+                        // The upsert created: announced as a create (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1522,32 +1763,51 @@ where
             // Ahead of validation, because every backend evaluates `ifMatch`
             // first: a stale precondition carrying an invalid body is a 412,
             // not a 422.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);
             }
 
-            match state
-                .storage()
-                .create_or_update(
-                    tenant.context(),
-                    &resource_type,
-                    &id,
-                    resource,
-                    fhir_version,
-                )
-                .await
-            {
+            // With a held `ifMatch` the write is a compare-and-swap against the
+            // row the precondition was evaluated on, as `handlers::update`
+            // does (#2527): a version written since is `VersionConflict` → 409,
+            // a delete since is `NotFound` → 404 rather than a revival.
+            // Without one it is the last-writer-wins upsert it always was.
+            let written = match held {
+                Some(held) => state
+                    .storage()
+                    .update(tenant.context(), &held.current, resource)
+                    .await
+                    .map(|stored| (stored, false)),
+                None => {
+                    state
+                        .storage()
+                        .create_or_update(
+                            tenant.context(),
+                            &resource_type,
+                            &id,
+                            resource,
+                            fhir_version,
+                        )
+                        .await
+                }
+            };
+            match written {
                 Ok((stored, created)) => {
                     super::write_event::report(
                         state,
@@ -1565,8 +1825,11 @@ where
                         BundleEntryResult::created(stored)
                     } else {
                         // For updates, include location with versioned URL
+                        // (#2517): `[type]/[id]/_history/[vid]`, the form the
+                        // created arm and every conditional arm answer.
+                        let location = stored.versioned_url();
                         let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(format!("{}/{}", resource_type, id));
+                        result.location = Some(location);
                         result
                     }
                 }
@@ -1601,14 +1864,25 @@ where
                     .await
                 {
                     Ok(ConditionalDeleteResult::Deleted(deleted)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional DELETE below (#862),
+                        // naming the resource the criteria resolved to, with the
+                        // pre-delete content the result carries.
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             -1,
-                            None,
+                            Some(super::write_event::delete_notice(
+                                deleted.id(),
+                                Some(deleted.content().clone()),
+                            )),
+                        );
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            &resource_type,
+                            &deleted,
                         );
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
@@ -1638,18 +1912,56 @@ where
 
             // Honour `ifMatch` on DELETE: a client asking to delete only the
             // version it reviewed must not destroy a concurrent amendment.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
-            // Delete operation
-            match state
-                .storage()
-                .delete(tenant.context(), &resource_type, &id)
-                .await
-            {
+            // A StructureDefinition leaves the profile registry with its
+            // delete; the registry is keyed by canonical url, so read the
+            // current content first.
+            let profile_to_unregister = if matches!(
+                resource_type.as_str(),
+                "StructureDefinition" | "ImplementationGuide"
+            ) {
+                match &held {
+                    Some(held) => Some(held.current.clone()),
+                    None => match state
+                        .storage()
+                        .read(tenant.context(), &resource_type, &id)
+                        .await
+                    {
+                        Ok(Some(current)) => Some(current),
+                        _ => None,
+                    },
+                }
+            } else {
+                None
+            };
+
+            // With a held `ifMatch` the delete is pinned to the version just
+            // evaluated, as `handlers::delete` does (#1404, #2527): a version
+            // written since is `VersionConflict` → 409 and survives. Without
+            // one it is the plain delete it always was.
+            let deleted = match held {
+                Some(held) => {
+                    delete_under_precondition(
+                        state.storage(),
+                        tenant.context(),
+                        &held.precondition,
+                        &held.current,
+                    )
+                    .await
+                }
+                None => {
+                    state
+                        .storage()
+                        .delete(tenant.context(), &resource_type, &id)
+                        .await
+                }
+            };
+            match deleted {
                 Ok(()) => {
                     super::write_event::report(
                         state,
@@ -1659,8 +1971,26 @@ where
                         -1,
                         Some(super::write_event::delete_notice(&id, None)),
                     );
+                    if let Some(current) = &profile_to_unregister {
+                        super::delete::unregister_deleted_profile(
+                            state,
+                            tenant.tenant_id(),
+                            &resource_type,
+                            current,
+                        );
+                    }
                     BundleEntryResult::deleted()
                 }
+                // Nothing to delete — never there, or already deleted — is the
+                // same successful no-op as `DELETE [type]/[id]` (#2523) and the
+                // conditional no-match above: `204`, and nothing announced.
+                // With `ifMatch` the same error is not a no-op: an absent
+                // resource already answered `412` at the gate, and one deleted
+                // after the gate lost a delete pinned to a version, so it keeps
+                // its storage mapping (`404`), as `handlers::delete` does.
+                Err(StorageError::Resource(
+                    ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+                )) if if_match.is_none() => BundleEntryResult::delete_not_found(),
                 Err(e) => entry_storage_failure(e),
             }
         }
@@ -1805,21 +2135,81 @@ where
         stored.fhir_version(),
         resource_type,
         0,
-        criteria
-            .is_none()
-            .then(|| super::write_event::stored_notice(WriteKind::Update, &stored)),
+        Some(super::write_event::stored_notice(
+            WriteKind::Update,
+            &stored,
+        )),
     );
     record_stored_profile(state, tenant, stored.fhir_version(), &stored);
+    let location = criteria.is_none().then(|| stored.versioned_url());
     let mut result = BundleEntryResult::updated(stored);
-    if criteria.is_none() {
-        result.location = Some(format!("{resource_type}/{id}"));
-    }
+    result.location = location;
     result
 }
 
 /// Applies the type and immutability gates shared by batch and transaction
 /// mutations. The caller decides whether the error belongs to one batch entry
 /// or rejects the whole transaction.
+/// The StructureDefinitions each DELETE entry of a transaction currently
+/// addresses, as `(position in the sorted entry list, resources)`: an
+/// instance delete reads the one row, a conditional delete resolves its
+/// criteria. Entries that address nothing (or whose criteria the backend
+/// cannot resolve) are left out — the registry then keeps a definition the
+/// store no longer has, which the next restart's rehydration corrects.
+async fn transaction_profiles_to_unregister<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    json_entries: &[Value],
+    indexed_entries: &[(usize, BundleEntry, Option<String>)],
+) -> Vec<(usize, Vec<helios_persistence::types::StoredResource>)>
+where
+    S: ResourceStorage + ConditionalStorage + Send + Sync,
+{
+    let mut out = Vec::new();
+    for (position, (index, entry, _)) in indexed_entries.iter().enumerate() {
+        if entry.method != BundleMethod::Delete {
+            continue;
+        }
+        let Ok((resource_type, id)) = parse_request_url(&entry.url) else {
+            continue;
+        };
+        if !matches!(
+            resource_type.as_str(),
+            "StructureDefinition" | "ImplementationGuide"
+        ) {
+            continue;
+        }
+        let found = if entry.criteria.is_some() {
+            let raw_query = json_entries
+                .get(*index)
+                .and_then(|e| e["request"]["url"].as_str())
+                .and_then(|url| url.split_once('?'))
+                .map(|(_, query)| query)
+                .unwrap_or_default();
+            state
+                .storage()
+                .resolve_conditional_matches(tenant.context(), &resource_type, raw_query)
+                .await
+                .unwrap_or_default()
+        } else if id.is_empty() {
+            Vec::new()
+        } else {
+            match state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await
+            {
+                Ok(Some(stored)) => vec![stored],
+                _ => Vec::new(),
+            }
+        };
+        if !found.is_empty() {
+            out.push((position, found));
+        }
+    }
+    out
+}
+
 /// Folds a written StructureDefinition into the tenant profile registry so
 /// later entries' `check_write` resolve against it. Every write arm calls this;
 /// `batch_concurrency` serializes the bundle when one of them will.
@@ -1831,13 +2221,11 @@ fn record_stored_profile<S>(
 ) where
     S: ResourceStorage + Send + Sync,
 {
-    if stored.resource_type() == "StructureDefinition" {
-        state.validation().upsert_stored_profile(
-            tenant.tenant_id(),
-            fhir_version,
-            stored.content(),
-        );
-    }
+    // Stored StructureDefinitions and ImplementationGuides feed the
+    // tenant's profile registry and global profiles.
+    state
+        .validation()
+        .record_stored_resource(tenant.tenant_id(), fhir_version, stored.content());
 }
 
 /// The entity a batch entry acted on, when neither its URL nor its response
@@ -2032,8 +2420,10 @@ impl EntryAuditCorrelation {
 }
 
 /// Emits an audit event for a processed batch entry.
+#[allow(clippy::too_many_arguments)]
 fn emit_batch_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     entry: &Value,
     result: &BundleEntryResult,
     audit_target: Option<&AuditTarget>,
@@ -2052,6 +2442,7 @@ fn emit_batch_entry_audit<S>(
     let request_resource = entry.get("resource");
     emit_entry_audit(
         state,
+        tenant,
         method,
         url,
         request_resource,
@@ -2070,6 +2461,7 @@ fn emit_batch_entry_audit<S>(
 /// whatever the entry's own status.
 fn emit_transaction_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     entry: &BundleEntry,
     result: &BundleEntryResult,
     principal: Option<&Principal>,
@@ -2088,6 +2480,7 @@ fn emit_transaction_entry_audit<S>(
         .and_then(AuditTarget::from_location);
     emit_entry_audit(
         state,
+        tenant,
         bundle_method_to_http_method(&entry.method),
         &entry.url,
         entry.resource.as_ref(),
@@ -2106,6 +2499,7 @@ fn emit_transaction_entry_audit<S>(
 #[allow(clippy::too_many_arguments)]
 fn emit_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     method: &str,
     url: &str,
     request_resource: Option<&Value>,
@@ -2121,26 +2515,57 @@ fn emit_entry_audit<S>(
         return;
     };
 
-    let action = method_to_audit_action(method);
+    // A vread or history entry is audited as the direct request is (#2380). The
+    // audit middleware records those through `balp::detect_interaction`, which
+    // calls all of them a query (`E`) and names `Type/id` for a vread and an
+    // instance history, the type alone for a type history and nothing for a
+    // system history. Read and search entries keep the Read action.
+    let get_target = (method == "GET")
+        .then(|| classify_get_entry_url(url).ok())
+        .flatten();
+    let history_audit = get_target.as_ref().and_then(GetEntryTarget::history_audit);
+
+    let action = history_audit
+        .as_ref()
+        .map_or_else(|| method_to_audit_action(method), |audit| audit.action);
     let outcome = if failure_desc.is_some() || result.status >= 400 {
         "8"
     } else {
         "0"
     };
 
-    let parsed = parse_request_url(url).ok();
-    let mut resource_type = parsed
-        .as_ref()
-        .map(|(rt, _)| rt.clone())
-        .unwrap_or_default();
-    let mut resource_id = parsed
-        .as_ref()
-        .and_then(|(_, id)| (!id.is_empty()).then_some(id.clone()));
+    let (mut resource_type, mut resource_id) = match &history_audit {
+        Some(audit) => (
+            audit.resource_type.to_string(),
+            audit.id.map(str::to_string),
+        ),
+        None => {
+            let parsed = parse_request_url(url).ok();
+            (
+                parsed
+                    .as_ref()
+                    .map(|(rt, _)| rt.clone())
+                    .unwrap_or_default(),
+                parsed
+                    .as_ref()
+                    .and_then(|(_, id)| (!id.is_empty()).then_some(id.clone())),
+            )
+        }
+    };
 
+    // The resource the entry answers with names the entity, unless it is a
+    // `history` Bundle: that names no entity, and taking it for one audited an
+    // instance history as `Bundle/p1` and a type history as `Bundle/_history`.
+    // A vread's body is the version itself, so it still names its entity.
     if let Some(resource) = result
         .resource
         .as_ref()
         .or_else(|| (method != "PATCH").then_some(request_resource).flatten())
+        .filter(|_| {
+            !history_audit
+                .as_ref()
+                .is_some_and(|audit| audit.answers_with_bundle)
+        })
     {
         if let Some(rt) = resource.get("resourceType").and_then(|v| v.as_str()) {
             resource_type = rt.to_string();
@@ -2178,7 +2603,62 @@ fn emit_entry_audit<S>(
                         .unwrap_or(&resource_type);
                     extract_patient_from_resource(rt, resource)
                 })
+        })
+        // A vread or history entry has no body naming the patient (a history
+        // Bundle names none), so it falls back to the entity, as the audit
+        // middleware does for the direct request (#2380).
+        .or_else(|| {
+            history_audit.as_ref().and_then(|_| {
+                helios_audit::patient::PatientResolver::resolve(
+                    &resource_type,
+                    resource_id.as_deref(),
+                    None,
+                    None,
+                )
+            })
         });
+
+    let patient_ref =
+        patient_ref.or_else(|| audit_target.and_then(|t| t.patient_reference.clone()));
+    let outcome_desc = failure_desc
+        .map(str::to_string)
+        .or_else(|| extract_outcome_description(result.outcome.as_ref()));
+
+    // Inside an audited request the entry is recorded by the audit middleware,
+    // which completes it with the request's parties (client, user, server,
+    // request id) and its tenant, as a BALP event of its own interaction.
+    if helios_audit::context::current().is_some() {
+        let mut spec = entry_audit_spec(method, url, state.base_url());
+        spec.status = if failure_desc.is_some() && result.status < 400 {
+            // The entry itself succeeded but the transaction around it failed
+            // and was rolled back: nothing it did persisted.
+            409
+        } else {
+            result.status
+        };
+        spec.outcome_desc = outcome_desc;
+        if !resource_type.is_empty() && spec.resource_type.as_deref() != Some("Bundle") {
+            spec.resource_type = Some(resource_type.clone());
+        }
+        if resource_id.is_some() {
+            spec.resource_id = resource_id.clone();
+        }
+        if let Some(p) = &patient_ref {
+            spec.add_patient(p);
+        }
+        if let Some(correlation) = correlation {
+            spec.details = vec![
+                ("bundle-id".to_string(), correlation.bundle_id.clone()),
+                ("bundle-type".to_string(), correlation.bundle_type.clone()),
+                (
+                    "entry-index".to_string(),
+                    correlation.entry_index.to_string(),
+                ),
+            ];
+        }
+        helios_audit::context::push_entry(spec);
+        return;
+    }
 
     let mut builder = AuditEventBuilder::new(state.audit_source_observer())
         .action(action)
@@ -2202,20 +2682,46 @@ fn emit_entry_audit<S>(
             .detail("entry-index", correlation.entry_index.to_string());
     }
 
-    if let Some(patient_ref) =
-        patient_ref.or_else(|| audit_target.and_then(|t| t.patient_reference.clone()))
-    {
+    if let Some(patient_ref) = patient_ref {
         builder = builder.patient(patient_ref);
     }
     if let Some(principal) = principal {
-        builder = builder.agent(principal.subject(), None, true);
+        builder = builder.principal(principal);
     }
+    // After the principal: the tenant the entry actually ran in wins over the
+    // token's claim (they agree whenever the claim is present).
+    builder = builder.tenant(tenant);
 
     let sink = Arc::clone(sink);
     let event = builder.build();
     tokio::spawn(async move {
         sink.record(event).await;
     });
+}
+
+/// Describes a bundle entry for the audit trail from its method and URL
+/// (relative `Patient/1`, `Observation?code=x`, or absolute).
+fn entry_audit_spec(method: &str, url: &str, base_url: &str) -> helios_audit::RestEventSpec {
+    let relative = match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            let full = parsed.path().to_string();
+            let base_path = url::Url::parse(base_url)
+                .map(|b| b.path().trim_end_matches('/').to_string())
+                .unwrap_or_default();
+            let path = full.strip_prefix(&base_path).unwrap_or(&full).to_string();
+            match parsed.query() {
+                Some(q) => format!("{path}?{q}"),
+                None => path,
+            }
+        }
+        _ => url.to_string(),
+    };
+    let (path, query) = match relative.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (relative, None),
+    };
+    let path = format!("/{}", path.trim_start_matches('/'));
+    helios_audit::RestEventSpec::from_request(method, &path, query.as_deref(), None, base_url)
 }
 
 fn method_to_audit_action(method: &str) -> AuditAction {
@@ -2280,8 +2786,10 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
         .next()
         .ok_or_else(|| "Entry request.url is empty".to_string())?;
 
-    // `Patient/123/_history/1` addresses `Patient/123`; anything past the id
-    // qualifies that address rather than extending it.
+    // The first two segments are the address: the instance a mutation writes.
+    // A GET entry is classified by `classify_get_entry_url` before dispatch, so
+    // for `Patient/123/_history/1` this address is only the resource type the
+    // scope check judges, never a read of the current `Patient/123` (#2380).
     Ok((
         resource_type.to_string(),
         segments.next().unwrap_or_default().to_string(),
@@ -2293,7 +2801,8 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
 /// Mutation URLs may be absolute or carry a server path prefix. POST targets
 /// the final path segment as a resource type, while PUT, PATCH, and DELETE
 /// target the final two segments as `[type]/[id]`. This matches the transaction
-/// backends. GET keeps the existing type, instance, and history interpretation.
+/// backends. GET keeps the first-two-segment address; `classify_get_entry_url`
+/// decides what a GET entry is.
 fn parse_bundle_request_url(
     method: &BundleMethod,
     request_url: &str,
@@ -2508,6 +3017,144 @@ fn parse_entry_method(request: &Value) -> Result<BundleMethod, EntryMethodRefusa
     }
 }
 
+/// Why a bundle entry's `request.url` was refused for what it says about an
+/// operation (#868).
+///
+/// A URL whose **last** path segment begins with `$` names an operation
+/// (`$lookup`, `[type]/$expand`, `[type]/[id]/$everything`), which a Bundle
+/// entry does not dispatch. It is refused honestly rather than left to the
+/// entry parsers, which know only resources: the POST parser takes the last
+/// segment for a resource type, the GET parser keeps the first two segments of
+/// an address and so answered `GET Patient/p1/$everything` as a read of
+/// `Patient/p1`, and the backends' transaction parser takes the last two
+/// segments of any URL as `[type]/[id]`.
+///
+/// Like [`EntryMethodRefusal`], the refusal carries its own status and wording,
+/// so the batch arm (a per-entry outcome) and the transaction arm (the
+/// whole-bundle error) cannot disagree about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationUrlRefusal {
+    /// The last path segment names an operation. Carries the operation as
+    /// spelled (`$lookup`), the entry's HTTP method and its URL as sent.
+    Operation {
+        operation: String,
+        method: &'static str,
+        url: String,
+    },
+    /// A segment other than the last begins with `$`. No FHIR URL has an
+    /// operation name before its end, and an id cannot begin with `$`, so the
+    /// URL is malformed and is not guessed at.
+    MisplacedOperation { segment: String, url: String },
+}
+
+impl OperationUrlRefusal {
+    /// Renders the refusal as the error **both** arms report.
+    ///
+    /// An operation is `501` + `not-supported` ([`RestError::NotImplemented`]):
+    /// a spec-defined interaction the server does not dispatch from a Bundle
+    /// entry yet, which is that variant's documented meaning, and the status
+    /// the transaction arm already answers for an entry its backend cannot
+    /// honour (a conditional interaction on a backend that cannot resolve it
+    /// inside a transaction). A client reading it learns the operation exists
+    /// and is not available *here*; the guidance says where it is.
+    ///
+    /// A misplaced `$` segment is `400` + `value`, as every other malformed
+    /// entry URL is.
+    fn into_rest_error(self, index: usize) -> RestError {
+        match self {
+            // `NotImplemented` renders "Feature '{feature}' is not implemented.",
+            // so the text is a clause that reads inside it, as the conditional
+            // refusal's does. It names the client's entry index: both arms call
+            // this before entries are reordered.
+            Self::Operation {
+                operation,
+                method,
+                url,
+            } => RestError::NotImplemented {
+                feature: format!(
+                    "operation {operation} is not supported in Bundle entries \
+                     (entry {index}: {method} {url}); invoke it directly against the REST API"
+                ),
+            },
+            Self::MisplacedOperation { segment, url } => RestError::InvalidElementValue {
+                message: format!(
+                    "Entry {index}: request.url '{url}' has the segment '{segment}' before its \
+                     last path segment. A '$' segment names an operation and can only end a URL."
+                ),
+            },
+        }
+    }
+}
+
+/// Refuses a Bundle entry URL that names an operation, or that puts a `$`
+/// segment where none can be (#868).
+///
+/// This is the one place the URL's `$` segments are judged, and both bundle
+/// arms call it, for **every** method, before anything parses the URL as a
+/// resource type, an id or a search. The query string is not part of the path,
+/// so `Observation/$lastn?max=3` is an operation and `Patient?name=$x` is
+/// still a search. A leading `/`, an absolute `http(s)` URL with a base path,
+/// and a percent-encoded `%24` for the `$` are the same operation, because the
+/// direct route would decode them to it.
+///
+/// A `$` segment is an operation only as the last one. A `$` anywhere else is a
+/// malformed URL, not an operation: valid FHIR ids are `[A-Za-z0-9\-.]{1,64}`,
+/// so no id begins with `$` either.
+fn refuse_operation_url(method: &BundleMethod, url: &str) -> Result<(), OperationUrlRefusal> {
+    let path = entry_url_path(url);
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(last) = segments.pop() else {
+        return Ok(());
+    };
+
+    if let Some(segment) = segments.into_iter().find(|s| is_operation_segment(s)) {
+        return Err(OperationUrlRefusal::MisplacedOperation {
+            segment: operation_name(segment),
+            url: url.to_string(),
+        });
+    }
+    if is_operation_segment(last) {
+        return Err(OperationUrlRefusal::Operation {
+            operation: operation_name(last),
+            method: bundle_method_to_http_method(method),
+            url: url.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The path of an entry URL, without its query: the part `$` segments are read in.
+///
+/// An absolute `http(s)` URL contributes its path (the base path included);
+/// anything else is taken as written, as the entry URL parsers take it.
+fn entry_url_path(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed.path().to_string(),
+        _ => url
+            .split_once('?')
+            .map_or(url, |(path, _)| path)
+            .to_string(),
+    }
+}
+
+/// Whether a path segment is an operation name: it begins with `$`, written
+/// plainly or percent-encoded (`%24`, either case of the hex digits).
+fn is_operation_segment(segment: &str) -> bool {
+    segment.starts_with('$')
+        || segment
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%24"))
+}
+
+/// The operation name of a segment [`is_operation_segment`] accepted, with a
+/// percent-encoded `$` written plainly (`%24lookup` -> `$lookup`).
+fn operation_name(segment: &str) -> String {
+    match segment.get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("%24") => format!("${}", &segment[3..]),
+        _ => segment.to_string(),
+    }
+}
+
 /// Why a bundle entry could not be parsed at all.
 ///
 /// Split from a bare `String` so the method refusal keeps its status across the
@@ -2523,12 +3170,16 @@ enum EntryParseError {
     /// `Bundle.entry.request.url` is present but names nothing a mutation
     /// can address (from [`canonical_bundle_mutation_url`]).
     MalformedUrl(String),
+    /// `Bundle.entry.request.url` names an operation, or puts a `$` segment
+    /// where no operation can be (#868).
+    OperationUrl(OperationUrlRefusal),
 }
 
 impl EntryParseError {
     fn into_rest_error(self, index: usize) -> RestError {
         match self {
             Self::Method(refusal) => refusal.into_rest_error(index),
+            Self::OperationUrl(refusal) => refusal.into_rest_error(index),
             // Both arms now reach the same helper, so an absent element is
             // described once rather than by whichever arm noticed it first.
             Self::MissingRequest => missing_request(index),
@@ -2567,7 +3218,325 @@ fn parse_search_entry_url(url: &str) -> Option<(String, Vec<(String, String)>)> 
     }
 }
 
-/// Builds the entry result embedding a searchset Bundle (bundle GET search).
+/// What a `GET` entry's `request.url` asks for, decided once before dispatch the
+/// way the router decides the direct request (#478, #2380).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GetEntryTarget {
+    /// `[type]` or `[type]?[params]`: a type-level search.
+    Search {
+        resource_type: String,
+        pairs: Vec<(String, String)>,
+    },
+    /// `[type]/[id]`: an instance read.
+    Read { resource_type: String, id: String },
+    /// `[type]/[id]/_history/[vid]`: a version read.
+    Vread {
+        resource_type: String,
+        id: String,
+        version_id: String,
+    },
+    /// `[type]/[id]/_history`, `[type]/_history` or `_history`.
+    History {
+        level: HistoryLevel,
+        pairs: Vec<(String, String)>,
+    },
+}
+
+/// A transaction's GET entry that runs after the commit: what it asks for and
+/// the compartment its own scope confines it to, both decided once, in the
+/// transaction's first loop (#2380).
+///
+/// The compartment is per entry, as in a batch. A token such as
+/// `user/Observation.rs patient/*.rs` confines a `Patient` entry and leaves an
+/// `Observation` entry unconfined, in the same Bundle.
+struct DeferredGet {
+    target: GetEntryTarget,
+    compartment: PatientCompartment,
+}
+
+/// Classifies a `GET` entry's `request.url`.
+///
+/// The path is read as [`parse_search_entry_url`] reads it: a leading `/` is
+/// tolerated and empty segments are dropped. The history shapes are `_history`,
+/// `[type]/_history`, `[type]/[id]/_history` and `[type]/[id]/_history/[vid]`;
+/// a path with a `_history` segment in any other place is an error, because
+/// answering it as a read of its first two segments would return different data
+/// from what the URL asks for. Anything else is a search (one segment) or a read
+/// of the first two segments, as before; a query on a read or vread is ignored.
+///
+/// The error is the message of the `400` / `value` entry (batch) or of the
+/// failed bundle (transaction).
+fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (url, None),
+    };
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let pairs = || crate::extractors::query_pairs::parse_query_pairs(query);
+
+    match segments.as_slice() {
+        [] => Err("Entry request.url is empty".to_string()),
+        ["_history"] => Ok(GetEntryTarget::History {
+            level: HistoryLevel::System,
+            pairs: pairs(),
+        }),
+        [resource_type, "_history"] if *resource_type != "_history" => {
+            Ok(GetEntryTarget::History {
+                level: HistoryLevel::Type {
+                    resource_type: (*resource_type).to_string(),
+                },
+                pairs: pairs(),
+            })
+        }
+        [resource_type, id, "_history"] if *resource_type != "_history" && *id != "_history" => {
+            Ok(GetEntryTarget::History {
+                level: HistoryLevel::Instance {
+                    resource_type: (*resource_type).to_string(),
+                    id: (*id).to_string(),
+                },
+                pairs: pairs(),
+            })
+        }
+        [resource_type, id, "_history", version_id]
+            if *resource_type != "_history" && *id != "_history" && *version_id != "_history" =>
+        {
+            Ok(GetEntryTarget::Vread {
+                resource_type: (*resource_type).to_string(),
+                id: (*id).to_string(),
+                version_id: (*version_id).to_string(),
+            })
+        }
+        _ if segments.contains(&"_history") => Err(format!(
+            "GET {url} is not a read, vread, history or search URL: _history may only end a \
+             [type]/[id], [type] or system URL, or be followed by a version id"
+        )),
+        _ => Ok(match parse_search_entry_url(url) {
+            Some((resource_type, pairs)) => GetEntryTarget::Search {
+                resource_type,
+                pairs,
+            },
+            None => GetEntryTarget::Read {
+                resource_type: segments[0].to_string(),
+                id: segments[1].to_string(),
+            },
+        }),
+    }
+}
+
+/// How the audit trail names a vread or history `GET` entry, which is not how
+/// it names a plain read or search (#2380).
+struct HistoryAudit<'a> {
+    /// What the audit middleware records for the direct request.
+    action: AuditAction,
+    resource_type: &'a str,
+    id: Option<&'a str>,
+    /// The entry answers with a `history` Bundle, which names no entity. A
+    /// vread's body is the version itself, and does.
+    answers_with_bundle: bool,
+}
+
+impl GetEntryTarget {
+    /// How the audit event of this entry is named, as the audit middleware
+    /// names the direct request; `None` for a read or search, which keep their
+    /// own action and the entity the URL and the body give.
+    ///
+    /// `balp::detect_interaction` calls a vread and every history read a query
+    /// (`E`), because it matches any `/_history` path. A vread and an instance
+    /// history name `Type/id`, a type history the type alone (no entity) and a
+    /// system history nothing.
+    fn history_audit(&self) -> Option<HistoryAudit<'_>> {
+        let (path, resource_type, id) = match self {
+            Self::Vread {
+                resource_type,
+                id,
+                version_id,
+            } => (
+                format!("/{resource_type}/{id}/_history/{version_id}"),
+                resource_type.as_str(),
+                Some(id.as_str()),
+            ),
+            Self::History { level, .. } => match level {
+                HistoryLevel::Instance { resource_type, id } => (
+                    format!("/{resource_type}/{id}/_history"),
+                    resource_type.as_str(),
+                    Some(id.as_str()),
+                ),
+                HistoryLevel::Type { resource_type } => (
+                    format!("/{resource_type}/_history"),
+                    resource_type.as_str(),
+                    None,
+                ),
+                HistoryLevel::System => ("/_history".to_string(), "", None),
+            },
+            Self::Search { .. } | Self::Read { .. } => return None,
+        };
+        Some(HistoryAudit {
+            action: helios_audit::balp::detect_interaction(
+                "GET",
+                &path,
+                (!resource_type.is_empty()).then_some(resource_type),
+                id,
+            ),
+            resource_type,
+            id,
+            answers_with_bundle: matches!(self, Self::History { .. }),
+        })
+    }
+}
+
+/// Answers a classified `GET` entry.
+///
+/// Shared by the batch arm and the transaction's post-commit GET loop, so one
+/// URL is answered one way whichever Bundle it arrives in. A vread and a
+/// history read go through [`execute_vread`] and [`execute_history_bundle`], the
+/// code the direct handlers call (#2380).
+///
+/// `if_none_match` is the entry's `ifNoneMatch`, honoured on an instance read
+/// only (#869): `GET [type]/[id]` answers `If-None-Match` and the other three
+/// targets do not, so neither does their entry. The transaction arm runs an
+/// instance read inside the storage transaction, not here; the backends reach
+/// the same answer through [`bundle_read_result`].
+async fn execute_get_entry<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    target: GetEntryTarget,
+    strict: bool,
+    if_none_match: Option<&str>,
+) -> BundleEntryResult
+where
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + SystemHistoryProvider
+        + Send
+        + Sync,
+{
+    match target {
+        GetEntryTarget::Search {
+            resource_type,
+            pairs,
+        } => {
+            match crate::handlers::search::execute_search_bundle(
+                state,
+                tenant,
+                compartment,
+                &resource_type,
+                pairs,
+                false,
+                None,
+            )
+            .await
+            {
+                Ok(bundle) => searchset_result(bundle),
+                // Rendered through the funnel like every other entry
+                // failure. #481 wrote this as `let (status, _, details) =
+                // e.client_response()` — the same code-discard #504
+                // deleted everywhere else, which would have made a search
+                // entry the one path still answering `processing`.
+                Err(e) => entry_failure(e),
+            }
+        }
+        GetEntryTarget::Read { resource_type, id } => {
+            // Read operation
+            match state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await
+            {
+                // Under a compartment-confined grant the stored payload is
+                // judged exactly as `GET [type]/[id]` judges it (#1618).
+                Ok(Some(stored)) => match compartment.assert_member(
+                    || state.storage().search_param_registry(tenant.context()),
+                    stored.fhir_version(),
+                    stored.content(),
+                    "read",
+                ) {
+                    Ok(()) => bundle_read_result(stored, if_none_match),
+                    Err(e) => entry_failure(e),
+                },
+                // The one expression this PR changes on the arm #478/#481 is
+                // rewriting. `not-found` is the only issue-type code whose
+                // definition names HTTP 404, and all three backends already
+                // emit it for the byte-identical condition inside their own
+                // transaction executors — this entry was the outlier.
+                Ok(None) => entry_failure(RestError::NotFound {
+                    resource_type: resource_type.clone(),
+                    id: id.clone(),
+                }),
+                Err(e) => entry_storage_failure(e),
+            }
+        }
+        GetEntryTarget::Vread {
+            resource_type,
+            id,
+            version_id,
+        } => {
+            if let Err(e) = check_entry_resource_type(state, &resource_type) {
+                return entry_failure(e);
+            }
+            match execute_vread(state, tenant, compartment, &resource_type, &id, &version_id).await
+            {
+                // The same etag and lastModified as a read entry.
+                Ok(stored) => BundleEntryResult::ok(stored),
+                Err(e) => entry_failure(e),
+            }
+        }
+        GetEntryTarget::History { level, pairs } => {
+            // A system history names no type.
+            let typed = match &level {
+                HistoryLevel::Instance { resource_type, .. }
+                | HistoryLevel::Type { resource_type } => Some(resource_type.as_str()),
+                HistoryLevel::System => None,
+            };
+            if let Some(resource_type) = typed
+                && let Err(e) = check_entry_resource_type(state, resource_type)
+            {
+                return entry_failure(e);
+            }
+            match execute_history_bundle(state, tenant, compartment, &level, &pairs, strict).await {
+                Ok(history) => searchset_result(history.bundle),
+                Err(e) => entry_failure(e),
+            }
+        }
+    }
+}
+
+/// Refuses a resource type the server does not serve, as the router does for a
+/// direct request.
+///
+/// The router's `reject_unknown_resource_type` never sees a Bundle entry, so
+/// `Patinet/1/_history/1` and `Patinet/_history` would otherwise reach storage
+/// and answer `404` / `not-found` or an empty history, where the direct request
+/// is `404` / `not-supported` (#989).
+///
+/// The type is judged against the server's default FHIR version
+/// (`ServerConfig::default_fhir_version`), as `execute_search_bundle` judges a
+/// search entry's, and not against the Bundle request's negotiated version: a
+/// type that exists only in another version than the default is refused here
+/// even in a Bundle that asked for that version.
+fn check_entry_resource_type<S>(state: &AppState<S>, resource_type: &str) -> Result<(), RestError>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    let version = state.config().default_fhir_version;
+    if is_valid_resource_type_for_version(resource_type, version) {
+        Ok(())
+    } else {
+        Err(RestError::UnknownResourceType {
+            resource_type: resource_type.to_string(),
+            version,
+        })
+    }
+}
+
+/// Builds the entry result embedding a searchset Bundle (bundle GET search) or
+/// a history Bundle (bundle GET history, #2380).
 fn searchset_result(bundle: Value) -> BundleEntryResult {
     BundleEntryResult {
         status: 200,
@@ -2664,6 +3633,7 @@ fn status_text(code: &str) -> &'static str {
         "200" => "OK",
         "201" => "Created",
         "204" => "No Content",
+        "304" => "Not Modified",
         "400" => "Bad Request",
         "401" => "Unauthorized",
         "403" => "Forbidden",
@@ -2741,6 +3711,19 @@ where
         let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query_string.as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
+        // `_in` is resolved by the search handlers, not here: refuse it rather
+        // than let it reach the backend unresolved.
+        if pairs
+            .iter()
+            .any(|(k, _)| k.split(':').next() == Some("_in"))
+        {
+            return Err(RestError::BadRequest {
+                message: format!(
+                    "Conditional reference '{reference}' is not a valid search: \
+                     '_in' is not supported in conditional references"
+                ),
+            });
+        }
         let registry = state.storage().search_param_registry(tenant.context());
         let query = {
             let registry = registry.read();
@@ -2877,6 +3860,12 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
         .and_then(|v| v.as_str())
         .ok_or(EntryParseError::MissingUrl)?
         .to_string();
+    // Before the URL is canonicalized, and for every method:
+    // `canonical_bundle_mutation_url` keeps the last one or two segments of a
+    // mutation URL, and a GET URL goes to the backend as written, so either
+    // would act on part of an operation URL (#868). The batch arm calls the
+    // same function.
+    refuse_operation_url(&method, &raw_url).map_err(EntryParseError::OperationUrl)?;
     let url = if matches!(
         method,
         BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
@@ -3051,6 +4040,69 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
+/// Renames the entries a failed transaction names from the position the
+/// executor saw them at to the position the client sent them at (#922).
+///
+/// The executor receives the entries sorted by [`method_processing_order`], so
+/// every index it reports is a position in that list; the client can act only
+/// on the index in its own Bundle. `client_index` maps the first to the second.
+///
+/// Deliberately exhaustive, with no `other => other`: a variant that names an
+/// entry and was left to fall through reported the wrong one until it was
+/// mapped (`PreconditionFailed`, #922), so a new variant has to be classified
+/// here on purpose.
+fn with_client_entry_indices(
+    err: TransactionError,
+    client_index: impl Fn(usize) -> usize,
+) -> TransactionError {
+    match err {
+        TransactionError::BundleError { index, message } => TransactionError::BundleError {
+            index: client_index(index),
+            message,
+        },
+        TransactionError::PatchEntry {
+            index,
+            status,
+            outcome,
+        } => TransactionError::PatchEntry {
+            index: client_index(index),
+            status,
+            outcome,
+        },
+        TransactionError::PreconditionFailed { index, message } => {
+            TransactionError::PreconditionFailed {
+                index: client_index(index),
+                message,
+            }
+        }
+        // Names two entries, and both are positions in the executor's list.
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => TransactionError::OverlappingIdentity {
+            index: client_index(index),
+            entry,
+            identity,
+            other: client_index(other),
+            other_entry,
+        },
+        // These name no entry.
+        unindexed @ (TransactionError::Timeout { .. }
+        | TransactionError::RolledBack { .. }
+        | TransactionError::Transient { .. }
+        | TransactionError::CommitOutcomeUnknown { .. }
+        | TransactionError::TooLargeForCache { .. }
+        | TransactionError::InvalidTransaction
+        | TransactionError::NestedNotSupported
+        | TransactionError::MultipleMatches { .. }
+        | TransactionError::UnsupportedIsolationLevel { .. }
+        | TransactionError::AtomicityUnsupported { .. }) => unindexed,
+    }
+}
+
 /// The text an audit event or an entry outcome carries for a failed
 /// transaction: the sanitized `reason` from [`transaction_error_response_parts`]
 /// under a prefix that says what is known about the writes.
@@ -3059,10 +4111,17 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
 /// before its commit is acknowledged as having applied. It does not hold when
 /// the commit's outcome is unknown ([`TransactionError::CommitOutcomeUnknown`]):
 /// the bundle may have been stored, and an audit trail that says otherwise is
-/// worse than none (#1586).
+/// worse than none (#1586). Nor does it hold for a Bundle refused before it ran
+/// because its payload is over the configured limit
+/// ([`TooLargeForCacheCause::PayloadOverLimit`], #2351): no transaction was
+/// started, so nothing was rolled back, and the prefix is "Transaction refused".
 fn transaction_failure_description(err: &TransactionError, reason: &str) -> String {
     let prefix = match err {
         TransactionError::CommitOutcomeUnknown { .. } => "Transaction failed",
+        TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit { .. },
+            ..
+        } => "Transaction refused",
         _ => "Transaction rolled back",
     };
     format!("{prefix}: {reason}")
@@ -3107,6 +4166,29 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             "processing",
             format!("Transaction failed at entry {}: {}", index, message),
         ),
+        // The same 400 `processing` the overlap was reported as while it was a
+        // `BundleError`: only the two entry numbers it names have changed
+        // (#922).
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => (
+            StatusCode::BAD_REQUEST,
+            "processing",
+            format!(
+                "Transaction failed at entry {}: {}",
+                index,
+                TransactionError::identity_overlap_description(
+                    entry,
+                    identity,
+                    *other,
+                    other_entry
+                )
+            ),
+        ),
         TransactionError::RolledBack { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "transient",
@@ -3139,25 +4221,86 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         // 500, not the 400 it was: the Bundle's uncommitted writes did not fit
         // in the MongoDB WiredTiger cache and the server rolled the transaction
         // back (#1837). Nothing in the request is malformed and nothing was
-        // applied, but an unchanged resubmit meets the same cache, so it is
-        // neither the retryable `transient` 503 nor carries `Retry-After`;
-        // `too-costly` says the request was too large to complete. The message
-        // names the cache, the knob and the entry count. The driver detail in
-        // `reason` is logged by the caller, never sent.
-        TransactionError::TooLargeForCache { entries, .. } => {
+        // applied. It is not the retryable `transient` 503 and carries no
+        // `Retry-After`; `too-costly` says the request was too large to
+        // complete. The rolled-back causes name the cache, the knob and the
+        // entry count. What the text says about an unchanged resubmit follows
+        // the cause (#1993):
+        //
+        // - `WriteSetTooLarge` (388) keeps "Resubmitting it unchanged will fail
+        //   the same way." on purpose. mongod sends 388 only when the
+        //   transaction itself holds more than
+        //   `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty
+        //   bytes, so the server has judged the Bundle's own write set too large
+        //   for the cache, not the load around it, and an unchanged resubmit
+        //   brings the same write set to the same cache.
+        // - `LoneEviction` (#1895) is a rollback under cache pressure while no
+        //   other transaction Bundle of this server was open. The admission gate
+        //   that made it run alone bounds only this server's transaction
+        //   Bundles: single-resource writes, batch Bundles, other servers on the
+        //   same database and other clients still fill the same cache. A
+        //   resubmit is unlikely to fit (49 of 50 such replays failed again in
+        //   the benchmark) but can, so the text says that rather than promising
+        //   a failure.
+        // - `PayloadOverLimit` (#2351) is the opt-in refusal before the
+        //   admission: the payload of the Bundle's creates and updates is above
+        //   the configured limit. Nothing ran, so the text says that no
+        //   transaction was started and no entries were applied, and it does not
+        //   say "rolled back". It names the payload and the limit, and an
+        //   unchanged resubmit is refused the same way while the limit stays.
+        //   `$bulk-submit` can be switched off (it then answers 501), so the
+        //   text only offers it "if this server enables it".
+        //
+        // The two rolled-back causes name the same remedies as
+        // `PayloadOverLimit` (the split, `$bulk-submit` "if this server enables
+        // it", the cache size), and the split says how to keep references
+        // working across Bundles: create the resources with PUT and
+        // client-assigned ids, because a POST ignores a client's id (#647) and a
+        // reference to a resource in another Bundle needs an id known in advance
+        // (#2350).
+        //
+        // The driver detail in `reason` is logged by the caller, never sent.
+        TransactionError::TooLargeForCache { entries, cause, .. } => {
             let noun = if *entries == 1 { "entry" } else { "entries" };
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "too-costly",
-                format!(
+            let message = match cause {
+                TooLargeForCacheCause::WriteSetTooLarge => format!(
                     "The transaction Bundle is too large for the server's MongoDB WiredTiger \
                      cache: the uncommitted writes of its {entries} {noun} do not fit, so the \
                      transaction was rolled back and no entries were applied. Resubmitting it \
                      unchanged will fail the same way. Split it into smaller transaction \
-                     Bundles, or ask the server operator to raise the cache size \
-                     (--wiredTigerCacheSizeGB)."
+                     Bundles (create the resources with PUT and client-assigned ids so that \
+                     references between the Bundles resolve), load the resources with \
+                     $bulk-submit if this server enables it, or ask the server operator to \
+                     raise the cache size (--wiredTigerCacheSizeGB)."
                 ),
-            )
+                TooLargeForCacheCause::LoneEviction => format!(
+                    "The transaction Bundle did not fit in the server's MongoDB WiredTiger \
+                     cache: the cache ran out of room for the uncommitted writes of its \
+                     {entries} {noun} while it was the only transaction Bundle this server \
+                     was running, so the transaction was rolled back and no entries were \
+                     applied. Resubmitting it unchanged is unlikely to succeed, though it may \
+                     if the cache is less busy. Split it into smaller transaction Bundles \
+                     (create the resources with PUT and client-assigned ids so that references \
+                     between the Bundles resolve), load the resources with $bulk-submit if \
+                     this server enables it, or ask the server operator to raise the cache \
+                     size (--wiredTigerCacheSizeGB)."
+                ),
+                TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes,
+                    limit_bytes,
+                } => format!(
+                    "The transaction Bundle of {entries} {noun} was refused before it ran: the \
+                     resources it would create or update come to {payload_bytes} bytes once \
+                     encoded for storage, over this server's limit of {limit_bytes} bytes for \
+                     one transaction Bundle, set to keep a Bundle within the server's MongoDB \
+                     WiredTiger cache. No transaction was started and no entries were applied. \
+                     Resubmitting it unchanged will be refused the same way. Split it into \
+                     smaller transaction Bundles, load the resources with $bulk-submit if this \
+                     server enables it, or ask the server operator to raise the cache size \
+                     (--wiredTigerCacheSizeGB) and this limit."
+                ),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, "too-costly", message)
         }
         // 504, not 500: the backend is healthy and deliberately stopped work
         // that exceeded its time budget. Kept in step with
@@ -3279,6 +4422,109 @@ mod tests {
         assert!(parse_search_entry_url("").is_none());
     }
 
+    /// #2380: every GET entry shape is sorted once, before dispatch. A
+    /// `_history` URL of none of the history shapes is an error, not a read of
+    /// its first two segments.
+    #[test]
+    fn classify_get_entry_url_sorts_every_get_shape() {
+        fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+            raw.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
+        fn instance(resource_type: &str, id: &str) -> HistoryLevel {
+            HistoryLevel::Instance {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }
+        }
+        let read = |resource_type: &str, id: &str| GetEntryTarget::Read {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        };
+        let search = |resource_type: &str, raw: &[(&str, &str)]| GetEntryTarget::Search {
+            resource_type: resource_type.to_string(),
+            pairs: pairs(raw),
+        };
+        let vread = |version_id: &str| GetEntryTarget::Vread {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            version_id: version_id.to_string(),
+        };
+        let history = |level: HistoryLevel, raw: &[(&str, &str)]| GetEntryTarget::History {
+            level,
+            pairs: pairs(raw),
+        };
+
+        let cases = [
+            // Searches.
+            ("Patient", search("Patient", &[])),
+            ("/Patient", search("Patient", &[])),
+            ("Patient?name=x", search("Patient", &[("name", "x")])),
+            // Reads, whatever follows the id that is not a history.
+            ("Patient/p1", read("Patient", "p1")),
+            ("Patient/p1?_format=json", read("Patient", "p1")),
+            ("Patient/p1/foo", read("Patient", "p1")),
+            // Vreads.
+            ("Patient/p1/_history/2", vread("2")),
+            ("/Patient/p1/_history/2?_format=json", vread("2")),
+            // Instance history.
+            (
+                "Patient/p1/_history",
+                history(instance("Patient", "p1"), &[]),
+            ),
+            (
+                "Patient/p1/_history/",
+                history(instance("Patient", "p1"), &[]),
+            ),
+            (
+                "Patient/p1/_history?_count=2&_since=x",
+                history(
+                    instance("Patient", "p1"),
+                    &[("_count", "2"), ("_since", "x")],
+                ),
+            ),
+            // Type history.
+            (
+                "Patient/_history",
+                history(
+                    HistoryLevel::Type {
+                        resource_type: "Patient".to_string(),
+                    },
+                    &[],
+                ),
+            ),
+            // System history.
+            ("_history", history(HistoryLevel::System, &[])),
+            (
+                "/_history?_count=1",
+                history(HistoryLevel::System, &[("_count", "1")]),
+            ),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(classify_get_entry_url(url), Ok(expected), "url: {url:?}");
+        }
+
+        for url in [
+            "Patient/p1/_history/2/extra",
+            "_history/x",
+            "Patient/_history/x",
+            "_history/_history",
+            "Patient/p1/_history/_history",
+            "Patient/p1/x/_history",
+            "",
+        ] {
+            assert!(
+                classify_get_entry_url(url).is_err(),
+                "url {url:?} must be refused"
+            );
+        }
+        assert_eq!(
+            classify_get_entry_url(""),
+            Err("Entry request.url is empty".to_string())
+        );
+    }
+
     /// #478: the searchset entry result embeds the bundle at 200 with no
     /// location/etag baggage.
     #[test]
@@ -3295,6 +4541,9 @@ mod tests {
     use helios_audit::AuditSink;
     use helios_fhir::FhirVersion;
     use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
+    use helios_persistence::core::{
+        HistoryPage, HistoryParams, InstanceHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    };
     use helios_persistence::error::StorageResult;
     use helios_persistence::tenant::TenantContext;
     use helios_persistence::types::StoredResource;
@@ -3533,7 +4782,29 @@ mod tests {
             ),
             (
                 TransactionError::TooLargeForCache {
+                    cause: TooLargeForCacheCause::WriteSetTooLarge,
                     entries: 7412,
+                    reason: "x".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "too-costly",
+            ),
+            (
+                TransactionError::TooLargeForCache {
+                    cause: TooLargeForCacheCause::LoneEviction,
+                    entries: 1502,
+                    reason: "x".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "too-costly",
+            ),
+            (
+                TransactionError::TooLargeForCache {
+                    cause: TooLargeForCacheCause::PayloadOverLimit {
+                        payload_bytes: 61_234_567,
+                        limit_bytes: 50_000_000,
+                    },
+                    entries: 22,
                     reason: "x".into(),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3557,6 +4828,107 @@ mod tests {
                 level: "serializable".to_string(),
             });
         assert!(msg.contains("serializable"), "isolation message: {msg}");
+    }
+
+    /// The executor's entry positions become the client's Bundle indices for
+    /// every variant that names an entry, and both of an overlap's (#922).
+    /// `PreconditionFailed` was the variant that fell through unmapped.
+    #[test]
+    fn with_client_entry_indices_renames_every_entry_a_failure_names() {
+        // The executor saw the client's entries 2, 0 and 1 as its 0, 1 and 2.
+        let client_index = |index: usize| [2, 0, 1][index];
+
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 0,
+                message: "boom".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::BundleError { index: 2, message } if message == "boom"),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PatchEntry {
+                index: 1,
+                status: 422,
+                outcome: serde_json::json!({"resourceType": "OperationOutcome"}),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(
+                &renamed,
+                TransactionError::PatchEntry {
+                    index: 0,
+                    status: 422,
+                    ..
+                }
+            ),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PreconditionFailed {
+                index: 0,
+                message: "stale".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::PreconditionFailed { index: 2, message } if message == "stale"),
+            "{renamed:?}"
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(code, "conflict");
+        assert_eq!(text, "Transaction failed at entry 2: stale");
+
+        let renamed = with_client_entry_indices(
+            TransactionError::OverlappingIdentity {
+                index: 1,
+                entry: "PUT Patient?identifier=x".to_string(),
+                identity: "Patient/p1".to_string(),
+                other: 0,
+                other_entry: "DELETE Patient/p1".to_string(),
+            },
+            client_index,
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "processing");
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT Patient?identifier=x resolves to Patient/p1, which entry 2 (DELETE Patient/p1) also addresses;"),
+            "{text}"
+        );
+
+        // An index the sort did not produce is left as it was.
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 7,
+                message: "m".to_string(),
+            },
+            |index| [2, 0, 1].get(index).copied().unwrap_or(index),
+        );
+        assert!(
+            matches!(renamed, TransactionError::BundleError { index: 7, .. }),
+            "{renamed:?}"
+        );
+
+        // A failure that names no entry is returned as it came.
+        let renamed = with_client_entry_indices(
+            TransactionError::MultipleMatches {
+                operation: "delete".to_string(),
+                count: 2,
+            },
+            client_index,
+        );
+        assert!(
+            matches!(renamed, TransactionError::MultipleMatches { count: 2, .. }),
+            "{renamed:?}"
+        );
     }
 
     /// A failed entry carries the issue code the single-resource endpoint
@@ -3798,6 +5170,7 @@ mod tests {
 
         emit_batch_entry_audit(
             &state,
+            "default",
             &entry_1,
             &result_1,
             None,
@@ -3807,6 +5180,7 @@ mod tests {
         );
         emit_batch_entry_audit(
             &state,
+            "default",
             &entry_2,
             &result_2,
             None,
@@ -3848,9 +5222,131 @@ mod tests {
         );
     }
 
+    /// The references of the entities of `event` with the given
+    /// `AuditEventEntityType` code (`"1"` is the patient, `"2"` the resource).
+    fn entity_references(event: &AuditEvent, entity_type: &str) -> Vec<String> {
+        event
+            .entity
+            .iter()
+            .flatten()
+            .filter(|entity| {
+                entity
+                    .r#type
+                    .as_ref()
+                    .and_then(|coding| coding.code.as_ref())
+                    .and_then(|code| code.value.as_deref())
+                    == Some(entity_type)
+            })
+            .filter_map(|entity| {
+                entity
+                    .what
+                    .as_ref()
+                    .and_then(|what| what.reference.as_ref())
+                    .and_then(|reference| reference.value.clone())
+            })
+            .collect()
+    }
+
+    /// #2380: a vread or history entry is audited as the direct request is. The
+    /// audit middleware records those as a query (`E`) through
+    /// `balp::detect_interaction`, names `Type/id` for a vread and an instance
+    /// history, the type alone for a type history (nothing) and nothing for a
+    /// system history. The `history` Bundle the entry answers with must not be
+    /// taken for the entity: it was audited as `Bundle/p1` and `Bundle/_history`.
+    #[tokio::test]
+    async fn history_and_vread_entries_are_audited_like_the_direct_requests() {
+        let sink = Arc::new(CollectorSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let state = AppState::with_auth_and_audit(
+            Arc::new(MockStorage),
+            crate::config::ServerConfig::default(),
+            helios_auth::AuthConfig::default(),
+            None,
+            Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
+            "Device/hfs",
+        );
+
+        let history = serde_json::json!({"resourceType": "Bundle", "type": "history", "total": 0});
+        let patient = serde_json::json!({"resourceType": "Patient", "id": "p1"});
+        // (url, the resource the entry answered with, expected action code,
+        // expected resource entity references)
+        let cases = [
+            ("Patient/p1/_history", &history, "E", vec!["Patient/p1"]),
+            ("Patient/_history", &history, "E", vec![]),
+            ("_history", &history, "E", vec![]),
+            ("Patient/p1/_history/2", &patient, "E", vec!["Patient/p1"]),
+            ("Patient/p1", &patient, "R", vec!["Patient/p1"]),
+        ];
+
+        let correlation = AuditCorrelation::new("batch");
+        for (index, (url, resource, _, _)) in cases.iter().enumerate() {
+            let entry = serde_json::json!({"request": {"method": "GET", "url": url}});
+            let result = BundleEntryResult {
+                status: 200,
+                location: None,
+                etag: None,
+                last_modified: None,
+                resource: Some((*resource).clone()),
+                outcome: None,
+                effect: BundleEntryEffect::Read,
+            };
+            emit_batch_entry_audit(
+                &state,
+                "default",
+                &entry,
+                &result,
+                None,
+                None,
+                None,
+                Some(&EntryAuditCorrelation::from_bundle(&correlation, index)),
+            );
+        }
+
+        for _ in 0..50 {
+            if sink.events.lock().await.len() == cases.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = sink.events.lock().await;
+        assert_eq!(events.len(), cases.len());
+        // The events are recorded from detached tasks, so match them to their
+        // entries by the `entry-index` detail rather than by position.
+        for (index, (url, _, action, resources)) in cases.iter().enumerate() {
+            let event = events
+                .iter()
+                .find(|event| {
+                    detail_map(event).get("entry-index").map(String::as_str)
+                        == Some(index.to_string().as_str())
+                })
+                .unwrap_or_else(|| panic!("no audit event for entry {index} ({url})"));
+            assert_eq!(
+                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                Some(*action),
+                "{url}: audit action"
+            );
+            assert_eq!(
+                entity_references(event, "2"),
+                *resources,
+                "{url}: resource entity"
+            );
+            if *url == "Patient/p1/_history" {
+                assert_eq!(
+                    entity_references(event, "1"),
+                    ["Patient/p1"],
+                    "{url}: patient entity"
+                );
+            }
+        }
+    }
+
     /// #1586: the audit text must not say "rolled back" when the commit's
-    /// outcome is unknown — the bundle may have been applied. Every other
-    /// failure of the transaction keeps "Transaction rolled back:".
+    /// outcome is unknown — the bundle may have been applied. Nor when a Bundle
+    /// was refused before it ran for its payload (#2351): no transaction was
+    /// started. Every other failure of the transaction keeps "Transaction rolled
+    /// back:".
     #[test]
     fn transaction_failure_description_follows_the_error_variant() {
         let description = |err: &TransactionError| {
@@ -3865,6 +5361,20 @@ mod tests {
         assert!(
             !unknown.to_lowercase().contains("rolled back"),
             "the commit may have applied: {unknown}"
+        );
+
+        let refused = description(&TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 61_234_567,
+                limit_bytes: 50_000_000,
+            },
+            entries: 22,
+            reason: "raw".to_string(),
+        });
+        assert!(refused.starts_with("Transaction refused: "), "{refused}");
+        assert!(
+            !refused.to_lowercase().contains("rolled back"),
+            "nothing ran, so nothing was rolled back: {refused}"
         );
 
         for err in [
@@ -3923,7 +5433,15 @@ mod tests {
             create_operation_outcome("error", code, &description),
         );
 
-        emit_transaction_entry_audit(&state, &entry, &result, None, Some(&description), None);
+        emit_transaction_entry_audit(
+            &state,
+            "default",
+            &entry,
+            &result,
+            None,
+            Some(&description),
+            None,
+        );
 
         for _ in 0..20 {
             if !sink.events.lock().await.is_empty() {
@@ -3983,8 +5501,9 @@ mod tests {
         MultipleMatches(usize),
         Unsupported,
         /// The storage declares no conditional interaction at all
-        /// (`supports_conditional` is `false`), as S3 does. Its methods are
-        /// unscripted: reaching one panics.
+        /// (`supports_conditional` is `false`), as S3 does for update, delete
+        /// and patch (it declares only an identifier-scoped create, #1435).
+        /// Its methods are unscripted: reaching one panics.
         Undeclared,
     }
 
@@ -4333,6 +5852,7 @@ mod tests {
             + IncludeProvider
             + RevincludeProvider
             + ConditionalStorage
+            + SystemHistoryProvider
             + Send
             + Sync,
     {
@@ -4599,13 +6119,16 @@ mod tests {
         );
     }
 
-    /// Shapes that already resolved keep resolving identically.
+    /// The first two segments are the address; what a GET entry is, is decided
+    /// by `classify_get_entry_url`.
     #[test]
-    fn parse_request_url_still_addresses_types_instances_and_history() {
+    fn parse_request_url_addresses_the_first_two_segments() {
         for (url, expected_type, expected_id) in [
             ("Patient", "Patient", ""),
             ("Patient/p1", "Patient", "p1"),
             ("/Patient/p1", "Patient", "p1"),
+            // The scope check's address. The GET entry itself is a vread of
+            // version 2, not a read of Patient/p1 (#2380).
             ("Patient/p1/_history/2", "Patient", "p1"),
         ] {
             assert_eq!(
@@ -4661,6 +6184,204 @@ mod tests {
         for url in ["", "/", "?identifier=x"] {
             assert!(parse_request_url(url).is_err(), "url: {url}");
         }
+    }
+
+    fn operation_refusal(method: BundleMethod, url: &str) -> Option<OperationUrlRefusal> {
+        refuse_operation_url(&method, url).err()
+    }
+
+    /// A URL whose last segment begins with `$` names an operation, in every
+    /// shape the spec gives one (`$op`, `[type]/$op`, `[type]/[id]/$op`), with
+    /// or without a query, on any method, relative or absolute, plain or with
+    /// the `$` percent-encoded (#868).
+    #[test]
+    fn refuse_operation_url_names_the_operation_at_the_end_of_any_shape() {
+        for (method, url, operation) in [
+            (BundleMethod::Post, "$diff", "$diff"),
+            (BundleMethod::Post, "/$export", "$export"),
+            (BundleMethod::Post, "ValueSet/$lookup", "$lookup"),
+            (
+                BundleMethod::Get,
+                "ValueSet/$expand?url=http://x/vs",
+                "$expand",
+            ),
+            (BundleMethod::Get, "Observation/$lastn?max=3", "$lastn"),
+            (BundleMethod::Get, "Patient/123/$everything", "$everything"),
+            (
+                BundleMethod::Post,
+                "Patient/123/$everything?_count=5",
+                "$everything",
+            ),
+            (BundleMethod::Put, "Patient/123/$purge", "$purge"),
+            (BundleMethod::Patch, "Patient/123/$purge", "$purge"),
+            (BundleMethod::Delete, "Patient/123/$expunge", "$expunge"),
+            (
+                BundleMethod::Get,
+                "Patient/123/%24everything",
+                "$everything",
+            ),
+            (
+                BundleMethod::Get,
+                "Patient/123/%24Everything",
+                "$Everything",
+            ),
+            (
+                BundleMethod::Get,
+                "http://example.test/fhir/Patient/123/$everything",
+                "$everything",
+            ),
+            (
+                BundleMethod::Post,
+                "https://example.test/fhir/ValueSet/$lookup?x=1",
+                "$lookup",
+            ),
+        ] {
+            match operation_refusal(method, url) {
+                Some(OperationUrlRefusal::Operation {
+                    operation: found,
+                    url: echoed,
+                    ..
+                }) => {
+                    assert_eq!(found, operation, "url: {url}");
+                    assert_eq!(echoed, url, "the URL is echoed as sent");
+                }
+                other => panic!("{method} {url}: expected an operation refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Nothing that is a resource URL is taken for an operation: a `$` in the
+    /// query is a search value, and the URL shapes the entry parsers accept
+    /// pass through untouched.
+    #[test]
+    fn refuse_operation_url_leaves_resource_urls_alone() {
+        for (method, url) in [
+            (BundleMethod::Post, "Patient"),
+            (BundleMethod::Get, "Patient"),
+            (BundleMethod::Get, "/Patient/123"),
+            (BundleMethod::Get, "Patient?name=$x&_sort=$y"),
+            (BundleMethod::Get, "Patient?name=%24x"),
+            (BundleMethod::Get, "Patient/123/_history/1"),
+            (BundleMethod::Get, "_history"),
+            (
+                BundleMethod::Put,
+                "Patient?identifier=http:/example.org/fhir/ids|456456",
+            ),
+            (BundleMethod::Delete, "Patient/123"),
+            (BundleMethod::Post, "http://example.test/fhir/Patient"),
+            (
+                BundleMethod::Get,
+                "urn:uuid:61ebe359-bfdc-4613-8bf2-c5e300945f0a",
+            ),
+            // Empty and whitespace-only paths are for the entry parsers to refuse.
+            (BundleMethod::Get, ""),
+            (BundleMethod::Get, "/"),
+            (BundleMethod::Get, "?name=x"),
+            // `%24` is only an escape for `$` at the start of a segment; it is
+            // the same character mid-segment and is no operation name.
+            (BundleMethod::Get, "Patient/12%243"),
+            (BundleMethod::Get, "Patient/a$b"),
+            // Short and multi-byte segments must not trip the prefix test.
+            (BundleMethod::Get, "Patient/%2"),
+            (BundleMethod::Get, "Patient/\u{e9}\u{e9}"),
+        ] {
+            assert_eq!(operation_refusal(method, url), None, "{method} {url}");
+        }
+    }
+
+    /// A `$` segment before the last is no operation: no FHIR URL has one, and an
+    /// id cannot begin with `$`. It is refused as malformed, naming the segment.
+    #[test]
+    fn refuse_operation_url_rejects_a_dollar_segment_before_the_last() {
+        for url in [
+            "$everything/Patient",
+            "Patient/$everything/123",
+            "Patient/$everything/_history",
+            "http://example.test/fhir/$export/Patient",
+            "Patient/%24everything/123",
+        ] {
+            match operation_refusal(BundleMethod::Get, url) {
+                Some(OperationUrlRefusal::MisplacedOperation {
+                    segment,
+                    url: echoed,
+                }) => {
+                    assert!(segment.starts_with('$'), "url: {url}: {segment}");
+                    assert_eq!(echoed, url);
+                }
+                other => panic!("{url}: expected a malformed-URL refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// An operation is `501` + `not-supported` naming the operation, the
+    /// client's entry index, the method and the URL; a misplaced `$` is the
+    /// `400` + `value` every other malformed entry URL is. Both are rendered by
+    /// the one `RestError` mapping the response body and the per-entry outcome
+    /// share, so the arms cannot differ.
+    #[test]
+    fn operation_url_refusal_renders_its_status_code_and_wording() {
+        let (status, outcome) = refuse_operation_url(&BundleMethod::Post, "ValueSet/$lookup")
+            .unwrap_err()
+            .into_rest_error(7)
+            .client_outcome();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        let issue = &outcome["issue"][0];
+        assert_eq!(issue["code"], "not-supported");
+        let text = issue["details"]["text"].as_str().unwrap();
+        for needle in [
+            "$lookup",
+            "not supported in Bundle entries",
+            "entry 7",
+            "POST ValueSet/$lookup",
+            "invoke it directly against the REST API",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}: {text}");
+        }
+        assert!(!text.to_lowercase().contains("resource type"), "{text}");
+
+        let (status, outcome) = refuse_operation_url(&BundleMethod::Get, "$everything/Patient")
+            .unwrap_err()
+            .into_rest_error(3)
+            .client_outcome();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(outcome["issue"][0]["code"], "value");
+        let text = outcome["issue"][0]["details"]["text"].as_str().unwrap();
+        assert!(text.starts_with("Entry 3:"), "{text}");
+        assert!(text.contains("'$everything'"), "{text}");
+    }
+
+    /// The transaction arm's parser is the choke point for every method: a
+    /// mutation URL is canonicalized to its last one or two segments and a GET
+    /// URL is passed on as written, so each would act on part of an operation
+    /// URL if it were not refused first.
+    #[test]
+    fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
+        for (method, url) in [
+            ("GET", "Patient/p1/$everything"),
+            ("GET", "ValueSet/$expand?url=x"),
+            ("POST", "ValueSet/$lookup"),
+            ("POST", "$diff"),
+            ("PUT", "Patient/p1/$purge"),
+            ("PATCH", "Patient/p1/$purge"),
+            ("DELETE", "Patient/p1/$expunge"),
+        ] {
+            let entry = serde_json::json!({
+                "request": { "method": method, "url": url },
+                "resource": { "resourceType": "Parameters" }
+            });
+            match parse_bundle_entry(&entry) {
+                Err(EntryParseError::OperationUrl(OperationUrlRefusal::Operation { .. })) => {}
+                other => panic!("{method} {url}: expected an operation refusal, got {other:?}"),
+            }
+        }
+
+        // A method that is refused wins over the URL, as in the batch arm.
+        let head =
+            serde_json::json!({ "request": { "method": "HEAD", "url": "Patient/p1/$everything" } });
+        assert!(matches!(
+            parse_bundle_entry(&head),
+            Err(EntryParseError::Method(EntryMethodRefusal::Head))
+        ));
     }
 
     /// The notice kind a committed transaction write announces (#1023). A POST
@@ -4777,18 +6498,14 @@ mod tests {
                 Some((WriteKind::Delete, "p1".to_string(), String::new()))
             ))
         );
-        // A delete of something that was not there moves no count, but its
-        // 2xx still announces from the URL as before.
+        // A delete of something that was not there is a `204` no-op (#2523):
+        // it moves no count and announces nothing, though its status is 2xx.
         assert_eq!(
             summary(transaction_entry_write(
                 &entry(BundleMethod::Delete, "Patient/p1"),
                 &result(204, None, BundleEntryEffect::NotFound)
             )),
-            Some((
-                "Patient".to_string(),
-                0,
-                Some((WriteKind::Delete, "p1".to_string(), String::new()))
-            ))
+            None
         );
         assert_eq!(
             summary(transaction_entry_write(
@@ -4811,6 +6528,57 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// #862: a conditional DELETE entry's URL carries criteria, not an id, so
+    /// its notice names the resource the backend resolved, through `location`.
+    /// One that matched nothing has no location and announces nothing.
+    #[test]
+    fn transaction_conditional_delete_notice_names_the_resolved_resource() {
+        let conditional = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient?identifier=x".to_string(),
+            criteria: Some(Vec::new()),
+            ..Default::default()
+        };
+        let result = |location: Option<&str>, effect: BundleEntryEffect| BundleEntryResult {
+            location: location.map(str::to_string),
+            effect,
+            ..BundleEntryResult::deleted()
+        };
+
+        let deleted = transaction_entry_write(
+            &conditional,
+            &result(Some("Patient/p9/_history/3"), BundleEntryEffect::Deleted),
+        )
+        .expect("a delete that resolved a resource is a write");
+        assert_eq!(deleted.0, "Patient");
+        assert_eq!(deleted.1, -1);
+        let notice = deleted.2.expect("announced");
+        assert_eq!(notice.kind, WriteKind::Delete);
+        assert_eq!(notice.resource_id, "p9");
+        assert!(notice.version_id.is_empty());
+        assert!(notice.resource.is_none());
+
+        // No match: a 204 with no location, nothing deleted, nothing announced.
+        assert!(
+            transaction_entry_write(&conditional, &result(None, BundleEntryEffect::NotFound))
+                .is_none()
+        );
+
+        // Criteria-less entries still announce from the URL, never from a
+        // location.
+        let instance = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient/p1".to_string(),
+            ..Default::default()
+        };
+        let notice = transaction_entry_notice(
+            &instance,
+            &result(Some("Patient/other/_history/1"), BundleEntryEffect::Deleted),
+        )
+        .expect("announced");
+        assert_eq!(notice.resource_id, "p1");
     }
 
     #[test]
@@ -5132,7 +6900,7 @@ mod tests {
         );
         let entry = &response["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/existing");
+        assert_eq!(entry["response"]["location"], "Patient/existing/_history/1");
         assert_eq!(entry["resource"]["id"], "existing");
 
         let state = state_with(DelayStorage::conditional(ConditionalReply::Created));
@@ -5309,6 +7077,109 @@ mod tests {
             _validator: Option<&dyn PatchCandidateValidator>,
         ) -> Result<helios_persistence::core::BundleResult, TransactionError> {
             unimplemented!("DelayStorage does not execute transactions")
+        }
+    }
+
+    // The batch handler is bounded by `SystemHistoryProvider`, like the router
+    // (#2380). `DelayStorage` serves no versions or history: a test that
+    // reaches one fails loudly.
+    #[async_trait]
+    impl VersionedStorage for DelayStorage {
+        async fn vread(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _version_id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn update_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn delete_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+        ) -> StorageResult<()> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn list_versions(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Vec<String>> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl InstanceHistoryProvider for DelayStorage {
+        async fn history_instance(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_instance_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl TypeHistoryProvider for DelayStorage {
+        async fn history_type(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_type_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+        ) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl SystemHistoryProvider for DelayStorage {
+        async fn history_system(
+            &self,
+            _tenant: &TenantContext,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_system_count(&self, _tenant: &TenantContext) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
         }
     }
 
@@ -5720,8 +7591,22 @@ mod tests {
                 reason: "x".to_string(),
             },
             TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
                 entries: 7412,
                 reason: RAW_TOO_LARGE_DETAIL.into(),
+            },
+            TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::LoneEviction,
+                entries: 7412,
+                reason: RAW_LONE_EVICTION_DETAIL.into(),
+            },
+            TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                entries: 7412,
+                reason: RAW_PAYLOAD_REFUSAL_DETAIL.into(),
             },
         ] {
             let response = transaction_error_to_response(err).expect("response");
@@ -5743,26 +7628,58 @@ mod tests {
         -31800: transaction is too large and will not fit in the storage engine cache\", \
         details: None }]) }";
 
-    /// #1837: a Bundle whose writes do not fit in the WiredTiger cache is a
+    /// The raw detail of a lone Bundle rolled back for eviction (#1895), as
+    /// `lone_eviction_failure` words it around a 112 on an entry write.
+    const RAW_LONE_EVICTION_DETAIL: &str = "Entry 6959 rolled back for eviction while the Bundle \
+        ran alone; not replayed: Entry processing failed: internal error in mongodb: Failed to \
+        insert search index entries: Kind: Command failed: Error code 112 (WriteConflict): \
+        Caused by :: WiredTigerRecordStore::insertRecord -31800: oldest pinned transaction ID \
+        rolled back for eviction :: Please retry your operation or multi-document transaction.";
+
+    /// The raw detail of a Bundle refused before admission for its payload
+    /// (#2351), as `PayloadLimitRefusal::into_error` words it. Log-only.
+    const RAW_PAYLOAD_REFUSAL_DETAIL: &str = "Refused before admission: the Bundle's create and \
+        update entries carry 61234567 bytes of resource payload (BSON), over the configured \
+        limit of 50000000 bytes; no session or transaction was started";
+
+    /// #1837, wording kept on purpose by #1993: a 388 (`WriteSetTooLarge`) is a
     /// `500 too-costly`, not the `400 processing` echoing driver text it used
-    /// to be. The message names the cache, the entry count and both remedies,
-    /// and carries none of the driver detail.
+    /// to be. The message names the cache, the entry count and every remedy
+    /// (`$bulk-submit` and the split with client-assigned ids, since #2350),
+    /// carries none of the driver detail, and still says an unchanged resubmit
+    /// fails the same way: mongod sends 388 only when the Bundle's own write
+    /// set holds most of the cache's dirty bytes.
     #[test]
     fn too_large_for_cache_maps_to_500_too_costly_naming_the_cache_and_the_entry_count() {
         let (status, code, message) =
             transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
                 entries: 7412,
                 reason: RAW_TOO_LARGE_DETAIL.to_string(),
             });
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "too-costly");
+        assert_eq!(
+            message,
+            "The transaction Bundle is too large for the server's MongoDB WiredTiger cache: the \
+             uncommitted writes of its 7412 entries do not fit, so the transaction was rolled \
+             back and no entries were applied. Resubmitting it unchanged will fail the same way. \
+             Split it into smaller transaction Bundles (create the resources with PUT and \
+             client-assigned ids so that references between the Bundles resolve), load the \
+             resources with $bulk-submit if this server enables it, or ask the server operator \
+             to raise the cache size (--wiredTigerCacheSizeGB)."
+        );
         for needle in [
             "WiredTiger",
             "--wiredTigerCacheSizeGB",
             "7412 entries",
             "no entries were applied",
             "Split",
+            "$bulk-submit",
+            "if this server enables it",
+            "PUT",
+            "client-assigned ids",
         ] {
             assert!(message.contains(needle), "missing {needle:?}: {message}");
         }
@@ -5791,47 +7708,236 @@ mod tests {
         );
     }
 
-    /// One entry reads as "1 entry", not "1 entries".
+    /// #1993: a lone eviction rollback (#1895) is the same `500 too-costly`
+    /// with the same remedies, but its text must not promise that an unchanged
+    /// resubmit fails: the admission gate bounds only this server's transaction
+    /// Bundles, and other writes share the cache.
     #[test]
-    fn too_large_for_cache_message_uses_the_singular_for_one_entry() {
-        let (_, _, message) =
+    fn too_large_for_cache_after_a_lone_eviction_does_not_claim_a_resubmit_will_fail() {
+        let (status, code, message) =
             transaction_error_response_parts(&TransactionError::TooLargeForCache {
-                entries: 1,
+                cause: TooLargeForCacheCause::LoneEviction,
+                entries: 7412,
+                reason: RAW_LONE_EVICTION_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "too-costly");
+        assert_eq!(
+            message,
+            "The transaction Bundle did not fit in the server's MongoDB WiredTiger cache: the \
+             cache ran out of room for the uncommitted writes of its 7412 entries while it was \
+             the only transaction Bundle this server was running, so the transaction was rolled \
+             back and no entries were applied. Resubmitting it unchanged is unlikely to \
+             succeed, though it may if the cache is less busy. Split it into smaller \
+             transaction Bundles (create the resources with PUT and client-assigned ids so \
+             that references between the Bundles resolve), load the resources with \
+             $bulk-submit if this server enables it, or ask the server operator to raise the \
+             cache size (--wiredTigerCacheSizeGB)."
+        );
+        for needle in [
+            "WiredTiger",
+            "--wiredTigerCacheSizeGB",
+            "7412 entries",
+            "no entries were applied",
+            "Split",
+            "the only transaction Bundle this server was running",
+            "unlikely to succeed",
+            "less busy",
+            "$bulk-submit",
+            "if this server enables it",
+            "PUT",
+            "client-assigned ids",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+        for claim in [
+            "fail the same way",
+            "will fail",
+            "is too large",
+            "Retry the request",
+        ] {
+            assert!(!message.contains(claim), "claims {claim:?}: {message}");
+        }
+        for leak in [
+            "112",
+            "365",
+            "WriteConflict",
+            "TemporarilyUnavailable",
+            "-31800",
+            "insertRecord",
+            "eviction",
+            "oldest pinned",
+            "Entry 6959",
+            "ran alone",
+            "not replayed",
+            "search index",
+            "Please retry",
+            "admission",
+        ] {
+            assert!(!message.contains(leak), "leaked {leak:?}: {message}");
+        }
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+
+        // The two causes are worded apart on purpose: only 388 promises a
+        // failure.
+        let (_, _, write_set) =
+            transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                entries: 7412,
                 reason: RAW_TOO_LARGE_DETAIL.to_string(),
             });
-        assert!(message.contains("1 entry "), "{message}");
-        assert!(!message.contains("1 entries"), "{message}");
-        assert!(!message.contains("  "), "{message:?}");
+        assert_ne!(message, write_set);
+        assert!(
+            write_set.contains("Resubmitting it unchanged will fail the same way."),
+            "{write_set}"
+        );
+    }
+
+    /// #2351: a Bundle refused before it ran for its payload is the same
+    /// `500 too-costly`, but nothing ran: the text says no transaction was
+    /// started and nothing was applied, never "rolled back", names the payload
+    /// and the limit, and leaves the log-only detail out.
+    #[test]
+    fn too_large_for_cache_over_the_payload_limit_says_nothing_ran() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                entries: 7412,
+                reason: RAW_PAYLOAD_REFUSAL_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "too-costly");
+        assert_eq!(
+            message,
+            "The transaction Bundle of 7412 entries was refused before it ran: the resources it \
+             would create or update come to 61234567 bytes once encoded for storage, over this \
+             server's limit of 50000000 bytes for one transaction Bundle, set to keep a Bundle \
+             within the server's MongoDB WiredTiger cache. No transaction was started and no \
+             entries were applied. Resubmitting it unchanged will be refused the same way. Split \
+             it into smaller transaction Bundles, load the resources with $bulk-submit if this \
+             server enables it, or ask the server operator to raise the cache size \
+             (--wiredTigerCacheSizeGB) and this limit."
+        );
+        for needle in [
+            "7412 entries",
+            "61234567 bytes once encoded for storage",
+            "50000000 bytes",
+            "refused before it ran",
+            "No transaction was started",
+            "no entries were applied",
+            "$bulk-submit",
+            "Split",
+            "--wiredTigerCacheSizeGB",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+        for claim in [
+            "rolled back",
+            "Retry the request",
+            "admission",
+            "Refused before admission",
+            "HFS_MONGODB",
+            "BSON",
+            "as stored",
+        ] {
+            assert!(!message.contains(claim), "says {claim:?}: {message}");
+        }
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+    }
+
+    /// One entry reads as "1 entry", not "1 entries", whatever the cause.
+    #[test]
+    fn too_large_for_cache_message_uses_the_singular_for_one_entry() {
+        for cause in [
+            TooLargeForCacheCause::WriteSetTooLarge,
+            TooLargeForCacheCause::LoneEviction,
+            TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 10,
+                limit_bytes: 5,
+            },
+        ] {
+            let (_, _, message) =
+                transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                    cause,
+                    entries: 1,
+                    reason: RAW_TOO_LARGE_DETAIL.to_string(),
+                });
+            assert!(message.contains("1 entry "), "{cause:?}: {message}");
+            assert!(!message.contains("1 entries"), "{cause:?}: {message}");
+            assert!(!message.contains("  "), "{cause:?}: {message:?}");
+        }
     }
 
     /// The Bundle path builds its response directly: a `500 too-costly` with no
-    /// `Retry-After` (a retry would meet the same cache) and a clean body.
+    /// `Retry-After` for either cause (a retry would meet a cache that is full
+    /// of the same kind of writes) and a clean body.
     #[tokio::test]
     async fn too_large_for_cache_response_is_a_500_with_a_clean_body() {
-        let response = transaction_error_to_response(TransactionError::TooLargeForCache {
-            entries: 7412,
-            reason: RAW_TOO_LARGE_DETAIL.to_string(),
-        })
-        .expect("response");
+        for (cause, reason) in [
+            (
+                TooLargeForCacheCause::WriteSetTooLarge,
+                RAW_TOO_LARGE_DETAIL,
+            ),
+            (
+                TooLargeForCacheCause::LoneEviction,
+                RAW_LONE_EVICTION_DETAIL,
+            ),
+            (
+                TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                RAW_PAYLOAD_REFUSAL_DETAIL,
+            ),
+        ] {
+            let response = transaction_error_to_response(TransactionError::TooLargeForCache {
+                cause,
+                entries: 7412,
+                reason: reason.to_string(),
+            })
+            .expect("response");
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .is_none(),
-            "an unchanged resubmit fails the same way, so no Retry-After"
-        );
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "a capacity limit gets no Retry-After, whatever its cause ({cause:?})"
+            );
 
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        let body: Value = serde_json::from_slice(&bytes).expect("OperationOutcome JSON");
-        assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "too-costly");
-        let text = body.to_string();
-        for leak in ["388", "-31800", "InsertMany"] {
-            assert!(!text.contains(leak), "body leaked {leak:?}: {text}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            let body: Value = serde_json::from_slice(&bytes).expect("OperationOutcome JSON");
+            assert_eq!(body["resourceType"], "OperationOutcome");
+            assert_eq!(body["issue"][0]["code"], "too-costly");
+            let text = body.to_string();
+            for leak in [
+                "388",
+                "-31800",
+                "InsertMany",
+                "112",
+                "WriteConflict",
+                "eviction",
+                "ran alone",
+            ] {
+                assert!(
+                    !text.contains(leak),
+                    "{cause:?} body leaked {leak:?}: {text}"
+                );
+            }
         }
     }
 

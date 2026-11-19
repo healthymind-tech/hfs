@@ -4,12 +4,12 @@
 //! against the SQLite search_index table.
 
 use crate::backends::sql_literal::sql_string_literal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::SearchError;
 use crate::types::{
-    CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
-    SearchQuery, SearchValue, strip_reference_version,
+    CompartmentMembership, CompositeSearchComponent, ContainedMode, SearchModifier,
+    SearchParamType, SearchParameter, SearchQuery, SearchValue, strip_reference_version,
 };
 
 use super::modifier_handlers::{build_missing_condition, get_missing_value, is_missing_modifier};
@@ -101,7 +101,7 @@ pub struct SqlFragment {
 }
 
 /// A bound SQL parameter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SqlParam {
     /// String parameter.
     String(String),
@@ -181,6 +181,319 @@ impl SqlFragment {
     }
 }
 
+/// One search parameter's condition on `resource_key`.
+enum ParameterCondition {
+    /// `resource_key IN (…)` over the parameter's own `search_index` rows of
+    /// the searched tenant and type; holds the subquery, which selects the
+    /// matching keys by itself.
+    Rows(SqlFragment),
+    /// Any other condition: `:not`, `:missing`, a composite, `_id`, …
+    Other(SqlFragment),
+}
+
+impl ParameterCondition {
+    /// The condition as a `WHERE` term on `resource_key`.
+    fn into_fragment(self) -> SqlFragment {
+        match self {
+            ParameterCondition::Rows(rows) => {
+                SqlFragment::with_params(format!("resource_key IN ({})", rows.sql), rows.params)
+            }
+            ParameterCondition::Other(fragment) => fragment,
+        }
+    }
+
+    /// The subquery whose keys are exactly the condition's matches, or `None`
+    /// when the condition is not a positive membership.
+    fn positive_subquery(&self) -> Option<&str> {
+        match self {
+            ParameterCondition::Rows(rows) => Some(&rows.sql),
+            ParameterCondition::Other(fragment) => positive_membership_subquery(&fragment.sql),
+        }
+    }
+
+    /// The values the condition binds.
+    fn into_params(self) -> Vec<SqlParam> {
+        match self {
+            ParameterCondition::Rows(fragment) | ParameterCondition::Other(fragment) => {
+                fragment.params
+            }
+        }
+    }
+
+    /// How many values the condition binds.
+    fn param_count(&self) -> usize {
+        match self {
+            ParameterCondition::Rows(fragment) | ParameterCondition::Other(fragment) => {
+                fragment.params.len()
+            }
+        }
+    }
+}
+
+/// `SELECT resource_key` over the `search_index` rows of parameter `name`, of
+/// the searched tenant (`?1`) and type (`?2`), that satisfy `condition`.
+fn parameter_rows(name: &str, condition: &str) -> String {
+    format!(
+        "{PARAMETER_ROWS_HEAD}param_name = {} AND ({condition})",
+        sql_string_literal(name)
+    )
+}
+
+/// What every [`parameter_rows`] subquery starts with, up to its
+/// `param_name` test.
+const PARAMETER_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// What a [`reference_versions_rows`] select starts with. Unlike
+/// [`PARAMETER_ROWS_HEAD`] its first term is parenthesized, which tells the
+/// two apart.
+const VERSION_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE (tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// How many bases one select of [`reference_versions_rows`] ORs together: the
+/// `OR` is a flat chain, so this bounds the expression depth, and the number
+/// of selects stays far below SQLite's compound-select limit (500).
+const VERSION_ROWS_CHUNK: usize = 50;
+
+/// The `_history` arm of a plain multi-value reference search (#2493):
+/// `resource_key`s whose stored reference is `<base>/_history/<n>` for one of
+/// the `count` bases bound at `?first..`. Every `OR` branch repeats the
+/// tenant, type and parameter tests, so SQLite plans each as its own bounded
+/// range seek on `idx_search_reference` (a `MULTI-INDEX OR`), never a scan
+/// (#1017, #1955); a `VALUES` join of the bases only seeks the prefix and
+/// reads every reference of the parameter. Selects of
+/// [`VERSION_ROWS_CHUNK`] bases are `UNION ALL`-ed. Binds nothing of its own:
+/// the placeholders are the ones of the exact `IN`.
+fn reference_versions_rows(name: &str, first: usize, count: usize) -> String {
+    let name = sql_string_literal(name);
+    let branches: Vec<String> = (0..count)
+        .map(|i| {
+            let p = first + i;
+            format!(
+                "(tenant_id = ?1 AND resource_type = ?2 AND param_name = {name} \
+                 AND value_reference >= ?{p} || '/_history/' \
+                 AND value_reference < ?{p} || '/_history0')"
+            )
+        })
+        .collect();
+    branches
+        .chunks(VERSION_ROWS_CHUNK)
+        .map(|chunk| {
+            format!(
+                "SELECT resource_key FROM search_index WHERE {}",
+                chunk.join(" OR ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// Whether `sql` is exactly one [`parameter_rows`] select: a single
+/// parameter's membership, nothing intersected with it.
+pub(crate) fn is_parameter_rows(sql: &str) -> bool {
+    (sql.starts_with(PARAMETER_ROWS_HEAD) || sql.starts_with(COMPOSITE_PAIR_HEAD))
+        && !sql.contains(" INTERSECT ")
+}
+
+/// The same membership as a correlated `EXISTS` on the outer `resources` row,
+/// for a subquery built by [`parameter_rows`]: `rowid IN (<rows>)` becomes
+/// `EXISTS (<rows> for outer_key)`, which lets the outer query walk
+/// `resources` in page order and stop at the first full page instead of
+/// materializing every matching key first. Reuses the subquery's numbered
+/// placeholders, so the same parameters bind. `None` for anything that is not
+/// one plain `parameter_rows` select or a `UNION ALL` of them (a date's
+/// ranges, tested as `EXISTS (…) OR EXISTS (…)`); an `INTERSECT` or a nested
+/// subquery keeps `rowid IN (…)`.
+pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    // The code-first composite pairing: its one nested `EXISTS` stays inside,
+    // and `c.resource_key = outer_key` joins the seek on `(…, code,
+    // resource_key)`.
+    if let Some(rest) = rows_sql.strip_prefix(COMPOSITE_PAIR_HEAD) {
+        if [" UNION ", " INTERSECT ", " EXCEPT ", " GROUP BY "]
+            .iter()
+            .any(|keyword| rest.contains(keyword))
+            || rest.matches("SELECT").count() != 1
+        {
+            return None;
+        }
+        return Some(format!(
+            "EXISTS (SELECT 1 FROM search_index AS c INDEXED BY idx_search_token \
+             WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND c.resource_key = {outer_key} AND {rest})"
+        ));
+    }
+    // A `UNION ALL` of parameter selects (a date's `ne`/`le`/`ge` ranges): a
+    // resource is a member when any one range holds for it, so the branches
+    // are `EXISTS`-es joined by `OR`.
+    if rows_sql.contains(" UNION ALL ") {
+        // A reference's absolute-URL arm: both selects read the same
+        // parameter's rows, and within one `resource_key` the `OR` is only a
+        // row filter, so one `EXISTS` answers both with a single lookup in
+        // `idx_search_composite` instead of two per non-matching outer row.
+        if let Some(merged) = reference_exists_predicate(rows_sql, outer_key) {
+            return Some(merged);
+        }
+        let branches = rows_sql
+            .split(" UNION ALL ")
+            .map(|branch| parameter_exists_predicate(branch, outer_key))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!("({})", branches.join(" OR ")));
+    }
+    parameter_exists_predicate(rows_sql, outer_key)
+}
+
+/// [`membership_exists_predicate`] for a reference parameter's selects (see
+/// `parameter_condition`): the `value_reference` test, optionally the
+/// `_history` arm of a plain multi-value list ([`reference_versions_rows`]),
+/// optionally the `value_reference_target` test, `UNION ALL`-ed in that order.
+/// One `EXISTS` whose row test is the `OR` of them. The `_history` arm becomes
+/// a flat filter on the version-stripped stored reference: the row is already
+/// pinned by `resource_key`, so there is nothing left to seek. `None` when
+/// `rows_sql` is not exactly that shape.
+fn reference_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    const TARGET_TEST: &str = "value_reference_target IS NOT NULL AND value_reference_target IN (";
+    const BASES_TEST: &str = "value_reference IN (";
+    let mut arms = rows_sql.split(" UNION ALL ");
+    let first = arms.next()?;
+    let first_rest = first.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    // `param_name = '<name>' AND (<cond>)` on every select, same name.
+    let (name, cond1) = first_rest.split_once(" AND (")?;
+    if !name.starts_with("param_name = ") {
+        return None;
+    }
+    let cond1 = cond1.strip_suffix(')')?;
+    if cond1.contains("SELECT") {
+        return None;
+    }
+    let mut tests = vec![format!("({cond1})")];
+    let mut seen_versions = false;
+    let mut seen_target = false;
+    for arm in arms {
+        if let Some(rest) = arm.strip_prefix(VERSION_ROWS_HEAD) {
+            if !rest.starts_with(name) {
+                return None;
+            }
+            // Only after the exact `IN`, once, and only when `cond1` is one.
+            let bases = cond1.strip_prefix(BASES_TEST)?;
+            if seen_target || !bases.ends_with(')') {
+                return None;
+            }
+            // One select per chunk of bases; they all collapse into one test.
+            if seen_versions {
+                continue;
+            }
+            seen_versions = true;
+            tests.push(format!(
+                "(instr(value_reference, '/_history/') > 0 AND \
+                 substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN ({bases})"
+            ));
+            continue;
+        }
+        let rest = arm.strip_prefix(PARAMETER_ROWS_HEAD)?;
+        let (arm_name, cond) = rest.split_once(" AND (")?;
+        let cond = cond.strip_suffix(')')?;
+        if seen_target
+            || arm_name != name
+            || !cond.starts_with(TARGET_TEST)
+            || cond.contains("SELECT")
+        {
+            return None;
+        }
+        seen_target = true;
+        tests.push(format!("({cond})"));
+    }
+    if tests.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} \
+         AND {name} AND ({}))",
+        tests.join(" OR ")
+    ))
+}
+
+/// [`membership_exists_predicate`] for one plain [`parameter_rows`] select.
+fn parameter_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    let rest = rows_sql.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    if [" UNION ", " INTERSECT ", " EXCEPT ", "SELECT"]
+        .iter()
+        .any(|keyword| rest.contains(keyword))
+    {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} AND {rest})"
+    ))
+}
+
+/// What a [`composite_pair_rows`] subquery starts with, up to its
+/// `param_name` test.
+const COMPOSITE_PAIR_HEAD: &str = "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_token WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND ";
+
+/// The keys of the resources with a composite group in which a token row
+/// matches the token component and a row of the same group matches the
+/// quantity component: the rows of the whole-parameter
+/// `GROUP BY resource_key, composite_group HAVING MAX(CASE token) AND
+/// MAX(CASE quantity)` for a two-component token+quantity composite, without
+/// reading every row of the parameter. The code-first token index
+/// (`idx_search_token`, which carries `composite_group` and `is_contained`)
+/// finds the token rows by code; each one is
+/// then paired by a probe of `idx_search_composite_cov` on `(resource_key,
+/// composite_group)`. A key can be listed once per matching token row, which
+/// the `rowid IN (…)` callers ignore.
+///
+/// `None` (keep the `GROUP BY`) unless the composite is exactly one token and
+/// one quantity component and the token part tests `value_token_code = ?`: a
+/// `system|` token has no code to seek. The fragments' columns are unqualified; the token part sits in the
+/// outer select, so it binds to `c`, and the quantity part in the `EXISTS`,
+/// so it binds to `q`. Both `INDEXED BY` hints need the partial-index terms
+/// spelled out in the `WHERE`.
+fn composite_pair_rows(
+    name: &str,
+    components: &[CompositeSearchComponent],
+    fragments: &[SqlFragment],
+) -> Option<String> {
+    if components.len() != 2 || fragments.len() != 2 {
+        return None;
+    }
+    let (token, quantity) = match (components[0].param_type, components[1].param_type) {
+        (SearchParamType::Token, SearchParamType::Quantity) => (&fragments[0], &fragments[1]),
+        (SearchParamType::Quantity, SearchParamType::Token) => (&fragments[1], &fragments[0]),
+        _ => return None,
+    };
+    if !token.sql.contains("value_token_code = ?") {
+        return None;
+    }
+    let name = sql_string_literal(name);
+    Some(format!(
+        "{COMPOSITE_PAIR_HEAD}c.param_name = {name} AND c.is_contained = 0 \
+         AND c.composite_group IS NOT NULL AND c.value_token_code IS NOT NULL AND ({token_sql}) \
+         AND EXISTS (SELECT 1 FROM search_index AS q INDEXED BY idx_search_composite_cov \
+         WHERE q.tenant_id = ?1 AND q.resource_type = ?2 AND q.param_name = {name} \
+         AND q.resource_key = c.resource_key AND q.composite_group = c.composite_group \
+         AND q.composite_group IS NOT NULL AND q.is_contained = 0 AND ({quantity_sql}))",
+        token_sql = token.sql,
+        quantity_sql = quantity.sql,
+    ))
+}
+
+/// The refusal for a parameter [`QueryBuilder::build`] has values for but no
+/// condition to build from (#866): the `_ => None` arm of
+/// `build_special_parameter_condition` (`_query`, `_type`, any `_` name nothing
+/// indexes), a `special`-typed parameter, a composite without its components.
+/// Skipped, it would leave the query with fewer conditions than were asked for —
+/// with none at all, every indexed resource of the type.
+fn unevaluable_parameter(param: &SearchParameter, resource_type: &str) -> SearchError {
+    SearchError::QueryParseError {
+        message: format!(
+            "search parameter '{}' cannot be evaluated by the SQLite backend: no condition can be \
+             built for it, and ignoring it would widen the search to every {resource_type}",
+            param.name
+        ),
+    }
+}
+
 /// Builds SQL queries from FHIR search parameters.
 pub struct QueryBuilder {
     /// The tenant ID for the query.
@@ -194,6 +507,17 @@ pub struct QueryBuilder {
     param_offset: usize,
     /// Whether to skip tenant/resource type params (they're shared with outer query).
     skip_base_params: bool,
+    /// Whether a token+quantity composite is built as the code-first pairing
+    /// ([`composite_pair_rows`], hinted to `idx_search_token` and
+    /// `idx_search_composite_cov`) instead of a whole-parameter `GROUP BY`.
+    /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
+    /// to prepare against a missing one (a bulk rebuild drops them).
+    composite_rewrite: bool,
+    /// Declared target types of reference parameters, by parameter name. A
+    /// bare-id value of a listed parameter is matched as a local reference to
+    /// one of them (see [`ReferenceHandler::bare_id_arms`]); any other keeps
+    /// the suffix match (fork, hm perf(sqlite) b217d359d).
+    reference_targets: HashMap<String, Vec<String>>,
 }
 
 impl QueryBuilder {
@@ -204,7 +528,23 @@ impl QueryBuilder {
             resource_type: resource_type.into(),
             param_offset: 0,
             skip_base_params: false,
+            composite_rewrite: false,
+            reference_targets: HashMap::new(),
         }
+    }
+
+    /// Sets the declared target types of reference parameters, by name.
+    pub fn with_reference_targets(mut self, targets: HashMap<String, Vec<String>>) -> Self {
+        self.reference_targets = targets;
+        self
+    }
+
+    /// Builds a token+quantity composite as the code-first pairing, which
+    /// needs `idx_search_token` (in its code-first shape) and
+    /// `idx_search_composite_cov` to exist (see [`composite_pair_rows`]). The rows are the same set.
+    pub fn with_composite_rewrite(mut self, enabled: bool) -> Self {
+        self.composite_rewrite = enabled;
+        self
     }
 
     /// Sets the parameter offset for embedded subqueries.
@@ -228,8 +568,18 @@ impl QueryBuilder {
 
     /// Builds a complete search query.
     ///
-    /// Returns SQL that selects matching resource IDs from the search_index table.
-    pub fn build(&self, query: &SearchQuery) -> SqlFragment {
+    /// Returns SQL that selects the `resource_key` of every matching resource
+    /// from the search_index table, for the caller's `rowid IN (…)`. A key can
+    /// be listed more than once.
+    ///
+    /// # Errors
+    ///
+    /// A parameter that carries values but for which no condition can be built
+    /// is an error, never skipped (#866): a query with no conditions matches
+    /// every indexed resource of the type, so skipping it turned `DELETE
+    /// Patient?_query=x` into "delete every Patient". A parameter with no values
+    /// asks for nothing and constrains nothing.
+    pub fn build(&self, query: &SearchQuery) -> Result<SqlFragment, SearchError> {
         let mut conditions = Vec::new();
 
         // Base conditions: tenant and resource type
@@ -259,34 +609,84 @@ impl QueryBuilder {
         // Build conditions for each parameter, tracking how many params we've added
         let mut current_offset = search_param_offset;
         for param in &query.parameters {
-            if let Some(condition) = self.build_parameter_condition(param, current_offset) {
-                current_offset += condition.params.len();
-                conditions.push(condition);
+            match self.parameter_condition(param, current_offset) {
+                Some(condition) => {
+                    current_offset += condition.param_count();
+                    conditions.push(condition);
+                }
+                // Nothing was asked for, so nothing is constrained.
+                None if param.values.is_empty() => {}
+                // Something was asked for and cannot be answered. Answering
+                // anyway, without it, would be a wider question than the one
+                // asked.
+                None => return Err(unevaluable_parameter(param, &self.resource_type)),
             }
         }
 
         // Compartment membership: a resource is in the compartment if it
         // references the compartment via ANY of the membership params (OR),
-        // per the FHIR CompartmentDefinition. Applied as a single subquery.
+        // per the FHIR CompartmentDefinition. Applied as a single subquery. A
+        // membership that can match nothing still adds its (empty) condition:
+        // skipping it would widen the search to every resource of the type
+        // (#2509).
         if let Some(comp) = &query.compartment {
             // Last condition appended, so no need to advance `current_offset`.
-            if let Some(condition) = self.build_compartment_condition(comp, current_offset) {
-                conditions.push(condition);
+            let condition = self.build_compartment_condition(comp, current_offset);
+            conditions.push(ParameterCondition::Other(condition));
+        }
+
+        // When every condition is a positive `resource_key IN (<subquery>)`,
+        // the subqueries already yield the matching keys: one is the whole
+        // query, several are their intersection. Wrapping them in `SELECT
+        // DISTINCT resource_key FROM search_index WHERE … AND (…)` probes
+        // `idx_search_composite` once per key and builds a second key list,
+        // which on a broad `date=le…` or `ne…` cost more than finding the
+        // keys did (#1506), and re-reads every index row of every candidate —
+        // millions of probes for a broad filter on a large store (#1955).
+        // Every caller embeds the fragment as `rowid IN (…)`, which ignores
+        // duplicates.
+        if !conditions.is_empty() {
+            let subqueries: Option<Vec<&str>> = conditions
+                .iter()
+                .map(ParameterCondition::positive_subquery)
+                .collect();
+            if let Some(subqueries) = subqueries {
+                base.sql = match subqueries.as_slice() {
+                    [only] => only.to_string(),
+                    // Compound operators share one precedence and bind left
+                    // to right, so a `UNION ALL` of date ranges is nested
+                    // before it is intersected.
+                    several => several
+                        .iter()
+                        .map(|subquery| {
+                            if subquery.contains(" UNION ") {
+                                format!("SELECT * FROM ({subquery})")
+                            } else {
+                                subquery.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" INTERSECT "),
+                };
+                for condition in conditions {
+                    base.params.extend(condition.into_params());
+                }
+                return Ok(base);
             }
         }
 
         // Combine all conditions with AND
         if !conditions.is_empty() {
-            let mut combined = conditions.remove(0);
+            let mut combined = conditions.remove(0).into_fragment();
             for cond in conditions {
-                combined = combined.and(cond);
+                combined = combined.and(cond.into_fragment());
             }
 
             base.sql = format!("{} AND ({})", base.sql, combined.sql);
             base.params.extend(combined.params);
         }
 
-        base
+        Ok(base)
     }
 
     /// Builds the `_contained` match subquery.
@@ -322,7 +722,9 @@ impl QueryBuilder {
     ///
     /// `query.compartment` is one more branch, on the contained resource's
     /// own references. With no criterion at all the result is every contained
-    /// resource of the type (#1383), so this always returns `Some`. The rows
+    /// resource of the type (#1383), so this always returns `Some`. A
+    /// compartment that [matches nothing](CompartmentMembership::matches_nothing)
+    /// is a criterion no row satisfies, not the absence of one (#2509). The rows
     /// are unordered; the caller sorts them before paging.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
         // (branch, negated)
@@ -432,7 +834,14 @@ impl QueryBuilder {
         // every branch did.
         let mut names_prove_branches = true;
         if let Some(comp) = &query.compartment {
-            if !comp.params.is_empty() && !comp.reference.is_empty() {
+            if comp.matches_nothing() {
+                // No contained resource is a member of a compartment through no
+                // parameter, or of one with no reference: an entity filter no
+                // row satisfies empties the result however the other
+                // criteria group (#2509), where adding no branch would leave
+                // every contained resource of the type matching.
+                entity_filters.push("0 = 1".to_string());
+            } else {
                 let in_list = comp
                     .params
                     .iter()
@@ -442,8 +851,10 @@ impl QueryBuilder {
                 let base = strip_reference_version(&comp.reference);
                 branches.push((
                     format!(
-                        "(param_name IN ({in_list}) AND value_reference IS NOT NULL \
-                         AND (value_reference = ?{} OR value_reference LIKE ?{} || '/_history/%'))",
+                        "((param_name IN ({in_list}) AND value_reference IS NOT NULL \
+                         AND value_reference >= ?{0} AND value_reference < ?{1} || '/_history0' \
+                         AND (value_reference = ?{0} OR value_reference >= ?{1} || '/_history/')) \
+                         OR (param_name IN ({in_list}) AND value_reference_target IS NOT NULL AND value_reference_target = ?{0}))",
                         offset + 1,
                         offset + 2
                     ),
@@ -625,15 +1036,17 @@ impl QueryBuilder {
     /// Builds the compartment-membership subquery: matches resources that
     /// reference `comp.reference` via ANY of `comp.params` (logical OR), which
     /// is how a resource joins a FHIR compartment. Reference matching mirrors the
-    /// standard reference handler (version-agnostic). Returns `None` if there are
-    /// no membership params or no reference.
+    /// standard reference handler (version-agnostic). A membership with no
+    /// params or no reference matches nothing
+    /// ([`CompartmentMembership::matches_nothing`]), so it yields a condition
+    /// that no row satisfies, never an absent one (#2509).
     fn build_compartment_condition(
         &self,
         comp: &CompartmentMembership,
         param_offset: usize,
-    ) -> Option<SqlFragment> {
-        if comp.params.is_empty() || comp.reference.is_empty() {
-            return None;
+    ) -> SqlFragment {
+        if comp.matches_nothing() {
+            return SqlFragment::new("1 = 0");
         }
 
         // Membership params come from the bundled FHIR CompartmentDefinitions
@@ -650,23 +1063,42 @@ impl QueryBuilder {
         let p1 = param_offset + 1;
         let p2 = param_offset + 2;
 
-        Some(SqlFragment::with_params(
+        // The absolute-URL form is a second select, `UNION ALL`-ed: an `OR`
+        // arm would not repeat the tenant/type/param tests and SQLite would
+        // walk every row of the type (see `build_parameter_condition`).
+        SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
                  AND value_reference IS NOT NULL \
-                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+                 AND value_reference >= ?{p1} AND value_reference < ?{p2} || '/_history0' \
+                 AND (value_reference = ?{p1} OR value_reference >= ?{p2} || '/_history/') \
+                 UNION ALL SELECT resource_key FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
+                 AND value_reference_target IS NOT NULL AND value_reference_target = ?{p1})"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],
-        ))
+        )
     }
 
     /// Builds a condition for a single search parameter.
+    #[cfg(test)]
     fn build_parameter_condition(
         &self,
         param: &SearchParameter,
         param_offset: usize,
     ) -> Option<SqlFragment> {
+        self.parameter_condition(param, param_offset)
+            .map(ParameterCondition::into_fragment)
+    }
+
+    /// Builds the condition for a single search parameter, keeping apart the
+    /// one that is a plain positive membership in the parameter's own rows.
+    fn parameter_condition(
+        &self,
+        param: &SearchParameter,
+        param_offset: usize,
+    ) -> Option<ParameterCondition> {
         if param.values.is_empty() {
             return None;
         }
@@ -676,7 +1108,9 @@ impl QueryBuilder {
         // that simultaneously requires an index row for the same parameter.
         if is_missing_modifier(&param.modifier) {
             let is_missing = get_missing_value(&param.values[0].value);
-            return Some(build_missing_condition(param, is_missing));
+            return Some(ParameterCondition::Other(build_missing_condition(
+                param, is_missing,
+            )));
         }
 
         // Defence in depth behind `validate_value_presence` (#1380): an empty
@@ -684,7 +1118,7 @@ impl QueryBuilder {
         // than whatever the handler below would make of it — the whole
         // parameter, since under `:not` "nothing" negates into "everything".
         if crate::search::has_empty_value(param) {
-            return Some(SqlFragment::new("1 = 0"));
+            return Some(ParameterCondition::Other(SqlFragment::new("1 = 0")));
         }
 
         // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
@@ -700,19 +1134,35 @@ impl QueryBuilder {
         // Anything added to this list must have a working regular path, and
         // anything left off it must have an arm in
         // `build_special_parameter_condition` — the `_ => None` fallback there
-        // drops the filter rather than narrowing it.
+        // yields no condition, which `build` refuses (#866) rather than
+        // dropping the filter and widening the result.
         if param.name.starts_with('_')
             && !matches!(
                 param.name.as_str(),
                 "_tag" | "_profile" | "_security" | "_source" | "_language"
             )
         {
-            return self.build_special_parameter_condition(param, param_offset);
+            return self
+                .build_special_parameter_condition(param, param_offset)
+                .map(ParameterCondition::Other);
         }
 
         // Composite parameters need a group-aware subquery (see below).
         if matches!(param.param_type, SearchParamType::Composite) {
-            return self.build_composite_parameter_condition(param, param_offset);
+            return self
+                .build_composite_parameter_condition(param, param_offset)
+                .map(ParameterCondition::Other);
+        }
+
+        // `ne`, `le` and `ge` compare one date value as two alternative
+        // ranges. OR-ed, SQLite reads them as a MULTI-INDEX OR: it
+        // de-duplicates every row by rowid and, for `ne`, whose two ranges
+        // seek different indexes, reads each row from the table for its key.
+        // One `SELECT` per range, `UNION ALL`-ed, reads each range from its
+        // covering index alone, and a key listed twice is still one member of
+        // the `IN` (#1506).
+        if let Some(rows) = Self::date_range_union(param, param_offset) {
+            return Some(Self::membership(param, rows));
         }
 
         // A plain multi-value reference search (all `Type/id`, no modifier)
@@ -722,9 +1172,11 @@ impl QueryBuilder {
         // nested one level per term — ~18 ms/value (250 refs ≈ 4.6 s) and the
         // parse-depth blow-up behind #943; a flat `IN` is a single indexed
         // lookup of any length at ~1 node. Version-stripped bases are matched
-        // exactly, which covers every unversioned stored reference (references
-        // are stored unversioned in practice); the single-value path below
-        // keeps the full `_history` range match for the rare versioned case.
+        // exactly by the `IN`; a stored versioned reference (`Type/id/_history/n`)
+        // is matched by a second `UNION ALL`-ed select that seeks one `_history`
+        // range per base ([`reference_versions_rows`]), reusing the same
+        // placeholders. Without it a list returned less than one of its own
+        // values did (#2493): the list must be the union of its values.
         let is_plain_multi_reference = matches!(param.param_type, SearchParamType::Reference)
             && param.modifier.is_none()
             && param.values.len() >= 2
@@ -732,6 +1184,58 @@ impl QueryBuilder {
                 .values
                 .iter()
                 .all(|v| strip_reference_version(&v.value).contains('/'));
+
+        // Bare ids of a parameter with declared targets: one seekable arm per
+        // target and form, each its own [`parameter_rows`] select, `UNION
+        // ALL`-ed (SQLite plans an `OR` of them as a scan of the whole
+        // parameter, never as one probe per arm). Fork (b217d359d): a bare id
+        // is a local reference to one of the targets, so `patient=abc` no
+        // longer matches `Patient/ABC` or a reference to another type; an
+        // absolute URL ending in `/<id>` still matches.
+        let bare_id_targets = (matches!(param.param_type, SearchParamType::Reference)
+            && param.modifier.is_none()
+            && !is_plain_multi_reference
+            && param
+                .values
+                .iter()
+                .any(|v| !strip_reference_version(&v.value).contains('/')))
+        .then(|| self.reference_targets.get(&param.name))
+        .flatten()
+        .filter(|targets| !targets.is_empty());
+        if let Some(targets) = bare_id_targets {
+            let mut arms: Vec<SqlFragment> = Vec::new();
+            let mut next = param_offset;
+            for value in &param.values {
+                let base = strip_reference_version(&value.value);
+                let value_arms = if base.contains('/') {
+                    let mut arms = vec![ReferenceHandler::build_sql(value, None, next)];
+                    // The absolute-URL form of a `Type/id` value (#2394).
+                    if let Some(target) = ReferenceHandler::target_base(value, None) {
+                        let p = next + arms[0].params.len() + 1;
+                        arms.push(SqlFragment::with_params(
+                            format!(
+                                "value_reference_target IS NOT NULL AND value_reference_target = ?{p}"
+                            ),
+                            vec![SqlParam::string(target)],
+                        ));
+                    }
+                    arms
+                } else {
+                    ReferenceHandler::bare_id_arms(base, targets, next)
+                };
+                for arm in value_arms {
+                    next += arm.params.len();
+                    arms.push(arm);
+                }
+            }
+            let sql = arms
+                .iter()
+                .map(|a| parameter_rows(&param.name, &a.sql))
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            let params = arms.into_iter().flat_map(|a| a.params).collect();
+            return Some(Self::membership(param, SqlFragment::with_params(sql, params)));
+        }
 
         let combined = if is_plain_multi_reference {
             let mut params = Vec::with_capacity(param.values.len());
@@ -774,26 +1278,89 @@ impl QueryBuilder {
             combined
         };
 
-        // Wrap in subquery to ensure proper AND/OR semantics. `:not` negates
-        // HERE, at the resource level, not inside the row predicate (#473):
-        // FHIR's :not means "no value of the parameter matches", so a
-        // multi-valued resource must not slip through via its other rows, and
-        // resources with no rows for the parameter count as matches — both of
-        // which NOT IN gives and a row-level NOT cannot.
-        let membership = if matches!(param.modifier, Some(SearchModifier::Not)) {
-            "NOT IN"
+        // A reference stored as an absolute URL is matched through
+        // `value_reference_target` (schema v48). It is a second select,
+        // `UNION ALL`-ed, rather than an `OR` arm: SQLite plans an `OR` as a
+        // multi-index lookup only when every arm repeats the tenant, type and
+        // parameter tests, and otherwise falls back to walking every row of
+        // the type (#1955).
+        let targets: Vec<String> = if param.param_type == SearchParamType::Reference {
+            param
+                .values
+                .iter()
+                .filter_map(|v| ReferenceHandler::target_base(v, param.modifier.as_ref()))
+                .collect()
         } else {
-            "IN"
+            Vec::new()
         };
-        Some(SqlFragment::with_params(
-            format!(
-                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({}))",
-                membership,
-                sql_string_literal(&param.name),
-                combined.sql
-            ),
-            combined.params,
-        ))
+        let mut sql = parameter_rows(&param.name, &combined.sql);
+        let mut params = combined.params;
+        if is_plain_multi_reference {
+            sql.push_str(" UNION ALL ");
+            sql.push_str(&reference_versions_rows(
+                &param.name,
+                param_offset + 1,
+                param.values.len(),
+            ));
+        }
+        if !targets.is_empty() {
+            let first = param_offset + params.len() + 1;
+            let placeholders: Vec<String> = (0..targets.len())
+                .map(|i| format!("?{}", first + i))
+                .collect();
+            sql.push_str(" UNION ALL ");
+            sql.push_str(&parameter_rows(
+                &param.name,
+                &format!(
+                    "value_reference_target IS NOT NULL AND value_reference_target IN ({})",
+                    placeholders.join(", ")
+                ),
+            ));
+            params.extend(targets.iter().map(SqlParam::string));
+        }
+        let rows = SqlFragment::with_params(sql, params);
+        Some(Self::membership(param, rows))
+    }
+
+    /// The resource-level test on a parameter's matching rows: wrapped in a
+    /// subquery to ensure proper AND/OR semantics. `:not` negates HERE, at
+    /// the resource level, not inside the row predicate (#473): FHIR's :not
+    /// means "no value of the parameter matches", so a multi-valued resource
+    /// must not slip through via its other rows, and resources with no rows
+    /// for the parameter count as matches — both of which NOT IN gives and a
+    /// row-level NOT cannot.
+    fn membership(param: &SearchParameter, rows: SqlFragment) -> ParameterCondition {
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            ParameterCondition::Other(SqlFragment::with_params(
+                format!("resource_key NOT IN ({})", rows.sql),
+                rows.params,
+            ))
+        } else {
+            ParameterCondition::Rows(rows)
+        }
+    }
+
+    /// The rows of a date parameter with a single value whose comparison is
+    /// more than one range (`ne`, `le`, `ge`): one `SELECT` per range,
+    /// `UNION ALL`-ed. `None` for anything else, which keeps the `OR` form —
+    /// a value that is not a date included, so it still matches nothing.
+    fn date_range_union(param: &SearchParameter, param_offset: usize) -> Option<SqlFragment> {
+        let [value] = param.values.as_slice() else {
+            return None;
+        };
+        if param.param_type != SearchParamType::Date {
+            return None;
+        }
+        let (alternatives, params) = DateHandler::build_alternatives(value, param_offset)?;
+        if alternatives.len() < 2 {
+            return None;
+        }
+        let sql = alternatives
+            .iter()
+            .map(|alternative| parameter_rows(&param.name, alternative))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// Builds a condition for a composite parameter.
@@ -822,6 +1389,22 @@ impl QueryBuilder {
                 param_offset + total_params,
             ) {
                 Some(fragments) if !fragments.is_empty() => {
+                    // One value only: an OR of values is wrapped by the caller
+                    // in a scan of the type's rows (not a positive membership),
+                    // and there the pairing measured slower than the GROUP BY
+                    // (0.30 s -> 0.59 s for two wide codes).
+                    if self.composite_rewrite
+                        && param.values.len() == 1
+                        && let Some(rows) =
+                            composite_pair_rows(&param.name, &param.components, &fragments)
+                    {
+                        for f in fragments {
+                            total_params += f.params.len();
+                            params.extend(f.params);
+                        }
+                        or_conditions.push(format!("resource_key IN ({rows})"));
+                        continue;
+                    }
                     let havings: Vec<String> = fragments
                         .iter()
                         .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
@@ -892,17 +1475,17 @@ impl QueryBuilder {
                 };
 
                 // `_id` is dispatched here rather than through the generic
-                // `:not` handling in `build_parameter_condition` (the
-                // `membership`/`NOT IN` wrapping above), so that handling
-                // never sees it and `_id:not` used to build the exact same
-                // `IN (...)` as a bare `_id`, returning precisely the
-                // resource the caller asked to exclude (#1092). The outer
+                // `:not` handling in `parameter_condition` (the `NOT IN` of
+                // `membership`), so that handling never sees it and `_id:not`
+                // used to build the exact same `IN (...)` as a bare `_id`,
+                // returning precisely the resource the caller asked to
+                // exclude (#1092). The outer
                 // query enumerates `search_index` rows, so negating the
                 // membership test here yields every indexed resource of the
                 // type except the listed ids — the same semantics the
                 // generic path uses for every other parameter. Any modifier
                 // other than `:not` (`:missing` is resolved earlier, in
-                // `build_parameter_condition`) is rejected before this point
+                // `parameter_condition`) is rejected before this point
                 // by each backend's search entry point, so it is not handled
                 // here.
                 let not_kw = if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -935,14 +1518,25 @@ impl QueryBuilder {
                 // _filter uses advanced filter expression syntax
                 self.build_filter_condition(&param.values, param_offset)
             }
+            "_in" => {
+                // `_in` (List/Group membership) is resolved application-side
+                // into an `_id` filter before the backend runs, and nothing
+                // indexes it. One that still arrives here was never resolved;
+                // fail closed rather than drop the filter and answer with
+                // every resource of the type (#638).
+                Some(SqlFragment::new("1 = 0"))
+            }
             _ => {
                 // Not "fall through to regular handling", as this comment used
-                // to claim: the caller returns whatever this yields, so `None`
-                // *drops* the parameter and the search answers with every
-                // resource of the type. That is how `_tag`/`_profile`/
-                // `_security`/`_source` came to be unfiltered (#474). Anything
-                // that must actually filter belongs in an arm above, or in the
-                // caller's exclusion list so it never reaches here.
+                // to claim: the caller takes whatever this yields, and `None`
+                // is "no condition for a parameter that has values", which
+                // `QueryBuilder::build` turns into an error. It used to drop
+                // the parameter, so the search answered with every resource of
+                // the type: how `_tag`/`_profile`/`_security`/`_source` came to
+                // be unfiltered (#474), and how `DELETE Patient?_query=x`
+                // deleted the only Patient on file (#866). Anything that must
+                // actually filter belongs in an arm above, or in the caller's
+                // exclusion list so it never reaches here.
                 None
             }
         }
@@ -1285,9 +1879,82 @@ impl QueryBuilder {
     }
 }
 
+/// The subquery of a condition that is exactly `resource_key IN (<subquery>)`,
+/// or `None` for anything else: `NOT IN`, an `OR` of memberships, a bare
+/// predicate. The opening parenthesis must close at the very end of the
+/// condition; parentheses inside single-quoted SQL literals are ignored.
+fn positive_membership_subquery(condition: &str) -> Option<&str> {
+    let body = condition.strip_prefix("resource_key IN (")?;
+    let mut depth = 1usize;
+    let mut in_literal = false;
+    for (index, ch) in body.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => {
+                depth -= 1;
+                if depth == 0 {
+                    return (index + 1 == body.len()).then(|| &body[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exists_form_only_for_one_plain_parameter_select() {
+        let rows = parameter_rows("code", "value_token_code = ?3");
+        let exists = membership_exists_predicate(&rows, "w.rk").unwrap();
+        assert!(
+            exists
+                .starts_with("EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite")
+        );
+        assert!(
+            exists.contains(
+                "resource_key = w.rk AND param_name = 'code' AND (value_token_code = ?3)"
+            )
+        );
+        assert!(is_parameter_rows(&rows));
+        let union = format!("{rows} UNION ALL {rows}");
+        let exists_union = membership_exists_predicate(&union, "w.rk").unwrap();
+        assert!(exists_union.starts_with("(EXISTS (SELECT 1 FROM search_index INDEXED BY"));
+        assert_eq!(exists_union.matches(") OR EXISTS (").count(), 1);
+        let nested = format!("{rows} UNION ALL SELECT resource_key FROM search_index");
+        assert!(membership_exists_predicate(&nested, "w.rk").is_none());
+        let union_all_then_union = format!("{rows} UNION {rows}");
+        assert!(membership_exists_predicate(&union_all_then_union, "w.rk").is_none());
+        let intersect = format!("{rows} INTERSECT {rows}");
+        assert!(!is_parameter_rows(&intersect));
+        assert!(
+            membership_exists_predicate("SELECT DISTINCT resource_key FROM search_index", "w.rk")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn positive_membership_subquery_takes_exactly_one_membership() {
+        assert_eq!(
+            positive_membership_subquery("resource_key IN (SELECT k FROM t WHERE (a) AND b = ')')"),
+            Some("SELECT k FROM t WHERE (a) AND b = ')'")
+        );
+        assert_eq!(
+            positive_membership_subquery("resource_key NOT IN (SELECT k FROM t)"),
+            None
+        );
+        assert_eq!(
+            positive_membership_subquery(
+                "resource_key IN (SELECT k FROM t) OR resource_key IN (SELECT k FROM u)"
+            ),
+            None
+        );
+        assert_eq!(positive_membership_subquery("1 = 0"), None);
+    }
 
     #[test]
     fn test_sql_fragment() {
@@ -1391,12 +2058,10 @@ mod tests {
         }
     }
 
-    /// `_in` never reaches the index — nothing writes rows for it, and the
-    /// SQLite special-parameter path has no arm for it, so a query naming it
-    /// would silently return the whole type. `helios-rest` rejects it before
-    /// the backend is asked; this pins the backend half of that contract so a
-    /// future "just let it through" change has to confront the drop. Update it
-    /// when membership resolution lands (#638).
+    /// `_in` never reaches the index — nothing writes rows for it — and is
+    /// resolved into an `_id` filter before the backend runs. This pins the
+    /// backstop: an `_in` that arrives unresolved matches nothing instead of
+    /// being dropped, which would return the whole type (#638).
     #[test]
     fn membership_parameter_has_no_backend_condition() {
         let builder = QueryBuilder::new("tenant1", "Patient");
@@ -1409,10 +2074,78 @@ mod tests {
             components: vec![],
         };
 
-        assert!(
-            builder.build_parameter_condition(&param, 2).is_none(),
-            "_in must not be answered by the index; it is rejected at the REST layer"
+        let fragment = builder
+            .build_parameter_condition(&param, 2)
+            .expect("an unresolved _in must not be dropped");
+        assert_eq!(
+            fragment.sql, "1 = 0",
+            "an unresolved _in must match nothing"
         );
+    }
+
+    /// #866: a parameter with values and no condition to build is an error from
+    /// `build`, not a skipped term. `_query` and `_type` are registered by the
+    /// spec and indexed by nothing, so they reach the `_ => None` arm of
+    /// `build_special_parameter_condition`; a `special`-typed parameter reaches
+    /// the matching arm of `build_value_condition`. Skipped, a query with no
+    /// other condition matches every indexed resource of the type.
+    #[test]
+    fn a_parameter_with_values_but_no_condition_is_an_error_not_a_skipped_term() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = |name: &str, param_type| SearchParameter {
+            name: name.to_string(),
+            param_type,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        };
+
+        for (name, param_type) in [
+            ("_query", SearchParamType::Token),
+            ("_type", SearchParamType::Token),
+            ("_filter_typo", SearchParamType::Token),
+            ("near", SearchParamType::Special),
+        ] {
+            let unevaluable = param(name, param_type);
+            assert!(
+                builder.build_parameter_condition(&unevaluable, 2).is_none(),
+                "{name} is the case where there is no condition"
+            );
+
+            // Alone, and beside one that does filter: either way the query is
+            // wider than the one asked, so neither builds.
+            for query in [
+                SearchQuery::new("Patient").with_parameter(unevaluable.clone()),
+                SearchQuery::new("Patient")
+                    .with_parameter(param("_id", SearchParamType::Token))
+                    .with_parameter(unevaluable.clone()),
+                SearchQuery::new("Patient")
+                    .with_parameter(unevaluable.clone())
+                    .with_parameter(param("_id", SearchParamType::Token)),
+            ] {
+                match builder.build(&query) {
+                    Err(SearchError::QueryParseError { message }) => {
+                        assert!(message.contains(&format!("'{name}'")), "{message}");
+                        assert!(message.contains("widen"), "{message}");
+                    }
+                    other => panic!("{name}: expected a refusal, got {other:?}"),
+                }
+            }
+        }
+
+        // A parameter that asks for nothing constrains nothing.
+        let mut nothing_asked = param("_query", SearchParamType::Token);
+        nothing_asked.values.clear();
+        let fragment = builder
+            .build(&SearchQuery::new("Patient").with_parameter(nothing_asked))
+            .expect("a parameter without values is not an error");
+        assert!(fragment.sql.contains("search_index"));
+
+        // And an evaluable parameter still builds.
+        builder
+            .build(
+                &SearchQuery::new("Patient").with_parameter(param("_id", SearchParamType::Token)),
+            )
+            .expect("_id has a condition");
     }
 
     #[test]
@@ -1420,7 +2153,7 @@ mod tests {
         let builder = QueryBuilder::new("tenant1", "Patient");
 
         let query = SearchQuery::new("Patient");
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         assert!(fragment.sql.contains("search_index"));
         assert!(fragment.sql.contains("tenant_id"));
@@ -1441,16 +2174,225 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         assert!(fragment.sql.contains("param_name = 'name'"));
+    }
+
+    fn date_param(
+        prefix: crate::types::SearchPrefix,
+        modifier: Option<SearchModifier>,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier,
+            values: vec![SearchValue::new(prefix, "2000")],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// #1506: one parameter read from its own rows is the whole filter. The
+    /// `SELECT DISTINCT` wrapper around it probed `idx_search_composite` once
+    /// per key and built a second key list, which on a broad `ne2000` or
+    /// `le2000` cost more than finding the keys.
+    #[test]
+    fn a_single_parameter_is_its_own_key_list() {
+        use crate::types::SearchPrefix;
+        let query =
+            SearchQuery::new("Encounter").with_parameter(date_param(SearchPrefix::Eq, None));
+
+        let fragment = QueryBuilder::new("tenant1", "Encounter")
+            .build(&query)
+            .unwrap();
+        assert_eq!(
+            fragment.sql,
+            "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 \
+             AND param_name = 'date' AND ((value_date_end > ?3 AND value_date_start >= ?3 \
+             AND value_date_end <= ?4))"
+        );
+        assert_eq!(fragment.params.len(), 4, "tenant, type and the two bounds");
+
+        // Embedded in an outer query, the numbering continues from its offset.
+        let fragment = QueryBuilder::new("tenant1", "Encounter")
+            .with_param_offset(4)
+            .build(&query)
+            .unwrap();
+        assert!(
+            fragment.sql.ends_with("AND value_date_end <= ?6))"),
+            "{}",
+            fragment.sql
+        );
+        assert_eq!(fragment.params.len(), 2);
+    }
+
+    /// #1506: `ne`, `le` and `ge` compare a date as two ranges. Each is its
+    /// own `SELECT`, `UNION ALL`-ed, so each seeks its covering index; as
+    /// `(…) OR (…)` SQLite de-duplicated every row by rowid and, for `ne`,
+    /// read every row from the table for its key. The groups, their order and
+    /// their numbering are `date_range_condition`'s.
+    #[test]
+    fn a_two_range_date_value_is_a_union_of_its_ranges() {
+        use crate::types::SearchPrefix;
+        let rows = "SELECT resource_key FROM search_index WHERE tenant_id = ?1 \
+                    AND resource_type = ?2 AND param_name = 'date' AND ";
+        for (prefix, first, second) in [
+            (
+                SearchPrefix::Ne,
+                "(value_date_start < ?3)",
+                "(value_date_end > ?4)",
+            ),
+            (
+                SearchPrefix::Le,
+                "(value_date_start < ?3)",
+                "(value_date_end > ?4 AND value_date_start >= ?4 AND value_date_end <= ?5)",
+            ),
+            (
+                SearchPrefix::Ge,
+                "(value_date_end > ?3)",
+                "(value_date_end > ?4 AND value_date_start >= ?4 AND value_date_end <= ?5)",
+            ),
+        ] {
+            let query = SearchQuery::new("Encounter").with_parameter(date_param(prefix, None));
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
+            assert_eq!(
+                fragment.sql,
+                format!("{rows}{first} UNION ALL {rows}{second}"),
+                "{prefix}"
+            );
+            let (condition, binds) =
+                crate::backends::sqlite::search::parameter_handlers::date::date_range_condition(
+                    "value_date_start",
+                    "value_date_end",
+                    prefix,
+                    "2000",
+                    3,
+                )
+                .unwrap();
+            assert_eq!(condition, format!("({first} OR {second})"), "{prefix}");
+            assert_eq!(fragment.params.len(), 2 + binds.len(), "{prefix}");
+
+            // Under `:not` the same union is the set the resource must avoid.
+            let query = SearchQuery::new("Encounter")
+                .with_parameter(date_param(prefix, Some(SearchModifier::Not)));
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
+            assert!(
+                fragment.sql.ends_with(&format!(
+                    "AND (resource_key NOT IN ({rows}{first} UNION ALL {rows}{second}))"
+                )),
+                "{prefix}: {}",
+                fragment.sql
+            );
+        }
+
+        // Two values keep one `OR`, and so does a value that is not a date,
+        // which still matches nothing.
+        let mut two_values = date_param(SearchPrefix::Ne, None);
+        two_values
+            .values
+            .push(SearchValue::new(SearchPrefix::Ne, "2010"));
+        let mut not_a_date = date_param(SearchPrefix::Ne, None);
+        not_a_date.values = vec![SearchValue::new(SearchPrefix::Ne, "2024-02-30")];
+        for (name, param, condition) in [
+            ("two values", two_values, " OR "),
+            ("not a date", not_a_date, "AND (1 = 0)"),
+        ] {
+            let query = SearchQuery::new("Encounter").with_parameter(param);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
+            assert!(!fragment.sql.contains("UNION"), "{name}: {}", fragment.sql);
+            assert!(fragment.sql.contains(condition), "{name}: {}", fragment.sql);
+        }
+    }
+
+    /// The wrapper stays where it does work: it is the universe a `NOT IN`
+    /// is taken from, also beside a positive filter. Positive filters alone
+    /// are their subqueries, intersected (#1955); a date's `UNION ALL` of
+    /// ranges is nested first, as compound operators bind left to right.
+    #[test]
+    fn other_filters_keep_the_distinct_wrapper() {
+        use crate::types::SearchPrefix;
+        let wrapped = "SELECT DISTINCT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND (";
+        let negated = SearchQuery::new("Encounter")
+            .with_parameter(date_param(SearchPrefix::Eq, Some(SearchModifier::Not)));
+        let negated_beside_positive = SearchQuery::new("Encounter")
+            .with_parameter(date_param(SearchPrefix::Le, None))
+            .with_parameter(date_param(SearchPrefix::Eq, Some(SearchModifier::Not)));
+        for (name, query) in [
+            ("not", negated),
+            ("not beside positive", negated_beside_positive),
+        ] {
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
+            assert!(
+                fragment.sql.starts_with(wrapped),
+                "{name}: {}",
+                fragment.sql
+            );
+        }
+
+        let two = SearchQuery::new("Encounter")
+            .with_parameter(date_param(SearchPrefix::Le, None))
+            .with_parameter(date_param(SearchPrefix::Ge, None));
+        let id = SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("a")],
+            ..Default::default()
+        });
+        let mut in_compartment =
+            SearchQuery::new("Encounter").with_parameter(date_param(SearchPrefix::Le, None));
+        in_compartment.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        for (name, query, intersections) in [
+            ("two", two, 1),
+            ("_id", id, 0),
+            ("compartment", in_compartment, 1),
+        ] {
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
+            assert!(
+                !fragment.sql.contains("DISTINCT"),
+                "{name}: {}",
+                fragment.sql
+            );
+            assert_eq!(
+                fragment.sql.matches(" INTERSECT ").count(),
+                intersections,
+                "{name}: {}",
+                fragment.sql
+            );
+            for operand in fragment.sql.split(" INTERSECT ") {
+                assert!(
+                    !operand.contains(" UNION ")
+                        || (operand.starts_with("SELECT * FROM (") && operand.ends_with(')')),
+                    "{name}: {}",
+                    fragment.sql
+                );
+            }
+        }
     }
 
     #[test]
     fn missing_parameter_bypasses_generic_value_wrapper() {
         let builder = QueryBuilder::new("tenant1", "Patient");
 
-        for (value, membership) in [("true", "NOT IN"), ("false", "IN")] {
+        // `:missing=true` keeps its `NOT IN` inside the wrapper; `:missing=false`
+        // is a positive membership, so the fragment is its subquery (#1955).
+        for (value, membership) in [
+            ("true", "resource_key NOT IN"),
+            ("false", "SELECT resource_key FROM search_index"),
+        ] {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "birthdate".to_string(),
                 param_type: SearchParamType::Date,
@@ -1460,10 +2402,10 @@ mod tests {
                 components: vec![],
             });
 
-            let fragment = builder.build(&query);
+            let fragment = builder.build(&query).unwrap();
 
             assert!(
-                fragment.sql.contains(&format!("resource_key {membership}")),
+                fragment.sql.contains(membership),
                 "{value}: {}",
                 fragment.sql
             );
@@ -1482,10 +2424,10 @@ mod tests {
     }
 
     /// #1092: `_id` is dispatched through `build_special_parameter_condition`,
-    /// which bypassed the generic `:not` handling in `build_parameter_condition`
-    /// (the `membership`/`NOT IN` wrapping just above) entirely, so `_id:not=a`
-    /// built the same `IN (...)` as a plain `_id=a` and returned exactly the
-    /// resource the caller asked to exclude.
+    /// which bypassed the generic `:not` handling in `parameter_condition`
+    /// (its `NOT IN` wrapping) entirely, so `_id:not=a` built the same
+    /// `IN (...)` as a plain `_id=a` and returned exactly the resource the
+    /// caller asked to exclude.
     fn id_param_string(value: &SqlParam) -> &str {
         match value {
             SqlParam::String(s) => s.as_str(),
@@ -1722,7 +2664,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         // ID-only reference search is version-agnostic: exact, `%/id`, and
         // `%/id/_history/%`, so three params (?3, ?4, ?5) after ?1 tenant / ?2
@@ -1749,7 +2691,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         // Each ID-only value now binds 3 params (exact, `%/id`, `%/id/_history/%`):
         // first value ?3..?5, second value ?6..?8.
@@ -1780,25 +2722,143 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
-            fragment.sql.contains("value_reference IN (?3, ?4, ?5)"),
+            fragment.sql.contains("value_reference IN (?3, ?4, ?5)")
+                && fragment
+                    .sql
+                    .contains("value_reference_target IN (?6, ?7, ?8)"),
             "expected a flat IN list, got: {}",
             fragment.sql
         );
-        // No per-value OR branches, and no `_history` range scan.
+        // The exact arm is the flat IN (no OR); only the `_history` arm ORs,
+        // one flat chain of prefixed ranges (one per value).
+        assert_eq!(fragment.sql.matches(" OR ").count(), 2, "{}", fragment.sql);
+        // Versioned stored references are matched by one `_history` select
+        // over the same placeholders (#2493), not by one range per value.
         assert!(
-            !fragment.sql.contains(" OR "),
-            "should not OR: {}",
+            fragment
+                .sql
+                .contains("value_reference >= ?3 || '/_history/'")
+                && fragment
+                    .sql
+                    .contains("value_reference < ?5 || '/_history0'"),
+            "expected the _history arm: {}",
             fragment.sql
         );
+        assert_eq!(fragment.sql.matches("/_history/").count(), 3);
+        // tenant, resource_type, + one base per value, + the same bases again
+        // for the `value_reference_target` select; the `_history` arm binds
+        // nothing of its own.
+        assert_eq!(fragment.params.len(), 8);
+    }
+
+    fn multi_reference_query(values: &[&str]) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        query
+    }
+
+    #[test]
+    fn test_multi_value_reference_exists_merge_keeps_versions() {
+        // The merged `EXISTS` form must keep the `_history` arm (#2493), as a
+        // flat filter, and still be a single `EXISTS`.
+        for (values, with_target) in [
+            (vec!["Patient/p1", "Patient/p2"], true),
+            // absolute URLs have no `value_reference_target` arm
+            (
+                vec![
+                    "http://example.org/fhir/Patient/p1",
+                    "https://other.example/fhir/Patient/p1",
+                ],
+                false,
+            ),
+        ] {
+            let fragment = QueryBuilder::new("default", "Observation")
+                .build(&multi_reference_query(&values))
+                .unwrap();
+            let rows = fragment
+                .sql
+                .strip_prefix("resource_key IN (")
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(&fragment.sql);
+            let exists = membership_exists_predicate(rows, "w.rk")
+                .unwrap_or_else(|| panic!("no EXISTS for {values:?}: {}", fragment.sql));
+            assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+            assert!(
+                exists.contains("INDEXED BY idx_search_composite"),
+                "{exists}"
+            );
+            assert!(
+                exists.contains("substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN (?3, ?4)"),
+                "{exists}"
+            );
+            assert_eq!(
+                exists.contains("value_reference_target IN"),
+                with_target,
+                "{exists}"
+            );
+            assert_eq!(exists.matches("(SELECT").count(), 1, "{exists}");
+        }
+    }
+
+    #[test]
+    fn test_multi_value_reference_versions_arm_seeks_the_index() {
+        // The `_history` arm must bound `value_reference` on the index per
+        // base, never scan `search_index` (#1017, #1955, #2493).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_index (tenant_id TEXT, resource_type TEXT, resource_key INTEGER, \
+               param_name TEXT, value_reference TEXT, value_reference_target TEXT);
+             CREATE INDEX idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) \
+               WHERE value_reference IS NOT NULL;
+             CREATE INDEX idx_search_reference_target ON search_index(tenant_id, resource_type, param_name, value_reference_target) \
+               WHERE value_reference_target IS NOT NULL;",
+        )
+        .unwrap();
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&multi_reference_query(&["Patient/p1", "Patient/p2"]))
+            .unwrap();
+        let start = fragment.sql.find("SELECT resource_key").unwrap();
+        let rows_sql = &fragment.sql[start..];
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {rows_sql}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![
+                    "t",
+                    "Observation",
+                    "Patient/p1",
+                    "Patient/p2",
+                    "Patient/p1",
+                    "Patient/p2"
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert!(
-            !fragment.sql.contains("_history"),
-            "multi-value IN path is exact-base only: {}",
-            fragment.sql
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN") && l.contains("search_index")),
+            "scan in plan: {plan:#?}"
         );
-        // tenant, resource_type, + one base per value
-        assert_eq!(fragment.params.len(), 5);
+        assert!(
+            plan.iter().any(|l| l.contains("idx_search_reference ")
+                && l.contains("value_reference>?")
+                && l.contains("value_reference<?")),
+            "no bounded range seek in plan: {plan:#?}"
+        );
     }
 
     #[test]
@@ -1819,7 +2879,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
             fragment.sql.contains("value_reference IN (?3, ?4)"),
             "{}",
@@ -1854,7 +2914,7 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
             !fragment.sql.contains("value_reference IN (?3, ?4)"),
             "bare ids must not take the flat-IN path: {}",
@@ -2073,15 +3133,18 @@ mod tests {
         });
         let frag = builder.build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
+        // The compartment test reuses its own two (#1955): the bounded
+        // reference range and the exact test inside it, plus the
+        // `value_reference_target` arm (schema v48).
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5]);
+        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5, 4, 5, 4]);
         assert_eq!(frag.params.len(), 3);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
         assert!(!having.contains("COUNT(DISTINCT"), "{having}");
         assert!(
             having.contains(
-                "MAX(CASE WHEN (param_name IN ('subject', 'performer') AND value_reference IS NOT NULL"
+                "MAX(CASE WHEN ((param_name IN ('subject', 'performer') AND value_reference IS NOT NULL"
             ),
             "{having}"
         );
@@ -2090,6 +3153,173 @@ mod tests {
             "{:?}",
             frag.params
         );
+    }
+
+    /// The memberships that match nothing (#2509): no params, no reference,
+    /// neither.
+    fn empty_memberships() -> Vec<(&'static str, CompartmentMembership)> {
+        vec![
+            (
+                "no params",
+                CompartmentMembership {
+                    params: vec![],
+                    reference: "Patient/p1".to_string(),
+                },
+            ),
+            (
+                "empty reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string()],
+                    reference: String::new(),
+                },
+            ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be an exact match on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string()],
+                    reference: "/_history/1".to_string(),
+                },
+            ),
+            ("neither", CompartmentMembership::default()),
+        ]
+    }
+
+    /// #2509: a compartment that matches nothing is a condition no row
+    /// satisfies. Left out, the query would match every resource of the type,
+    /// widening a patient-confined search to the whole type.
+    #[test]
+    fn empty_compartment_membership_matches_nothing() {
+        let builder = QueryBuilder::new("tenant1", "Observation");
+        let code = contained_param("code", SearchParamType::Token, None, &["X"]);
+        let not_status = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Not),
+            &["final"],
+        );
+        let missing = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Missing),
+            &["false"],
+        );
+
+        for (label, membership) in empty_memberships() {
+            // Alone: the base select with a condition nothing satisfies.
+            let mut alone = SearchQuery::new("Observation");
+            alone.compartment = Some(membership.clone());
+            let fragment = builder.build(&alone).unwrap();
+            assert_eq!(
+                fragment.sql,
+                "SELECT DISTINCT resource_key FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND (1 = 0)",
+                "{label}"
+            );
+
+            // Beside ordinary, `:not` and `:missing` parameters it is ANDed in,
+            // never the only thing the other conditions are left to answer.
+            for (name, parameter) in [
+                ("code", code.clone()),
+                ("status:not", not_status.clone()),
+                ("status:missing", missing.clone()),
+            ] {
+                let mut query = SearchQuery::new("Observation").with_parameter(parameter);
+                query.compartment = Some(membership.clone());
+                let fragment = builder.build(&query).unwrap();
+                assert!(
+                    fragment.sql.starts_with(
+                        "SELECT DISTINCT resource_key FROM search_index WHERE tenant_id = ?1"
+                    ),
+                    "{label} + {name}: must not be the bare parameter subquery: {}",
+                    fragment.sql
+                );
+                assert!(
+                    fragment.sql.ends_with("AND (1 = 0))"),
+                    "{label} + {name}: {}",
+                    fragment.sql
+                );
+                assert!(!fragment.sql.contains(" INTERSECT "), "{label} + {name}");
+            }
+
+            // Embedded in an outer query, as every caller does.
+            let embedded = QueryBuilder::new("tenant1", "Observation")
+                .with_param_offset(4)
+                .build(&alone)
+                .unwrap();
+            assert!(
+                embedded.sql.ends_with("AND (1 = 0)"),
+                "{label}: {}",
+                embedded.sql
+            );
+            assert!(embedded.params.is_empty(), "{label}: binds nothing");
+        }
+
+        // A real membership is a positive membership subquery, unchanged.
+        let mut real = SearchQuery::new("Observation");
+        real.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        let fragment = builder.build(&real).unwrap();
+        assert!(!fragment.sql.contains("1 = 0"), "{}", fragment.sql);
+        assert!(
+            fragment
+                .sql
+                .starts_with("SELECT resource_key FROM search_index"),
+            "{}",
+            fragment.sql
+        );
+    }
+
+    /// #2509: the `_contained` branch. No criterion at all is every contained
+    /// resource of the type (#1383); a compartment that matches nothing is a
+    /// criterion, not the absence of one.
+    #[test]
+    fn empty_compartment_membership_matches_no_contained_resource() {
+        let builder = QueryBuilder::new("t", "Observation");
+        let code = contained_param("code", SearchParamType::Token, None, &["X"]);
+        let not_status = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Not),
+            &["final"],
+        );
+
+        for (label, membership) in empty_memberships() {
+            for (name, parameters) in [
+                ("alone", vec![]),
+                ("code", vec![code.clone()]),
+                ("status:not", vec![not_status.clone()]),
+            ] {
+                for mode in [ContainedMode::On, ContainedMode::Both] {
+                    let mut query = contained_query(parameters.clone());
+                    query.contained = mode;
+                    query.compartment = Some(membership.clone());
+                    let frag = builder.build_contained(&query).unwrap();
+                    let (filter, grouping) = frag
+                        .sql
+                        .split_once(" GROUP BY ")
+                        .expect("the contained select groups per entity");
+                    assert!(
+                        filter.contains("contained_type = ?2 AND 0 = 1"),
+                        "{label} + {name}: {}",
+                        frag.sql
+                    );
+                    assert!(grouping.starts_with("resource_type"), "{}", frag.sql);
+                }
+            }
+        }
+
+        // A real membership adds a branch and no impossible filter.
+        let mut real = contained_query(vec![]);
+        real.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        let frag = builder.build_contained(&real).unwrap();
+        assert!(!frag.sql.contains("0 = 1"), "{}", frag.sql);
     }
 
     /// #1383: `_has` and `_list` select top-level resources.
@@ -2247,6 +3477,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }];
         let refused = [
             contained_param("_lastUpdated", SearchParamType::Date, None, &["gt2020"]),

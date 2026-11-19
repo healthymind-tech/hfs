@@ -23,11 +23,19 @@
 //! - [`composite_metrics`] — process-level Prometheus metrics for composite
 //!   storage's secondary sync: final failures by backend and operation, and
 //!   the number of resources recorded as needing a reindex (#1334).
+//! - [`deferred_index_metrics`] — process-level Prometheus metrics for MongoDB's
+//!   deferred search indexing of large transaction Bundles: the ledger backlog
+//!   and the age of its oldest document (as the latest repair pass left them),
+//!   failed repair documents, and each post-commit step's duration, rows and
+//!   incomplete outcomes (#2034, #2036). Only a fixed `reason` label.
 //! - [`pool_metrics`] — process-level Prometheus gauges for the server's
 //!   PostgreSQL connection pools (ceiling, open, idle, waiting callers),
 //!   sampled at scrape time from sources the server registers (#1907). Only
 //!   a fixed `pool` label.
+//! - [`build_info`] — the constant `build_info{version, revision}` gauge.
 //! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
+//! - [`redact`] — strips credentials from URLs before they reach logs or
+//!   responses (#2149).
 //!
 //! ## Typical wiring
 //!
@@ -57,14 +65,18 @@
 //! - OTLP *metrics* are expected to be produced by an OpenTelemetry Collector
 //!   scraping `/metrics`; the app itself only pushes OTLP *traces*.
 
+pub mod audit_metrics;
+pub mod build_info;
 pub mod composite_metrics;
 pub mod dashboard;
 pub mod dashboard_counters;
 pub mod dashboard_metrics;
+pub mod deferred_index_metrics;
 pub mod metrics;
 pub mod middleware;
 pub mod mode;
 pub mod pool_metrics;
+pub mod redact;
 pub mod reqlog;
 pub mod shutdown;
 pub mod subscriptions;

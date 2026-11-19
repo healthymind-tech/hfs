@@ -26,12 +26,18 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
-//! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
+//! | `HFS_DEFAULT_FHIR_VERSION` | R4 (a build without R4 uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
-//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
+//! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in`/`:above`/`:below` search and FHIRPath terminology functions |
+//! | `HFS_TERMINOLOGY_TIMEOUT_SECS` | 30 | Per-request timeout of the search terminology client (`$expand` pages) |
+//! | `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: closed (error), empty (match nothing) or open (drop the parameter) |
+//! | `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used for search modifiers |
+//! | `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else 422 `too-costly`) |
+//! | `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; 0 disables |
+//! | `HFS_TERMINOLOGY_PUBLIC_URL` | (none) | Browser-reachable URL for the web UI's Terminology link; defaults to `/ui/hts` when `HFS_TERMINOLOGY_SERVER` is an internal host |
 //! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
 //! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
 //! | `HFS_VALIDATION_UNKNOWN_PROFILE` | warn | Unresolvable profiles: warn, error, or ignore |
@@ -41,6 +47,7 @@
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
+//! | `HFS_VALIDATION_IG_GLOBAL` | true | Hold every resource to the `ImplementationGuide.global` profiles of the stored ImplementationGuides |
 //!
 //! # Example
 //!
@@ -63,9 +70,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use helios_fhir::FhirVersion;
+use helios_observability::redact::redact_url;
 use helios_persistence::BackendKind;
+use helios_persistence::core::database_url::redact_database_url;
 
 /// Storage backend mode.
 ///
@@ -112,6 +121,20 @@ impl StorageBackendMode {
             StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
         }
     }
+
+    /// Whether search is served by an Elasticsearch secondary in this mode,
+    /// so the primary keeps no search index of its own and bulk ingestion
+    /// can index into the secondary batch by batch (see
+    /// [`BulkSubmitConfig::defaults_for`]).
+    pub fn offloads_search(self) -> bool {
+        matches!(
+            self,
+            StorageBackendMode::SqliteElasticsearch
+                | StorageBackendMode::PostgresElasticsearch
+                | StorageBackendMode::MongoDBElasticsearch
+                | StorageBackendMode::S3Elasticsearch
+        )
+    }
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -154,6 +177,30 @@ impl FromStr for StorageBackendMode {
             )),
         }
     }
+}
+
+/// Unified async-job store backend (docs/cluster-capable-state-design.md §4).
+///
+/// Selects where cluster-affected async job state (SQL-on-FHIR export,
+/// reindex) lives. Resolved by [`ServerConfig::job_store_backend_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStoreBackend {
+    /// In-process job state — visible only to this instance; lost on restart.
+    Memory,
+    /// Job state in the shared primary database — cluster-capable.
+    Database,
+}
+
+/// Subscriptions event fan-out backend (docs/cluster-capable-state-design.md
+/// §Class B). Resolved by [`ServerConfig::subscriptions_fanout_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionsFanoutMode {
+    /// In-process only — notifications reach only sockets and workers on
+    /// the instance that served the triggering write.
+    Memory,
+    /// Postgres LISTEN/NOTIFY fan-out plus the shared state/outbox seams —
+    /// cluster-capable.
+    PgNotify,
 }
 
 /// Tenant routing mode for multi-tenant deployments.
@@ -470,6 +517,219 @@ impl BulkExportConfig {
     }
 }
 
+/// FHIR package (Implementation Guide) manager configuration.
+///
+/// See `docs/ops/ig-packages.md` for the operator guide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageConfig {
+    /// Enables the package administration API (`/admin/packages`) and the
+    /// console page (`/ui/packages`) — `HFS_ADMIN_UI`, default `false`.
+    /// Installing and removing packages are administrative actions; until
+    /// SMART/OIDC admin scopes land they sit behind this explicit switch.
+    /// `HFS_PACKAGES` startup installs run regardless.
+    pub admin_ui: bool,
+    /// Online package registries — `HFS_PACKAGE_REGISTRY`: `on` (default:
+    /// packages.fhir.org, falling back to packages2.fhir.org), `off` (no
+    /// network access at all: upload and the local cache only), or a
+    /// comma-separated list of npm-compatible mirror base URLs used instead
+    /// of the public registries.
+    pub registry: RegistryMode,
+    /// Marketplace index (FHIR/ig-registry `fhir-ig-list.json`) URL —
+    /// `HFS_PACKAGE_MARKETPLACE`; `off` disables it. Ignored when the
+    /// registry is `off`.
+    pub marketplace_url: Option<String>,
+    /// Packages to install at startup when missing —
+    /// `HFS_PACKAGES=name#version,name#version`.
+    pub startup: Vec<String>,
+    /// Package cache directory — `HFS_PACKAGE_CACHE_DIR`. Unset: next to the
+    /// SQLite database file, else `<HFS_DATA_DIR or ./data>/packages`.
+    pub cache_dir: Option<std::path::PathBuf>,
+    /// Largest accepted `.tgz` (compressed), bytes — `HFS_PACKAGE_MAX_SIZE`,
+    /// default 256 MiB.
+    pub max_size: u64,
+    /// Largest total unpacked size of one package, bytes —
+    /// `HFS_PACKAGE_MAX_UNPACKED`, default 1 GiB.
+    pub max_unpacked: u64,
+    /// Largest single file inside a package, bytes —
+    /// `HFS_PACKAGE_MAX_ENTRY`, default 64 MiB.
+    pub max_entry: u64,
+    /// Send the FHIR core package's CodeSystems, ValueSets and ConceptMaps
+    /// (`hl7.fhir.r4.core#4.0.1` for R4) to the terminology server at
+    /// startup, those it does not have yet — `HFS_CORE_TERMINOLOGY`,
+    /// default `true`. The core package itself is never installed (its
+    /// definitions are embedded), so without this a fresh terminology
+    /// server lacks `units-of-time`, `ucum-units`, `observation-codes`, ….
+    /// Only applies with `HFS_TERMINOLOGY_SERVER`.
+    pub core_terminology: bool,
+    /// Credential sent as `Authorization: Bearer` on the package manager's
+    /// calls to the terminology server (IG and core terminology imports,
+    /// uninstall deletes) — `HFS_TERMINOLOGY_SERVER_TOKEN`, or the contents
+    /// of `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` (which wins). For HTS this is
+    /// its administrator password, which `HTS_REQUIRE_AUTH_FOR_WRITES`
+    /// requires for terminology writes.
+    pub terminology_token: Option<helios_admin_auth::Secret>,
+}
+
+/// Where the package manager looks for packages online.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryMode {
+    /// No network access.
+    Off,
+    /// packages.fhir.org first, packages2.fhir.org as fallback.
+    Public,
+    /// Operator-provided npm-compatible mirrors, tried in order.
+    Mirrors(Vec<String>),
+}
+
+/// The public registries tried by [`RegistryMode::Public`], in order.
+pub const PUBLIC_PACKAGE_REGISTRIES: &[&str] = &[
+    "https://packages.fhir.org",
+    "https://packages2.fhir.org/packages",
+];
+
+/// Default marketplace index.
+pub const DEFAULT_PACKAGE_MARKETPLACE: &str =
+    "https://raw.githubusercontent.com/FHIR/ig-registry/master/fhir-ig-list.json";
+
+impl RegistryMode {
+    /// Parses `HFS_PACKAGE_REGISTRY`.
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "on" | "true" | "1" | "public" | "default" => Self::Public,
+            "off" | "false" | "0" | "none" => Self::Off,
+            _ => Self::Mirrors(
+                trimmed
+                    .split(',')
+                    .map(|u| u.trim().trim_end_matches('/').to_string())
+                    .filter(|u| !u.is_empty())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Registry base URLs to try, in order (empty when off).
+    pub fn sources(&self) -> Vec<String> {
+        match self {
+            Self::Off => Vec::new(),
+            Self::Public => PUBLIC_PACKAGE_REGISTRIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Self::Mirrors(urls) => urls.clone(),
+        }
+    }
+
+    /// Whether any online access is allowed.
+    pub fn is_online(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The label the admin API reports (`off`, `public`, `mirror`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Public => "public",
+            Self::Mirrors(_) => "mirror",
+        }
+    }
+}
+
+impl Default for PackageConfig {
+    fn default() -> Self {
+        Self {
+            admin_ui: false,
+            registry: RegistryMode::Public,
+            marketplace_url: Some(DEFAULT_PACKAGE_MARKETPLACE.to_string()),
+            startup: Vec::new(),
+            cache_dir: None,
+            max_size: 256 * 1024 * 1024,
+            max_unpacked: 1024 * 1024 * 1024,
+            max_entry: 64 * 1024 * 1024,
+            core_terminology: true,
+            terminology_token: None,
+        }
+    }
+}
+
+impl PackageConfig {
+    /// Loads the package-manager configuration from the environment.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        let bytes = |key: &str, default: u64| {
+            env(key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            admin_ui: env("HFS_ADMIN_UI")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(d.admin_ui),
+            registry: env("HFS_PACKAGE_REGISTRY")
+                .map(|v| RegistryMode::parse(&v))
+                .unwrap_or(d.registry),
+            marketplace_url: match env("HFS_PACKAGE_MARKETPLACE") {
+                Some(v) if v.trim().eq_ignore_ascii_case("off") => None,
+                Some(v) => Some(v.trim().to_string()),
+                None => d.marketplace_url,
+            },
+            startup: env("HFS_PACKAGES")
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cache_dir: env("HFS_PACKAGE_CACHE_DIR").map(std::path::PathBuf::from),
+            max_size: bytes("HFS_PACKAGE_MAX_SIZE", d.max_size),
+            max_unpacked: bytes("HFS_PACKAGE_MAX_UNPACKED", d.max_unpacked),
+            max_entry: bytes("HFS_PACKAGE_MAX_ENTRY", d.max_entry),
+            core_terminology: env("HFS_CORE_TERMINOLOGY")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    )
+                })
+                .unwrap_or(d.core_terminology),
+            terminology_token: terminology_token_from_env(),
+        }
+    }
+}
+
+/// `HFS_TERMINOLOGY_SERVER_TOKEN_FILE` (wins; trailing newline dropped), else
+/// `HFS_TERMINOLOGY_SERVER_TOKEN`. An unreadable file is logged — never with
+/// its contents — and leaves no token, so terminology writes fail visibly.
+fn terminology_token_from_env() -> Option<helios_admin_auth::Secret> {
+    if let Some(path) = std::env::var("HFS_TERMINOLOGY_SERVER_TOKEN_FILE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return match std::fs::read_to_string(path.trim()) {
+            Ok(contents) => {
+                let token = contents.trim_end_matches(['\r', '\n']);
+                (!token.trim().is_empty()).then(|| helios_admin_auth::Secret::new(token))
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %path.trim(),
+                    error = %err.kind(),
+                    "cannot read HFS_TERMINOLOGY_SERVER_TOKEN_FILE; terminology writes will be sent without a credential"
+                );
+                None
+            }
+        };
+    }
+    std::env::var("HFS_TERMINOLOGY_SERVER_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(helios_admin_auth::Secret::new)
+}
+
 /// Resource validation configuration, loaded from `HFS_VALIDATION_*`
 /// environment variables.
 ///
@@ -491,16 +751,71 @@ pub struct ValidationConfig {
     pub suppress_constraints: Vec<String>,
     /// Terminology binding checking: `embedded` (default — offline checks
     /// against the FHIR core value sets embedded in helios-fhir-validator),
-    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
+    /// `remote` (embedded core value sets first, then
+    /// `HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code` for everything
+    /// the pack cannot judge), `remote-only` (every binding goes to the
+    /// server), or `off`.
     pub terminology: String,
     /// Per-check terminology timeout, in milliseconds.
     pub terminology_timeout_ms: u64,
-    /// Terminology outages: `open` (warn and proceed) or `closed`
-    /// (treat as validation errors).
+    /// Terminology failures on required bindings: `open` (warn and proceed),
+    /// `closed` (every failure is an error, outages included), or
+    /// `closed-required` (a ValueSet the server does not know is an error,
+    /// an outage is a warning).
     pub terminology_fail: String,
+    /// Severity of a wrong `Coding.display` (`HFS_VALIDATION_DISPLAY_ISSUES`):
+    /// `warning` (default, as HAPI and the HL7 validator's
+    /// `--display-issues-are-warnings`) or `error` (the HL7 validator's
+    /// default). A wrong display never makes the code itself invalid.
+    pub display_issues: String,
+    /// `extensible` bindings (`HFS_VALIDATION_EXTENSIBLE_BINDINGS`):
+    /// `warning` (default, as the HL7 validator: a coded value from none of
+    /// the value set's codes draws a warning) or `off` (only `required`
+    /// bindings are checked).
+    pub extensible_bindings: String,
+    /// The HL7 validator's best-practice recommendations
+    /// (`HFS_VALIDATION_BEST_PRACTICE`): `warning` (default; e.g. "all
+    /// observations should have a performer") or `off`.
+    pub best_practice: String,
+    /// Extensions whose url resolves to no definition
+    /// (`HFS_VALIDATION_UNKNOWN_EXTENSIONS`): `lenient` (default — FHIR lets
+    /// a receiver accept extensions it does not know; only an HL7-namespace
+    /// url warns) or `error` (the HL7 validator's default: "could not be
+    /// found so is not allowed here").
+    pub unknown_extensions: String,
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
+    /// Let a stored StructureDefinition whose canonical URL is already
+    /// defined by the embedded core pack (`http://hl7.org/fhir/StructureDefinition/…`)
+    /// override the embedded definition. Off by default: importing the
+    /// `hl7.fhir.r4.core` package must not replace the base types the
+    /// validator was built with.
+    pub shadow_core: bool,
+    /// Apply the profiles stored ImplementationGuides declare in
+    /// `ImplementationGuide.global` to every resource of the named type
+    /// (`HFS_VALIDATION_IG_GLOBAL`, default `true`), as the HL7 validator
+    /// applies the global profiles of the IGs it has loaded. Installing a
+    /// package stores its ImplementationGuide, so its global profiles take
+    /// effect on install and stop on uninstall. Needs `stored_profiles`.
+    pub ig_global: bool,
+    /// Replay stored StructureDefinitions into the profile registries at
+    /// startup (`HFS_VALIDATION_REHYDRATE`, default `true`). Without it the
+    /// registries are empty after every restart until each profile is
+    /// re-written.
+    pub rehydrate: bool,
+    /// StructureDefinitions fetched per storage round-trip during startup
+    /// rehydration (`HFS_VALIDATION_REHYDRATE_BATCH_SIZE`, default 100).
+    pub rehydrate_batch_size: u32,
+    /// How long validation waits for an unfinished startup rehydration
+    /// before validating against the profiles registered so far
+    /// (`HFS_VALIDATION_REHYDRATE_WAIT_MS`, default 60000).
+    pub rehydrate_wait_ms: u64,
+    /// Directory of the compiled-profile cache that lets a restart skip
+    /// re-converting unchanged StructureDefinitions
+    /// (`HFS_VALIDATION_PROFILE_CACHE`: a path, or `off`). Unset: next to
+    /// the package cache; see [`crate::validation_cache::cache_dir`].
+    pub profile_cache: Option<String>,
 }
 
 impl Default for ValidationConfig {
@@ -514,7 +829,17 @@ impl Default for ValidationConfig {
             terminology: "embedded".to_string(),
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
+            display_issues: "warning".to_string(),
+            extensible_bindings: "warning".to_string(),
+            best_practice: "warning".to_string(),
+            unknown_extensions: "lenient".to_string(),
             stored_profiles: true,
+            shadow_core: false,
+            ig_global: true,
+            rehydrate: true,
+            rehydrate_batch_size: 100,
+            rehydrate_wait_ms: 60_000,
+            profile_cache: None,
         }
     }
 }
@@ -559,7 +884,29 @@ impl ValidationConfig {
             ),
             terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
+            display_issues: std::env::var("HFS_VALIDATION_DISPLAY_ISSUES")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.display_issues),
+            extensible_bindings: std::env::var("HFS_VALIDATION_EXTENSIBLE_BINDINGS")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.extensible_bindings),
+            best_practice: std::env::var("HFS_VALIDATION_BEST_PRACTICE")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.best_practice),
+            unknown_extensions: std::env::var("HFS_VALIDATION_UNKNOWN_EXTENSIONS")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.unknown_extensions),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+            shadow_core: env_bool("HFS_VALIDATION_SHADOW_CORE", d.shadow_core),
+            ig_global: env_bool("HFS_VALIDATION_IG_GLOBAL", d.ig_global),
+            rehydrate: env_bool("HFS_VALIDATION_REHYDRATE", d.rehydrate),
+            rehydrate_batch_size: env_u64(
+                "HFS_VALIDATION_REHYDRATE_BATCH_SIZE",
+                u64::from(d.rehydrate_batch_size),
+            )
+            .clamp(1, u64::from(u32::MAX)) as u32,
+            rehydrate_wait_ms: env_u64("HFS_VALIDATION_REHYDRATE_WAIT_MS", d.rehydrate_wait_ms),
+            profile_cache: std::env::var("HFS_VALIDATION_PROFILE_CACHE").ok(),
         }
     }
 
@@ -578,20 +925,151 @@ impl ValidationConfig {
                 self.unknown_profile
             ));
         }
-        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
+        if !matches!(
+            self.terminology.as_str(),
+            "off" | "embedded" | "remote" | "remote-only"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote|remote-only)",
                 self.terminology
             ));
         }
-        if !matches!(self.terminology_fail.as_str(), "open" | "closed") {
+        if !matches!(
+            self.terminology_fail.as_str(),
+            "open" | "closed" | "closed-required"
+        ) {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed)",
+                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed|closed-required)",
                 self.terminology_fail
+            ));
+        }
+        if !matches!(self.display_issues.as_str(), "warning" | "error") {
+            errors.push(format!(
+                "HFS_VALIDATION_DISPLAY_ISSUES '{}' invalid (expected warning|error)",
+                self.display_issues
+            ));
+        }
+        if !matches!(self.extensible_bindings.as_str(), "warning" | "off") {
+            errors.push(format!(
+                "HFS_VALIDATION_EXTENSIBLE_BINDINGS '{}' invalid (expected warning|off)",
+                self.extensible_bindings
+            ));
+        }
+        if !matches!(self.best_practice.as_str(), "warning" | "off") {
+            errors.push(format!(
+                "HFS_VALIDATION_BEST_PRACTICE '{}' invalid (expected warning|off)",
+                self.best_practice
+            ));
+        }
+        if !matches!(self.unknown_extensions.as_str(), "lenient" | "error") {
+            errors.push(format!(
+                "HFS_VALIDATION_UNKNOWN_EXTENSIONS '{}' invalid (expected lenient|error)",
+                self.unknown_extensions
             ));
         }
         if self.terminology_timeout_ms == 0 {
             errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Search-time terminology configuration (`HFS_SEARCH_TERMINOLOGY_*`,
+/// `HFS_SEARCH_EXPANSION_*`): how the `:in` / `:not-in` / token `:above` /
+/// `:below` search modifiers are resolved through `HFS_TERMINOLOGY_SERVER`.
+///
+/// A modifier's ValueSet (or code hierarchy) is expanded with
+/// `ValueSet/$expand` — flat (`excludeNested=true`), paged with
+/// `count`/`offset` up to a code cap — and the search runs on the codes.
+#[derive(Debug, Clone)]
+pub struct SearchTerminologyConfig {
+    /// What a search does when the expansion fails (unknown ValueSet,
+    /// terminology server down, expansion over the cap): `closed` (default —
+    /// the search fails with an OperationOutcome), `empty` (the parameter
+    /// matches nothing), or `open` (the parameter is dropped and the search
+    /// runs without it — the pre-fork behaviour, which returns a superset).
+    pub fail: String,
+    /// `$expand` page size (`count`); must not exceed the terminology
+    /// server's own expansion limit (`HTS_MAX_EXPANSION_SIZE`, 3500 by
+    /// default on HTS).
+    pub expansion_page_size: u32,
+    /// Maximum number of codes a single expansion may turn into a search
+    /// filter. Larger expansions fail the search as `too-costly` (`422`) —
+    /// SQLite binds at most 32,766 parameters per statement.
+    pub expansion_max_codes: usize,
+    /// How long a successful expansion is reused for identical searches,
+    /// in seconds; `0` disables the cache.
+    pub expansion_cache_ttl_secs: u64,
+    /// Per-request timeout of the terminology client, in seconds
+    /// (`HFS_TERMINOLOGY_TIMEOUT_SECS`). A cold expansion of a several-thousand-
+    /// code ValueSet can take more than 10 s on a loaded terminology server.
+    pub timeout_secs: u64,
+}
+
+impl Default for SearchTerminologyConfig {
+    fn default() -> Self {
+        Self {
+            fail: "closed".to_string(),
+            expansion_page_size: 1000,
+            expansion_max_codes: 10_000,
+            expansion_cache_ttl_secs: 60,
+            timeout_secs: 30,
+        }
+    }
+}
+
+impl SearchTerminologyConfig {
+    /// Loads the configuration from `HFS_SEARCH_TERMINOLOGY_FAIL`,
+    /// `HFS_SEARCH_EXPANSION_PAGE_SIZE`, `HFS_SEARCH_EXPANSION_MAX_CODES` and
+    /// `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`, defaulting each unset variable.
+    pub fn from_env() -> Self {
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            fail: std::env::var("HFS_SEARCH_TERMINOLOGY_FAIL").unwrap_or(d.fail),
+            expansion_page_size: env_u64(
+                "HFS_SEARCH_EXPANSION_PAGE_SIZE",
+                u64::from(d.expansion_page_size),
+            )
+            .min(u64::from(u32::MAX)) as u32,
+            expansion_max_codes: env_u64(
+                "HFS_SEARCH_EXPANSION_MAX_CODES",
+                d.expansion_max_codes as u64,
+            ) as usize,
+            expansion_cache_ttl_secs: env_u64(
+                "HFS_SEARCH_EXPANSION_CACHE_TTL_SECS",
+                d.expansion_cache_ttl_secs,
+            ),
+            timeout_secs: env_u64("HFS_TERMINOLOGY_TIMEOUT_SECS", d.timeout_secs),
+        }
+    }
+
+    /// Validates the configuration, returning every problem found.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.timeout_secs == 0 {
+            errors.push("HFS_TERMINOLOGY_TIMEOUT_SECS must be at least 1".to_string());
+        }
+        if !matches!(self.fail.as_str(), "closed" | "empty" | "open") {
+            errors.push(format!(
+                "HFS_SEARCH_TERMINOLOGY_FAIL '{}' invalid (expected closed|empty|open)",
+                self.fail
+            ));
+        }
+        if self.expansion_page_size == 0 {
+            errors.push("HFS_SEARCH_EXPANSION_PAGE_SIZE must be > 0".to_string());
+        }
+        if self.expansion_max_codes == 0 {
+            errors.push("HFS_SEARCH_EXPANSION_MAX_CODES must be > 0".to_string());
         }
         if errors.is_empty() {
             Ok(())
@@ -607,7 +1085,8 @@ impl ValidationConfig {
 /// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
 /// manifests/files, ingests them, and serves a status manifest whose
 /// `output`/`outcome`/`deleted` artifacts are written to the output store below.
-#[derive(Debug, Clone)]
+// `Debug` is hand-written below: it redacts the private and decryption keys.
+#[derive(Clone)]
 pub struct BulkSubmitConfig {
     /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
     pub enabled: bool,
@@ -621,7 +1100,12 @@ pub struct BulkSubmitConfig {
     pub requires_access_token: String,
     /// Pre-signed download-URL lifetime, in seconds.
     pub file_url_ttl_secs: u64,
-    /// How long status artifacts are retained after completion, in seconds.
+    /// Retention in seconds, counted from a submission's last activity
+    /// (`updated_at`). A completed or aborted submission past it is purged
+    /// whole: output files, manifests, receipts and change records. An idle
+    /// in-progress submission with no pending or processing manifest is
+    /// aborted first and purged one TTL later; one with such a manifest is
+    /// never purged.
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
@@ -644,9 +1128,21 @@ pub struct BulkSubmitConfig {
     /// finishes. Reads and history are complete throughout; search sees a
     /// manifest's resources once its reindex lands.
     ///
-    /// Defaults to `true` for import speed (#946), which trades away the
-    /// durability property below. Both are measured, and both are reproducible
-    /// from `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
+    /// Defaults to `true` when the primary owns search (#946), and to `false`
+    /// when search is offloaded to an Elasticsearch secondary
+    /// ([`StorageBackendMode::offloads_search`], resolved by
+    /// [`Self::defaults_for`] at startup; #1749). On an ES composite the
+    /// primary extracts nothing either way, so deferring buys no ingest-side
+    /// saving: it only moves the whole Elasticsearch write *after* the
+    /// ingest, as a single-stream rebuild that re-reads every resource —
+    /// measured on the 72k Synthea mix on pg-es at 9.8 s inline against
+    /// 73 s deferred + rebuild, with the rebuild re-reading the corpus from
+    /// PostgreSQL. The batch-by-batch sink overlaps the Elasticsearch work
+    /// with the ingest instead, and the deferred reindex still repairs
+    /// whatever the sink could not index (#1666). When the primary owns
+    /// search, `true` keeps trading the durability property below for speed.
+    /// Both are measured, and both are reproducible from
+    /// `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
     /// `run_defer_indexing_crash_check.sh`:
     ///
     /// - Speed: end to end — kick-off until search returns every resource —
@@ -679,27 +1175,75 @@ pub struct BulkSubmitConfig {
     /// `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` flag, which named that mechanism
     /// explicitly and produced a dead flag combination, is gone.
     pub defer_indexing: bool,
-    /// Bulk index rebuild for the deferred reindex (SQLite): drop the
-    /// `search_index` value indexes for the duration of each rebuild and
-    /// build them once, sorted, when it finishes. Measured 27% faster on a
-    /// 72k-resource rebuild with everything in memory; the sorted build is
-    /// sequential I/O, so the gap widens on loads whose b-trees outgrow the
-    /// page cache. The cost: while a rebuild runs, search on that database is
+    /// Bulk index rebuild for the deferred reindex (SQLite and PostgreSQL):
+    /// drop the `search_index` value indexes for the duration of each
+    /// rebuild and build them once, sorted, when it finishes. SQLite:
+    /// measured 27% faster on a 72k-resource rebuild with everything in
+    /// memory; the sorted build is sequential I/O, so the gap widens on loads
+    /// whose b-trees outgrow the page cache. PostgreSQL: the write side of a
+    /// 72k-resource rebuild ~27% faster at reindex width 1, ~5% at width 8,
+    /// and 31% less WAL on 300k resources at width 8 (wall clock there
+    /// within run-to-run noise); the indexes are
+    /// rebuilt `HFS_PG_BULK_INDEX_BUILD_CONCURRENCY` (default 4) at a time
+    /// with `maintenance_work_mem` = `HFS_PG_BULK_INDEX_MAINTENANCE_WORK_MEM`
+    /// (default `256MB`), the window is shared across HFS processes through a
+    /// session advisory lock, and dropped definitions are recorded in
+    /// `search_index_deferred_indexes` so a crashed run is healed at the next
+    /// startup. The cost: while a rebuild runs, search on that database is
     /// unindexed for **every** tenant and type, and the final index build
     /// holds the write lock for as long as it takes. Meant for the initial
     /// load of a large corpus on a server that is not serving traffic; `false`
     /// by default. Ignored when search is offloaded to a secondary. Set with
     /// `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`.
     pub bulk_index_rebuild: bool,
+    /// Safety margin, in seconds, subtracted from a manifest's registration
+    /// time to get the `last_updated` floor its deferred rebuild starts at
+    /// (#945 L3): the rebuild after a manifest walks only resources of its
+    /// types stored since then, instead of the types whole, tenant-wide — a
+    /// 5,000-resource increment into a tenant of millions costs the 5,000.
+    /// Clock skew between the node that registered the manifest and the
+    /// node that ingested it must stay within the margin, or resources
+    /// stamped before the floor are left unindexed until a manual `$reindex`
+    /// of their type. Default 900 (15 minutes). Set with
+    /// `HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`.
+    pub reindex_since_margin_secs: u64,
+    /// Up to this many entries, a finished manifest's receipts name the
+    /// resources its deferred rebuild fetches one by one — exact on every
+    /// backend, S3 included, which has no time index. Above it, or at `0`,
+    /// the rebuild is scoped by time instead (see
+    /// [`Self::reindex_since_margin_secs`]). Default 50000. Set with
+    /// `HFS_BULK_SUBMIT_REINDEX_IDS_MAX`.
+    pub reindex_ids_max: u64,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
     pub max_concurrent_per_tenant: u32,
     /// Resources per ingestion batch — one database transaction per batch.
-    /// Defaults to `100`, the size the engine has always used; a larger batch
-    /// measured slower with index-during-ingest on (382 s at 1000 against
-    /// 252 s at 100, #1127). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
+    /// Defaults to `1000`. The engine ran at `100` for a long time on the
+    /// strength of one measurement taken with index-during-ingest on (382 s
+    /// at 1000 against 252 s at 100, #1127); with the deferred rebuild that
+    /// has been the default since #903, a 1000-entry batch measured 19 %
+    /// faster on SQLite (72k Synthea resources: 3.77 s at 100 against 3.05 s
+    /// at 1000, and the same ordering with inline indexing: 23.4 s against
+    /// 19.7 s), and on PostgreSQL and MongoDB it cuts the per-batch round
+    /// trips tenfold. Memory per in-flight batch grows with it (about 5 MB
+    /// for a batch of Observations). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
     pub batch_size: u32,
+    /// How many batches of one output file the ingest writes concurrently.
+    /// The per-file stream always parses the next batch while the current
+    /// one writes; above `1` it also keeps that many batches in flight on
+    /// the concurrent-writer backends (PostgreSQL, MongoDB, S3), with the
+    /// file watermark and manifest counters still charged in file order so
+    /// receipts, resume-after-crash and rollback keep their semantics. Each
+    /// PostgreSQL batch holds a pooled connection for its transaction, so
+    /// `file_concurrency × batch_writers` should stay well below
+    /// `HFS_PG_MAX_CONNECTIONS` (the engine caps it at half the pool). Forced
+    /// to `1` when `max_errors` / `continue_on_error = false` can stop a
+    /// file mid-way. Defaults to `4`. Set with `HFS_BULK_SUBMIT_BATCH_WRITERS`.
+    ///
+    /// This is the *configured* value: the engine caps it, and SQLite always
+    /// writes a file's batches one at a time (one write lock, #942).
+    pub batch_writers: u32,
     /// How long the input-file fetcher waits for the next bytes of a
     /// response before treating the body as broken and resuming it with a
     /// `Range` request, in seconds (#1127). Set with
@@ -710,6 +1254,15 @@ pub struct BulkSubmitConfig {
     /// replaying a manifest writes no new versions (#1127). Off by default.
     /// Set with `HFS_BULK_SUBMIT_SKIP_UNCHANGED`.
     pub skip_unchanged: bool,
+    /// Keep a submission's status poll at `202` ("Indexing") until the
+    /// search-index rebuild that deferred indexing postponed has finished, so
+    /// the `200` manifest means "written and searchable". Measured on
+    /// PostgreSQL the rebuild outlasted the ingest itself by ~4x, and a `200`
+    /// right after ingest told the provider its data was queryable minutes
+    /// before it was. `false` restores the old "200 once written" answer.
+    /// Only backends that record the rebuild marker (SQLite, PostgreSQL) can
+    /// hold the poll. Set with `HFS_BULK_SUBMIT_STATUS_WAITS_FOR_INDEX`.
+    pub status_waits_for_index: bool,
     /// Batches each index-during-ingest writer may hold queued before the
     /// ingest waits for it. Set with `HFS_BULK_SUBMIT_INDEX_QUEUE`.
     pub index_queue: u32,
@@ -776,6 +1329,98 @@ pub struct BulkSubmitConfig {
     pub poll_rate_window_secs: u64,
 }
 
+/// Prints the keys as `[redacted]` (#2149). Destructures every field, so a
+/// new field fails to compile until it is listed here.
+impl fmt::Debug for BulkSubmitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            enabled,
+            output_backend,
+            output_dir,
+            s3_bucket,
+            requires_access_token,
+            file_url_ttl_secs,
+            output_ttl_secs,
+            worker_concurrency,
+            file_concurrency,
+            defer_indexing,
+            bulk_index_rebuild,
+            reindex_since_margin_secs,
+            reindex_ids_max,
+            disable_local_worker,
+            max_concurrent_per_tenant,
+            batch_size,
+            batch_writers,
+            fetch_read_timeout_secs,
+            skip_unchanged,
+            index_queue,
+            index_concurrency,
+            index_coalesce,
+            index_max_wait_secs,
+            index_page_bytes,
+            lease_duration_secs,
+            heartbeat_interval_secs,
+            cleanup_interval_secs,
+            block_concurrent_submission,
+            client_id,
+            private_key,
+            signing_alg,
+            decryption_key,
+            outbound_scope,
+            retry_after_secs,
+            pre_ingest_retry_after_secs,
+            manifest_page_size,
+            poll_rate_limit,
+            poll_rate_window_secs,
+            status_waits_for_index,
+        } = self;
+        f.debug_struct("BulkSubmitConfig")
+            .field("enabled", enabled)
+            .field("output_backend", output_backend)
+            .field("output_dir", output_dir)
+            .field("s3_bucket", s3_bucket)
+            .field("requires_access_token", requires_access_token)
+            .field("file_url_ttl_secs", file_url_ttl_secs)
+            .field("output_ttl_secs", output_ttl_secs)
+            .field("worker_concurrency", worker_concurrency)
+            .field("file_concurrency", file_concurrency)
+            .field("defer_indexing", defer_indexing)
+            .field("bulk_index_rebuild", bulk_index_rebuild)
+            .field("reindex_since_margin_secs", reindex_since_margin_secs)
+            .field("reindex_ids_max", reindex_ids_max)
+            .field("disable_local_worker", disable_local_worker)
+            .field("max_concurrent_per_tenant", max_concurrent_per_tenant)
+            .field("batch_size", batch_size)
+            .field("batch_writers", batch_writers)
+            .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("skip_unchanged", skip_unchanged)
+            .field("index_queue", index_queue)
+            .field("index_concurrency", index_concurrency)
+            .field("index_coalesce", index_coalesce)
+            .field("index_max_wait_secs", index_max_wait_secs)
+            .field("index_page_bytes", index_page_bytes)
+            .field("lease_duration_secs", lease_duration_secs)
+            .field("heartbeat_interval_secs", heartbeat_interval_secs)
+            .field("cleanup_interval_secs", cleanup_interval_secs)
+            .field("block_concurrent_submission", block_concurrent_submission)
+            .field("client_id", client_id)
+            .field("private_key", &private_key.as_ref().map(|_| "[redacted]"))
+            .field("signing_alg", signing_alg)
+            .field(
+                "decryption_key",
+                &decryption_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("outbound_scope", outbound_scope)
+            .field("retry_after_secs", retry_after_secs)
+            .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
+            .field("manifest_page_size", manifest_page_size)
+            .field("poll_rate_limit", poll_rate_limit)
+            .field("poll_rate_window_secs", poll_rate_window_secs)
+            .field("status_waits_for_index", status_waits_for_index)
+            .finish()
+    }
+}
+
 impl Default for BulkSubmitConfig {
     fn default() -> Self {
         Self {
@@ -791,10 +1436,14 @@ impl Default for BulkSubmitConfig {
             disable_local_worker: false,
             defer_indexing: true,
             bulk_index_rebuild: false,
+            reindex_since_margin_secs: 15 * 60,
+            reindex_ids_max: 50_000,
             max_concurrent_per_tenant: 4,
-            batch_size: 100,
+            batch_size: 1000,
+            batch_writers: 4,
             fetch_read_timeout_secs: 60,
             skip_unchanged: false,
+            status_waits_for_index: true,
             index_queue: 16,
             index_concurrency: 4,
             index_coalesce: 4,
@@ -878,8 +1527,29 @@ impl BulkSubmitConfig {
         }
     }
 
-    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
+    /// The defaults for a deployment: [`Self::default`] with
+    /// [`Self::defer_indexing`] `false` when `mode` offloads search to an
+    /// Elasticsearch secondary (index batch by batch during the ingest) and
+    /// `true` otherwise. `None` — the mode is unknown or invalid — keeps the
+    /// primary-owns-search default.
+    pub fn defaults_for(mode: Option<StorageBackendMode>) -> Self {
+        Self {
+            defer_indexing: !mode.is_some_and(StorageBackendMode::offloads_search),
+            ..Self::default()
+        }
+    }
+
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars over
+    /// the primary-owns-search defaults ([`Self::default`]). The server
+    /// resolves its defaults from the storage mode first
+    /// ([`Self::from_env_with_defaults`]).
     pub fn from_env() -> Self {
+        Self::from_env_with_defaults(Self::default())
+    }
+
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars,
+    /// taking every unset variable from `d` (see [`Self::defaults_for`]).
+    pub fn from_env_with_defaults(d: Self) -> Self {
         fn env_bool(key: &str, default: bool) -> bool {
             std::env::var(key)
                 .map(|s| {
@@ -900,7 +1570,6 @@ impl BulkSubmitConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default)
         }
-        let d = Self::default();
         Self {
             enabled: env_bool("HFS_BULK_SUBMIT_ENABLED", d.enabled),
             output_backend: std::env::var("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
@@ -918,6 +1587,11 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_BULK_INDEX_REBUILD",
                 d.bulk_index_rebuild,
             ),
+            reindex_since_margin_secs: env_u64(
+                "HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN",
+                d.reindex_since_margin_secs,
+            ),
+            reindex_ids_max: env_u64("HFS_BULK_SUBMIT_REINDEX_IDS_MAX", d.reindex_ids_max),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
@@ -927,11 +1601,16 @@ impl BulkSubmitConfig {
                 d.max_concurrent_per_tenant,
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            batch_writers: env_u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
             fetch_read_timeout_secs: env_u64(
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
             ),
             skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
+            status_waits_for_index: env_bool(
+                "HFS_BULK_SUBMIT_STATUS_WAITS_FOR_INDEX",
+                d.status_waits_for_index,
+            ),
             index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
             index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
             index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
@@ -1024,6 +1703,9 @@ impl BulkSubmitConfig {
         if self.batch_size == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
         }
+        if self.batch_writers == 0 {
+            errors.push("HFS_BULK_SUBMIT_BATCH_WRITERS must be >= 1".to_string());
+        }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
         }
@@ -1075,7 +1757,8 @@ impl BulkSubmitConfig {
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
-#[derive(Debug, Clone, Parser)]
+// `Debug` is hand-written below: it redacts credentials (#2149).
+#[derive(Clone, Parser)]
 // `long_about = None` keeps `--help` on the one-line `about`: clap would
 // otherwise print this struct's Rust doc comment (a note about constructors
 // that means nothing to an operator) at the top of the help text.
@@ -1176,7 +1859,7 @@ pub struct ServerConfig {
     pub base_url: String,
 
     /// Database connection string.
-    #[arg(long, env = "HFS_DATABASE_URL")]
+    #[arg(long, env = "HFS_DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
 
     /// Enable request ID tracking.
@@ -1201,11 +1884,19 @@ pub struct ServerConfig {
 
     /// Default FHIR version for operations that need it before request parsing
     /// (e.g., tenant resolution, resource type detection).
+    ///
+    /// Defaults to R4. A build without the `R4` feature has no R4 to fall back
+    /// to: with a single enabled version that version is the default
+    /// (`FhirVersion::default_enabled()`; a literal "R4" default failed to
+    /// parse in such builds, #2064), and with several there is no default, so
+    /// `hfs` refuses to start unless this is set
+    /// ([`ServerConfig::implicit_default_fhir_version_error`]). R5/R6 builds
+    /// always include R4B, so they must set it.
     #[arg(
         long,
         env = "HFS_DEFAULT_FHIR_VERSION",
         value_enum,
-        default_value = "R4"
+        default_value_t = FhirVersion::default_enabled()
     )]
     pub default_fhir_version: FhirVersion,
 
@@ -1241,13 +1932,54 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
     pub storage_backend: String,
 
+    /// Declares this process one of N instances behind a load balancer.
+    ///
+    /// Flips cluster-safe defaults (e.g. the unified job store backend) and
+    /// makes the server fail fast at boot on configurations that cannot be
+    /// clustered instead of silently degrading.
+    #[arg(long, env = "HFS_CLUSTER", default_value = "false")]
+    pub cluster: bool,
+
+    /// Unified async-job store backend: "memory" (in-process, single
+    /// instance) or "database" (shared primary database, cluster-capable).
+    ///
+    /// Unset resolves to "memory", or to "database" when `HFS_CLUSTER=true`.
+    /// Parsed ahead of the unified-job-store phases; not consumed yet.
+    #[arg(long, env = "HFS_JOB_STORE_BACKEND", default_value = "")]
+    pub job_store_backend: String,
+
+    /// How often (milliseconds) a cluster instance (`HFS_CLUSTER=true`) polls
+    /// the shared database for definition changes written by other instances:
+    /// stored StructureDefinitions (the validation profile registry) and
+    /// SearchParameters (the search registry). Bounds how long a profile or
+    /// SearchParameter installed through one instance is unknown to the
+    /// others. `0` disables the sync.
+    #[arg(long, env = "HFS_CLUSTER_SYNC_INTERVAL_MS", default_value = "1000")]
+    pub cluster_sync_interval_ms: u64,
+
+    /// Enables the topic-based Subscriptions engine.
+    ///
+    /// Kept as a raw string for backward-compatible truthiness ("false"/"0"
+    /// and unset disable; anything else enables) — resolved by
+    /// [`ServerConfig::subscriptions_enabled`].
+    #[arg(long, env = "HFS_SUBSCRIPTIONS_ENABLED", default_value = "")]
+    pub subscriptions_enabled: String,
+
+    /// Subscriptions event fan-out: "memory" (per-instance) or "pg-notify"
+    /// (cluster-capable, Postgres primary).
+    ///
+    /// Unset resolves to "memory", or to "pg-notify" when `HFS_CLUSTER=true`.
+    #[arg(long, env = "HFS_SUBSCRIPTIONS_FANOUT", default_value = "")]
+    pub subscriptions_fanout: String,
+
     /// Elasticsearch node URLs (comma-separated).
     /// Used when storage_backend is sqlite-elasticsearch, postgres-elasticsearch,
     /// or mongodb-elasticsearch.
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_NODES",
-        default_value = "http://localhost:9200"
+        default_value = "http://localhost:9200",
+        hide_env_values = true
     )]
     pub elasticsearch_nodes: String,
 
@@ -1260,12 +1992,14 @@ pub struct ServerConfig {
     pub elasticsearch_username: Option<String>,
 
     /// Elasticsearch basic auth password (optional).
-    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
+    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD", hide_env_values = true)]
     pub elasticsearch_password: Option<String>,
 
     /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
     /// periodic refresh). Controls how quickly indexed documents become
-    /// searchable when no per-write refresh is requested.
+    /// searchable when no per-write refresh is requested. Set on new indices
+    /// when they are created and applied to existing indices at startup. With
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` it is the wait of every write.
     #[arg(long, env = "HFS_ELASTICSEARCH_REFRESH_INTERVAL", default_value = "1s")]
     pub elasticsearch_refresh_interval: String,
 
@@ -1323,25 +2057,42 @@ pub struct ServerConfig {
     )]
     pub elasticsearch_bulk_max_bytes: usize,
 
-    /// How many Elasticsearch `_bulk` requests of one page may be in flight
-    /// at once. `1` (the default) sends them one at a time, as every release
-    /// before #1125 did; raising it shortens a rebuild when the cluster is not
-    /// the bottleneck. Splitting after a `413` or a timeout, and `429`
-    /// back-off, stay sequential within the request that caused them.
-    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
+    /// How many Elasticsearch `_bulk` requests of one page are in flight at
+    /// once. The page is cut into this many requests (at most one
+    /// per 250 operations), so the setting is what goes out: `4` (the default)
+    /// sends a 1,000-resource page as four concurrent requests of 250, `1`
+    /// as two sequential requests of 500, as every release before #1749
+    /// did. Splitting after a `413` or a timeout, and `429` back-off, stay
+    /// sequential within the request that caused them.
+    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "4")]
     pub elasticsearch_bulk_concurrency: usize,
 
-    /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
-    /// "false", "wait_for" or "true". Unset follows
-    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
-    /// per-request refresh wait while ordinary writes keep `wait_for`.
+    /// Most contained-document sweeps (the `_delete_by_query` that removes a
+    /// container's stale `contained[]` documents) in flight at once. `0` (the
+    /// default) keeps the built-in 16. Each sweep opens a scroll context on
+    /// every shard it visits and Elasticsearch allows 500 in all
+    /// (`search.max_open_scroll_context`); a burst beyond that is answered
+    /// `429 too_many_scroll_contexts`.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY",
+        default_value = "0"
+    )]
+    pub elasticsearch_contained_sweep_concurrency: usize,
+
+    /// Refresh behavior for `$reindex`, the deferred post-import rebuild and
+    /// the index-during-ingest sink: "false", "wait_for" or "true". Unset
+    /// means no per-request refresh on those bulk writes, whatever
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH` says: inheriting `wait_for` put one
+    /// `refresh_interval` wait on every `_bulk` request (#1749).
     #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
     pub elasticsearch_reindex_refresh: Option<String>,
 
     /// Threads that extract search values for one Elasticsearch `$reindex`
-    /// page (the composite deployments' rebuild). `0` (the default) uses
-    /// cores − 1, clamped to 1–4; `1` extracts on the page's own thread, as
-    /// before #1250; an explicit value is capped at 64.
+    /// page (the composite deployments' rebuild and the index-during-ingest
+    /// sink). `0` (the default) uses cores − 1, clamped to 1–16; `1`
+    /// extracts on the page's own thread, as before #1250; an explicit value
+    /// is capped at 64.
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS",
@@ -1368,15 +2119,63 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Search-index rebuild writers on standalone PostgreSQL: how many
+    /// 128-resource write groups of a rebuild page run at once, shared by
+    /// `POST $reindex` and the automatic rebuild after a deferred-indexing
+    /// bulk submit. The effective width is the larger of this and
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, capped by the connection pool.
+    /// It used to follow the file concurrency alone, whose default of 1 made
+    /// the rebuild a single writer (~900 resources/s, four times the ingest
+    /// it followed). `1` restores that.
+    #[arg(long, env = "HFS_REINDEX_CONCURRENCY", default_value = "4")]
+    pub reindex_concurrency: u32,
+    /// Page streams per resource type of the automatic search-index rebuild:
+    /// how many id ranges of a type are fetched and written at once. `auto`
+    /// (the default) is half the cores, at most 8; `1` keeps one serial page
+    /// loop. Every writer caps it — SQLite's single writer always runs one
+    /// stream, standalone PostgreSQL at most its reindex width, MongoDB at
+    /// most 8 (and its pool), Elasticsearch 8. Manual `POST $reindex` runs
+    /// use `auto`. Measured on the 72k mix (deferred bulk submit, rebuild
+    /// only): MongoDB 17.2 s → 7.3 s, mongo-es 13.5 s → 6.4 s, pg-es
+    /// 13.3 s → 5.8 s, sqlite-es 12.2 s → 6.3–8.9 s, standalone PostgreSQL
+    /// 9.6 s → 7.9 s on top of the reindex width; 300k pg-es 56 s → 12 s.
+    #[arg(
+        long,
+        env = "HFS_REINDEX_STREAMS",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub reindex_streams: u32,
+
+    /// Concurrent write groups of the PostgreSQL search-index rebuild on the
+    /// standalone `postgres` backend (`with_reindex_concurrency`): how many
+    /// 128-resource groups of a page are in flight at once. `auto` (the
+    /// default) is a quarter of the connection pool, at most 8 (and at least
+    /// 1; pools of 32 and more reach 8); an explicit value is capped by the
+    /// pool. Measured on the 72k mix with one page stream: width 1 27.1 s,
+    /// width 8 9.6 s. Before this setting the width followed
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which left it at 1 on every default
+    /// deployment. Ignored on composites (pg-es), where
+    /// PostgreSQL is not a rebuild writer.
+    #[arg(
+        long,
+        env = "HFS_POSTGRES_REINDEX_WIDTH",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub postgres_reindex_width: u32,
+
     /// Whether the search-index rebuild fetches the next page from the
     /// primary while the current one is written (`true`, the default), or
     /// keeps the strictly serial fetch → write loop (`false`). Applies to
     /// `POST $reindex` and the automatic post-import rebuild alike, on every
-    /// backend whose source allows the overlap: standalone MongoDB and
-    /// `mongo-es` (id phase), and `sqlite-es`, `postgres-es` and `s3-es`,
-    /// where search is offloaded so the page read and the Elasticsearch
-    /// write touch disjoint stores (#1250). `HFS_MONGODB_REINDEX_PREFETCH`
-    /// stays the MongoDB-specific switch underneath.
+    /// backend whose source allows the overlap: standalone SQLite,
+    /// PostgreSQL and MongoDB, whose page read touches only stored resources
+    /// that no page write changes; `mongo-es` (id phase); and `sqlite-es`,
+    /// `postgres-es` and `s3-es`, where search is offloaded so the page read
+    /// and the Elasticsearch write touch disjoint stores (#1250).
+    /// `HFS_MONGODB_REINDEX_PREFETCH` stays the MongoDB-specific switch
+    /// underneath.
     #[arg(
         long,
         env = "HFS_REINDEX_PREFETCH",
@@ -1392,23 +2191,25 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
-    /// Mount the web UI at `/ui`.
+    /// Mount the web UI at `/ui` and run its dashboard's background work.
     ///
     /// On by default. Headless deployments (behind an API gateway, or anywhere
     /// an HTML surface should not listen at all) opt out with
     /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
     /// `404` + OperationOutcome rather than falling through to the FHIR
-    /// router. This replaces the former `headless` *build* feature, which was
-    /// a negative Cargo feature and so was tripped accidentally by
-    /// `--all-features` (see issue #975).
+    /// router, and the Home dashboard performs no startup seed or background
+    /// reconcile storage reads. This replaces the former `headless` *build*
+    /// feature, which was a negative Cargo feature and so was tripped
+    /// accidentally by `--all-features` (see issue #975).
     ///
-    /// Has no effect on a binary built without the `ui` feature — there the UI
-    /// is not compiled in at all and `/ui` always answers `404`.
+    /// A `hfs` binary built without the `ui` feature normalizes this flag to
+    /// `false`: `/ui` always answers `404`, and dashboard background work is
+    /// skipped. The shared REST configuration's default remains `true`.
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 
     /// Seconds between the web UI dashboard's background reconcile passes
-    /// (#1078).
+    /// (#1078). Used only when the web UI is served.
     ///
     /// Each pass re-reads the per-type totals of the tenants that are due and
     /// re-seeds their charted history, so the dashboard's in-memory counters
@@ -1447,7 +2248,7 @@ pub struct ServerConfig {
     /// LLM provider API key for natural-language search. Present makes the
     /// feature functional; absent (with the switch on) leaves the UI in an
     /// advertise/setup state and the endpoint non-functional.
-    #[arg(long, env = "HFS_NL_SEARCH_API_KEY")]
+    #[arg(long, env = "HFS_NL_SEARCH_API_KEY", hide_env_values = true)]
     pub nl_search_api_key: Option<String>,
 
     /// LLM model id used for query translation.
@@ -1458,7 +2259,8 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_NL_SEARCH_BASE_URL",
-        default_value = "https://api.anthropic.com"
+        default_value = "https://api.anthropic.com",
+        hide_env_values = true
     )]
     pub nl_search_base_url: String,
 
@@ -1501,6 +2303,14 @@ pub struct ServerConfig {
     /// S3 region for S3 export sink (defaults to AWS credential-chain region).
     #[arg(long, env = "HFS_EXPORT_S3_REGION")]
     pub export_s3_region: Option<String>,
+
+    /// Custom S3 endpoint URL for the S3 export sink (e.g. MinIO).
+    #[arg(long, env = "HFS_EXPORT_S3_ENDPOINT", hide_env_values = true)]
+    pub export_s3_endpoint: Option<String>,
+
+    /// Use path-style S3 addressing; forced on when an endpoint is set.
+    #[arg(long, env = "HFS_EXPORT_S3_FORCE_PATH_STYLE", default_value = "false")]
+    pub export_s3_force_path_style: bool,
 
     /// Pre-signed URL TTL (seconds) for S3 export sink.
     ///
@@ -1603,8 +2413,19 @@ pub struct ServerConfig {
     ///
     /// Leave unset (default: none) to disable terminology integration.
     /// Example: `http://localhost:8090`
-    #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "HFS_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
+
+    /// Browser-reachable URL of the terminology server's console, for the
+    /// web UI's "Terminology" link. `HFS_TERMINOLOGY_SERVER` is where *this
+    /// process* calls the terminology server — behind a reverse proxy that is
+    /// an internal address (`http://hts:8090`) a browser cannot open. When
+    /// unset, the UI links to `/ui/hts` on its own origin whenever
+    /// `HFS_TERMINOLOGY_SERVER` names a loopback, private or single-label
+    /// host, and to `HFS_TERMINOLOGY_SERVER` itself otherwise.
+    /// Example: `https://fhir.example.org/ui/hts`
+    #[arg(long, env = "HFS_TERMINOLOGY_PUBLIC_URL")]
+    pub terminology_public_url: Option<String>,
 
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
@@ -1621,6 +2442,287 @@ pub struct ServerConfig {
     /// Resource validation configuration (loaded from environment variables).
     #[arg(skip)]
     pub validation: ValidationConfig,
+
+    /// FHIR package (IG) manager configuration (`HFS_PACKAGE_*`,
+    /// `HFS_PACKAGES`, `HFS_ADMIN_UI`; loaded from environment variables).
+    #[arg(skip)]
+    pub packages: PackageConfig,
+    /// Search-time terminology configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub search_terminology: SearchTerminologyConfig,
+}
+
+/// Parses an `auto`-or-count setting (`HFS_REINDEX_STREAMS`,
+/// `HFS_POSTGRES_REINDEX_WIDTH`): `auto` (any case) or `0` mean "let the
+/// server choose" and parse as `0`; otherwise a positive integer.
+fn parse_auto_or_count(value: &str) -> Result<u32, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("expected `auto` or a non-negative integer, got {value:?}"))
+}
+
+/// Prints secrets as `[redacted]` and configured URLs without their
+/// credentials, query or fragment (#2149). Destructures every field, so a new
+/// field fails to compile until it is listed here.
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            max_body_size,
+            request_timeout,
+            batch_max_concurrency,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            default_tenant,
+            base_url,
+            database_url,
+            enable_request_id,
+            return_gone,
+            enable_versioning,
+            require_if_match,
+            default_fhir_version,
+            data_dir,
+            search_param_cache_ttl,
+            default_page_size,
+            max_page_size,
+            everything_max_unpaged,
+            storage_backend,
+            elasticsearch_nodes,
+            elasticsearch_index_prefix,
+            elasticsearch_username,
+            elasticsearch_password,
+            elasticsearch_refresh_interval,
+            elasticsearch_write_refresh,
+            elasticsearch_nested_objects_limit,
+            elasticsearch_max_terms_count,
+            elasticsearch_request_timeout_ms,
+            elasticsearch_bulk_max_bytes,
+            elasticsearch_bulk_concurrency,
+            elasticsearch_contained_sweep_concurrency,
+            elasticsearch_reindex_refresh,
+            elasticsearch_reindex_prepare_threads,
+            reindex_batch_size,
+            reindex_batch_bytes,
+            reindex_streams,
+            postgres_reindex_width,
+            reindex_prefetch,
+            sof_enabled,
+            ui_enabled,
+            dashboard_reconcile_interval_secs,
+            dashboard_refresh_secs,
+            dashboard_idle_refresh_secs,
+            nl_search_enabled,
+            nl_search_api_key,
+            nl_search_model,
+            nl_search_base_url,
+            nl_search_rate_limit,
+            nl_search_rate_window_secs,
+            nl_search_daily_limit,
+            nl_search_max_chars,
+            seed_conformance,
+            export_sink,
+            export_dir,
+            export_s3_bucket,
+            export_s3_region,
+            export_s3_endpoint,
+            export_s3_force_path_style,
+            export_presign_ttl_secs,
+            export_max_concurrency,
+            export_max_jobs_per_tenant,
+            export_shard_rows,
+            export_controller,
+            export_output_ttl_secs,
+            export_cleanup_interval_secs,
+            sof_sqlquery_max_rows,
+            sof_sqlquery_max_source_rows_per_vd,
+            sof_sqlquery_max_vds,
+            sof_sqlquery_timeout_secs,
+            sof_runner_header,
+            terminology_server,
+            multitenancy,
+            bulk_export,
+            bulk_submit,
+            validation,
+            cluster,
+            job_store_backend,
+            cluster_sync_interval_ms,
+            subscriptions_enabled,
+            subscriptions_fanout,
+            reindex_concurrency,
+            terminology_public_url,
+            packages,
+            search_terminology,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("max_body_size", max_body_size)
+            .field("request_timeout", request_timeout)
+            .field("batch_max_concurrency", batch_max_concurrency)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field("default_tenant", default_tenant)
+            .field("base_url", base_url)
+            .field(
+                "database_url",
+                &database_url
+                    .as_deref()
+                    .map(|url| debug_database_url(url, storage_backend)),
+            )
+            .field("enable_request_id", enable_request_id)
+            .field("return_gone", return_gone)
+            .field("enable_versioning", enable_versioning)
+            .field("require_if_match", require_if_match)
+            .field("default_fhir_version", default_fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_param_cache_ttl", search_param_cache_ttl)
+            .field("default_page_size", default_page_size)
+            .field("max_page_size", max_page_size)
+            .field("everything_max_unpaged", everything_max_unpaged)
+            .field("storage_backend", storage_backend)
+            .field("elasticsearch_nodes", &redact_url_list(elasticsearch_nodes))
+            .field("elasticsearch_index_prefix", elasticsearch_index_prefix)
+            .field("elasticsearch_username", elasticsearch_username)
+            .field(
+                "elasticsearch_password",
+                &elasticsearch_password.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "elasticsearch_refresh_interval",
+                elasticsearch_refresh_interval,
+            )
+            .field("elasticsearch_write_refresh", elasticsearch_write_refresh)
+            .field(
+                "elasticsearch_nested_objects_limit",
+                elasticsearch_nested_objects_limit,
+            )
+            .field(
+                "elasticsearch_max_terms_count",
+                elasticsearch_max_terms_count,
+            )
+            .field(
+                "elasticsearch_request_timeout_ms",
+                elasticsearch_request_timeout_ms,
+            )
+            .field("elasticsearch_bulk_max_bytes", elasticsearch_bulk_max_bytes)
+            .field(
+                "elasticsearch_bulk_concurrency",
+                elasticsearch_bulk_concurrency,
+            )
+            .field(
+                "elasticsearch_contained_sweep_concurrency",
+                elasticsearch_contained_sweep_concurrency,
+            )
+            .field(
+                "elasticsearch_reindex_refresh",
+                elasticsearch_reindex_refresh,
+            )
+            .field(
+                "elasticsearch_reindex_prepare_threads",
+                elasticsearch_reindex_prepare_threads,
+            )
+            .field("reindex_batch_size", reindex_batch_size)
+            .field("reindex_batch_bytes", reindex_batch_bytes)
+            .field("reindex_streams", reindex_streams)
+            .field("postgres_reindex_width", postgres_reindex_width)
+            .field("reindex_prefetch", reindex_prefetch)
+            .field("sof_enabled", sof_enabled)
+            .field("ui_enabled", ui_enabled)
+            .field(
+                "dashboard_reconcile_interval_secs",
+                dashboard_reconcile_interval_secs,
+            )
+            .field("dashboard_refresh_secs", dashboard_refresh_secs)
+            .field("dashboard_idle_refresh_secs", dashboard_idle_refresh_secs)
+            .field("nl_search_enabled", nl_search_enabled)
+            .field(
+                "nl_search_api_key",
+                &nl_search_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("nl_search_model", nl_search_model)
+            .field("nl_search_base_url", &redact_url(nl_search_base_url))
+            .field("nl_search_rate_limit", nl_search_rate_limit)
+            .field("nl_search_rate_window_secs", nl_search_rate_window_secs)
+            .field("nl_search_daily_limit", nl_search_daily_limit)
+            .field("nl_search_max_chars", nl_search_max_chars)
+            .field("seed_conformance", seed_conformance)
+            .field("export_sink", export_sink)
+            .field("export_dir", export_dir)
+            .field("export_s3_bucket", export_s3_bucket)
+            .field("export_s3_region", export_s3_region)
+            .field(
+                "export_s3_endpoint",
+                &export_s3_endpoint.as_deref().map(redact_url),
+            )
+            .field("export_s3_force_path_style", export_s3_force_path_style)
+            .field("export_presign_ttl_secs", export_presign_ttl_secs)
+            .field("export_max_concurrency", export_max_concurrency)
+            .field("export_max_jobs_per_tenant", export_max_jobs_per_tenant)
+            .field("export_shard_rows", export_shard_rows)
+            .field("export_controller", export_controller)
+            .field("export_output_ttl_secs", export_output_ttl_secs)
+            .field("export_cleanup_interval_secs", export_cleanup_interval_secs)
+            .field("sof_sqlquery_max_rows", sof_sqlquery_max_rows)
+            .field(
+                "sof_sqlquery_max_source_rows_per_vd",
+                sof_sqlquery_max_source_rows_per_vd,
+            )
+            .field("sof_sqlquery_max_vds", sof_sqlquery_max_vds)
+            .field("sof_sqlquery_timeout_secs", sof_sqlquery_timeout_secs)
+            .field("sof_runner_header", sof_runner_header)
+            .field(
+                "terminology_server",
+                &terminology_server.as_deref().map(redact_url),
+            )
+            .field("multitenancy", multitenancy)
+            .field("bulk_export", bulk_export)
+            .field("bulk_submit", bulk_submit)
+            .field("validation", validation)
+            .field("cluster", cluster)
+            .field("job_store_backend", job_store_backend)
+            .field("cluster_sync_interval_ms", cluster_sync_interval_ms)
+            .field("subscriptions_enabled", subscriptions_enabled)
+            .field("subscriptions_fanout", subscriptions_fanout)
+            .field("reindex_concurrency", reindex_concurrency)
+            .field("terminology_public_url", &terminology_public_url.as_deref().map(redact_url))
+            .field("packages", packages)
+            .field("search_terminology", search_terminology)
+            .finish()
+    }
+}
+
+/// `url` for `Debug` output: the location the primary backend of
+/// `storage_backend` would read from it, credentials and options removed.
+fn debug_database_url(url: &str, storage_backend: &str) -> String {
+    let backend = match storage_backend
+        .parse::<StorageBackendMode>()
+        .map(StorageBackendMode::primary_backend_kind)
+    {
+        Ok(BackendKind::Sqlite) => "sqlite",
+        Ok(BackendKind::Postgres) => "postgres",
+        Ok(BackendKind::MongoDB) => "mongodb",
+        _ => "",
+    };
+    redact_database_url(url, backend)
+}
+
+/// A comma-separated URL list, each entry passed through [`redact_url`].
+fn redact_url_list(urls: &str) -> String {
+    urls.split(',')
+        .map(|url| redact_url(url.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
@@ -1631,7 +2733,31 @@ impl ServerConfig {
     /// Loads configuration for the HFS binary and reports command-line,
     /// environment, and validation errors to the caller.
     pub fn try_from_env() -> Result<Self, clap::Error> {
-        Self::finish_parsed(Self::try_parse()?)
+        Self::try_from_env_with_provenance().map(|(config, _)| config)
+    }
+
+    /// Like [`ServerConfig::try_from_env`], and also reports whether
+    /// `default_fhir_version` came from its built-in default (`true`) rather
+    /// than from `--default-fhir-version` or `HFS_DEFAULT_FHIR_VERSION`.
+    ///
+    /// Pass the flag to [`ServerConfig::implicit_default_fhir_version_error`].
+    pub fn try_from_env_with_provenance() -> Result<(Self, bool), clap::Error> {
+        Self::try_parse_from_with_provenance(std::env::args_os())
+    }
+
+    /// [`ServerConfig::try_from_env_with_provenance`] over an explicit
+    /// argument list, whose first item is the program name.
+    pub fn try_parse_from_with_provenance<I, T>(args: I) -> Result<(Self, bool), clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut matches = Self::command().try_get_matches_from(args)?;
+        let version_is_implicit = matches.value_source("default_fhir_version")
+            == Some(clap::parser::ValueSource::DefaultValue);
+        let parsed = Self::from_arg_matches_mut(&mut matches)
+            .map_err(|error| error.format(&mut Self::command()))?;
+        Ok((Self::finish_parsed(parsed)?, version_is_implicit))
     }
 
     fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
@@ -1639,6 +2765,8 @@ impl ServerConfig {
         config.bulk_export = BulkExportConfig::from_env();
         config.bulk_submit = BulkSubmitConfig::from_env();
         config.validation = ValidationConfig::from_env();
+        config.packages = PackageConfig::from_env();
+        config.search_terminology = SearchTerminologyConfig::from_env();
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
@@ -1651,6 +2779,61 @@ impl ServerConfig {
     /// Parses the storage backend mode from the string field.
     pub fn storage_backend_mode(&self) -> Result<StorageBackendMode, String> {
         self.storage_backend.parse()
+    }
+
+    /// Resolves the unified async-job store backend.
+    ///
+    /// An unset value defaults to [`JobStoreBackend::Database`] when
+    /// `cluster` is set and [`JobStoreBackend::Memory`] otherwise
+    /// (docs/cluster-capable-state-design.md §6).
+    pub fn job_store_backend_mode(&self) -> Result<JobStoreBackend, String> {
+        match self.job_store_backend.to_lowercase().as_str() {
+            "" => Ok(if self.cluster {
+                JobStoreBackend::Database
+            } else {
+                JobStoreBackend::Memory
+            }),
+            "memory" => Ok(JobStoreBackend::Memory),
+            "database" | "db" => Ok(JobStoreBackend::Database),
+            other => Err(format!(
+                "Invalid job store backend '{}'. Valid values: memory, database",
+                other
+            )),
+        }
+    }
+
+    /// Whether the Subscriptions engine is enabled
+    /// (`HFS_SUBSCRIPTIONS_ENABLED`): unset, "false", and "0" disable;
+    /// anything else enables (the historical truthiness).
+    pub fn subscriptions_enabled(&self) -> bool {
+        !matches!(
+            self.subscriptions_enabled
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "" | "false" | "0"
+        )
+    }
+
+    /// Resolves the subscriptions fan-out backend.
+    ///
+    /// An unset value defaults to [`SubscriptionsFanoutMode::PgNotify`] when
+    /// `cluster` is set and [`SubscriptionsFanoutMode::Memory`] otherwise
+    /// (docs/cluster-capable-state-design.md §Class B).
+    pub fn subscriptions_fanout_mode(&self) -> Result<SubscriptionsFanoutMode, String> {
+        match self.subscriptions_fanout.to_lowercase().as_str() {
+            "" => Ok(if self.cluster {
+                SubscriptionsFanoutMode::PgNotify
+            } else {
+                SubscriptionsFanoutMode::Memory
+            }),
+            "memory" => Ok(SubscriptionsFanoutMode::Memory),
+            "pg-notify" | "pg_notify" | "pgnotify" => Ok(SubscriptionsFanoutMode::PgNotify),
+            other => Err(format!(
+                "Invalid subscriptions fanout '{}'. Valid values: memory, pg-notify",
+                other
+            )),
+        }
     }
 }
 
@@ -1681,6 +2864,11 @@ impl Default for ServerConfig {
             max_page_size: 1000,
             everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
+            subscriptions_enabled: String::new(),
+            subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -1691,11 +2879,15 @@ impl Default for ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_concurrency: 4,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
@@ -1715,6 +2907,8 @@ impl Default for ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
+            export_s3_endpoint: None,
+            export_s3_force_path_style: false,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_max_jobs_per_tenant: 8,
@@ -1728,10 +2922,13 @@ impl Default for ServerConfig {
             sof_sqlquery_timeout_secs: 30,
             sof_runner_header: false,
             terminology_server: None,
+            terminology_public_url: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
+            packages: PackageConfig::default(),
+            search_terminology: SearchTerminologyConfig::default(),
         }
     }
 }
@@ -1748,10 +2945,15 @@ impl ServerConfig {
         config.multitenancy = MultitenancyConfig::from_env();
         // Load bulk export config from environment
         config.bulk_export = BulkExportConfig::from_env();
-        // Load bulk submit config from environment
-        config.bulk_submit = BulkSubmitConfig::from_env();
+        // Load bulk submit config from environment, over the defaults the
+        // storage mode selects (index during ingest on ES composites).
+        config.bulk_submit = BulkSubmitConfig::from_env_with_defaults(
+            BulkSubmitConfig::defaults_for(config.storage_backend_mode().ok()),
+        );
         // Load validation config from environment
         config.validation = ValidationConfig::from_env();
+        config.packages = PackageConfig::from_env();
+        config.search_terminology = SearchTerminologyConfig::from_env();
         config
     }
 
@@ -1761,6 +2963,26 @@ impl ServerConfig {
             .as_str()
             .to_string();
         Ok(())
+    }
+
+    /// Returns a startup error when `default_fhir_version` was not chosen by
+    /// the operator and this build has no R4 to default to.
+    ///
+    /// `version_is_implicit` is the flag from
+    /// [`ServerConfig::try_from_env_with_provenance`]. Without the `R4` feature
+    /// the built-in default is the first enabled version. Every R5 or R6 build
+    /// also enables R4B (helios-audit turns it on), so that first version would
+    /// be R4B, and a server left on it would parse, store and advertise R4B
+    /// (4.3.0) for requests that name no version. That is hard to undo once
+    /// data is written (#2064), so the operator has to choose. A build with a
+    /// single enabled version (for example R4B only) has nothing to choose
+    /// between, and a build with R4 defaults to R4; neither returns an error.
+    pub fn implicit_default_fhir_version_error(&self, version_is_implicit: bool) -> Option<String> {
+        let enabled: Vec<&str> = FhirVersion::enabled_versions()
+            .iter()
+            .map(|version| version.as_str())
+            .collect();
+        implicit_default_fhir_version_error_for(&enabled, version_is_implicit)
     }
 
     /// Returns why a loopback public base is unsafe for the configured listener.
@@ -1908,6 +3130,63 @@ impl ServerConfig {
             ));
         }
 
+        if let Err(job_store_error) = self.job_store_backend_mode() {
+            errors.push(job_store_error);
+        }
+
+        if let Err(fanout_error) = self.subscriptions_fanout_mode() {
+            errors.push(fanout_error);
+        }
+
+        // The export sink is only wired when SQL-on-FHIR is, so a leftover
+        // `HFS_EXPORT_*` setting on a server with SoF off is not an error.
+        if self.sof_enabled {
+            match self.export_sink.trim().to_lowercase().as_str() {
+                "fs" => {}
+                "s3" => {
+                    if !cfg!(feature = "s3") {
+                        errors.push(
+                            "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                             Build with: cargo build -p helios-hfs --features s3"
+                                .to_string(),
+                        );
+                    }
+                    if self
+                        .export_s3_bucket
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .is_none()
+                    {
+                        errors.push(
+                            "HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3".to_string(),
+                        );
+                    }
+                    if let Some(endpoint) = self
+                        .export_s3_endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                    {
+                        let valid = url::Url::parse(endpoint).is_ok_and(|u| {
+                            matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+                        });
+                        if !valid {
+                            errors.push(format!(
+                                "HFS_EXPORT_S3_ENDPOINT must be an http(s) URL with a host, \
+                                 e.g. http://localhost:9000; got '{endpoint}'"
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    errors.push(format!(
+                        "HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"
+                    ));
+                }
+            }
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -1920,11 +3199,20 @@ impl ServerConfig {
             errors.append(&mut validation_errors);
         }
 
+        if let Err(mut search_errors) = self.search_terminology.validate() {
+            errors.append(&mut search_errors);
+        }
+
         // Remote terminology checking needs a terminology server to call.
-        if self.validation.terminology == "remote" && self.terminology_server.is_none() {
-            errors.push(
-                "HFS_VALIDATION_TERMINOLOGY=remote requires HFS_TERMINOLOGY_SERVER".to_string(),
-            );
+        if matches!(
+            self.validation.terminology.as_str(),
+            "remote" | "remote-only"
+        ) && self.terminology_server.is_none()
+        {
+            errors.push(format!(
+                "HFS_VALIDATION_TERMINOLOGY={} requires HFS_TERMINOLOGY_SERVER",
+                self.validation.terminology
+            ));
         }
 
         if errors.is_empty() {
@@ -1964,6 +3252,11 @@ impl ServerConfig {
             max_page_size: 100,
             everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
+            cluster: false,
+            job_store_backend: String::new(),
+            cluster_sync_interval_ms: 1000,
+            subscriptions_enabled: String::new(),
+            subscriptions_fanout: String::new(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
@@ -1974,11 +3267,15 @@ impl ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_concurrency: 4,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
@@ -1998,6 +3295,8 @@ impl ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
+            export_s3_endpoint: None,
+            export_s3_force_path_style: false,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_max_jobs_per_tenant: 8,
@@ -2011,10 +3310,17 @@ impl ServerConfig {
             sof_sqlquery_timeout_secs: 30,
             sof_runner_header: false,
             terminology_server: None,
+            terminology_public_url: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
             validation: ValidationConfig::default(),
+            packages: PackageConfig::default(),
+            // Tests count `$expand` calls per search; caching would hide them.
+            search_terminology: SearchTerminologyConfig {
+                expansion_cache_ttl_secs: 0,
+                ..SearchTerminologyConfig::default()
+            },
         }
     }
 
@@ -2024,9 +3330,60 @@ impl ServerConfig {
     }
 }
 
+/// Decides whether an implicit default FHIR version is a startup error, given
+/// the names of the versions this build enables.
+///
+/// Takes plain names rather than reading [`FhirVersion::enabled_versions`] so
+/// the decision and its message can be unit-tested in any build, including the
+/// default R4 build where the error never fires.
+fn implicit_default_fhir_version_error_for(
+    enabled: &[&str],
+    version_is_implicit: bool,
+) -> Option<String> {
+    let has_r4 = enabled.contains(&"R4");
+    if !version_is_implicit || has_r4 || enabled.len() < 2 {
+        return None;
+    }
+
+    let enabled_list = enabled.join(", ");
+    Some(format!(
+        "HFS_DEFAULT_FHIR_VERSION is not set and this build does not include R4, so there is \
+         no default FHIR version to fall back to. This build enables: {enabled_list}. R4B is \
+         always enabled alongside R5 and R6 because helios-audit requires it. Set \
+         HFS_DEFAULT_FHIR_VERSION (or --default-fhir-version) to one of the enabled versions"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_or_count_parses_auto_zero_and_counts() {
+        assert_eq!(parse_auto_or_count("auto"), Ok(0));
+        assert_eq!(parse_auto_or_count(" AUTO "), Ok(0));
+        assert_eq!(parse_auto_or_count("0"), Ok(0));
+        assert_eq!(parse_auto_or_count("4"), Ok(4));
+        assert!(parse_auto_or_count("-1").is_err());
+        assert!(parse_auto_or_count("many").is_err());
+    }
+
+    #[test]
+    fn reindex_streams_and_postgres_width_default_to_auto() {
+        let config = ServerConfig::try_parse_from(["hfs"]).expect("defaults parse");
+        assert_eq!(config.reindex_streams, 0);
+        assert_eq!(config.postgres_reindex_width, 0);
+        let config = ServerConfig::try_parse_from([
+            "hfs",
+            "--reindex-streams",
+            "1",
+            "--postgres-reindex-width",
+            "auto",
+        ])
+        .expect("explicit values parse");
+        assert_eq!(config.reindex_streams, 1);
+        assert_eq!(config.postgres_reindex_width, 0);
+    }
 
     #[test]
     fn test_default_config() {
@@ -2106,6 +3463,89 @@ mod tests {
     }
 
     #[test]
+    fn test_job_store_backend_default_flips_with_cluster() {
+        // Unset → memory single-instance, database when clustered.
+        let mut config = ServerConfig::default();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = true;
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+
+        // Explicit values win regardless of the cluster switch.
+        config.job_store_backend = "memory".to_string();
+        assert_eq!(config.job_store_backend_mode(), Ok(JobStoreBackend::Memory));
+        config.cluster = false;
+        config.job_store_backend = "Database".to_string();
+        assert_eq!(
+            config.job_store_backend_mode(),
+            Ok(JobStoreBackend::Database)
+        );
+    }
+
+    #[test]
+    fn test_subscriptions_fanout_default_flips_with_cluster() {
+        // Unset → memory single-instance, pg-notify when clustered.
+        let mut config = ServerConfig::default();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::Memory)
+        );
+        config.cluster = true;
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::PgNotify)
+        );
+
+        // Explicit values win regardless of the cluster switch.
+        config.subscriptions_fanout = "memory".to_string();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::Memory)
+        );
+        config.cluster = false;
+        config.subscriptions_fanout = "pg-notify".to_string();
+        assert_eq!(
+            config.subscriptions_fanout_mode(),
+            Ok(SubscriptionsFanoutMode::PgNotify)
+        );
+
+        // Invalid values fail validation, naming the valid set.
+        config.subscriptions_fanout = "zookeeper".to_string();
+        assert!(config.subscriptions_fanout_mode().is_err());
+    }
+
+    #[test]
+    fn test_subscriptions_enabled_truthiness_is_preserved() {
+        let mut config = ServerConfig::default();
+        assert!(!config.subscriptions_enabled(), "unset disables");
+        for disabled in ["false", "0", "FALSE", " false "] {
+            config.subscriptions_enabled = disabled.to_string();
+            assert!(!config.subscriptions_enabled(), "{disabled:?} disables");
+        }
+        for enabled in ["true", "1", "yes", "on"] {
+            config.subscriptions_enabled = enabled.to_string();
+            assert!(config.subscriptions_enabled(), "{enabled:?} enables");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_job_store_backend() {
+        let config = ServerConfig {
+            job_store_backend: "kafka".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Invalid job store backend 'kafka'")),
+            "expected a job-store error, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_rejects_zero_export_max_jobs_per_tenant() {
         let config = ServerConfig {
             export_max_jobs_per_tenant: 0,
@@ -2118,6 +3558,116 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("HFS_EXPORT_MAX_JOBS_PER_TENANT")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unrecognised_export_sink() {
+        let config = ServerConfig {
+            export_sink: "aws".to_string(),
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("an unrecognised export sink must fail startup validation");
+        assert!(
+            errors.iter().any(|e| e.contains("HFS_EXPORT_SINK")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_export_sink_s3_requires_bucket() {
+        for bucket in [None, Some("".to_string()), Some("   ".to_string())] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: bucket.clone(),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("s3 sink without a bucket must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_EXPORT_S3_BUCKET")),
+                "bucket {bucket:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ignores_export_sink_when_sof_disabled() {
+        let config = ServerConfig {
+            sof_enabled: false,
+            export_sink: "s3".to_string(),
+            export_s3_bucket: None,
+            export_s3_endpoint: Some("not a url".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn test_validate_export_s3_endpoint_must_be_http_url() {
+        for endpoint in ["localhost:9000", "ftp://minio:9000", "http://", "not a url"] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("a malformed endpoint must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_EXPORT_S3_ENDPOINT")),
+                "endpoint {endpoint:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_validate_export_s3_endpoint_accepts_http_url_or_blank() {
+        for endpoint in [" http://localhost:9000 ", "https://s3.example.com", "  "] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "endpoint {endpoint:?}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_validate_export_sink_s3_with_bucket_and_whitespace_ok() {
+        let config = ServerConfig {
+            export_sink: " S3 ".to_string(),
+            export_s3_bucket: Some("hfs-sql-export".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn test_validate_export_sink_s3_rejected_without_feature() {
+        let config = ServerConfig {
+            export_sink: "s3".to_string(),
+            export_s3_bucket: Some("hfs-sql-export".to_string()),
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("s3 sink without the s3 feature must fail startup validation");
+        assert!(
+            errors.iter().any(|e| e.contains("'s3' feature")),
             "{errors:?}"
         );
     }
@@ -2618,9 +4168,9 @@ mod tests {
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
 
     /// Every default reproduces today's behavior, except the reindex byte cap
-    /// (32 MiB, #1499 — the new default is intentional, not a regression): a
-    /// 30 s client timeout, the 1000-row deferred rebuild page, and a rebuild
-    /// refresh that follows `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    /// (32 MiB, #1499) and the bulk concurrency (4, #1749 — both intentional,
+    /// not regressions): a 30 s client timeout, the 1000-row deferred rebuild
+    /// page, and no rebuild refresh override (unset = no per-request refresh).
     #[test]
     fn test_elasticsearch_rebuild_knob_defaults() {
         let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
@@ -2634,7 +4184,7 @@ mod tests {
                 config.reindex_prefetch,
                 "HFS_REINDEX_PREFETCH is on by default (#1250)"
             );
-            assert_eq!(config.elasticsearch_bulk_concurrency, 1);
+            assert_eq!(config.elasticsearch_bulk_concurrency, 4);
         }
     }
 
@@ -2845,6 +4395,86 @@ mod tests {
             ..Default::default()
         };
         assert!(public.loopback_public_base_warning().is_none());
+    }
+
+    #[test]
+    fn test_default_fhir_version_provenance() {
+        // The CLI value wins over the built-in default, whatever the build enables.
+        let version = FhirVersion::default_enabled();
+        let (config, implicit) = ServerConfig::try_parse_from_with_provenance([
+            "rest-server",
+            "--default-fhir-version",
+            version.as_str(),
+        ])
+        .unwrap();
+        assert_eq!(config.default_fhir_version, version);
+        assert!(
+            !implicit,
+            "an explicit --default-fhir-version is not implicit"
+        );
+
+        // With nothing on the command line the value is the built-in default,
+        // unless the environment sets it (then it is not implicit either).
+        let (config, implicit) =
+            ServerConfig::try_parse_from_with_provenance(["rest-server"]).unwrap();
+        if std::env::var_os("HFS_DEFAULT_FHIR_VERSION").is_none() {
+            assert!(implicit, "no flag and no env var is the built-in default");
+            assert_eq!(config.default_fhir_version, FhirVersion::default_enabled());
+        } else {
+            assert!(!implicit, "HFS_DEFAULT_FHIR_VERSION is an explicit choice");
+        }
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error() {
+        let config = ServerConfig::default();
+        // Only an implicit default can be an error, in every build.
+        assert!(config.implicit_default_fhir_version_error(false).is_none());
+        // This unit-test module needs `R4`, and a build with R4 never errors
+        // (the build without R4 is covered by tests/fhir_version_coverage.rs).
+        assert!(config.implicit_default_fhir_version_error(true).is_none());
+    }
+
+    // The decision helper takes plain version names, so these run in every
+    // build, including the default R4 build where the error never fires.
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5."),
+            "message must list the enabled versions: {error}"
+        );
+        assert!(
+            error.contains("HFS_DEFAULT_FHIR_VERSION"),
+            "message must name the setting to choose: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5_r6() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5", "R6"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5, R6."),
+            "message must list every enabled version: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_explicit_choice() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B", "R5"], false).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4_present() {
+        assert!(implicit_default_fhir_version_error_for(&["R4", "R5"], true).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_single_version() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B"], true).is_none());
     }
 
     // ── multitenancy() accessor ───────────────────────────────────
@@ -3140,10 +4770,61 @@ mod tests {
         }
     }
 
+    /// `DEFER_INDEXING` defaults by deployment (#1749): `true` where the
+    /// primary owns search, `false` where an Elasticsearch secondary serves
+    /// it; an explicit `HFS_BULK_SUBMIT_DEFER_INDEXING` wins either way.
+    #[test]
+    fn test_bulk_submit_defer_indexing_defaults_to_index_during_ingest_on_es_composites() {
+        for mode in [
+            StorageBackendMode::Sqlite,
+            StorageBackendMode::Postgres,
+            StorageBackendMode::MongoDB,
+            StorageBackendMode::S3,
+        ] {
+            assert!(!mode.offloads_search(), "{mode}");
+            assert!(
+                BulkSubmitConfig::defaults_for(Some(mode)).defer_indexing,
+                "{mode}"
+            );
+        }
+        for mode in [
+            StorageBackendMode::SqliteElasticsearch,
+            StorageBackendMode::PostgresElasticsearch,
+            StorageBackendMode::MongoDBElasticsearch,
+            StorageBackendMode::S3Elasticsearch,
+        ] {
+            assert!(mode.offloads_search(), "{mode}");
+            let defaults = BulkSubmitConfig::defaults_for(Some(mode));
+            assert!(!defaults.defer_indexing, "{mode}");
+            assert!(defaults.validate().is_ok(), "{mode}");
+        }
+        assert!(BulkSubmitConfig::defaults_for(None).defer_indexing);
+        assert!(BulkSubmitConfig::default().defer_indexing);
+
+        // The env loader takes the unset value from the given defaults.
+        let from_es = BulkSubmitConfig::from_env_with_defaults(BulkSubmitConfig::defaults_for(
+            Some(StorageBackendMode::PostgresElasticsearch),
+        ));
+        let from_pg = BulkSubmitConfig::from_env_with_defaults(BulkSubmitConfig::defaults_for(
+            Some(StorageBackendMode::Postgres),
+        ));
+        match std::env::var("HFS_BULK_SUBMIT_DEFER_INDEXING") {
+            Ok(set) => {
+                let explicit = matches!(set.to_lowercase().as_str(), "true" | "1");
+                assert_eq!(from_es.defer_indexing, explicit);
+                assert_eq!(from_pg.defer_indexing, explicit);
+            }
+            Err(_) => {
+                assert!(!from_es.defer_indexing);
+                assert!(from_pg.defer_indexing);
+            }
+        }
+    }
+
     #[test]
     fn test_bulk_submit_config_ingest_tuning_defaults() {
         let cfg = BulkSubmitConfig::default();
-        assert_eq!(cfg.batch_size, 100);
+        assert_eq!(cfg.batch_size, 1000);
         assert_eq!(cfg.fetch_read_timeout_secs, 60);
         assert!(!cfg.skip_unchanged);
         assert_eq!(
@@ -3343,5 +5024,80 @@ mod tests {
     #[test]
     fn bulk_submit_file_concurrency_default_is_one() {
         assert_eq!(BulkSubmitConfig::default().file_concurrency, 1);
+    }
+
+    // ── Secrets stay out of `--help` and `Debug` (#2149) ─────────────
+
+    /// Every argument whose environment value can carry a credential.
+    const SECRET_ENV_ARGS: &[&str] = &[
+        "HFS_DATABASE_URL",
+        "HFS_ELASTICSEARCH_NODES",
+        "HFS_ELASTICSEARCH_PASSWORD",
+        "HFS_NL_SEARCH_API_KEY",
+        "HFS_NL_SEARCH_BASE_URL",
+        "HFS_EXPORT_S3_ENDPOINT",
+        "HFS_TERMINOLOGY_SERVER",
+    ];
+
+    #[test]
+    fn help_hides_the_values_of_secret_environment_variables() {
+        let command = ServerConfig::command();
+        for name in SECRET_ENV_ARGS {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_env().is_some_and(|env| env == *name))
+                .unwrap_or_else(|| panic!("no argument reads {name}"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`hfs --help` would print the value of {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_server_config_secrets() {
+        let config = ServerConfig {
+            storage_backend: "postgres".to_string(),
+            database_url: Some("postgres://hfs:DB-SECRET@db.internal:5432/hfs".to_string()),
+            elasticsearch_nodes: "https://elastic:NODE-SECRET@es1:9200, https://es2:9200"
+                .to_string(),
+            elasticsearch_username: Some("elastic".to_string()),
+            elasticsearch_password: Some("ES-PASSWORD-SECRET".to_string()),
+            nl_search_api_key: Some("sk-NL-KEY-SECRET".to_string()),
+            nl_search_base_url: "https://llm-proxy.internal?key=NL-URL-SECRET".to_string(),
+            export_s3_endpoint: Some("http://minio:9000?X-Amz-Signature=S3-SECRET".to_string()),
+            terminology_server: Some("https://u:TX-SECRET@hts.internal:8090".to_string()),
+            bulk_submit: BulkSubmitConfig {
+                client_id: Some("hfs-client".to_string()),
+                private_key: Some("-----BEGIN PRIVATE KEY----- PRIVATE-SECRET".to_string()),
+                decryption_key: Some("{\"d\":\"DECRYPTION-SECRET\"}".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for debug in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+            for kept in [
+                "es1:9200",
+                "es2:9200",
+                "elastic",
+                "llm-proxy.internal",
+                "minio:9000",
+                "hts.internal:8090",
+                "hfs-client",
+                "[redacted]",
+            ] {
+                assert!(debug.contains(kept), "`{kept}` missing from {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_shows_a_sqlite_database_path() {
+        let config = ServerConfig {
+            database_url: Some("./data/fhir.db".to_string()),
+            ..Default::default()
+        };
+        assert!(format!("{config:?}").contains("./data/fhir.db"));
     }
 }

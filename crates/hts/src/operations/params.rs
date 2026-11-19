@@ -50,6 +50,24 @@ pub fn find_str_param(params: &[Value], name: &str) -> Option<String> {
         .and_then(extract_any_string_value)
 }
 
+/// Return the boolean value of the first parameter named `name`, accepting
+/// both the POST encoding (`valueBoolean`) and the GET encoding produced by
+/// [`query_params_to_fhir_params`] (`valueString` / `valueCode` of `"true"` /
+/// `"false"`). `None` when absent or not a recognisable boolean.
+pub fn find_bool_param(params: &[Value], name: &str) -> Option<bool> {
+    let p = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?;
+    if let Some(b) = p.get("valueBoolean").and_then(|v| v.as_bool()) {
+        return Some(b);
+    }
+    match extract_any_string_value(p)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Collect the string values of **all** parameters named `name` (handles
 /// repeated parameters such as `property` in `$lookup`).
 pub fn collect_str_params(params: &[Value], name: &str) -> Vec<String> {
@@ -88,6 +106,25 @@ pub fn collect_canonical_params(params: &[Value], name: &str) -> Vec<(String, St
                     Some((u.to_string(), v.to_string()))
                 }
             })
+        })
+        .collect()
+}
+
+/// Collect every `useSupplement` value, as given (`url` or `url|version`).
+///
+/// Accepts `valueCanonical`, `valueUri`, `valueUrl` and `valueString`: the GET
+/// forms of the operations turn every query parameter into a `valueString`
+/// (see [`query_params_to_fhir_params`]), so a reader that only knows the
+/// canonical types silently ignores `?useSupplement=` on GET.
+pub fn collect_use_supplements(params: &[Value]) -> Vec<String> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueUrl", "valueString"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                .map(str::to_string)
         })
         .collect()
 }
@@ -339,6 +376,99 @@ fn extract_codeable_concept_named(params: &[Value], name: &str) -> Option<Vec<(S
     Some(pairs)
 }
 
+// ── Canonical `url|version` helpers ────────────────────────────────────────────
+
+/// Split a FHIR canonical reference of the form `url|version` into its two
+/// halves. Returns `(url, None)` when there is no `|` or the version side is
+/// empty, so callers can treat the result uniformly.
+///
+/// The pipe character is reserved in canonical URLs (FHIR R4 §2.3.0.3), so the
+/// first `|` is always the version separator.
+pub fn split_canonical(raw: &str) -> (&str, Option<&str>) {
+    match raw.split_once('|') {
+        Some((url, ver)) if !ver.is_empty() => (url, Some(ver)),
+        Some((url, _)) => (url, None),
+        None => (raw, None),
+    }
+}
+
+/// Normalise a canonical parameter so that every operation sees the same
+/// shape regardless of whether the caller wrote `url=X|V` or
+/// `url=X&<version_name>=V`.
+///
+/// For every parameter named `url_name` whose value is `X|V`:
+/// - the parameter value is rewritten to the bare `X` (the `valueXxx` key is
+///   preserved), and
+/// - the version `V` is promoted into a parameter named `version_name` when
+///   the request did not already carry one.
+///
+/// When the request already carries `version_name` and it disagrees with the
+/// piped version, the request is ambiguous and is rejected with
+/// [`HtsError::InvalidRequest`] (rendered as a 400 `OperationOutcome`). When
+/// `version_name` is `None`, the version suffix is dropped (used for canonical
+/// parameters that have no companion version parameter in the operation
+/// definition).
+///
+/// This is the single place that teaches HTS about piped canonicals; `$expand`,
+/// `$validate-code`, `$lookup`, `$subsumes`, `$translate` and `?url=` search all
+/// call it on entry so the operations behave identically.
+pub fn normalize_canonical_params(
+    params: &mut Vec<Value>,
+    url_name: &str,
+    version_name: Option<&str>,
+) -> Result<(), HtsError> {
+    let mut promoted: Option<String> = None;
+    for param in params.iter_mut() {
+        if param.get("name").and_then(|v| v.as_str()) != Some(url_name) {
+            continue;
+        }
+        let Some(obj) = param.as_object_mut() else {
+            continue;
+        };
+        let Some((key, raw)) = obj.iter().find_map(|(k, v)| {
+            if k.starts_with("value") {
+                v.as_str().map(|s| (k.clone(), s.to_string()))
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        if !raw.contains('|') {
+            continue;
+        }
+        let (bare, ver) = split_canonical(&raw);
+        let bare = bare.to_string();
+        let ver = ver.map(str::to_string);
+        obj.insert(key, Value::String(bare));
+        if let Some(v) = ver {
+            if let Some(prev) = promoted.as_deref()
+                && prev != v
+            {
+                return Err(HtsError::InvalidRequest(format!(
+                    "Parameter `{url_name}` was supplied with conflicting versions \
+                     ({prev} vs {v})"
+                )));
+            }
+            promoted = Some(v);
+        }
+    }
+    let (Some(ver), Some(version_name)) = (promoted, version_name) else {
+        return Ok(());
+    };
+    match find_str_param(params, version_name) {
+        Some(explicit) if explicit != ver => Err(HtsError::InvalidRequest(format!(
+            "Parameter `{url_name}` carries version `{ver}` but `{version_name}` is `{explicit}`; \
+             supply one or make them agree"
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            params.push(json!({"name": version_name, "valueString": ver}));
+            Ok(())
+        }
+    }
+}
+
 // ── GET / query-string helpers ─────────────────────────────────────────────────
 
 /// Parse a raw URL query string (e.g. `"system=http%3A...&code=ABC"`) into a
@@ -367,9 +497,14 @@ pub fn query_params_to_fhir_params(pairs: Vec<(String, String)>) -> Vec<Value> {
 
 /// Map a FHIR property `value_type` string to the correct `valueXxx` key
 /// used in a FHIR Parameters `part` entry.
-pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
-    match value_type {
+/// Malformed stored Coding JSON is a storage error, never a string property.
+pub fn property_value_part(value_type: &str, raw_value: &str) -> Result<Value, HtsError> {
+    Ok(match value_type {
         "code" => serde_json::json!({"name": "value", "valueCode": raw_value}),
+        "Coding" => {
+            let coding = parse_stored_coding(raw_value)?;
+            serde_json::json!({"name": "value", "valueCoding": coding})
+        }
         "boolean" => {
             let b = raw_value.parse::<bool>().unwrap_or(false);
             serde_json::json!({"name": "value", "valueBoolean": b})
@@ -384,7 +519,19 @@ pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
         }
         "dateTime" => serde_json::json!({"name": "value", "valueDateTime": raw_value}),
         _ => serde_json::json!({"name": "value", "valueString": raw_value}),
+    })
+}
+
+pub(super) fn parse_stored_coding(raw_value: &str) -> Result<Value, HtsError> {
+    let coding: Value = serde_json::from_str(raw_value).map_err(|error| {
+        HtsError::StorageError(format!("Invalid stored Coding property: {error}"))
+    })?;
+    if !coding.is_object() {
+        return Err(HtsError::StorageError(
+            "Stored Coding property must be a JSON object".into(),
+        ));
     }
+    Ok(coding)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -393,6 +540,88 @@ pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn find_bool_param_accepts_boolean_and_string_forms() {
+        let params = vec![
+            json!({"name": "a", "valueBoolean": true}),
+            json!({"name": "b", "valueString": "false"}),
+            json!({"name": "c", "valueCode": "true"}),
+            json!({"name": "d", "valueString": "yes"}),
+        ];
+        assert_eq!(find_bool_param(&params, "a"), Some(true));
+        assert_eq!(find_bool_param(&params, "b"), Some(false));
+        assert_eq!(find_bool_param(&params, "c"), Some(true));
+        assert_eq!(find_bool_param(&params, "d"), None);
+        assert_eq!(find_bool_param(&params, "e"), None);
+    }
+
+    #[test]
+    fn split_canonical_handles_plain_piped_and_empty_version() {
+        assert_eq!(split_canonical("http://x/vs"), ("http://x/vs", None));
+        assert_eq!(
+            split_canonical("http://x/vs|2.0"),
+            ("http://x/vs", Some("2.0"))
+        );
+        assert_eq!(split_canonical("http://x/vs|"), ("http://x/vs", None));
+        // Only the first pipe separates url from version.
+        assert_eq!(
+            split_canonical("http://x/vs|1|2"),
+            ("http://x/vs", Some("1|2"))
+        );
+    }
+
+    #[test]
+    fn normalize_canonical_promotes_piped_version() {
+        let mut params = vec![json!({"name": "url", "valueUri": "http://x/vs|2.0"})];
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params[0]["valueUri"], "http://x/vs");
+        assert_eq!(
+            find_str_param(&params, "valueSetVersion").as_deref(),
+            Some("2.0")
+        );
+    }
+
+    #[test]
+    fn normalize_canonical_is_a_no_op_without_pipe() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://x/vs"}),
+            json!({"name": "valueSetVersion", "valueString": "1.0"}),
+        ];
+        let before = params.clone();
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params, before);
+    }
+
+    #[test]
+    fn normalize_canonical_accepts_agreeing_explicit_version() {
+        let mut params = vec![
+            json!({"name": "url", "valueString": "http://x/vs|1.0"}),
+            json!({"name": "valueSetVersion", "valueString": "1.0"}),
+        ];
+        normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0]["valueString"], "http://x/vs");
+    }
+
+    #[test]
+    fn normalize_canonical_rejects_conflicting_versions() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://x/vs|1.0"}),
+            json!({"name": "valueSetVersion", "valueString": "2.0"}),
+        ];
+        let err =
+            normalize_canonical_params(&mut params, "url", Some("valueSetVersion")).unwrap_err();
+        assert!(matches!(err, HtsError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[test]
+    fn normalize_canonical_drops_version_when_no_slot() {
+        let mut params = vec![json!({"name": "source", "valueUri": "http://x/vs|3"})];
+        normalize_canonical_params(&mut params, "source", None).unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["valueUri"], "http://x/vs");
+    }
 
     #[test]
     fn extract_parameter_array_ok() {
@@ -451,33 +680,56 @@ mod tests {
 
     #[test]
     fn property_value_part_code() {
-        let part = property_value_part("code", "ROOT");
+        let part = property_value_part("code", "ROOT").unwrap();
         assert_eq!(part["valueCode"], "ROOT");
     }
 
     #[test]
     fn property_value_part_boolean() {
-        let part = property_value_part("boolean", "true");
+        let part = property_value_part("boolean", "true").unwrap();
         assert_eq!(part["valueBoolean"], true);
     }
 
     #[test]
     fn property_value_part_integer() {
-        let part = property_value_part("integer", "42");
+        let part = property_value_part("integer", "42").unwrap();
         assert_eq!(part["valueInteger"], 42);
     }
 
     #[test]
     fn property_value_part_decimal() {
-        let part = property_value_part("decimal", "2.5");
+        let part = property_value_part("decimal", "2.5").unwrap();
         let v = part["valueDecimal"].as_f64().unwrap();
         assert!((v - 2.5_f64).abs() < 1e-9);
     }
 
     #[test]
     fn property_value_part_unknown_type_falls_back_to_string() {
-        let part = property_value_part("custom", "hello");
+        let part = property_value_part("custom", "hello").unwrap();
         assert_eq!(part["valueString"], "hello");
+    }
+
+    #[test]
+    fn property_value_part_coding_preserves_the_complete_object() {
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "A", "display": "Alpha", "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        assert_eq!(
+            property_value_part("Coding", &coding.to_string()).unwrap(),
+            json!({"name": "value", "valueCoding": coding})
+        );
+    }
+
+    #[test]
+    fn property_value_part_rejects_invalid_stored_coding() {
+        for value in ["not json", "null", "[]", "42", "true", "\"A\""] {
+            assert!(matches!(
+                property_value_part("Coding", value),
+                Err(HtsError::StorageError(_))
+            ));
+        }
     }
 
     // ── extract_coding ─────────────────────────────────────────────────────────

@@ -2,6 +2,9 @@
 
 FHIR `AuditEvent` logging for the Helios FHIR Server, with [IHE BALP](https://profiles.ihe.net/ITI/BALP/) profile selection for REST, authentication, and persistence-layer events.
 
+> Operators: see [`docs/ops/audit.md`](../../docs/ops/audit.md) for what is recorded,
+> configuration, retention and the recommended production setup.
+
 ## Overview
 
 This crate records security, privacy, and operational activity as typed FHIR `AuditEvent` resources. It plugs into HFS at four layers:
@@ -25,7 +28,8 @@ Additionally, batch and transaction bundles produce **correlated per-entry audit
 - **Patient Resolution**: Resolves patient context from resource paths, request bodies, and search parameters
 - **Write Context Enrichment**: Supports response-extension context for create/update/patch IDs and patient references
 - **Durable File Writes**: Flushes file sink writes after each recorded event
-- **Fire-and-Forget Semantics**: Audit failures are logged via `tracing`, never returned to the caller
+- **Fire-and-Forget Semantics**: Audit failures are logged via `tracing` and counted on `/metrics`, never returned to the caller
+- **Bounded Write Queue**: `QueuedSink` puts a bounded queue and a fixed pool of writers between requests and the store, so load cannot stampede the audit connection pool
 
 ## Audit Sinks
 
@@ -66,7 +70,32 @@ Persists `AuditEvent` resources through HFS storage backends (SQLite, PostgreSQL
 | `HFS_AUDIT_S3_REGION` | No | Dedicated S3 region override (S3 family) |
 | `HFS_AUDIT_S3_VALIDATE_BUCKETS` | No | Dedicated S3 bucket validation toggle (`true`/`false`, default inherited from primary) |
 
-`DatabaseSink` writes with `TenantContext::system()` (tenant ID `__system__`) to keep audit records isolated from tenant-scoped clinical writes.
+`DatabaseSink` writes with `TenantContext::system()` (tenant ID `__system__`) to keep audit records isolated from tenant-scoped clinical writes. A tenant cannot read, rewrite or delete its own trail: `__system__` is reserved and refused (`403`) as a request tenant on every route, whether it arrives by header, URL prefix, JWT claim or default (#317).
+
+#### Which tenant an event describes
+
+Every event recorded for a request that resolved a tenant carries that tenant as a `meta.tag` (#1515):
+
+```json
+"meta": {
+  "tag": [{ "system": "http://heliossoftware.com/fhir/CodeSystem/tenant", "code": "acme" }]
+}
+```
+
+The tag is set on REST interaction events (from the tenant the handler resolved), batch/transaction entry events, purge / bulk-export / reindex lifecycle events, and tenant-administration events (the tenant that was created or deleted). Authorization events carry the token's tenant claim when it has one. Events with no tenant, such as server start-up, a request rejected before its tenant was resolved, or one naming a reserved tenant, are left untagged.
+
+The trail is not readable through the FHIR API yet; a read-only, tenant-filtered view is planned (#2416). Until then an auditor reads it from the audit store directly, filtering on the tag. The `_tag` search parameter is indexed for these events, so on SQLite/PostgreSQL:
+
+```sql
+SELECT r.data
+FROM resources r
+JOIN search_index s
+  ON s.tenant_id = r.tenant_id AND s.resource_type = r.resource_type AND s.resource_id = r.id
+WHERE r.tenant_id = '__system__' AND r.resource_type = 'AuditEvent'
+  AND s.param_name = '_tag'
+  AND s.value_token_system = 'http://heliossoftware.com/fhir/CodeSystem/tenant'
+  AND s.value_token_code = 'acme';
+```
 
 Examples:
 
@@ -196,27 +225,17 @@ The crate is split into six core pieces:
 
 ### REST Interactions
 
-The middleware uses interaction-aware detection (`detect_interaction`) instead of mapping by HTTP method alone:
-
-| Request Pattern | Audit Action |
-|-----------------|--------------|
-| `GET`/`HEAD` type search or history (`/Patient`, `/Patient/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` system history (`/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` instance history (`/Patient/123/_history`) | `Query` (`E`) |
-| `GET`/`HEAD` instance read (`/Patient/123`) | `Read` (`R`) |
-| `POST` with `/_search` | `Query` (`E`) |
-| `POST /[type]` create | `Create` (`C`) |
-| `POST /` batch/transaction envelope | `Execute` (`E`) |
-| `PUT`/`PATCH` | `Update` (`U`) |
-| `DELETE` | `Delete` (`D`) |
-| Other methods | `Execute` (`E`) |
-
-Response status is translated into a coarse outcome:
-
-- `status < 400` -> outcome `0`
-- `status >= 400` -> outcome `8`
-
-For query events, BALP profile selection uses query profiles (`IHE.BasicAudit.Query` / `IHE.BasicAudit.PatientQuery`) and RESTful interaction subtype `search`.
+`interaction::classify` maps each request to a FHIR restful-interaction
+(`read`, `vread`, `create`, `update`, `patch`, `delete`, `history-*`,
+`search-type`, `search-system` incl. compartment searches, `operation`,
+`batch`/`transaction`), and `rest_event::build_rest_events` turns it into
+IHE BALP events (Read/Create/Update/Delete/Query and Patient* variants) with
+client, server and user agents, the query entity, the patient and the
+`X-Request-Id`. Outcome: `0` for < 400, `4` for 4xx, `8` for 5xx; failures
+carry `outcomeDesc` and claim no BALP profile (BALP fixes outcome `0`).
+Batch/transaction requests are recorded per entry (the envelope only when it
+fails as a whole). The middleware sits outside authentication, so 401/403
+are recorded too. Full mapping table: `docs/ops/audit.md`.
 
 ### Write Context Enrichment (`AuditResponseContext`)
 
@@ -351,6 +370,24 @@ All configuration is via `HFS_AUDIT_*` environment variables. Backend-specific v
 | `HFS_AUDIT_BACKEND` | `none` | Active backend: `none`, `file`, `database`, or `cloudwatch` |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Value used for `AuditEvent.source.observer.reference` |
 | `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated request paths to exclude |
+| `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | Events the write queue holds before `HFS_AUDIT_OVERFLOW` applies |
+| `HFS_AUDIT_WRITERS` | 4 × cores (4–64) | Writer tasks draining the queue: the most concurrent audit writes the sink sees |
+| `HFS_AUDIT_OVERFLOW` | `block` | Full queue: `block` holds the response until the event is queued; `drop` discards the event and counts it |
+| `HFS_AUDIT_WRITE_RETRIES` | `5` | Database sink: retries of a transient write failure (pool exhausted, connection refused, server unavailable), backoff 100 ms doubling to 2 s |
+
+### Write Queue and Loss Accounting
+
+In `hfs`, every sink other than `NullSink` is wrapped in a `QueuedSink`. The middleware hands each event to the queue before returning the response; `HFS_AUDIT_WRITERS` tasks drain it in batches of up to 64 through the inner sink's `record_batch`. On shutdown the queue is drained before the sink is flushed.
+
+The default `block` policy never discards an event because the queue is full: if the store falls behind, responses slow down instead. Choose `drop` when request latency matters more than a complete trail; dropped events are then counted.
+
+An event is lost only when a policy or a failure says so, and each loss is counted on `/metrics`:
+
+| Series | Labels | Meaning |
+|--------|--------|---------|
+| `audit_events_dropped_total` | `sink`, `reason` | Events never persisted. `reason`: `queue_full` (`drop` policy), `queue_closed`, `serialize_failed`, `write_failed` (non-transient error), `retries_exhausted` |
+| `audit_write_retries_total` | `sink` | Transient database write failures that were retried |
+| `audit_queue_depth` | `sink` | Events accepted and not yet written |
 
 ### Built-In Exclusions
 
@@ -394,13 +431,13 @@ The [FHIR AuditEvent specification](https://hl7.org/fhir/auditevent.html) identi
 | **Access control decisions** | Covered | Auth success/failure, authz grant/denial via bridge |
 | **Software startup/shutdown** | Covered | Lifecycle events with config details |
 | **Configuration events** | Covered | Config snapshot in startup event; no runtime config changes exist |
-| **User login/logout** | N/A | HFS uses stateless JWT — no sessions to log in/out of |
+| **User login/logout** | Not covered | Bearer-token API calls are stateless JWT; the web UI's interactive sessions (#1481) are not audited yet |
 | **Software installation** | N/A | Compiled binary — no runtime installation |
 | **Policy rules changes** | N/A | Policy is determined by JWT scopes — no runtime policy API |
 
 ## Current Limitations
 
-- Dedicated database audit stores are not automatically exposed through the primary REST API (they are intentionally separate storage targets)
-- Middleware records events after the handler runs and does not directly inspect response bodies (enrichment comes from response extensions)
-- Audit recording is intentionally infallible; write failures are logged, not surfaced to API clients
-- Persistence-layer audit functions (bulk export, purge, reindex) exist in `helios-persistence` but are not yet called — REST endpoints for these operations have not been implemented yet
+- Dedicated database audit stores (`HFS_AUDIT_DATABASE_URL`) are not exposed through the primary REST API (they are intentionally separate storage targets); events in the shared store live in the request's tenant and are searchable there
+- Patient attribution of searches comes from the request (path and parameters), not from the result set
+- Audit recording is intentionally infallible; write failures are retried, then spilled to the fallback file, never surfaced to API clients
+- Retention (`HFS_AUDIT_RETENTION_*`) is implemented for the SQLite and PostgreSQL stores only

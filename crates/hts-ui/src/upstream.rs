@@ -46,6 +46,11 @@ use std::time::Duration;
 pub struct UpstreamClient {
     client: reqwest::Client,
     base_url: String,
+    /// `Authorization` for the admin API (`/admin`) and the terminology
+    /// writes (`/import`), both guarded by the administrator sign-in: the
+    /// console's own credential, so its management pages work for whoever
+    /// signed in to the console.
+    admin_authorization: Option<reqwest::header::HeaderValue>,
 }
 
 impl UpstreamClient {
@@ -86,7 +91,18 @@ impl UpstreamClient {
             .map_err(|source| UpstreamError::ClientBuild {
                 message: source.to_string(),
             })?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            admin_authorization: None,
+        })
+    }
+
+    /// The same client, sending `value` as `Authorization` on admin API
+    /// calls ([`helios_admin_auth::AdminAuth::service_authorization`]).
+    pub fn with_admin_authorization(mut self, value: reqwest::header::HeaderValue) -> Self {
+        self.admin_authorization = Some(value);
+        self
     }
 
     /// The base URL the client is pointed at, without a trailing slash.
@@ -451,11 +467,7 @@ impl OutcomeView {
             .and_then(|s| s.as_str())
             .unwrap_or("unknown")
             .to_owned();
-        let diagnostics = issue
-            .and_then(|i| i.get("diagnostics"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let diagnostics = issue.map(issue_text).unwrap_or_default();
         let location = issue
             .and_then(|i| i.get("location"))
             .and_then(|v| v.as_array())
@@ -601,6 +613,40 @@ impl CsBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/code-systems/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/code-systems".to_owned()
+        } else {
+            format!("/ui/hts/code-systems?{query}")
+        }
+    }
 }
 
 /// One row of the CS browser table (§7.2 wireframe).
@@ -638,26 +684,73 @@ impl CsBrowserRow {
     }
 }
 
+/// Paging facts read from a search `Bundle`, shared by the CS / VS / CM
+/// browsers.
+///
+/// Since #1537, HTS search sets `Bundle.total` to the number of matches
+/// across all pages and adds `self` / `previous` / `next` links. HTS
+/// releases from before that sent no `link` array and a `total` that only
+/// counted the current page, so both fields stay optional here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchPaging {
+    /// `Bundle.total`. Only meaningful when [`Self::has_next`] is `Some`,
+    /// because older HTS reported a page count here.
+    pub total: Option<u64>,
+    /// Whether the Bundle has a `link[relation=next]`. `None` when the
+    /// Bundle has no `link` array at all (HTS before #1537).
+    pub has_next: Option<bool>,
+}
+
+impl SearchPaging {
+    fn from_bundle(bundle: &Value) -> Self {
+        let has_next = bundle.get("link").and_then(|v| v.as_array()).map(|links| {
+            links
+                .iter()
+                .any(|l| l.get("relation").and_then(|r| r.as_str()) == Some("next"))
+        });
+        Self {
+            total: bundle.get("total").and_then(|v| v.as_u64()),
+            has_next,
+        }
+    }
+
+    /// The offset of the next page, or `None` on the last page.
+    ///
+    /// Follows the Bundle's `next` link when HTS sent paging links. An
+    /// older HTS sends none, so this falls back to "a full page means
+    /// there may be more", which offers one empty extra page when the
+    /// match count is an exact multiple of the page size.
+    fn next_offset(&self, offset: u32, rows: usize, requested: u32) -> Option<u32> {
+        let more = match self.has_next {
+            Some(has_next) => has_next && rows > 0,
+            None => (rows as u32) >= requested,
+        };
+        more.then(|| offset.saturating_add(rows as u32))
+    }
+}
+
 /// The browser rows partial's data. `filters` is echoed so the page can
 /// preserve them in the pager and reset form state (§7.2).
 #[derive(Clone, Debug)]
 pub struct CsBrowserPage {
     pub rows: Vec<CsBrowserRow>,
     pub filters: CsBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
+    pub paging: SearchPaging,
 }
 
 impl CsBrowserPage {
-    /// The next offset to request, or `None` when HTS returned fewer rows
-    /// than the requested page size (the terminal-page heuristic — HTS's
-    /// `total` is a page count, not an authoritative match count, so we
-    /// can't rely on it; see hts-details.md §Search).
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded into the table for the "Showing N" strip
@@ -666,6 +759,20 @@ impl CsBrowserPage {
     /// latest page size alone (which would regress to "Showing 9").
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
+        }
     }
 }
 
@@ -942,10 +1049,9 @@ pub struct SubsumesResult {
 impl UpstreamClient {
     /// `GET /CodeSystem?...` — the browser rows fragment source.
     ///
-    /// Only fields the row projection renders are extracted; the full Bundle
-    /// is discarded. HTS's `total` in the Bundle is a *page* count and is
-    /// deliberately not exposed to callers — the pager uses length-of-rows
-    /// as the terminal-page heuristic (see [`CsBrowserPage::next_offset`]).
+    /// Only fields the row projection renders are extracted, plus the
+    /// Bundle's `total` and whether it has a `next` link (see
+    /// [`SearchPaging`]); the rest of the Bundle is discarded.
     pub async fn search_code_systems(
         &self,
         filters: &CsBrowserFilters,
@@ -990,6 +1096,8 @@ impl UpstreamClient {
         Ok(CsBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -1687,6 +1795,40 @@ impl VsBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/value-sets/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("version", &self.version),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/value-sets".to_owned()
+        } else {
+            format!("/ui/hts/value-sets?{query}")
+        }
+    }
 }
 
 /// One row of the VS browser table (§7.4 mirror of §7.2 wireframe).
@@ -1726,25 +1868,41 @@ impl VsBrowserRow {
 pub struct VsBrowserPage {
     pub rows: Vec<VsBrowserRow>,
     pub filters: VsBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
+    pub paging: SearchPaging,
 }
 
 impl VsBrowserPage {
-    /// Terminal-page heuristic mirroring [`CsBrowserPage::next_offset`]:
-    /// HTS's `Bundle.total` is a page count for the browser search (see
-    /// hts-details.md §Search + §7.3.1), so the pager keys off
-    /// length-of-rows and stops when HTS returned fewer than requested.
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
+        }
     }
 }
 
@@ -2018,9 +2176,8 @@ impl UpstreamClient {
     /// `GET /ValueSet?...` — the VS browser rows fragment source.
     ///
     /// Same page-shape rules as [`UpstreamClient::search_code_systems`]:
-    /// only the row projection's fields are extracted and the Bundle's
-    /// `total` field is deliberately not consumed (see hts-details.md
-    /// §Search).
+    /// only the row projection's fields and the Bundle's [`SearchPaging`]
+    /// are extracted.
     pub async fn search_value_sets(
         &self,
         filters: &VsBrowserFilters,
@@ -2065,6 +2222,8 @@ impl UpstreamClient {
         Ok(VsBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -2662,6 +2821,41 @@ impl CmBrowserFilters {
         ser.append_pair("_offset", &next_offset.to_string());
         format!("/ui/hts/concept-maps/rows?{}", ser.finish())
     }
+
+    /// The browser *page* URL at `offset` with every active filter carried
+    /// forward — the foot's Previous/Next page links, real `<a href>`s that
+    /// work without JavaScript and give the back button a page to return
+    /// to. The default page size is left out, like the page module's own
+    /// `BrowserRowsView::page_url`.
+    pub fn page_url_at(&self, offset: &u32) -> String {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for (field, value) in [
+            ("url", &self.url),
+            ("name", &self.name),
+            ("title", &self.title),
+            ("source", &self.source),
+            ("target", &self.target),
+            ("status", &self.status),
+        ] {
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
+            }
+        }
+        if self.effective_count() != Self::DEFAULT_COUNT {
+            ser.append_pair("_count", &self.effective_count().to_string());
+        }
+        if *offset > 0 {
+            ser.append_pair("_offset", &offset.to_string());
+        }
+        let query = ser.finish();
+        if query.is_empty() {
+            "/ui/hts/concept-maps".to_owned()
+        } else {
+            format!("/ui/hts/concept-maps?{query}")
+        }
+    }
 }
 
 /// One row of the CM browser table (§7.5 wireframe row shape).
@@ -2726,28 +2920,46 @@ impl CmBrowserRow {
     }
 }
 
-/// The browser rows partial's data (§7.5). Same terminal-page heuristic
-/// as CS / VS since HTS's `Bundle.total` for search is a page count, not
-/// an authoritative match count.
+/// The browser rows partial's data (§7.5). Pages the same way as CS / VS.
 #[derive(Clone, Debug)]
 pub struct CmBrowserPage {
     pub rows: Vec<CmBrowserRow>,
     pub filters: CmBrowserFilters,
+    /// `Bundle.total`: HTS reports the number of matches across every page
+    /// (`crates/hts/src/operations/search.rs`), so the foot can say
+    /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
+    pub total: Option<u64>,
+    pub paging: SearchPaging,
 }
 
 impl CmBrowserPage {
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
     pub fn showing_count(&self) -> usize {
         (self.filters.offset as usize).saturating_add(self.rows.len())
+    }
+
+    /// The offset of the page before this one, for the foot's "Previous
+    /// page" link; `None` on the first page.
+    pub fn prev_offset(&self) -> Option<u32> {
+        if self.filters.offset == 0 {
+            None
+        } else {
+            Some(
+                self.filters
+                    .offset
+                    .saturating_sub(self.filters.effective_count()),
+            )
+        }
     }
 }
 
@@ -2971,9 +3183,8 @@ impl UpstreamClient {
     /// Emits `source-uri` / `target-uri` search params for the URL-scoped
     /// filter chips. Per §7.5 the browser does not expose `source-code` /
     /// `target-code` (those are per-mapping searches and would leak the
-    /// browser's shape). `Bundle.total` is a page count for CM search
-    /// (hts-details.md §Search) so the pager keys off `rows.len()` here
-    /// the same way CS / VS do.
+    /// browser's shape). Paging is read from the Bundle the same way CS /
+    /// VS do (see [`SearchPaging`]).
     pub async fn search_concept_maps(
         &self,
         filters: &CmBrowserFilters,
@@ -3018,6 +3229,8 @@ impl UpstreamClient {
         Ok(CmBrowserPage {
             rows,
             filters: filters.clone(),
+            total: body.get("total").and_then(|v| v.as_u64()),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -3872,12 +4085,19 @@ impl UpstreamClient {
     /// banner picks it up.
     pub async fn import_bundle(&self, bundle_json: &str) -> Result<ImportResult, UpstreamError> {
         let url = format!("{}/import", self.base_url);
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .header("Accept", "application/fhir+json")
             .header("Content-Type", "application/fhir+json")
-            .body(bundle_json.to_owned())
+            .body(bundle_json.to_owned());
+        // `/import` writes, so with HTS_REQUIRE_AUTH_FOR_WRITES on it needs
+        // the administrator credential; the Import page itself is behind the
+        // console sign-in.
+        if let Some(auth) = &self.admin_authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, auth.clone());
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| UpstreamError::from_reqwest("import", &url, e))?;
@@ -4007,6 +4227,18 @@ fn parse_import_counts(body: &Value) -> Option<ImportCounts> {
     })
 }
 
+/// Human-readable text of an OperationOutcome issue: `diagnostics`, or
+/// `details.text` (HTS puts its messages in `details.text` only).
+fn issue_text(issue: &Value) -> String {
+    issue
+        .get("diagnostics")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .or_else(|| issue.pointer("/details/text").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_owned()
+}
+
 /// Best-effort projection of `OperationOutcome.issue[].diagnostics`
 /// into a flat list of strings. Used for the 400-rejection issue list
 /// under the shared outcome banner. Missing / empty diagnostics fall
@@ -4018,9 +4250,9 @@ fn collect_outcome_diagnostics(body: &Value) -> Vec<String> {
             issues
                 .iter()
                 .map(|i| {
-                    let d = i.get("diagnostics").and_then(|v| v.as_str()).unwrap_or("");
+                    let d = issue_text(i);
                     if !d.is_empty() {
-                        d.to_owned()
+                        d
                     } else {
                         i.get("code")
                             .and_then(|v| v.as_str())
@@ -4342,6 +4574,53 @@ fn parse_terminology_capabilities_view(body: &Value) -> TerminologyCapabilitiesV
     }
 }
 
+// ── Admin API (terminology management) ─────────────────────────────────
+
+impl UpstreamClient {
+    /// One call to the HTS admin API (`/admin/...`, see
+    /// `docs/hts-terminology-admin.md`). Returns the HTTP status and the JSON
+    /// body (`Null` when the body is empty or not JSON) — the admin pages
+    /// branch on the status themselves (404 = admin switched off, 202 = job
+    /// queued, 507 = not enough disk), so non-2xx is not an error here; only
+    /// transport failures are.
+    ///
+    /// `timeout` overrides the 5 s dashboard default: inventory scans and
+    /// delete-dependents lookups legitimately take longer on a large database.
+    pub(crate) async fn admin_call(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+        forward: &[(&'static str, String)],
+    ) -> Result<(u16, Value), UpstreamError> {
+        let url = format!("{}/admin{}", self.base_url, path_and_query);
+        let mut req = self.client.request(method, &url).timeout(timeout);
+        // Identity of the browser behind the console, for the admin audit
+        // trail (the upstream otherwise sees only this loopback client).
+        for (name, value) in forward {
+            req = req.header(*name, value.as_str());
+        }
+        if let Some(auth) = &self.admin_authorization {
+            req = req.header(reqwest::header::AUTHORIZATION, auth.clone());
+        }
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Ok((status, value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4497,23 +4776,90 @@ mod tests {
     fn browser_page_next_offset_stops_when_rows_are_short() {
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 5],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 0,
                 ..CsBrowserFilters::default()
+            },
+            paging: SearchPaging::default(),
+        };
+        assert_eq!(page.next_offset(), None);
+
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 25],
+            total: None,
+            filters: CsBrowserFilters {
+                count: 25,
+                offset: 50,
+                ..CsBrowserFilters::default()
+            },
+            paging: SearchPaging::default(),
+        };
+        assert_eq!(page.next_offset(), Some(75));
+    }
+
+    #[test]
+    fn search_paging_reads_total_and_next_link() {
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "total": 50,
+            "link": [
+                { "relation": "self", "url": "http://hts/CodeSystem?_count=25&_offset=0" },
+                { "relation": "next", "url": "http://hts/CodeSystem?_count=25&_offset=25" }
+            ]
+        });
+        assert_eq!(
+            SearchPaging::from_bundle(&bundle),
+            SearchPaging {
+                total: Some(50),
+                has_next: Some(true),
+            }
+        );
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "total": 50,
+            "link": [{ "relation": "self", "url": "http://hts/CodeSystem" }]
+        });
+        assert_eq!(SearchPaging::from_bundle(&bundle).has_next, Some(false));
+
+        // HTS before #1537: no links at all.
+        let bundle = json!({ "resourceType": "Bundle", "total": 25 });
+        assert_eq!(SearchPaging::from_bundle(&bundle).has_next, None);
+    }
+
+    #[test]
+    fn browser_page_next_offset_follows_next_link() {
+        let filters = CsBrowserFilters {
+            count: 25,
+            offset: 25,
+            ..CsBrowserFilters::default()
+        };
+        // Exactly 50 matches: the second page is full but is the last one,
+        // so no Load more button (the old page-length guess offered one).
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 25],
+            filters: filters.clone(),
+            total: Some(50),
+            paging: SearchPaging {
+                total: Some(50),
+                has_next: Some(false),
             },
         };
         assert_eq!(page.next_offset(), None);
 
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 25],
-            filters: CsBrowserFilters {
-                count: 25,
-                offset: 50,
-                ..CsBrowserFilters::default()
+            filters,
+            total: Some(80),
+            paging: SearchPaging {
+                total: Some(80),
+                has_next: Some(true),
             },
         };
-        assert_eq!(page.next_offset(), Some(75));
+        assert_eq!(page.next_offset(), Some(50));
     }
 
     #[test]
@@ -4521,22 +4867,26 @@ mod tests {
         // First page: offset 0, 25 rows → "Showing 25".
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 25],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 0,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.showing_count(), 25);
 
         // Load-more page: offset 25, 9 rows → "Showing 34" (not 9).
         let page = CsBrowserPage {
             rows: vec![CsBrowserRow::default(); 9],
+            total: None,
             filters: CsBrowserFilters {
                 count: 25,
                 offset: 25,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.showing_count(), 34);
     }
@@ -5712,5 +6062,57 @@ mod concept_plane_tests {
         };
         assert!(!manual.is_conflict());
         assert_eq!(manual.tag_modifier(), "muted");
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn prev_offset_steps_back_one_page_and_stops_at_the_start() {
+        let mut page = VsBrowserPage {
+            rows: Vec::new(),
+            total: Some(21_334),
+            paging: Default::default(),
+            filters: VsBrowserFilters {
+                count: 25,
+                offset: 50,
+                ..VsBrowserFilters::default()
+            },
+        };
+        assert_eq!(page.prev_offset(), Some(25));
+        page.filters.offset = 10;
+        assert_eq!(page.prev_offset(), Some(0));
+        page.filters.offset = 0;
+        assert_eq!(page.prev_offset(), None);
+    }
+
+    #[test]
+    fn page_url_at_carries_filters_and_omits_defaults() {
+        let filters = VsBrowserFilters {
+            name: Some("obs".to_owned()),
+            status: Some("active".to_owned()),
+            count: 25,
+            offset: 0,
+            ..VsBrowserFilters::default()
+        };
+        assert_eq!(
+            filters.page_url_at(&50),
+            "/ui/hts/value-sets?name=obs&status=active&_offset=50"
+        );
+        assert_eq!(
+            filters.page_url_at(&0),
+            "/ui/hts/value-sets?name=obs&status=active"
+        );
+        let bare = CmBrowserFilters {
+            count: 50,
+            ..CmBrowserFilters::default()
+        };
+        assert_eq!(bare.page_url_at(&0), "/ui/hts/concept-maps?_count=50");
+        assert_eq!(
+            CsBrowserFilters::default().page_url_at(&0),
+            "/ui/hts/code-systems"
+        );
     }
 }

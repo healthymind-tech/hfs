@@ -14,9 +14,9 @@ use serde_json::Value;
 // ── R4 import ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r4_bundle_returns_correct_counts() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let (status, body) = app.import_bundle(bundles::r4_bundle()).await;
 
     assert_eq!(
@@ -43,9 +43,9 @@ async fn import_r4_bundle_returns_correct_counts() {
 // ── R4B import ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r4b_bundle_returns_correct_counts() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let (status, body) = app.import_bundle(bundles::r4b_bundle()).await;
 
     assert_eq!(
@@ -71,9 +71,9 @@ async fn import_r4b_bundle_returns_correct_counts() {
 // ── R5 import (sourceScope/targetScope + relationship) ────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r5_bundle_returns_correct_counts() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let (status, body) = app.import_bundle(bundles::r5_bundle()).await;
 
     assert_eq!(
@@ -91,9 +91,9 @@ async fn import_r5_bundle_returns_correct_counts() {
 // ── R6 import ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_r6_bundle_returns_correct_counts() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let (status, body) = app.import_bundle(bundles::r6_bundle()).await;
 
     assert_eq!(
@@ -111,9 +111,9 @@ async fn import_r6_bundle_returns_correct_counts() {
 // ── Idempotent re-import ──────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn reimport_same_bundle_is_idempotent() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     // First import
     let (status, _) = app.import_bundle(bundles::r4_bundle()).await;
@@ -138,9 +138,9 @@ async fn reimport_same_bundle_is_idempotent() {
 /// unconditional wipe at server startup, so a live re-import left stale
 /// display/synonym rows searchable until the next restart.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn reimport_changed_display_refreshes_filtered_expand() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     // Same (url, version) both times so the storage system_id is stable and the
     // concept is updated in place — the case the per-system invalidation covers.
@@ -213,9 +213,9 @@ async fn reimport_changed_display_refreshes_filtered_expand() {
 // ── Non-Bundle payload returns 400 ────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_non_bundle_returns_400() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     let not_a_bundle = r#"{"resourceType":"Patient","id":"p1"}"#;
     let (status, _) = app.import_bundle(not_a_bundle).await;
@@ -230,9 +230,9 @@ async fn import_non_bundle_returns_400() {
 // ── Malformed entry produces 207 with errors ──────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn import_bundle_with_malformed_cs_returns_207() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     // A bundle where one CodeSystem is missing its `url` field (non-fatal).
     let bundle = r#"{

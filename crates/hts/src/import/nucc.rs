@@ -43,7 +43,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ pub async fn import_nucc(
         });
     }
 
-    let bytes = build_code_system_bundle(
+    let bytes = build_native_batch(
         &CodeSystemMeta {
             id: NUCC_ID,
             url: NUCC_URL,
@@ -166,7 +166,7 @@ pub async fn import_nucc(
         &builder_concepts,
     );
 
-    let imported = backend.import_bundle(ctx, &bytes).await?;
+    let imported = backend.import_parsed(ctx, bytes).await?;
     stats.code_systems = imported.code_systems;
     stats.concepts = concepts.len() as u32;
     stats.errors.extend(imported.errors);
@@ -207,7 +207,10 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
     let best_index = (0..archive.len())
         .find_map(|i| {
             let entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_ascii_lowercase();
+            let name = entry
+                .name()
+                .map(|n| n.to_ascii_lowercase())
+                .unwrap_or_default();
             if name.ends_with(".csv") && (name.contains("nucc") || name.contains("taxonomy")) {
                 Some(i)
             } else {

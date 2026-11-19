@@ -167,6 +167,11 @@ pub struct AppState<S> {
 
     /// Post-commit write observer and the dashboard counters it feeds.
     write_observability: WriteObservability,
+
+    /// Search-time terminology service (`:in` / `:not-in` / token `:above` /
+    /// `:below` expansion through `HFS_TERMINOLOGY_SERVER`, with its cache).
+    /// `None` when no terminology server is configured.
+    search_terminology: Option<Arc<crate::terminology::SearchTerminology>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -198,6 +203,7 @@ impl<S> Clone for AppState<S> {
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
             validation: Arc::clone(&self.validation),
             write_observability: self.write_observability.clone(),
+            search_terminology: self.search_terminology.clone(),
         }
     }
 }
@@ -215,11 +221,15 @@ impl<S: ResourceStorage> AppState<S> {
         config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .with_profile_cache(crate::validation_cache::cache_dir(&config)),
+        );
+        let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -246,6 +256,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_config,
             validation,
             write_observability: WriteObservability::new(),
+            search_terminology,
         }
     }
 
@@ -273,11 +284,15 @@ impl<S: ResourceStorage> AppState<S> {
         config.base_url = public_url.as_str().to_string();
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .with_profile_cache(crate::validation_cache::cache_dir(&config)),
+        );
+        let search_terminology = Self::search_terminology_from(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -304,6 +319,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_config,
             validation,
             write_observability: WriteObservability::new(),
+            search_terminology,
         }
     }
 
@@ -337,6 +353,12 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the resource validation service.
     pub fn validation(&self) -> &crate::validation::ValidationService {
         &self.validation
+    }
+
+    /// The validation service as a shared handle, for background work such
+    /// as the startup profile rehydration that outlives a request.
+    pub fn validation_shared(&self) -> Arc<crate::validation::ValidationService> {
+        Arc::clone(&self.validation)
     }
 
     /// Sets the SQL-on-FHIR runner for this application state.
@@ -537,6 +559,33 @@ impl<S: ResourceStorage> AppState<S> {
         self.public_url.with_segments(all_segments)
     }
 
+    /// The `Location` of a stored resource version, as a create (or an update
+    /// that created) answers it: `[base]/[type]/[id]/_history/[vid]` (#2517).
+    ///
+    /// R4, R4B and R5 http.html#create: "The Location header should be as
+    /// specific as possible - if the server understands versioning, the
+    /// version is included." The version is always included, even with
+    /// `HFS_ENABLE_VERSIONING=false`. That flag drops only the `ETag`: HFS
+    /// still keeps every version and serves vread on it, and `/metadata`
+    /// advertises `"versioning": "versioned"`. So the spec's "If a server does
+    /// not track versions" form never applies, and batch and transaction
+    /// entries already name the version regardless of the flag.
+    pub(crate) fn location_for_request(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        stored: &helios_persistence::types::StoredResource,
+    ) -> String {
+        self.public_url_for_request(
+            tenant,
+            [
+                stored.resource_type(),
+                stored.id(),
+                "_history",
+                stored.version_id(),
+            ],
+        )
+    }
+
     /// Builds a request-bound public URL and retains an encoded query string.
     pub(crate) fn public_url_for_request_with_query<'a>(
         &self,
@@ -586,6 +635,31 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns a reference to the auth configuration.
     pub fn auth_config(&self) -> &AuthConfig {
         &self.auth_config
+    }
+
+    /// Builds the search-time terminology service from the configuration:
+    /// `Some` when a terminology server is configured.
+    fn search_terminology_from(
+        config: &ServerConfig,
+    ) -> Option<Arc<crate::terminology::SearchTerminology>> {
+        config.terminology_server.as_deref().map(|url| {
+            Arc::new(crate::terminology::SearchTerminology::from_config(
+                url,
+                &config.search_terminology,
+            ))
+        })
+    }
+
+    /// The search-time terminology service, when a terminology server is
+    /// configured (`HFS_TERMINOLOGY_SERVER`).
+    pub fn search_terminology(&self) -> Option<&crate::terminology::SearchTerminology> {
+        self.search_terminology.as_deref()
+    }
+
+    /// What a search does when a terminology expansion behind one of its
+    /// modifiers fails (`HFS_SEARCH_TERMINOLOGY_FAIL`).
+    pub fn expansion_failure_policy(&self) -> crate::terminology::ExpansionFailurePolicy {
+        crate::terminology::ExpansionFailurePolicy::parse(&self.config.search_terminology.fail)
     }
 
     /// Returns the configured terminology server URL, if any.

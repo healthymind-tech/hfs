@@ -251,8 +251,10 @@ async fn validate_rejects_type_mismatch() {
     response.assert_status_bad_request();
 }
 
+/// A profile the caller asks for that the server does not know is an
+/// error: the requested validation did not happen.
 #[tokio::test]
-async fn validate_unknown_profile_reports_warning() {
+async fn validate_unknown_requested_profile_is_an_error() {
     let (server, _backend) = create_test_server().await;
     let response = server
         .post("/Patient/$validate?profile=http://example.org/StructureDefinition/nope")
@@ -263,8 +265,40 @@ async fn validate_unknown_profile_reports_warning() {
     assert!(
         issue_codes(&outcome)
             .iter()
-            .any(|(sev, code)| sev == "warning" && code == "not-supported"),
-        "unresolvable profile surfaces as a warning: {outcome:#}"
+            .any(|(sev, code)| sev == "error" && code == "not-supported"),
+        "unresolvable requested profile surfaces as an error: {outcome:#}"
+    );
+}
+
+/// An unknown `meta.profile` claim is a warning (default policy) located at
+/// the claim, as the HL7 validator reports it.
+#[tokio::test]
+async fn validate_unknown_meta_profile_warns_at_the_claim() {
+    let (server, _backend) = create_test_server().await;
+    let response = server
+        .post("/Patient/$validate")
+        .json(&json!({
+            "resourceType": "Patient",
+            "meta": { "profile": ["http://example.org/StructureDefinition/nope"] }
+        }))
+        .await;
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    let issues = outcome["issue"].as_array().expect("issues");
+    let claim = issues
+        .iter()
+        .find(|i| i["code"] == "not-supported")
+        .unwrap_or_else(|| panic!("no unknown-profile issue: {outcome:#}"));
+    assert_eq!(claim["severity"], "warning", "{outcome:#}");
+    assert_eq!(
+        claim["expression"][0], "Patient.meta.profile[0]",
+        "{outcome:#}"
+    );
+    assert!(
+        claim["details"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("has not been checked")),
+        "{outcome:#}"
     );
 }
 

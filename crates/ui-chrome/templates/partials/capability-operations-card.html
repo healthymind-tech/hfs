@@ -15,12 +15,12 @@
 #}
 <section class="card table-card cap-operations-card">
   <div class="card-head">
-    <h3>{{ i18n.t("cap-operations-heading") }}</h3>
+    <h2>{{ i18n.t("cap-operations-heading") }}</h2>
   </div>
   {%- if let Some(notice) = notice %}
   <p class="notice notice--warn">{{ notice }}</p>
   {%- else %}
-  <div class="table-wrap">
+  <div class="table-wrap" tabindex="0">
     <table class="data-table">
       <thead>
         <tr>

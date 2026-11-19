@@ -19,6 +19,7 @@
 //! | [`metadata`] | `GET /metadata` |
 //! | [`params`] | FHIR Parameters parsing helpers (shared) |
 //! | [`search`] | `GET /CodeSystem`, `/ValueSet`, `/ConceptMap` |
+//! | [`snomed_version`] | SNOMED CT version URIs in `$validate-code` / `$lookup` requests (shared) |
 //! | [`subsumes`] | `GET/POST /CodeSystem/$subsumes` |
 //! | [`translate`] | `GET/POST /ConceptMap/$translate` |
 //! | [`validate_code`] | `GET/POST /CodeSystem/$validate-code`, `/ValueSet/$validate-code` |
@@ -34,6 +35,7 @@
 //! [`metadata`]: self::metadata
 //! [`params`]: self::params
 //! [`search`]: self::search
+//! [`snomed_version`]: self::snomed_version
 //! [`subsumes`]: self::subsumes
 //! [`translate`]: self::translate
 //! [`validate_code`]: self::validate_code
@@ -50,6 +52,7 @@ pub mod lookup;
 pub mod metadata;
 pub mod params;
 pub mod search;
+pub mod snomed_version;
 pub mod subsumes;
 pub mod translate;
 pub mod validate_code;

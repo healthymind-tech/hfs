@@ -8,11 +8,14 @@ pub mod status;
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use helios_fhir::FhirVersion;
+use helios_persistence::core::bulk_submit_input::redact_url;
+use tokio::sync::{Mutex, watch};
 use tracing::{debug, warn};
 
 use crate::error::SubscriptionError;
+use crate::notification::NotificationEventData;
 use crate::topics::InMemoryTopicRegistry;
 
 pub use filters::SubscriptionFilter;
@@ -85,7 +88,10 @@ impl ChannelType {
 }
 
 /// Channel configuration for a subscription.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the endpoint and the header values, which commonly carry
+/// a receiver's credentials (#2149).
+#[derive(Clone)]
 pub struct ChannelConfig {
     pub channel_type: ChannelType,
     pub endpoint: Option<String>,
@@ -95,6 +101,47 @@ pub struct ChannelConfig {
     pub heartbeat_period: Option<u32>,
     pub timeout: Option<u32>,
     pub max_count: Option<u32>,
+}
+
+impl ChannelConfig {
+    /// The endpoint with userinfo, query, and fragment removed, for logs and
+    /// error messages. Empty when the channel has no endpoint.
+    pub fn endpoint_for_log(&self) -> String {
+        self.endpoint.as_deref().map(redact_url).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            channel_type,
+            endpoint,
+            payload_mime_type,
+            payload_content,
+            headers,
+            heartbeat_period,
+            timeout,
+            max_count,
+        } = self;
+        // Header names stay (they show what was configured); values do not.
+        let headers: Vec<String> = headers
+            .iter()
+            .map(|h| match h.split_once(':') {
+                Some((name, _)) => format!("{}: [redacted]", name.trim()),
+                None => "[redacted]".to_string(),
+            })
+            .collect();
+        f.debug_struct("ChannelConfig")
+            .field("channel_type", channel_type)
+            .field("endpoint", &endpoint.as_deref().map(redact_url))
+            .field("payload_mime_type", payload_mime_type)
+            .field("payload_content", payload_content)
+            .field("headers", &headers)
+            .field("heartbeat_period", heartbeat_period)
+            .field("timeout", timeout)
+            .field("max_count", max_count)
+            .finish()
+    }
 }
 
 /// An active subscription tracked by the manager.
@@ -131,16 +178,274 @@ pub struct ActiveSubscription {
     pub tenant_id: String,
 }
 
+/// A registration snapshot for work that may finish after a client update.
+/// The public subscription representation deliberately carries no runtime token.
+#[derive(Debug, Clone)]
+pub(crate) struct SubscriptionSnapshot {
+    pub subscription: ActiveSubscription,
+    pub generation: GenerationToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationState {
+    Live,
+    Terminal,
+    Invalidated,
+}
+
+#[derive(Debug)]
+struct Generation {
+    state: watch::Sender<GenerationState>,
+    status_writes: Arc<Mutex<()>>,
+}
+
+/// Shared identity and cancellation state for exactly one registration.
+/// Watch retains the state even when cancellation precedes a waiter's creation.
+#[derive(Debug, Clone)]
+pub(crate) struct GenerationToken {
+    inner: Arc<Generation>,
+}
+
+impl GenerationToken {
+    fn new(status: SubscriptionStatusCode) -> Self {
+        let state = if status.is_terminal() {
+            GenerationState::Terminal
+        } else {
+            GenerationState::Live
+        };
+        let (state, _) = watch::channel(state);
+        Self {
+            inner: Arc::new(Generation {
+                state,
+                status_writes: Arc::new(Mutex::new(())),
+            }),
+        }
+    }
+
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        *self.inner.state.borrow() != GenerationState::Live
+    }
+
+    /// Delivery and activation stop both on terminal status and replacement.
+    pub(crate) async fn cancelled(&self) {
+        self.wait_for(|state| state != GenerationState::Live).await;
+    }
+
+    /// Status write-back may persist a terminal decision, but must stop when
+    /// the registration that made that decision was replaced or removed.
+    pub(crate) async fn invalidated(&self) {
+        self.wait_for(|state| state == GenerationState::Invalidated)
+            .await;
+    }
+
+    pub(crate) fn status_write_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.inner.status_writes)
+    }
+
+    async fn wait_for(&self, predicate: fn(GenerationState) -> bool) {
+        let mut receiver = self.inner.state.subscribe();
+        loop {
+            let state = *receiver.borrow_and_update();
+            if predicate(state) || receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn make_terminal(&self) {
+        self.inner.state.send_if_modified(|state| {
+            if *state == GenerationState::Live {
+                *state = GenerationState::Terminal;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn invalidate(&self) {
+        self.inner.state.send_replace(GenerationState::Invalidated);
+    }
+}
+
+/// The exact stored intent a generation may update. Server metadata is
+/// normalized away; all other fields, including unknown fields, remain fenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusSourceFence {
+    version_id: Option<String>,
+    content: Arc<serde_json::Value>,
+}
+
+impl StatusSourceFence {
+    fn new(resource: &serde_json::Value, source_version: Option<&str>) -> Self {
+        let version_id = source_version
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                resource
+                    .get("meta")
+                    .and_then(|meta| meta.get("versionId"))
+                    .and_then(|version| version.as_str())
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_string);
+        Self {
+            version_id,
+            content: Arc::new(normalize_source(resource)),
+        }
+    }
+
+    pub(crate) fn matches(&self, version_id: &str, content: &serde_json::Value) -> bool {
+        self.version_id
+            .as_deref()
+            .is_none_or(|expected| expected == version_id)
+            && *self.content == normalize_source(content)
+    }
+}
+
+fn normalize_source(resource: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = resource.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        let remove_meta = object
+            .get_mut("meta")
+            .and_then(|meta| meta.as_object_mut())
+            .is_some_and(|meta| {
+                meta.remove("versionId");
+                meta.remove("lastUpdated");
+                meta.is_empty()
+            });
+        if remove_meta {
+            object.remove("meta");
+        }
+    }
+    normalized
+}
+
+/// Default number of events remembered per subscription.
+const DEFAULT_EVENT_HISTORY_SIZE: usize = 100;
+
+/// Result of an `$events` range query (see [`SubscriptionManager::events_in_range`]).
+#[derive(Debug, Clone)]
+pub struct EventQuery {
+    /// Current subscription status.
+    pub status: SubscriptionStatusCode,
+    /// Canonical URL of the subscription topic.
+    pub topic_url: String,
+    /// FHIR version of the subscription resource.
+    pub fhir_version: FhirVersion,
+    /// Number of the latest event assigned (`eventsSinceSubscriptionStart`).
+    pub events_since_start: u64,
+    /// Number of the oldest event still retained, if any.
+    pub oldest_retained: Option<u64>,
+    /// Retained events inside the requested range, oldest first.
+    pub events: Vec<NotificationEventData>,
+}
+
+/// Why an `$events` range could not be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeError {
+    /// `eventsSinceNumber` / `eventsUntilNumber` must be at least 1.
+    BelowMinimum { param: &'static str },
+    /// `eventsSinceNumber` is greater than `eventsUntilNumber`.
+    SinceAfterUntil { since: u64, until: u64 },
+    /// The whole range is older than the retained history (or no history is kept).
+    NoLongerRetained { oldest: Option<u64> },
+}
+
+impl RangeError {
+    /// The request parameter the error is about.
+    pub fn param(&self) -> &'static str {
+        match self {
+            Self::BelowMinimum { param } => param,
+            Self::SinceAfterUntil { .. } => "eventsSinceNumber",
+            Self::NoLongerRetained { .. } => "eventsSinceNumber",
+        }
+    }
+}
+
+impl std::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BelowMinimum { param } => write!(f, "{param} must be 1 or greater"),
+            Self::SinceAfterUntil { since, until } => write!(
+                f,
+                "eventsSinceNumber ({since}) is greater than eventsUntilNumber ({until})"
+            ),
+            Self::NoLongerRetained { oldest: Some(n) } => {
+                write!(f, "events before {n} are no longer retained")
+            }
+            Self::NoLongerRetained { oldest: None } => {
+                write!(f, "no event history is retained for this subscription")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RangeError {}
+
+struct RegisteredSubscription {
+    subscription: ActiveSubscription,
+    generation: GenerationToken,
+    source_fence: StatusSourceFence,
+    /// Most recent events, oldest first. Numbered and trimmed under the same
+    /// map guard as `subscription.events_since_start`, so the two never drift.
+    history: std::collections::VecDeque<NotificationEventData>,
+}
+
+impl RegisteredSubscription {
+    fn snapshot(&self) -> SubscriptionSnapshot {
+        SubscriptionSnapshot {
+            subscription: self.subscription.clone(),
+            generation: self.generation.clone(),
+        }
+    }
+
+    fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
+        self.generation.same_generation(&snapshot.generation)
+    }
+
+    fn update_status(
+        &mut self,
+        new_status: SubscriptionStatusCode,
+    ) -> Result<SubscriptionStatusCode, SubscriptionError> {
+        let old_status = self.subscription.status;
+        if !old_status.can_transition_to(new_status) {
+            return Err(SubscriptionError::InvalidStatusTransition {
+                from: old_status.to_string(),
+                to: new_status.to_string(),
+            });
+        }
+        self.subscription.status = new_status;
+        if new_status.is_terminal() {
+            self.generation.make_terminal();
+        }
+        debug!(
+            tenant = %self.subscription.tenant_id,
+            subscription_id = %self.subscription.id,
+            from = %old_status,
+            to = %new_status,
+            "Status transition"
+        );
+        Ok(old_status)
+    }
+}
+
 /// Manages the lifecycle and in-memory indexing of active subscriptions.
 pub struct SubscriptionManager {
     /// Active subscriptions keyed by (tenant_id, subscription_id).
-    subscriptions: DashMap<(String, String), ActiveSubscription>,
+    subscriptions: DashMap<(String, String), RegisteredSubscription>,
 
     /// Topic registry for validation.
     topic_registry: Arc<InMemoryTopicRegistry>,
 
     /// Supported channel types.
     supported_channels: Vec<String>,
+
+    /// Events remembered per subscription for `$events` (0 disables).
+    event_history_size: usize,
 }
 
 impl SubscriptionManager {
@@ -153,12 +458,20 @@ impl SubscriptionManager {
             subscriptions: DashMap::new(),
             topic_registry,
             supported_channels,
+            event_history_size: DEFAULT_EVENT_HISTORY_SIZE,
         }
+    }
+
+    /// Sets how many recent events are remembered per subscription (0 disables).
+    pub fn with_event_history_size(mut self, size: usize) -> Self {
+        self.event_history_size = size;
+        self
     }
 
     /// Registers a subscription from a FHIR Subscription resource JSON.
     ///
-    /// Validates the topic URL, channel type, and filter criteria.
+    /// Validates the topic URL and filters against the supplied tenant's
+    /// definition, as well as the channel type.
     /// On success, the subscription is stored in the in-memory index.
     pub fn register(
         &self,
@@ -167,17 +480,33 @@ impl SubscriptionManager {
         resource: &serde_json::Value,
         fhir_version: FhirVersion,
     ) -> Result<ActiveSubscription, SubscriptionError> {
+        self.register_snapshot(tenant_id, subscription_id, resource, fhir_version, None)
+            .map(|snapshot| snapshot.subscription)
+    }
+
+    /// Register atomically with the version of the write that announced it.
+    /// Public callers without that version still retain a content fence and
+    /// can supply `meta.versionId` in the resource itself.
+    pub(crate) fn register_snapshot(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        resource: &serde_json::Value,
+        fhir_version: FhirVersion,
+        source_version: Option<&str>,
+    ) -> Result<SubscriptionSnapshot, SubscriptionError> {
         // Parse the subscription resource.
         let topic_url = extract_topic_url(resource, fhir_version)?;
         let channel = extract_channel_config(resource, fhir_version)?;
         let filter_strings = extract_filter_criteria(resource, fhir_version);
 
         // Validate topic exists.
-        let topic = self.topic_registry.get_topic(&topic_url).ok_or_else(|| {
-            SubscriptionError::TopicNotFound {
+        let topic = self
+            .topic_registry
+            .get_topic(tenant_id, &topic_url)
+            .ok_or_else(|| SubscriptionError::TopicNotFound {
                 url: topic_url.clone(),
-            }
-        })?;
+            })?;
 
         // Validate channel type is supported.
         if !self
@@ -244,50 +573,74 @@ impl SubscriptionManager {
         // the subscription (see [`is_rearm`]), which is the one deliberate,
         // client-driven reset and the documented way back from `error`/`off`.
         let key = (tenant_id.to_string(), subscription_id.to_string());
-        let previous = self.subscriptions.get(&key).map(|entry| {
-            let sub = entry.value();
-            (sub.status, sub.events_since_start, sub.consecutive_failures)
-        });
-
-        let (events_since_start, consecutive_failures) = match previous {
-            Some((previous_status, events, failures)) if !is_rearm(previous_status, status) => {
-                (events, failures)
-            }
-            _ => (0, 0),
+        let mut registered = RegisteredSubscription {
+            subscription: ActiveSubscription {
+                id: subscription_id.to_string(),
+                topic_url,
+                status,
+                channel,
+                filters: parsed_filters,
+                fhir_version,
+                events_since_start: 0,
+                consecutive_failures: 0,
+                tenant_id: tenant_id.to_string(),
+            },
+            generation: GenerationToken::new(status),
+            source_fence: StatusSourceFence::new(resource, source_version),
+            history: std::collections::VecDeque::new(),
         };
 
-        let subscription = ActiveSubscription {
-            id: subscription_id.to_string(),
-            topic_url,
-            status,
-            channel,
-            filters: parsed_filters,
-            fhir_version,
-            events_since_start,
-            consecutive_failures,
-            tenant_id: tenant_id.to_string(),
+        // Counter preservation, invalidation, and replacement share one map
+        // critical section: a concurrent delivery cannot increment a value
+        // between the previous-counter read and the new registration's insert.
+        let (snapshot, re_registered) = match self.subscriptions.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let previous = entry.get_mut();
+                if !is_rearm(previous.subscription.status, status) {
+                    registered.subscription.events_since_start =
+                        previous.subscription.events_since_start;
+                    registered.subscription.consecutive_failures =
+                        previous.subscription.consecutive_failures;
+                    // The history follows the counter: kept together, reset together.
+                    registered.history = std::mem::take(&mut previous.history);
+                }
+                previous.generation.invalidate();
+                let snapshot = registered.snapshot();
+                entry.insert(registered);
+                (snapshot, true)
+            }
+            Entry::Vacant(entry) => {
+                let snapshot = registered.snapshot();
+                entry.insert(registered);
+                (snapshot, false)
+            }
         };
 
         debug!(
             tenant = tenant_id,
             subscription_id,
-            topic = %subscription.topic_url,
-            status = %subscription.status,
-            events_since_start,
-            consecutive_failures,
-            re_registered = previous.is_some(),
+            topic = %snapshot.subscription.topic_url,
+            status = %snapshot.subscription.status,
+            events_since_start = snapshot.subscription.events_since_start,
+            consecutive_failures = snapshot.subscription.consecutive_failures,
+            re_registered,
             "Registered subscription"
         );
 
-        self.subscriptions.insert(key, subscription.clone());
-
-        Ok(subscription)
+        Ok(snapshot)
     }
 
     /// Removes a subscription from the in-memory index.
     pub fn deregister(&self, tenant_id: &str, subscription_id: &str) -> bool {
         let key = (tenant_id.to_string(), subscription_id.to_string());
-        let removed = self.subscriptions.remove(&key).is_some();
+        let removed = match self.subscriptions.entry(key) {
+            Entry::Occupied(entry) => {
+                entry.get().generation.invalidate();
+                entry.remove();
+                true
+            }
+            Entry::Vacant(_) => false,
+        };
         if removed {
             debug!(
                 tenant = tenant_id,
@@ -306,12 +659,12 @@ impl SubscriptionManager {
         self.subscriptions
             .iter()
             .filter(|entry| {
-                let sub = entry.value();
+                let sub = &entry.value().subscription;
                 sub.tenant_id == tenant_id
                     && sub.topic_url == topic_url
                     && sub.status == SubscriptionStatusCode::Active
             })
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().subscription.clone())
             .collect()
     }
 
@@ -322,7 +675,9 @@ impl SubscriptionManager {
         subscription_id: &str,
     ) -> Option<ActiveSubscription> {
         let key = (tenant_id.to_string(), subscription_id.to_string());
-        self.subscriptions.get(&key).map(|entry| entry.clone())
+        self.subscriptions
+            .get(&key)
+            .map(|entry| entry.subscription.clone())
     }
 
     /// Updates the status of a subscription.
@@ -337,40 +692,26 @@ impl SubscriptionManager {
             SubscriptionError::Internal(format!("subscription not found: {subscription_id}"))
         })?;
 
-        let old_status = entry.status;
-        if !old_status.can_transition_to(new_status) {
-            return Err(SubscriptionError::InvalidStatusTransition {
-                from: old_status.to_string(),
-                to: new_status.to_string(),
-            });
-        }
-
-        entry.status = new_status;
-        debug!(
-            tenant = tenant_id,
-            subscription_id,
-            from = %old_status,
-            to = %new_status,
-            "Status transition"
-        );
-
-        Ok(old_status)
+        entry.update_status(new_status)
     }
 
     /// Increments the event counter and returns the new value.
+    ///
+    /// Does not record an history entry (there is no timestamp or focus here);
+    /// the engine uses `record_event_if_current`, which does.
     pub fn increment_event_count(&self, tenant_id: &str, subscription_id: &str) -> Option<u64> {
         let key = (tenant_id.to_string(), subscription_id.to_string());
         let mut entry = self.subscriptions.get_mut(&key)?;
-        entry.events_since_start += 1;
-        Some(entry.events_since_start)
+        entry.subscription.events_since_start += 1;
+        Some(entry.subscription.events_since_start)
     }
 
     /// Records a delivery failure and returns the new consecutive failure count.
     pub fn record_failure(&self, tenant_id: &str, subscription_id: &str) -> Option<u32> {
         let key = (tenant_id.to_string(), subscription_id.to_string());
         let mut entry = self.subscriptions.get_mut(&key)?;
-        entry.consecutive_failures += 1;
-        let count = entry.consecutive_failures;
+        entry.subscription.consecutive_failures += 1;
+        let count = entry.subscription.consecutive_failures;
         warn!(
             tenant = tenant_id,
             subscription_id,
@@ -384,7 +725,39 @@ impl SubscriptionManager {
     pub fn reset_failures(&self, tenant_id: &str, subscription_id: &str) {
         let key = (tenant_id.to_string(), subscription_id.to_string());
         if let Some(mut entry) = self.subscriptions.get_mut(&key) {
-            entry.consecutive_failures = 0;
+            entry.subscription.consecutive_failures = 0;
+        }
+    }
+
+    /// Overlays cluster-shared runtime state onto the local projection: the
+    /// shared counters win over whatever this instance accumulated, and a
+    /// stored status is applied directly — transition validation happened on
+    /// the instance that recorded it, so replaying it here must not be
+    /// re-gated (e.g. a hydrating instance adopting `off`).
+    pub fn apply_state_overlay(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        event_number: u64,
+        consecutive_failures: u32,
+        status: Option<SubscriptionStatusCode>,
+    ) {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            entry.subscription.events_since_start = event_number;
+            entry.subscription.consecutive_failures = consecutive_failures;
+            if let Some(status) = status {
+                entry.subscription.status = status;
+            }
+        }
+    }
+
+    /// Mirrors a cluster-store event number into the local projection so
+    /// local reads stay coherent between overlays.
+    pub fn sync_event_count(&self, tenant_id: &str, subscription_id: &str, event_number: u64) {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            entry.subscription.events_since_start = event_number;
         }
     }
 
@@ -392,8 +765,279 @@ impl SubscriptionManager {
     pub fn all_subscriptions(&self) -> Vec<ActiveSubscription> {
         self.subscriptions
             .iter()
-            .map(|e| e.value().clone())
+            .map(|e| e.value().subscription.clone())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_snapshot(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+    ) -> Option<SubscriptionSnapshot> {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        self.subscriptions.get(&key).map(|entry| entry.snapshot())
+    }
+
+    pub(crate) fn active_snapshots_for_topic(
+        &self,
+        tenant_id: &str,
+        topic_url: &str,
+    ) -> Vec<SubscriptionSnapshot> {
+        self.subscriptions
+            .iter()
+            .filter(|entry| {
+                let sub = &entry.subscription;
+                sub.tenant_id == tenant_id
+                    && sub.topic_url == topic_url
+                    && sub.status == SubscriptionStatusCode::Active
+            })
+            .map(|entry| entry.snapshot())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_snapshots(&self) -> Vec<SubscriptionSnapshot> {
+        self.subscriptions
+            .iter()
+            .map(|entry| entry.snapshot())
+            .collect()
+    }
+
+    pub(crate) fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        self.subscriptions
+            .get(&key)
+            .is_some_and(|entry| entry.is_current(snapshot))
+    }
+
+    pub(crate) fn is_current_status(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatusCode,
+    ) -> bool {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        self.subscriptions
+            .get(&key)
+            .is_some_and(|entry| entry.is_current(snapshot) && entry.subscription.status == status)
+    }
+
+    /// Assign numbers only while the evaluated generation is still Active, and
+    /// remember the event in the bounded history under the same guard.
+    pub(crate) fn record_event_if_current(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        focus_reference: String,
+    ) -> Option<u64> {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        let mut entry = self.subscriptions.get_mut(&key)?;
+        if !entry.is_current(snapshot)
+            || entry.subscription.status != SubscriptionStatusCode::Active
+        {
+            return None;
+        }
+        entry.subscription.events_since_start += 1;
+        let event_number = entry.subscription.events_since_start;
+        if self.event_history_size > 0 {
+            while entry.history.len() >= self.event_history_size {
+                entry.history.pop_front();
+            }
+            entry.history.push_back(NotificationEventData {
+                event_number,
+                timestamp,
+                focus_reference,
+            });
+        }
+        Some(event_number)
+    }
+
+    /// Appends an already-numbered event to the subscription's retained
+    /// history (the fork's engine numbers events itself, through the shared
+    /// store when clustered, then records them here for `$events`).
+    pub(crate) fn record_event_history(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        event: NotificationEventData,
+    ) {
+        if self.event_history_size == 0 {
+            return;
+        }
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        if let Some(mut entry) = self.subscriptions.get_mut(&key) {
+            while entry.history.len() >= self.event_history_size {
+                entry.history.pop_front();
+            }
+            entry.history.push_back(event);
+        }
+    }
+
+    /// Looks up the retained events of a subscription in an inclusive number range.
+    ///
+    /// Returns `None` when the engine does not hold the subscription. Defaults:
+    /// `since` is the oldest retained event, `until` the latest event number;
+    /// an `until` beyond the latest is clamped to it. A `since` beyond the
+    /// latest event (the next number a polling client expects) yields no
+    /// events rather than an error. A partial overlap with the retained
+    /// history yields the retained subset. The history is in memory only and
+    /// is empty after a restart.
+    pub fn events_in_range(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Option<Result<EventQuery, RangeError>> {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        let entry = self.subscriptions.get(&key)?;
+        let latest = entry.subscription.events_since_start;
+        let oldest = entry.history.front().map(|e| e.event_number);
+
+        let result = (|| {
+            for (param, value) in [("eventsSinceNumber", since), ("eventsUntilNumber", until)] {
+                if value == Some(0) {
+                    return Err(RangeError::BelowMinimum { param });
+                }
+            }
+            if let (Some(s), Some(u)) = (since, until)
+                && s > u
+            {
+                return Err(RangeError::SinceAfterUntil { since: s, until: u });
+            }
+            // A range starting after the latest event asks for events that have
+            // not happened yet: answer with none (polling with `last seen + 1`)
+            // instead of treating it as evicted history.
+            let ahead = since.is_some_and(|s| s > latest);
+            let explicit = since.is_some() || until.is_some();
+            let lower = since.or(oldest).unwrap_or(1);
+            let upper = until.map_or(latest, |u| u.min(latest));
+            let evicted = match oldest {
+                Some(o) => upper < o,
+                None => latest > 0,
+            };
+            if explicit && evicted && !ahead {
+                return Err(RangeError::NoLongerRetained { oldest });
+            }
+            let events = entry
+                .history
+                .iter()
+                .filter(|e| e.event_number >= lower && e.event_number <= upper)
+                .cloned()
+                .collect();
+            Ok(EventQuery {
+                status: entry.subscription.status,
+                topic_url: entry.subscription.topic_url.clone(),
+                fhir_version: entry.subscription.fhir_version,
+                events_since_start: latest,
+                oldest_retained: oldest,
+                events,
+            })
+        })();
+        Some(result)
+    }
+
+    /// Accept one delivery outcome for the current serving generation. The
+    /// callback records rolling metrics synchronously under the same entry
+    /// guard as the failure streak, so replacement cannot split acceptance.
+    /// It must be cheap, perform no I/O, and never re-enter this manager.
+    /// The returned failure count may drive async transitions after this returns.
+    pub(crate) fn accept_delivery_outcome(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        succeeded: bool,
+        record_stats: impl FnOnce(),
+    ) -> Option<u32> {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        let mut entry = self.subscriptions.get_mut(&key)?;
+        if !entry.is_current(snapshot)
+            || !matches!(
+                entry.subscription.status,
+                SubscriptionStatusCode::Active | SubscriptionStatusCode::Error
+            )
+        {
+            return None;
+        }
+        if succeeded {
+            entry.subscription.consecutive_failures = 0;
+        } else {
+            entry.subscription.consecutive_failures += 1;
+        }
+        record_stats();
+        let count = entry.subscription.consecutive_failures;
+        if !succeeded {
+            warn!(tenant = %sub.tenant_id, subscription_id = %sub.id, consecutive_failures = count, "Delivery failure recorded");
+        }
+        Some(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_failure_if_current(&self, snapshot: &SubscriptionSnapshot) -> Option<u32> {
+        self.accept_delivery_outcome(snapshot, false, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_failures_if_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
+        self.accept_delivery_outcome(snapshot, true, || {})
+            .is_some()
+    }
+
+    pub(crate) fn update_status_if_current(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        new_status: SubscriptionStatusCode,
+    ) -> Option<SubscriptionStatusCode> {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        let mut entry = self.subscriptions.get_mut(&key)?;
+        if !entry.is_current(snapshot) {
+            return None;
+        }
+        entry.update_status(new_status).ok()
+    }
+
+    /// This fence can be used after an async storage read without retaining a
+    /// map guard. Generation/status must be rechecked before issuing the write.
+    pub(crate) fn source_fence(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+    ) -> Option<StatusSourceFence> {
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        let entry = self.subscriptions.get(&key)?;
+        entry
+            .is_current(snapshot)
+            .then(|| entry.source_fence.clone())
+    }
+
+    /// Record successful server write-back only for the same registration and
+    /// prior source. A late completion cannot advance a client's replacement
+    /// fence. Callers serialize own writes with the generation's write lock.
+    pub(crate) fn acknowledge_status_write(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        expected_fence: &StatusSourceFence,
+        new_version: &str,
+        content: &serde_json::Value,
+    ) -> bool {
+        if new_version.is_empty() {
+            return false;
+        }
+        let sub = &snapshot.subscription;
+        let key = (sub.tenant_id.clone(), sub.id.clone());
+        let mut entry = match self.subscriptions.get_mut(&key) {
+            Some(entry) => entry,
+            None => return false,
+        };
+        if !entry.is_current(snapshot) || &entry.source_fence != expected_fence {
+            return false;
+        }
+        entry.source_fence = StatusSourceFence::new(content, Some(new_version));
+        true
     }
 }
 
@@ -747,24 +1391,27 @@ pub(crate) mod tests {
     use crate::topics::{FilterDefinition, ResourceTrigger, TopicDefinition};
     use serde_json::json;
 
-    fn create_test_registry() -> Arc<InMemoryTopicRegistry> {
+    fn create_test_registry(tenant_id: &str) -> Arc<InMemoryTopicRegistry> {
         let registry = Arc::new(InMemoryTopicRegistry::new());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-start".to_string(),
-            title: Some("Encounter Start".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![FilterDefinition {
-                resource_type: Some("Encounter".to_string()),
-                filter_parameter: "patient".to_string(),
-                comparators: vec!["eq".to_string()],
-                modifiers: vec![],
-            }],
-            notification_shape: vec![],
-        });
+        registry.add_topic(
+            tenant_id,
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/encounter-start".to_string(),
+                title: Some("Encounter Start".to_string()),
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Encounter".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![FilterDefinition {
+                    resource_type: Some("Encounter".to_string()),
+                    filter_parameter: "patient".to_string(),
+                    comparators: vec!["eq".to_string()],
+                    modifiers: vec![],
+                }],
+                notification_shape: vec![],
+            },
+        );
         registry
     }
 
@@ -858,9 +1505,51 @@ pub(crate) mod tests {
         FhirVersion::R6
     }
 
+    fn channel_with_secrets() -> ChannelConfig {
+        ChannelConfig {
+            channel_type: ChannelType::RestHook,
+            endpoint: Some(
+                "https://user:PASSWORD@hooks.example.com/notify?token=QUERYSECRET".into(),
+            ),
+            payload_mime_type: None,
+            payload_content: PayloadContent::IdOnly,
+            headers: vec![
+                "Authorization: Bearer HEADERSECRET".into(),
+                "no-colon-HEADERSECRET2".into(),
+            ],
+            heartbeat_period: None,
+            timeout: None,
+            max_count: None,
+        }
+    }
+
+    #[test]
+    fn channel_config_debug_redacts_endpoint_and_header_values() {
+        let debug = format!("{:?}", channel_with_secrets());
+        for secret in ["PASSWORD", "QUERYSECRET", "HEADERSECRET"] {
+            assert!(!debug.contains(secret), "{secret} leaked: {debug}");
+        }
+        assert!(debug.contains("hooks.example.com/notify"), "{debug}");
+        assert!(debug.contains("Authorization: [redacted]"), "{debug}");
+    }
+
+    #[test]
+    fn endpoint_for_log_redacts_credentials_and_keeps_host() {
+        let channel = channel_with_secrets();
+        assert_eq!(
+            channel.endpoint_for_log(),
+            "https://[redacted]@hooks.example.com/notify?[redacted]"
+        );
+        let none = ChannelConfig {
+            endpoint: None,
+            ..channel
+        };
+        assert_eq!(none.endpoint_for_log(), "");
+    }
+
     #[test]
     fn test_register_r5_subscription() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -883,7 +1572,7 @@ pub(crate) mod tests {
     #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
     #[test]
     fn test_register_native_subscription_topic_and_channeltype_parsing() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -924,7 +1613,7 @@ pub(crate) mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn test_register_r4_subscription_with_backport_extensions() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = r4_subscription_json();
@@ -943,7 +1632,7 @@ pub(crate) mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn test_register_r4_subscription_payload_content_in_channel_payload_extension() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -1013,7 +1702,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_invalid_topic() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1030,8 +1719,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn registration_rejects_a_topic_owned_only_by_another_tenant() {
+        let registry = create_test_registry("tenant-a");
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+        let result = manager.register(
+            "tenant-b",
+            "foreign-sub",
+            &default_subscription_json(),
+            FhirVersion::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(SubscriptionError::TopicNotFound { .. })
+        ));
+        assert!(
+            manager
+                .get_subscription("tenant-b", "foreign-sub")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registration_uses_the_owning_tenants_filter_definitions() {
+        let registry = create_test_registry("tenant-a");
+        let mut other_topic = registry
+            .get_topic("tenant-a", "http://example.org/topic/encounter-start")
+            .unwrap();
+        other_topic.can_filter_by[0].filter_parameter = "status".to_string();
+        registry.add_topic("tenant-b", other_topic);
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let filtered_resource = |parameter: &str| {
+            let mut resource = default_subscription_json();
+            if FhirVersion::default().as_str() == "R4" {
+                resource["extension"].as_array_mut().unwrap().push(json!({
+                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
+                    "valueString": format!("Encounter?{parameter}=value")
+                }));
+            } else {
+                resource["filterBy"] = json!([{"resourceType": "Encounter", "filterParameter": parameter, "value": "value"}]);
+            }
+            resource
+        };
+        let patient = filtered_resource("patient");
+        assert!(
+            manager
+                .register("tenant-a", "sub-a", &patient, FhirVersion::default())
+                .is_ok()
+        );
+        assert!(matches!(
+            manager.register("tenant-b", "wrong-filter", &patient, FhirVersion::default()),
+            Err(SubscriptionError::InvalidFilter { .. })
+        ));
+        let status = filtered_resource("status");
+        assert!(
+            manager
+                .register("tenant-b", "sub-b", &status, FhirVersion::default())
+                .is_ok()
+        );
+        assert!(matches!(
+            manager.register("tenant-a", "wrong-filter", &status, FhirVersion::default()),
+            Err(SubscriptionError::InvalidFilter { .. })
+        ));
+    }
+
+    #[test]
     fn test_register_unsupported_channel() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1049,7 +1803,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_rest_hook_missing_endpoint() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1067,7 +1821,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deregister() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1084,7 +1838,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_active_subscriptions_for_topic() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1110,7 +1864,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_status_transitions() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1144,7 +1898,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_increment_event_count() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1162,7 +1916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_record_and_reset_failures() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1180,7 +1934,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tenant_isolation() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-a");
+        registry.add_topic(
+            "tenant-b",
+            registry
+                .get_topic("tenant-a", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1203,7 +1963,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_with_filter_by() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         #[cfg(feature = "R4")]
@@ -1267,7 +2027,7 @@ pub(crate) mod tests {
     #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
     #[test]
     fn test_register_with_native_filter_by_comparator() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -1296,7 +2056,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_with_invalid_filter() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         #[cfg(feature = "R4")]
@@ -1369,7 +2129,7 @@ pub(crate) mod tests {
         failures: u32,
     ) -> SubscriptionManager {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         manager
             .register(
                 "t1",
@@ -1390,6 +2150,267 @@ pub(crate) mod tests {
             manager.record_failure("t1", "sub-1");
         }
         manager
+    }
+
+    /// Active subscription with `n` recorded events (`Encounter/<k>`), through
+    /// the same path the engine uses.
+    fn manager_with_history(size: usize, n: u64) -> SubscriptionManager {
+        let manager =
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()])
+                .with_event_history_size(size);
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("register");
+        manager
+            .update_status("t1", "sub-1", SubscriptionStatusCode::Active)
+            .expect("activate");
+        for k in 1..=n {
+            let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+            let number = manager
+                .record_event_if_current(&snapshot, chrono::Utc::now(), format!("Encounter/{k}"))
+                .expect("record");
+            assert_eq!(number, k);
+        }
+        manager
+    }
+
+    fn numbers(query: &EventQuery) -> Vec<u64> {
+        query.events.iter().map(|e| e.event_number).collect()
+    }
+
+    #[test]
+    fn history_is_bounded_and_drops_the_oldest() {
+        let manager = manager_with_history(3, 5);
+        let q = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.events_since_start, 5);
+        assert_eq!(q.oldest_retained, Some(3));
+        assert_eq!(numbers(&q), vec![3, 4, 5]);
+        assert_eq!(q.events[0].focus_reference, "Encounter/3");
+    }
+
+    #[test]
+    fn events_in_range_defaults_and_subranges() {
+        let manager = manager_with_history(10, 4);
+        let all = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&all), vec![1, 2, 3, 4]);
+        let sub = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&sub), vec![2, 3]);
+        let one = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&one), vec![2]);
+        let from = manager
+            .events_in_range("t1", "sub-1", Some(3), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&from), vec![3, 4]);
+        let upto = manager
+            .events_in_range("t1", "sub-1", None, Some(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&upto), vec![1, 2]);
+        // `until` beyond the latest is clamped.
+        let clamped = manager
+            .events_in_range("t1", "sub-1", Some(3), Some(99))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&clamped), vec![3, 4]);
+    }
+
+    #[test]
+    fn events_in_range_rejects_invalid_ranges() {
+        let manager = manager_with_history(10, 3);
+        let err = |s, u| {
+            manager
+                .events_in_range("t1", "sub-1", s, u)
+                .unwrap()
+                .unwrap_err()
+        };
+        assert_eq!(
+            err(Some(0), None),
+            RangeError::BelowMinimum {
+                param: "eventsSinceNumber"
+            }
+        );
+        assert_eq!(
+            err(None, Some(0)),
+            RangeError::BelowMinimum {
+                param: "eventsUntilNumber"
+            }
+        );
+        assert_eq!(
+            err(Some(3), Some(1)),
+            RangeError::SinceAfterUntil { since: 3, until: 1 }
+        );
+    }
+
+    /// Polling with `eventsSinceNumber = last seen + 1` when nothing new has
+    /// happened is an empty result, not an error, also on a fresh subscription
+    /// and with the history disabled.
+    #[test]
+    fn events_in_range_since_beyond_latest_is_empty() {
+        for (size, n) in [(10, 3), (10, 0), (0, 3)] {
+            let manager = manager_with_history(size, n);
+            for (since, until) in [(n + 1, None), (n + 5, None), (n + 1, Some(n + 9))] {
+                let q = manager
+                    .events_in_range("t1", "sub-1", Some(since), until)
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("size {size}, n {n}, since {since}: {e}"));
+                assert!(q.events.is_empty());
+                assert_eq!(q.events_since_start, n);
+            }
+        }
+    }
+
+    #[test]
+    fn events_in_range_evicted_and_partial_ranges() {
+        let manager = manager_with_history(3, 6); // retains 4..=6
+        let evicted = manager
+            .events_in_range("t1", "sub-1", Some(1), Some(2))
+            .unwrap();
+        assert_eq!(
+            evicted.unwrap_err(),
+            RangeError::NoLongerRetained { oldest: Some(4) }
+        );
+        let partial = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&partial), vec![4, 5]);
+    }
+
+    #[test]
+    fn events_in_range_with_history_disabled() {
+        let manager = manager_with_history(0, 3);
+        let all = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.events_since_start, 3, "numbering still works");
+        assert!(all.events.is_empty());
+        let err = manager
+            .events_in_range("t1", "sub-1", Some(1), Some(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err, RangeError::NoLongerRetained { oldest: None });
+    }
+
+    #[test]
+    fn events_in_range_unknown_subscription_is_none() {
+        let manager = manager_with_history(3, 1);
+        assert!(manager.events_in_range("t1", "nope", None, None).is_none());
+    }
+
+    #[test]
+    fn history_is_kept_on_edit_and_reset_on_rearm() {
+        let manager = manager_with_history(10, 3);
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("edit");
+        let kept = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&kept), vec![1, 2, 3]);
+
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("rearm");
+        let reset = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.events_since_start, 0);
+        assert!(reset.events.is_empty());
+    }
+
+    #[test]
+    fn stale_snapshot_records_no_history() {
+        let manager = manager_with_history(10, 1);
+        let old = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("2"),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.record_event_if_current(&old, chrono::Utc::now(), "Encounter/z".to_string()),
+            None
+        );
+        let q = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&q), vec![1]);
+    }
+
+    #[test]
+    fn history_is_tenant_scoped() {
+        let registry = create_test_registry("t1");
+        registry.add_topic(
+            "t2",
+            registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+        for t in ["t1", "t2"] {
+            manager
+                .register(
+                    t,
+                    "sub-1",
+                    &subscription_with_status("requested"),
+                    FhirVersion::default(),
+                )
+                .unwrap();
+            manager
+                .update_status(t, "sub-1", SubscriptionStatusCode::Active)
+                .unwrap();
+        }
+        let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager
+            .record_event_if_current(&snapshot, chrono::Utc::now(), "Encounter/a".to_string())
+            .unwrap();
+        let t1 = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        let t2 = manager
+            .events_in_range("t2", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&t1), vec![1]);
+        assert!(t2.events.is_empty());
+        assert_eq!(t2.events_since_start, 0);
     }
 
     /// An edit that does not change the status must not reset the counters.
@@ -1483,7 +2504,7 @@ pub(crate) mod tests {
     #[test]
     fn test_first_registration_starts_at_zero() {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         let sub = manager
             .register(
                 "t1",
@@ -1501,6 +2522,13 @@ pub(crate) mod tests {
     #[test]
     fn test_counters_are_tenant_scoped() {
         let manager = manager_with_state(SubscriptionStatusCode::Active, 6, 3);
+        manager.topic_registry.add_topic(
+            "t2",
+            manager
+                .topic_registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
 
         let other = manager
             .register(
@@ -1518,13 +2546,448 @@ pub(crate) mod tests {
         assert_eq!(first.events_since_start, 6);
     }
 
+    #[test]
+    fn stale_terminal_and_deleted_outcomes_never_record_metrics_or_erase_prior_history() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 7, 2);
+        let stats = crate::delivery_stats::DeliveryStats::new();
+        let now = chrono::Utc::now().timestamp();
+        stats.record_success("t1", "sub-1", true, now);
+        let old = manager.get_snapshot("t1", "sub-1").unwrap();
+        let replacement = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("2"),
+            )
+            .unwrap();
+        for succeeded in [false, true] {
+            assert_eq!(
+                manager.accept_delivery_outcome(&old, succeeded, || panic!(
+                    "stale callback must not run"
+                )),
+                None
+            );
+        }
+        assert_eq!(
+            manager
+                .get_subscription("t1", "sub-1")
+                .unwrap()
+                .consecutive_failures,
+            2
+        );
+        manager.deregister("t1", "sub-1");
+        let recreated = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("3"),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.accept_delivery_outcome(&replacement, false, || panic!(
+                "deleted callback must not run"
+            )),
+            None
+        );
+        manager
+            .update_status_if_current(&recreated, SubscriptionStatusCode::Off)
+            .unwrap();
+        assert_eq!(
+            manager.accept_delivery_outcome(&recreated, false, || panic!(
+                "terminal callback must not run"
+            )),
+            None
+        );
+        let window = stats.window("t1", "sub-1", now);
+        assert_eq!(
+            (window.delivered, window.first_try, window.failed),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn accepted_metrics_and_streak_commit_before_a_concurrent_replacement() {
+        use dashmap::try_result::TryResult;
+        use std::sync::{Arc, mpsc};
+        let manager = Arc::new(manager_with_state(SubscriptionStatusCode::Active, 7, 2));
+        let stats = Arc::new(crate::delivery_stats::DeliveryStats::new());
+        let now = chrono::Utc::now().timestamp();
+        let old = manager.get_snapshot("t1", "sub-1").unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (registering_tx, registering_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_manager = Arc::clone(&manager);
+            let worker_stats = Arc::clone(&stats);
+            let worker_snapshot = old.clone();
+            let worker = scope.spawn(move || {
+                worker_manager.accept_delivery_outcome(&worker_snapshot, false, || {
+                    accepted_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap(); // deterministic test-only pause before metrics
+                    worker_stats.record_failure("t1", "sub-1", now);
+                })
+            });
+            accepted_rx.recv().unwrap();
+            // Check before starting any registrar, so only the outcome callback
+            // can account for this lock. Release its test gate even on failure.
+            let guard_held = matches!(
+                manager
+                    .subscriptions
+                    .try_get_mut(&("t1".into(), "sub-1".into())),
+                TryResult::Locked
+            );
+            let registering = scope.spawn(|| {
+                registering_tx.send(()).unwrap();
+                manager
+                    .register_snapshot(
+                        "t1",
+                        "sub-1",
+                        &subscription_with_status("active"),
+                        FhirVersion::default(),
+                        Some("2"),
+                    )
+                    .unwrap()
+            });
+            registering_rx.recv().unwrap();
+            continue_tx.send(()).unwrap();
+            assert!(guard_held, "outcome guard must span the metrics callback");
+            assert_eq!(worker.join().unwrap(), Some(3));
+            let replacement = registering.join().unwrap();
+            assert_eq!(replacement.subscription.consecutive_failures, 3);
+            assert_eq!(stats.window("t1", "sub-1", now).failed, 1);
+            assert_eq!(
+                manager.accept_delivery_outcome(&old, false, || panic!(
+                    "now-stale result must not record twice"
+                )),
+                None
+            );
+            assert_eq!(
+                manager.accept_delivery_outcome(&replacement, true, || stats
+                    .record_success("t1", "sub-1", true, now)),
+                Some(0)
+            );
+            let window = stats.window("t1", "sub-1", now);
+            assert_eq!((window.delivered, window.failed), (1, 1));
+        });
+    }
+
+    #[test]
+    fn replacement_rejects_late_delivery_mutations_without_resetting_counters() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 7, 2);
+        let old = manager.get_snapshot("t1", "sub-1").unwrap();
+        let replacement = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("2"),
+            )
+            .unwrap();
+
+        assert!(old.generation.is_cancelled());
+        assert!(!manager.is_current(&old));
+        assert!(manager.is_current(&replacement));
+        assert!(!old.generation.same_generation(&replacement.generation));
+        assert_eq!(
+            manager.record_event_if_current(&old, chrono::Utc::now(), "Encounter/x".to_string()),
+            None
+        );
+        assert_eq!(manager.record_failure_if_current(&old), None);
+        assert!(!manager.reset_failures_if_current(&old));
+        assert_eq!(
+            manager.update_status_if_current(&old, SubscriptionStatusCode::Off),
+            None
+        );
+        assert!(!manager.is_current_status(&old, SubscriptionStatusCode::Active));
+        assert!(manager.source_fence(&old).is_none());
+
+        let current = manager.get_subscription("t1", "sub-1").unwrap();
+        assert_eq!(current.events_since_start, 7);
+        assert_eq!(current.consecutive_failures, 2);
+        assert_eq!(current.status, SubscriptionStatusCode::Active);
+        assert_eq!(
+            manager.record_event_if_current(
+                &replacement,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
+            Some(8)
+        );
+
+        let rearmed = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+                Some("3"),
+            )
+            .unwrap();
+        assert!(replacement.generation.is_cancelled());
+        assert_eq!(rearmed.subscription.events_since_start, 0);
+        assert_eq!(rearmed.subscription.consecutive_failures, 0);
+        assert_eq!(
+            manager.record_event_if_current(
+                &rearmed,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn deletion_invalidates_only_the_deleted_tenant_and_never_reuses_its_token() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 3, 1);
+        let deleted = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager.topic_registry.add_topic(
+            "t2",
+            manager
+                .topic_registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
+        let other = manager
+            .register_snapshot(
+                "t2",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("1"),
+            )
+            .unwrap();
+        assert!(manager.deregister("t1", "sub-1"));
+        assert!(deleted.generation.is_cancelled());
+        assert!(!other.generation.is_cancelled());
+
+        let recreated = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("1"),
+            )
+            .unwrap();
+        assert!(!deleted.generation.same_generation(&recreated.generation));
+        assert_eq!(manager.record_failure_if_current(&deleted), None);
+        assert_eq!(manager.record_failure_if_current(&other), Some(1));
+        assert_eq!(recreated.subscription.events_since_start, 0);
+        assert_eq!(recreated.subscription.consecutive_failures, 0);
+        assert_eq!(
+            manager
+                .active_snapshots_for_topic("t1", &recreated.subscription.topic_url)
+                .len(),
+            1
+        );
+        assert_eq!(manager.all_snapshots().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_cancels_delivery_but_allows_its_status_write_until_replaced() {
+        use std::time::Duration;
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 1, 1);
+        let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+        let waiter = tokio::spawn({
+            let token = snapshot.generation.clone();
+            async move { token.cancelled().await }
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            manager.update_status_if_current(&snapshot, SubscriptionStatusCode::Error),
+            Some(SubscriptionStatusCode::Active)
+        );
+        assert!(
+            !snapshot.generation.is_cancelled(),
+            "admitted jobs drain through error"
+        );
+        assert_eq!(
+            manager.record_event_if_current(
+                &snapshot,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
+            None
+        );
+        assert_eq!(manager.record_failure_if_current(&snapshot), Some(2));
+        assert!(manager.reset_failures_if_current(&snapshot));
+        assert!(!manager.is_current_status(&snapshot, SubscriptionStatusCode::Active));
+        assert!(manager.is_current_status(&snapshot, SubscriptionStatusCode::Error));
+
+        assert_eq!(
+            manager.update_status_if_current(&snapshot, SubscriptionStatusCode::Off),
+            Some(SubscriptionStatusCode::Error)
+        );
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        // A waiter created after cancellation also observes the retained state.
+        tokio::time::timeout(Duration::from_secs(1), snapshot.generation.cancelled())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), snapshot.generation.invalidated())
+                .await
+                .is_err()
+        );
+        assert!(
+            manager.source_fence(&snapshot).is_some(),
+            "off still needs persistence"
+        );
+        assert_eq!(manager.record_failure_if_current(&snapshot), None);
+        assert!(!manager.reset_failures_if_current(&snapshot));
+
+        // Holding an async write lock never blocks synchronous lifecycle.
+        let write_lock = snapshot.generation.status_write_lock();
+        let _write_guard = write_lock.lock().await;
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), snapshot.generation.invalidated())
+            .await
+            .unwrap();
+        assert!(manager.source_fence(&snapshot).is_none());
+    }
+
+    #[test]
+    fn source_fence_preserves_exact_intent_and_advances_only_for_its_own_write() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 0, 0);
+        let mut source = subscription_with_status("active");
+        source["meta"] = json!({
+            "versionId": "stale-metadata", "lastUpdated": "old",
+            "tag": [{"system": "urn:test", "code": "operator-owned"}]
+        });
+        source["operatorMetadata"] = json!({"unknown": ["preserve", "these", "fields"]});
+        let snapshot = manager
+            .register_snapshot("t1", "sub-1", &source, FhirVersion::default(), Some("7"))
+            .unwrap();
+        let original = manager.source_fence(&snapshot).unwrap();
+        let mut stored = source.clone();
+        stored["meta"]["versionId"] = json!("7");
+        stored["meta"]["lastUpdated"] = json!("new-server-time");
+        assert!(original.matches("7", &stored));
+        assert!(!manager.acknowledge_status_write(&snapshot, &original, "", &stored));
+        assert!(
+            !original.matches("8", &stored),
+            "identical rewritten intent has a different version"
+        );
+        let mut changed_unknown = stored.clone();
+        changed_unknown["operatorMetadata"]["unknown"] = json!(["changed"]);
+        assert!(!original.matches("7", &changed_unknown));
+        let mut changed_tag = stored.clone();
+        changed_tag["meta"]["tag"][0]["code"] = json!("changed");
+        assert!(!original.matches("7", &changed_tag));
+
+        manager
+            .update_status_if_current(&snapshot, SubscriptionStatusCode::Error)
+            .unwrap();
+        stored["status"] = json!("error");
+        assert!(manager.acknowledge_status_write(&snapshot, &original, "8", &stored));
+        let persisted = manager.source_fence(&snapshot).unwrap();
+        assert!(persisted.matches("8", &stored));
+        assert!(!persisted.matches("7", &stored));
+        assert!(
+            !manager.acknowledge_status_write(&snapshot, &original, "9", &stored),
+            "stale acknowledgements cannot rewind the source"
+        );
+
+        let replacement = manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &changed_unknown,
+                FhirVersion::default(),
+                Some("9"),
+            )
+            .unwrap();
+        assert!(!manager.acknowledge_status_write(&snapshot, &persisted, "10", &stored));
+        assert!(
+            manager
+                .source_fence(&replacement)
+                .unwrap()
+                .matches("9", &changed_unknown)
+        );
+    }
+
+    #[test]
+    fn source_version_uses_metadata_fallback_and_normalizes_only_server_metadata() {
+        let resource = subscription_with_status("active");
+        let without_version = StatusSourceFence::new(&resource, None);
+        assert!(without_version.matches("arbitrary-version", &resource));
+        let mut with_meta = resource.clone();
+        with_meta["meta"] = json!({"versionId": "4", "lastUpdated": "server-time"});
+        assert!(without_version.matches("4", &with_meta));
+        let fallback = StatusSourceFence::new(&with_meta, Some(""));
+        assert!(fallback.matches("4", &resource));
+        assert!(!fallback.matches("5", &resource));
+        with_meta["meta"]["profile"] = json!(["urn:operator-profile"]);
+        assert!(!fallback.matches("4", &with_meta));
+    }
+
+    #[test]
+    fn failed_registration_preserves_the_current_generation_and_source() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 2, 1);
+        let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+        let fence = manager.source_fence(&snapshot).unwrap();
+        let mut invalid = subscription_with_status("active");
+        // Empty resources are rejected before any registration is replaced.
+        invalid.as_object_mut().unwrap().clear();
+        assert!(
+            manager
+                .register("t1", "sub-1", &invalid, FhirVersion::default())
+                .is_err()
+        );
+        assert!(!snapshot.generation.is_cancelled());
+        assert!(manager.is_current_status(&snapshot, SubscriptionStatusCode::Active));
+        assert_eq!(manager.source_fence(&snapshot).unwrap(), fence);
+    }
+
+    #[test]
+    fn ordinary_reregistration_does_not_lose_concurrent_counter_increments() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 0, 0);
+        let resource = subscription_with_status("active");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..1_000 {
+                    manager.increment_event_count("t1", "sub-1").unwrap();
+                    manager.record_failure("t1", "sub-1").unwrap();
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..1_000 {
+                    manager
+                        .register("t1", "sub-1", &resource, FhirVersion::default())
+                        .unwrap();
+                }
+            });
+        });
+        let subscription = manager.get_subscription("t1", "sub-1").unwrap();
+        assert_eq!(subscription.events_since_start, 1_000);
+        assert_eq!(subscription.consecutive_failures, 1_000);
+    }
+
     /// `entered-in-error` used to be unparseable, so `register` fell back to
     /// `requested` and rehydration would handshake and activate a subscription
     /// the client had explicitly retracted.
     #[test]
     fn test_entered_in_error_is_registered_as_itself() {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         let sub = manager
             .register(
                 "t1",

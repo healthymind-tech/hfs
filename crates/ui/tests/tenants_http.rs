@@ -257,13 +257,18 @@ async fn page_renders_and_lists_registered_and_discovered_tenants() {
 async fn rows_fragment_filters_by_search_term() {
     let store = store();
     let router = app(&store);
-    post_form(&router, "id=acme-health&display_name=Acme+Health").await;
-    post_form(
-        &router,
+    // One create at a time: two provisioning jobs running at once contend on
+    // the shared-cache in-memory SQLite, which reports SQLITE_LOCKED at once
+    // (no busy_timeout), so the second job could fail and its row never
+    // settle into the registry.
+    for form in [
+        "id=acme-health&display_name=Acme+Health",
         "id=riverside-labs&display_name=Riverside+Diagnostics",
-    )
-    .await;
-    wait_settled(&router).await;
+    ] {
+        let (status, _) = post_form(&router, form).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_settled(&router).await;
+    }
 
     // Unfiltered: both present, and it's a fragment (no full document).
     let (_, all) = get(&router, "/ui/tenants/rows").await;
@@ -889,6 +894,7 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
+        None,
         "http://localhost:8080".to_string(),
         10 * 1024 * 1024,
         false,
@@ -933,6 +939,84 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
     );
 }
 
+/// UI/UX review §3.8: Delete opens a dialog that states what is at stake and
+/// asks for the id to be typed, instead of the browser's one-click confirm().
+#[tokio::test]
+async fn delete_asks_for_the_typed_id_in_a_dialog() {
+    let store = store();
+    let router = app(&store);
+    post_form(&router, "id=acme&display_name=Acme").await;
+    let html = wait_settled(&router).await;
+
+    assert!(html.contains(r#"data-tenant-delete="acme""#), "{html}");
+    assert!(html.contains(r#"role="dialog" aria-modal="true""#));
+    // Merged with upstream #1851: the dialog's form is not an htmx element;
+    // tenants.js issues its DELETE from the issuer outside the rows.
+    assert!(html.contains(r#"<form data-tenant-delete="/ui/tenants/acme">"#));
+    assert!(html.contains(r#"name="confirm" type="text" required"#));
+    assert!(html.contains(r#"pattern="acme""#));
+    assert!(html.contains("Type acme to confirm"));
+    assert!(html.contains("its stored data is kept"));
+    assert!(!html.contains("hx-confirm"), "no native confirm() any more");
+
+    // The typed confirmation rides along as a query parameter the handler
+    // tolerates.
+    let res = router
+        .clone()
+        .oneshot(
+            Request::delete("/ui/tenants/acme?confirm=acme&purge=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let (_, rows) = get(&router, "/ui/tenants/rows").await;
+    assert!(!rows.contains(r#"data-tenant-delete="acme""#));
+}
+
+/// The default tenant gets no Delete, and the handler refuses it anyway.
+#[tokio::test]
+async fn the_default_tenant_cannot_be_deleted() {
+    let store = store();
+    store
+        .register_tenant("default", Some("Default"))
+        .await
+        .expect("register default");
+    let router = app(&store);
+
+    let (_, html) = get(&router, "/ui/tenants/rows").await;
+    assert!(!html.contains(r#"data-tenant-delete="default""#), "{html}");
+    assert!(
+        html.contains(r#"<span class="tag tag--muted" title="The server&#39;s default tenant"#)
+            || html.contains("tag tag--muted\" title=\"The server"),
+        "{html}"
+    );
+
+    let res = router
+        .clone()
+        .oneshot(
+            Request::delete("/ui/tenants/default?confirm=default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
+    assert!(
+        body.contains("is the server&#39;s default tenant")
+            || body.contains("is the server's default tenant")
+            || body.contains("is the server&#x27;s default tenant"),
+        "{body}"
+    );
+    let tenants = store.list_tenants().await.expect("list");
+    assert!(
+        tenants.iter().any(|t| t.id == "default"),
+        "still registered"
+    );
+}
+
 /// #1850: a mounted UI subscribes its tenant inventory to the server's
 /// write-observer fan-out, so purges made outside the UI (the
 /// `/admin/tenants` API) invalidate it too. A plain observer that is not a
@@ -951,6 +1035,7 @@ fn mount_subscribes_the_tenant_inventory_to_the_server_fan_out() {
             "default".to_string(),
             Arc::new(helios_ui::StaticConformanceSource::empty()),
             FhirVersion::R4,
+            None,
             None,
             "http://localhost:8080".to_string(),
             10 * 1024 * 1024,
@@ -1361,10 +1446,11 @@ async fn mutation_responses_keep_the_search_term() {
     // #tenant-rows, which every response replaces, and htmx skips a queued
     // request whose element has left the page. tenants.js issues the DELETE
     // from the issuer outside the rows instead.
-    let delete = dom.one("button[data-tenant-delete='/ui/tenants/acme-health']");
+    // (fork: the trash button opens the typed-id deregister dialog, whose
+    // form carries the path; the confirmation is the dialog itself.)
+    let delete = dom.one("form[data-tenant-delete='/ui/tenants/acme-health']");
     assert_eq!(delete.attr("hx-delete"), None);
     assert_eq!(delete.attr("hx-sync"), None);
-    assert!(delete.attr("data-confirm").is_some());
     let issuer = dom.one(".table-card [data-tenant-mutations]");
     assert_eq!(issuer.attr("hx-include"), Some("[name='q']"));
     assert_eq!(issuer.attr("hx-target"), Some("#tenant-rows"));

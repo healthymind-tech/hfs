@@ -55,8 +55,8 @@ use crate::types::{ExpandRequest, ExpansionContains};
 
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
-    collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    collect_resource_params, extract_parameter_array, find_bool_param, find_resource_param,
+    find_str_param, normalize_canonical_params, parse_query_string, query_params_to_fhir_params,
 };
 
 /// Standards-status codes that warrant a `warning-<status>` expansion
@@ -188,9 +188,30 @@ fn serialize_expansion_contains(
         item.insert("inactive".into(), json!(true));
     }
     if !c.designations.is_empty() {
-        let designations: Vec<Value> = c
+        // SNOMED CT: the fully specified name and the preferred terms only,
+        // as tx.fhir.org (the other synonyms are for $lookup).
+        let snomed = c.system == crate::snomed::SNOMED_URL;
+        let preferred: Vec<&str> = c
             .designations
             .iter()
+            .filter(|d| d.use_code.as_deref() == Some("preferredForLanguage"))
+            .map(|d| d.value.as_str())
+            .collect();
+        let mut chosen: Vec<_> = c
+            .designations
+            .iter()
+            .filter(|d| {
+                !snomed
+                    || (d.use_system.as_deref() == Some(crate::snomed::SNOMED_URL)
+                        && (d.use_code.as_deref() == Some(crate::snomed::FSN)
+                            || preferred.contains(&d.value.as_str())))
+            })
+            .collect();
+        if snomed {
+            chosen.sort_by_key(|d| d.use_code.as_deref() != Some(crate::snomed::FSN));
+        }
+        let designations: Vec<Value> = chosen
+            .into_iter()
             .map(|d| {
                 let mut entry = serde_json::Map::new();
                 if !d.extensions.is_empty() {
@@ -206,6 +227,11 @@ fn serialize_expansion_contains(
                     }
                     if let Some(c) = &d.use_code {
                         us.insert("code".into(), json!(c));
+                        if snomed {
+                            if let Some(name) = crate::snomed::description_type_name(c) {
+                                us.insert("display".into(), json!(name));
+                            }
+                        }
                     }
                     entry.insert("use".into(), Value::Object(us));
                 }
@@ -232,9 +258,14 @@ fn serialize_expansion_contains(
                     "Decimal" => "valueDecimal",
                     "DateTime" => "valueDateTime",
                     "Code" => "valueCode",
+                    "Coding" | CODING_JSON => "valueCoding",
                     _ => "valueString",
                 };
-                let value: Value = if key == "valueBoolean" {
+                let value: Value = if p.value_type == CODING_JSON {
+                    serde_json::from_str(&p.value).unwrap_or(Value::Null)
+                } else if key == "valueCoding" {
+                    json!({"system": c.system, "code": p.value})
+                } else if key == "valueBoolean" {
                     json!(p.value == "true")
                 } else if key == "valueInteger" {
                     json!(p.value.parse::<i64>().unwrap_or(0))
@@ -330,6 +361,19 @@ fn populate_concept_flags<'a, B: TerminologyBackend>(
 /// Populate `designations` on each expansion entry in-place via a per-system
 /// batched lookup. Mirrors `populate_concept_flags` and is only invoked when
 /// the caller passes `includeDesignations=true`.
+/// Distinct `system` URLs appearing anywhere in `contains` (nested included),
+/// in first-seen order.
+fn collect_contains_systems(contains: &[ExpansionContains], out: &mut Vec<String>) {
+    for c in contains {
+        if !out.contains(&c.system) {
+            out.push(c.system.clone());
+        }
+        if !c.contains.is_empty() {
+            collect_contains_systems(&c.contains, out);
+        }
+    }
+}
+
 fn populate_designations<'a, B: TerminologyBackend>(
     backend: &'a B,
     ctx: &'a TenantContext,
@@ -389,6 +433,118 @@ fn populate_designations<'a, B: TerminologyBackend>(
     })
 }
 
+/// `ExpansionContainsProperty::value_type` of a Coding property whose
+/// `value` is the full Coding as JSON.
+const CODING_JSON: &str = "CodingJson";
+
+/// `true` when a stored Coding property value is the whole Coding as a JSON
+/// object (the upstream import form for a `valueCoding` without a `code`).
+fn stored_coding_json(value: &str) -> bool {
+    value.starts_with('{')
+        && serde_json::from_str::<Value>(value).is_ok_and(|v| v.is_object())
+}
+
+/// Index the `valueCoding` properties of a stored CodeSystem's concepts by
+/// `(system, concept code, property code, coding code)`.
+fn collect_coding_properties(
+    system: &str,
+    concepts: Option<&Vec<Value>>,
+    out: &mut std::collections::HashMap<(String, String, String, String), Value>,
+) {
+    for concept in concepts.into_iter().flatten() {
+        let Some(code) = concept.get("code").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        for prop in concept
+            .get("property")
+            .and_then(|p| p.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(pcode), Some(coding)) = (
+                prop.get("code").and_then(|c| c.as_str()),
+                prop.get("valueCoding"),
+            ) {
+                if let Some(ccode) = coding.get("code").and_then(|c| c.as_str()) {
+                    out.insert(
+                        (system.into(), code.into(), pcode.into(), ccode.into()),
+                        coding.clone(),
+                    );
+                }
+            }
+        }
+        collect_coding_properties(
+            system,
+            concept.get("concept").and_then(|c| c.as_array()),
+            out,
+        );
+    }
+}
+
+/// The property codes a ValueSet asks its expansions to carry:
+/// `compose.property` (R5) or, in R4, the cross-version extension
+/// `extension-ValueSet.compose.property` on `compose`.
+fn compose_properties(vs: &Value) -> Vec<String> {
+    let Some(compose) = vs.get("compose") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = compose
+        .get("property")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(exts) = compose.get("extension").and_then(|e| e.as_array()) {
+        for ext in exts {
+            if ext.get("url").and_then(|u| u.as_str())
+                == Some(
+                    "http://hl7.org/fhir/5.0/StructureDefinition/extension-ValueSet.compose.property",
+                )
+            {
+                if let Some(code) = ext
+                    .get("valueCode")
+                    .or_else(|| ext.get("valueString"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.push(code.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `property[].code`s the CodeSystem `system` declares.
+async fn cs_declared_property_codes<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+) -> Vec<String> {
+    let hits = crate::traits::CodeSystemOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(system.to_string()),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_default();
+    hits.first()
+        .and_then(|cs| cs.get("property"))
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("code").and_then(|c| c.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Populate `properties` on each expansion entry from a per-system batched
 /// lookup of the named properties. Mirrors `populate_designations`. Walks
 /// nested `contains[]` recursively.
@@ -417,6 +573,9 @@ fn populate_properties<'a, B: TerminologyBackend>(
         // `parameters/parameters-expand-supplement-good` fixture's `prop1`
         // entry which the IG pins as a `valueString`.
         let mut prop_types_by_system: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Coding-valued properties are stored by code only; their full
+        // Coding (system, version, display) comes from the stored resource.
+        let mut codings: HashMap<(String, String, String, String), Value> = HashMap::new();
         // Per-system: issue (property-values, CS-search) concurrently inside
         // each task via `tokio::join!`, and fan all per-system tasks out via
         // `join_all` so multi-system VS expansions don't pay N×serialised
@@ -445,12 +604,20 @@ fn populate_properties<'a, B: TerminologyBackend>(
         for (system, pv_opt, cs_opt) in results {
             if let Some(props) = pv_opt {
                 for (code, list) in props {
-                    map.insert((system.clone(), code), list);
+                    map.insert(
+                        (system.clone(), code),
+                        list.into_iter().map(|p| (p.code, p.value)).collect(),
+                    );
                 }
             }
             if let Some(hits) = cs_opt {
                 let mut type_map: HashMap<String, String> = HashMap::new();
                 for cs in &hits {
+                    collect_coding_properties(
+                        &system,
+                        cs.get("concept").and_then(|c| c.as_array()),
+                        &mut codings,
+                    );
                     if let Some(props) = cs.get("property").and_then(|p| p.as_array()) {
                         for entry in props {
                             if let (Some(code), Some(ty)) = (
@@ -512,6 +679,29 @@ fn populate_properties<'a, B: TerminologyBackend>(
                             None if code == "definition" => "string".to_string(),
                             None => "Code".to_string(),
                         };
+                        if value_type == "Coding" {
+                            if let Some(full) = codings.get(&(
+                                c.system.clone(),
+                                c.code.clone(),
+                                code.clone(),
+                                value.clone(),
+                            )) {
+                                return ExpansionContainsProperty {
+                                    code,
+                                    value_type: CODING_JSON.into(),
+                                    value: full.to_string(),
+                                };
+                            }
+                            // A valueCoding without a code is stored as the
+                            // whole Coding JSON (upstream #2095).
+                            if stored_coding_json(&value) {
+                                return ExpansionContainsProperty {
+                                    code,
+                                    value_type: CODING_JSON.into(),
+                                    value,
+                                };
+                            }
+                        }
                         ExpansionContainsProperty {
                             code,
                             value_type,
@@ -519,6 +709,18 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         }
                     })
                     .collect();
+            }
+            // A concept made inactive by its `inactive` property (rather than
+            // a status) has the status `inactive` (IG `inactive/inactive-expand`).
+            if c.inactive == Some(true)
+                && properties.iter().any(|p| p == "status")
+                && !c.properties.iter().any(|p| p.code == "status")
+            {
+                c.properties.push(ExpansionContainsProperty {
+                    code: "status".into(),
+                    value_type: "Code".into(),
+                    value: "inactive".into(),
+                });
             }
             if !c.contains.is_empty() {
                 populate_properties(backend, ctx, &mut c.contains, properties).await;
@@ -538,7 +740,8 @@ fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
         "decimal" | "Decimal" => "Decimal".to_string(),
         "dateTime" | "DateTime" => "DateTime".to_string(),
         "code" | "Code" => "Code".to_string(),
-        // string, Coding, and any unrecognised type fall back to a string
+        "coding" | "Coding" => "Coding".to_string(),
+        // string and any unrecognised type fall back to a string
         // serialization so the FHIR `valueString` field carries the value.
         _ => "string".to_string(),
     }
@@ -673,7 +876,10 @@ fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String,
             let prop = f.get("property").and_then(|v| v.as_str()).unwrap_or("");
             matches!(op, "is-a" | "descendent-of") && matches!(prop, "concept" | "code")
         });
-        if is_subsumption {
+        // SNOMED CT is a polyhierarchy: tx.fhir.org keeps its subtree
+        // expansions flat (a concept would otherwise appear under every
+        // parent).
+        if is_subsumption && system != crate::snomed::SNOMED_URL {
             let version = inc
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -682,6 +888,77 @@ fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String,
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// The version a `system-version` parameter pins for `system`, if any.
+fn system_version_pin(params: &[Value], system: &str) -> Option<String> {
+    params
+        .iter()
+        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("system-version"))
+        .filter_map(|p| {
+            ["valueCanonical", "valueUri", "valueString", "valueUrl"]
+                .iter()
+                .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+        })
+        .find_map(|s| {
+            s.split_once('|')
+                .filter(|(u, _)| *u == system)
+                .map(|(_, v)| v.to_string())
+        })
+}
+
+/// `expansion.extension` for an expansion that draws on SNOMED CT by rule.
+///
+/// SNOMED CT has a compositional grammar: besides its concepts, every valid
+/// post-coordinated expression is a member of the code system, and of any
+/// value set selecting by a hierarchy, constraint or other filter (subsumption
+/// covers refinements of the concepts it selects). Such an expansion lists
+/// only the pre-coordinated concepts, so it is not closed — tx.fhir.org marks
+/// it `valueset-unclosed`, and the whole code system additionally with a
+/// reason. Value sets that enumerate their codes, or whose filters exclude
+/// expressions (`expressions = false`), are closed.
+fn snomed_unclosed(compose_vs: Option<&Value>, url: Option<&str>) -> Option<Vec<Value>> {
+    let unclosed = json!({"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed", "valueBoolean": true});
+    let whole = || {
+        Some(vec![
+            unclosed.clone(),
+            json!({"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+                   "valueString": "The code System 'http://snomed.info/sct' has a grammar and so has infinite members"}),
+        ])
+    };
+    if let Some(u) = url {
+        if let Some(rest) = u.strip_prefix(crate::snomed::SNOMED_URL) {
+            let rest = rest.split_once('?').map(|(_, q)| q).unwrap_or(rest);
+            return match rest {
+                "fhir_vs" => whole(),
+                r if r.starts_with("fhir_vs=") => Some(vec![unclosed]),
+                _ => None,
+            };
+        }
+    }
+    let includes = compose_vs?.get("compose")?.get("include")?.as_array()?;
+    let mut by_rule = false;
+    for inc in includes {
+        if inc.get("system").and_then(Value::as_str) != Some(crate::snomed::SNOMED_URL) {
+            continue;
+        }
+        let filters = inc.get("filter").and_then(Value::as_array);
+        let has_concepts = inc.get("concept").is_some();
+        match filters {
+            Some(f) if !f.is_empty() => {
+                let closed = f.iter().any(|f| {
+                    f.get("property").and_then(Value::as_str) == Some("expressions")
+                        && f.get("value").and_then(Value::as_str) == Some("false")
+                });
+                if !closed {
+                    by_rule = true;
+                }
+            }
+            _ if !has_concepts && inc.get("valueSet").is_none() => return whole(),
+            _ => {}
+        }
+    }
+    by_rule.then(|| vec![unclosed])
 }
 
 /// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
@@ -786,7 +1063,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
             .unwrap_or_default();
         let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (code, list) in map {
-            by_code.insert(code, list);
+            by_code.insert(code, list.into_iter().map(|p| (p.code, p.value)).collect());
         }
         // Build a property-code → FHIR-type map from the supplement CodeSystems
         // themselves. The IG `parameters/parameters-expand-supplement-good`
@@ -829,6 +1106,11 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
                     let value_type = match supp_prop_types.get(prop) {
                         Some(ty) => fhir_property_type_to_value_type(ty),
                         None => "Code".to_string(),
+                    };
+                    let value_type = if value_type == "Coding" && stored_coding_json(value) {
+                        CODING_JSON.to_string()
+                    } else {
+                        value_type
                     };
                     c.properties.push(ExpansionContainsProperty {
                         code: prop.clone(),
@@ -1141,6 +1423,7 @@ fn apply_display_language<'a, B: TerminologyBackend>(
     contains: &'a mut [ExpansionContains],
     spec: &'a DisplayLangSpec,
     cs_lang_by_url: &'a std::collections::HashMap<String, Option<String>>,
+    supplement_urls: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
         use crate::types::ExpansionContainsDesignation;
@@ -1160,9 +1443,33 @@ fn apply_display_language<'a, B: TerminologyBackend>(
         // a designation whose tag extends the requested tag with a `-`
         // subtag (so `de` matches `de-CH` but not `den`), then the same two
         // rules against truncations of the requested tag (`de-DE` → `de`).
+        // Designations contributed by applied supplements (translation
+        // supplements in particular) take part in the language match too.
+        // They are keyed by code only, so they are offered to every system
+        // that carries that code.
+        let mut supplement_lists: HashMap<String, Vec<crate::traits::ConceptDesignation>> =
+            HashMap::new();
+        if !supplement_urls.is_empty() {
+            let mut all_codes: Vec<String> = by_system.values().flatten().cloned().collect();
+            all_codes.sort();
+            all_codes.dedup();
+            if let Ok(ds) = backend
+                .supplement_designations(ctx, supplement_urls, &all_codes)
+                .await
+            {
+                supplement_lists = ds;
+            }
+        }
         let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
         for (system, codes) in &by_system {
-            if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
+            if let Ok(mut ds) = backend.concept_designations(ctx, system, codes).await {
+                for code in codes {
+                    if let Some(extra) = supplement_lists.get(code) {
+                        ds.entry(code.clone())
+                            .or_default()
+                            .extend(extra.iter().cloned());
+                    }
+                }
                 for (code, list) in ds {
                     let chosen = crate::language::best_lang_match_index(
                         language,
@@ -1190,8 +1497,15 @@ fn apply_display_language<'a, B: TerminologyBackend>(
             if cs_lang_already_matches {
                 // Skip the swap entirely; designations are preserved as-is.
                 if !c.contains.is_empty() {
-                    apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url)
-                        .await;
+                    apply_display_language(
+                        backend,
+                        ctx,
+                        &mut c.contains,
+                        spec,
+                        cs_lang_by_url,
+                        supplement_urls,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -1272,7 +1586,15 @@ fn apply_display_language<'a, B: TerminologyBackend>(
             }
 
             if !c.contains.is_empty() {
-                apply_display_language(backend, ctx, &mut c.contains, spec, cs_lang_by_url).await;
+                apply_display_language(
+                    backend,
+                    ctx,
+                    &mut c.contains,
+                    spec,
+                    cs_lang_by_url,
+                    supplement_urls,
+                )
+                .await;
             }
         }
     })
@@ -1464,7 +1786,170 @@ fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Byte
 /// nonetheless map to the same canonical URL+params bucket (e.g. when the
 /// caller adds `valueSet` / `tx-resource` inline payloads that force this
 /// outer cache to skip but otherwise produce the same expansion).
-async fn process_expand<B: TerminologyBackend>(
+/// `$expand` of a value set over media types only (see
+/// [`crate::mimetypes`]); `None` for any other value set. The core
+/// `mimetypes` value set keeps its own handling.
+async fn media_type_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Result<Option<Bytes>, HtsError> {
+    use crate::mimetypes;
+    if find_str_param(params, "url")
+        .as_deref()
+        .is_some_and(crate::bcp13::is_mimetypes_valueset_url)
+    {
+        return Ok(None);
+    }
+    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
+        return Ok(None);
+    };
+    if !mimetypes::is_media_type_value_set(&vs) {
+        return Ok(None);
+    }
+    let (codes, unclosed) = mimetypes::expand(&vs).map_err(|()| {
+        HtsError::coded(
+            "not-supported",
+            "not-supported",
+            mimetypes::NOT_ENUMERABLE,
+            None,
+        )
+    })?;
+    let int_param = |name: &str| {
+        params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|p| {
+                p.get("valueInteger")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| p.get("valueString").and_then(|v| v.as_str()?.parse().ok()))
+            })
+    };
+    let count = int_param("count");
+    let offset = int_param("offset");
+    let limit = int_param("__max_expansion_size__").unwrap_or(u64::from(state.max_expansion_size));
+    if count.is_none() && codes.len() as u64 > limit {
+        return Err(HtsError::TooCostly(format!(
+            "The value set '{}' has {} codes, more than the limit of {limit}",
+            vs.get("url").and_then(|v| v.as_str()).unwrap_or_default(),
+            codes.len()
+        )));
+    }
+    let start = offset.unwrap_or(0) as usize;
+    let page: Vec<&String> = codes
+        .iter()
+        .skip(start)
+        .take(count.map_or(usize::MAX, |c| c as usize))
+        .collect();
+    let mut parameter = Vec::new();
+    if let Some(c) = count {
+        parameter.push(json!({"name": "count", "valueInteger": c}));
+    }
+    if let Some(o) = offset {
+        parameter.push(json!({"name": "offset", "valueInteger": o}));
+    }
+    parameter.push(json!({"name": "used-codesystem", "valueUri": mimetypes::SYSTEM}));
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "total": codes.len(),
+        "parameter": parameter,
+        "contains": page.iter().map(|c| json!({
+            "system": mimetypes::SYSTEM, "code": c, "display": c
+        })).collect::<Vec<_>>(),
+    });
+    if offset.is_some() || count.is_some() {
+        expansion["offset"] = json!(start);
+    }
+    if unclosed {
+        expansion["extension"] = json!([{
+            "url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed",
+            "valueBoolean": true
+        }]);
+    }
+    // The value set's identity, and its expansion.
+    let mut out = json!({"resourceType": "ValueSet"});
+    for key in ["url", "version", "name", "status"] {
+        if let Some(v) = vs.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out["expansion"] = expansion;
+    Ok(Some(Bytes::from(
+        serde_json::to_vec(&out).map_err(|e| HtsError::Internal(e.to_string()))?,
+    )))
+}
+
+/// `$expand` of a value set over the UCUM grammar (see [`crate::ucum`]):
+/// based on the common UCUM units, filtered by the value set, and marked
+/// unclosed; `None` for any other value set.
+async fn ucum_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Result<Option<Bytes>, HtsError> {
+    use crate::ucum_validate::UCUM_URL;
+    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
+        return Ok(None);
+    };
+    if !crate::ucum::is_ucum_grammar_value_set(&vs) {
+        return Ok(None);
+    }
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let (common, common_vs) = crate::ucum::common_units(state.backend()).await;
+    let mut codes: Vec<String> = common
+        .into_iter()
+        .map(|(c, _)| c)
+        .filter(|c| crate::ucum::takes_whole_grammar(&vs) || crate::ucum::in_value_set(&vs, c))
+        .collect();
+    codes.sort();
+    codes.dedup();
+    let mut parameter =
+        vec![json!({"name": "used-codesystem", "valueUri": format!("{UCUM_URL}|{version}")})];
+    // The whole grammar is the common units value set, with its status.
+    if crate::ucum::takes_whole_grammar(&vs) {
+        if let Some(cvs) = common_vs.as_ref() {
+            let canonical = match cvs.get("version").and_then(|v| v.as_str()) {
+                Some(v) => format!("{}|{v}", crate::ucum::UCUM_COMMON),
+                None => crate::ucum::UCUM_COMMON.to_string(),
+            };
+            let status = if cvs.get("experimental").and_then(|v| v.as_bool()) == Some(true) {
+                Some("experimental")
+            } else {
+                cvs.get("status")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| *s != "active")
+            };
+            if let Some(status) = status {
+                parameter.push(json!({"name": format!("warning-{status}"), "valueUri": canonical}));
+            }
+        }
+    }
+    let mut expansion = json!({
+        "identifier": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "extension": [
+            {"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed", "valueBoolean": true},
+            {"url": "http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason",
+             "valueString": crate::ucum::UNCLOSED_REASON}
+        ],
+        "parameter": parameter,
+        "contains": codes.iter().map(|c| json!({"system": UCUM_URL, "code": c, "display": c})).collect::<Vec<_>>(),
+    });
+    if !crate::ucum::takes_whole_grammar(&vs) {
+        expansion["total"] = json!(codes.len());
+    }
+    let mut out = json!({"resourceType": "ValueSet"});
+    for key in ["url", "version", "name", "status"] {
+        if let Some(v) = vs.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out["expansion"] = expansion;
+    Ok(Some(Bytes::from(
+        serde_json::to_vec(&out).map_err(|e| HtsError::Internal(e.to_string()))?,
+    )))
+}
+
+pub(crate) async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
@@ -1481,6 +1966,198 @@ async fn process_expand<B: TerminologyBackend>(
     // Either path is short-circuited on a hit.  Falling through both means
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
+    //
+    // Canonical `url|version` is folded into `url` + `valueSetVersion` first so
+    // the cache key, the negative cache and every resolver below see one shape.
+    //
+    // A VCL implicit-ValueSet `url` (`http://fhir.org/VCL?v1=…`, upstream
+    // #1830) becomes an inline `valueSet` before any cache key is computed, so
+    // the keys hash the translated body and the `url|version` split / negative
+    // cache never see the VCL expression.
+    let mut params = crate::vcl::rewrite_vcl_params(params)?;
+    adopt_limit_param(&mut params);
+    let limit = params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("__max_expansion_size__"))
+        .and_then(|p| p.get("valueInteger").and_then(Value::as_u64))
+        .unwrap_or(u64::from(state.max_expansion_size));
+    let label = find_str_param(&params, "url")
+        .or_else(|| {
+            find_resource_param(&params, "valueSet")
+                .and_then(|vs| vs.get("url").and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| "??".to_string());
+    process_expand_cached(state, params)
+        .await
+        .map_err(|e| match e {
+            HtsError::TooCostly(_) => HtsError::TooCostly(format!(
+                "The value set '{label}' expansion has too many codes to produce (>{limit})"
+            )),
+            other => other,
+        })
+}
+
+/// tx.fhir.org's `limit` parameter: the most codes the client will take in
+/// an expansion (`too-costly` beyond it), the same as the
+/// `X-TOO-COSTLY-THRESHOLD` header.
+fn adopt_limit_param(params: &mut Vec<Value>) {
+    let has_threshold = params
+        .iter()
+        .any(|p| p.get("name").and_then(Value::as_str) == Some("__max_expansion_size__"));
+    let limit = params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("limit"))
+        .and_then(|p| p.get("valueInteger").and_then(Value::as_u64));
+    if let (false, Some(n)) = (has_threshold, limit) {
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": n}));
+    }
+    params.retain(|p| p.get("name").and_then(Value::as_str) != Some("limit"));
+}
+
+/// A SNOMED CT value set that lists post-coordinated expressions, or filters
+/// on `expressions`: the backends expand concepts only, so the request is
+/// answered from a copy without them (an `expressions` filter selects the
+/// same concepts either way), and the listed expressions that are valid are
+/// added to the expansion after. The `valueset-unclosed` marking follows the
+/// original definition.
+async fn snomed_expression_expand<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Result<Bytes, HtsError>> {
+    let vs = super::validate_code::requested_value_set(state, params).await?;
+    let includes = vs.get("compose")?.get("include")?.as_array()?;
+    let is_expr = |c: &str| !c.bytes().all(|b| b.is_ascii_digit());
+    let affected = includes.iter().any(|inc| {
+        inc.get("system").and_then(Value::as_str) == Some(crate::snomed::SNOMED_URL)
+            && (inc
+                .get("filter")
+                .and_then(Value::as_array)
+                .is_some_and(|f| {
+                    f.iter()
+                        .any(|f| f.get("property").and_then(Value::as_str) == Some("expressions"))
+                })
+                || inc
+                    .get("concept")
+                    .and_then(Value::as_array)
+                    .is_some_and(|cs| {
+                        cs.iter()
+                            .any(|c| c.get("code").and_then(Value::as_str).is_some_and(is_expr))
+                    }))
+    });
+    if !affected {
+        return None;
+    }
+    let mut copy = vs.clone();
+    let mut expressions: Vec<String> = Vec::new();
+    let mut kept = Vec::new();
+    for inc in includes {
+        let mut inc = inc.clone();
+        if inc.get("system").and_then(Value::as_str) == Some(crate::snomed::SNOMED_URL) {
+            if let Some(f) = inc.get_mut("filter").and_then(Value::as_array_mut) {
+                f.retain(|f| f.get("property").and_then(Value::as_str) != Some("expressions"));
+            }
+            if let Some(cs) = inc.get_mut("concept").and_then(Value::as_array_mut) {
+                cs.retain(|c| {
+                    let code = c.get("code").and_then(Value::as_str).unwrap_or_default();
+                    if is_expr(code) {
+                        expressions.push(code.to_string());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if cs.is_empty() {
+                    continue;
+                }
+            }
+        }
+        kept.push(inc);
+    }
+    copy["compose"]["include"] = Value::Array(kept);
+    let mut inner: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.get("name").and_then(Value::as_str),
+                Some("url" | "valueSetVersion" | "valueSet")
+            )
+        })
+        .cloned()
+        .collect();
+    inner.push(json!({"name": "valueSet", "resource": copy}));
+    let bytes = match process_expand_cached(state, inner).await {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let Ok(mut out) = serde_json::from_slice::<Value>(&bytes) else {
+        return Some(Ok(bytes));
+    };
+    let model = state
+        .backend()
+        .snomed_model(&TenantContext::system(), crate::snomed::SNOMED_URL, None)
+        .await
+        .ok()
+        .flatten();
+    if let Some(exp) = out.get_mut("expansion") {
+        let mut added = 0u64;
+        if let Some(m) = model.as_deref() {
+            let list = exp
+                .as_object_mut()
+                .map(|o| o.entry("contains").or_insert_with(|| json!([])));
+            if let Some(Value::Array(list)) = list {
+                for code in &expressions {
+                    if let crate::snomed::ops::Checked::Valid { display, .. } =
+                        crate::snomed::ops::check(m, code)
+                    {
+                        list.push(json!({"system": crate::snomed::SNOMED_URL, "code": code, "display": display}));
+                        added += 1;
+                    }
+                }
+            }
+        }
+        if let Some(t) = exp.get("total").and_then(Value::as_u64) {
+            exp["total"] = json!(t + added);
+        }
+        match snomed_unclosed(Some(&vs), None) {
+            Some(ext) => exp["extension"] = Value::Array(ext),
+            None => {
+                if let Some(o) = exp.as_object_mut() {
+                    o.remove("extension");
+                }
+            }
+        }
+    }
+    // Answer as for the value set itself.
+    if let Some(o) = out.as_object_mut() {
+        o.remove("compose");
+    }
+    Some(Ok(Bytes::from(
+        serde_json::to_vec(&out).unwrap_or_default(),
+    )))
+}
+
+async fn process_expand_cached<B: TerminologyBackend>(
+    state: &AppState<B>,
+    mut params: Vec<Value>,
+) -> Result<Bytes, HtsError> {
+    normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    if let Some(result) = Box::pin(snomed_expression_expand(state, &params)).await {
+        return result;
+    }
+    // SNOMED CT edition URIs in `*-system-version` pins and an inline
+    // ValueSet's includes → the stored release they name.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
+    if let Some(bytes) = media_type_expand(state, &params).await? {
+        return Ok(bytes);
+    }
+    if let Some(bytes) = ucum_expand(state, &params).await? {
+        return Ok(bytes);
+    }
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
@@ -1670,16 +2347,8 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // bad-supplement IG fixtures reject with 4xx. The resolved info list is
     // applied later, after expansion completes.
     let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
-    let mut supplement_inputs: Vec<String> = params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect();
+    let mut supplement_inputs: Vec<String> =
+        crate::operations::params::collect_use_supplements(&params);
     if !supplement_inputs.is_empty() {
         let ctx = TenantContext::system();
         for raw in &supplement_inputs {
@@ -1761,12 +2430,20 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // URLs that previously returned NotFound are remembered here so we can skip
     // all backend queries on repeated requests (saves 5+ SQLite round-trips per
     // hit).
-    if let Some(ref url_str) = url {
-        if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(url_str.as_str()) {
-                return Err(HtsError::NotFound(url_str.clone()));
-            }
-        }
+    // Keyed on `url` or `url|valueSetVersion`: a miss for one pinned version
+    // must not shadow a different version (or the unpinned latest) of the same
+    // canonical URL.
+    let neg_cache_key: Option<String> =
+        url.as_ref()
+            .map(|u| match find_str_param(&params, "valueSetVersion") {
+                Some(v) => format!("{u}|{v}"),
+                None => u.clone(),
+            });
+    if let (Some(url_str), Some(key)) = (&url, &neg_cache_key)
+        && let Ok(neg) = state.not_found_urls.read()
+        && neg.contains(key.as_str())
+    {
+        return Err(HtsError::NotFound(url_str.clone()));
     }
 
     // `tx-resource` parameters provide ad-hoc terminology that the caller does
@@ -1899,6 +2576,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // Cloned for downstream `used-valueset` echo logic which needs to apply
     // the same default-version pins to refs lacking a `|version` suffix.
     let default_value_set_versions_for_echo = default_value_set_versions.clone();
+    let (url_for_echo, inline_vs_for_echo) = (url.clone(), value_set.clone());
     let req = ExpandRequest {
         url,
         value_set_version: effective_vs_version,
@@ -1972,12 +2650,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
             if let Some(ref url_str) = url_for_neg_cache {
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
-                if msg_names_top {
-                    if let Ok(mut neg) = state.not_found_urls.write() {
-                        if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(url_str.clone());
-                        }
-                    }
+                if msg_names_top
+                    && let Ok(mut neg) = state.not_found_urls.write()
+                    && neg.len() < NOT_FOUND_CACHE_MAX
+                {
+                    neg.insert(neg_cache_key.clone().unwrap_or_else(|| url_str.clone()));
                 }
             }
             // The IG fixtures format VS-not-found errors as
@@ -2156,6 +2833,38 @@ async fn process_expand_inner<B: TerminologyBackend>(
             }
         }
     }
+    // Auto-apply stored supplements of every CodeSystem that contributed to
+    // the expansion (`HTS_AUTO_SUPPLEMENTS`, default on), so e.g. zh-Hant
+    // designations from a translation supplement reach `includeDesignations`
+    // and `displayLanguage` without an explicit `useSupplement`.
+    if state.auto_supplements {
+        let mut systems: Vec<String> = Vec::new();
+        collect_contains_systems(&resp.contains, &mut systems);
+        for system in systems {
+            for info in state
+                .backend()
+                .supplements_for_system(&ctx, &system)
+                .await
+                .unwrap_or_default()
+            {
+                let bare = info
+                    .supplement_canonical
+                    .split('|')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if supplement_inputs
+                    .iter()
+                    .any(|s| s.split('|').next() == Some(bare.as_str()))
+                    || state.auto_supplements_skip.contains(&bare)
+                {
+                    continue;
+                }
+                supplement_inputs.push(info.supplement_canonical.clone());
+                applied_supplements.push(info);
+            }
+        }
+    }
     // Rebuild bare_supplement_urls including any VS-extension additions.
     let bare_supplement_urls: Vec<String> = supplement_inputs
         .iter()
@@ -2163,11 +2872,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
         .collect();
 
     // ── Populate designations (only if explicitly requested) ─────────────────
-    let include_designations = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("includeDesignations"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    // Accept the GET spelling (`includeDesignations=true`) as well as the
+    // POST `valueBoolean`.
+    let include_designations = find_bool_param(&params, "includeDesignations").unwrap_or(false);
     if include_designations {
         populate_designations(state.backend(), &ctx, &mut resp.contains).await;
         // After base designations are loaded, append any supplement-derived
@@ -2255,6 +2962,39 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .map(str::to_string)
         })
         .collect();
+    // Without `property` parameters, the ValueSet may name the properties
+    // itself (`compose.property`, R5; the R5 cross-version extension in R4).
+    let mut requested_properties = requested_properties;
+    if requested_properties.is_empty() {
+        let vs_for_props = source_vs
+            .clone()
+            .or_else(|| super::params::find_resource_param(&params, "valueSet"));
+        if let Some(vs) = vs_for_props.as_ref() {
+            requested_properties = compose_properties(vs);
+        }
+    }
+    // `*`: every property the contributing CodeSystems define.
+    if requested_properties.iter().any(|p| p == "*") {
+        let mut systems: Vec<String> = Vec::new();
+        for c in &resp.contains {
+            if !systems.contains(&c.system) {
+                systems.push(c.system.clone());
+            }
+        }
+        let mut all: Vec<String> = requested_properties
+            .iter()
+            .filter(|p| p.as_str() != "*")
+            .cloned()
+            .collect();
+        for system in &systems {
+            for code in cs_declared_property_codes(state.backend(), &ctx, system).await {
+                if !all.contains(&code) {
+                    all.push(code);
+                }
+            }
+        }
+        requested_properties = all;
+    }
     let mut population_properties: Vec<String> = requested_properties.clone();
     if !population_properties.iter().any(|p| p == "status") {
         population_properties.push("status".to_string());
@@ -2574,6 +3314,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 &mut resp.contains,
                 &spec,
                 &cs_lang_by_url,
+                &bare_supplement_urls,
             )
             .await;
         }
@@ -2585,11 +3326,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     //   - the source VS has `compose.inactive: false` (FHIR R5)
     // Post-filter using the freshly-populated inactive flag and adjust
     // `total` to match.
-    let active_only_request = params
-        .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("activeOnly"))
-        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let active_only_request = find_bool_param(&params, "activeOnly").unwrap_or(false);
     let compose_inactive_false = source_vs
         .as_ref()
         .and_then(|vs| vs.get("compose"))
@@ -2789,7 +3526,12 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     .iter()
                     .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
                     .and_then(|s| s.split_once('|').map(|(u, _)| u.to_string()));
+                let implicit_sys = url_for_echo
+                    .as_deref()
+                    .and_then(|u| u.split_once("?fhir_vs"))
+                    .map(|(s, _)| s);
                 let echo = match pin_sys {
+                    Some(sys) if implicit_sys == Some(sys.as_str()) => true,
                     Some(sys) => source_vs
                         .as_ref()
                         .and_then(|vs| vs.get("compose"))
@@ -2824,6 +3566,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
             // in expansion.parameter[]. Echoing produces "Unexpected Node
             // found in array" diffs against every fixture.
             if matches!(name, "uuid" | "binding-style") {
+                return false;
+            }
+            // tx.fhir.org's knob to lift its expansion size limit; it
+            // does not echo it.
+            if name == "allowMaximumSizeExpansion" {
                 return false;
             }
             // Synthetic internal-only params injected by handlers — never
@@ -3141,6 +3888,14 @@ async fn process_expand_inner<B: TerminologyBackend>(
                         if ver.as_deref().is_some_and(|v| v.contains(".x") || v == "x") {
                             continue;
                         }
+                        // Likewise a SNOMED CT edition URI pin: it names a
+                        // stored release, which contains[] already carries.
+                        if ver.as_deref().is_some_and(|v| {
+                            crate::operations::snomed_version::parse_version_uri(v).is_some()
+                        }) && used_pairs.iter().any(|(s, _)| s == sys)
+                        {
+                            continue;
+                        }
                         // Skip versionless pins when contains[] already
                         // covers this system — they resolve to the same
                         // concrete (system, version) pair.
@@ -3163,6 +3918,26 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     }
                 }
             }
+        }
+    }
+
+    // An implicit value set (`<system>?fhir_vs…`) draws on its system even
+    // when the page is empty (`count = 0`).
+    if used_pairs.is_empty() {
+        if let Some(sys) = url_for_echo
+            .as_deref()
+            .and_then(|u| u.split_once("?fhir_vs"))
+            .map(|(s, _)| s)
+        {
+            let ver = system_version_pin(&params, sys).or_else(|| {
+                cs_by_url
+                    .get(sys)
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.get("version"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+            used_pairs.push((sys.to_string(), ver));
         }
     }
 
@@ -3539,6 +4314,12 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 == Some("fragment")
         })
         .collect();
+    if fragment_systems.is_empty() {
+        let compose_vs = inline_vs_for_echo.as_ref().or(source_vs.as_ref());
+        if let Some(ext) = snomed_unclosed(compose_vs, url_for_echo.as_deref()) {
+            expansion["extension"] = Value::Array(ext);
+        }
+    }
     if !fragment_systems.is_empty() {
         // Match the IG fixture wording verbatim — txTests compares the string
         // (no $external$ wildcard for the reason text).
@@ -3629,45 +4410,70 @@ async fn process_expand_inner<B: TerminologyBackend>(
             } else {
                 None
             };
-            let referenced_vs: Option<Value> = ValueSetOperations::search(
-                state.backend(),
-                &ctx,
-                crate::types::ResourceSearchQuery {
-                    url: Some(bare_url.clone()),
-                    version: pinned_version.clone(),
-                    count: Some(count_hint),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-            .and_then(|mut hits| {
-                if pinned_version.is_some() {
-                    hits.pop()
-                } else if let Some(ref resolved) = resolved_vs_version {
-                    hits.iter()
-                        .find(|r| {
-                            r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
-                        })
-                        .cloned()
-                        .or_else(|| {
-                            hits.sort_by(|a, b| {
-                                let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                                let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                                bv.cmp(av)
-                            });
-                            hits.into_iter().next()
-                        })
-                } else {
-                    // Backend has no opinion: fall back to highest version.
-                    hits.sort_by(|a, b| {
-                        let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                        let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
-                        bv.cmp(av)
+            // A ValueSet supplied with the request (`tx-resource`) is the one
+            // the expansion used (IG `exclude/exclude-valueset`).
+            let from_request: Option<Value> =
+                super::params::collect_resource_params(&params, "tx-resource")
+                    .into_iter()
+                    .filter(|r| {
+                        r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                            && r.get("url").and_then(|v| v.as_str()) == Some(bare_url.as_str())
+                            && pinned_version.as_deref().is_none_or(|want| {
+                                r.get("version").and_then(|v| v.as_str()) == Some(want)
+                            })
+                    })
+                    // Several versions supplied: the latest, as for stored ones.
+                    .max_by(|a, b| {
+                        crate::version_order::compare_versions(
+                            a.get("version").and_then(|v| v.as_str()),
+                            b.get("version").and_then(|v| v.as_str()),
+                        )
                     });
-                    hits.into_iter().next()
-                }
-            });
+            let referenced_vs: Option<Value> = if from_request.is_some() {
+                from_request
+            } else {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(bare_url.clone()),
+                        version: pinned_version.clone(),
+                        count: Some(count_hint),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut hits| {
+                    if pinned_version.is_some() {
+                        hits.pop()
+                    } else if let Some(ref resolved) = resolved_vs_version {
+                        hits.iter()
+                            .find(|r| {
+                                r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
+                            })
+                            .cloned()
+                            .or_else(|| {
+                                hits.sort_by(|a, b| {
+                                    let av =
+                                        a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                    let bv =
+                                        b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                    bv.cmp(av)
+                                });
+                                hits.into_iter().next()
+                            })
+                    } else {
+                        // Backend has no opinion: fall back to highest version.
+                        hits.sort_by(|a, b| {
+                            let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                            let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                            bv.cmp(av)
+                        });
+                        hits.into_iter().next()
+                    }
+                })
+            };
             let resolved_version = referenced_vs
                 .as_ref()
                 .and_then(|h| {
@@ -3902,6 +4708,15 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // the canonical-resource fields. For inline ValueSet requests, the
     // caller supplied the body — copy from there.
     let mut response = json!({ "resourceType": "ValueSet" });
+    // The implicit value set of all of SNOMED CT, named as tx.fhir.org names
+    // it.
+    if source_vs.is_none()
+        && url_for_echo.as_deref() == Some(&format!("{}?fhir_vs", crate::snomed::SNOMED_URL))
+    {
+        response["url"] = json!(format!("{}?fhir_vs", crate::snomed::SNOMED_URL));
+        response["title"] = json!("SNOMED CT Reference Set (All of SNOMED CT)");
+        response["status"] = json!("active");
+    }
     if let Some(ref vs) = source_vs {
         if let Some(obj) = vs.as_object() {
             // Copy required-by-fixtures fields plus a few common optionals.
@@ -4025,6 +4840,20 @@ async fn process_expand_inner<B: TerminologyBackend>(
         && !cfg!(feature = "R6")
     {
         downconvert_property_to_r4_extension(&mut response);
+    }
+
+    // Stored SNOMED CT releases are reported as edition URIs. A release named
+    // both by date and by URI along the way now reads the same; report it once.
+    crate::operations::snomed_version::report_edition_versions(&mut response);
+    if let Some(ps) = response
+        .pointer_mut("/expansion/parameter")
+        .and_then(Value::as_array_mut)
+    {
+        let mut seen = std::collections::HashSet::new();
+        ps.retain(|p| {
+            p.get("name").and_then(Value::as_str) != Some("used-codesystem")
+                || seen.insert(p.get("valueUri").cloned())
+        });
     }
 
     // ── Serialize once, cache, return ─────────────────────────────────────────
@@ -4224,7 +5053,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
-    match process_expand(&state, params).await {
+    match dispatch_tx!(state, params, process_expand) {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
             if let Some(resp) = version_check_response(&e) {
@@ -4257,7 +5086,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
-    match process_expand(&state, params).await {
+    match dispatch_tx!(state, params, process_expand) {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
             if let Some(resp) = version_check_response(&e) {
@@ -4388,7 +5217,7 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
     let HtsError::VsInvalid(msg) = err else {
         return None;
     };
-    if !msg.starts_with("Cyclic reference detected when excluding ") {
+    if !msg.starts_with("Cyclic reference detected when ") {
         return None;
     }
     let body = json!({
@@ -4491,7 +5320,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        dispatch_tx!(state, params, process_expand)?,
         format,
     ))
 }
@@ -4522,7 +5351,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        dispatch_tx!(state, params, process_expand)?,
         format,
     ))
 }
@@ -4983,7 +5812,8 @@ mod tests {
         Router::new()
             .route(
                 "/ValueSet/$expand",
-                post(expand_handler::<SqliteTerminologyBackend>),
+                post(expand_handler::<SqliteTerminologyBackend>)
+                    .get(get_expand_handler::<SqliteTerminologyBackend>),
             )
             .with_state(state)
     }
@@ -5079,6 +5909,44 @@ mod tests {
         });
         let resp = post_json(app, "/ValueSet/$expand", body).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    /// GET passes `useSupplement` as a `valueString`; it must still be
+    /// resolved (and an unknown one rejected), as on POST.
+    #[tokio::test]
+    async fn get_expand_honours_use_supplement() {
+        let base = "/ValueSet/$expand?url=http://hl7.org/fhir/test/ValueSet/extensions-all-ns";
+        let resp = make_supplement_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&useSupplement=http://does-not-exist/cs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = make_supplement_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{base}&useSupplement=http://hl7.org/fhir/test/CodeSystem/supplement"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        assert!(
+            json["expansion"]["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "used-supplement"),
+            "{json}"
+        );
     }
 
     /// `excludeNested=false` should produce a tree (root contains child contains grandchild,

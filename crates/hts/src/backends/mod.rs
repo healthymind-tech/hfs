@@ -13,6 +13,9 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod hierarchy;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
@@ -40,7 +43,12 @@ pub use postgres::PostgresTerminologyBackend;
 ///    tier is the only thing keeping `version=current` resolving to the real
 ///    import. See `docs/ig-publisher-compatibility.md`.
 /// 2. **has concepts** — a populated row beats an empty one, for the same reason.
-/// 3. **`authority_rank`** — the original beats a re-published copy. This is the
+/// 3. **`current_pin`** — a version an operator explicitly marked "current"
+///    through the admin API beats every other populated row. It sits below
+///    tiers 1–2 so pinning an empty stub cannot hide the real edition, and
+///    above provenance and version order because it is an explicit decision.
+///    Unpinned (the default), the semantic newest version wins as before.
+/// 4. **`authority_rank`** — the original beats a re-published copy. This is the
 ///    tier that fixes the `terminology.hl7.org` collisions: `hl7.fhir.r4.core`
 ///    re-ships 746 THO CodeSystems stamped with the *FHIR release* version
 ///    (`4.0.1`), which outsorts the code system's own version (`1.0.0`) under any
@@ -48,10 +56,10 @@ pub use postgres::PostgresTerminologyBackend;
 ///    Provenance is the only thing that separates those rows; nothing intrinsic
 ///    to them does. `NULL` (a row imported before the column existed) coalesces
 ///    to 0, so an un-re-imported database keeps its previous behaviour.
-/// 4. **`version`** — highest version string wins, as before.
-/// 5. **`id`** — a stable, deterministic final tiebreak.
+/// 5. **`version`** — highest version string wins, as before.
+/// 6. **`id`** — a stable, deterministic final tiebreak.
 ///
-/// Tier 3 sits *below* 1 and 2 deliberately: if a package that owns a canonical
+/// Tier 4 sits *below* 1 and 2 deliberately: if a package that owns a canonical
 /// ships only an empty stub of it while some other package ships a populated
 /// copy, the populated row should still win — being authoritative is worthless
 /// if the row has no concepts to validate against.
@@ -90,8 +98,9 @@ fn build_cs_precedence_order_by(alias: &str) -> String {
          (CASE WHEN EXISTS \
              (SELECT 1 FROM concepts hc WHERE hc.system_id = {alias}.id) \
              THEN 0 ELSE 1 END), \
+         (CASE WHEN {alias}.current_pin = 1 THEN 0 ELSE 1 END), \
          COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
@@ -99,6 +108,35 @@ fn build_cs_precedence_order_by(alias: &str) -> String {
 static CS_ORDER_BY_CODE_SYSTEMS: LazyLock<String> =
     LazyLock::new(|| build_cs_precedence_order_by("code_systems"));
 static CS_ORDER_BY_S: LazyLock<String> = LazyLock::new(|| build_cs_precedence_order_by("s"));
+
+/// `ORDER BY` for a resource search (`GET /CodeSystem?url=…`, and every
+/// operation that resolves "the" CodeSystem, ValueSet or ConceptMap for a URL
+/// with `search(url, count: 1)`).
+///
+/// A search restricted to one canonical URL without a version — `url`, or
+/// CodeSystem `system` (its alias), whatever other parameters (`name`,
+/// `title`, `status`, `_id`, …) narrow it further — lists the rows in
+/// [`cs_precedence_order_by`] / [`vs_precedence_order_by`] /
+/// [`cm_precedence_order_by`] order, so its first hit is the row every other
+/// versionless resolver picks. Before, it listed them by `created_at`: with
+/// the THO `v3-loinc` stub (`content=not-present`, version `3.1.0`) imported
+/// before the real LOINC 2.83, `$expand` expanded 2.83 but reported
+/// `used-codesystem = http://loinc.org|3.1.0` from the stub. Other searches
+/// span several canonicals and keep insertion order. Both orders are total
+/// (they end in a unique column), so paging stays stable.
+pub(crate) fn search_order_by(
+    table: &str,
+    query: &crate::types::ResourceSearchQuery,
+) -> Cow<'static, str> {
+    let single_canonical =
+        (query.url.is_some() || query.system.is_some()) && query.version.is_none();
+    match (table, single_canonical) {
+        ("code_systems", true) => cs_precedence_order_by("code_systems"),
+        ("value_sets", true) => vs_precedence_order_by("value_sets"),
+        ("concept_maps", true) => cm_precedence_order_by("concept_maps"),
+        _ => Cow::Borrowed("created_at, id"),
+    }
+}
 
 /// Precedence among `value_sets` rows sharing one canonical URL.
 ///
@@ -121,13 +159,263 @@ pub(crate) fn vs_precedence_order_by(alias: &str) -> Cow<'static, str> {
 fn build_vs_precedence_order_by(alias: &str) -> String {
     format!(
         "COALESCE({alias}.authority_rank, 0), \
-         COALESCE({alias}.version, '') DESC, \
+         COALESCE({alias}.version_sort, {alias}.version, '') DESC, \
          {alias}.id",
     )
 }
 
 static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
     LazyLock::new(|| build_vs_precedence_order_by("value_sets"));
+
+/// Precedence among `concept_maps` rows sharing one canonical URL: the
+/// highest version (semantic order, [`crate::version_order`]), then a stable
+/// `id`. The ConceptMap analogue of [`vs_precedence_order_by`]; ConceptMaps
+/// carry no provenance rank.
+///
+/// Every place that picks "the" ConceptMap for a URL without a version — a
+/// versionless `GET /ConceptMap?url=…`, `$translate` with `url` (or without,
+/// per map) — orders by this.
+pub(crate) fn cm_precedence_order_by(alias: &str) -> Cow<'static, str> {
+    match alias {
+        "concept_maps" => Cow::Borrowed(CM_ORDER_BY_CONCEPT_MAPS.as_str()),
+        other => Cow::Owned(build_cm_precedence_order_by(other)),
+    }
+}
+
+fn build_cm_precedence_order_by(alias: &str) -> String {
+    format!("COALESCE({alias}.version_sort, {alias}.version, '') DESC, {alias}.id")
+}
+
+static CM_ORDER_BY_CONCEPT_MAPS: LazyLock<String> =
+    LazyLock::new(|| build_cm_precedence_order_by("concept_maps"));
+
+/// `expansion.contains` entries built straight from `compose.include.concept[]`
+/// (code + embedded display), skipping codes already in `skip`.
+/// Extension HTS puts on the includes it derives from a stored `expansion`
+/// (a ValueSet published without `compose`, see
+/// `import::bundle_parser::compose_from_expansion`). Such an include lists
+/// the ValueSet's members as published: its codes are kept as listed even
+/// when the loaded CodeSystem (another edition or version) lacks them.
+pub const STORED_EXPANSION_INCLUDE_EXT: &str =
+    "http://helios-software.com/fhir/StructureDefinition/hts-include-from-stored-expansion";
+
+/// Whether `include` was derived from a stored expansion (see
+/// [`STORED_EXPANSION_INCLUDE_EXT`]).
+pub(crate) fn include_is_stored_expansion(include: &serde_json::Value) -> bool {
+    include["extension"].as_array().is_some_and(|exts| {
+        exts.iter()
+            .any(|e| e["url"].as_str() == Some(STORED_EXPANSION_INCLUDE_EXT))
+    })
+}
+
+pub(crate) fn enumerated_from_compose(
+    system_url: &str,
+    version: Option<&str>,
+    explicit_codes: &[serde_json::Value],
+    skip: &std::collections::HashSet<String>,
+) -> Vec<crate::types::ExpansionContains> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in explicit_codes {
+        let Some(code) = entry["code"].as_str() else {
+            continue;
+        };
+        if skip.contains(code) || !seen.insert(code) {
+            continue;
+        }
+        out.push(crate::types::ExpansionContains {
+            system: system_url.to_owned(),
+            version: version.map(str::to_owned),
+            code: code.to_owned(),
+            display: entry["display"].as_str().map(str::to_owned),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        });
+    }
+    out
+}
+
+/// Enumerated UCUM codes (`compose.include.concept[]` over
+/// `http://unitsofmeasure.org`) the stored UCUM code system does not list but
+/// the UCUM grammar accepts, as `expansion.contains` entries.
+///
+/// The stored UCUM content (`ucum-essence`, imported by the bootstrap as a
+/// `complete` code system) holds atoms only — prefixes, base units and named
+/// units — so `mm[Hg]`, `kg`, `cm` or `/min` never match a concept row. UCUM
+/// is a grammar system: a well-formed expression is a member of the code
+/// system whether or not a row exists for it. Without this, value sets such as
+/// `ucum-vitals-common` lose most of their codes as soon as a UCUM code system
+/// is stored (and US Core vital-sign examples fail validation). Non-UCUM
+/// systems and malformed units return nothing (IG `simple-expand-enum-bad`
+/// still drops unknown codes of enumerating code systems).
+pub(crate) fn ucum_grammar_from_compose(
+    system_url: &str,
+    version: Option<&str>,
+    explicit_codes: &[serde_json::Value],
+    skip: &std::collections::HashSet<String>,
+) -> Vec<crate::types::ExpansionContains> {
+    if !crate::ucum_validate::is_ucum_url(system_url) {
+        return Vec::new();
+    }
+    let valid: Vec<serde_json::Value> = explicit_codes
+        .iter()
+        .filter(|e| {
+            e["code"]
+                .as_str()
+                .is_some_and(crate::ucum_validate::is_valid_ucum_code)
+        })
+        .cloned()
+        .collect();
+    let mut out = enumerated_from_compose(system_url, version, &valid, skip);
+    for c in &mut out {
+        if c.display.is_none() {
+            c.display = Some(c.code.clone());
+        }
+    }
+    out
+}
+
+/// VSAC's compose filters carry the real operator in a modifier extension:
+/// `{"op": "is-a", "value": "2133-7", "modifierExtension": [{"url":
+/// "vsacOpModifier", "valueString": "childOf"}]}` means *child-of*
+/// (VSAC/US Core `detailed-ethnicity` excludes the two OMB categories this
+/// way). Read as plain `is-a`, that exclude removed every ethnicity code.
+/// Rewrites `op` for the modifiers VSAC uses; leaves other filters alone.
+pub(crate) fn apply_vsac_op_modifier(filter: &mut serde_json::Value) {
+    let modifier = filter
+        .get("modifierExtension")
+        .and_then(|m| m.as_array())
+        .and_then(|exts| {
+            exts.iter().find_map(|e| {
+                (e.get("url").and_then(|u| u.as_str()) == Some("vsacOpModifier"))
+                    .then(|| e.get("valueString").and_then(|v| v.as_str()))
+                    .flatten()
+            })
+        });
+    let op = match modifier {
+        Some("childOf") => "child-of",
+        Some("descendantOf") => "descendent-of",
+        _ => return,
+    };
+    filter["op"] = serde_json::Value::String(op.to_string());
+}
+
+/// The canonicals a ValueSet compose names directly: code system urls
+/// (`include/exclude.system`) and value set urls (`include/exclude.valueSet`,
+/// version suffix dropped). Feeds the `value_set_dependencies` table.
+pub(crate) fn compose_dependencies(compose: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut systems = Vec::new();
+    let mut value_sets = Vec::new();
+    for key in ["include", "exclude"] {
+        for inc in compose
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(s) = inc.get("system").and_then(|v| v.as_str())
+                && !systems.iter().any(|x| x == s)
+            {
+                systems.push(s.to_string());
+            }
+            for vs in inc
+                .get("valueSet")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+            {
+                let url = vs.split('|').next().unwrap_or(vs).to_string();
+                if !value_sets.contains(&url) {
+                    value_sets.push(url);
+                }
+            }
+        }
+    }
+    (systems, value_sets)
+}
+
+/// Every canonical a compose depends on, following `valueSet` references
+/// through `lookup` (value set url → its stored composes, any version) to
+/// depth 4.
+pub(crate) fn transitive_dependencies(
+    compose: &serde_json::Value,
+    mut lookup: impl FnMut(&str) -> Vec<serde_json::Value>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![compose.clone()];
+    for _depth in 0..5 {
+        let mut next = Vec::new();
+        for c in &frontier {
+            let (systems, value_sets) = compose_dependencies(c);
+            for s in systems {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            for vs in value_sets {
+                if !out.contains(&vs) {
+                    out.push(vs.clone());
+                    next.extend(lookup(&vs));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// Re-sort `out` into the order the codes are listed in `explicit_codes`
+/// (codes appended after the concept-table join keep the compose order).
+pub(crate) fn sort_by_compose_order(
+    out: &mut [crate::types::ExpansionContains],
+    explicit_codes: &[serde_json::Value],
+) {
+    let pos: std::collections::HashMap<&str, usize> = explicit_codes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e["code"].as_str().map(|c| (c, i)))
+        .rev()
+        .collect();
+    out.sort_by_key(|c| pos.get(c.code.as_str()).copied().unwrap_or(usize::MAX));
+}
+
+/// Warning issue for a code accepted through ValueSet enumeration while the
+/// CodeSystem has no loaded content to verify it against. Shared by both
+/// storage backends.
+pub(crate) fn push_unverified_code_system_warning(
+    response: &mut crate::types::ValidateCodeResponse,
+    system_url: &str,
+    value_set_url: &str,
+) {
+    if response
+        .issues
+        .iter()
+        .any(|i| i.message_id.as_deref() == Some("UNKNOWN_CODESYSTEM"))
+    {
+        return;
+    }
+    response.issues.push(crate::types::ValidationIssue {
+        severity: "warning".into(),
+        fhir_code: "not-found".into(),
+        tx_code: "not-found".into(),
+        text: format!(
+            "A definition for CodeSystem '{system_url}' could not be found, so the code could not \
+             be checked against it; it was accepted because the ValueSet '{value_set_url}' \
+             enumerates it"
+        ),
+        expression: None,
+        location: None,
+        message_id: Some("UNKNOWN_CODESYSTEM".into()),
+    });
+}
 
 /// True when `ver` is the sentinel `current` (case-insensitive).
 ///
@@ -138,6 +426,105 @@ static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
 /// `sqlite/code_system.rs` / `postgres/code_system.rs`.
 pub(super) fn code_system_version_is_current(ver: &str) -> bool {
     ver.eq_ignore_ascii_case("current")
+}
+
+/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
+///
+/// Shared by both backends: SQLite ranks text-filtered expansions with it, and
+/// so does PostgreSQL, so a filtered page lists the same codes in the same order.
+/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
+/// and short common phrases over long FSNs.
+pub(crate) fn sort_typeahead_candidates(
+    candidates: &mut [crate::types::ExpansionContains],
+    query: &str,
+) {
+    candidates.sort_by(|a, b| {
+        typeahead_match_score(query, a)
+            .cmp(&typeahead_match_score(query, b))
+            .then_with(|| {
+                a.display
+                    .as_deref()
+                    .unwrap_or("")
+                    .len()
+                    .cmp(&b.display.as_deref().unwrap_or("").len())
+            })
+            .then_with(|| a.code.cmp(&b.code))
+    });
+}
+
+fn typeahead_match_score(query: &str, hit: &crate::types::ExpansionContains) -> i32 {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return i32::MAX;
+    }
+    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
+    let code = hit.code.to_lowercase();
+
+    if display == q {
+        return 0;
+    }
+    if code == q {
+        return 1;
+    }
+    if typeahead_word_match(&display, &q) {
+        return 20 + display.len() as i32;
+    }
+    if display.starts_with(&q) {
+        return 10 + display.len() as i32;
+    }
+    if let Some(pos) = display.find(&q) {
+        return 30 + pos as i32 + display.len() as i32;
+    }
+    i32::MAX
+}
+
+fn typeahead_word_match(display: &str, query: &str) -> bool {
+    display
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == query)
+}
+
+/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
+/// the map is already at `max` capacity.
+///
+/// The response and concept-flag caches are read under a shared (`read`) lock
+/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
+/// track per-entry recency: true LRU would require taking a write lock on every
+/// read to bump a recency counter, serializing the very lookups the cache
+/// exists to speed up. Instead, when the map is full we evict a single
+/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
+/// this is effectively random replacement) and admit the new key.
+///
+/// This replaces the previous "insert only while `len < max`" policy, which
+/// *froze* each cache once it filled: the first `max` distinct keys held their
+/// slots permanently and every later key missed forever, making the cache
+/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
+/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
+/// same memory ceiling while letting hot keys re-enter the cache.
+pub(crate) fn bounded_cache_insert<K, V, S>(
+    map: &mut std::collections::HashMap<K, V, S>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
+{
+    if max == 0 {
+        return;
+    }
+    // Only evict when inserting a genuinely new key would exceed the bound;
+    // overwriting an existing key does not grow the map.
+    if map.len() >= max && !map.contains_key(&key) {
+        // Clone one key to end the immutable borrow before removing. The keys
+        // here are small (`String` / `(String, String)`) and this only runs on
+        // a cache miss, so the clone is negligible next to the SQLite work that
+        // produced `value`.
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, value);
 }
 
 #[cfg(test)]
@@ -160,8 +547,9 @@ mod precedence_tests {
          (CASE WHEN EXISTS \
              (SELECT 1 FROM concepts hc WHERE hc.system_id = code_systems.id) \
              THEN 0 ELSE 1 END), \
+         (CASE WHEN code_systems.current_pin = 1 THEN 0 ELSE 1 END), \
          COALESCE(code_systems.authority_rank, 0), \
-         COALESCE(code_systems.version, '') DESC, \
+         COALESCE(code_systems.version_sort, code_systems.version, '') DESC, \
          code_systems.id";
 
     #[test]
@@ -195,7 +583,7 @@ mod precedence_tests {
     #[test]
     fn vs_precedence_cached_and_fallback_match_shipped_sql() {
         const VS_EXPECTED: &str = "COALESCE(value_sets.authority_rank, 0), \
-         COALESCE(value_sets.version, '') DESC, \
+         COALESCE(value_sets.version_sort, value_sets.version, '') DESC, \
          value_sets.id";
         assert_eq!(&*vs_precedence_order_by("value_sets"), VS_EXPECTED);
         assert_eq!(

@@ -41,6 +41,9 @@ pub struct FhirSchema {
     /// Canonical URL this schema is published under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Business version of the definition (`StructureDefinition.version`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Machine-readable name (also usable as a resolution alias).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -117,6 +120,25 @@ pub struct FhirSchema {
     /// equal; extra data keys permitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<Value>,
+    /// `minValue[x]` of the element definition: the value (a number, a
+    /// date/time string, or a Quantity) the data must not be below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<Value>,
+    /// `maxValue[x]`: the value the data must not exceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<Value>,
+    /// `ElementDefinition.maxLength`: most characters a string value may
+    /// have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// The `minLength` extension on the element definition: fewest
+    /// characters a string value may have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// The `maxSize` extension on the element definition: most bytes an
+    /// Attachment's data may hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,
@@ -126,6 +148,10 @@ pub struct FhirSchema {
     /// Allowed reference target types (for Reference/canonical elements).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refers: Option<Vec<String>>,
+    /// `type.profile` of the element (datatype or resource profiles): the
+    /// value must conform to one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_profiles: Option<Vec<String>>,
 
     // ------------------------------------------------------------------
     // Slicing
@@ -344,5 +370,206 @@ mod tests {
             home.schema.as_ref().unwrap().required.as_ref().unwrap(),
             &vec!["city".to_string()]
         );
+    }
+}
+
+/// Pin unversioned binding value sets to the versions in `pins`
+/// (value set url → version).
+///
+/// A profile binds `…/ValueSet/x` without a version, meaning "the version in
+/// my package's dependency context" — the IG publisher and the HL7 validator
+/// resolve it that way. A terminology server holding several versions (IPS
+/// 1.1.0 from an installed IG and IPS 2.0.0 from a bundled package) would
+/// otherwise answer from its newest one, which for IPS replaced the LOINC
+/// answers with SNOMED codes. Bindings that already name a version, and value
+/// sets without a pin, are left alone. Returns `None` when nothing changed.
+pub fn pin_binding_versions(
+    schema: &FhirSchema,
+    pins: &std::collections::HashMap<String, String>,
+) -> Option<FhirSchema> {
+    fn walk(s: &mut FhirSchema, pins: &std::collections::HashMap<String, String>) -> bool {
+        let mut changed = false;
+        if let Some(b) = s.binding.as_mut()
+            && !b.value_set.contains('|')
+            && let Some(v) = pins.get(&b.value_set)
+        {
+            b.value_set = format!("{}|{v}", b.value_set);
+            changed = true;
+        }
+        // Reference target profiles and type profiles mean the release of
+        // the package context too (TW IDIR 0.1.1 targets TW Core 0.1.1's
+        // Patient-twcore while TW Core 1.0.0 is installed).
+        let pin_list = |list: &mut Option<Vec<String>>| -> bool {
+            let mut any = false;
+            for url in list.iter_mut().flatten() {
+                if !url.contains('|')
+                    && let Some(v) = pins.get(url.as_str())
+                {
+                    *url = format!("{url}|{v}");
+                    any = true;
+                }
+            }
+            any
+        };
+        changed |= pin_list(&mut s.refers);
+        changed |= pin_list(&mut s.type_profiles);
+        let mut each = |map: &mut IndexMap<String, Arc<FhirSchema>>, extension_entries: bool| {
+            for child in map.values_mut() {
+                let mut c = (**child).clone();
+                let mut child_changed = walk(&mut c, pins);
+                // An extension entry's `url` names the extension definition.
+                if extension_entries
+                    && let Some(url) = c.url.as_mut()
+                    && !url.contains('|')
+                    && let Some(v) = pins.get(url.as_str())
+                {
+                    *url = format!("{url}|{v}");
+                    child_changed = true;
+                }
+                if child_changed {
+                    *child = Arc::new(c);
+                    changed = true;
+                }
+            }
+        };
+        if let Some(m) = s.elements.as_mut() {
+            each(m, false);
+        }
+        if let Some(m) = s.extensions.as_mut() {
+            each(m, true);
+        }
+        if let Some(slicing) = s.slicing.as_mut() {
+            for slice in slicing.slices.values_mut() {
+                if let Some(child) = slice.schema.as_mut() {
+                    let mut c = (**child).clone();
+                    if walk(&mut c, pins) {
+                        *child = Arc::new(c);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+    if pins.is_empty() {
+        return None;
+    }
+    let mut out = schema.clone();
+    let mut changed = walk(&mut out, pins);
+    // The base definition, when the package context names its version (a
+    // profile of an IG built on an older release of another installed IG).
+    if let Some(base) = out.base.as_mut()
+        && !base.contains('|')
+        && base.contains("://")
+        && let Some(v) = pins.get(base.as_str())
+    {
+        *base = format!("{base}|{v}");
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn an_unversioned_base_is_pinned_to_its_package_context() {
+        let schema = FhirSchema {
+            url: Some("https://emr/Encounter".into()),
+            base: Some("https://twcore/StructureDefinition/Encounter-twcore".into()),
+            ..Default::default()
+        };
+        let pins: std::collections::HashMap<String, String> = [(
+            "https://twcore/StructureDefinition/Encounter-twcore".to_string(),
+            "0.3.2".to_string(),
+        )]
+        .into();
+        let pinned = pin_binding_versions(&schema, &pins).expect("changed");
+        assert_eq!(
+            pinned.base.as_deref(),
+            Some("https://twcore/StructureDefinition/Encounter-twcore|0.3.2")
+        );
+        let versioned = FhirSchema {
+            base: Some("https://twcore/StructureDefinition/Encounter-twcore|1.0.0".into()),
+            ..schema
+        };
+        assert!(pin_binding_versions(&versioned, &pins).is_none());
+        // Reference target profiles are pinned the same way.
+        let mut elements = IndexMap::new();
+        elements.insert(
+            "subject".to_string(),
+            Arc::new(FhirSchema {
+                refers: Some(vec![
+                    "https://twcore/StructureDefinition/Encounter-twcore".into(),
+                    "http://hl7.org/fhir/StructureDefinition/Group".into(),
+                ]),
+                ..Default::default()
+            }),
+        );
+        let with_ref = FhirSchema { elements: Some(elements), ..Default::default() };
+        let pinned = pin_binding_versions(&with_ref, &pins).expect("changed");
+        assert_eq!(
+            pinned.elements.unwrap()["subject"].refers.as_deref(),
+            Some(&[
+                "https://twcore/StructureDefinition/Encounter-twcore|0.3.2".to_string(),
+                "http://hl7.org/fhir/StructureDefinition/Group".to_string()
+            ][..])
+        );
+    }
+
+    #[test]
+    fn unversioned_bindings_are_pinned_everywhere_and_versioned_ones_kept() {
+        let leaf = |vs: &str| {
+            Arc::new(FhirSchema {
+                binding: Some(Binding {
+                    value_set: vs.to_string(),
+                    strength: Some("required".into()),
+                }),
+                ..Default::default()
+            })
+        };
+        let mut elements = IndexMap::new();
+        elements.insert("smoking".to_string(), leaf("http://ips/ValueSet/smoking"));
+        elements.insert("status".to_string(), leaf("http://hl7.org/fhir/ValueSet/obs|4.0.1"));
+        elements.insert("other".to_string(), leaf("http://x/ValueSet/unpinned"));
+        let mut slices = IndexMap::new();
+        slices.insert(
+            "s".to_string(),
+            Slice {
+                match_: None,
+                min: None,
+                max: None,
+                order: None,
+                reslice: None,
+                slice_is_constraining: None,
+                schema: Some(leaf("http://ips/ValueSet/smoking")),
+            },
+        );
+        let schema = FhirSchema {
+            elements: Some(elements),
+            slicing: Some(Slicing {
+                slices,
+                rules: None,
+                ordered: None,
+            }),
+            ..Default::default()
+        };
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("http://ips/ValueSet/smoking".to_string(), "1.1.0".to_string());
+        pins.insert("http://hl7.org/fhir/ValueSet/obs".to_string(), "9".to_string());
+        let pinned = pin_binding_versions(&schema, &pins).expect("changed");
+        let vs = |s: &FhirSchema, k: &str| {
+            s.elements.as_ref().unwrap()[k].binding.as_ref().unwrap().value_set.clone()
+        };
+        assert_eq!(vs(&pinned, "smoking"), "http://ips/ValueSet/smoking|1.1.0");
+        assert_eq!(vs(&pinned, "status"), "http://hl7.org/fhir/ValueSet/obs|4.0.1");
+        assert_eq!(vs(&pinned, "other"), "http://x/ValueSet/unpinned");
+        let slice = pinned.slicing.as_ref().unwrap().slices["s"].schema.clone().unwrap();
+        assert_eq!(
+            slice.binding.as_ref().unwrap().value_set,
+            "http://ips/ValueSet/smoking|1.1.0"
+        );
+        assert!(pin_binding_versions(&schema, &Default::default()).is_none());
     }
 }

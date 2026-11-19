@@ -82,8 +82,9 @@ async fn search_ids(
     ids
 }
 
-/// `system|` on a chained or reverse-chained token terminal selects every code
-/// in that system, and nothing from another system.
+/// `system|` on a chained or reverse-chained token terminal, or on the `_has`
+/// a chain ends in, selects every code in that system, and nothing from
+/// another system.
 async fn assert_system_only_chains(server: &TestServer) {
     for (resource_type, key, value, expected) in [
         (
@@ -115,6 +116,19 @@ async fn assert_system_only_chains(server: &TestServer) {
         (
             "Patient",
             "_has:Observation:subject:code",
+            "http://unused.example|",
+            &[][..],
+        ),
+        // #2556: a chain that ends in `_has` has the same terminal.
+        (
+            "Observation",
+            "subject:Patient._has:Observation:subject:code",
+            "http://loinc.org|",
+            &["ob1"][..],
+        ),
+        (
+            "Observation",
+            "subject:Patient._has:Observation:subject:code",
             "http://unused.example|",
             &[][..],
         ),
@@ -328,6 +342,99 @@ mod postgres {
                 || sql.contains("SELECT DISTINCT resource_id, last_updated")),
             "native HTTP query must not enumerate source Observation bodies: {sql:?}"
         );
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_2075_native_has_http_five_rows_total_modes_and_prepared_sql() {
+        let pg = pg_server_with_connections("native_2075", 2).await;
+        for n in 0..8 {
+            for resource in [
+                json!({"resourceType":"Patient","id":format!("pt{n}")}),
+                json!({"resourceType":"Observation","id":format!("ob{n}"),"status":"final",
+                    "subject":{"reference":format!("Patient/pt{n}")},
+                    "code":{"coding":[{"system":super::LOINC,"code":if n < 7 {"8302-2"} else {"wrong"}}]}}),
+            ] {
+                let path = format!(
+                    "/{}/{}",
+                    resource["resourceType"].as_str().unwrap(),
+                    resource["id"].as_str().unwrap()
+                );
+                let response = pg.server.put(&path).json(&resource).await;
+                assert!(response.status_code().is_success(), "{}", response.text());
+            }
+        }
+        let _reserved = pg.backend.get_client().await.unwrap();
+        let mut pages = vec![];
+        for total_mode in ["none", "accurate", "estimate"] {
+            let response = pg
+                .server
+                .get("/Patient")
+                .add_query_param("_has:Observation:patient:code", "http://loinc.org|8302-2")
+                .add_query_param("_count", "5")
+                .add_query_param("_total", total_mode)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::OK,
+                "{}",
+                response.text()
+            );
+            let body: Value = response.json();
+            let ids = body["entry"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(ids.len(), 5);
+            assert!(!ids.iter().any(|id| id == "pt7"));
+            if total_mode == "none" {
+                assert!(body.get("total").is_none(), "{body}");
+            } else {
+                assert_eq!(body["total"], 7, "total must ignore the five-row page");
+            }
+            pages.push(ids);
+        }
+        assert_eq!(
+            pages[0], pages[1],
+            "total mode must preserve the ordered first page"
+        );
+        assert_eq!(pages[0], pages[2]);
+        let response = pg
+            .server
+            .get("/Patient")
+            .add_query_param("_has:Observation:patient:code", "http://loinc.org|8302-2")
+            .add_query_param("_summary", "count")
+            .add_query_param("_count", "5")
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let body: Value = response.json();
+        assert_eq!(body["total"], 7);
+        assert!(body.get("entry").is_none() || body["entry"].as_array().unwrap().is_empty());
+        let client = pg.backend.get_client().await.unwrap();
+        let rows = client.query(
+            "SELECT statement,parameter_types::text FROM pg_prepared_statements \
+             WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') \
+             AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%' ORDER BY statement", &[]).await.unwrap();
+        assert_eq!(rows.len(), 2, "actual HTTP count and page statements");
+        for row in rows {
+            let sql: String = row.get(0);
+            let parameter_types: String = row.get(1);
+            assert_eq!(parameter_types, "{text,text,text,text}");
+            assert!(
+                !sql.contains("LIMIT 1001")
+                    && !sql.contains("SELECT DISTINCT resource_id, last_updated"),
+                "no source enumeration: {sql}"
+            );
+            println!("2075 HTTP actual prepared types: {parameter_types}");
+            println!("2075 HTTP actual prepared SQL: {sql}");
+        }
     }
 
     #[tokio::test]

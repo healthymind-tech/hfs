@@ -55,14 +55,23 @@ enum BindingTokenRejection {
     TenantMismatch { token_tenant_id: String },
 }
 
+#[cfg(test)]
 fn validate_binding_token_for_request(
     manager: &helios_subscriptions::WsBindingTokenManager,
     token: &str,
     request_tenant_id: &str,
 ) -> Result<(String, String), BindingTokenRejection> {
-    let (token_tenant_id, subscription_id) = manager
-        .validate_and_consume(token)
-        .ok_or(BindingTokenRejection::InvalidOrExpired)?;
+    check_binding_tenant(manager.validate_and_consume(token), request_tenant_id)
+}
+
+/// Holds a redeemed binding (`(tenant, subscription)`, or `None` when the
+/// token was unknown/expired/already used) to the tenant of the upgrade request.
+fn check_binding_tenant(
+    redeemed: Option<(String, String)>,
+    request_tenant_id: &str,
+) -> Result<(String, String), BindingTokenRejection> {
+    let (token_tenant_id, subscription_id) =
+        redeemed.ok_or(BindingTokenRejection::InvalidOrExpired)?;
     if token_tenant_id != request_tenant_id {
         return Err(BindingTokenRejection::TenantMismatch { token_tenant_id });
     }
@@ -84,10 +93,10 @@ async fn handle_ws_connection(
         None => return,
     };
 
-    // Validate and consume the binding token (single-use).
-    let (tenant_id, subscription_id) = match validate_binding_token_for_request(
-        engine.ws_token_manager(),
-        &token,
+    // Validate and consume the binding token (single-use; redeemable on any
+    // instance when clustered, upstream B2), then hold it to the request tenant.
+    let (tenant_id, subscription_id) = match check_binding_tenant(
+        engine.redeem_ws_token(&token).await,
         &request_tenant_id,
     ) {
         Ok(binding) => binding,
@@ -109,8 +118,8 @@ async fn handle_ws_connection(
 
     // Verify subscription still exists.
     let sub = match engine
-        .manager()
-        .get_subscription(&tenant_id, &subscription_id)
+        .subscription_snapshot(&tenant_id, &subscription_id)
+        .await
     {
         Some(sub) => sub,
         None => {

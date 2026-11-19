@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Stable error type strings — the cross-implementation contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
     /// A data key matched no element in any schema of the cooperative set.
@@ -43,6 +43,8 @@ pub enum ErrorKind {
     FhirpathConstraint,
     /// A coded value failed its required-strength ValueSet binding.
     TerminologyBinding,
+    /// A coding's `display` is not a display of its code (warning).
+    DisplayMismatch,
     // ------------------------------------------------------------------
     // Helios extensions — not pinned by (and never triggered in) the
     // upstream conformance fixtures.
@@ -60,19 +62,56 @@ pub enum ErrorKind {
     /// A profile named in `meta.profile` or the caller's profile list could
     /// not be resolved.
     UnknownProfile,
-    /// A known extension used outside its declared context (#615). Always
-    /// warning severity: context matching is conservative and ad-hoc
-    /// extensions must stay permissive.
+    /// A known extension used outside its declared context (#615). Error
+    /// severity (warning on canonical resources); context matching is
+    /// conservative — only resource-root placements against resource-rooted
+    /// contexts are judged.
     ExtensionContext,
+    /// An extension url in an HL7 namespace that resolves to no known
+    /// definition (warning severity).
+    UnknownExtension,
+    /// A `batch`/`transaction` entry whose `request.url` names a different
+    /// resource type than the entry's `resource` (X10).
+    BundleEntryMismatch,
+    /// A `Reference` that is malformed, contradicts its own `type`, or names
+    /// a target type the element does not allow.
+    ReferenceInvalid,
+    /// A `urn:uuid:`/`urn:oid:` reference inside a Bundle that no entry's
+    /// `fullUrl` matches.
+    ReferenceUnresolved,
+    /// A JSON object with no members (FHIR JSON forbids empty elements).
+    EmptyObject,
+    /// A `Coding.system` in an HL7 namespace (`hl7.org`, `fhir.org`) that
+    /// names no known code system (HL7 validator:
+    /// Type_Specific_Checks_DT_URL_Resolve, error).
+    UnknownCodeSystem,
+    /// Narrative problems: an internal hyperlink (`<a href="#x">`) that
+    /// resolves to nothing in the resource (HL7 validator:
+    /// Type_Specific_Checks_DT_XHTML_Resolve, error).
+    Narrative,
+    /// Best-practice recommendations the HL7 validator warns about by
+    /// default (e.g. an Observation without a performer).
+    BestPractice,
+    /// Two contained resources of one resource share an id.
+    DuplicateId,
+    /// A resource-specific rule beyond any profile: a defining canonical
+    /// URL that is not absolute, an RFC 3986 Identifier value that is not a
+    /// URI, CodeSystem/ValueSet authoring rules (HL7 validator
+    /// `CodeSystemValidator` / `ValueSetValidator`).
+    ResourceRule,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
 /// conformance error shape stays exactly `{type, path, message, ...extra}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Severity {
     #[default]
     Error,
     Warning,
+    /// Informational note: no finding (an unknown code system on
+    /// `meta.tag`/`meta.security`, which the HL7 validator reports as
+    /// information). Never logged as a log-mode finding.
+    Information,
 }
 
 /// One validation issue, shaped for the conformance contract.
@@ -91,6 +130,16 @@ pub struct ValidationError {
     /// Internal severity; REST maps it onto OperationOutcome.
     #[serde(skip)]
     pub severity: Severity,
+    /// The canonical URL of the profile (or extension definition) whose
+    /// rule produced the issue, when known — rendered by REST as the HL7
+    /// validator's `(from <url>)`. Not part of the conformance shape.
+    #[serde(skip)]
+    pub source: Option<String>,
+    /// The HL7 validator's wording of the issue, when it differs from the
+    /// conformance-pinned `message` (slice cardinality names the slice
+    /// there). REST reports it in preference to `message`.
+    #[serde(skip)]
+    pub hl7_message: Option<String>,
 }
 
 impl ValidationError {
@@ -101,7 +150,19 @@ impl ValidationError {
             message,
             extra: serde_json::Map::new(),
             severity: Severity::Error,
+            source: None,
+            hl7_message: None,
         }
+    }
+
+    pub fn with_hl7_message(mut self, message: Option<String>) -> Self {
+        self.hl7_message = message;
+        self
+    }
+
+    pub fn with_source(mut self, source: Option<String>) -> Self {
+        self.source = source;
+        self
     }
 
     pub fn with_severity(mut self, severity: Severity) -> Self {
@@ -161,14 +222,26 @@ pub(crate) fn msg_expected_object_comma(json_type: &str) -> String {
     format!("expected object, got {json_type}")
 }
 
-/// [reference] `expected {min} > {actual_len}`
+/// [helios] an extension used outside its declared context (HL7
+/// validator wording).
 pub(crate) fn msg_extension_context(url: &str, at: &str, contexts: &[String]) -> String {
     format!(
-        "extension {url} is not declared for use at {at}; its contexts are [{}]",
-        contexts.join(", ")
+        "The extension {url} is not allowed to be used at this point (this element is [{at}]; allowed = {})",
+        contexts
+            .iter()
+            .map(|c| format!("e:{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
+/// [helios] an HL7-namespace extension with no known definition (HL7
+/// validator wording).
+pub(crate) fn msg_unknown_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
+/// [reference] `expected {min} > {actual_len}`
 pub(crate) fn msg_min(min: u64, actual_len: usize) -> String {
     format!("expected {min} > {actual_len}")
 }
@@ -199,6 +272,30 @@ pub(crate) fn msg_slice_min(min: u64, actual: u64) -> String {
 /// [pinned] `Slice defines the following max cardinality: '{max}', actual cardinality: '{n}'`
 pub(crate) fn msg_slice_max(max: u64, actual: u64) -> String {
     format!("Slice defines the following max cardinality: '{max}', actual cardinality: '{actual}'")
+}
+
+/// [helios] HL7 validator wording of an element minimum violation.
+pub(crate) fn hl7_min(element: &str, min: u64, found: usize) -> String {
+    format!("{element}: minimum required = {min}, but only found {found}")
+}
+
+/// [helios] HL7 validator wording of an element maximum violation.
+pub(crate) fn hl7_max(element: &str, max: u64, found: usize) -> String {
+    format!("{element}: max allowed = {max}, but found {found}")
+}
+
+/// [helios] HL7 validator wording of a slice minimum violation.
+pub(crate) fn hl7_slice_min(element: &str, slice: &str, min: u64, found: u64) -> String {
+    if found == 0 {
+        format!("Slice '{element}:{slice}': a matching slice is required, but not found")
+    } else {
+        format!("{element}:{slice}: minimum required = {min}, but only found {found}")
+    }
+}
+
+/// [helios] HL7 validator wording of a slice maximum violation.
+pub(crate) fn hl7_slice_max(element: &str, slice: &str, max: u64, found: u64) -> String {
+    format!("{element}:{slice}: max allowed = {max}, but found {found}")
 }
 
 /// Render a value for message text: bare strings (like the reference
@@ -272,6 +369,114 @@ pub(crate) fn msg_terminology_binding(value: &Value, value_set: &str) -> String 
     )
 }
 
+/// [helios] a coding's display is not one of its code's displays (HL7
+/// validator wording).
+pub(crate) fn msg_wrong_display(
+    display: &str,
+    system: &str,
+    code: &str,
+    valid: &[String],
+) -> String {
+    let valid = match valid {
+        [one] => format!("'{one}'"),
+        many => format!(
+            "one of {} choices: {}",
+            many.len(),
+            many.iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    format!("Wrong Display Name '{display}' for {system}#{code}. Valid display is {valid}")
+}
+
+/// [helios] no coding of the value is in an `extensible` binding's value
+/// set (HL7 validator wording: Terminology_TX_NoValid_2_CC /
+/// Terminology_TX_NoValid_13 / Terminology_TX_Confirm_5).
+pub(crate) fn msg_extensible_binding(
+    coded: &crate::effects::CodedValue,
+    value_set: &str,
+) -> String {
+    use crate::effects::CodedValue;
+    let token = |c: &Value| {
+        format!(
+            "{}#{}",
+            c.get("system").and_then(Value::as_str).unwrap_or_default(),
+            c.get("code").and_then(Value::as_str).unwrap_or_default()
+        )
+    };
+    match coded {
+        CodedValue::CodeableConcept(cc) => {
+            let codes: Vec<String> = cc
+                .get("coding")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(token)
+                .collect();
+            format!(
+                "None of the codings provided are in the value set '{value_set}', and a coding should come from this value set unless it has no suitable code (note that the validator cannot judge what is suitable) (codes = {})",
+                codes.join(", ")
+            )
+        }
+        CodedValue::Coding(c) => format!(
+            "The Coding provided ({}) was not found in the value set '{value_set}', and a code should come from this value set unless it has no suitable code (note that the validator cannot judge what is suitable)",
+            token(c)
+        ),
+        CodedValue::Code(code) => format!(
+            "The code provided ({code}) is not in the value set '{value_set}', and a code should come from this value set unless it has no suitable code (the validator cannot judge what is suitable)"
+        ),
+    }
+}
+
+/// [helios] a uri in an HL7 namespace that names nothing known (HL7
+/// validator wording).
+/// A required-bound primitive present only as id/extension.
+pub(crate) fn msg_no_code_required(value_set: &str) -> String {
+    format!("No code provided, and a code is required from the value set '{value_set}'")
+}
+
+/// A Coding's code system is known, its stated version is not.
+pub(crate) fn msg_unknown_code_system_version(system: &str, version: &str) -> String {
+    format!(
+        "A definition for CodeSystem '{system}' version '{version}' could not be found, so the code cannot be validated"
+    )
+}
+
+pub(crate) fn msg_url_unresolved(url: &str) -> String {
+    format!("No definition could be found for URL value '{url}'")
+}
+
+/// HL7 validator UNKNOWN_CODESYSTEM / UNKNOWN_CODESYSTEM_VERSION (warning):
+/// a Coding whose code system the terminology service does not have.
+pub(crate) fn msg_code_system_unknown(system: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!(
+            "A definition for CodeSystem '{system}' version '{v}' could not be found, so the code cannot be validated"
+        ),
+        None => format!(
+            "A definition for CodeSystem '{system}' could not be found, so the code cannot be validated"
+        ),
+    }
+}
+
+/// [helios] an internal narrative hyperlink with no target (HL7 validator
+/// wording).
+pub(crate) fn msg_narrative_link(href: &str, at: &str, text: &str) -> String {
+    format!("Hyperlink '{href}' at '{at}' for '{text}' does not resolve")
+}
+
+/// [helios] HL7 validator best-practice recommendations for Observation.
+pub(crate) fn msg_observation_performer() -> String {
+    "Best Practice Recommendation: In general, all observations should have a performer".into()
+}
+
+/// [helios] see [`msg_observation_performer`].
+pub(crate) fn msg_observation_subject() -> String {
+    "Best Practice Recommendation: In general, all observations should have a subject".into()
+}
+
 /// [helios] the terminology service could not be reached / errored.
 pub(crate) fn msg_terminology_unavailable(value_set: &str, detail: &str) -> String {
     format!("terminology validation against '{value_set}' could not be performed: {detail}")
@@ -283,15 +488,93 @@ pub(crate) fn msg_constraint_not_evaluable(id: &str, detail: &str) -> String {
     format!("FHIRPath constraint {id} could not be evaluated: {detail}")
 }
 
+/// [helios] no constraint could be evaluated, all for the same reason.
+pub(crate) fn msg_constraints_not_evaluable(detail: &str) -> String {
+    format!("FHIRPath constraints could not be evaluated: {detail}")
+}
+
+/// [helios] the base profile of a constraint profile is not installed; the
+/// profile's own snapshot is used.
+pub(crate) fn msg_unknown_base_profile(base: &str, profile: &str) -> String {
+    format!(
+        "The base profile '{base}' of '{profile}' could not be found; the resource was validated against the snapshot of '{profile}' only"
+    )
+}
+
 /// [helios] a schema reference could not be resolved (reference validator
 /// throws `could not resolve ["…"]`; we report and continue).
 pub(crate) fn msg_unknown_schema(reference: &str) -> String {
     format!("could not resolve schema '{reference}'")
 }
 
-/// [helios] a profile reference could not be resolved.
+/// [helios] a `meta.profile` claim could not be resolved (the HL7
+/// validator's wording).
+/// A resource profile of another resource type (HL7:
+/// `VALIDATION_VAL_PROFILE_WRONGTYPE`).
+pub(crate) fn msg_profile_wrong_type(expected: &str, actual: &str, profile: &str) -> String {
+    format!(
+        "Specified profile type was '{expected}' in profile '{profile}', but found type '{actual}'"
+    )
+}
+
 pub(crate) fn msg_unknown_profile(reference: &str) -> String {
-    format!("could not resolve profile '{reference}'")
+    format!("Profile reference '{reference}' has not been checked because it could not be found")
+}
+
+/// [helios] a profile the caller asked to validate against could not be
+/// resolved.
+pub(crate) fn msg_unknown_requested_profile(reference: &str) -> String {
+    format!(
+        "Profile '{reference}' was requested for validation but could not be found; the resource was not checked against it"
+    )
+}
+
+/// [helios] `Reference.reference` is not a reference (HL7 validator
+/// wording).
+pub(crate) fn msg_reference_malformed(reference: &str) -> String {
+    format!("The reference '{reference}' is not a valid reference")
+}
+
+/// [helios] the literal reference and `Reference.type` disagree.
+pub(crate) fn msg_reference_type_mismatch(
+    reference: &str,
+    literal: &str,
+    declared: &str,
+) -> String {
+    format!(
+        "The reference '{reference}' refers to a {literal}, but Reference.type says '{declared}'"
+    )
+}
+
+/// [helios] the target type is not allowed (HL7 validator wording).
+pub(crate) fn msg_reference_target_type(found: &str, allowed: &[String]) -> String {
+    format!(
+        "Invalid Resource target type. Found {found}, but expected one of ({})",
+        allowed.join(", ")
+    )
+}
+
+/// [helios] a Bundle-internal URN reference no entry provides (HL7
+/// validator wording).
+pub(crate) fn msg_reference_urn_unresolved(reference: &str) -> String {
+    format!("URN reference is not locally contained within the bundle {reference}")
+}
+
+/// [helios] a resource id outside the `id` pattern (HL7 validator
+/// wording).
+pub(crate) fn msg_resource_id(id: &str) -> String {
+    format!("Invalid Resource id: Invalid Characters ('{id}')")
+}
+
+/// [helios] a modifier extension with no known definition (HL7 validator
+/// wording).
+pub(crate) fn msg_unknown_modifier_extension(url: &str) -> String {
+    format!("The extension {url} could not be found so is not allowed here")
+}
+
+/// [helios] an empty JSON object (HL7 validator wording).
+pub(crate) fn msg_empty_object() -> String {
+    "Object must have some content".to_string()
 }
 
 /// The reference validator's JSON type vocabulary (`getType`).

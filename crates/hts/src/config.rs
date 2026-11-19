@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::Path;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use helios_persistence::core::database_url::redact_database_url;
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
@@ -36,12 +37,50 @@ pub enum Command {
     Run(HtsConfig),
     /// Bulk-import a terminology package from the filesystem
     Import(ImportArgs),
+    /// Copy an HTS SQLite database into PostgreSQL (backend switch without
+    /// re-importing the source terminologies)
+    Migrate(MigrateArgs),
+}
+
+/// Arguments for `hts migrate`.
+#[derive(Parser, Debug)]
+pub struct MigrateArgs {
+    /// SQLite `hts.db` to copy (opened read-only; stop the server first or
+    /// pass a copy)
+    #[arg(long)]
+    pub from: std::path::PathBuf,
+
+    /// PostgreSQL connection string of the target database
+    #[arg(long)]
+    pub to: String,
+
+    /// Empty the target's terminology tables first instead of refusing a
+    /// database that already holds terminology
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Do not copy the REST-created resources of the persistence store
+    #[arg(long)]
+    pub skip_resources: bool,
+
+    /// Tables copied concurrently
+    #[arg(long, default_value = "4")]
+    pub jobs: usize,
+
+    /// Write the per-table report as JSON to this file
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, env = "HTS_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
 }
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
 /// Configuration for the Helios Terminology Server HTTP server.
-#[derive(Parser, Debug, Clone)]
+// `Debug` is hand-written below: it redacts `database_url` (#2149).
+#[derive(Parser, Clone)]
 pub struct HtsConfig {
     /// Server port
     #[arg(long, env = "HTS_SERVER_PORT", default_value = "8090")]
@@ -56,7 +95,12 @@ pub struct HtsConfig {
     pub log_level: String,
 
     /// Database URL (SQLite file path or PostgreSQL connection string)
-    #[arg(long, env = "HTS_DATABASE_URL", default_value = "./data/hts.db")]
+    #[arg(
+        long,
+        env = "HTS_DATABASE_URL",
+        default_value = "./data/hts.db",
+        hide_env_values = true
+    )]
     pub database_url: String,
 
     /// Storage backend (sqlite | postgres)
@@ -79,11 +123,30 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_MAX_BODY_SIZE", default_value = "10485760")]
     pub max_body_size: usize,
 
+    /// Seconds a request may run before HTS answers `408`. Bundle imports
+    /// into a large database (SNOMED + LOINC) can take longer than the
+    /// default; when one times out its write still runs to completion and
+    /// holds the SQLite write lock, so later writes fail with
+    /// "database is locked". Mirrors `HFS_REQUEST_TIMEOUT`.
+    #[arg(long, env = "HTS_REQUEST_TIMEOUT", default_value = "30")]
+    pub request_timeout: u64,
+
     /// Maximum number of codes allowed in a single ValueSet expansion.
     /// Requests that would exceed this limit receive HTTP 422 with issue
     /// code `too-costly`.
     #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "3500")]
     pub max_expansion_size: u32,
+
+    /// Automatically apply stored CodeSystem supplements (`content=supplement`
+    /// resources whose `supplements` names the CodeSystem) to `$lookup` and
+    /// `$expand`, so translated designations (e.g. zh-Hant display names for
+    /// ICD-10-CM or LOINC) are returned — and honoured by `displayLanguage` —
+    /// without the client having to pass `useSupplement`. Set to `false` to
+    /// restore the strict FHIR behaviour where supplements apply only when
+    /// named explicitly (`useSupplement`) or pinned by the ValueSet
+    /// (`valueset-supplement` extension).
+    #[arg(long, env = "HTS_AUTO_SUPPLEMENTS", default_value = "true", action = clap::ArgAction::Set)]
+    pub auto_supplements: bool,
 
     /// Directory of terminology distribution files to auto-import on first
     /// run. When set and pointing at an existing directory, the server
@@ -94,6 +157,15 @@ pub struct HtsConfig {
     /// boots a populated server automatically. Leave empty to disable.
     #[arg(long, env = "HTS_BOOTSTRAP_DIR", default_value = "")]
     pub bootstrap_dir: String,
+
+    /// How often (milliseconds) a PostgreSQL-backed server polls the shared
+    /// `terminology_epoch` counter and drops its response caches when another
+    /// replica, a `hts import` run or a hand-written SQL change moved it.
+    /// Bounds cross-replica staleness of `$expand` / `$validate-code` /
+    /// `$lookup` / `$translate` / `$subsumes`. `0` disables the poller (a
+    /// single replica that is the only writer). Ignored for SQLite.
+    #[arg(long, env = "HTS_CACHE_SYNC_INTERVAL_MS", default_value = "1000")]
+    pub cache_sync_interval_ms: u64,
 
     /// Number of concepts per import batch during bootstrap sync. Each batch
     /// is one database transaction plus fixed per-batch bookkeeping (metadata
@@ -122,6 +194,151 @@ pub struct HtsConfig {
     /// convenience, not part of the FHIR contract.
     #[arg(long, env = "HTS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
+
+    /// Enable terminology management: the `/admin` API (upload, import,
+    /// delete, set current version, compact) and the console pages that use
+    /// it. **Off by default.** Requires `HTS_ADMIN_PASSWORD` (or
+    /// `HTS_ADMIN_PASSWORD_FILE`): without one every admin endpoint answers
+    /// `503` rather than run unauthenticated.
+    #[arg(long, env = "HTS_ADMIN_UI", default_value = "false", action = clap::ArgAction::Set)]
+    pub admin_ui: bool,
+
+    /// Working directory for uploads, job records and logs, downloaded
+    /// packages and the audit log. Empty = `<database dir>/hts-admin`.
+    #[arg(long, env = "HTS_ADMIN_DATA_DIR", default_value = "")]
+    pub admin_data_dir: String,
+
+    /// Server-side directory operators copy terminology files into; the
+    /// console lists it and imports from it without an upload. Empty = off.
+    #[arg(long, env = "HTS_IMPORT_DIR", default_value = "")]
+    pub import_dir: String,
+
+    /// FHIR package registry for terminology packages (`hl7.terminology.r4`…):
+    /// packages.fhir.org, an internal mirror URL, or `off` for hospitals
+    /// without outbound internet.
+    #[arg(
+        long,
+        env = "HTS_PACKAGE_REGISTRY",
+        default_value = "https://packages.fhir.org"
+    )]
+    pub package_registry: String,
+
+    /// Upload chunk size in bytes (default 8 MiB). Each chunk is one request,
+    /// so this must stay well below any proxy body limit and the 30 s request
+    /// timeout at the slowest expected link speed.
+    #[arg(long, env = "HTS_UPLOAD_CHUNK_SIZE", default_value = "8388608")]
+    pub upload_chunk_size: u64,
+
+    /// Largest accepted upload in bytes (default 16 GiB).
+    #[arg(long, env = "HTS_MAX_UPLOAD_SIZE", default_value = "17179869184")]
+    pub max_upload_size: u64,
+
+    /// Free space required on top of every import's growth estimate (default
+    /// 1 GiB) — covers WAL growth and temporary files during the import.
+    #[arg(long, env = "HTS_DISK_HEADROOM", default_value = "1073741824")]
+    pub disk_headroom: u64,
+
+    /// Administrator sign-in for `/admin` and the console's management
+    /// pages. Not a flag: `None` (the default) reads `HTS_ADMIN_USER`,
+    /// `HTS_ADMIN_PASSWORD` / `HTS_ADMIN_PASSWORD_FILE` and the other
+    /// `HTS_ADMIN_*` sign-in variables when the app is built (see
+    /// `docs/hts-terminology-admin.md`); tests and embedders set it directly.
+    #[arg(skip)]
+    pub admin_auth: Option<helios_admin_auth::AdminSettings>,
+
+    /// Require the administrator credential for state-changing terminology
+    /// requests: CodeSystem/ValueSet/ConceptMap create, update and delete,
+    /// `POST /import`, and batch/transaction Bundles with write entries.
+    /// Reads and the non-persisting operations (`$lookup`, `$validate-code`,
+    /// `$subsumes`, `$expand`, `$batch-validate-code`, `$translate`,
+    /// `$closure`) stay public. Default: `true` when `HTS_ADMIN_PASSWORD`
+    /// (or `_FILE`) is set, else `false` (open, with a startup warning).
+    /// `true` without a password answers those writes with `503`.
+    #[arg(long, env = "HTS_REQUIRE_AUTH_FOR_WRITES", action = clap::ArgAction::Set)]
+    pub require_auth_for_writes: Option<bool>,
+}
+
+/// The storage backend to use for `database_url`.
+///
+/// A `postgres://` or `postgresql://` URL always means the PostgreSQL backend:
+/// with the `sqlite` default such a URL would be opened as a file path, and
+/// the resulting error would carry the URL — password included — into logs.
+pub fn effective_storage_backend(storage_backend: &str, database_url: &str) -> String {
+    let url = database_url.trim_start().to_ascii_lowercase();
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "postgres".to_string()
+    } else {
+        storage_backend.to_string()
+    }
+}
+
+/// Prints `database_url` without credentials or connection options (#2149).
+/// Destructures every field, so a new field fails to compile until it is
+/// listed here.
+impl fmt::Debug for HtsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            database_url,
+            storage_backend,
+            enable_cors,
+            cors_origins,
+            max_body_size,
+            max_expansion_size,
+            bootstrap_dir,
+            bootstrap_batch_size,
+            import_languages,
+            ui_enabled,
+            request_timeout,
+            auto_supplements,
+            cache_sync_interval_ms,
+            admin_ui,
+            admin_data_dir,
+            import_dir,
+            package_registry,
+            upload_chunk_size,
+            max_upload_size,
+            disk_headroom,
+            admin_auth,
+            require_auth_for_writes,
+        } = self;
+        f.debug_struct("HtsConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field(
+                "database_url",
+                &redact_database_url(database_url, storage_backend),
+            )
+            .field("storage_backend", storage_backend)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("max_body_size", max_body_size)
+            .field("max_expansion_size", max_expansion_size)
+            .field("bootstrap_dir", bootstrap_dir)
+            .field("bootstrap_batch_size", bootstrap_batch_size)
+            .field("import_languages", import_languages)
+            .field("ui_enabled", ui_enabled)
+            .field("request_timeout", request_timeout)
+            .field("auto_supplements", auto_supplements)
+            .field("cache_sync_interval_ms", cache_sync_interval_ms)
+            .field("admin_ui", admin_ui)
+            .field("admin_data_dir", admin_data_dir)
+            .field("import_dir", import_dir)
+            .field("package_registry", package_registry)
+            .field("upload_chunk_size", upload_chunk_size)
+            .field("max_upload_size", max_upload_size)
+            .field("disk_headroom", disk_headroom)
+            // The administrator password lives in here: never print it.
+            .field(
+                "admin_auth",
+                &admin_auth.as_ref().map(|_| "<configured, redacted>"),
+            )
+            .field("require_auth_for_writes", require_auth_for_writes)
+            .finish()
+    }
 }
 
 impl HtsConfig {
@@ -142,11 +359,23 @@ impl Default for HtsConfig {
             enable_cors: true,
             cors_origins: "*".into(),
             max_body_size: 10 * 1024 * 1024, // 10MB
+            request_timeout: 30,
             max_expansion_size: 10_000,
+            auto_supplements: true,
             bootstrap_dir: String::new(),
+            cache_sync_interval_ms: 1000,
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
             ui_enabled: true,
+            admin_ui: false,
+            admin_data_dir: String::new(),
+            import_dir: String::new(),
+            package_registry: "https://packages.fhir.org".into(),
+            upload_chunk_size: 8 * 1024 * 1024,
+            max_upload_size: 16 * 1024 * 1024 * 1024,
+            disk_headroom: 1024 * 1024 * 1024,
+            admin_auth: None,
+            require_auth_for_writes: None,
         }
     }
 }
@@ -165,9 +394,16 @@ pub enum ImportFormat {
     /// LOINC CSV distribution (.zip) from loinc.org
     #[value(name = "loinc")]
     Loinc,
+    /// The properties of a LOINC distribution (.zip), added to an existing
+    /// LOINC import without re-importing its concepts. Never auto-detected.
+    #[value(name = "loinc-properties")]
+    LoincProperties,
     /// ICD-10-CM tabular XML from CMS
     #[value(name = "icd10-cm")]
     Icd10Cm,
+    /// ICD-10-PCS order file (`icd10pcs_codes_YYYY.txt`) or CMS tables ZIP
+    #[value(name = "icd10-pcs")]
+    Icd10Pcs,
     /// ICD-9-CM pipe-delimited text from CMS (retired 2015, public domain)
     #[value(name = "icd9-cm")]
     Icd9Cm,
@@ -206,7 +442,9 @@ impl fmt::Display for ImportFormat {
             ImportFormat::Hl7Npm => write!(f, "hl7-npm"),
             ImportFormat::SnomedRf2 => write!(f, "snomed-rf2"),
             ImportFormat::Loinc => write!(f, "loinc"),
+            ImportFormat::LoincProperties => write!(f, "loinc-properties"),
             ImportFormat::Icd10Cm => write!(f, "icd10-cm"),
+            ImportFormat::Icd10Pcs => write!(f, "icd10-pcs"),
             ImportFormat::Icd9Cm => write!(f, "icd9-cm"),
             ImportFormat::Rxnorm => write!(f, "rxnorm"),
             ImportFormat::Ucum => write!(f, "ucum"),
@@ -226,8 +464,11 @@ impl fmt::Display for ImportFormat {
 /// Detection rules (in order):
 /// - `.tgz` / `.tar.gz` → [`ImportFormat::Hl7Npm`]
 /// - `.xml` containing "tabular" in the filename → [`ImportFormat::Icd10Cm`]
+/// - `.txt` containing "icd10pcs" in the filename → [`ImportFormat::Icd10Pcs`]
 /// - `.rrf` (case-insensitive) → [`ImportFormat::Rxnorm`]
-/// - directory → [`ImportFormat::Rxnorm`]
+/// - directory holding `RXNCONSO.RRF` → [`ImportFormat::Rxnorm`] (other
+///   directories: `None`; the admin API inspects their contents, see
+///   `admin::formats::detect`)
 /// - `.zip` → peeks into the archive to distinguish formats
 /// - `.json` → peeks to check for `"resourceType":"Bundle"` → [`ImportFormat::FhirBundle`]
 /// - anything else → `None` (user must pass `--format`)
@@ -254,6 +495,10 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
     if name.ends_with(".xml") && (name.contains("mesh") || name.starts_with("desc")) {
         return Some(ImportFormat::Mesh);
     }
+    // ICD-10-PCS order file (e.g. icd10pcs_codes_2025.txt).
+    if name.ends_with(".txt") && name.contains("icd10pcs") {
+        return Some(ImportFormat::Icd10Pcs);
+    }
     // NCI Thesaurus flat text.
     if name.ends_with(".txt") && name.contains("thesaurus") {
         return Some(ImportFormat::NciThesaurus);
@@ -270,7 +515,14 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
         return Some(ImportFormat::Rxnorm);
     }
     if path.is_dir() {
-        return Some(ImportFormat::Rxnorm);
+        // Only an RxNorm RRF folder is importable as a directory. Anything else
+        // (a LOINC release folder holding `Loinc_2.80.zip`, a SNOMED tree …)
+        // used to be reported as RxNorm here.
+        return std::fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .any(|e| e.file_name().eq_ignore_ascii_case("RXNCONSO.RRF"))
+            .then_some(ImportFormat::Rxnorm);
     }
     if name.ends_with(".zip") {
         return detect_zip_format(path);
@@ -284,10 +536,12 @@ pub fn detect_format(path: &Path) -> Option<ImportFormat> {
 /// Peek into a ZIP to identify the terminology distribution format.
 ///
 /// Checks entry names in order:
-/// - Contains `concept_full` or `description_full` (RF2) → SNOMED RF2
+/// - Contains `concept_full` / `description_full`, or a `sct2_*.txt` /
+///   `der2_*.txt` table (RF2, incl. Snapshot-only archives) → SNOMED RF2
 /// - Ends with `loinctable.csv` → LOINC
 /// - Ends with `rxnconso.rrf` → RxNorm
 /// - Ends with `.xml` and contains `tabular` → ICD-10-CM
+/// - Ends with `.txt` and contains `icd10pcs` → ICD-10-PCS
 /// - Otherwise → `None` (user must pass `--format`)
 fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
     let file = std::fs::File::open(path).ok()?;
@@ -297,8 +551,15 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         let Ok(entry) = zip.by_index(i) else {
             continue; // skip unreadable entries (zip64, encoding issues, etc.)
         };
-        let entry_name = entry.name().to_lowercase();
-        if entry_name.contains("concept_full") || entry_name.contains("description_full") {
+        let entry_name = entry.name().map(|n| n.to_lowercase()).unwrap_or_default();
+        // RF2 tables: `sct2_Concept_Full_…`, but also Snapshot-only archives
+        // (`sct2_Concept_Snapshot_…`, `der2_…Refset…`).
+        let fname = entry_name.rsplit('/').next().unwrap_or(&entry_name);
+        if entry_name.contains("concept_full")
+            || entry_name.contains("description_full")
+            || ((fname.starts_with("sct2_") || fname.starts_with("der2_"))
+                && fname.ends_with(".txt"))
+        {
             return Some(ImportFormat::SnomedRf2);
         }
         // Match the LOINC main table however it is named inside the ZIP.
@@ -321,6 +582,10 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         }
         if entry_name.ends_with(".xml") && entry_name.contains("tabular") {
             return Some(ImportFormat::Icd10Cm);
+        }
+        // CMS ICD-10-PCS tables ZIP (icd10pcs_codes_2025.txt + optional tables XML).
+        if entry_name.ends_with(".txt") && entry_name.contains("icd10pcs") {
+            return Some(ImportFormat::Icd10Pcs);
         }
         if entry_name.contains("_desc_long_dx") || entry_name.contains("_desc_short_dx") {
             return Some(ImportFormat::Icd9Cm);
@@ -378,7 +643,8 @@ fn detect_json_format(path: &Path) -> Option<ImportFormat> {
 // ── Import args ───────────────────────────────────────────────────────────────
 
 /// Arguments for `hts import`.
-#[derive(Parser, Debug)]
+// `Debug` is hand-written below: it redacts `database_url` (#2149).
+#[derive(Parser)]
 pub struct ImportArgs {
     /// Path to the terminology package file or directory
     pub path: std::path::PathBuf,
@@ -389,7 +655,12 @@ pub struct ImportArgs {
     pub format: Option<ImportFormat>,
 
     /// Database URL (SQLite file path or PostgreSQL connection string)
-    #[arg(long, env = "HTS_DATABASE_URL", default_value = "./data/hts.db")]
+    #[arg(
+        long,
+        env = "HTS_DATABASE_URL",
+        default_value = "./data/hts.db",
+        hide_env_values = true
+    )]
     pub database_url: String,
 
     /// Storage backend to import into (`sqlite` or `postgres`)
@@ -421,10 +692,65 @@ pub struct ImportArgs {
     pub verbose: bool,
 }
 
+/// Prints `database_url` without credentials or connection options (#2149).
+/// Destructures every field, so a new field fails to compile until it is
+/// listed here.
+impl fmt::Debug for ImportArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            path,
+            format,
+            database_url,
+            storage_backend,
+            log_level,
+            batch_size,
+            languages,
+            dry_run,
+            verbose,
+        } = self;
+        f.debug_struct("ImportArgs")
+            .field("path", path)
+            .field("format", format)
+            .field(
+                "database_url",
+                &redact_database_url(database_url, storage_backend),
+            )
+            .field("storage_backend", storage_backend)
+            .field("log_level", log_level)
+            .field("batch_size", batch_size)
+            .field("languages", languages)
+            .field("dry_run", dry_run)
+            .field("verbose", verbose)
+            .finish()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use super::effective_storage_backend;
+
+    #[test]
+    fn postgres_urls_select_the_postgres_backend() {
+        assert_eq!(
+            effective_storage_backend("sqlite", "postgresql://u:p@h/db"),
+            "postgres"
+        );
+        assert_eq!(
+            effective_storage_backend("sqlite", "POSTGRES://u:p@h/db"),
+            "postgres"
+        );
+        assert_eq!(
+            effective_storage_backend("sqlite", "./data/hts.db"),
+            "sqlite"
+        );
+        assert_eq!(
+            effective_storage_backend("postgres", "./data/hts.db"),
+            "postgres"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -449,6 +775,37 @@ mod tests {
             detect_format(Path::new("icd10cm_tabular_2025.xml")),
             Some(ImportFormat::Icd10Cm)
         );
+    }
+
+    #[test]
+    fn detect_txt_icd10pcs_returns_icd10_pcs() {
+        assert_eq!(
+            detect_format(Path::new("icd10pcs_codes_2025.txt")),
+            Some(ImportFormat::Icd10Pcs)
+        );
+        assert_eq!(
+            detect_format(Path::new("/x/ICD10PCS_Codes_2026.TXT")),
+            Some(ImportFormat::Icd10Pcs)
+        );
+        // A generic .txt still needs --format.
+        assert_eq!(detect_format(Path::new("codes.txt")), None);
+    }
+
+    #[test]
+    fn detect_zip_icd10pcs_order_file() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.as_file_mut());
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("icd10pcsCodesFile.pdf", opts).unwrap();
+            zip.write_all(b"%PDF").unwrap();
+            zip.start_file("icd10pcs_codes_2025.txt", opts).unwrap();
+            zip.write_all(b"0DTJ0ZZ Resection of Appendix, Open Approach\r\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd10Pcs));
     }
 
     #[test]
@@ -482,8 +839,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_directory_returns_rxnorm() {
+    fn detect_directory_is_rxnorm_only_with_rrf_files() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_format(dir.path()), None);
+        std::fs::write(dir.path().join("Loinc_2.80.zip"), b"x").unwrap();
+        assert_eq!(detect_format(dir.path()), None);
+        std::fs::write(dir.path().join("RXNCONSO.RRF"), b"").unwrap();
         assert_eq!(detect_format(dir.path()), Some(ImportFormat::Rxnorm));
     }
 
@@ -493,9 +854,27 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file(
                 "SnomedCT/Snapshot/Terminology/Concept_Full_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"dummy").unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(detect_format(tmp.path()), Some(ImportFormat::SnomedRf2));
+    }
+
+    #[test]
+    fn detect_zip_snomed_snapshot_only() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file(
+                "SnomedCT_ManagedServiceTW/Snapshot/Terminology/sct2_Concept_Snapshot_TW_20250901.txt",
                 opts,
             )
             .unwrap();
@@ -511,7 +890,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -527,7 +906,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Loinc_2.80/Loinc.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -542,7 +921,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Loinc_2.77/LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -556,7 +935,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("readme.txt", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -570,7 +949,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("rrf/RXNCONSO.RRF", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -584,7 +963,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("icd10cm_tabular_2025.xml", opts).unwrap();
             zip.write_all(b"<ICD10CM.tabular/>").unwrap();
             zip.finish().unwrap();
@@ -598,6 +977,7 @@ mod tests {
         assert_eq!(ImportFormat::SnomedRf2.to_string(), "snomed-rf2");
         assert_eq!(ImportFormat::Loinc.to_string(), "loinc");
         assert_eq!(ImportFormat::Icd10Cm.to_string(), "icd10-cm");
+        assert_eq!(ImportFormat::Icd10Pcs.to_string(), "icd10-pcs");
         assert_eq!(ImportFormat::Icd9Cm.to_string(), "icd9-cm");
         assert_eq!(ImportFormat::Rxnorm.to_string(), "rxnorm");
         assert_eq!(ImportFormat::Ucum.to_string(), "ucum");
@@ -666,7 +1046,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("ucum-essence.xml", opts).unwrap();
             zip.write_all(b"<root/>").unwrap();
             zip.finish().unwrap();
@@ -680,7 +1060,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Thesaurus.txt", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -694,7 +1074,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             // File is nested inside a subdirectory — tests the starts_with fix
             zip.start_file("mesh2026/desc2026.xml", opts).unwrap();
             zip.write_all(b"<MeshHeadingList/>").unwrap();
@@ -709,7 +1089,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("dicom_codes.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -723,7 +1103,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("nucc_taxonomy_250.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -737,7 +1117,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("CMS32_DESC_LONG_DX.txt", opts).unwrap();
             zip.write_all(b"001|Cholera\n").unwrap();
             zip.finish().unwrap();
@@ -751,11 +1131,68 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("CMS32_DESC_SHORT_DX.txt", opts).unwrap();
             zip.write_all(b"001|Cholera\n").unwrap();
             zip.finish().unwrap();
         }
         assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd9Cm));
+    }
+
+    // ── Secrets stay out of `--help` and `Debug` (#2149) ─────────────
+
+    #[test]
+    fn help_hides_the_database_url_value() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for subcommand in ["run", "import"] {
+            let arg = cli
+                .find_subcommand(subcommand)
+                .unwrap_or_else(|| panic!("no `{subcommand}` subcommand"))
+                .get_arguments()
+                .find(|arg| arg.get_env().is_some_and(|env| env == "HTS_DATABASE_URL"))
+                .unwrap_or_else(|| panic!("`{subcommand}` does not read HTS_DATABASE_URL"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`hts {subcommand} --help` would print HTS_DATABASE_URL"
+            );
+        }
+    }
+
+    const PG_URL: &str = "postgres://hts:DB-SECRET@db.internal:5432/hts?sslpassword=OPT-SECRET";
+
+    #[test]
+    fn debug_redacts_the_database_url() {
+        let config = HtsConfig {
+            database_url: PG_URL.to_string(),
+            storage_backend: "postgres".to_string(),
+            ..Default::default()
+        };
+        let args = ImportArgs {
+            path: "snomed.zip".into(),
+            format: None,
+            database_url: PG_URL.to_string(),
+            storage_backend: "postgres".to_string(),
+            log_level: "info".to_string(),
+            batch_size: 500,
+            languages: String::new(),
+            dry_run: false,
+            verbose: false,
+        };
+        for debug in [
+            format!("{config:?}"),
+            format!("{config:#?}"),
+            format!("{args:?}"),
+            format!("{:?}", Command::Run(config.clone())),
+        ] {
+            assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+            assert!(debug.contains("database_url"), "{debug}");
+        }
+    }
+
+    #[test]
+    fn debug_shows_a_sqlite_database_path() {
+        let config = HtsConfig::default();
+        assert!(format!("{config:?}").contains("./data/hts.db"));
     }
 }

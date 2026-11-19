@@ -178,6 +178,7 @@
 #![recursion_limit = "256"]
 
 pub mod advisor;
+pub mod audit_store;
 pub mod backends;
 pub mod composite;
 /// Process-exit removal of the shared testcontainers the lib tests park in

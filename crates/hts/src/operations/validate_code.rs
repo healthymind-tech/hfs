@@ -36,8 +36,14 @@ use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     coding_entries_from_codeable_concept, collect_canonical_params, collect_resource_params,
     extract_codeable_concept, extract_coding_full, extract_parameter_array,
-    find_codeable_concept_param, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    find_codeable_concept_param, find_resource_param, find_str_param, normalize_canonical_params,
+    parse_query_string, query_params_to_fhir_params,
+};
+
+#[path = "validate_input.rs"]
+mod validate_input;
+use validate_input::{
+    INCOMPLETE_CODING_MESSAGE_IDS, InputCheck, check_validate_input, merge_issues,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -213,13 +219,18 @@ fn build_validate_response_inner(
     if matches!(request_path, RequestPath::BareCode) {
         for issue in &mut issues {
             // Rewrite FHIRPath expression paths for bare-code requests:
-            // `Coding.code` → `code`, `Coding.system` → `system`, `Coding` → drop.
-            for field in [&mut issue.expression, &mut issue.location] {
+            // `Coding.code` → `code`, `Coding.system` → `system`. An issue
+            // about the whole Coding is about the `code` parameter (IG
+            // `tho/validate-isa-other-branch`: INACTIVE_CONCEPT_FOUND at
+            // `code`); its location is dropped.
+            for (field, is_expression) in
+                [(&mut issue.expression, true), (&mut issue.location, false)]
+            {
                 if let Some(path) = field.as_deref() {
                     if let Some(stripped) = path.strip_prefix("Coding.") {
                         *field = Some(stripped.to_string());
                     } else if path == "Coding" {
-                        *field = None;
+                        *field = is_expression.then(|| "code".to_string());
                     }
                 }
             }
@@ -309,8 +320,12 @@ fn build_validate_response_inner(
                     || (i.severity == "warning"
                         && (i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                             || i.message_id.as_deref() == Some("DEPRECATED_CONCEPT_FOUND")
+                            || i.message_id.as_deref() == Some("INACTIVE_DISPLAY_FOUND")
                             || i.message_id.as_deref()
-                                == Some("Coding_has_no_system__cannot_validate")
+                                == Some("UNKNOWN_CODESYSTEM_CODING_NOT_CHECKED")
+                            || i.message_id
+                                .as_deref()
+                                .is_some_and(|m| INCOMPLETE_CODING_MESSAGE_IDS.contains(&m))
                             || i.tx_code == "invalid-display"))
                     || (i.severity == "information"
                         && i.message_id
@@ -416,6 +431,565 @@ fn build_validate_response_inner(
     })
 }
 
+/// The ValueSet a `$validate-code` / `$expand` request names: the stored
+/// one (`url` + `valueSetVersion`), a request-supplied one with that url, or
+/// the inline `valueSet`.
+pub(crate) async fn requested_value_set<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    let Some(url) = find_str_param(params, "url") else {
+        return find_resource_param(params, "valueSet");
+    };
+    let version = find_str_param(params, "valueSetVersion");
+    if let Some(vs) = collect_resource_params(params, "tx-resource")
+        .into_iter()
+        .find(|r| {
+            r.get("resourceType").and_then(|v| v.as_str()) == Some("ValueSet")
+                && r.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
+                && version
+                    .as_deref()
+                    .is_none_or(|v| r.get("version").and_then(|x| x.as_str()) == Some(v))
+        })
+    {
+        return Some(vs);
+    }
+    ValueSetOperations::search(
+        state.backend(),
+        &TenantContext::system(),
+        crate::types::ResourceSearchQuery {
+            url: Some(url),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()
+}
+
+/// `ValueSet/$validate-code` against a value set over media types only
+/// (see [`crate::mimetypes`]); `None` for any other value set. The core
+/// `mimetypes` value set keeps its own handling.
+async fn media_type_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::mimetypes;
+    let vs = match requested_value_set(state, params).await {
+        Some(vs) => vs,
+        // The core mimetypes value set, even when it is not stored.
+        None if find_str_param(params, "url")
+            .as_deref()
+            .is_some_and(crate::bcp13::is_mimetypes_valueset_url) =>
+        {
+            json!({"url": crate::bcp13::MIMETYPES_VS_URL,
+                   "compose": {"include": [{"system": mimetypes::SYSTEM}]}})
+        }
+        None => return None,
+    };
+    if !mimetypes::is_media_type_value_set(&vs) {
+        return None;
+    }
+    let (code, path) = if let Some(code) = find_str_param(params, "code") {
+        if find_str_param(params, "system").is_some_and(|s| s != mimetypes::SYSTEM) {
+            return None;
+        }
+        (code, RequestPath::BareCode)
+    } else if let Some((system, code, _, _)) = extract_coding_full(params, "coding") {
+        if system != mimetypes::SYSTEM {
+            return None;
+        }
+        (code, RequestPath::Coding)
+    } else {
+        return None;
+    };
+    let url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+    let label = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    let parsed = mimetypes::parse(&code);
+    let in_vs = parsed
+        .as_ref()
+        .is_some_and(|mt| mimetypes::in_value_set(&vs, mt));
+    let mut issues = Vec::new();
+    if parsed.is_none() {
+        // As tx.fhir.org: not a media type at all (`json`) is an unknown code.
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "invalid-code".into(),
+            text: format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("Unknown_Code_in".into()),
+        });
+    }
+    let issues = if in_vs {
+        issues
+    } else {
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: format!(
+                "The provided code '{}#{code}' was not found in the value set '{label}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+        issues
+    };
+    Some(build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: parsed.is_some().then(|| code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(mimetypes::SYSTEM),
+        None,
+        None,
+        None,
+        path,
+    ))
+}
+
+/// `CodeSystem/$validate-code` of a media type (`urn:ietf:bcp:13`, a
+/// grammar): any well-formed `type/subtype[; parameters]` is a code.
+fn media_type_cs_validate(params: &[Value]) -> Option<Value> {
+    use crate::mimetypes;
+    let (code, path) = match find_str_param(params, "code") {
+        Some(code) => {
+            let system = find_str_param(params, "url").or_else(|| find_str_param(params, "system"));
+            if system.as_deref() != Some(mimetypes::SYSTEM) {
+                return None;
+            }
+            (code, RequestPath::BareCode)
+        }
+        None => match extract_coding_full(params, "coding") {
+            Some((system, code, _, _)) if system == mimetypes::SYSTEM => {
+                (code, RequestPath::Coding)
+            }
+            _ => return None,
+        },
+    };
+    let valid = mimetypes::parse(&code).is_some();
+    let issues = if valid {
+        vec![]
+    } else {
+        vec![ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "invalid-code".into(),
+            text: format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                mimetypes::SYSTEM
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("Unknown_Code_in".into()),
+        }]
+    };
+    Some(build_validate_response(
+        ValidateCodeResponse {
+            result: valid,
+            message: None,
+            display: valid.then(|| code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(mimetypes::SYSTEM),
+        None,
+        None,
+        None,
+        path,
+    ))
+}
+
+/// Whether `code` is written in the SNOMED CT compositional grammar (a
+/// refinement, conjunction or terms) rather than being a concept id.
+fn is_snomed_expression(code: &str) -> bool {
+    code.contains(|c: char| matches!(c, ':' | '+' | '|' | '{' | '(' | '=') || c.is_whitespace())
+}
+
+/// The SNOMED CT expression a `$validate-code` request validates, with the
+/// request path and the version it pins.
+fn snomed_expression_param(
+    params: &[Value],
+    cs: bool,
+) -> Option<(String, RequestPath, Option<String>)> {
+    let sys_name = if cs { "url" } else { "system" };
+    let (code, path, version) = if let Some(code) = find_str_param(params, "code") {
+        let system = find_str_param(params, sys_name).or_else(|| find_str_param(params, "system"));
+        if system.as_deref() != Some(crate::snomed::SNOMED_URL) {
+            return None;
+        }
+        let version = if cs {
+            find_str_param(params, "version")
+        } else {
+            find_str_param(params, "systemVersion")
+        };
+        (code, RequestPath::BareCode, version)
+    } else {
+        let (system, code, _, version) = extract_coding_full(params, "coding")?;
+        if system != crate::snomed::SNOMED_URL {
+            return None;
+        }
+        (code, RequestPath::Coding, version)
+    };
+    is_snomed_expression(&code).then_some((code, path, version))
+}
+
+/// The issues and response of an expression that failed its checks.
+fn snomed_invalid_response(
+    code: &str,
+    version: Option<&str>,
+    reason: String,
+    path: RequestPath,
+) -> Value {
+    let text = format!(
+        "Unknown code '{code}' in the CodeSystem '{}' version '{}'",
+        crate::snomed::SNOMED_URL,
+        version.unwrap_or_default()
+    );
+    build_validate_response(
+        ValidateCodeResponse {
+            result: false,
+            message: None,
+            display: None,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![
+                ValidationIssue {
+                    severity: "error".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "invalid-code".into(),
+                    text,
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: Some("Unknown_Code_in_Version".into()),
+                },
+                ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "code-invalid".into(),
+                    tx_code: "invalid-code".into(),
+                    text: reason,
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: None,
+                },
+            ],
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(code),
+        Some(crate::snomed::SNOMED_URL),
+        version,
+        None,
+        None,
+        path,
+    )
+}
+
+/// `CodeSystem/$validate-code` of a post-coordinated SNOMED CT expression:
+/// its syntax, concepts and concept model (MRCM) rules.
+async fn snomed_cs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::snomed::ops::{Checked, check};
+    let (code, path, version) = snomed_expression_param(params, true)?;
+    let model = state
+        .backend()
+        .snomed_model(
+            &TenantContext::system(),
+            crate::snomed::SNOMED_URL,
+            version.as_deref(),
+        )
+        .await
+        .ok()??;
+    let version = model.version.clone();
+    Some(match check(&model, &code) {
+        Checked::Invalid(reason) => {
+            snomed_invalid_response(&code, version.as_deref(), reason, path)
+        }
+        Checked::Valid {
+            display,
+            normal_form,
+            ..
+        } => {
+            let mut issues = Vec::new();
+            if let Some(nf) = &normal_form {
+                issues.push(ValidationIssue {
+                    severity: "information".into(),
+                    fhir_code: "business-rule".into(),
+                    tx_code: "code-rule".into(),
+                    text: format!(
+                        "The code '{code}' is valid, but it is not the normal form for the code system '{}|{}'; the normal form is '{nf}'",
+                        crate::snomed::SNOMED_URL,
+                        version.as_deref().unwrap_or_default()
+                    ),
+                    expression: Some("Coding.code".into()),
+                    location: None,
+                    message_id: Some("CODE_NOT_IN_NORMAL_FORM".into()),
+                });
+            }
+            build_validate_response(
+                ValidateCodeResponse {
+                    result: true,
+                    message: None,
+                    display: Some(display),
+                    system: None,
+                    cs_version: None,
+                    inactive: None,
+                    issues,
+                    caused_by_unknown_system: None,
+                    concept_status: None,
+                    normalized_code: normal_form,
+                },
+                Some(&code),
+                Some(crate::snomed::SNOMED_URL),
+                version.as_deref(),
+                None,
+                None,
+                path,
+            )
+        }
+    })
+}
+
+/// `ValueSet/$validate-code` of a SNOMED CT expression, or of any code
+/// against an implicit SNOMED CT value set that names no concept or
+/// reference set (which does not exist).
+async fn snomed_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Result<Value, HtsError>> {
+    use crate::snomed::ops::{self, Checked};
+    let ctx = TenantContext::system();
+    let url = find_str_param(params, "url");
+    let implicit_url = url
+        .as_deref()
+        .filter(|u| u.starts_with(crate::snomed::SNOMED_URL) && u.contains("?fhir_vs"));
+    let expr_param = snomed_expression_param(params, false);
+    if implicit_url.is_none() && expr_param.is_none() {
+        return None;
+    }
+    let version = expr_param
+        .as_ref()
+        .and_then(|(_, _, v)| v.clone())
+        .or_else(|| {
+            find_str_param(params, "system-version")
+                .and_then(|s| s.split_once('|').map(|(_, v)| v.to_string()))
+        });
+    let model = state
+        .backend()
+        .snomed_model(&ctx, crate::snomed::SNOMED_URL, version.as_deref())
+        .await
+        .ok()??;
+    let implicit = match implicit_url.map(|u| ops::implicit(&model, u)) {
+        Some(Some(Err(e))) => return Some(Err(e)),
+        Some(Some(Ok(i))) => Some(i),
+        _ => None,
+    };
+    let (code, path, _) = expr_param?;
+    let version = model.version.clone();
+    let (expr, display) = match ops::check(&model, &code) {
+        Checked::Invalid(reason) => {
+            return Some(Ok(snomed_invalid_response(
+                &code,
+                version.as_deref(),
+                reason,
+                path,
+            )));
+        }
+        Checked::Valid { expr, display, .. } => (expr, display),
+    };
+    let virt = ops::virtual_of(&model, &expr)?;
+    let (in_vs, label) = match &implicit {
+        Some(i) => (
+            ops::in_implicit(&model, i, &virt),
+            url.clone().unwrap_or_default(),
+        ),
+        None => {
+            let vs = requested_value_set(state, params).await?;
+            let vs_url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let label = match vs.get("version").and_then(|v| v.as_str()) {
+                Some(v) => format!("{vs_url}|{v}"),
+                None => vs_url.to_string(),
+            };
+            (ops::in_value_set(&model, &vs, &expr, &virt), label)
+        }
+    };
+    let mut issues = Vec::new();
+    if !in_vs {
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: format!(
+                "The provided code '{}#{code}' was not found in the value set '{label}'",
+                crate::snomed::SNOMED_URL
+            ),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+    }
+    Some(Ok(build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: Some(display),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(crate::snomed::SNOMED_URL),
+        version.as_deref(),
+        None,
+        None,
+        path,
+    )))
+}
+
+/// `ValueSet/$validate-code` against a value set over the UCUM grammar
+/// (the whole of it, or filtered by `canonical`; see [`crate::ucum`]);
+/// `None` for any other value set.
+async fn ucum_vs_validate<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    use crate::ucum_validate::{UCUM_URL, is_valid_ucum_code};
+    let vs = requested_value_set(state, params).await?;
+    if !crate::ucum::is_ucum_grammar_value_set(&vs) {
+        return None;
+    }
+    let (code, path) = if let Some(code) = find_str_param(params, "code") {
+        if find_str_param(params, "system").is_some_and(|s| s != UCUM_URL) {
+            return None;
+        }
+        (code, RequestPath::BareCode)
+    } else if let Some((system, code, _, _)) = extract_coding_full(params, "coding") {
+        if system != UCUM_URL {
+            return None;
+        }
+        (code, RequestPath::Coding)
+    } else {
+        return None;
+    };
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let url = vs.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+    let label = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    let valid = is_valid_ucum_code(&code);
+    let in_vs = valid && crate::ucum::in_value_set(&vs, &code);
+    let mut issues = Vec::new();
+    let mut message = None;
+    if !in_vs {
+        let not_in = format!(
+            "The provided code '{UCUM_URL}#{code}' was not found in the value set '{label}'"
+        );
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            fhir_code: "code-invalid".into(),
+            tx_code: "not-in-vs".into(),
+            text: not_in.clone(),
+            expression: Some("Coding.code".into()),
+            location: None,
+            message_id: Some("None_of_the_provided_codes_are_in_the_value_set_one".into()),
+        });
+        if valid {
+            // Say why: its canonical unit is not the value set's.
+            if let Some(c) = crate::ucum::canonical(&code) {
+                message = Some(format!(
+                    "{not_in} (its canonical unit is {})",
+                    crate::ucum::canonical_unit(&c)
+                ));
+            }
+        } else {
+            let unknown =
+                format!("Unknown code '{code}' in the CodeSystem '{UCUM_URL}' version '{version}'");
+            issues.push(ValidationIssue {
+                severity: "error".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "invalid-code".into(),
+                text: unknown,
+                expression: Some("Coding.code".into()),
+                location: None,
+                message_id: Some("Unknown_Code_in_Version".into()),
+            });
+            issues.push(ValidationIssue {
+                severity: "information".into(),
+                fhir_code: "code-invalid".into(),
+                tx_code: "invalid-code".into(),
+                text: crate::ucum::error_message(&code),
+                expression: Some("Coding.code".into()),
+                location: None,
+                message_id: None,
+            });
+        }
+    }
+    let mut value = build_validate_response(
+        ValidateCodeResponse {
+            result: in_vs,
+            message: None,
+            display: valid.then(|| code.clone()),
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues,
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        Some(&code),
+        Some(UCUM_URL),
+        Some(&version),
+        None,
+        None,
+        path,
+    );
+    if let (Some(m), Some(ps)) = (message, value["parameter"].as_array_mut()) {
+        for p in ps.iter_mut() {
+            if p["name"] == "message" {
+                p["valueString"] = Value::String(m.clone());
+            }
+        }
+    }
+    Some(value)
+}
+
 /// Look up the `status` property of a concept (e.g. `retired`, `deprecated`,
 /// `withdrawn`, `inactive`). Returns `None` when the concept has no status
 /// Extract a VS-implied `displayLanguage` from a stored ValueSet resource.
@@ -517,6 +1091,98 @@ async fn lookup_concept_status<B: TerminologyBackend>(
         }
     }
     None
+}
+
+/// The supplements a display check draws on: the requested ones, plus —
+/// when the request names a `displayLanguage` — every stored supplement of
+/// `system` that has a designation of `code` in that language (a
+/// translation supplement such as the zh-Hant ICD-10-CM one; `zh-TW` is
+/// served by `zh-Hant`). A display in the requested language that the
+/// server itself hands out (`$lookup` and `$expand` apply stored
+/// supplements automatically) must then also validate, as the HL7 validator
+/// accepts any designation in the requested language. Without a
+/// `displayLanguage` only requested supplements count, as on tx.fhir.org.
+async fn with_language_supplements<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+    code: &str,
+    display_language: Option<&str>,
+    supplements: &[SupplementInfo],
+) -> Vec<SupplementInfo> {
+    let mut out = supplements.to_vec();
+    let requested: Vec<&str> = display_language
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return out;
+    }
+    for info in backend
+        .supplements_for_system(ctx, system)
+        .await
+        .unwrap_or_default()
+    {
+        let bare = info
+            .supplement_canonical
+            .split('|')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if out
+            .iter()
+            .any(|s| s.supplement_canonical.split('|').next() == Some(bare.as_str()))
+        {
+            continue;
+        }
+        let in_language = backend
+            .supplement_designations(ctx, std::slice::from_ref(&bare), &[code.to_string()])
+            .await
+            .ok()
+            .and_then(|mut m| m.remove(code))
+            .unwrap_or_default()
+            .iter()
+            .any(|d| {
+                d.language.as_deref().is_some_and(|stored| {
+                    requested
+                        .iter()
+                        .any(|req| crate::language::lang_matches(req, stored))
+                })
+            });
+        if in_language {
+            out.push(info);
+        }
+    }
+    out
+}
+
+/// Whether `code` is inactive in `system`: its `inactive` property is true,
+/// or its `status` is `inactive` / `retired`.
+async fn concept_inactive_in_cs<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system: &str,
+    code: &str,
+) -> bool {
+    let req = crate::types::LookupRequest {
+        system: system.to_string(),
+        code: code.to_string(),
+        version: None,
+        display_language: None,
+        expression: None,
+        properties: vec!["inactive".to_string(), "status".to_string()],
+        date: None,
+        use_supplements: vec![],
+    };
+    let Ok(resp) = CodeSystemOperations::lookup(backend, ctx, req).await else {
+        return false;
+    };
+    resp.properties.iter().any(|p| {
+        (p.code == "inactive" && p.value == "true")
+            || (p.code == "status" && matches!(p.value.as_str(), "inactive" | "retired"))
+    })
 }
 
 /// Apply IG-style language-aware display validation to a `validate-code`
@@ -728,6 +1394,19 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     if display_language.is_none() && !has_existing_invalid_display {
         return;
     }
+    // A concept with no display at all (an ATC code of IPS's fragment code
+    // system) gives nothing to judge a supplied display against, whatever
+    // language was asked for.
+    if displays_for_lang.is_empty() {
+        if has_existing_invalid_display {
+            resp.issues.retain(|i| i.tx_code != "invalid-display");
+            if !resp.issues.iter().any(|i| i.severity == "error") {
+                resp.result = true;
+                resp.message = None;
+            }
+        }
+        return;
+    }
 
     // Decide whether the supplied display is valid. The accepted set mirrors
     // exactly the choices advertised by `format_valid_displays`:
@@ -928,6 +1607,7 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
     code: &str,
     request_path: RequestPath,
     expected_display: Option<&str>,
+    lenient_display_validation: bool,
     resp: &mut ValidateCodeResponse,
 ) {
     let entry_map = match backend
@@ -1040,7 +1720,7 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
                 }
             }
         }
-        let Some(_status_code) = desig_status else {
+        let Some(status_code) = desig_status else {
             continue;
         };
         // Replace the response display with the concept's primary display so
@@ -1051,16 +1731,20 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
         // Drop any pre-existing display-mismatch issue — the supplied display
         // matched a known designation, just an inactive one.
         resp.issues.retain(|i| i.tx_code != "invalid-display");
-        let valid_str = match primary_display.as_deref() {
-            Some(d) => format!("\"{d}\""),
-            None => "(none)".to_string(),
+        let correct = match primary_display.as_deref() {
+            Some(d) => format!("The correct display is '{d}'"),
+            None => "There is no correct display".to_string(),
         };
-        // The IG fixture wording uses "(status = deprecated)" regardless of
-        // whether the designation is marked deprecated or withdrawn — the
-        // concept of "inactive display" subsumes both per the IG.
         let text = format!(
-            "'{expected}' is no longer considered a correct display for code '{code}' (status = deprecated). The correct display is one of {valid_str}."
+            "'{expected}' is no longer considered a correct display for code '{code}' (status = {status_code}). {correct}"
         );
+        // An inactive display is a wrong display: an error, unless the
+        // caller asked for lenient display validation.
+        let severity = if lenient_display_validation {
+            "warning"
+        } else {
+            "error"
+        };
         let already = resp
             .issues
             .iter()
@@ -1075,20 +1759,85 @@ async fn apply_concept_extension_status<B: TerminologyBackend>(
                 _ => ("Coding.display".to_string(), "Coding.display".to_string()),
             };
             resp.issues.push(ValidationIssue {
-                severity: "warning".into(),
+                severity: severity.into(),
                 fhir_code: "invalid".into(),
                 tx_code: "display-comment".into(),
-                text,
+                text: text.clone(),
                 expression: Some(expr_path),
                 location: Some(loc_path),
                 message_id: Some("INACTIVE_DISPLAY_FOUND".into()),
             });
         }
-        // Mark result=true so the response is "validated with warnings".
-        resp.result = true;
-        resp.message = None;
+        resp.result = lenient_display_validation;
+        resp.message = Some(text);
         break;
     }
+}
+
+/// A SNOMED CT display that is one of the concept's inactive descriptions:
+/// tx.fhir.org reports it as `INACTIVE_DISPLAY_FOUND` (a warning when
+/// display validation is lenient, otherwise an error) instead of a wrong
+/// display, naming the active terms.
+async fn snomed_inactive_display<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    code: &str,
+    request_path: RequestPath,
+    expected_display: Option<&str>,
+    lenient: bool,
+    resp: &mut ValidateCodeResponse,
+) {
+    let Some(expected) = expected_display.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    if !resp.issues.iter().any(|i| i.tx_code == "invalid-display") {
+        return;
+    }
+    let Ok(rows) = backend
+        .snomed_concepts(ctx, crate::snomed::SNOMED_URL, None, &[code.to_string()])
+        .await
+    else {
+        return;
+    };
+    let Some(info) = rows.get(code) else { return };
+    let matches = |t: &String| t.eq_ignore_ascii_case(expected);
+    if info.row.terms.iter().any(matches) || !info.row.inactive_terms.iter().any(matches) {
+        return;
+    }
+    let mut correct: Vec<&str> = Vec::new();
+    for t in info.display.iter().chain(info.row.terms.iter()) {
+        if !correct.contains(&t.as_str()) {
+            correct.push(t);
+        }
+    }
+    let text = format!(
+        "'{expected}' is no longer considered a correct display for code '{code}' (status = inactive). The correct display is one of {}",
+        correct.join(",")
+    );
+    resp.issues.retain(|i| i.tx_code != "invalid-display");
+    if let Some(d) = &info.display {
+        resp.display = Some(d.clone());
+    }
+    let path = match request_path {
+        RequestPath::BareCode => "display".to_string(),
+        RequestPath::CodeableConcept => "CodeableConcept.coding[0].display".to_string(),
+        _ => "Coding.display".to_string(),
+    };
+    resp.issues.push(ValidationIssue {
+        severity: if lenient { "warning" } else { "error" }.into(),
+        fhir_code: "invalid".into(),
+        tx_code: "display-comment".into(),
+        text,
+        expression: Some(path.clone()),
+        location: Some(path),
+        // The message id puts the warning in `message`, which tx.fhir.org
+        // leaves out for a lenient SNOMED CT check.
+        message_id: (!lenient).then(|| "INACTIVE_DISPLAY_FOUND".to_string()),
+    });
+    if lenient {
+        resp.message = None;
+    }
+    resp.result = resp.result || lenient;
 }
 
 /// Format the "Valid display is ..." segment of an IG `invalid-display`
@@ -1436,14 +2185,37 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                 Some(v) => format!("{sys}|{v}"),
                 None => sys.to_string(),
             };
+            let (text, message_id) = if status == "draft" && value_set_url.is_some() {
+                // A draft CodeSystem is only worth a note when a ValueSet that
+                // is not itself a draft relies on it (IG
+                // `deprecated/draft-validate`: MSG_DRAFT_SRC_STATUS).
+                match value_set_status(backend, ctx, value_set_url.unwrap_or_default()).await {
+                    Some((vs_status, _)) if vs_status == "draft" => continue,
+                    Some((vs_status, vs_uri)) => (
+                        format!(
+                            "Reference to draft CodeSystem {cs_uri} from {vs_status} ValueSet {vs_uri}"
+                        ),
+                        "MSG_DRAFT_SRC_STATUS",
+                    ),
+                    None => (
+                        format!("Reference to draft CodeSystem {cs_uri}"),
+                        status_message_id(&status),
+                    ),
+                }
+            } else {
+                (
+                    format!("Reference to {status} CodeSystem {cs_uri}"),
+                    status_message_id(&status),
+                )
+            };
             resp.issues.push(ValidationIssue {
                 severity: "information".into(),
                 fhir_code: "business-rule".into(),
                 tx_code: "status-check".into(),
-                text: format!("Reference to {status} CodeSystem {cs_uri}"),
+                text,
                 expression: None,
                 location: None,
-                message_id: Some(status_message_id(&status).into()),
+                message_id: Some(message_id.into()),
             });
         }
     }
@@ -1457,6 +2229,8 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     // `CodeSystem.language` and `concept.designation[].language`) and an
     // `expected_display` was supplied (otherwise there is nothing to validate).
     if let (Some(sys), Some(cs), Some(cd)) = (effective_system, cs_resource.as_ref(), code) {
+        let supplements =
+            with_language_supplements(backend, ctx, sys, cd, display_language, supplements).await;
         apply_language_display_validation(
             backend,
             ctx,
@@ -1465,7 +2239,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             cs,
             display_language,
             expected_display,
-            supplements,
+            &supplements,
             lenient_display_validation,
             &mut resp,
         )
@@ -1484,9 +2258,22 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             cd,
             request_path,
             expected_display,
+            lenient_display_validation,
             &mut resp,
         )
         .await;
+        if crate::snomed::is_snomed(sys) {
+            snomed_inactive_display(
+                backend,
+                ctx,
+                cd,
+                request_path,
+                expected_display,
+                lenient_display_validation,
+                &mut resp,
+            )
+            .await;
+        }
     }
 
     // Mirror the same status-check emission for the validated ValueSet on
@@ -1712,6 +2499,38 @@ fn concept_marked_deprecated(concept: &Value) -> bool {
     false
 }
 
+/// `(status, url|version)` of the stored ValueSet `vs_url` (`url` or
+/// `url|version`) names.
+async fn value_set_status<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    vs_url: &str,
+) -> Option<(String, String)> {
+    let (url, version) = match vs_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (vs_url, None),
+    };
+    let vs = crate::traits::ValueSetOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(url.to_string()),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    let status = vs.get("status").and_then(|v| v.as_str())?.to_string();
+    let uri = match vs.get("version").and_then(|v| v.as_str()) {
+        Some(v) => format!("{url}|{v}"),
+        None => url.to_string(),
+    };
+    Some((status, uri))
+}
+
 /// Collect the standards-status codes (deprecated, withdrawn, draft, etc.)
 /// declared on a CodeSystem or ValueSet resource_json. Used by the
 /// validate-code response builder to emit IG `MSG_DEPRECATED`-style
@@ -1731,8 +2550,13 @@ fn collect_status_check_codes(resource: &Value) -> Vec<String> {
                     "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
                 )
             {
+                // `normative`, `trial-use`, `informative`, `external` are
+                // ordinary maturity levels, not something a user of the
+                // code system needs warning about.
                 if let Some(code) = ext.get("valueCode").and_then(|v| v.as_str()) {
-                    push_unique(code);
+                    if matches!(code, "deprecated" | "withdrawn" | "draft") {
+                        push_unique(code);
+                    }
                 }
             }
         }
@@ -1781,16 +2605,8 @@ async fn resolve_supplements<B: TerminologyBackend>(
     expected_target: Option<&str>,
 ) -> Result<Vec<SupplementInfo>, HtsError> {
     let mut out = Vec::new();
-    for s in params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-        })
-    {
-        let bare = s.split('|').next().unwrap_or(s);
+    for s in crate::operations::params::collect_use_supplements(params) {
+        let bare = s.split('|').next().unwrap_or(&s);
         let info = backend.supplement_target(ctx, bare).await?;
         let info = match info {
             Some(i) => i,
@@ -2007,11 +2823,15 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     code: Option<&str>,
     request_path: RequestPath,
 ) -> Option<Value> {
-    let info = match backend.supplement_target(ctx, system_url).await {
-        Ok(Some(i)) => i,
-        _ => return None,
+    let canonical = match backend.supplement_target(ctx, system_url).await {
+        Ok(Some(info)) => info.supplement_canonical,
+        // A CodeSystem that names the code system it supplements is a
+        // supplement whatever its `content` says (the HL7 validator judges
+        // it by `supplements`; `content` other than `supplement` is its own
+        // authoring error): its codes are not Coding.system values either.
+        _ => declared_supplement_canonical(backend, ctx, system_url).await?,
     };
-    let canonical = &info.supplement_canonical;
+    let canonical = &canonical;
     let text = format!(
         "CodeSystem {canonical} is a supplement, so can't be used as a value in Coding.system"
     );
@@ -2050,8 +2870,43 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
     ))
 }
 
-/// True when `url` is a synthesized `?fhir_vs` implicit ValueSet URL (e.g.
-/// `http://snomed.info/sct?fhir_vs` or `http://snomed.info/sct?fhir_vs=isa/X`).
+/// `url|version` of the stored CodeSystem at `system_url` when it declares
+/// `supplements` (with a `content` other than `supplement`, which
+/// `supplement_target` does not treat as one).
+async fn declared_supplement_canonical<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    system_url: &str,
+) -> Option<String> {
+    let (bare, version) = match system_url.split_once('|') {
+        Some((u, v)) => (u, Some(v.to_string())),
+        None => (system_url, None),
+    };
+    let cs = CodeSystemOperations::search(
+        backend,
+        ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(bare.to_string()),
+            version,
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    cs.get("supplements")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    Some(match cs.get("version").and_then(Value::as_str) {
+        Some(v) => format!("{bare}|{v}"),
+        None => bare.to_string(),
+    })
+}
+
+/// True when `url` is an implicit ValueSet URL (e.g.
+/// `http://snomed.info/sct?fhir_vs=isa/X` or `http://loinc.org/vs`; see
+/// [`crate::implicit_vs`]).
 ///
 /// These URLs are computed dynamically from the underlying CodeSystem and
 /// never appear as rows in the `value_sets` table, so the per-request
@@ -2065,10 +2920,7 @@ async fn supplement_url_in_coding_error<B: TerminologyBackend>(
 /// warming fast enough within the 30 s bench window because the cold
 /// path's overhead dominated.
 fn is_implicit_fhir_vs_url(url: &str) -> bool {
-    match url.split_once('?') {
-        Some((_, query)) => query == "fhir_vs" || query.starts_with("fhir_vs="),
-        None => false,
-    }
+    crate::implicit_vs::is_implicit_vs_url(url)
 }
 
 /// Build a canonical cache key for the `$validate-code` handler-response cache.
@@ -2203,6 +3055,19 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     // CodeSystemOperations::validate_code) when the same canonical params have
     // produced a response earlier in this AppState's lifetime.  Cleared on
     // every bundle import / CRUD write via `clear_expand_cache`.
+    //
+    // `url=X|V` / `system=X|V` are folded into the bare URL + `version` first
+    // (see `normalize_canonical_params`) so every path below sees one shape.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("version"))?;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // SNOMED CT version URIs → the stored release they name.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &TenantContext::system(),
+        &mut params,
+    )
+    .await;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
@@ -2225,7 +3090,17 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_validate_code_inner(state, params).await;
+    let result = match check_validate_input(state, &params, false).await {
+        Err(e) => Err(e),
+        Ok(InputCheck::Done(value)) => Ok(value),
+        Ok(InputCheck::Proceed) => process_validate_code_inner(state, params).await,
+        Ok(InputCheck::ProceedThenAdd(issues)) => process_validate_code_inner(state, params)
+            .await
+            .map(|mut value| {
+                merge_issues(&mut value, issues);
+                value
+            }),
+    };
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.cs_validate_code_handler_cache,
@@ -2240,6 +3115,12 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    if let Some(value) = media_type_cs_validate(&params) {
+        return Ok(value);
+    }
+    if let Some(value) = snomed_cs_validate(state, &params).await {
+        return Ok(value);
+    }
     let ctx = TenantContext::system();
     // The IG `display/`, `language2/`, and parts of `validation/` test groups
     // pin the response display + invalid-display issue text against the
@@ -2554,8 +3435,8 @@ pub async fn validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    match process_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+    match dispatch_tx!(state, params, process_validate_code) {
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => match invalid_display_language_response(&e) {
             Some(resp) => Ok(resp),
             None => Err(e),
@@ -2575,12 +3456,33 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => match invalid_display_language_response(&e) {
             Some(resp) => Ok(resp),
             None => Err(e),
         },
     }
+}
+
+/// Moves the `result` parameter to the front of a `$validate-code` response.
+///
+/// Parameter order carries no meaning in FHIR, but widely deployed clients
+/// read the answer positionally: the cqf CQL engine's
+/// `R4FhirTerminologyProvider.in()` (HAPI/cqf-ruler, cql-workbench) takes
+/// `parameter[0]` as the boolean. The spec's examples and tx.fhir.org put
+/// `result` first; the HL7 tx-ecosystem runner sorts parameters before
+/// comparing, so the order elsewhere is unchanged.
+pub(crate) fn result_first(mut response: Value) -> Value {
+    if let Some(params) = response.get_mut("parameter").and_then(Value::as_array_mut) {
+        if let Some(i) = params
+            .iter()
+            .position(|p| p.get("name").and_then(Value::as_str) == Some("result"))
+        {
+            let result = params.remove(i);
+            params.insert(0, result);
+        }
+    }
+    response
 }
 
 // ── ValueSet/$validate-code ────────────────────────────────────────────────────
@@ -3616,6 +4518,128 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
     Ok(out)
 }
 
+/// Membership of `attempts` (`(system, code)`) in an inline ValueSet whose
+/// compose is simple enough to judge without expanding it: every include
+/// names a `system` and either nothing else (the whole code system) or an
+/// enumerated `concept` list, and excludes, if any, are enumerated too. A
+/// whole-system include is answered by `CodeSystem/$validate-code` on that
+/// system (and version, when the include pins one). Returns a pseudo
+/// expansion holding the attempts found in the value set, or `None` when
+/// the compose has filters or value-set imports (an expansion is then the
+/// only way to decide).
+async fn inline_membership_without_expansion<B: TerminologyBackend>(
+    state: &AppState<B>,
+    ctx: &TenantContext,
+    vs_resource: &Value,
+    attempts: &[(Option<String>, String)],
+) -> Option<crate::types::ExpandResponse> {
+    let compose = vs_resource.get("compose")?;
+    let includes = compose.get("include")?.as_array()?;
+    let enumerated_only = |inc: &Value| {
+        inc.get("system").and_then(Value::as_str).is_some()
+            && inc
+                .get("filter")
+                .is_none_or(|f| f.as_array().is_some_and(Vec::is_empty))
+            && inc
+                .get("valueSet")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+    };
+    let excludes: Vec<&Value> = compose
+        .get("exclude")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if includes.is_empty()
+        || !includes.iter().all(enumerated_only)
+        || !excludes
+            .iter()
+            .all(|e| enumerated_only(e) && e.get("concept").and_then(Value::as_array).is_some())
+    {
+        return None;
+    }
+    // `Some(display)` when `code` is in the include's enumerated concepts.
+    let listed = |inc: &Value, code: &str| -> Option<Option<String>> {
+        inc.get("concept")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|c| c.get("code").and_then(Value::as_str) == Some(code))
+            .map(|c| c.get("display").and_then(Value::as_str).map(str::to_string))
+    };
+    let mut contains = Vec::new();
+    for (system, code) in attempts {
+        let excluded = excludes.iter().any(|e| {
+            system
+                .as_deref()
+                .is_none_or(|s| e.get("system").and_then(Value::as_str) == Some(s))
+                && listed(e, code).is_some()
+        });
+        if excluded {
+            continue;
+        }
+        for inc in includes {
+            let inc_system = inc
+                .get("system")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if system.as_deref().is_some_and(|s| s != inc_system) {
+                continue;
+            }
+            let version = inc
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let hit = if inc
+                .get("concept")
+                .and_then(Value::as_array)
+                .is_some_and(|c| !c.is_empty())
+            {
+                listed(inc, code).map(|display| (display, version.clone()))
+            } else {
+                let req = ValidateCodeRequest {
+                    url: None,
+                    value_set_version: None,
+                    system: Some(inc_system.to_string()),
+                    code: code.clone(),
+                    version: version.clone(),
+                    display: None,
+                    date: None,
+                    include_abstract: None,
+                    input_form: None,
+                    lenient_display_validation: None,
+                    default_value_set_versions: std::collections::HashMap::new(),
+                };
+                match CodeSystemOperations::validate_code(state.backend(), ctx, req).await {
+                    Ok(resp) if resp.result => {
+                        Some((resp.display, resp.cs_version.or(version.clone())))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((display, version)) = hit {
+                contains.push(crate::types::ExpansionContains {
+                    system: inc_system.to_string(),
+                    version,
+                    code: code.clone(),
+                    display,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: Vec::new(),
+                    properties: Vec::new(),
+                    extensions: Vec::new(),
+                    contains: Vec::new(),
+                });
+                break;
+            }
+        }
+    }
+    Some(crate::types::ExpandResponse {
+        total: Some(contains.len() as u32),
+        offset: None,
+        contains,
+        warnings: Vec::new(),
+    })
+}
+
 /// `ValueSet/$validate-code` against an inline `valueSet` body.
 ///
 /// Drives the IG `validation/validate-contained-{good,bad}` fixtures: the
@@ -3818,7 +4842,23 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         system_version_defaults: std::collections::HashMap::new(),
         default_value_set_versions: std::collections::HashMap::new(),
     };
-    let expansion = ValueSetOperations::expand(state.backend(), &ctx, expand_req).await?;
+    let expansion = match ValueSetOperations::expand(state.backend(), &ctx, expand_req).await {
+        Ok(expansion) => expansion,
+        // Too large to expand (an include of all of SNOMED CT or LOINC):
+        // membership in a compose made only of whole code systems and
+        // enumerated concepts can be decided code by code instead.
+        Err(HtsError::TooCostly(message)) => {
+            let attempts: Vec<(Option<String>, String)> = coding_attempts
+                .iter()
+                .map(|(s, c, _, _)| (s.clone(), c.clone()))
+                .collect();
+            match inline_membership_without_expansion(state, &ctx, &vs_resource, &attempts).await {
+                Some(expansion) => expansion,
+                None => return Err(HtsError::TooCostly(message)),
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     // Try each coding attempt (first-to-last for CodeableConcept) until one
     // is found in the inline VS expansion.
@@ -4102,6 +5142,19 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     //   * `resolve_supplements` / `supplement_url_in_coding_error`
     // A warm hit here returns the previously-built JSON response directly,
     // skipping all of those.  Cleared on every bundle import / CRUD write.
+    //
+    // `url=X|V` → `url=X` + `valueSetVersion=V`, `system=X|V` → `system=X` +
+    // `systemVersion=V` (see `normalize_canonical_params`).
+    let mut params = params;
+    normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    normalize_canonical_params(&mut params, "system", Some("systemVersion"))?;
+    // SNOMED CT version URIs (codings, `systemVersion`) → the stored release.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &TenantContext::system(),
+        &mut params,
+    )
+    .await;
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
@@ -4124,7 +5177,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_vs_validate_code_inner(state, params).await;
+    let mut result = match check_validate_input(state, &params, true).await {
+        Err(e) => Err(e),
+        Ok(InputCheck::Done(value)) => Ok(value),
+        Ok(InputCheck::Proceed) => process_vs_validate_code_inner(state, params.clone()).await,
+        Ok(InputCheck::ProceedThenAdd(issues)) => {
+            process_vs_validate_code_inner(state, params.clone())
+                .await
+                .map(|mut value| {
+                    merge_issues(&mut value, issues);
+                    value
+                })
+        }
+    };
+    if let Ok(value) = &result
+        && response_result(value) == Some(false)
+        && let Some(answer) = retry_without_unknown_version_includes(state, &params).await
+    {
+        result = Ok(answer);
+    }
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
@@ -4135,10 +5206,197 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     result
 }
 
+/// The `result` parameter of a `$validate-code` answer.
+fn response_result(value: &Value) -> Option<bool> {
+    value
+        .get("parameter")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("result"))?
+        .get("valueBoolean")?
+        .as_bool()
+}
+
+/// A stored ValueSet that also includes another code system at a version
+/// the server does not have (NHI CI's `nhi-category` 1.0.2 includes
+/// `condition-category` "1.0.2", which no release carries) cannot be
+/// expanded, and the membership check of a code of its *own* system failed
+/// with it. Such an include can never contain a code of another system, so
+/// the code is judged again against the includes and excludes of its own
+/// system only (an inline ValueSet with the stored url and version). `None`
+/// when that does not apply: no include of the coded system, an unknown
+/// version nowhere, or value-set imports (which may contain any system).
+async fn retry_without_unknown_version_includes<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Value> {
+    if params
+        .iter()
+        .any(|p| p.get("name").and_then(Value::as_str) == Some("valueSet"))
+    {
+        return None;
+    }
+    let ctx = TenantContext::system();
+    let url = find_str_param(params, "url")?;
+    let systems: Vec<String> = match extract_coding_full(params, "coding") {
+        Some((system, _, _, _)) => vec![system],
+        None => match find_codeable_concept_param(params) {
+            Some(cc) => coding_entries_from_codeable_concept(&cc)?
+                .iter()
+                .filter_map(|c| c.get("system").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            None => vec![find_str_param(params, "system")?],
+        },
+    };
+    let systems: Vec<String> = systems.into_iter().filter(|s| !s.is_empty()).collect();
+    if systems.is_empty() {
+        return None;
+    }
+    let vs = ValueSetOperations::search(
+        state.backend(),
+        &ctx,
+        crate::types::ResourceSearchQuery {
+            url: Some(url.clone()),
+            version: find_str_param(params, "valueSetVersion"),
+            count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .pop()?;
+    let compose = vs.get("compose")?;
+    let includes = compose.get("include")?.as_array()?;
+    let of = |e: &Value| e.get("system").and_then(Value::as_str).map(str::to_string);
+    if includes.iter().any(|i| i.get("valueSet").is_some())
+        || !includes
+            .iter()
+            .any(|i| of(i).is_some_and(|s| systems.contains(&s)))
+    {
+        return None;
+    }
+    let mut unknown_version = false;
+    for inc in includes {
+        let (Some(system), Some(version)) = (of(inc), inc.get("version").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        if systems.contains(&system) {
+            continue;
+        }
+        let stored = cs_stored_versions(state.backend(), &ctx, &system).await;
+        if !stored.is_empty() && !stored.iter().any(|v| v == version) {
+            unknown_version = true;
+        }
+    }
+    if !unknown_version {
+        return None;
+    }
+    let keep = |key: &str| -> Value {
+        Value::Array(
+            compose
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter(|e| of(e).is_some_and(|s| systems.contains(&s)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    let mut reduced = json!({"resourceType": "ValueSet", "url": url, "status": "active",
+        "compose": {"include": keep("include")}});
+    if let Some(v) = vs.get("version") {
+        reduced["version"] = v.clone();
+    }
+    let excludes = keep("exclude");
+    if excludes.as_array().is_some_and(|a| !a.is_empty()) {
+        reduced["compose"]["exclude"] = excludes;
+    }
+    let mut inline_params: Vec<Value> = params
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.get("name").and_then(Value::as_str),
+                Some("url") | Some("valueSetVersion")
+            )
+        })
+        .cloned()
+        .collect();
+    inline_params.push(json!({"name": "valueSet", "resource": reduced.clone()}));
+    let answer = process_inline_vs_validate_code(state, inline_params, reduced)
+        .await
+        .ok()?;
+    (response_result(&answer) == Some(true)).then_some(answer)
+}
+
+/// Builds the `result=false` / `Unable_to_resolve_value_Set_` response for an
+/// inline ValueSet whose `compose.include[].valueSet[]` names an import that
+/// is neither stored nor supplied as a `tx-resource`.
+fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Value {
+    let cc_value = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+        .and_then(|p| p.get("valueCodeableConcept"))
+        .cloned();
+    let req_path = if extract_codeable_concept(params, "codeableConcept").is_some() {
+        RequestPath::CodeableConcept
+    } else if extract_coding_full(params, "coding").is_some() {
+        RequestPath::Coding
+    } else {
+        RequestPath::BareCode
+    };
+    let text = format!("A definition for the value Set '{unresolved_vs_url}' could not be found");
+    let issue = ValidationIssue {
+        severity: "error".into(),
+        fhir_code: "not-found".into(),
+        tx_code: "not-found".into(),
+        text: text.clone(),
+        expression: None,
+        location: None,
+        message_id: Some("Unable_to_resolve_value_Set_".into()),
+    };
+    // Surface message via the response struct's `message` field —
+    // build_validate_response emits it as the top-level `message` Parameters
+    // entry. Setting it here (rather than appending after) keeps single
+    // emission.
+    build_validate_response(
+        ValidateCodeResponse {
+            result: false,
+            message: Some(text),
+            display: None,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![issue],
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        find_str_param(params, "code").as_deref(),
+        find_str_param(params, "system").as_deref(),
+        None,
+        cc_value.as_ref(),
+        None,
+        req_path,
+    )
+}
+
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    if let Some(value) = media_type_vs_validate(state, &params).await {
+        return Ok(value);
+    }
+    if let Some(value) = ucum_vs_validate(state, &params).await {
+        return Ok(value);
+    }
+    if let Some(result) = snomed_vs_validate(state, &params).await {
+        return result;
+    }
     // ValueSet/$validate-code accepts either `url` (canonical URL of a stored
     // ValueSet) or `valueSet` (an inline ValueSet resource). The IG
     // `validation/validate-contained-{good,bad}` fixtures exercise the inline
@@ -4148,8 +5406,35 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // When only `valueSet` is supplied, hand off to a dedicated inline-VS
     // validator that resolves contained refs from the inline body before
     // falling back to the local store / tx-resources.
+    //
+    // A VCL implicit-ValueSet `url` (upstream #1830) is rewritten to that
+    // inline form here (after the handler cache key, which uses the original
+    // VCL URL).
+    let is_vcl = find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
+    let params = crate::vcl::rewrite_vcl_params(params)?;
     if find_str_param(&params, "url").is_none() {
         if let Some(vs_resource) = find_resource_param(&params, "valueSet") {
+            if is_vcl {
+                // The inline validator silently drops unresolved `^(vs)`
+                // imports; surface them as the IG-pinned not-found outcome.
+                let ctx = TenantContext::system();
+                let default_vs_pins: std::collections::HashMap<String, String> =
+                    collect_canonical_params(&params, "default-valueset-version")
+                        .into_iter()
+                        .collect();
+                let tx_resources = collect_resource_params(&params, "tx-resource");
+                if let Some(unresolved) = detect_bad_vs_import_inline(
+                    state.backend(),
+                    &ctx,
+                    &vs_resource,
+                    &tx_resources,
+                    &default_vs_pins,
+                )
+                .await
+                {
+                    return Ok(unresolved_import_response(&params, &unresolved));
+                }
+            }
             return process_inline_vs_validate_code(state, params, vs_resource).await;
         }
     }
@@ -4228,59 +5513,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 )
                 .await
                 {
-                    let cc_value = params
-                        .iter()
-                        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
-                        .and_then(|p| p.get("valueCodeableConcept"))
-                        .cloned();
-                    let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some()
-                    {
-                        RequestPath::CodeableConcept
-                    } else if extract_coding_full(&params, "coding").is_some() {
-                        RequestPath::Coding
-                    } else {
-                        RequestPath::BareCode
-                    };
-                    let text = format!(
-                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
-                    );
-                    let issue = ValidationIssue {
-                        severity: "error".into(),
-                        fhir_code: "not-found".into(),
-                        tx_code: "not-found".into(),
-                        text,
-                        expression: None,
-                        location: None,
-                        message_id: Some("Unable_to_resolve_value_Set_".into()),
-                    };
-                    // Surface message via the response struct's `message`
-                    // field — build_validate_response emits it as the
-                    // top-level `message` Parameters entry. Setting it here
-                    // (rather than appending after) keeps single emission.
-                    let text_for_msg = format!(
-                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
-                    );
-                    let value = build_validate_response(
-                        ValidateCodeResponse {
-                            result: false,
-                            message: Some(text_for_msg),
-                            display: None,
-                            system: None,
-                            cs_version: None,
-                            inactive: None,
-                            issues: vec![issue],
-                            caused_by_unknown_system: None,
-                            concept_status: None,
-                            normalized_code: None,
-                        },
-                        find_str_param(&params, "code").as_deref(),
-                        find_str_param(&params, "system").as_deref(),
-                        None,
-                        cc_value.as_ref(),
-                        None,
-                        req_path,
-                    );
-                    return Ok(value);
+                    return Ok(unresolved_import_response(&params, &unresolved_vs_url));
                 }
                 return process_inline_vs_validate_code(state, params, vs).await;
             }
@@ -5266,11 +6499,20 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // Map (system, code) → original CC index so per-coding failure issues
         // reference `CodeableConcept.coding[N]` with the input order's N. Keep
         // the FIRST occurrence to match first-wins coding selection.
-        let coding_index: std::collections::HashMap<(String, String), usize> = codings
+        // The index is the coding's position in the CodeableConcept as sent,
+        // counting codings that lack a system or code (`codings` skips them).
+        let coding_index: std::collections::HashMap<(String, String), usize> = coding_entries
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .enumerate()
-            .fold(std::collections::HashMap::new(), |mut m, (i, (s, c))| {
-                m.entry((s.clone(), c.clone())).or_insert(i);
+            .filter_map(|(i, c)| {
+                let s = c.get("system").and_then(|v| v.as_str())?;
+                let cd = c.get("code").and_then(|v| v.as_str())?;
+                Some(((s.to_string(), cd.to_string()), i))
+            })
+            .fold(std::collections::HashMap::new(), |mut m, (k, i)| {
+                m.entry(k).or_insert(i);
                 m
             });
         for (system, code) in codings.clone().into_iter() {
@@ -5504,7 +6746,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     Some(v) => format!("{url}|{v}"),
                     None => url.clone(),
                 };
-                for (other_idx, (other_system, other_code)) in codings.iter().enumerate() {
+                // Notes about the other codings that do not change the result:
+                // an unchecked unknown code system, an inactive code.
+                let mut notes: Vec<ValidationIssue> = Vec::new();
+                for (other_system, other_code) in codings.iter() {
+                    let other_idx = coding_index
+                        .get(&(other_system.clone(), other_code.clone()))
+                        .copied()
+                        .unwrap_or(0);
                     if other_idx == success_idx {
                         continue;
                     }
@@ -5514,6 +6763,35 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         .await
                         .unwrap_or(false);
                     if !cs_exists {
+                        // IG `validation-simple-codeableconcept-unknown-system`:
+                        // the coding is not (known to be) in the value set,
+                        // and its code system could not be checked.
+                        notes.push(ValidationIssue {
+                            severity: "information".into(),
+                            fhir_code: "code-invalid".into(),
+                            tx_code: "this-code-not-in-vs".into(),
+                            text: format!(
+                                "The provided code '{other_system}#{other_code}' was not \
+                                 found in the value set '{url_with_version}'"
+                            ),
+                            expression: Some(format!("CodeableConcept.coding[{other_idx}].code")),
+                            location: None,
+                            message_id: Some(
+                                "None_of_the_provided_codes_are_in_the_value_set_one".into(),
+                            ),
+                        });
+                        notes.push(ValidationIssue {
+                            severity: "warning".into(),
+                            fhir_code: "not-found".into(),
+                            tx_code: "not-found".into(),
+                            text: format!(
+                                "A definition for CodeSystem '{other_system}' could not be \
+                                 found, so the code cannot be validated"
+                            ),
+                            expression: Some(format!("CodeableConcept.coding[{other_idx}].system")),
+                            location: None,
+                            message_id: Some("UNKNOWN_CODESYSTEM_CODING_NOT_CHECKED".into()),
+                        });
                         continue;
                     }
                     let cs_version = state
@@ -5542,6 +6820,24 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                             .map(|r| r.result)
                             .unwrap_or(false);
                     if code_in_cs {
+                        // IG `inactive/inactive-4-validate`: an inactive code
+                        // is worth a warning whichever coding carries the result.
+                        if concept_inactive_in_cs(state.backend(), &ctx, other_system, other_code)
+                            .await
+                        {
+                            notes.push(ValidationIssue {
+                                severity: "warning".into(),
+                                fhir_code: "business-rule".into(),
+                                tx_code: "code-comment".into(),
+                                text: format!(
+                                    "The concept '{other_code}' has a status of inactive and \
+                                     its use should be reviewed"
+                                ),
+                                expression: Some(format!("CodeableConcept.coding[{other_idx}]")),
+                                location: None,
+                                message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
+                            });
+                        }
                         continue;
                     }
                     // Hard failure: emit `Unknown_Code_in_Version` error +
@@ -5593,6 +6889,21 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 }
                 let has_bad_codings = !accumulated_issues.is_empty();
                 let mut hybrid_resp = resp.clone();
+                // The winning coding's own issues are about its position in
+                // the CodeableConcept, which need not be the first.
+                for issue in &mut hybrid_resp.issues {
+                    for field in [&mut issue.expression, &mut issue.location] {
+                        if let Some(path) = field.as_deref() {
+                            if path == "Coding" {
+                                *field = Some(format!("CodeableConcept.coding[{success_idx}]"));
+                            } else if let Some(rest) = path.strip_prefix("Coding.") {
+                                *field =
+                                    Some(format!("CodeableConcept.coding[{success_idx}].{rest}"));
+                            }
+                        }
+                    }
+                }
+                hybrid_resp.issues.extend(notes);
                 if has_bad_codings {
                     hybrid_resp.result = false;
                     hybrid_resp.issues.extend(accumulated_issues);
@@ -6081,7 +7392,7 @@ fn vs_cyclic_validate_response(err: &HtsError) -> Option<Response> {
     let HtsError::VsInvalid(msg) = err else {
         return None;
     };
-    if !msg.starts_with("Cyclic reference detected when excluding ") {
+    if !msg.starts_with("Cyclic reference detected when ") {
         return None;
     }
     let body = json!({
@@ -6117,8 +7428,8 @@ pub async fn vs_validate_code_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    match process_vs_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+    match dispatch_tx!(state, params, process_vs_validate_code) {
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => {
             if let Some(resp) = invalid_display_language_response(&e) {
                 return Ok(resp);
@@ -6143,7 +7454,7 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_vs_validate_code(&state, params).await {
-        Ok(v) => Ok(fhir_respond(v, format)),
+        Ok(v) => Ok(fhir_respond(result_first(v), format)),
         Err(e) => {
             if let Some(resp) = invalid_display_language_response(&e) {
                 return Ok(resp);
@@ -6190,7 +7501,7 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     let mut params = inject_url(raw_params, url);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        result_first(dispatch_tx!(state, params, process_vs_validate_code)?),
         format,
     ))
 }
@@ -6214,7 +7525,7 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
     let mut params = inject_url(params, url);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        result_first(process_vs_validate_code(&state, params).await?),
         format,
     ))
 }
@@ -6843,6 +8154,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6863,6 +8175,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "C" }
             ]
         });
@@ -6911,6 +8224,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://unknown.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6926,6 +8240,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 { "name": "url", "valueUri": "http://example.org/vs" },
+                { "name": "system", "valueUri": "http://example.org/cs" },
                 { "name": "code", "valueCode": "A" }
             ]
         });
@@ -6964,7 +8279,8 @@ mod tests {
             .with_state(state)
     }
 
-    /// IG Publisher Library `contentType`: inline core `mimetypes` ValueSet, no `url` param.
+    /// IG Publisher Library `contentType`: inline core `mimetypes` ValueSet, no `url` param,
+    /// the code system inferred (`inferSystem`).
     #[tokio::test]
     async fn vs_inline_mimetypes_publisher_shape_validates_text_cql() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
@@ -6979,6 +8295,7 @@ mod tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
+                {"name": "inferSystem", "valueBoolean": true},
                 {"name": "code", "valueCode": "text/cql"},
                 {
                     "name": "valueSet",
@@ -7019,6 +8336,7 @@ mod tests {
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [
+                {"name": "inferSystem", "valueBoolean": true},
                 {"name": "code", "valueCode": "not-a-mime"},
                 {
                     "name": "valueSet",
@@ -7503,6 +8821,49 @@ mod tests {
 
         let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    /// fhir-test-cases `supplement-1`, `supplement-1b`: a CodeSystem that
+    /// declares `supplements` is a supplement even with `content: complete`,
+    /// and its codes are not valid with it as Coding.system.
+    #[tokio::test]
+    async fn declared_supplement_with_complete_content_is_not_a_coding_system() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('supp', 'http://hl7.org/fhir/test/CodeSystem/supplement-cs', '1.0',
+                         'SupplementCS', 'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://hl7.org/fhir/test/CodeSystem/supplement-cs\",\"version\":\"1.0\",\"content\":\"complete\",\"supplements\":\"http://loinc.org\"}');
+                 INSERT INTO concepts (id, system_id, code, display) VALUES (1, 'supp', 'test', 'Test');",
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "coding", "valueCoding": {
+                "system": "http://hl7.org/fhir/test/CodeSystem/supplement-cs", "code": "test"}}
+        ]});
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let result = v["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "result")
+            .and_then(|p| p["valueBoolean"].as_bool());
+        assert_eq!(result, Some(false), "{v:#}");
+        assert!(v.to_string().contains("is a supplement"), "{v:#}");
     }
 
     // ── Supplement-aware display matching (IG `parameters-validate-supplement-good`) ──

@@ -39,7 +39,7 @@ mod patient_everything_postgres_tests {
         port: u16,
         /// Kept alive for the duration of the test binary; the
         /// `container_cleanup` exit hook removes it at process exit.
-        _container: testcontainers::ContainerAsync<Postgres>,
+        _container: Option<testcontainers::ContainerAsync<Postgres>>,
     }
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
@@ -47,6 +47,16 @@ mod patient_everything_postgres_tests {
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
+                // `HFS_TEST_PG_PORT`: use an externally managed PostgreSQL 16
+                // on localhost (user/password/db `postgres`) instead of a
+                // Testcontainers one.
+                if let Ok(port) = std::env::var("HFS_TEST_PG_PORT") {
+                    return SharedPg {
+                        host: "127.0.0.1".to_string(),
+                        port: port.parse().expect("HFS_TEST_PG_PORT must be a TCP port"),
+                        _container: None,
+                    };
+                }
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // Pin the major version. testcontainers-modules defaults to
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
@@ -77,7 +87,7 @@ mod patient_everything_postgres_tests {
                 SharedPg {
                     host,
                     port,
-                    _container: container,
+                    _container: Some(container),
                 }
             })
             .await
@@ -128,6 +138,57 @@ mod patient_everything_postgres_tests {
         let state = helios_rest::AppState::new(Arc::new(backend), server_config);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
         TestServer::new(app).expect("failed to create test server")
+    }
+
+    /// A resource whose contained resources reference the patient as well is
+    /// one match, not one per index row: PostgreSQL returned every Synthea
+    /// ExplanationOfBenefit twice (307 entries for 273 resources).
+    #[tokio::test]
+    async fn postgres_everything_returns_a_container_once() {
+        let server = create_test_server("everything-pg-contained").await;
+        seed(&server).await;
+        seed_eob_with_contained(&server).await;
+
+        for path in [
+            "/Patient/p1/$everything",
+            "/Patient/p1/$everything?_count=3",
+        ] {
+            let (matches, pages) = walk(&server, path).await;
+            for page in &pages {
+                assert_no_duplicate_entries(page);
+            }
+            assert_eq!(
+                matches
+                    .iter()
+                    .filter(|m| *m == "ExplanationOfBenefit/eob1")
+                    .count(),
+                1,
+                "{path}: {matches:?}"
+            );
+            let mut distinct = matches.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), matches.len(), "{path}: {matches:?}");
+        }
+
+        for path in [
+            "/ExplanationOfBenefit?patient=p1",
+            "/ExplanationOfBenefit?patient=Patient/p1",
+        ] {
+            let resp = server.get(path).await;
+            assert_eq!(resp.status_code(), axum::http::StatusCode::OK, "{path}");
+            let body: serde_json::Value = resp.json();
+            assert_no_duplicate_entries(&body);
+            assert_eq!(
+                entries(&body, "match"),
+                vec!["ExplanationOfBenefit/eob1"],
+                "{path}"
+            );
+            // Counted once as well, from the same top-level rows the page reads.
+            let resp = server.get(&format!("{path}&_summary=count")).await;
+            let count: serde_json::Value = resp.json();
+            assert_eq!(count["total"], 1, "{path}: {count}");
+        }
     }
 
     #[tokio::test]

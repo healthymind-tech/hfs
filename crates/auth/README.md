@@ -64,6 +64,20 @@ The authentication flow follows the [SMART Backend Services](https://hl7.org/fhi
    - Extracts the tenant ID from the configured claim
 5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
 
+## Modes, patient context and production setup
+
+The operator guide is [`docs/ops/auth.md`](../../docs/ops/auth.md): auth modes
+(`HFS_AUTH_MODE=off|write-protect|full`), clock skew, JWKS cache lifetime,
+patient-compartment enforcement for `patient/` scopes, SMART v2 granular
+scopes, rate limiting, the administrator credential alongside tokens, HTS
+terminology writes with tokens, Keycloak setup, nginx/TLS and the rollout plan.
+
+In this crate: [`ScopeSet::access`] answers how far a token reaches for one
+type and permission (`Access::Full`, `Access::Restricted(grants)` for
+patient-compartment / granular grants, `Access::Denied`);
+[`Principal::launch_patient`] is the SMART `patient` launch context. SMART v1
+permissions (`read`, `write`, `*`) are parsed alongside v2 (`cruds`).
+
 ## SMART v2 Scopes
 
 Scopes follow the SMART v2 syntax: `context/resourceType.permissions`
@@ -75,8 +89,11 @@ Scopes follow the SMART v2 syntax: `context/resourceType.permissions`
 | `system/Observation.r` | Read-only access to Observation |
 | `system/Condition.crud` | Create, read, update, delete Condition (no search) |
 | `user/Patient.rs` | User-level read/search on Patient |
+| `patient/Observation.rs` | Read/search Observations **in the launch patient's compartment** (see [Patient scopes](#patient-scopes)) |
 
 Permission characters: `c` = create, `r` = read, `u` = update, `d` = delete, `s` = search.
+
+A `system/` or `user/` scope grants the operation on every resource of the type in the tenant. A `patient/` scope grants it inside one patient's compartment only; `SmartScopePolicy::check` returns which of the two (`AccessScope::Unrestricted` or `AccessScope::PatientCompartment`), the widest matching context winning per resource type.
 
 ### Operation-to-Permission Mapping
 
@@ -98,7 +115,10 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_ENABLED` | `false` | Master switch for authentication |
+| `HFS_AUTH_ENABLED` | `false` | Master switch for authentication (`true` = `HFS_AUTH_MODE=full`) |
+| `HFS_AUTH_MODE` | `off` | `off`, `write-protect` (anonymous reads, authenticated writes) or `full`; wins over `HFS_AUTH_ENABLED` |
+| `HFS_AUTH_CLOCK_SKEW_SECONDS` | `60` | Leeway for `exp`/`nbf` |
+| `HFS_AUTH_PATIENT_NON_COMPARTMENT` | `allow` | Whether `patient/` scopes may read types outside the Patient compartment |
 | `HFS_AUTH_JWKS_URL` | *(required)* | JWKS endpoint URL |
 | `HFS_AUTH_ISSUER` | *(none)* | Expected JWT `iss` claim |
 | `HFS_AUTH_AUDIENCE` | *(none)* | Expected JWT `aud` claim (**recommended for production** — prevents accepting tokens intended for other services) |
@@ -113,6 +133,7 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
+| `HFS_AUTH_JWKS_MAX_AGE_SECONDS` | `300` | Max seconds a fetched JWKS is trusted before refetching |
 
 ### SMART Discovery Endpoint
 
@@ -128,6 +149,8 @@ These populate the `GET /.well-known/smart-configuration` response:
 | `HFS_SMART_REGISTRATION_ENDPOINT` | Dynamic client registration endpoint |
 | `HFS_SMART_REVOCATION_ENDPOINT` | Token revocation endpoint |
 | `HFS_SMART_END_SESSION_ENDPOINT` | OIDC end-session (RP-initiated logout) endpoint; used by the web UI's Sign out. Discovered from the issuer when unset |
+
+**Two different key sets.** The `jwks_uri` in `/.well-known/smart-configuration` (`HFS_SMART_JWKS_URL`, else `HFS_AUTH_JWKS_URL`) is the identity provider's key set: HFS uses it to validate the bearer tokens coming *in*. `/.well-known/bulk-submit-jwks.json` is HFS's own key set, served by `helios-rest` and used by other servers to verify the client assertions HFS signs and sends *out* for bulk submit (see the Bulk Submit section of the `helios-rest` README).
 
 ### Web UI Interactive Login
 
@@ -588,7 +611,23 @@ If the token does not contain the tenant claim, the server falls back to the sta
 
 `LaunchContext::patient_id()` returns the patient's logical id from a bare `<id>` or `Patient/<id>`, where `<id>` is valid FHIR id syntax (1-64 characters of `A-Za-z0-9.-`). Any other value (another resource type, an absolute URL, a `_history` reference, empty) gives `None`.
 
-Today HFS uses it only to scope type-level `Patient/$everything` (see the [`Patient/$everything` section of the rest README](../rest/README.md#patienteverything)). `patient/` scope enforcement and compartment narrowing of other operations is the follow-up in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+It narrows type-level `Patient/$everything` to the launch patient (see the [`Patient/$everything` section of the rest README](../rest/README.md#patienteverything)) and it is what a `patient/` scope is confined to.
+
+## Patient scopes
+
+SMART App Launch defines `patient/` scopes as access to the launch patient's compartment. HFS enforces that (#1618):
+
+- **The grant needs a launch patient.** When an operation is granted only by a `patient/` scope and the token has no usable `patient` claim (missing, empty, not a bare `<id>` or `Patient/<id>`), the request is `403` with an OperationOutcome saying so. The scope is never widened to `user/`. A token that also holds a `user/` or `system/` scope covering the type is unrestricted for that type and unaffected.
+- **Searches are filtered.** `GET /{type}` and `POST /{type}/_search` get the same Patient compartment filter `GET /Patient/{id}/{type}` applies (membership from the spec `CompartmentDefinition`), ANDed with the client's parameters; a search for `Patient` is pinned to the launch patient's id. `_include`/`_revinclude` entries outside the compartment are dropped. A type with no Patient compartment parameters (`Practitioner`, `Organization`, `Medication`, `Binary`, the conformance types, …) is refused with `403`: it cannot be confined to a patient, so a `patient/` scope does not reach it.
+- **Instance interactions are judged on the payload.** Read, vread, instance history, update, patch and delete check the stored resource's membership (a Patient is in its own compartment; anything else must reference the launch patient through a compartment parameter). Create and update also check the submitted payload, so a resource can be neither taken over nor moved out of the compartment. A deleted resource cannot be restored under the grant.
+- **Compartment paths are the launch patient's only.** `GET /Patient/{id}/{type}`, `/Patient/{id}/*` and `Patient/{id}/$everything` are refused for any other `{id}` and for any other compartment type.
+- **`$export`.** `Patient/$export` is pinned to the launch patient (a `patient` parameter naming anyone else is `403`); system-level `/$export` and `Group/{id}/$export` are refused. A `patient/*` wildcard does not override export job ownership.
+- **Bundles.** In a batch, `GET` entries are confined like their single-resource twins and write entries are refused per entry; a transaction holding anything but searches is refused whole. Use the single-resource endpoints to write.
+- **Refused outright** (`403`, cannot be confined): system and type history, conditional (type-level) update, patch, delete and conditional create, every other `$`-operation, and — for a token whose resource scopes are all `patient/` scopes — every endpoint the middleware does not classify (the console, `/_user/settings`, `$bulk-submit`, …).
+
+A refused request is a `403` with an OperationOutcome (`forbidden`) that names the reason; existence of the resource is therefore disclosed to the holder of a valid token, as it is for any other scope denial.
+
+Confinement is decided in the REST layer (`crates/rest/src/patient_compartment.rs` and the path check in `crates/rest/src/middleware/auth.rs`), so it applies on every storage backend.
 
 ## Token Replay
 

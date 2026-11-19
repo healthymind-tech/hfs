@@ -100,6 +100,62 @@ impl SchemaRegistry {
         }
     }
 
+    /// Insert a schema under its canonical `url` **only** — no `name` alias.
+    ///
+    /// Profiles and extensions (`derivation: constraint`) are referenced by
+    /// canonical URL; element `type` references resolve base types by *name*.
+    /// Indexing a constraint under its name lets an extension such as
+    /// `rendering-xhtml` (`name: "xhtml"`) shadow the primitive `xhtml`, so
+    /// every `Narrative.div` fails as "expected object, got string". Stored
+    /// (tenant-uploaded) profiles use this entry point; the embedded packs
+    /// keep their two-pass `insert` because there the core schema is
+    /// guaranteed to win the name alias.
+    ///
+    /// Returns `false` (and stores nothing) if the schema has no `url`.
+    ///
+    /// A versioned definition is also indexed as `url|version`. Under the
+    /// bare `url` the highest version stays: with two releases of an IG
+    /// installed side by side (US Core 5.0.1 for mCODE next to 7.0.0), a
+    /// claim without a version means the latest, whatever order they were
+    /// written in.
+    pub fn insert_by_url(&mut self, schema: FhirSchema) -> bool {
+        let Some(url) = schema.url.clone() else {
+            return false;
+        };
+        let schema = Arc::new(schema);
+        if let Some(version) = &schema.version {
+            self.map
+                .insert(format!("{url}|{version}"), Arc::clone(&schema));
+        }
+        let newer_stays =
+            self.map
+                .get(&url)
+                .is_some_and(|current| match (&current.version, &schema.version) {
+                    (Some(have), Some(new)) => {
+                        compare_versions(have, new) == std::cmp::Ordering::Greater
+                    }
+                    _ => false,
+                });
+        if !newer_stays {
+            self.map.insert(url, schema);
+        }
+        true
+    }
+
+    /// Remove the schema reachable under `reference`, together with every
+    /// other key (url, name, explicit key) that aliases the same schema.
+    ///
+    /// Returns `true` if something was removed. Removing an alias that
+    /// pointed at a schema also registered under a *different* schema's key
+    /// only drops the aliases of the schema actually found.
+    pub fn remove(&mut self, reference: &str) -> bool {
+        let Some(target) = self.map.get(reference).cloned() else {
+            return false;
+        };
+        self.map.retain(|_, schema| !Arc::ptr_eq(schema, &target));
+        true
+    }
+
     /// Build a registry from `(key, schema)` pairs.
     pub fn from_named(iter: impl IntoIterator<Item = (String, FhirSchema)>) -> Self {
         let mut reg = Self::new();
@@ -111,9 +167,49 @@ impl SchemaRegistry {
 }
 
 impl SchemaResolver for SchemaRegistry {
+    /// A versioned canonical (`url|version`, as instance data, `meta.profile`
+    /// and IG profiles write them — e.g. an extension URL
+    /// `…/patient-nationality|5.3.0`) resolves to the schema registered under
+    /// the bare `url`: the registry holds one schema per canonical, so the
+    /// version is advisory here (the HL7 validator likewise falls back to the
+    /// loaded version of a canonical).
     fn resolve(&self, reference: &str) -> Option<Arc<FhirSchema>> {
-        self.map.get(reference).cloned()
+        if let Some(schema) = self.map.get(reference) {
+            return Some(Arc::clone(schema));
+        }
+        match reference.split_once('|') {
+            Some((url, _)) if !url.is_empty() => self.map.get(url).cloned(),
+            _ => None,
+        }
     }
+}
+
+/// Orders two business versions: dot-separated parts numerically where both
+/// are numbers, a pre-release (`-ballot`) below its release.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let split = |v: &str| -> (Vec<String>, bool) {
+        let (main, pre) = match v.split_once('-') {
+            Some((m, _)) => (m, true),
+            None => (v, false),
+        };
+        (main.split('.').map(str::to_string).collect(), pre)
+    };
+    let ((pa, a_pre), (pb, b_pre)) = (split(a), split(b));
+    for i in 0..pa.len().max(pb.len()) {
+        let (x, y) = (
+            pa.get(i).map(String::as_str).unwrap_or("0"),
+            pb.get(i).map(String::as_str).unwrap_or("0"),
+        );
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    b_pre.cmp(&a_pre)
 }
 
 /// Layered resolver: earlier layers win. Used to overlay tenant-uploaded
@@ -144,6 +240,44 @@ impl SchemaResolver for CompositeResolver {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_highest_version_answers_an_unversioned_canonical() {
+        let profile = |version: &str| FhirSchema {
+            url: Some("http://example.org/p".into()),
+            version: Some(version.into()),
+            name: Some(format!("p{version}")),
+            ..Default::default()
+        };
+        let mut r = SchemaRegistry::new();
+        r.insert_by_url(profile("7.0.0"));
+        r.insert_by_url(profile("5.0.1")); // written later, older
+        fn name(r: &SchemaRegistry, reference: &str) -> Option<String> {
+            r.resolve(reference).and_then(|s| s.name.clone())
+        }
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.0"));
+        assert_eq!(
+            name(&r, "http://example.org/p|5.0.1").as_deref(),
+            Some("p5.0.1")
+        );
+        assert_eq!(
+            name(&r, "http://example.org/p|7.0.0").as_deref(),
+            Some("p7.0.0")
+        );
+        // Removing the older release leaves the newer one.
+        assert!(r.remove("http://example.org/p|5.0.1"));
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.0"));
+        // (a version no longer held falls back to the canonical)
+        assert_eq!(
+            name(&r, "http://example.org/p|5.0.1").as_deref(),
+            Some("p7.0.0")
+        );
+        // A newer release replaces under the bare url.
+        r.insert_by_url(profile("7.0.1"));
+        assert_eq!(name(&r, "http://example.org/p").as_deref(), Some("p7.0.1"));
+        assert!(compare_versions("3.0.0-ballot", "3.0.0").is_lt());
+        assert!(compare_versions("10.0.0", "9.1.0").is_gt());
+    }
+
     fn named(name: &str) -> FhirSchema {
         FhirSchema {
             name: Some(name.to_string()),
@@ -162,6 +296,92 @@ mod tests {
         assert!(Arc::ptr_eq(&by_key, &by_url));
         assert!(Arc::ptr_eq(&by_key, &by_name));
         assert!(reg.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn versioned_canonical_resolves_by_bare_url() {
+        let mut reg = SchemaRegistry::new();
+        reg.insert(named("Patient"));
+        let bare = reg.resolve("http://example.org/Patient").unwrap();
+        let versioned = reg.resolve("http://example.org/Patient|5.3.0").unwrap();
+        assert!(Arc::ptr_eq(&bare, &versioned));
+        assert!(
+            reg.resolve("http://example.org/Patient|").is_some(),
+            "an empty version is the bare canonical"
+        );
+        assert!(reg.resolve("http://example.org/Other|1.0").is_none());
+        assert!(reg.resolve("|1.0").is_none());
+
+        // Through a composite: an overlay layer and the core layer both apply.
+        let composite =
+            CompositeResolver::new(vec![Arc::new(SchemaRegistry::new()), Arc::new(reg)]);
+        assert!(
+            composite
+                .resolve("http://example.org/Patient|4.0.1")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn insert_by_url_does_not_claim_the_name_alias() {
+        let mut reg = SchemaRegistry::new();
+        // A base type registered the usual way (url + name).
+        reg.insert(FhirSchema {
+            name: Some("xhtml".into()),
+            url: Some("http://hl7.org/fhir/StructureDefinition/xhtml".into()),
+            kind: Some("primitive-type".into()),
+            ..Default::default()
+        });
+        // An extension whose *name* collides with the base type (the real
+        // `rendering-xhtml` extension in hl7.fhir.r4.core).
+        assert!(reg.insert_by_url(FhirSchema {
+            name: Some("xhtml".into()),
+            url: Some("http://hl7.org/fhir/StructureDefinition/rendering-xhtml".into()),
+            kind: Some("extension".into()),
+            derivation: Some("constraint".into()),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            reg.resolve("xhtml").unwrap().kind.as_deref(),
+            Some("primitive-type"),
+            "the name alias must still resolve the base type"
+        );
+        assert_eq!(
+            reg.resolve("http://hl7.org/fhir/StructureDefinition/rendering-xhtml")
+                .unwrap()
+                .kind
+                .as_deref(),
+            Some("extension")
+        );
+        assert!(
+            !reg.insert_by_url(FhirSchema {
+                name: Some("no-url".into()),
+                ..Default::default()
+            }),
+            "a schema without a url cannot be registered by url"
+        );
+    }
+
+    #[test]
+    fn remove_drops_every_alias_of_the_schema() {
+        let mut reg = SchemaRegistry::new();
+        reg.insert_named("PatKey", named("Patient"));
+        reg.insert(named("Observation"));
+        assert_eq!(reg.len(), 5);
+
+        assert!(reg.remove("http://example.org/Patient"));
+        assert!(reg.resolve("PatKey").is_none());
+        assert!(reg.resolve("Patient").is_none());
+        assert!(reg.resolve("http://example.org/Patient").is_none());
+        assert!(
+            reg.resolve("http://example.org/Observation").is_some(),
+            "unrelated schemas are untouched"
+        );
+        assert_eq!(reg.len(), 2);
+
+        assert!(!reg.remove("http://example.org/Patient"), "already gone");
+        assert!(!reg.remove("never-there"));
     }
 
     #[test]

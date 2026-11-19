@@ -2,6 +2,7 @@
 
 #![cfg(feature = "postgres")]
 
+use super::CachedQuery;
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
@@ -15,15 +16,15 @@ use crate::types::{
     TranslationMatch,
 };
 
-use super::code_system::build_synthetic_resource;
 use super::{PG_TRANSLATE_RESPONSE_CACHE_MAX, PostgresTerminologyBackend, error_chain};
 
 /// Build the $translate response cache key. Folds every TranslateRequest
 /// field that affects the output rows.
 fn translate_cache_key(req: &TranslateRequest) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         req.url.as_deref().unwrap_or(""),
+        req.map_version.as_deref().unwrap_or(""),
         req.system.as_deref().unwrap_or(""),
         req.code,
         req.source.as_deref().unwrap_or(""),
@@ -37,6 +38,43 @@ fn translate_cache_key(req: &TranslateRequest) -> String {
 
 #[async_trait]
 impl ConceptMapOperations for PostgresTerminologyBackend {
+    async fn concept_maps_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system: &str,
+        reverse: bool,
+    ) -> Result<Vec<(String, Option<String>)>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let col = if reverse {
+            "target_system"
+        } else {
+            "source_system"
+        };
+        // Per map (default version of each URL), an indexed probe on
+        // (map_id, source_system) — no scan of the elements table.
+        let sql = format!(
+            "SELECT cm.url, cm.version FROM concept_maps cm
+              WHERE cm.id = (SELECT c2.id FROM concept_maps c2 WHERE c2.url = cm.url
+                              ORDER BY {order} LIMIT 1)
+                AND EXISTS (SELECT 1 FROM concept_map_elements cme
+                             WHERE cme.map_id = cm.id AND cme.{col} = $1)
+              ORDER BY cm.url",
+            order = crate::backends::cm_precedence_order_by("c2")
+        );
+        let rows = client
+            .cq(&sql, &[&system])
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+            .collect())
+    }
+
     async fn translate(
         &self,
         _ctx: &TenantContext,
@@ -70,17 +108,72 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         } else {
             (req.system.as_deref(), req.target_system.as_deref())
         };
+        // Each map URL contributes one version: `conceptMapVersion` for the
+        // named `url`, else its default version.
+        let map_version = req.url.as_ref().and(req.map_version.as_deref());
 
-        let rows = query_translate_elements(
-            &client,
-            lookup_code,
-            search_sys,
-            other_side_sys,
-            req.url.as_deref(),
-            reverse,
-            req.date.as_deref(),
-        )
-        .await?;
+        // A named ConceptMap that is not loaded is a 404, distinct from "no
+        // match found" (mirrors SQLite `translate_sync`).
+        // The map-exists probe and the element query go out together.
+        let (exists, rows) = futures::join!(
+            async {
+                match req.url.as_deref() {
+                    Some(url) => super::query_text_opt(
+                        &client,
+                        "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE url = $1)",
+                        &[&url],
+                    )
+                    .await
+                    .map(|r| r.is_some_and(|r| r.get::<_, bool>(0)))
+                    .map_err(|e| HtsError::StorageError(error_chain(&e))),
+                    None => Ok(true),
+                }
+            },
+            query_translate_elements(
+                &client,
+                lookup_code,
+                search_sys,
+                other_side_sys,
+                req.url.as_deref(),
+                map_version,
+                reverse,
+                req.date.as_deref(),
+            )
+        );
+        if !exists? {
+            return Err(HtsError::NotFound(format!(
+                "ConceptMap not found: {}",
+                req.url.as_deref().unwrap_or("")
+            )));
+        }
+        let mut rows = rows?;
+
+        // Packages that encode several source codes as one comma-separated
+        // string are stored one row per code; a client may still send the
+        // compound string, so try each token when the whole one misses.
+        if rows.is_empty() && lookup_code.contains(',') {
+            for token in lookup_code.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let token_rows = query_translate_elements(
+                    &client,
+                    token,
+                    search_sys,
+                    other_side_sys,
+                    req.url.as_deref(),
+                    map_version,
+                    reverse,
+                    req.date.as_deref(),
+                )
+                .await?;
+                if !token_rows.is_empty() {
+                    rows = token_rows;
+                    break;
+                }
+            }
+        }
 
         let matches: Vec<TranslationMatch> = rows
             .into_iter()
@@ -155,7 +248,7 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 crate::backends::cs_precedence_order_by("code_systems")
             );
             let id_rows = client
-                .query(&sql, &[system_url])
+                .cq(&sql, &[system_url])
                 .await
                 .map_err(|e| HtsError::StorageError(format!("DB error: {}", error_chain(&e))))?;
 
@@ -229,86 +322,14 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
     async fn search(
         &self,
         _ctx: &TenantContext,
-        mut query: ResourceSearchQuery,
+        query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
-        let string_search = crate::string_search::ResourceStringSearch::new(&query);
-        if string_search.is_empty() {
-            query.name = None;
-            query.title = None;
-        }
         let mut client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-
-        if !string_search.is_empty() {
-            return super::search_resources(
-                &mut client,
-                "concept_maps",
-                "ConceptMap",
-                query,
-                string_search,
-            )
-            .await;
-        }
-
-        let limit = i64::from(query.count.unwrap_or(20));
-        let offset = i64::from(query.offset.unwrap_or(0));
-
-        let rows = client
-            .query(
-                "SELECT id, url, version, name, title, status, resource_json
-                 FROM concept_maps
-                 WHERE ($1::text IS NULL OR url = $1)
-                   AND ($2::text IS NULL OR version = $2)
-                   AND ($3::text IS NULL OR name = $3)
-                   AND ($4::text IS NULL OR title = $4)
-                   AND ($5::text IS NULL OR status = $5)
-                 ORDER BY created_at
-                 LIMIT $6 OFFSET $7",
-                &[
-                    &query.url,
-                    &query.version,
-                    &query.name,
-                    &query.title,
-                    &query.status,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await
-            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get(0);
-            let url: String = row.get(1);
-            let version: Option<String> = row.get(2);
-            let name: Option<String> = row.get(3);
-            let title: Option<String> = row.get(4);
-            let status: String = row.get(5);
-            let resource_json: Option<serde_json::Value> = row.get(6);
-
-            let mut resource = resource_json.unwrap_or_else(|| {
-                build_synthetic_resource(
-                    "ConceptMap",
-                    &id,
-                    &url,
-                    version.as_deref(),
-                    name.as_deref(),
-                    title.as_deref(),
-                    &status,
-                )
-            });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-            }
-            results.push(resource);
-        }
-        Ok(results)
+        super::search_table(&mut client, "concept_maps", "ConceptMap", query, false).await
     }
 }
 
@@ -334,11 +355,12 @@ struct TranslateRow {
 /// `other_side_sys` restricts the result-side system (target side in forward
 /// mode, source side in reverse mode).
 async fn query_translate_elements(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     code: &str,
     system: Option<&str>,
     other_side_sys: Option<&str>,
     map_url: Option<&str>,
+    map_version: Option<&str>,
     reverse: bool,
     date: Option<&str>,
 ) -> Result<Vec<TranslateRow>, HtsError> {
@@ -368,13 +390,27 @@ async fn query_translate_elements(
            AND ($2::text IS NULL OR {lookup_sys_col} = $2)
            AND ($3::text IS NULL OR {other_sys_col} = $3)
            AND ($4::text IS NULL OR cm.url = $4)
-           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)"
+           AND ($5::text IS NULL OR (cm.resource_json->>'date') <= $5)
+           AND cm.id = (SELECT c2.id FROM concept_maps c2
+                         WHERE c2.url = cm.url AND ($6::text IS NULL OR c2.version = $6)
+                         ORDER BY {default_first} LIMIT 1)",
+        default_first = crate::backends::cm_precedence_order_by("c2")
     );
 
-    let rows = client
-        .query(&sql, &[&code, &system, &other_side_sys, &map_url, &date])
-        .await
-        .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;
+    let rows = super::query_text(
+        client,
+        &sql,
+        &[
+            &code,
+            &system,
+            &other_side_sys,
+            &map_url,
+            &date,
+            &map_version,
+        ],
+    )
+    .await
+    .map_err(|e| HtsError::StorageError(format!("Query error: {}", error_chain(&e))))?;
 
     Ok(rows
         .into_iter()
@@ -394,13 +430,13 @@ async fn query_translate_elements(
 /// Returns `true` if `ancestor_code` is a (possibly transitive) ancestor of
 /// `descendant_code` in the given code system.
 async fn is_ancestor_of(
-    client: &tokio_postgres::Client,
+    client: &super::PgClient,
     system_id: &str,
     ancestor_code: &str,
     descendant_code: &str,
 ) -> Result<bool, HtsError> {
     let rows = client
-        .query(
+        .cq(
             "WITH RECURSIVE ancestors(code) AS (
                 SELECT parent_code
                 FROM concept_hierarchy

@@ -1,0 +1,40 @@
+{% extends "layouts/base.html" %}
+
+{#
+  Administrator sign-in (`HFS_ADMIN_PASSWORD`, crates/ui/src/admin_login.rs).
+  A plain form — no script — posting back to itself; on success the server
+  sets the `hfs_admin` session cookie and redirects to `next`. Same catalog
+  keys and markup shape as the HTS console's `pages/login.html`.
+#}
+
+{% block title %}{{ i18n.t("admin-login-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("admin-login-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("admin-login-lede") }}</p>
+</header>
+{% if locked %}
+<div class="card notice notice--warn" role="alert">{{ i18n.t_arg("admin-login-locked", "var", "HFS_ADMIN_PASSWORD") }}</div>
+{% else %}
+<section class="card admin-login">
+  {% if let Some(message) = error %}<div class="alert" role="alert">{{ message }}</div>{% endif %}
+  <form method="post" action="/ui/admin/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label class="field">
+      <span class="field__label">{{ i18n.t("admin-login-user") }}</span>
+      <input class="field__input" type="text" name="username" value="{{ user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    </label>
+    <label class="field">
+      <span class="field__label">{{ i18n.t("admin-login-password") }}</span>
+      <input class="field__input" type="password" name="password" autocomplete="current-password" required autofocus>
+    </label>
+    <div class="form-actions form-actions--start">
+      <button class="btn btn--primary" type="submit">{{ i18n.t("admin-login-submit") }}</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

@@ -775,6 +775,62 @@ fn assert_recent_types_are_pinned_above_the_list(html: &str) {
     );
 }
 
+/// Mounts the UI with the given `HFS_BASE_URL`: what the browser-facing API
+/// prefix meta is derived from.
+fn app_with_public_base(public_base_url: &str) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        public_base_url.to_string(),
+        None,
+    )
+}
+
+/// Behind a reverse proxy that mounts the FHIR API under a prefix
+/// (`HFS_BASE_URL=https://host/fhir`), the page scripts used to call
+/// `/Patient` at the origin root and get the proxy's 404 for every search,
+/// read, save and history load. The layout now stamps the prefix — path only,
+/// never the configured host, so the browser stays same-origin — and the
+/// per-user settings endpoint under it; a root deployment stamps an empty
+/// prefix and behaves exactly as before.
+#[tokio::test]
+async fn layout_stamps_the_fhir_api_prefix_from_the_public_base_url() {
+    let response = app_with_public_base("https://fhir.example.org/fhir/")
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"<meta name="hfs-fhir-base" content="/fhir">"#),
+        "prefix meta missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<meta name="hfs-user-settings" content="/fhir/_user/settings">"#),
+        "settings meta missing: {html}"
+    );
+    assert!(
+        !html.contains("fhir.example.org"),
+        "the configured host must never reach the browser"
+    );
+
+    let response = app_with_public_base("http://localhost:8080")
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<meta name="hfs-fhir-base" content="">"#));
+    assert!(html.contains(r#"<meta name="hfs-user-settings" content="/_user/settings">"#));
+}
+
 #[tokio::test]
 async fn index_serves_the_full_landing_page() {
     let response = app()
@@ -876,9 +932,16 @@ async fn page_wires_the_hover_rail_nav() {
         .unwrap();
     let html = body_text(response).await;
 
-    // The rail expands on hover (#438): no toggle button, no state script.
-    assert!(!html.contains("nav.js"));
+    // The rail expands on hover (#438): no pinned/collapsed state and no
+    // toggle for it. The one script the chrome carries is the responsive
+    // drawer below the tablet breakpoint, where there is no hover at all.
     assert!(!html.contains("data-toggle-nav"));
+    assert!(html.contains("/ui/assets/nav.js"));
+    assert!(html.contains(
+        r#"class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false""#
+    ));
+    assert!(html.contains(r#"class="sidebar__close" data-nav-close"#));
+    assert!(html.contains(r#"class="sidebar-scrim" data-nav-scrim"#));
     // Labels are wrapped so the resting rail can hide them (a11y-safe).
     assert!(html.contains("nav-item__label"));
     // The Batch & Data entries from the design: Import and Export.
@@ -1101,6 +1164,83 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "fhir handled");
+}
+
+/// An unknown `/ui/...` path used to fall through to the FHIR app, which read
+/// `ui` as a resource type and answered a JSON OperationOutcome: no title, no
+/// `lang`, no navigation, and axe flagged it twice as serious. It now renders
+/// the shell-wrapped not-found page with a `404`. The asset service and the
+/// FHIR fall-through for non-`/ui` paths are unaffected.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_localized_not_found_page_inside_the_shell() {
+    let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
+    let app = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/this-page-does-not-exist")
+                .header("Accept-Language", "es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let ctype = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<html lang="es">"#), "{html}");
+    assert!(html.contains("No encontrado"), "{html}");
+    assert!(html.contains(r#"class="sidebar""#));
+    assert!(html.contains(r#"href="/ui""#));
+
+    // Nested unknown paths too.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/nope/deeper")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Assets and the FHIR surface keep their own routes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/assets/app.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     assert_eq!(body_text(response).await, "fhir handled");
 }
 
@@ -2075,6 +2215,68 @@ fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
     serializer.finish()
 }
 
+#[tokio::test]
+async fn editor_choice_selects_keep_their_native_contract_in_both_response_shapes() {
+    for (document, name, arm) in [
+        (
+            serde_json::json!({"resourceType": "Patient"}),
+            "deceased",
+            "deceasedBoolean",
+        ),
+        (
+            serde_json::json!({"resourceType": "RiskAssessment", "status": "final", "subject": {"reference": "Patient/p1"}}),
+            "occurrence",
+            "occurrencePeriod",
+        ),
+        (
+            serde_json::json!({"resourceType": "ViewDefinition", "status": "draft", "resource": "Patient"}),
+            "versionAlgorithm",
+            "versionAlgorithmString",
+        ),
+        (
+            serde_json::json!({"resourceType": "Library", "status": "draft"}),
+            "subject",
+            "subjectReference",
+        ),
+    ] {
+        for pane in ["", "form"] {
+            let response = edit(&form_pane_body(&document, &[("pane", pane)])).await;
+            let dom = Dom::fragment(&response);
+            let selector = format!("select[data-choose=''][data-declarer='{name}']");
+            let select = dom.one(&selector);
+            assert!(select.has_attr("data-combobox-select"));
+            assert!(!select.has_attr("hidden"));
+            assert!(!select.has_attr("disabled"));
+            assert!(
+                select
+                    .attr("aria-label")
+                    .unwrap()
+                    .starts_with(&format!("{name}[x]"))
+            );
+            assert_eq!(select.one("option[value='']").text(), "Pick a type…");
+            assert_eq!(select.one(&format!("option[value='{arm}']")).text(), arm);
+
+            let changed = edit(&form_pane_body(
+                &document,
+                &[
+                    ("pane", pane),
+                    ("op", "choose"),
+                    ("path", ""),
+                    ("name", name),
+                    ("arm", arm),
+                ],
+            ))
+            .await;
+            let dom = Dom::fragment(&changed);
+            let returned: Value =
+                serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+            assert!(returned.get(arm).is_some());
+            assert_eq!(dom.one("#editor-form").attr("data-focus"), Some(arm));
+            assert_eq!(dom.count(&selector), 0);
+        }
+    }
+}
+
 /// Slices out one row's own markup — from its `<div class="editor-row...`
 /// opening tag, found by the unique `data-path="{path}"` attribute every row
 /// carries, up to the next row (or the end of the fragment). `data-path` is
@@ -2990,6 +3192,14 @@ async fn history_page_renders_the_shell() {
     assert!(html.contains(r#"data-tab="instance""#));
     assert!(html.contains(r#"id="history-versions""#));
     assert!(html.contains("history.js"));
+    // #1759: the operation labels each version row shows are translated
+    // server-side and handed to the script as data attributes.
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }
 
 async fn diff(form: &str) -> String {
@@ -6856,6 +7066,48 @@ async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() 
     assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
 }
 
+#[tokio::test]
+async fn sql_query_numeric_fields_keep_native_steps_values_and_form_association() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "numeric", "name": "numeric", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+        "parameter": [
+            {"name": "amount", "use": "in", "type": "decimal", "defaultDecimal": -150.5},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=numeric")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = Dom::page(&html);
+    for (name, step, value) in [
+        ("amount", "any", "-150.5"),
+        ("whole", "1", "30"),
+        ("big", "1", "9007199254740993"),
+    ] {
+        let field = dom.one(&format!("input[name='param:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.attr("form"), Some("lib-editor-form"));
+    }
+}
+
 /// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,
 /// so `/run`'s out-of-band card has an element to replace once the pasted
 /// JSON declares a parameter. The starter declares none, so its signature is
@@ -7428,6 +7680,142 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     assert!(html.contains("by_ward"), "{html}");
     assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
     assert!(html.contains("Nightly extract"), "{html}");
+}
+
+/// A loopback terminology server for #1824's *Reads from* rows: `POST
+/// ValueSet/$expand` expands only `http://example.org/ValueSet/cardio`
+/// (404 otherwise), and `GET ConceptMap?url=` holds only
+/// `http://example.org/ConceptMap/ids-to-icd`.
+async fn mock_terminology_tables() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/ValueSet/$expand",
+            axum::routing::post(|body: String| async move {
+                let params: Value = serde_json::from_str(&body).unwrap_or_default();
+                let url = params["parameter"][0]["valueUri"].as_str().unwrap_or("");
+                if url == "http://example.org/ValueSet/cardio" {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "resourceType": "ValueSet", "url": url,
+                            "name": "Cardio", "title": "Cardiology codes",
+                            "expansion": {"total": 2}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, String::new())
+                }
+            }),
+        )
+        .route(
+            "/ConceptMap",
+            axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let url = query.get("url").map(String::as_str).unwrap_or("");
+                    let entry = if url == "http://example.org/ConceptMap/ids-to-icd" {
+                        serde_json::json!([{"resource": {
+                            "resourceType": "ConceptMap", "url": url, "name": "IdsToIcd"
+                        }}])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({"resourceType": "Bundle", "entry": entry}).to_string()
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #1824: a dependency storage has no ViewDefinition or Library for is
+/// resolved on the terminology server — a value set it expands and a
+/// concept map it holds each render as a resolved row with their own chip
+/// and name, never as *Not found*; a canonical it knows neither of still
+/// does.
+#[tokio::test]
+async fn reads_from_resolves_value_set_and_concept_map_dependencies_on_the_terminology_server() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "cardio_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "cardio", "resource": "http://example.org/ValueSet/cardio"},
+            {"type": "depends-on", "label": "icd", "resource": "http://example.org/ConceptMap/ids-to-icd"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ValueSet/nope"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with("Library", helios_fhir::FhirVersion::R4, vec![library]);
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        Some(mock_terminology_tables().await),
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    let row = |alias: &str| {
+        let start = reads_from
+            .find(&format!(
+                r#"<code class="lib-tables__alias">{alias}</code>"#
+            ))
+            .unwrap_or_else(|| panic!("no row for {alias}: {reads_from}"));
+        let head = &reads_from[..start];
+        let row_start = head.rfind("<li").unwrap();
+        let row_end = start + reads_from[start..].find("</li>").unwrap();
+        reads_from[row_start..row_end].to_string()
+    };
+
+    let cardio = row("cardio");
+    assert!(
+        cardio.contains(r#"<span class="tag tag--type">ValueSet</span>"#),
+        "{cardio}"
+    );
+    assert!(cardio.contains("Cardiology codes"), "{cardio}");
+    assert!(!cardio.contains("row--alert"), "{cardio}");
+
+    let icd = row("icd");
+    assert!(
+        icd.contains(r#"<span class="tag tag--type">ConceptMap</span>"#),
+        "{icd}"
+    );
+    assert!(icd.contains("IdsToIcd"), "{icd}");
+    assert!(!icd.contains("row--alert"), "{icd}");
+
+    let missing = row("missing");
+    assert!(missing.contains("row--alert"), "{missing}");
+    assert!(missing.contains("Not found"), "{missing}");
+
+    assert!(!row("v").contains("row--alert"));
 }
 
 /// #1238: the Tables card's own add row — search, alias, *Add* — is
@@ -8280,8 +8668,7 @@ async fn sql_queries_page_saved_redirect_fills_the_columns_card() {
 /// with no nested `<div>` in between (the list holds only `<a>` items and,
 /// when empty, a `<p>`) — so a test can assert what the paginated/filtered
 /// list shows without also matching the "Recently used" group above it,
-/// which can legitimately render an id the list itself excludes — the
-/// group is never filtered.
+/// which can render an off-page id from its stored snapshot.
 fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
     let start = html
         .find(&format!(r#"id="{list_id}""#))
@@ -8369,6 +8756,12 @@ async fn view_definitions_rail_paginates_across_pages_of_fifty() {
         html.contains(r#"class="pagination""#)
             && html.contains(r#"href="/ui/sql/view-definitions""#),
         "a previous link back to the bare route (page 1)"
+    );
+    // With a link to show, the always-emitted nav is not `hidden` (#1275).
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).expect("nav id")..];
+    assert!(
+        !nav[..nav.find('>').unwrap()].contains("hidden"),
+        "the pagination nav is visible when prev/next exist"
     );
     assert!(!html.contains("page=3"), "no next link past the last page");
 }
@@ -8508,10 +8901,13 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     let list = rail_list_html(&html, "vd-rail-list");
     assert!(list.contains(r#"data-type="other""#));
     assert!(!list.contains(r#"data-type="keep""#));
-    // ...but the just-selected "keep" still surfaces through the "Recently
-    // used" group above it — the group is never itself filtered — from its
-    // snapshot, since the filter takes it off the list this render shows.
-    assert!(html.contains(r#"id="vd-rail-recent""#));
+    // ...and the "Recently used" group above it follows the same filter
+    // (#1275): it is always emitted (the live filter swaps it by id) and the
+    // excluded selection is not in it.
+    let group_start = html.find(r#"id="vd-rail-recent""#).expect("group emitted");
+    let group =
+        &html[group_start..html[group_start..].find("filter-rail__divider").unwrap() + group_start];
+    assert!(!group.contains(r#"data-type="keep""#));
     // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));
     assert!(html.contains("keep_me"));
@@ -8581,7 +8977,7 @@ async fn user_menu_carries_language_and_the_signed_out_state() {
     let html = body_text(response).await;
     assert!(html.contains("menu--user"));
     assert!(!html.contains("lang-switcher"));
-    for lang in ["en", "es", "de"] {
+    for lang in ["en", "es", "de", "zh-Hant"] {
         assert!(
             html.contains(&format!("?lang={lang}")),
             "missing ?lang={lang}"
@@ -8711,6 +9107,265 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
     assert!(
         html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
         "editor-add.js must load before resources.js"
+    );
+}
+
+/// The Validate page (`/ui/validate`): a full page in the shell, current in
+/// the nav (which every page — and so the phone drawer, the same `<aside>` —
+/// carries), with the editor, the profile datalist, its scripts and the
+/// rendered message templates.
+#[tokio::test]
+async fn validate_page_serves_the_shell_and_is_in_the_nav() {
+    let response = app_with_body_limit(4096)
+        .oneshot(Request::get("/ui/validate").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"href="/ui/validate" aria-current="page""#));
+    assert!(html.contains(r#"id="validate-text""#));
+    assert!(html.contains(r#"list="validate-profiles""#));
+    assert!(html.contains(r#"<datalist id="validate-profiles">"#));
+    assert!(html.contains(r#"id="validate-per-entry""#));
+    assert!(html.contains(r#"data-max-body-size="4096""#));
+    for script in [
+        "vendor/codemirror.bundle.js",
+        "code-editor.js",
+        "bundle-check.js",
+        "fhir-validate.js",
+        "validate-page.js",
+    ] {
+        assert!(
+            html.contains(&format!(r#"src="/ui/assets/{script}""#)),
+            "{script}"
+        );
+    }
+    // Rendered copy, not just the attribute: a missing Fluent key would
+    // still carry the attribute with the key as its value.
+    assert!(html.contains(r#"data-msg-entry-label="entry %n% (%name%)""#));
+    assert!(html.contains(r#"data-msg-json-syntax="JSON syntax error: %detail%.""#));
+
+    // Every other page links it, in the one sidebar the drawer also is.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let home = body_text(response).await;
+    assert!(home.contains(r#"<a class="nav-item" href="/ui/validate""#));
+    assert!(!home.contains(r#"href="/ui/validate" aria-current"#));
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/validate?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zh = body_text(response).await;
+    assert!(zh.contains("驗證"), "{zh}");
+}
+
+/// The Batch page's paste mode, live checks and "Validate" action ride on
+/// the shell: the mode tabs, the editor, the check report, the validate
+/// controls, and the shared check / validate scripts and their messages.
+#[tokio::test]
+async fn batch_page_offers_paste_mode_checks_and_validation() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="batch-mode-file" role="tab" aria-selected="true""#));
+    assert!(html.contains(r#"id="batch-mode-paste" role="tab" aria-selected="false""#));
+    assert!(html.contains(r#"<textarea class="json-editor batch-paste__source" id="batch-paste""#));
+    assert!(html.contains(r#"id="batch-format""#));
+    assert!(html.contains(r#"id="batch-continue" disabled"#));
+    assert!(html.contains(r#"id="batch-check" aria-live="polite" hidden"#));
+    assert!(html.contains(r#"id="batch-validate""#));
+    assert!(html.contains(r#"id="batch-validate-per-entry""#));
+    assert!(html.contains(r#"data-msg-bad-method="Entry %entry%: request.method"#));
+    assert!(html.contains(r#"data-msg-check-at="line %line%, col %col%""#));
+    let check = html
+        .find(r#"src="/ui/assets/bundle-check.js""#)
+        .expect("check");
+    let validate = html
+        .find(r#"src="/ui/assets/fhir-validate.js""#)
+        .expect("validate");
+    let page = html.find(r#"src="/ui/assets/batch.js""#).expect("batch");
+    assert!(
+        check < page && validate < page,
+        "helpers load before the page script"
+    );
+
+    for (asset, needle) in [
+        ("bundle-check.js", "window.HfsBundleCheck"),
+        ("fhir-validate.js", "/$validate"),
+        (
+            "validate-page.js",
+            "StructureDefinition?derivation=constraint",
+        ),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui/assets/{asset}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{asset}");
+        assert!(body_text(response).await.contains(needle), "{asset}");
+    }
+}
+
+/// The theme switcher is one shared button with a translated, mode-specific
+/// label in every locale.
+#[tokio::test]
+async fn theme_switcher_is_one_button_labelled_per_locale() {
+    for (lang, label) in [
+        ("en", "Theme: follow system"),
+        ("zh-Hant", "主題：跟隨系統"),
+        ("de", "Design: System folgen"),
+        ("es", "Tema: seguir al sistema"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(html.matches("data-theme-cycle").count(), 1, "{lang}");
+        assert!(html.contains(&format!(r#"aria-label="{label}""#)), "{lang}");
+        assert!(html.contains("data-label-dark="), "{lang}");
+    }
+}
+
+/// IG Packages (`/ui/packages`): with package administration on
+/// (`HFS_ADMIN_UI`), a full page in the shell, current in the nav (which
+/// every page — and so the phone drawer, the same `<aside>` — carries), with
+/// the three tabs, the install wizard's four steps, the stacked tables, the
+/// page script and its rendered messages. Only ever switched on here: the
+/// switch is process-wide, and the "off" rendering is a lib unit test.
+#[tokio::test]
+async fn packages_page_serves_tabs_wizard_and_nav_entry() {
+    helios_ui::set_package_admin(true);
+    let response = app()
+        .oneshot(Request::get("/ui/packages").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains(r#"href="/ui/packages" aria-current="page""#));
+    assert!(html.contains(r#"id="pkg-app""#));
+    for tab in ["installed", "market", "upload"] {
+        assert!(
+            html.contains(&format!(r#"data-pkg-tab="{tab}""#)),
+            "tab {tab}"
+        );
+        assert!(
+            html.contains(&format!(r#"id="pkg-pane-{tab}""#)),
+            "pane {tab}"
+        );
+    }
+    for step in ["tree", "options", "progress", "result"] {
+        assert!(
+            html.contains(&format!(r#"id="pkg-step-{step}""#)),
+            "step {step}"
+        );
+    }
+    assert!(html.contains(r#"class="data-table data-table--stack pkg-table""#));
+    assert!(html.contains(r#"class="table-wrap" tabindex="0""#));
+    assert!(html.contains(r#"accept=".tgz,.tar.gz,application/gzip,application/x-gzip""#));
+    assert!(html.contains(r#"src="/ui/assets/packages.js""#));
+    assert!(html.contains(r#"name="dependencyPolicy" value="newer" checked"#));
+    // Rendered copy, not just the attribute name.
+    assert!(html.contains(r#"data-m-action-embedded="built into the server""#));
+    assert!(html.contains(r#"data-m-remove-confirm="Type %name% to confirm""#));
+
+    // Every other page links it.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let home = body_text(response).await;
+    assert!(home.contains(r#"<a class="nav-item" href="/ui/packages""#));
+    assert!(!home.contains(r#"href="/ui/packages" aria-current"#));
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/packages?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zh = body_text(response).await;
+    assert!(zh.contains("IG 套件"), "{zh}");
+    assert!(zh.contains("瀏覽市集"));
+    assert!(zh.contains(r#"data-m-action-embedded="伺服器內建""#));
+}
+
+/// One installed package (`/ui/packages/{name}/{version}`): the shell with
+/// the name and version for the script, the remove dialog with its typed
+/// confirmation, and a 404 page for names that are not package names.
+#[tokio::test]
+async fn package_detail_page_carries_the_package_and_rejects_odd_names() {
+    helios_ui::set_package_admin(true);
+    let response = app()
+        .oneshot(
+            Request::get("/ui/packages/tw.gov.mohw.twcore/1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-name="tw.gov.mohw.twcore" data-version="1.0.0""#));
+    assert!(html.contains(r#"<dialog class="pkg-dialog" id="pkg-remove-dialog""#));
+    assert!(html.contains(r#"id="pkg-remove-submit" disabled"#));
+    assert!(html.contains(r#"href="/ui/packages" aria-current="page""#));
+    assert!(html.contains(r#"src="/ui/assets/packages.js""#));
+
+    for bad in [
+        "/ui/packages/bad%20name/1.0.0",
+        "/ui/packages/a/1%3Cscript%3E",
+        "/ui/packages/.hidden/1",
+    ] {
+        let response = app()
+            .oneshot(Request::get(bad).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{bad}");
+    }
+}
+
+/// The page script is served from the embedded assets and only ever writes
+/// remote package metadata as text.
+#[tokio::test]
+async fn packages_script_is_served_and_builds_dom_as_text() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/packages.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("/admin/packages"));
+    assert!(js.contains("registry/marketplace"));
+    assert!(
+        !js.contains("innerHTML"),
+        "remote data must not be parsed as HTML"
     );
 }
 
@@ -10070,4 +10725,23 @@ async fn editor_render_publishes_empty_issue_list_when_valid() {
     let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
     let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
     assert!(html.contains(r#"data-issues="[]""#), "{html}");
+}
+
+/* #1759: the Resources modal's History tab builds the same operation labels
+ * as the History page, from data attributes on #resource-history. */
+#[tokio::test]
+async fn resources_page_hands_the_history_operation_labels_to_the_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }

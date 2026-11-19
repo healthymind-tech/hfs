@@ -517,9 +517,14 @@ http_request_duration_seconds{service="hfs",...}                                
 uptime_seconds{service="hfs"}                                                                14691.53
 ```
 
-The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) adds
-its own series. Like the HTTP series they have no `hfs_` prefix, carry only the
-global `service` label, and have no tenant or resource-type label:
+The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) runs
+when `hfs` serves the web UI. On a headless start (`HFS_UI_ENABLED=false`, or a
+binary built without the `ui` feature), no dashboard startup seed or reconcile
+storage reads run, and none of the dashboard series below is published. Other
+`/metrics` series remain available.
+
+Like the HTTP series, the dashboard series have no `hfs_` prefix, carry only
+the global `service` label, and have no tenant or resource-type label:
 
 | Series | Type | Meaning |
 |--------|------|---------|
@@ -544,7 +549,7 @@ sampled at scrape time. Besides `service` their only label is `pool`:
 `primary` for the storage backend, and `audit` for the database audit sink
 (`HFS_AUDIT_BACKEND=database`), which opens its own pool even when it shares
 the primary database. SQLite, MongoDB and S3 export no `postgres_pool_*`
-series.
+series (MongoDB has its own, below).
 
 | Series | Type | Unit | Meaning |
 |--------|------|------|---------|
@@ -569,6 +574,79 @@ minutes), for example:
 ```
 min_over_time(postgres_pool_waiting_callers{pool="primary"}[5m]) > 0
 ```
+
+With a MongoDB primary (`HFS_STORAGE_BACKEND=mongodb` or
+`mongodb-elasticsearch`), the driver's connection pool is reported the same way,
+sampled at scrape time from the driver's connection-pool events. Besides
+`service` their only label is `pool`: `primary` for the storage backend, and
+`audit` for the audit sink when it opens its own client. The ceiling comes from
+`HFS_MONGODB_MAX_CONNECTIONS`, else the URI's `maxPoolSize`, else `10`.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `mongodb_pool_max_connections{pool}` | gauge | connections | The effective ceiling, per server |
+| `mongodb_pool_connections{pool}` | gauge | connections | Connections currently open, idle or in use |
+| `mongodb_pool_in_use_connections{pool}` | gauge | connections | Connections checked out by a caller |
+| `mongodb_pool_idle_connections{pool}` | gauge | connections | Open connections that can be checked out now |
+| `mongodb_pool_waiting_callers{pool}` | gauge | callers | Callers waiting for a connection |
+| `mongodb_pool_checkout_wait_seconds{pool}` | histogram | seconds | Time a caller waited to check out a connection |
+
+Caveats:
+
+- Against a replica set the driver keeps one pool per server. The connection,
+  in-use, idle and waiting series are summed across those pools, while
+  `mongodb_pool_max_connections` is the ceiling of one server, so the sum can
+  exceed it.
+- The Rust driver has no timeout for waiting on a pooled connection
+  (`waitQueueTimeoutMS` is ignored), so `mongodb_pool_waiting_callers` and the
+  checkout histogram are how saturation shows. A wait ends only when a
+  connection frees up or server selection or the request timeout expires.
+- The values are instantaneous at scrape time, as for PostgreSQL.
+
+A sustained-saturation alert, for example:
+
+```
+min_over_time(mongodb_pool_waiting_callers{pool="primary"}[5m]) > 0
+```
+
+With the native MongoDB backend (`HFS_STORAGE_BACKEND=mongodb`), a transaction
+Bundle of at least `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES`
+entries commits without its search rows and writes them right after the commit
+(#1975); what that step does not finish waits in the `search_index_pending`
+ledger for the repair task. Six series report the step and the ledger. Besides
+`service` their only label is `reason`, on the last one. Nothing in them names a
+tenant, a resource type or a Bundle.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `mongodb_deferred_search_index_pending_chunks` | gauge | ledger documents | Documents in the ledger after the latest repair pass, due or not |
+| `mongodb_deferred_search_index_oldest_pending_seconds` | gauge | seconds | Age of the oldest ledger document, `0` when the ledger is empty: a Bundle committed and not fully searchable for this long |
+| `mongodb_deferred_search_index_repair_failed_chunks_total` | counter | ledger documents | Documents a repair pass worked on and had to leave in place |
+| `mongodb_deferred_search_index_step_seconds` | histogram | seconds | Duration of each post-commit step |
+| `mongodb_deferred_search_index_step_rows_total` | counter | search rows | Rows written by post-commit steps |
+| `mongodb_deferred_search_index_steps_incomplete_total{reason}` | counter | steps | Steps that left work to the repair; `reason` is `deadline` or `failure` |
+
+Caveats:
+
+- The two gauges are set by the repair task, so they are as fresh as its last
+  pass (`HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`, 60 s by default), are
+  not exported while it is off (`0`), and keep the last successful pass's
+  values (the age does not grow) while passes fail. The ledger is shared by
+  every instance, so aggregate the gauges across instances with `max`.
+- The step series are per process and recorded when a step ends. The step's rows
+  per second is `rate(mongodb_deferred_search_index_step_rows_total[5m]) /
+  rate(mongodb_deferred_search_index_step_seconds_sum[5m])`.
+
+A Bundle left unsearchable beyond the repair's own lag (its minimum age, at
+least 60 s and the Bundle deadline, plus one interval), for example with the
+default 30 s request timeout:
+
+```
+max(mongodb_deferred_search_index_oldest_pending_seconds) > 300
+```
+
+See "Deferred search indexing for large MongoDB transaction Bundles" in
+`crates/persistence/README.md` for the meaning of each series and the log lines.
 
 Per-tenant stored-resource counts are **deliberately NOT exported to
 `/metrics`**. Tenant is never a metric label (see the rule in

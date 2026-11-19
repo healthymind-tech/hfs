@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -19,6 +19,7 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -61,18 +62,49 @@ pub async fn update_handler<S>(
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
-    FhirResource(resource): FhirResource,
+    FhirResource(mut resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope updates inside the launch patient's compartment only
+    // (#1618). Both ends are checked: the submitted payload must stay in the
+    // compartment, and the resource being replaced must already be in it —
+    // otherwise another patient's resource could be overwritten by one that
+    // names the launch patient. A deleted resource has no current payload to
+    // prove membership with, so it cannot be restored under this grant.
+    if compartment.is_confined() {
+        let registry = || state.storage().search_param_registry(tenant.context());
+        compartment.assert_member(registry, fhir_version, &resource, "update")?;
+        match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(Some(existing)) => compartment.assert_member(
+                registry,
+                existing.fhir_version(),
+                existing.content(),
+                "update",
+            )?,
+            Ok(None) => {}
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(compartment.outside_compartment(format!(
+                    "update of the deleted {resource_type}/{id} is not permitted under a patient/ scope: a deleted resource has no current payload to place it in the launch patient's compartment"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
@@ -113,14 +145,30 @@ where
         });
     }
 
-    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    // Empty-element cleanup (#2554) and write-path validation
+    // (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
-        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .prepare_write(
+            tenant.tenant_id(),
+            fhir_version,
+            &resource_type,
+            &mut resource,
+        )
         .await?;
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
 
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
@@ -256,6 +304,13 @@ where
             )
             .await?
     };
+    super::sof::terminology::commit_library_write(
+        &state,
+        tenant.context(),
+        stored.id(),
+        terminology,
+    )
+    .await;
     // A create — including the restore of a deleted resource, which storage
     // reports as created — adds a live resource; a plain update does not.
     super::write_event::report(
@@ -270,14 +325,11 @@ where
         )),
     );
 
-    // Stored StructureDefinitions feed the tenant's profile registry.
-    if resource_type == "StructureDefinition" {
-        state.validation().upsert_stored_profile(
-            tenant.tenant_id(),
-            fhir_version,
-            stored.content(),
-        );
-    }
+    // Stored StructureDefinitions and ImplementationGuides feed the
+    // tenant's profile registry and global profiles.
+    state
+        .validation()
+        .record_stored_resource(tenant.tenant_id(), fhir_version, stored.content());
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let status = if created {
@@ -294,8 +346,7 @@ where
         "Resource updated"
     );
 
-    let location = created
-        .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
+    let location = created.then(|| state.location_for_request(&tenant, &stored));
     build_update_response(
         status,
         &stored,
@@ -345,10 +396,10 @@ pub async fn conditional_update_handler<S>(
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
-    FhirResource(resource): FhirResource,
+    FhirResource(mut resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     super::conditional_support::require_update(state.storage())?;
 
@@ -383,14 +434,30 @@ where
         "Processing conditional update request"
     );
 
-    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    // Empty-element cleanup (#2554) and write-path validation
+    // (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
-        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .prepare_write(
+            tenant.tenant_id(),
+            fhir_version,
+            &resource_type,
+            &mut resource,
+        )
         .await?;
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
 
     // `If-Match` is honoured, not ignored (#1381). It is evaluated by the
     // backend, against the one resource the criteria resolve to and ahead of
@@ -412,16 +479,30 @@ where
         .map_err(|e| conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalUpdateResult;
+    if let ConditionalUpdateResult::Updated(stored) | ConditionalUpdateResult::Created(stored) =
+        &result
+    {
+        super::sof::terminology::commit_library_write(
+            &state,
+            tenant.context(),
+            stored.id(),
+            terminology,
+        )
+        .await;
+    }
     match result {
         ConditionalUpdateResult::Updated(stored) => {
-            // Conditional writes announce nothing.
+            // Announced like the unconditional update (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 fhir_version,
                 &resource_type,
                 0,
-                None,
+                Some(super::write_event::stored_notice(
+                    WriteKind::Update,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_update_response(
@@ -448,17 +529,20 @@ where
             })
         }
         ConditionalUpdateResult::Created(stored) => {
+            // The upsert created: announced as a create (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 fhir_version,
                 &resource_type,
                 1,
-                None,
+                Some(super::write_event::stored_notice(
+                    WriteKind::Create,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            let location =
-                state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
+            let location = state.location_for_request(&tenant, &stored);
             build_update_response(
                 StatusCode::CREATED,
                 &stored,

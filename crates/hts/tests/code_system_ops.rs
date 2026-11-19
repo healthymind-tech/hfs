@@ -15,9 +15,9 @@ use common::{TestApp, bundles};
 // ── $lookup ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_existing_code_returns_display() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -41,9 +41,9 @@ async fn lookup_existing_code_returns_display() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_nested_code_returns_correct_display() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -66,9 +66,9 @@ async fn lookup_nested_code_returns_correct_display() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_unknown_code_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -81,9 +81,9 @@ async fn lookup_unknown_code_returns_404() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_unknown_system_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -98,9 +98,9 @@ async fn lookup_unknown_system_returns_404() {
 // ── $validate-code ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn validate_existing_code_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -123,9 +123,9 @@ async fn validate_existing_code_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn validate_nonexistent_code_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -145,6 +145,129 @@ async fn validate_nonexistent_code_returns_false() {
         .expect("expected a result parameter");
 
     assert!(!result, "unknown code should return false");
+}
+
+// ── Versioned canonicals (`url|version`, #2122) ───────────────────────────────
+
+/// Anatomy 2.0: same URL as the shared bundle's 1.0, but `arm` has a different
+/// display and `leg` is gone, so each version is distinguishable.
+#[cfg(feature = "sqlite")]
+const ANATOMY_V2_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{
+  "resourceType":"CodeSystem","id":"anatomy-v2","url":"http://hts.test/anatomy","version":"2.0",
+  "name":"AnatomyCS2","status":"active","content":"complete",
+  "concept":[{"code":"arm","display":"Upper limb"}]}}]}"#;
+
+#[cfg(feature = "sqlite")]
+fn param<'a>(body: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    body["parameter"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+}
+
+/// `system=X|V` looks up version V, the same as `system=X` + `version=V`;
+/// an unknown version is not found.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_accepts_a_versioned_canonical_system() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+
+    for (version, display) in [("1.0", "Arm"), ("2.0", "Upper limb")] {
+        let system = format!("{}|{version}", bundles::ANATOMY_CS_URL);
+        let req = TestApp::params(&[
+            ("system", "valueUri", &system),
+            ("code", "valueCode", "arm"),
+        ]);
+        let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::OK, "{version}: {body}");
+        assert_eq!(
+            param(&body, "display").unwrap()["valueString"],
+            display,
+            "{body}"
+        );
+        assert_eq!(
+            param(&body, "version").unwrap()["valueString"],
+            version,
+            "{body}"
+        );
+    }
+
+    // GET form: the pipe arrives percent-encoded.
+    let (status, body) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$lookup?system={}%7C1.0&code=arm",
+            bundles::ANATOMY_CS_URL
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Arm");
+
+    let system = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+    let req = TestApp::params(&[
+        ("system", "valueUri", &system),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// `url=X|V` (and the `system` alias) validates against version V, the same
+/// as `url=X` + `version=V`. A conflicting explicit `version` is a 400.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+    let validate = |entries: &[(&str, &str, &str)]| {
+        let req = TestApp::params(entries);
+        let app = &app;
+        async move {
+            let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result = param(&body, "result").and_then(|p| p["valueBoolean"].as_bool());
+            (result, body)
+        }
+    };
+    let v1 = format!("{}|1.0", bundles::ANATOMY_CS_URL);
+    let v2 = format!("{}|2.0", bundles::ANATOMY_CS_URL);
+    let v9 = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+
+    // `leg` exists only in 1.0.
+    for (name, url, expected) in [
+        ("url", &v1, true),
+        ("url", &v2, false),
+        ("system", &v1, true),
+        ("system", &v2, false),
+    ] {
+        let (result, body) =
+            validate(&[(name, "valueUri", url), ("code", "valueCode", "leg")]).await;
+        assert_eq!(result, Some(expected), "{name}={url}: {body}");
+        assert_eq!(
+            param(&body, "version").map(|p| &p["valueString"]),
+            Some(&serde_json::json!(url.rsplit_once('|').unwrap().1)),
+            "{body}"
+        );
+    }
+
+    let (result, body) = validate(&[("url", "valueUri", &v9), ("code", "valueCode", "arm")]).await;
+    assert_eq!(
+        result,
+        Some(false),
+        "unknown version must not validate: {body}"
+    );
+
+    // Fork rule (9eab3e5d7): a piped version that disagrees with an explicit
+    // `version` is a 400, not "explicit wins" as upstream decided.
+    let req = TestApp::params(&[
+        ("url", "valueUri", &v1),
+        ("version", "valueString", "2.0"),
+        ("code", "valueCode", "leg"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "conflicting versions: {body}");
 }
 
 // ── $subsumes ─────────────────────────────────────────────────────────────────
@@ -175,53 +298,53 @@ async fn subsumes_outcome(app: &TestApp, code_a: &str, code_b: &str) -> String {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_self_is_equivalent() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     assert_eq!(subsumes_outcome(&app, "body", "body").await, "equivalent");
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_parent_child_is_subsumes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     // body is an ancestor of limb
     assert_eq!(subsumes_outcome(&app, "body", "limb").await, "subsumes");
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_grandparent_grandchild_is_subsumes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     // body is an ancestor of arm (two levels)
     assert_eq!(subsumes_outcome(&app, "body", "arm").await, "subsumes");
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_child_parent_is_subsumed_by() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     // limb is a descendant of body
     assert_eq!(subsumes_outcome(&app, "limb", "body").await, "subsumed-by");
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_siblings_are_not_subsumed() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     // arm and leg are siblings — no subsumption relationship
     assert_eq!(subsumes_outcome(&app, "arm", "leg").await, "not-subsumed");
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn subsumes_unrelated_branches_are_not_subsumed() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
     // head and arm are in different branches under body
     assert_eq!(subsumes_outcome(&app, "head", "arm").await, "not-subsumed");
@@ -230,9 +353,9 @@ async fn subsumes_unrelated_branches_are_not_subsumed() {
 // ── GET /CodeSystem (search) ──────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_no_filter_returns_bundle() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/CodeSystem").await;
@@ -245,9 +368,9 @@ async fn search_code_systems_no_filter_returns_bundle() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_by_url_returns_match() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let url = format!("/CodeSystem?url={}", bundles::ANATOMY_CS_URL);
@@ -260,9 +383,9 @@ async fn search_code_systems_by_url_returns_match() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_by_url_no_match_returns_empty_bundle() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app
@@ -277,9 +400,9 @@ async fn search_code_systems_by_url_no_match_returns_empty_bundle() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_by_name() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/CodeSystem?name=AnatomyCS").await;
@@ -291,9 +414,9 @@ async fn search_code_systems_by_name() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_by_status() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/CodeSystem?status=active").await;
@@ -308,9 +431,9 @@ async fn search_code_systems_by_status() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_code_systems_pagination_count_and_offset() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     // Import the same bundle twice under different URLs via two separate bundles.
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
@@ -331,9 +454,9 @@ async fn search_code_systems_pagination_count_and_offset() {
 
 /// $lookup with `Accept: application/fhir+xml` should return valid FHIR XML.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_xml_response_contains_parameters_root() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -352,9 +475,9 @@ async fn lookup_xml_response_contains_parameters_root() {
 
 /// $lookup with `_format=xml` in the query string should also return XML.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_xml_via_format_query_param() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -371,9 +494,9 @@ async fn lookup_xml_via_format_query_param() {
 
 /// GET /metadata with `Accept: application/fhir+xml` returns XML CapabilityStatement.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metadata_xml_response_contains_capability_statement_root() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let (status, body, ct) = app.get_fhir_xml("/metadata").await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -390,9 +513,9 @@ async fn metadata_xml_response_contains_capability_statement_root() {
 
 /// GET /metadata?_format=xml returns XML even without Accept header.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn metadata_xml_via_format_query_param() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     // Use get_fhir_xml with the _format=xml query param.
     let (status, body, _ct) = app.get_fhir_xml("/metadata?_format=xml").await;
 
@@ -407,9 +530,9 @@ async fn metadata_xml_via_format_query_param() {
 
 /// POST /CodeSystem/{id}/$lookup returns same result as the system-level endpoint.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_post_returns_same_as_system_level() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // System-level lookup
@@ -451,9 +574,9 @@ async fn lookup_by_id_post_returns_same_as_system_level() {
 
 /// GET /CodeSystem/{id}/$lookup?code=... returns the correct concept.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_get_returns_display() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/CodeSystem/anatomy/$lookup?code=leg").await;
@@ -474,9 +597,9 @@ async fn lookup_by_id_get_returns_display() {
 
 /// POST /CodeSystem/{id}/$lookup with an unknown ID returns 404.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lookup_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, _body) = app
@@ -504,7 +627,7 @@ async fn lookup_by_id_unknown_id_returns_404() {
 const PIN_CS_URL: &str = "http://hts.test/cs/pinned";
 
 async fn app_with_two_versions() -> TestApp {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     let bundle = serde_json::json!({
         "resourceType": "Bundle",
         "type": "collection",
@@ -537,7 +660,7 @@ fn result_of(body: &serde_json::Value) -> bool {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn validate_code_unpinned_resolves_newest_version() {
     let app = app_with_two_versions().await;
 
@@ -567,7 +690,7 @@ async fn validate_code_unpinned_resolves_newest_version() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn validate_code_honours_system_version_param() {
     let app = app_with_two_versions().await;
 
@@ -591,7 +714,7 @@ async fn validate_code_honours_system_version_param() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn validate_code_honours_canonical_system_version_pin() {
     let app = app_with_two_versions().await;
     let pin = format!("{PIN_CS_URL}|1.0.0");
@@ -612,7 +735,7 @@ async fn validate_code_honours_canonical_system_version_pin() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn force_system_version_overrides_an_explicit_version() {
     let app = app_with_two_versions().await;
     let pin = format!("{PIN_CS_URL}|1.0.0");
@@ -639,7 +762,7 @@ async fn force_system_version_overrides_an_explicit_version() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn explicit_version_beats_default_system_version_pin() {
     let app = app_with_two_versions().await;
     let pin = format!("{PIN_CS_URL}|1.0.0");

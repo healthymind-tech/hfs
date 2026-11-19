@@ -13,6 +13,8 @@
 //! `concept_maps`, and their child tables (properties, designations, group
 //! elements) — plus `concept_closure` used by `$closure`.
 
+use std::collections::{HashMap, VecDeque};
+
 /// SQL DDL for the HTS SQLite schema.
 ///
 /// All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
@@ -50,7 +52,17 @@ CREATE TABLE IF NOT EXISTS code_systems (
     -- database behaves exactly as it did before. Had this defaulted to 0 the
     -- upsert below could not distinguish 'asserted authoritative' from 'never
     -- asserted', and a re-imported copy could not demote itself.
-    authority_rank INTEGER
+    authority_rank INTEGER,
+    -- Byte-sortable key derived from `version` (see `version_order.rs`), so
+    -- `ORDER BY version_sort DESC` picks the semantically newest version
+    -- (10.0.0 above 9.0.0 above 2018-08-12) instead of the textually largest.
+    -- Recomputed on every write; backfilled by `migrate_version_sort`.
+    version_sort  TEXT,
+    -- 1 = an operator pinned this row as the current version of `url`
+    -- (admin API `PUT /admin/code-systems/current`). At most one row per url
+    -- carries it; the precedence ORDER BY ranks it above version order. NULL
+    -- (the default) leaves the semantic newest version current.
+    current_pin   INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -134,7 +146,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
     updated_at    TEXT NOT NULL,
     resource_json TEXT,
     -- See code_systems.authority_rank.
-    authority_rank INTEGER
+    authority_rank INTEGER,
+    -- See code_systems.version_sort.
+    version_sort  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
@@ -160,6 +174,17 @@ CREATE TABLE IF NOT EXISTS value_set_expansions (
     PRIMARY KEY (value_set_id, system_url, code)
 );
 
+-- What a cached expansion was computed from: every code system and value set
+-- canonical its compose names, transitively through `include.valueSet`. A
+-- CodeSystem or ValueSet write drops the cached expansions that depend on its
+-- url, including ones in which that system contributed no row at all.
+CREATE TABLE IF NOT EXISTS value_set_dependencies (
+    value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
+    dep_url      TEXT NOT NULL,
+    PRIMARY KEY (value_set_id, dep_url)
+);
+CREATE INDEX IF NOT EXISTS idx_value_set_dependencies_url ON value_set_dependencies(dep_url);
+
 -- ── Implicit expansion cache ───────────────────────────────────────────────────
 -- Caches expansions for implicit ValueSet URLs (e.g. ?fhir_vs patterns) that
 -- have no corresponding row in value_sets. Keyed by the full URL string.
@@ -174,17 +199,27 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
     ON implicit_expansion_cache(url);
 CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
     ON implicit_expansion_cache(url, code);
+-- Per-system invalidation on CodeSystem (re)import probes this before
+-- touching implicit_expansion_fts, whose system_url column is UNINDEXED.
+CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_system
+    ON implicit_expansion_cache(system_url);
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
+-- Multi-version like code_systems / value_sets: one row per (url, version).
+-- Databases created with the old `url TEXT NOT NULL UNIQUE` are rebuilt by
+-- `migrate_concept_maps_drop_url_unique`.
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
+    url         TEXT NOT NULL,
     version     TEXT,
     source_uri  TEXT,
     target_uri  TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
     created_at  TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+    ON concept_maps(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_map_elements (
@@ -222,6 +257,17 @@ USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
 CREATE VIRTUAL TABLE IF NOT EXISTS implicit_expansion_word_fts
 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
            tokenize='unicode61 remove_diacritics 1');
+
+-- ── Implicit-expansion FTS tracker ─────────────────────────────────────────────
+-- One row per implicit-expansion url whose rows are in implicit_expansion_fts
+-- and implicit_expansion_word_fts. `url` is UNINDEXED there, so finding or
+-- deleting a url's rows by it scans every url's rows; instead each url owns
+-- the rowid block [block << 32, (block + 1) << 32), which FTS5 seeks directly.
+-- A url has FTS rows iff it has a row here (see `ensure_implicit_fts`).
+CREATE TABLE IF NOT EXISTS implicit_expansion_fts_built (
+    block INTEGER PRIMARY KEY,
+    url   TEXT NOT NULL UNIQUE
+);
 
 -- ── FTS5 trigram index for direct concept text search ─────────────────────────
 -- Enables fast substring matching on concepts.code and concepts.display.
@@ -278,6 +324,61 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
 
+-- ── Reference set membership ──────────────────────────────────────────────────
+-- Active members of SNOMED CT Simple reference sets (RF2
+-- der2_Refset_Simple*): ECL `^ refset` and `?fhir_vs=refset/<id>` read it.
+-- Replaced per system on re-import; goes with the CodeSystem row.
+CREATE TABLE IF NOT EXISTS refset_members (
+    system_id       TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    refset_id       TEXT NOT NULL,
+    referenced_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, refset_id, referenced_code)
+) WITHOUT ROWID;
+
+-- ── SNOMED CT concept model ───────────────────────────────────────────────────
+-- What the in-memory SNOMED CT model (`crate::snomed::model`) is built from:
+-- per-concept status, definition status, effective time, module and active /
+-- inactive description terms (in description id order, newline-separated);
+-- every active inferred relationship with its group (is-a included, concrete
+-- values marked); and the MRCM attribute domain and range rules. Written by
+-- the RF2 importer, replaced per system on re-import. `snomed_model_stamps`
+-- names the import, so a cached model is rebuilt after a re-import.
+CREATE TABLE IF NOT EXISTS snomed_concepts (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    code           TEXT NOT NULL,
+    active         INTEGER NOT NULL,
+    primitive      INTEGER NOT NULL,
+    effective_time TEXT,
+    module_id      TEXT,
+    terms          TEXT NOT NULL DEFAULT '',
+    inactive_terms TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (system_id, code)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS snomed_relationships (
+    system_id   TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    source_code TEXT NOT NULL,
+    rel_group   INTEGER NOT NULL,
+    type_code   TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    concrete    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_relationships_system
+    ON snomed_relationships(system_id);
+CREATE TABLE IF NOT EXISTS snomed_mrcm (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    kind           TEXT NOT NULL,
+    attribute_code TEXT NOT NULL,
+    c1             TEXT NOT NULL,
+    c2             TEXT NOT NULL,
+    c3             TEXT NOT NULL,
+    c4             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_mrcm_system ON snomed_mrcm(system_id);
+CREATE TABLE IF NOT EXISTS snomed_model_stamps (
+    system_id TEXT PRIMARY KEY REFERENCES code_systems(id) ON DELETE CASCADE,
+    stamp     TEXT NOT NULL
+);
+
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the
@@ -302,7 +403,49 @@ CREATE TABLE IF NOT EXISTS bootstrap_imports (
 ///
 /// Safe to call on every startup — all statements are idempotent.
 pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // Must look at the database before SCHEMA creates the tracker table.
+    migrate_implicit_fts_blocks(conn)?;
     conn.execute_batch(SCHEMA)
+}
+
+/// Drop implicit-expansion FTS rows written before the rowid-block tracker
+/// (`implicit_expansion_fts_built`) existed.
+///
+/// Those rows have arbitrary rowids, so they can neither be found by block nor
+/// told apart from new rows. The tables are a lazily rebuilt cache of
+/// `implicit_expansion_cache`, normally empty (filtered implicit expansions
+/// are served from the in-memory index), so they are dropped and SCHEMA
+/// recreates them. The checks are a `sqlite_master` lookup and a one-row
+/// probe; nothing is scanned.
+pub fn migrate_implicit_fts_blocks(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |r| r.get(0),
+        )
+    };
+    if table_exists("implicit_expansion_fts_built")? || !table_exists("implicit_expansion_fts")? {
+        return Ok(());
+    }
+    let mut legacy = false;
+    for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+        if table_exists(table)? {
+            legacy |= conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                [],
+                |r| r.get::<_, bool>(0),
+            )?;
+        }
+    }
+    if legacy {
+        tracing::info!("dropping implicit-expansion FTS rows written without a rowid block");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS implicit_expansion_fts;
+             DROP TABLE IF EXISTS implicit_expansion_word_fts;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Build (or rebuild) the transitive ancestor closure for one code system.
@@ -322,11 +465,17 @@ pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 /// per row.  Without this, autocommit INSERTs on EBS-backed CI storage
 /// (~1 500 IOPS) would take ~7 hours for SNOMED.
 pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> rusqlite::Result<()> {
-    use std::collections::{HashMap, VecDeque};
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    build_concept_closure_in_transaction(&tx, system_id)?;
+    tx.commit()
+}
 
-    // Load all concept codes for this system (reads run outside the write
-    // transaction — cheap on WAL, and avoids holding an exclusive lock while
-    // we build the in-memory graph).
+/// Build closure within the caller's transaction, including uncommitted concepts.
+pub(crate) fn build_concept_closure_in_transaction(
+    conn: &rusqlite::Connection,
+    system_id: &str,
+) -> rusqlite::Result<()> {
+    // Read concepts and hierarchy from the same transaction snapshot.
     let concepts: Vec<String> = {
         let mut stmt = conn.prepare_cached("SELECT code FROM concepts WHERE system_id = ?1")?;
         stmt.query_map(rusqlite::params![system_id], |r| r.get::<_, String>(0))?
@@ -368,60 +517,49 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
         }
     }
 
-    // All data is now in memory. Open an exclusive write transaction so all
-    // BFS inserts commit in one WAL write instead of one fsync per row.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let write_result: rusqlite::Result<()> = (|| {
-        conn.execute(
-            "DELETE FROM concept_closure WHERE system_id = ?1",
-            rusqlite::params![system_id],
-        )?;
+    // The caller owns the transaction covering all BFS inserts.
+    conn.execute(
+        "DELETE FROM concept_closure WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
 
-        // BFS from every concept to enumerate all its descendants (including self).
-        // A u32 generation counter replaces a boolean visited array: the generation
-        // for BFS from concept at index anc_idx is anc_idx+1, which is always
-        // distinct from all previous and future BFS generations.
-        let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
-        let mut queue: VecDeque<usize> = VecDeque::new();
+    // BFS from every concept to enumerate all its descendants (including self).
+    // A u32 generation counter replaces a boolean visited array: the generation
+    // for BFS from concept at index anc_idx is anc_idx+1, which is always
+    // distinct from all previous and future BFS generations.
+    let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
+    let mut queue: VecDeque<usize> = VecDeque::new();
 
-        let mut insert_stmt = conn.prepare_cached(
-            "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
-             VALUES (?1, ?2, ?3)",
-        )?;
+    let mut insert_stmt = conn.prepare_cached(
+        "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
+         VALUES (?1, ?2, ?3)",
+    )?;
 
-        for anc_idx in 0..concepts.len() {
-            let g = (anc_idx as u32) + 1;
+    for anc_idx in 0..concepts.len() {
+        let g = (anc_idx as u32) + 1;
 
-            queue.clear();
-            queue.push_back(anc_idx);
+        queue.clear();
+        queue.push_back(anc_idx);
 
-            while let Some(idx) = queue.pop_front() {
-                if visit_gen[idx] == g {
-                    continue;
-                }
-                visit_gen[idx] = g;
+        while let Some(idx) = queue.pop_front() {
+            if visit_gen[idx] == g {
+                continue;
+            }
+            visit_gen[idx] = g;
 
-                insert_stmt.execute(rusqlite::params![
-                    system_id,
-                    &concepts[anc_idx],
-                    &concepts[idx],
-                ])?;
+            insert_stmt.execute(rusqlite::params![
+                system_id,
+                &concepts[anc_idx],
+                &concepts[idx],
+            ])?;
 
-                for &ci in &children[idx] {
-                    if visit_gen[ci] != g {
-                        queue.push_back(ci);
-                    }
+            for &ci in &children[idx] {
+                if visit_gen[ci] != g {
+                    queue.push_back(ci);
                 }
             }
         }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return write_result;
     }
-    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
@@ -433,28 +571,52 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
 /// correctly without rebuilding the existing closure.
 ///
 /// Called once at startup so that existing databases (imported before the
-/// closure table was introduced) are migrated automatically.
-pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+/// closure table was introduced) are migrated automatically, and again after a
+/// chunked `POST /import?finalize=true` — see
+/// [`BundleImportBackend::rebuild_missing_closures`](crate::import::BundleImportBackend::rebuild_missing_closures).
+///
+/// Returns the number of systems rebuilt, so callers can log whether any work
+/// happened rather than guessing.
+pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     // Find every system that has hierarchy edges but no closure rows at all.
+    //
+    // One indexed probe per stored CodeSystem rather than a correlated
+    // `NOT EXISTS` over every hierarchy row: once `ANALYZE` has run on a
+    // database holding a single large closure (a fresh SNOMED CT load),
+    // `sqlite_stat1` says `system_id = ?` matches every closure row, and
+    // SQLite 3.48 then plans the subquery as a full `SCAN` of
+    // `concept_closure` — once per hierarchy row. Importing LOINC next to
+    // SNOMED turned that into 176 k scans of 7.7 M rows (hours of CPU, no
+    // I/O). `INDEXED BY` pins the seek regardless of the statistics.
     let systems_needing_closure: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT h.system_id
-             FROM   concept_hierarchy h
-             WHERE  NOT EXISTS (
-                        SELECT 1 FROM concept_closure c
-                        WHERE  c.system_id = h.system_id
-                        LIMIT  1
-                    )",
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM code_systems")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut has_edges = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM concept_hierarchy INDEXED BY idx_hierarchy_child
+                           WHERE system_id = ?1)",
         )?;
-        stmt.query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
+        let mut has_closure = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM concept_closure INDEXED BY idx_closure_descendant
+                           WHERE system_id = ?1)",
+        )?;
+        let mut out = Vec::new();
+        for id in ids {
+            let edges: bool = has_edges.query_row([&id], |r| r.get(0))?;
+            if edges && !has_closure.query_row([&id], |r| r.get::<_, bool>(0))? {
+                out.push(id);
+            }
+        }
+        out
     };
 
     for sid in &systems_needing_closure {
         build_concept_closure(conn, sid)?;
     }
 
-    Ok(())
+    Ok(systems_needing_closure.len())
 }
 
 /// Add search-related columns to the existing tables.
@@ -556,6 +718,323 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
         }
     }
 
+    Ok(())
+}
+
+/// Add `version_sort` to `code_systems` / `value_sets` and backfill it for
+/// every versioned row that does not have one yet.
+///
+/// The key is computed in Rust ([`crate::version_order::version_sort_key`])
+/// because SQL has no portable way to express the numeric-then-date-then-text
+/// ordering. Idempotent: the `ALTER TABLE` is skipped when the column exists
+/// and the backfill only touches rows whose key is `NULL`, so a database
+/// written by an older binary (which leaves the column `NULL`) converges on
+/// the next start.
+pub fn migrate_version_sort(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for table in ["code_systems", "value_sets", "concept_maps"] {
+        match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN version_sort TEXT")) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+        backfill_version_sort(conn, table)?;
+    }
+    Ok(())
+}
+
+/// Add the operator-controlled `current_pin` column to `code_systems`.
+///
+/// Must run after the `drop_url_unique` rebuild (which recreates the table with
+/// a fixed column list). Idempotent; no backfill — `NULL` means "not pinned".
+pub fn migrate_current_pin(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    match conn.execute_batch("ALTER TABLE code_systems ADD COLUMN current_pin INTEGER") {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Add the JSON-derived search columns behind the `supplements` and
+/// `publisher` search parameters.
+///
+/// They are `VIRTUAL` generated columns: computed from `resource_json` when
+/// read, so existing rows become searchable immediately — nothing is
+/// backfilled or rewritten, and every write path stays correct without
+/// knowing about them. Searches select them only when filtering on them.
+/// `json_valid` guards keep a malformed stored document from turning a
+/// search into an error. Idempotent; must run after the `drop_url_unique`
+/// rebuilds (fixed column lists).
+pub fn migrate_search_param_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    for sql in [
+        "ALTER TABLE code_systems ADD COLUMN supplements TEXT GENERATED ALWAYS AS \
+         (CASE WHEN content = 'supplement' AND json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.supplements') END) VIRTUAL",
+        "ALTER TABLE code_systems ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+        "ALTER TABLE value_sets ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+        "ALTER TABLE concept_maps ADD COLUMN publisher TEXT GENERATED ALWAYS AS \
+         (CASE WHEN json_valid(resource_json) \
+               THEN json_extract(resource_json, '$.publisher') END) VIRTUAL",
+    ] {
+        match conn.execute_batch(sql) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn backfill_version_sort(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<()> {
+    let pending: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, version FROM {table} \
+             WHERE version IS NOT NULL AND version_sort IS NULL"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the whole backfill: ~24k individual autocommit
+    // UPDATEs on a 2 GB database took five minutes; batched they take seconds.
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> rusqlite::Result<()> {
+        let mut update = conn.prepare(&format!(
+            "UPDATE {table} SET version_sort = ?1 WHERE id = ?2"
+        ))?;
+        for (id, version) in &pending {
+            let key = crate::version_order::version_sort_key(Some(version));
+            update.execute(rusqlite::params![key, id])?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
+    }
+    conn.execute_batch("COMMIT")?;
+    tracing::info!(
+        table,
+        rows = pending.len(),
+        "Backfilled version_sort keys for semantic version ordering"
+    );
+    Ok(())
+}
+
+/// One-time backfill: derive `concept_hierarchy` edges from stored
+/// `subsumedBy` / `parent` concept properties for CodeSystems that were
+/// imported before the parser recognised `subsumedBy` as a hierarchy edge
+/// (the HL7 v3 code systems on terminology.hl7.org — v3-ActCode etc. — use a
+/// flat concept list with `subsumedBy`). Without this, `is-a` filters such as
+/// the Encounter.class binding (`_ActEncounterCode`) and `$subsumes` see no
+/// hierarchy until the package is re-imported.
+///
+/// Only systems with far fewer hierarchy rows than property edges are touched
+/// (so a correctly imported system is left alone); their closure rows are
+/// dropped so `migrate_concept_closure` rebuilds them on the same start.
+/// Uses the `bootstrap_imports` sentinel pattern of [`migrate_icd9cm_reimport`].
+pub fn migrate_property_hierarchy(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+
+    const MARKER: &str = "#migration:hierarchy-from-subsumedby-p1b";
+
+    let already_ran: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    let affected: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT c.system_id
+             FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             WHERE cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+             GROUP BY c.system_id
+             HAVING COUNT(*) > 2 * (SELECT COUNT(*) FROM concept_hierarchy h
+                                    WHERE h.system_id = c.system_id)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for sid in &affected {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT c.system_id, cp.value, c.code
+             FROM concept_properties cp
+             JOIN concepts c ON c.id = cp.concept_id
+             WHERE c.system_id = ?1
+               AND cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+               AND cp.value <> c.code",
+            [sid],
+        )?;
+        conn.execute("DELETE FROM concept_closure WHERE system_id = ?1", [sid])?;
+        tracing::info!(
+            system_id = %sid,
+            edges = inserted,
+            "Derived concept_hierarchy edges from subsumedBy/parent properties"
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [MARKER],
+    )?;
+    Ok(())
+}
+
+/// One-time repair for the p25-data2 fixes; see the PostgreSQL twin
+/// `migrate_p25_data2_pg`.
+pub fn migrate_p25_data2(conn: &rusqlite::Connection) -> Result<(), crate::error::HtsError> {
+    use crate::import::bundle_parser::{
+        ADVISORY_VERSION_SYSTEMS, P25_DATA2_MIGRATION_MARKER, strip_advisory_versions,
+    };
+    use rusqlite::OptionalExtension;
+    let db = |e: rusqlite::Error| crate::error::HtsError::StorageError(e.to_string());
+    let done: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [P25_DATA2_MIGRATION_MARKER],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db)?
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for system in ADVISORY_VERSION_SYSTEMS {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, compose_json FROM value_sets
+                  WHERE compose_json LIKE '%' || ?1 || '%' AND compose_json LIKE '%\"version\"%'",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([system], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(db)?;
+        for row in rows {
+            let (id, compose) = row.map_err(db)?;
+            if let Some(c) = compose
+                && !candidates.iter().any(|(i, _)| *i == id)
+            {
+                candidates.push((id, c));
+            }
+        }
+    }
+    for (id, text) in candidates {
+        let Ok(mut compose) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if strip_advisory_versions(&mut compose) {
+            conn.execute(
+                "UPDATE value_sets SET compose_json = ?2 WHERE id = ?1",
+                rusqlite::params![id, compose.to_string()],
+            )
+            .map_err(db)?;
+            conn.execute("DELETE FROM value_set_expansions WHERE value_set_id = ?1", [&id])
+                .map_err(db)?;
+        }
+    }
+    let cached: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT e.value_set_id FROM value_set_expansions e
+                  WHERE NOT EXISTS (SELECT 1 FROM value_set_dependencies d
+                                     WHERE d.value_set_id = e.value_set_id)",
+            )
+            .map_err(db)?;
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?
+    };
+    for id in &cached {
+        crate::backends::sqlite::record_value_set_dependencies(conn, id)?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [P25_DATA2_MIGRATION_MARKER],
+    )
+    .map_err(db)?;
+    Ok(())
+}
+
+/// One-time repair for the p25-data fixes; see the PostgreSQL twin
+/// `migrate_p25_data_pg`. Must run before [`migrate_concept_closure`].
+pub fn migrate_p25_data(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use crate::import::bundle_parser::{
+        CDCREC_URL, P25_DATA_MIGRATION_MARKER, P25_DATA_SYSTEMS, cdcrec_edges,
+    };
+    use rusqlite::OptionalExtension;
+    let done: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [P25_DATA_MIGRATION_MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    let flat: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT cs.id FROM code_systems cs WHERE cs.url = ?1
+               AND NOT EXISTS (SELECT 1 FROM concept_hierarchy h WHERE h.system_id = cs.id)
+               AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id)",
+        )?;
+        stmt.query_map([CDCREC_URL], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut edges = 0usize;
+    for sid in &flat {
+        let mut insert = conn.prepare_cached(
+            "INSERT OR IGNORE INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT ?1, ?2, ?3
+              WHERE EXISTS (SELECT 1 FROM concepts WHERE system_id = ?1 AND code = ?2)
+                AND EXISTS (SELECT 1 FROM concepts WHERE system_id = ?1 AND code = ?3)",
+        )?;
+        for (child, parent) in cdcrec_edges() {
+            edges += insert.execute(rusqlite::params![sid, parent, child])?;
+        }
+    }
+    let mut cleared = 0usize;
+    for system in P25_DATA_SYSTEMS {
+        cleared += conn.execute(
+            "DELETE FROM value_set_expansions WHERE system_url = ?1
+                OR value_set_id IN (SELECT id FROM value_sets
+                                     WHERE compose_json LIKE '%' || ?1 || '%'
+                                        OR compose_json LIKE '%\"valueSet\"%')",
+            [system],
+        )?;
+        cleared += conn.execute(
+            "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
+            [system],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [P25_DATA_MIGRATION_MARKER],
+    )?;
+    tracing::info!(
+        cdcrec_edges = edges,
+        cleared_expansion_rows = cleared,
+        "p25-data migration: CDCREC hierarchy, CDCREC/UCUM expansion cache"
+    );
     Ok(())
 }
 
@@ -686,6 +1165,68 @@ pub fn migrate_code_systems_drop_url_unique(
     tx.commit()
 }
 
+/// Drop the legacy `UNIQUE` constraint on `concept_maps.url`, so several
+/// versions of a ConceptMap can be stored (before, importing version 2
+/// replaced version 1, whichever was imported last). Mirror of
+/// [`migrate_code_systems_drop_url_unique`].
+///
+/// Foreign keys are switched off for the rebuild: with them on, dropping the
+/// old table would cascade-delete every `concept_map_elements` row.
+/// Idempotent: a no-op once the rebuild has run. Must run after
+/// [`migrate_search_columns`] (which adds `name`, `title`, `resource_json`)
+/// and before the migrations that add columns to `concept_maps`.
+pub fn migrate_concept_maps_drop_url_unique(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let needs_rebuild: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='concept_maps' \
+               AND sql LIKE '%url%TEXT%NOT NULL%UNIQUE%'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !needs_rebuild {
+        return Ok(());
+    }
+    let fk_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let result = (|| {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE concept_maps_new (
+                 id            TEXT PRIMARY KEY,
+                 url           TEXT NOT NULL,
+                 version       TEXT,
+                 source_uri    TEXT,
+                 target_uri    TEXT,
+                 status        TEXT NOT NULL DEFAULT 'active',
+                 created_at    TEXT NOT NULL,
+                 name          TEXT,
+                 title         TEXT,
+                 resource_json TEXT
+             );
+             INSERT INTO concept_maps_new
+                 (id, url, version, source_uri, target_uri, status, created_at, name, title,
+                  resource_json)
+             SELECT id, url, version, source_uri, target_uri, status, created_at, name, title,
+                    resource_json
+               FROM concept_maps;
+             DROP TABLE concept_maps;
+             ALTER TABLE concept_maps_new RENAME TO concept_maps;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+                 ON concept_maps(url, COALESCE(version, ''));
+             CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);",
+        )?;
+        tx.commit()
+    })();
+    if fk_on {
+        conn.execute_batch("PRAGMA foreign_keys=ON")?;
+    }
+    result
+}
+
 /// Drop the legacy `UNIQUE` constraint on `value_sets.url`. Mirror of
 /// [`migrate_code_systems_drop_url_unique`] for the value_sets table — the
 /// HL7 tx-ecosystem ships per-version ValueSet fixtures (e.g.
@@ -775,6 +1316,8 @@ mod tests {
             "concepts_word_fts",
             "concepts_search_fts",
             "concepts_fts_built",
+            "implicit_expansion_fts_built",
+            "refset_members",
         ];
 
         for table in &expected_tables {
@@ -787,6 +1330,41 @@ mod tests {
                 .unwrap_or(0);
             assert_eq!(count, 1, "table '{table}' should exist after migration");
         }
+    }
+
+    /// Implicit-expansion FTS rows written before the rowid-block tracker
+    /// existed cannot be found by block, so the first start with the tracker
+    /// drops them (the tables are a lazily rebuilt cache); later starts keep
+    /// what was built.
+    #[test]
+    fn legacy_implicit_fts_rows_are_dropped_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE implicit_expansion_fts
+                 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+                            tokenize='trigram case_sensitive 0');
+             CREATE VIRTUAL TABLE implicit_expansion_word_fts
+                 USING fts5(url UNINDEXED, system_url UNINDEXED, code, display,
+                            tokenize='unicode61 remove_diacritics 1');
+             INSERT INTO implicit_expansion_fts (url, system_url, code, display)
+                 VALUES ('u', 's', 'a', 'Alpha');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let rows = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows("implicit_expansion_fts"), 0, "legacy rows dropped");
+
+        conn.execute_batch(
+            "INSERT INTO implicit_expansion_fts_built (block, url) VALUES (1, 'u');
+             INSERT INTO implicit_expansion_fts (rowid, url, system_url, code, display)
+                 VALUES (4294967297, 'u', 's', 'a', 'Alpha');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(rows("implicit_expansion_fts"), 1, "block rows kept");
     }
 
     #[test]
@@ -1049,5 +1627,75 @@ mod tests {
         migrate_icd9cm_reimport(&conn).unwrap();
 
         assert_eq!(ledger_paths(&conn), vec![ICD9CM_MARKER.to_string()]);
+    }
+
+    /// After `ANALYZE` on a database whose closure holds a single large
+    /// system, the statistics claim `system_id = ?` matches every closure
+    /// row. The probe must still seek the index (it used to fall back to a
+    /// full table scan per hierarchy row), and a second system lacking its
+    /// closure must be found and built.
+    #[test]
+    fn closure_probe_stays_indexed_after_analyze_with_one_big_system() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        for id in ["big", "small"] {
+            conn.execute(
+                "INSERT INTO code_systems (id, url, status, content, created_at, updated_at)
+                 VALUES (?1, ?1, 'active', 'complete', ?2, ?2)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..3000 {
+            conn.execute(
+                "INSERT INTO concept_closure VALUES ('big', ?1, ?1)",
+                [format!("c{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT; ANALYZE;").unwrap();
+        for (p, c) in [("a", "b"), ("b", "c")] {
+            conn.execute(
+                "INSERT INTO concepts (system_id, code) VALUES ('small', ?1)",
+                [p],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO concept_hierarchy VALUES ('small', ?1, ?2)",
+                [p, c],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO concepts (system_id, code) VALUES ('small', 'c')",
+            [],
+        )
+        .unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM concept_closure \
+                 INDEXED BY idx_closure_descendant WHERE system_id = ?1)",
+            )
+            .unwrap()
+            .query_map(["small"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("USING COVERING INDEX idx_closure_descendant")),
+            "{plan:?}"
+        );
+        migrate_concept_closure(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_closure WHERE system_id = 'small'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 6, "a, b, c self-links + a>b, b>c, a>c");
     }
 }

@@ -73,6 +73,9 @@ pub fn negotiate_format(raw_query: Option<&str>, accept: Option<&str>) -> Respon
 
 /// Serialize `body` using the negotiated format and return an Axum response.
 pub fn fhir_respond(body: Value, format: ResponseFormat) -> Response {
+    // Stored SNOMED CT releases are reported as edition URIs.
+    let mut body = body;
+    crate::operations::snomed_version::report_edition_versions(&mut body);
     match format {
         ResponseFormat::Json => Json(body).into_response(),
         ResponseFormat::Xml => {

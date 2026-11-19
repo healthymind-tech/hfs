@@ -49,9 +49,9 @@ async fn expand_codes(app: &TestApp, url: &str) -> Vec<String> {
 
 /// `<< limb` — descendants including self → limb, arm, leg
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_constraint_desc_and_self() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_CONSTRAINT_VS_URL).await;
@@ -60,9 +60,9 @@ async fn ecl_constraint_desc_and_self() {
 
 /// `concept is-a limb` is equivalent to `<< limb`
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_isa_filter_equivalent_to_descendants_and_self() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_ISA_VS_URL).await;
@@ -71,9 +71,9 @@ async fn ecl_isa_filter_equivalent_to_descendants_and_self() {
 
 /// `< limb` — strict descendants (excludes limb itself) → arm, leg
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_strict_descendants_excludes_self() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_STRICT_DESC_VS_URL).await;
@@ -82,9 +82,9 @@ async fn ecl_strict_descendants_excludes_self() {
 
 /// `>> arm` — ancestors including self → arm, limb, body
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_ancestors_including_self() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_ANCESTORS_VS_URL).await;
@@ -94,9 +94,9 @@ async fn ecl_ancestors_including_self() {
 /// `<< body MINUS << limb` — all body descendants except limb and its subtree
 /// Expected: body, head  (arm and leg are under limb so they are excluded)
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_minus_removes_subtree() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_MINUS_VS_URL).await;
@@ -105,9 +105,9 @@ async fn ecl_minus_removes_subtree() {
 
 /// `<< limb OR head` — union: limb subtree plus head → arm, head, leg, limb
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_or_union_of_subtree_and_single_code() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_OR_VS_URL).await;
@@ -119,9 +119,9 @@ async fn ecl_or_union_of_subtree_and_single_code() {
 /// limb subtree = {limb, arm, leg}; body subtree = {body, limb, arm, leg, head}
 /// intersection = {limb, arm, leg}
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_two_filters_are_intersected() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes = expand_codes(&app, bundles::ECL_AND_FILTER_VS_URL).await;
@@ -131,9 +131,9 @@ async fn ecl_two_filters_are_intersected() {
 // ── expansion total reflects ECL result count ──────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_expansion_total_matches_returned_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::ECL_CONSTRAINT_VS_URL)]);
@@ -151,9 +151,9 @@ async fn ecl_expansion_total_matches_returned_codes() {
 // ── ECL + pagination ───────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_expansion_with_count_paginates() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let body = serde_json::json!({
@@ -186,9 +186,9 @@ async fn ecl_expansion_with_count_paginates() {
 /// `arm` is a descendant of `limb`, so it should be valid inside the ECL
 /// ValueSet that expands to {limb, arm, leg}.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_validate_code_member_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let req = TestApp::params(&[
@@ -209,9 +209,9 @@ async fn ecl_validate_code_member_returns_true() {
 
 /// `head` is NOT a descendant of `limb`, so it should be invalid.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_validate_code_non_member_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let req = TestApp::params(&[
@@ -234,9 +234,9 @@ async fn ecl_validate_code_non_member_returns_false() {
 
 /// A second `$expand` call returns the same codes (cache hit).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_expansion_is_cached_and_consistent() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let codes_first = expand_codes(&app, bundles::ECL_CONSTRAINT_VS_URL).await;
@@ -251,9 +251,9 @@ async fn ecl_expansion_is_cached_and_consistent() {
 
 /// `*` in ECL means all concepts in the code system.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_wildcard_expands_all_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     // Create a ValueSet with a wildcard ECL filter dynamically via import.
@@ -292,9 +292,9 @@ async fn ecl_wildcard_expands_all_codes() {
 /// A ValueSet with an ECL filter referencing an unknown code system returns an
 /// empty expansion (the include clause is skipped with a warning).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_unknown_system_skipped_gracefully() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     let bundle = r#"{
       "resourceType": "Bundle",
@@ -336,9 +336,9 @@ async fn ecl_unknown_system_skipped_gracefully() {
 
 /// An invalid ECL expression returns a 400 Bad Request.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_invalid_expression_returns_error() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let bundle = r#"{
@@ -378,9 +378,9 @@ async fn ecl_invalid_expression_returns_error() {
 /// `<< limb` yields {limb, arm, leg}; in tree mode limb is the root and
 /// arm/leg are its children.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_hierarchical_expansion_returns_tree() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let body = serde_json::json!({
@@ -415,9 +415,9 @@ async fn ecl_hierarchical_expansion_returns_tree() {
 
 /// Expansion entries should carry the display name from the CodeSystem.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_expansion_includes_display_names() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::ECL_CONSTRAINT_VS_URL)]);
@@ -449,9 +449,9 @@ async fn ecl_expansion_includes_display_names() {
 /// NOT all concepts in the code system.  Silently expanding to all concepts
 /// would violate the ValueSet author's intent.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ecl_unrecognized_filter_yields_empty_expansion() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::ecl_bundle()).await;
 
     let bundle = r#"{

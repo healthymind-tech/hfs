@@ -299,6 +299,36 @@ pub(super) fn resource_key(tenant_id: &str, resource_type: &str, id: &str) -> St
     ])
 }
 
+/// Advisory-lock namespace of the fork's session-level conditional
+/// create / upsert lock (`ConditionLock` in `storage.rs`, hm/p3-cluster).
+/// The same `HFSC` namespace as upstream's Bundle [`CRITERIA_LOCK_NAMESPACE`];
+/// the keys are derived differently (`b"conditional"` vs `b"criteria"`
+/// components), so the two only meet on a hash collision (false contention).
+pub(super) const CONDITION_LOCK_NAMESPACE: i32 = CRITERIA_LOCK_NAMESPACE;
+
+/// Derives the key serializing conditional creates / upserts that share
+/// `tenant_id` / `resource_type` / search criteria. The criteria's `&`-separated
+/// parameters are sorted first, so `a=1&b=2` and `b=2&a=1` share a key.
+pub(super) fn condition_key(
+    tenant_id: &str,
+    resource_type: &str,
+    criteria: &str,
+) -> StorageResult<i32> {
+    let mut params: Vec<&str> = criteria
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .collect();
+    params.sort_unstable();
+    let normalized = params.join("&");
+    hash_components(&[
+        b"conditional",
+        tenant_id.as_bytes(),
+        resource_type.as_bytes(),
+        normalized.as_bytes(),
+    ])
+}
+
 /// Derives the per-resource keys for a group, deduplicated and sorted ascending.
 ///
 /// Acquiring the returned keys in order is what keeps overlapping groups from
@@ -380,6 +410,8 @@ pub(super) fn criteria_key_for(
     criteria_key(tenant_id, resource_type, &pairs).map(Some)
 }
 
+/// One advisory lock in its own statement (upstream's single-key form, used
+/// by the criteria locks of transaction Bundles).
 async fn advisory_xact_lock(
     client: &impl GenericClient,
     namespace: i32,
@@ -399,6 +431,74 @@ async fn advisory_xact_lock(
     Ok(())
 }
 
+/// How long a writer may wait for the tenant gate and its resource keys.
+///
+/// Lock waits used to run under the session's `statement_timeout` (30 s by
+/// default), which bounds how long one statement may *work*, not how long a
+/// writer may queue. Behind bundles that legitimately hold the exclusive gate
+/// in turn — conditional or SearchParameter bundles under load — the queue
+/// outlasted it and writers failed 500 "rolled back" although nothing was
+/// wrong. The wait now has its own, longer bound; the statements after it run
+/// under the caller's timeout again.
+const LOCK_WAIT_TIMEOUT_MS: u64 = 600_000;
+
+/// Runs advisory-lock statements as one simple-query message.
+///
+/// `query_one("SELECT pg_advisory_xact_lock($1, $2)", …)` with a `&str` is
+/// not one round trip but two — Parse + Describe + Sync to prepare an unnamed
+/// statement, then Bind + Execute + Sync — so a single-resource write used to
+/// spend four round trips and two server-side parses just on the gate and its
+/// key. `batch_execute` sends every lock in one message, and PostgreSQL runs
+/// the statements in text order, so the gate is still taken before the keys
+/// and the keys still in ascending order. The text contains only fixed
+/// namespaces and locally derived `i32` keys, never tenant or resource
+/// strings.
+async fn advisory_xact_locks(
+    client: &impl GenericClient,
+    gate: (i32, bool),
+    keys: &[i32],
+    context: &str,
+) -> StorageResult<()> {
+    use std::fmt::Write;
+    let (gate_key, shared) = gate;
+    let gate_fn = if shared {
+        "pg_advisory_xact_lock_shared"
+    } else {
+        "pg_advisory_xact_lock"
+    };
+    let mut sql = String::with_capacity((keys.len() + 4) * 58 + 160);
+    // Wait under LOCK_WAIT_TIMEOUT_MS, not the session's statement_timeout,
+    // then put back exactly the value the caller had.
+    writeln!(
+        sql,
+        "SELECT set_config('hfs.saved_statement_timeout', current_setting('statement_timeout'), true);"
+    )
+    .expect("writing to String cannot fail");
+    writeln!(sql, "SET LOCAL statement_timeout = {LOCK_WAIT_TIMEOUT_MS};")
+        .expect("writing to String cannot fail");
+    writeln!(
+        sql,
+        "SELECT {gate_fn}({TENANT_GATE_NAMESPACE}, {gate_key});"
+    )
+    .expect("writing to String cannot fail");
+    for key in keys {
+        writeln!(
+            sql,
+            "SELECT pg_advisory_xact_lock({RESOURCE_LOCK_NAMESPACE}, {key});"
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(
+        sql,
+        "SELECT set_config('statement_timeout', current_setting('hfs.saved_statement_timeout'), true);"
+    )
+    .expect("writing to String cannot fail");
+    client
+        .batch_execute(&sql)
+        .await
+        .map_err(|e| lock_error(context, e))
+}
+
 /// Locks a bounded write set: shared tenant gate, then exclusive resource keys.
 ///
 /// This is the general PostgreSQL write-protocol path shared by CRUD,
@@ -406,7 +506,7 @@ async fn advisory_xact_lock(
 /// sets for the same tenant run concurrently while still conflicting with an
 /// exclusive whole-tenant gate, and the exclusive resource keys serialize
 /// overlapping write sets against each other. Keys are acquired in ascending
-/// order.
+/// order, all in one round trip.
 ///
 /// The caller must hold an open transaction on `client`; the locks release
 /// when it commits or rolls back.
@@ -421,44 +521,49 @@ where
 {
     let gate = gate_key(tenant_id)?;
     let keys = sorted_resource_keys(tenant_id, resources)?;
-    advisory_xact_lock(
+    advisory_xact_locks(
         client,
-        TENANT_GATE_NAMESPACE,
-        gate,
-        true,
-        "failed to acquire shared write gate lock",
+        (gate, true),
+        &keys,
+        "failed to acquire shared write gate and resource locks",
     )
-    .await?;
-    if keys.len() == 1 {
-        advisory_xact_lock(
-            client,
-            RESOURCE_LOCK_NAMESPACE,
-            keys[0],
-            false,
-            "failed to acquire write resource lock",
-        )
-        .await?;
-    } else if !keys.is_empty() {
-        // `batch_execute` sends these independent simple-query statements in
-        // one message. PostgreSQL executes them in text order, so locks remain
-        // sorted even if a hash collision or opposing write set is present.
-        // The text contains only locally derived i32 keys and a fixed
-        // namespace, never tenant or resource strings.
-        let mut sql = String::with_capacity(keys.len() * 58);
-        for key in keys {
-            use std::fmt::Write;
-            writeln!(
-                sql,
-                "SELECT pg_advisory_xact_lock({RESOURCE_LOCK_NAMESPACE}, {key});"
-            )
-            .expect("writing to String cannot fail");
+    .await
+}
+
+/// The lock plan of a multi-key write set as one simple-query text: the
+/// shared tenant gate first, then every resource key, exclusive, in the
+/// ascending order `keys` arrives in.
+///
+/// The keys go through one `unnest` statement rather than one `SELECT
+/// pg_advisory_xact_lock(...)` per key. PostgreSQL executes the function once
+/// per row of the subquery, and that subquery is sorted on the array
+/// ordinal — a subquery with its own `ORDER BY` is never flattened into the
+/// outer query, so the sort is a real node and the rows reach the function in
+/// array order. The keys are already ascending, so the lock order is the one
+/// the per-statement form had, and overlapping write sets still cannot
+/// deadlock each other. `count(...)` collapses the result to one row so the
+/// message carries no result rows worth mentioning.
+///
+/// The text contains only locally derived i32 keys and fixed namespaces,
+/// never tenant or resource strings.
+fn shared_write_locks_sql(gate: i32, keys: &[i32]) -> String {
+    use std::fmt::Write;
+    let mut sql = String::with_capacity(keys.len() * 12 + 256);
+    write!(
+        sql,
+        "SELECT pg_advisory_xact_lock_shared({TENANT_GATE_NAMESPACE}, {gate}); \
+         SELECT count(pg_advisory_xact_lock({RESOURCE_LOCK_NAMESPACE}, k)) \
+         FROM (SELECT k FROM unnest(ARRAY["
+    )
+    .expect("writing to String cannot fail");
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
         }
-        client
-            .batch_execute(&sql)
-            .await
-            .map_err(|e| lock_error("failed to acquire write resource locks", e))?;
+        write!(sql, "{key}").expect("writing to String cannot fail");
     }
-    Ok(())
+    sql.push_str("]::int4[]) WITH ORDINALITY AS u(k, n) ORDER BY n) AS s");
+    sql
 }
 
 /// Locks the whole tenant: exclusive tenant gate, no resource keys.
@@ -471,11 +576,10 @@ pub(super) async fn acquire_exclusive_write_gate(
     tenant_id: &str,
 ) -> StorageResult<()> {
     let gate = gate_key(tenant_id)?;
-    advisory_xact_lock(
+    advisory_xact_locks(
         client,
-        TENANT_GATE_NAMESPACE,
-        gate,
-        false,
+        (gate, false),
+        &[],
         "failed to acquire exclusive write gate lock",
     )
     .await
@@ -596,6 +700,20 @@ mod tests {
              SELECT pg_advisory_xact_lock_shared(1212568387, -594198615); \
              ROLLBACK TO SAVEPOINT hfs_criteria_wait; \
              RELEASE SAVEPOINT hfs_criteria_wait"
+        );
+    }
+
+    /// The multi-key plan is one message: the shared gate, then the keys in
+    /// the order given, through a sorted subquery so the lock order is the
+    /// array order.
+    #[test]
+    fn shared_write_locks_sql_takes_the_gate_then_every_key_in_order() {
+        assert_eq!(
+            shared_write_locks_sql(-2026577464, &[-5, 7, 261144589]),
+            "SELECT pg_advisory_xact_lock_shared(1212568391, -2026577464); \
+             SELECT count(pg_advisory_xact_lock(1212568402, k)) \
+             FROM (SELECT k FROM unnest(ARRAY[-5,7,261144589]::int4[]) \
+             WITH ORDINALITY AS u(k, n) ORDER BY n) AS s"
         );
     }
 

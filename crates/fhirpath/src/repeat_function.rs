@@ -158,7 +158,7 @@ mod tests {
 
         // Build a context with our test object
         let mut context = EvaluationContext::new_empty_with_default_version();
-        context.this = Some(object1.clone());
+        context.this = Some(std::sync::Arc::new(object1.clone()));
 
         // Test repeat with child projection
         let parsed = parser().parse("repeat(child)").unwrap();
@@ -270,7 +270,7 @@ mod tests {
 
         // Create context
         let mut context = EvaluationContext::new_empty_with_default_version();
-        context.this = Some(root.clone());
+        context.this = Some(std::sync::Arc::new(root.clone()));
 
         // Test repeat with next projection (should handle the circular references)
         let parsed = parser().parse("next").into_result().unwrap();

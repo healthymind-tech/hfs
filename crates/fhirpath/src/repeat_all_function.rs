@@ -129,7 +129,7 @@ mod tests {
         };
 
         let mut context = EvaluationContext::new_empty_with_default_version();
-        context.this = Some(root.clone());
+        context.this = Some(std::sync::Arc::new(root.clone()));
 
         let parsed = parser().parse("child").into_result().unwrap();
         let result = repeat_all_function(&root, &parsed, &context).unwrap();

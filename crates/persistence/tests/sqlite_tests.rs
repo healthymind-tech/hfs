@@ -2,6 +2,10 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;
+
 #[path = "reindex/scoped_clear.rs"]
 mod scoped_clear;
 
@@ -10,6 +14,12 @@ mod resource_scoped_clear;
 
 #[path = "reindex/id_range.rs"]
 mod id_range;
+
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
 
 use std::path::PathBuf;
 
@@ -29,6 +39,17 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[path = "search/large_id_set_suite.rs"]
 mod large_id_set_suite;
+
+#[path = "search/filter_plan_suite.rs"]
+mod filter_plan_suite;
+
+/// Searches drive from their smallest filter without changing the answer
+/// (members, order, pages, count, deletes).
+#[tokio::test]
+async fn sqlite_filter_plans_keep_the_answer() {
+    let backend = create_backend();
+    filter_plan_suite::filter_plans_keep_the_answer(&backend, "filter-plan-sqlite").await;
+}
 
 #[tokio::test]
 async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
@@ -50,6 +71,18 @@ async fn sqlite_tenant_has_resources_matches_discovery() {
     let backend = create_backend();
     tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
     tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
+}
+
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
+/// #2185: the SQL-on-FHIR terminology store contract every SOF-capable
+/// backend shares. Physical-table residue is checked by the SQLite module's
+/// own unit tests, which can reach the connection.
+#[tokio::test]
+async fn sqlite_sof_terminology_store_suite() {
+    let backend = create_backend();
+    sof_terminology_suite::run_all(&backend, "sof-term", None).await;
 }
 
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
@@ -78,6 +111,32 @@ mod contained_suite;
 
 #[path = "search/sql_composite_slots_suite.rs"]
 mod sql_composite_slots_suite;
+
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
+/// The backend-agnostic FHIR version filter suite (#2254). Same `#[path]`
+/// arrangement; needs R4 and R5.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// #2254: a query naming a FHIR version matches only resources stored
+/// under it, on every pagination path, count, ids and `_contained`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[tokio::test]
+async fn sqlite_search_honors_fhir_version() {
+    let backend = create_backend();
+    fhir_version_filter_suite::search_honors_fhir_version(&backend, "fhir-version-2254").await;
+}
+
+/// #2283: a total is reported only when `_total` asks for one.
+#[tokio::test]
+async fn sqlite_total_mode_reported_only_when_requested() {
+    let backend = create_backend();
+    total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283").await;
+}
 
 /// #1362: a repeated parameter under `_contained` is a conjunction on one
 /// contained resource.
@@ -651,6 +710,20 @@ async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
     versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
         backend,
         "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #2111: unconditional PUTs racing onto one tombstone all succeed, and the
+/// history stays contiguous with the live body as its newest entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_puts_onto_a_tombstone_all_succeed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        backend,
+        "restore-race-2111",
         40,
     )
     .await;
@@ -3370,16 +3443,14 @@ async fn test_reindex_fans_out_to_every_target() {
         ["Patient/p1", "Patient/p2", "Patient/p3"],
         "every resource must be written to the secondary index, not just the primary's"
     );
+    // clearExisting rebuilds first and sweeps afterwards (#2278): it no longer
+    // clears the secondary up front, so an interrupted run cannot empty it.
     assert_eq!(
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "clear_existing must clear the secondary index too"
+        0,
+        "clear_existing must not clear the secondary index before rebuilding it"
     );
-    assert_eq!(
-        *secondary.cleared_scopes.lock().unwrap(),
-        [Some(vec!["Patient".to_string()])],
-        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
-    );
+    assert!(secondary.cleared_scopes.lock().unwrap().is_empty());
 }
 
 /// Runs `request` on `op` and waits for it to complete cleanly.
@@ -3593,7 +3664,8 @@ async fn test_reindex_fetch_resources_by_ids() {
 // ============================================================================
 
 use helios_persistence::core::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
+    ConditionalUpdateResult, PatchFormat,
 };
 
 #[tokio::test]
@@ -3876,6 +3948,294 @@ async fn test_conditional_operations_tenant_isolation() {
         matches!(result, ConditionalCreateResult::Created(_)),
         "Conditional create should succeed in different tenant"
     );
+}
+
+/// Seeds a Patient carrying `identifier=http://hospital.org/mrn|<mrn>` into
+/// `tenant` for the cross-tenant conditional update/delete/patch tests below.
+async fn create_mrn_patient(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    mrn: &str,
+    family: &str,
+) -> helios_persistence::types::StoredResource {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://hospital.org/mrn", "value": mrn}],
+                "name": [{"family": family}],
+                "active": false
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A conditional update resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, B's upsert creates
+/// B's own row instead of overwriting A's, and once both exist the same
+/// criteria still resolve to exactly one row per tenant.
+#[tokio::test]
+async fn test_conditional_update_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-UPDATE";
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-UPDATE", "TenantA").await;
+
+    let replacement = |family: &str| {
+        json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-ISO-UPDATE"}],
+            "name": [{"family": family}]
+        })
+    };
+
+    // Without upsert tenant B has nothing the criteria can match.
+    let result = backend
+        .conditional_update(
+            &tenant_b,
+            "Patient",
+            replacement("TenantB"),
+            criteria,
+            false,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalUpdateResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+
+    // With upsert tenant B creates its own row; A's is not overwritten.
+    let result = backend
+        .conditional_update(
+            &tenant_b,
+            "Patient",
+            replacement("TenantB"),
+            criteria,
+            true,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Created(patient_b) = result else {
+        panic!("upsert in tenant B should create B's own patient, got {result:?}");
+    };
+    assert_ne!(patient_b.id(), patient_a.id());
+
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must survive tenant B's conditional updates");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["name"][0]["family"], "TenantA");
+
+    // Both tenants now hold the identifier; A's update still finds exactly its
+    // own row and leaves B's alone.
+    let result = backend
+        .conditional_update(
+            &tenant_a,
+            "Patient",
+            replacement("TenantAUpdated"),
+            criteria,
+            false,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Updated(updated) = result else {
+        panic!("tenant A's own conditional update should match one row, got {result:?}");
+    };
+    assert_eq!(updated.id(), patient_a.id());
+    assert_eq!(updated.version_id(), "2");
+
+    let b_after = backend
+        .read(&tenant_b, "Patient", patient_b.id())
+        .await
+        .unwrap()
+        .expect("tenant B's patient must still exist");
+    assert_eq!(b_after.version_id(), "1");
+    assert_eq!(b_after.content()["name"][0]["family"], "TenantB");
+}
+
+/// A conditional delete resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, and when B holds the
+/// same identifier B's delete removes B's own row and nothing of A's.
+#[tokio::test]
+async fn test_conditional_delete_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-DELETE";
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-DELETE", "TenantA").await;
+
+    // Tenant B has nothing matching: no-match, and A's row is still there.
+    let result = backend
+        .conditional_delete(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalDeleteResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+    assert!(
+        backend
+            .exists(&tenant_a, "Patient", patient_a.id())
+            .await
+            .unwrap(),
+        "tenant A's patient must survive tenant B's conditional delete"
+    );
+
+    // Same identifier in B: B's delete takes exactly B's row (not
+    // MultipleMatches across tenants) and A's row is still untouched.
+    let patient_b = create_mrn_patient(&backend, &tenant_b, "MRN-ISO-DELETE", "TenantB").await;
+    let result = backend
+        .conditional_delete(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalDeleteResult::Deleted(deleted) = result else {
+        panic!("tenant B's own conditional delete should match one row, got {result:?}");
+    };
+    assert_eq!(deleted.id(), patient_b.id());
+    assert!(
+        !backend
+            .exists(&tenant_b, "Patient", patient_b.id())
+            .await
+            .unwrap()
+    );
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must survive tenant B's conditional delete");
+    assert_eq!(a_after.version_id(), "1");
+
+    // Control: the same criteria do match in A.
+    let result = backend
+        .conditional_delete(
+            &tenant_a,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalDeleteResult::Deleted(deleted) = result else {
+        panic!("tenant A's own conditional delete should match one row, got {result:?}");
+    };
+    assert_eq!(deleted.id(), patient_a.id());
+}
+
+/// A conditional patch resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, and when B holds the
+/// same identifier B's patch lands on B's own row and nothing of A's.
+#[tokio::test]
+async fn test_conditional_patch_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-PATCH";
+    let patch = PatchFormat::JsonPatch(json!([
+        {"op": "replace", "path": "/active", "value": true}
+    ]));
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-PATCH", "TenantA").await;
+
+    // Tenant B has nothing matching: no-match, and A's row is unpatched.
+    let result = backend
+        .conditional_patch(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalPatchResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must still exist");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["active"], json!(false));
+
+    // Same identifier in B: B's patch lands on B's row alone (not
+    // MultipleMatches across tenants) and A's row is still unpatched.
+    let patient_b = create_mrn_patient(&backend, &tenant_b, "MRN-ISO-PATCH", "TenantB").await;
+    let result = backend
+        .conditional_patch(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalPatchResult::Patched(patched) = result else {
+        panic!("tenant B's own conditional patch should match one row, got {result:?}");
+    };
+    assert_eq!(patched.id(), patient_b.id());
+    assert_eq!(patched.content()["active"], json!(true));
+
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must still exist");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["active"], json!(false));
+
+    // Control: the same criteria do match in A, and that patch leaves B's
+    // already-patched row at its own version.
+    let result = backend
+        .conditional_patch(
+            &tenant_a,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalPatchResult::Patched(patched) = result else {
+        panic!("tenant A's own conditional patch should match one row, got {result:?}");
+    };
+    assert_eq!(patched.id(), patient_a.id());
+    assert_eq!(patched.version_id(), "2");
+
+    let b_after = backend
+        .read(&tenant_b, "Patient", patient_b.id())
+        .await
+        .unwrap()
+        .expect("tenant B's patient must still exist");
+    assert_eq!(b_after.version_id(), "2");
 }
 
 #[tokio::test]
@@ -5416,6 +5776,63 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
     .await;
 }
 
+mod empty_elements_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/empty_elements_contract.rs"
+    ));
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+    empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+        &create_backend(),
+        &create_tenant("submit-empty-merge"),
+    )
+    .await;
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_replace_drops_empty_elements() {
+    empty_elements_contract::replace_import_drops_empty_elements(
+        &create_backend(),
+        &create_tenant("submit-empty-replace"),
+    )
+    .await;
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_skip_unchanged_compares_the_clean_candidate() {
+    empty_elements_contract::skip_unchanged_compares_the_clean_candidate(
+        &create_backend(),
+        &create_tenant("submit-empty-skip"),
+    )
+    .await;
+}
+
+mod index_pending_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/index_pending_contract.rs"
+    ));
+}
+
+/// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+#[tokio::test]
+async fn test_bulk_submit_marked_manifest_is_listed_until_cleared() {
+    index_pending_contract::marked_manifest_is_listed_until_cleared(
+        &create_backend(),
+        &create_tenant("submit-index-pending"),
+        false,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
     scoped_clear::assert_scoped_clear(&create_backend()).await;
@@ -5426,6 +5843,32 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_updated_since_view_bounds_counts_and_pages() {
+    updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
 }
 
 #[tokio::test]

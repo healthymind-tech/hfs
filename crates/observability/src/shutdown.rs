@@ -59,6 +59,110 @@ pub async fn signal() -> &'static str {
     }
 }
 
+/// How long a stopping server may take to drain before [`StopGuard`] ends
+/// the process, when the `*_SHUTDOWN_TIMEOUT` variable is unset: under the
+/// 10 s `docker stop` grace period, so the process exits on its own rather
+/// than to the `SIGKILL` that follows it.
+pub const DEFAULT_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Parses a `*_SHUTDOWN_TIMEOUT` value in whole seconds; unset, empty or
+/// malformed gives `default`.
+pub fn parse_grace(value: Option<&str>, default: std::time::Duration) -> std::time::Duration {
+    match value.map(str::trim) {
+        None | Some("") => default,
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|_| {
+                tracing::warn!(value = raw, "shutdown timeout is not a whole number of seconds; using the default");
+                default
+            }),
+    }
+}
+
+/// Makes a stop signal end the process at every stage, not only while the
+/// HTTP server is draining.
+///
+/// [`signal`] is normally awaited only once the server is listening. Before
+/// that — loading the database, seeding SearchParameters, rehydrating
+/// profiles, building terminology indexes, which takes minutes on a large
+/// or slow database — a server running as PID 1 in a container has no
+/// handler installed, the kernel discards `SIGTERM`, and `docker stop` waits
+/// out its grace period and kills it. And once draining, a request or
+/// background job that never finishes keeps the process (and its port)
+/// alive indefinitely.
+///
+/// The guard listens from the moment it is created:
+///
+/// * a signal before [`StopGuard::serving`] exits at once (status 0) — the
+///   startup work is all re-done on the next start;
+/// * a signal after it leaves the drain to the server, but exits (status 1)
+///   when the drain takes longer than `grace`, or at a second signal.
+///
+/// Create it first thing in `main`, inside the runtime.
+#[derive(Clone)]
+pub struct StopGuard {
+    serving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StopGuard {
+    /// Starts listening. `server` names the process in the log lines.
+    pub fn install(server: &'static str, grace: std::time::Duration) -> Self {
+        let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&serving);
+        tokio::spawn(async move {
+            let first = signal().await;
+            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::warn!(
+                    signal = first,
+                    server,
+                    "Stop signal received while starting up; exiting without serving"
+                );
+                crate::telemetry::shutdown();
+                std::process::exit(0);
+            }
+            let outcome = tokio::select! {
+                _ = tokio::time::sleep(grace) => "did not finish in time",
+                second = signal() => second,
+            };
+            tracing::warn!(
+                signal = first,
+                server,
+                grace_secs = grace.as_secs(),
+                outcome,
+                "Shutdown still draining; exiting now (open requests and background jobs are \
+                 abandoned)"
+            );
+            crate::telemetry::shutdown();
+            std::process::exit(1);
+        });
+        Self { serving }
+    }
+
+    /// The server is about to listen: from now on a signal starts a drain
+    /// instead of ending the process at once.
+    pub fn serving(&self) {
+        self.serving
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn grace_parses_whole_seconds_with_a_default() {
+        let d = Duration::from_secs(8);
+        assert_eq!(parse_grace(None, d), d);
+        assert_eq!(parse_grace(Some(" "), d), d);
+        assert_eq!(parse_grace(Some("3"), d), Duration::from_secs(3));
+        assert_eq!(parse_grace(Some("0"), d), Duration::ZERO);
+        assert_eq!(parse_grace(Some("soon"), d), d);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

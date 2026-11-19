@@ -1,8 +1,20 @@
 //! FDA National Drug Code (NDC) Directory importer.
 //!
-//! Parses the FDA NDC Text Files distribution (`product.txt`) and imports all
-//! active drug product codes, display names, and a product-type hierarchy into
-//! the HTS normalized schema.
+//! Parses the FDA NDC Text Files distribution and imports, into the HTS
+//! normalized schema:
+//!
+//! * product codes (`product.txt`, labeler-product: `0777-3105`) under a
+//!   product-type hierarchy;
+//! * package codes (`package.txt`, labeler-product-package: `0777-3105-02`)
+//!   under their product — the codes prescriptions and claims carry;
+//! * the 11-digit (5-4-2, HIPAA) form of every package code
+//!   (`00777310502`), under its 10-digit package code;
+//! * when the ZIP also holds FDA's "NDC excluded" files
+//!   (`Products_excluded.txt`, `Packages_excluded.txt`: expired, delisted and
+//!   unfinished listings, from `ndc_excluded.zip`), those products and
+//!   packages too, marked `status = inactive` — historical NDCs in older
+//!   records and IG examples (US Core `49281012165`) then validate as
+//!   inactive instead of unknown.
 //!
 //! # No license required
 //!
@@ -18,7 +30,9 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{
+    BuilderConcept, BuilderProperty, CodeSystemMeta, build_native_batch,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -36,6 +50,36 @@ struct NdcProduct {
     code: String,
     display: String,
     product_type: String,
+    /// From the "excluded" file (no longer listed).
+    inactive: bool,
+}
+
+#[derive(Debug)]
+struct NdcPackage {
+    /// 10-digit package code, hyphenated (`0777-3105-02`).
+    code: String,
+    /// Its product code (`0777-3105`).
+    product: String,
+    description: String,
+    inactive: bool,
+}
+
+/// The 11-digit (5-4-2) form of a hyphenated 10-digit NDC package code:
+/// the short segment is zero-padded (4-4-2 → `0`+labeler, 5-3-2 → `0`+product,
+/// 5-4-1 → `0`+package). `None` for anything else.
+pub fn ndc_11_digit(code: &str) -> Option<String> {
+    let parts: Vec<&str> = code.split('-').collect();
+    if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let (l, p, k) = (parts[0], parts[1], parts[2]);
+    match (l.len(), p.len(), k.len()) {
+        (4, 4, 2) => Some(format!("0{l}{p}{k}")),
+        (5, 3, 2) => Some(format!("{l}0{p}{k}")),
+        (5, 4, 1) => Some(format!("{l}{p}0{k}")),
+        (5, 4, 2) => Some(format!("{l}{p}{k}")),
+        _ => None,
+    }
 }
 
 struct ColIdx {
@@ -59,10 +103,34 @@ pub async fn import_ndc(
     let batch_size = batch_size.max(1);
 
     let path_owned = path.to_path_buf();
-    let (products, errors) = tokio::task::spawn_blocking(
-        move || -> Result<(Vec<NdcProduct>, Vec<String>), HtsError> {
-            let text = read_product_txt(&path_owned)?;
-            parse_product_txt(&text)
+    #[allow(clippy::type_complexity)]
+    let (products, packages, errors) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<NdcProduct>, Vec<NdcPackage>, Vec<String>), HtsError> {
+            let files = read_ndc_files(&path_owned)?;
+            let product_txt = files.get("product.txt").ok_or_else(|| {
+                HtsError::InvalidRequest(format!(
+                    "No 'product.txt' found in '{}'",
+                    path_owned.display()
+                ))
+            })?;
+            let (mut products, mut errors) = parse_product_txt(product_txt)?;
+            let mut seen: std::collections::HashSet<String> =
+                products.iter().map(|p| p.code.clone()).collect();
+            if let Some(text) = files.get("products_excluded.txt") {
+                let (excluded, errs) = parse_products(text, true)?;
+                errors.extend(errs);
+                products.extend(excluded.into_iter().filter(|p| seen.insert(p.code.clone())));
+            }
+            let mut packages = Vec::new();
+            let mut seen_pkg: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (name, inactive) in [("package.txt", false), ("packages_excluded.txt", true)] {
+                if let Some(text) = files.get(name) {
+                    let (pkgs, errs) = parse_package_txt(text, inactive)?;
+                    errors.extend(errs);
+                    packages.extend(pkgs.into_iter().filter(|p| seen_pkg.insert(p.code.clone())));
+                }
+            }
+            Ok((products, packages, errors))
         },
     )
     .await
@@ -75,7 +143,7 @@ pub async fn import_ndc(
 
     if dry_run {
         stats.code_systems = 1;
-        stats.concepts = products.len() as u32;
+        stats.concepts = (products.len() + 2 * packages.len()) as u32;
         eprintln!(
             "[ndc] dry-run — {} products parsed, no DB writes",
             products.len()
@@ -118,13 +186,20 @@ pub async fn import_ndc(
             ..Default::default()
         });
     }
-    let seed = build_code_system_bundle(&meta, &seed_concepts);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_native_batch(&meta, &seed_concepts);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
     let total = products.len();
     let total_batches = total.div_ceil(batch_size).max(1);
+
+    const INACTIVE: &[BuilderProperty<'static>] = &[BuilderProperty {
+        code: "status",
+        value_key: "valueCode",
+        value: "inactive",
+    }];
+    let status = |inactive: bool| if inactive { INACTIVE } else { &[] };
 
     for (batch_idx, batch) in products.chunks(batch_size).enumerate() {
         let builder: Vec<BuilderConcept<'_>> = batch
@@ -137,12 +212,13 @@ pub async fn import_ndc(
                 } else {
                     p.product_type.as_str()
                 }),
+                extra_properties: status(p.inactive),
                 ..Default::default()
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let bytes = build_native_batch(&meta, &builder);
+        let chunk = backend.import_parsed(ctx, bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(
@@ -153,8 +229,161 @@ pub async fn import_ndc(
         );
     }
 
-    stats.concepts = total as u32;
+    // Packages under their product (or the root when the product is not
+    // listed), then the 11-digit form of each under its package.
+    let product_display: std::collections::HashMap<&str, &str> = products
+        .iter()
+        .map(|p| (p.code.as_str(), p.display.as_str()))
+        .collect();
+    struct Row {
+        code: String,
+        display: String,
+        parent: String,
+        inactive: bool,
+    }
+    let mut rows: Vec<Row> = Vec::with_capacity(packages.len() * 2);
+    for pkg in &packages {
+        let parent = if product_display.contains_key(pkg.product.as_str()) {
+            pkg.product.clone()
+        } else {
+            ROOT_CODE.to_string()
+        };
+        let display = match product_display.get(pkg.product.as_str()) {
+            Some(d) if !d.is_empty() => format!("{d}, {}", pkg.description),
+            _ => pkg.description.clone(),
+        };
+        if let Some(eleven) = ndc_11_digit(&pkg.code) {
+            rows.push(Row {
+                code: pkg.code.clone(),
+                display: display.clone(),
+                parent,
+                inactive: pkg.inactive,
+            });
+            rows.push(Row {
+                code: eleven,
+                display,
+                parent: pkg.code.clone(),
+                inactive: pkg.inactive,
+            });
+        } else {
+            rows.push(Row {
+                code: pkg.code.clone(),
+                display,
+                parent,
+                inactive: pkg.inactive,
+            });
+        }
+    }
+    let total_rows = rows.len();
+    for batch in rows.chunks(batch_size) {
+        let builder: Vec<BuilderConcept<'_>> = batch
+            .iter()
+            .map(|r| BuilderConcept {
+                code: &r.code,
+                display: Some(r.display.as_str()).filter(|s| !s.is_empty()),
+                parent_code: Some(r.parent.as_str()),
+                extra_properties: status(r.inactive),
+                ..Default::default()
+            })
+            .collect();
+        let parsed = build_native_batch(&meta, &builder);
+        let chunk = backend.import_parsed(ctx, parsed).await?;
+        stats.errors.extend(chunk.errors);
+    }
+    eprintln!(
+        "[ndc] {} package codes (+ 11-digit forms): {total_rows} concepts",
+        packages.len()
+    );
+
+    stats.concepts = (total + total_rows) as u32;
     Ok(stats)
+}
+
+/// The NDC text files in `path`: a ZIP with `product.txt` (and optionally
+/// `package.txt`, `Products_excluded.txt`, `Packages_excluded.txt`), or a
+/// bare `product.txt`. Keys are lower-case file names.
+fn read_ndc_files(path: &Path) -> Result<std::collections::HashMap<String, String>, HtsError> {
+    let mut out = std::collections::HashMap::new();
+    let is_zip = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        out.insert("product.txt".to_string(), read_product_txt(path)?);
+        return Ok(out);
+    }
+    let file = std::fs::File::open(path).map_err(|e| {
+        HtsError::InvalidRequest(format!("Cannot open ZIP '{}': {e}", path.display()))
+    })?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| HtsError::InvalidRequest(format!("Invalid ZIP '{}': {e}", path.display())))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
+        let name = entry
+            .name()
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry name: {e}")))?
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            name.as_str(),
+            "product.txt" | "package.txt" | "products_excluded.txt" | "packages_excluded.txt"
+        ) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read {name} from ZIP: {e}")))?;
+        out.insert(name, decode_ndc_text(bytes));
+    }
+    Ok(out)
+}
+
+/// Parse `package.txt` / `Packages_excluded.txt`.
+fn parse_package_txt(text: &str, inactive: bool) -> Result<(Vec<NdcPackage>, Vec<String>), HtsError> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| HtsError::InvalidRequest("package file is empty".to_string()))?;
+    let cols: Vec<&str> = header.split('\t').map(str::trim).collect();
+    let find = |name: &str| {
+        cols.iter()
+            .position(|h| h.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                HtsError::InvalidRequest(format!("package file header is missing column '{name}'"))
+            })
+    };
+    let (i_product, i_package, i_desc) = (
+        find("PRODUCTNDC")?,
+        find("NDCPACKAGECODE")?,
+        find("PACKAGEDESCRIPTION")?,
+    );
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for (n, line) in lines.enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        let get = |i: usize| f.get(i).map(|s| s.trim()).unwrap_or("");
+        let code = get(i_package);
+        if code.is_empty() {
+            errors.push(format!("package line {}: missing NDCPACKAGECODE — skipped", n + 2));
+            continue;
+        }
+        out.push(NdcPackage {
+            code: code.to_string(),
+            product: get(i_product).to_string(),
+            description: get(i_desc).to_string(),
+            inactive,
+        });
+    }
+    Ok((out, errors))
 }
 
 // ── File reader ───────────────────────────────────────────────────────────────
@@ -187,7 +416,7 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
                 .by_index(i)
                 .ok()
                 .map(|e| {
-                    let n = e.name().to_ascii_lowercase();
+                    let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                     n == "product.txt" || n.ends_with("/product.txt")
                 })
                 .unwrap_or(false)
@@ -245,6 +474,12 @@ fn resolve_columns(header: &str) -> Result<ColIdx, HtsError> {
 }
 
 fn parse_product_txt(text: &str) -> Result<(Vec<NdcProduct>, Vec<String>), HtsError> {
+    parse_products(text, false)
+}
+
+/// Parse a product file; `excluded` = FDA's `Products_excluded.txt` (every
+/// row kept, marked inactive) instead of `product.txt` (flag `E` skipped).
+fn parse_products(text: &str, excluded: bool) -> Result<(Vec<NdcProduct>, Vec<String>), HtsError> {
     let mut lines = BufReader::new(text.as_bytes()).lines().enumerate();
 
     let (_, first) = lines
@@ -269,11 +504,12 @@ fn parse_product_txt(text: &str) -> Result<(Vec<NdcProduct>, Vec<String>), HtsEr
 
         let cols: Vec<&str> = line.split('\t').collect();
 
-        if cols
-            .get(idx.ndc_exclude_flag)
-            .map(|s| s.trim())
-            .unwrap_or("")
-            == "E"
+        if !excluded
+            && cols
+                .get(idx.ndc_exclude_flag)
+                .map(|s| s.trim())
+                .unwrap_or("")
+                == "E"
         {
             continue;
         }
@@ -322,6 +558,7 @@ fn parse_product_txt(text: &str) -> Result<(Vec<NdcProduct>, Vec<String>), HtsEr
             code: ndc,
             display,
             product_type,
+            inactive: excluded,
         });
     }
 
@@ -419,6 +656,27 @@ mod tests {
     }
 
     #[test]
+    fn eleven_digit_forms_pad_the_short_segment() {
+        assert_eq!(ndc_11_digit("0777-3105-02").as_deref(), Some("00777310502"));
+        assert_eq!(ndc_11_digit("49281-121-65").as_deref(), Some("49281012165"));
+        assert_eq!(ndc_11_digit("12345-6789-1").as_deref(), Some("12345678901"));
+        assert_eq!(ndc_11_digit("0777-3105"), None, "product codes have no 11-digit form");
+        assert_eq!(ndc_11_digit("07773105-02"), None);
+    }
+
+    #[test]
+    fn package_file_parses_codes_products_and_descriptions() {
+        let text = "PRODUCTID\tPRODUCTNDC\tNDCPACKAGECODE\tPACKAGEDESCRIPTION\tSTARTMARKETINGDATE\tENDMARKETINGDATE\tNDC_EXCLUDE_FLAG\tSAMPLE_PACKAGE\n\
+                    0777-3105_x\t0777-3105\t0777-3105-02\t100 CAPSULE in 1 BOTTLE (0777-3105-02) \t19880201\t\tN\tN\n";
+        let (pkgs, errors) = parse_package_txt(text, true).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].code, "0777-3105-02");
+        assert_eq!(pkgs[0].product, "0777-3105");
+        assert!(pkgs[0].inactive);
+    }
+
+    #[test]
     fn parse_empty_input_returns_error() {
         let result = parse_product_txt("");
         assert!(result.is_err());
@@ -456,7 +714,7 @@ mod tests {
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("product.txt", zip::write::FileOptions::default())
+                zip.start_file("product.txt", zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(sample_product_txt().as_bytes()).unwrap();
                 zip.finish().unwrap();
@@ -585,6 +843,82 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 0);
+        }
+
+        /// Packages, their 11-digit forms and FDA's excluded listings
+        /// (inactive) come in with the products.
+        #[tokio::test]
+        async fn packages_eleven_digit_forms_and_excluded_listings() {
+            use crate::traits::CodeSystemOperations;
+            use crate::types::ValidateCodeRequest;
+            let pkg_header = "PRODUCTID\tPRODUCTNDC\tNDCPACKAGECODE\tPACKAGEDESCRIPTION\tSTARTMARKETINGDATE\tENDMARKETINGDATE\tNDC_EXCLUDE_FLAG\tSAMPLE_PACKAGE";
+            let package = format!(
+                "{pkg_header}\n0_0002-1200_001\t0002-1200\t0002-1200-30\t30 CAPSULE in 1 BOTTLE (0002-1200-30) \t19870101\t\tN\tN\n"
+            );
+            let products_excluded = format!(
+                "{header}\n49281-121_x\t49281-121\tVACCINE\tFluzone\t\tinfluenza vaccine\tINJECTION\tIM\t20210702\t20231206\tBLA\tBLA1\tSanofi\tflu\t\t\t\t\tD\t\n",
+                header = sample_header()
+            );
+            let packages_excluded = format!(
+                "{pkg_header}\n49281-121_x\t49281-121\t49281-121-65\t10 SYRINGE, GLASS in 1 PACKAGE (49281-121-65) \t20210702\t20231206\tD\tN\n"
+            );
+            let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
+            {
+                let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+                for (name, text) in [
+                    ("product.txt", sample_product_txt()),
+                    ("package.txt", package),
+                    ("Products_excluded.txt", products_excluded),
+                    ("Packages_excluded.txt", packages_excluded),
+                ] {
+                    zip.start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(text.as_bytes()).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
+            import_ndc(&backend, &ctx, tmp.path(), 2, false).await.unwrap();
+            for (code, active) in [
+                ("0002-1200-30", true),
+                ("00002120030", true),
+                ("49281-121-65", false),
+                ("49281012165", false),
+                ("49281-121", false),
+            ] {
+                let r = CodeSystemOperations::validate_code(
+                    &backend,
+                    &ctx,
+                    ValidateCodeRequest {
+                        system: Some(NDC_URL.into()),
+                        code: code.into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(r.result, "{code}: {r:?}");
+                let conn = backend.pool().get().unwrap();
+                let flagged: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM concept_properties cp JOIN concepts c ON c.id = cp.concept_id
+                          WHERE c.code = ?1 AND cp.property = 'status' AND cp.value = 'inactive'",
+                        [code],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(flagged == 0, active, "{code}");
+            }
+            let conn = backend.pool().get().unwrap();
+            let parent: String = conn
+                .query_row(
+                    "SELECT parent_code FROM concept_hierarchy WHERE child_code = '00002120030'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent, "0002-1200-30");
         }
     }
 }

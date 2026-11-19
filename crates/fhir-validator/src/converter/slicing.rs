@@ -2,12 +2,20 @@
 //!
 //! A `value`/`pattern` discriminator at path `P` becomes a partial-match
 //! pattern built from the `fixed[x]`/`pattern[x]` constant found at `P`
-//! inside the slice's subtree (`$this` meaning the item root). Discriminator
-//! types we cannot evaluate yet (`type`, `profile`, `exists`, and any path
-//! containing `resolve()` or `extension(...)`) produce a slice with **no
-//! match and no minimum**: it can never produce false cardinality errors,
-//! its constraints simply stay dormant until the matcher lands (Phase 7),
-//! and the generator surfaces a warning.
+//! inside the slice's subtree (`$this` meaning the item root; constants
+//! inside nested slices count, as in the core `bp` profile). `type` and
+//! `profile` discriminators read the types/profiles declared at `P` and
+//! compile to an `all` match (see `build_match`), as do `exists`
+//! discriminators and `type`/`profile` discriminators through `resolve()`
+//! (judged on the resolved target). A single `value`/`pattern`
+//! discriminator whose path has no constant but a required binding compiles
+//! to a `binding` match: membership in that value set, decided by the
+//! engine's effects pass through the terminology service, as the HL7
+//! validator does (`memberOf`). Discriminators we cannot evaluate
+//! (`extension(...)`, value/pattern through `resolve()`) produce a slice
+//! with **no match and no minimum**: it
+//! can never produce false cardinality errors, its constraints simply stay
+//! dormant, and the generator surfaces a warning.
 //!
 //! Under `ordered: true` each slice also gets its declaration ordinal as
 //! `order` — FHIR's ordered slicing means "matched items appear in the order
@@ -39,7 +47,7 @@ pub(super) fn build_slicing(
             extension_profile: _,
         } = slice_node;
 
-        let match_ = build_match(&node, discriminators);
+        let match_ = build_match(&node, discriminators).or_else(|| profile_element_match(&node));
         if match_.is_none() {
             warnings.push(format!(
                 "slice '{name}': discriminator(s) {:?} not translatable to a match; \
@@ -80,8 +88,57 @@ pub(super) fn build_slicing(
     })
 }
 
-/// Build a pattern match from `value`/`pattern` discriminators, reading the
-/// constant at each discriminator path out of the slice subtree.
+/// A slice whose type profile names an element of another profile
+/// (`elementdefinition-profile-element`, a library of slices): it matches
+/// what that element's slice matches, looked up when validating.
+fn profile_element_match(node: &super::tree::Node) -> Option<Match> {
+    let parts: Vec<Value> = node
+        .profile_elements
+        .iter()
+        .map(|(url, element)| {
+            serde_json::json!({"type": "profile-element", "url": url, "element": element})
+        })
+        .collect();
+    (parts.len() == 1).then(|| Match {
+        type_: Some("all".to_string()),
+        value: Some(Value::Array(parts)),
+        resolve_ref: None,
+    })
+}
+
+/// A value/pattern discriminator answered by the type profile of an element
+/// on its path: `{type: profile-value, path, profiles, rest}`, where `rest`
+/// is the path inside the profile (`ofType(...)` steps dropped).
+fn profile_value_part(node: &super::tree::Node, path: &str) -> Option<Value> {
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|s| !s.starts_with("ofType("))
+        .collect();
+    let mut current = node;
+    for (i, segment) in segments.iter().enumerate() {
+        current = current.children.get(*segment)?;
+        if !current.type_profiles.is_empty() && i + 1 < segments.len() {
+            return Some(serde_json::json!({
+                "type": "profile-value",
+                "path": path,
+                "profiles": current.type_profiles,
+                "rest": segments[i + 1..].join("."),
+            }));
+        }
+    }
+    None
+}
+
+/// Build the slice match from the discriminators.
+///
+/// `value`/`pattern` discriminators compile to one partial-match pattern
+/// built from the constants at their paths. `type` and `profile`
+/// discriminators (`Bundle.entry` by `resource`, `component` by `value`)
+/// read the slice's declared types/profiles at their path; a slicing that
+/// uses any of them compiles to an `all` match whose parts the engine
+/// checks together (`pattern`, `type`, `profile`, `exists`; `type` and
+/// `profile` through `resolve()` judge the reference target). Paths through
+/// `extension(...)` stay untranslatable.
 fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> Option<Match> {
     if discriminators.is_empty() {
         return None;
@@ -89,54 +146,255 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
 
     let mut this_constant: Option<Value> = None;
     let mut pattern = Map::new();
+    let mut parts: Vec<Value> = Vec::new();
 
     for disc in discriminators {
-        if !matches!(disc.type_.as_str(), "value" | "pattern") {
+        if disc.path.contains("extension(") {
             return None;
         }
-        if disc.path.contains("resolve()") || disc.path.contains("extension(") {
-            return None;
+        if disc.path.contains("resolve()") {
+            parts.push(resolve_part(node, disc)?);
+            continue;
         }
-        let constant = constant_at(node, &disc.path)?;
-        if disc.path == "$this" {
-            if discriminators.len() > 1 {
-                return None; // $this plus siblings — ambiguous
+        match disc.type_.as_str() {
+            "value" | "pattern" => {
+                // A slice that leaves one of several value/pattern
+                // discriminators unset matches any value there (the HL7
+                // validator judges it on the others).
+                let Some(constant) = constant_at(node, &disc.path) else {
+                    // The value may live in the type profile of an element
+                    // on the path (`resource.ofType(Observation).code`, the
+                    // code pattern of the entry's Observation profile).
+                    if let Some(part) = profile_value_part(node, &disc.path) {
+                        parts.push(part);
+                        continue;
+                    }
+                    if discriminators.len() > 1 && disc.path != "$this" {
+                        continue;
+                    }
+                    // No fixed/pattern value at the path: the HL7 validator
+                    // decides membership by the element's required binding
+                    // (`memberOf`). That needs a terminology service, so the
+                    // engine defers it to the effects pass.
+                    return binding_match(node, discriminators);
+                };
+                if disc.path == "$this" {
+                    if discriminators.len() > 1 {
+                        return None; // $this plus siblings — ambiguous
+                    }
+                    this_constant = Some(constant);
+                } else {
+                    insert_nested(&mut pattern, &disc.path, constant);
+                }
             }
-            this_constant = Some(constant);
-        } else {
-            insert_nested(&mut pattern, &disc.path, constant);
+            "type" => {
+                let target = node_at(node, &disc.path)?;
+                if target.type_codes.is_empty() {
+                    return None;
+                }
+                parts.push(serde_json::json!({
+                    "type": "type", "path": disc.path, "codes": target.type_codes,
+                }));
+            }
+            "profile" => {
+                let target = node_at(node, &disc.path)?;
+                if target.type_profiles.is_empty() {
+                    return None;
+                }
+                parts.push(serde_json::json!({
+                    "type": "profile", "path": disc.path, "profiles": target.type_profiles,
+                }));
+            }
+            "exists" => {
+                let exists = exists_at(node, &disc.path)?;
+                parts.push(serde_json::json!({
+                    "type": "exists", "path": disc.path, "exists": exists,
+                }));
+            }
+            _ => return None,
         }
     }
 
-    let value = match this_constant {
-        Some(v) => v,
-        None if !pattern.is_empty() => Value::Object(pattern),
-        None => return None,
+    let pattern_value = match this_constant {
+        Some(v) => Some(v),
+        None if !pattern.is_empty() => Some(Value::Object(pattern)),
+        None => None,
     };
+    if parts.is_empty() {
+        return Some(Match {
+            type_: Some("pattern".to_string()),
+            value: Some(pattern_value?),
+            resolve_ref: None,
+        });
+    }
+    if let Some(value) = pattern_value {
+        parts.insert(0, serde_json::json!({"type": "pattern", "value": value}));
+    }
     Some(Match {
-        type_: Some("pattern".to_string()),
-        value: Some(value),
+        type_: Some("all".to_string()),
+        value: Some(Value::Array(parts)),
         resolve_ref: None,
     })
 }
 
+/// A single `value`/`pattern` discriminator answered by the required
+/// binding at its path (TW Core slices `Condition.code.coding` by
+/// `pattern@$this` with one bound value set per slice):
+/// `{"type": "binding", "value": {"path": P, "valueSet": vs}}`.
+fn binding_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> Option<Match> {
+    let [disc] = discriminators else {
+        return None;
+    };
+    let binding = node_at(node, &disc.path)?.schema.binding.as_ref()?;
+    if binding.strength.as_deref() != Some("required") {
+        return None;
+    }
+    Some(Match {
+        type_: Some("binding".to_string()),
+        value: Some(serde_json::json!({ "path": disc.path, "valueSet": binding.value_set })),
+        resolve_ref: None,
+    })
+}
+
+/// A `type`/`profile` discriminator through `resolve()` (`resolve()`,
+/// `$this.resolve()`, `item.resolve()`): the References at the path before
+/// `resolve()` must resolve to a resource of the slice's target types /
+/// conforming to one of its target profiles (`type.targetProfile` of the
+/// Reference element, as the HL7 validator reads it). A path continuing
+/// after `resolve()`, or a value/pattern discriminator through it, stays
+/// untranslatable.
+fn resolve_part(node: &super::tree::Node, disc: &EdDiscriminator) -> Option<Value> {
+    // `resolve().code` (value/pattern): the value is the one the target
+    // profiles fix at `code`.
+    if matches!(disc.type_.as_str(), "value" | "pattern")
+        && let Some((prefix, rest)) = disc.path.split_once("resolve().")
+    {
+        let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
+        let prefix = if prefix.is_empty() { "$this" } else { prefix };
+        let target = node_at(node, prefix)?;
+        if target.type_target_profiles.is_empty() {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "profile-value", "path": prefix, "resolve": true,
+            "profiles": target.type_target_profiles, "rest": rest,
+        }));
+    }
+    let prefix = disc.path.strip_suffix("resolve()")?;
+    let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
+    let prefix = if prefix.is_empty() { "$this" } else { prefix };
+    if !matches!(disc.type_.as_str(), "type" | "profile") {
+        return None;
+    }
+    let target = node_at(node, prefix)?;
+    if target.type_target_profiles.is_empty() {
+        return None;
+    }
+    let profiles = &target.type_target_profiles;
+    Some(serde_json::json!({
+        "type": disc.type_, "path": prefix, "resolve": true, "profiles": profiles,
+    }))
+}
+
+/// `exists` discriminator: the slice requires the element at `path`
+/// (`min >= 1` → `true`) or prohibits it (`max = 0` → `false`); otherwise
+/// the slice does not say, and the discriminator is untranslatable.
+fn exists_at(node: &super::tree::Node, path: &str) -> Option<bool> {
+    let (parent_path, name) = match path.rsplit_once('.') {
+        Some((p, n)) => (p, n),
+        None => ("$this", path),
+    };
+    let name = name.strip_suffix("[x]").unwrap_or(name);
+    let parent = node_at(node, parent_path)?;
+    let listed =
+        |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| l.iter().any(|k| k == name));
+    if listed(&parent.schema.required) {
+        return Some(true);
+    }
+    if listed(&parent.schema.excluded) || parent.children.get(name).is_some_and(|c| c.dead) {
+        return Some(false);
+    }
+    let child = parent.children.get(name)?;
+    if child.schema.min.is_some_and(|m| m >= 1) {
+        return Some(true);
+    }
+    None
+}
+
+/// The node at a discriminator path within the slice subtree (`$this` →
+/// the subtree root). A `foo[x]` / `foo` step resolves to the choice
+/// declarer `foo`.
+fn node_at<'a>(node: &'a super::tree::Node, path: &str) -> Option<&'a super::tree::Node> {
+    let path = path.strip_prefix("$this.").unwrap_or(path);
+    if path == "$this" {
+        return Some(node);
+    }
+    let mut current = node;
+    for segment in path.split('.') {
+        let name = segment.strip_suffix("[x]").unwrap_or(segment);
+        current = current.children.get(name)?;
+    }
+    Some(current)
+}
+
 /// The fixed/pattern constant at `path` within the slice subtree
 /// (`$this` → the subtree root itself).
+///
+/// The constant may sit below a nested slice: the core blood-pressure
+/// profile slices `component` by `code.coding.code`, and the constants live
+/// at `component:SystolicBP.code.coding:SBPCode.code` — inside the
+/// `coding` slice. Required (`min >= 1`) nested slices are searched first.
+/// A constant on an intermediate element (`patternCodeableConcept` on
+/// `code`) answers for the path below it.
 fn constant_at(node: &super::tree::Node, path: &str) -> Option<Value> {
-    let target = if path == "$this" {
-        node
-    } else {
-        let mut current = node;
-        for segment in path.split('.') {
-            current = current.children.get(segment)?;
-        }
-        current
-    };
-    target
-        .schema
+    if path == "$this" {
+        return own_constant(node);
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    find_constant(node, &segments)
+}
+
+fn own_constant(node: &super::tree::Node) -> Option<Value> {
+    node.schema
         .fixed
         .clone()
-        .or_else(|| target.schema.pattern.clone())
+        .or_else(|| node.schema.pattern.clone())
+}
+
+fn find_constant(node: &super::tree::Node, segments: &[&str]) -> Option<Value> {
+    let Some((segment, rest)) = segments.split_first() else {
+        return own_constant(node);
+    };
+    let child = node.children.get(*segment)?;
+    if let Some(v) = find_constant(child, rest) {
+        return Some(v);
+    }
+    let mut slices: Vec<&super::tree::SliceNode> = child.slices.values().collect();
+    slices.sort_by_key(|s| std::cmp::Reverse(s.min.unwrap_or(0).min(1)));
+    for slice in slices {
+        if let Some(v) = find_constant(&slice.node, rest) {
+            return Some(v);
+        }
+    }
+    if !rest.is_empty()
+        && let Some(constant) = own_constant(child)
+    {
+        return json_at(&constant, rest);
+    }
+    None
+}
+
+/// The value at `segments` inside a constant, through arrays (first item
+/// that has it).
+fn json_at(value: &Value, segments: &[&str]) -> Option<Value> {
+    let Some((segment, rest)) = segments.split_first() else {
+        return Some(value.clone());
+    };
+    match value {
+        Value::Array(items) => items.iter().find_map(|item| json_at(item, segments)),
+        Value::Object(map) => json_at(map.get(*segment)?, rest),
+        _ => None,
+    }
 }
 
 /// `insert_nested(map, "a.b", v)` → `{a: {b: v}}` (merging siblings).

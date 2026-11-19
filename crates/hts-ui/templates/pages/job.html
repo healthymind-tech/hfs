@@ -1,0 +1,20 @@
+{#- One job: phases, live progress, result, log, cancel. -#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-job-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <a class="back-link" href="/ui/hts/jobs">{{ chrome.i18n.t("hts-job-back") }}</a>
+  <h1 id="hts-job-heading" class="page-head__title">{% if let Some(j) = job_opt %}{{ j.label }}{% else %}{{ chrome.i18n.t("hts-job-title") }}{% endif %}</h1>
+</section>
+{% if let Some(n) = flash.notice %}<p class="notice" role="status">{{ chrome.i18n.t(format!("hts-job-notice-{}", n).as_str()) }}</p>{% endif %}
+{% if let Some(e) = flash.error %}<p class="alert" role="alert">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>{% endif %}
+{% if let Some(u) = unavailable %}
+  {% include "partials/hts-admin-unavailable.html" %}
+{% else if let Some(job) = job_opt %}
+  {% include "partials/hts-job-detail.html" %}
+{% else %}
+  <p class="alert" role="alert">{{ chrome.i18n.t("hts-job-not-found") }}</p>
+{% endif %}
+{% endblock %}

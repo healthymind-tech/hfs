@@ -42,6 +42,12 @@
 //! crate owns templates only, not assets, so the two concerns move on their
 //! own schedules.
 
+mod admin;
+// Not referenced yet, but linked on purpose: the crate's `R4`/`R4B`/`R5`/`R6`
+// features select the FHIR version through `helios-fhir` so it matches the
+// hts binary (see Cargo.toml).
+use helios_fhir as _;
+
 mod capability;
 mod chart;
 mod code_systems;
@@ -50,6 +56,7 @@ mod concepts;
 mod home;
 mod i18n;
 mod import;
+mod login;
 mod metrics_parse;
 mod metrics_ring;
 mod raw_fold;
@@ -70,6 +77,9 @@ use std::sync::Arc;
 // account menu from the real Fluent catalogs and asserts the page contains it
 // (#799). `crates/ui` exports it for the same reason.
 pub use i18n::{I18n, RequestLocale, negotiate_locale};
+/// The administrator session cookie (`hts_admin`, `Path=/ui/hts`) the `hts`
+/// binary configures its [`helios_admin_auth::AdminGate`] with.
+pub use login::COOKIE as ADMIN_COOKIE;
 // Home request-rate chart (§7.1): the sample ring lives on `HtsUiState`, so
 // its type must be nameable by the `hts` binary and by the test rings.
 // `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
@@ -162,22 +172,122 @@ pub struct HtsUiState {
 /// Build the HTS UI router.
 ///
 /// Mount this at `/ui` in the HTS binary so the routes below become
-/// `/ui/hts`, `/ui/hts/assets/*`, etc.
+/// `/ui/hts`, `/ui/hts/assets/*`, etc. Without an admin API there is nothing
+/// to sign in to, so this mounts no administrator guard.
 pub fn router(state: Arc<HtsUiState>) -> Router {
-    Router::new()
-        .merge(home::routes())
+    router_with_admin(state, None, helios_admin_auth::AdminGate::Open)
+}
+
+/// [`router`] plus the HTS admin API nested at `/hts/api/admin`, so the
+/// console's browser code (chunked upload, live job progress) reaches it on
+/// the console's own origin and path prefix — `/ui/hts/api/admin/...` — which
+/// any reverse proxy forwarding `/ui/hts` already routes to this binary.
+/// `admin` is `None` when `HTS_ADMIN_UI` is off.
+///
+/// `gate` is the administrator sign-in (`HTS_ADMIN_PASSWORD`): it guards the
+/// management pages (`/hts/terminology`, `/hts/jobs`, `/hts/import`) and
+/// backs `/hts/login`. `admin` must already be wrapped in the API guard for
+/// the same gate — this function does not guard it — so `/hts/api/admin`
+/// and `/admin` refuse alike.
+pub fn router_with_admin(
+    state: Arc<HtsUiState>,
+    admin: Option<Router>,
+    gate: helios_admin_auth::AdminGate,
+) -> Router {
+    let base = match admin {
+        Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
+        None => Router::new(),
+    };
+    base.merge(home::routes())
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
         .merge(concepts::routes())
         .merge(import::routes())
+        .merge(admin::routes())
+        .merge(login::routes())
         .merge(capability::routes())
         .merge(raw_json_fragment::concept_fragment_routes())
         .merge(raw_json_fragment::workbench_fragment_routes())
         .nest_service("/hts/assets", ServeEmbed::<Assets>::new())
+        // Anything else under the mount is a page that does not exist: answer
+        // with the shell-wrapped not-found page rather than axum's empty 404,
+        // which a browser shows as a blank tab with no title or language.
+        .fallback(not_found_page)
         .with_state(state)
+        // Inner to the guard: exposes the signed-in administrator it stamped
+        // to page rendering (the account menu's Sign out).
+        .layer(axum::middleware::from_fn(login::scope_signed_in))
+        // Whether an HFS console shares this origin, for the topbar product
+        // switcher (UI/UX review §4.2).
+        .layer(axum::middleware::from_fn(scope_hfs_console))
+        .layer(axum::middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: gate.clone(),
+                protects: login::protects,
+                style: helios_admin_auth::Style::Browser {
+                    login_path: login::LOGIN_PATH,
+                },
+            },
+            helios_admin_auth::guard,
+        ))
+        .layer(axum::Extension(gate))
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
         .layer(AutoVaryLayer)
+}
+
+tokio::task_local! {
+    static HFS_CONSOLE: bool;
+}
+
+/// Middleware: remember, for page rendering, whether the browser carries the
+/// cookie an HFS console sets on every page it serves
+/// ([`helios_ui_chrome::HFS_CONSOLE_COOKIE`]). Only an HFS console on this
+/// same origin can have set it, so only then does the product switcher link
+/// to it — a stand-alone HTS shows no dead "FHIR Server" entry.
+async fn scope_hfs_console(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let known = helios_ui_chrome::has_hfs_console_cookie(
+        request
+            .headers()
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    HFS_CONSOLE.scope(known, next.run(request)).await
+}
+
+/// Whether an HFS console shares this origin (see [`scope_hfs_console`]).
+fn hfs_console_known() -> bool {
+    HFS_CONSOLE.try_with(|known| *known).unwrap_or(false)
+}
+
+/// The generic "not found" page, `404` inside the full chrome.
+#[derive(askama::Template)]
+#[template(path = "pages/not-found.html")]
+struct NotFoundPage<'a> {
+    chrome: Chrome<'a>,
+}
+
+async fn not_found_page(
+    axum::extract::State(state): axum::extract::State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+) -> Response {
+    let page = NotFoundPage {
+        chrome: Chrome {
+            i18n: I18n::new(locale),
+            active_page: "",
+            fhir_version: state.fhir_version,
+            version: state.version,
+        },
+    };
+    let mut response = render_page(askama::Template::render(&page));
+    if response.status() == axum::http::StatusCode::OK {
+        *response.status_mut() = axum::http::StatusCode::NOT_FOUND;
+    }
+    response
 }
 
 // ── Page context ────────────────────────────────────────────────────────────
@@ -198,21 +308,52 @@ pub(crate) struct Chrome<'a> {
 impl Chrome<'_> {
     /// Render the topbar account menu from the shared chrome (#799).
     ///
-    /// Deliberately a method rather than a `Chrome` field: HTS has no
-    /// authenticated principal to put in one. `/ui/hts` sits outside any auth
-    /// layer (cf. #320), so no request carries a signed-in user, and
+    /// Deliberately a method rather than a `Chrome` field, which leaves all
+    /// the HTS page structs untouched: the only identity HTS has is the
+    /// administrator sign-in (`HTS_ADMIN_PASSWORD`, [`login`]), and the
+    /// request's signed-in administrator reaches rendering through a
+    /// task-local the sign-in middleware scopes. Signed out, this is
     /// [`helios_ui_chrome::UserIdentity::default`] — every field `None`,
-    /// `can_logout: false` — *is* the signed-out shape. That is byte-identical
-    /// to what HFS renders today, because `crates/ui/src/lib.rs:400-420`
-    /// hard-codes the very same values behind its `user_*` accessors.
-    ///
-    /// Keeping it a method also leaves all ten HTS page structs untouched: the
-    /// menu costs the pages nothing until there is something to show. When the
-    /// browser login flow and the claim inventory (#724) land, the default here
-    /// gives way to real claims and both products light up from one change,
-    /// because the markup is shared rather than copied.
+    /// `can_logout: false` — the same shape HFS renders without a session.
     pub(crate) fn user_menu(&self) -> Result<String, askama::Error> {
-        helios_ui_chrome::user_menu(&self.i18n, helios_ui_chrome::UserIdentity::default())
+        // Signed in as the administrator (`HTS_ADMIN_PASSWORD`): name the
+        // account and offer Sign out. Otherwise the signed-out shape.
+        let user = login::signed_in();
+        let hint = self.i18n.t("admin-user-hint");
+        let identity = match user.as_deref() {
+            Some(name) => helios_ui_chrome::UserIdentity {
+                display: Some(name),
+                secondary: Some(hint.as_str()),
+                can_logout: true,
+                logout_href: login::LOGOUT_PATH,
+                ..Default::default()
+            },
+            None => helios_ui_chrome::UserIdentity::default(),
+        };
+        helios_ui_chrome::user_menu(&self.i18n, identity)
+    }
+
+    /// The topbar theme switcher, shared with HFS (`helios-ui-chrome`).
+    pub(crate) fn theme_toggle(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_toggle(&self.i18n)
+    }
+
+    /// The topbar product switcher, shared with HFS (UI/UX review §4.2):
+    /// rendered only when an HFS console on this origin has announced itself.
+    pub(crate) fn product_switcher(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::product_switcher(
+            &self.i18n,
+            helios_ui_chrome::ProductLinks {
+                current: helios_ui_chrome::Product::Terminology,
+                fhir: hfs_console_known().then_some(helios_ui_chrome::HFS_CONSOLE_PATH),
+                terminology: Some(helios_ui_chrome::HTS_CONSOLE_PATH),
+            },
+        )
+    }
+
+    /// The inline first-paint theme stamp for `<head>` (shared with HFS).
+    pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_boot()
     }
 }
 

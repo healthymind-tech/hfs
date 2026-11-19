@@ -931,7 +931,8 @@ fn url_origin(url: &str) -> String {
 }
 
 /// Computes the RFC 7638 thumbprint of a private key as the `kid`.
-/// Supports ES384 (P-384) and RS384. Returns `None` when the PEM cannot be parsed.
+/// ES384 (P-384) only. Returns `None` for `RS384`, whose assertions go out
+/// without a `kid`, and when the PEM cannot be parsed as a P-384 key.
 fn signing_kid(pem: &str, alg: &str) -> Option<String> {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -945,13 +946,13 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
         // the recipient out-of-band.
         "RS384" => None,
         _ => {
-            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            use p384::elliptic_curve::sec1::ToSec1Point;
             use p384::pkcs8::DecodePrivateKey;
 
             let secret = p384::SecretKey::from_pkcs8_pem(pem)
                 .or_else(|_| p384::SecretKey::from_sec1_pem(pem))
                 .ok()?;
-            let point = secret.public_key().to_encoded_point(false);
+            let point = secret.public_key().to_sec1_point(false);
             let x = URL_SAFE_NO_PAD.encode(point.x()?);
             let y = URL_SAFE_NO_PAD.encode(point.y()?);
             let canonical = format!(r#"{{"crv":"P-384","kty":"EC","x":"{x}","y":"{y}"}}"#);

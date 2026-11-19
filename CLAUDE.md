@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
+The project is a Rust workspace with 23 crates (22 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -30,6 +30,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
 | **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS — Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
 | **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs — the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
+| **`helios-admin-auth`** (`crates/admin-auth`) | Administrator password sign-in shared by HFS and HTS (`HFS_ADMIN_PASSWORD`, `HTS_ADMIN_PASSWORD`): fail-closed gate, session cookie, CSRF origin check, failed-attempt lockout, axum guard middleware. |
 | **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
@@ -85,6 +86,8 @@ The `CompositeStorage` pattern combines backends (e.g., SQLite for CRUD + Elasti
 Detailed operational guidance lives in project skills under `.claude/skills/`.
 Use those skills instead of expanding this always-loaded file.
 
+`.agents/skills` (read by Codex) is a byte-for-byte mirror of `.claude/skills`. Edit both together and check with `diff -r .agents/skills .claude/skills` (no output means in sync).
+
 HFS / Claude Code skills:
 
 - `/fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
@@ -101,6 +104,8 @@ HFS / Claude Code skills:
 - `/work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `/work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
 - `/work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
+- `/hts-api-skill` - Reference for building UI on the HTS HTTP API: routes, content negotiation, OperationOutcome rendering, the `HFS_TERMINOLOGY_SERVER` proxy pattern, and client gaps.
+- `/create-issue` - File a GitHub issue describing work to be done, and stop there; never implements the fix.
 - `/work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `/bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `/bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
@@ -153,4 +158,4 @@ don't duplicate them elsewhere; cite this section instead.
 - The project follows standard Rust conventions
 - `pysof` is excluded from default workspace members — `cargo build` from root skips it
 - Server returns appropriate HTTP status codes and FHIR OperationOutcomes for errors
-- Minimum supported Rust version: 1.90 (edition 2024)
+- Minimum supported Rust version: 1.95 (edition 2024), from `rust-version` in the root `Cargo.toml`; Extended CI checks it daily. Raise it there if a dependency update needs a newer rustc.

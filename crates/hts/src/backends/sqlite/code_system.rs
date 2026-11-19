@@ -195,6 +195,49 @@ impl SqliteTerminologyBackend {
 
 #[async_trait]
 impl CodeSystemOperations for SqliteTerminologyBackend {
+    async fn snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<std::sync::Arc<crate::snomed::SnomedModel>>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::load_sqlite(&conn, &id),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn snomed_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::snomed::ConceptInfo>, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version, codes) = (url.to_string(), version.map(str::to_string), codes.to_vec());
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            match crate::snomed::store::system_id_sqlite(&conn, &url, version.as_deref())? {
+                Some(id) => crate::snomed::store::concepts_sqlite(&conn, &id, &codes),
+                None => Ok(std::collections::HashMap::new()),
+            }
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     /// Look up a concept by system URL + code.
     ///
     /// Returns the concept display, all (or filtered) properties, and all
@@ -486,7 +529,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // fixtures expect ONE warning issue, result=true, and the
                     // `UNKNOWN_CODE_IN_FRAGMENT` message-id with the
                     // "...labeled as a fragment..." text.
-                    if cs_content.as_deref() == Some("fragment") {
+                    // A code system whose content is not present is treated
+                    // the same way (as tx.fhir.org does).
+                    if crate::types::may_hold_unlisted_codes(cs_content.as_deref(), Some(&*system)) {
                         let text = match cs_version_str.as_deref() {
                             Some(v) => format!(
                                 "Unknown Code '{}' in the CodeSystem '{}' version '{}' - note that the code system is labeled as a fragment, so the code may be valid in some other fragment",
@@ -919,7 +964,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         system_url: &str,
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if codes.is_empty() || properties.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -941,7 +986,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT c.code, cp.property, cp.value
+                "SELECT c.code, cp.property, cp.value, cp.value_type
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
                  JOIN code_systems s ON s.id = c.system_id
@@ -961,20 +1006,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             for p in &properties {
                 params.push(p as &dyn rusqlite::ToSql);
             }
-            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
                 std::collections::HashMap::new();
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        PropertyValue {
+                            code: row.get(1)?,
+                            value: row.get(2)?,
+                            value_type: row.get(3)?,
+                            description: None,
+                        },
                     ))
                 })
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             for r in rows {
-                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-                out.entry(code).or_default().push((prop, value));
+                let (code, property) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push(property);
             }
 
             // FHIR `definition` is stored as a column on `concepts` rather
@@ -1016,8 +1065,13 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // Don't double-emit if a `definition` already came from
                     // concept_properties (unusual but possible for hand-rolled
                     // CSes that mirror the field as a property).
-                    if !entry.iter().any(|(p, _)| p == "definition") {
-                        entry.push(("definition".to_string(), definition));
+                    if !entry.iter().any(|property| property.code == "definition") {
+                        entry.push(PropertyValue {
+                            code: "definition".into(),
+                            value_type: "string".into(),
+                            value: definition,
+                            description: None,
+                        });
                     }
                 }
             }
@@ -1174,6 +1228,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
+            let order_by = crate::backends::search_order_by("code_systems", &query);
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_code_systems_meta serves this query without touching the main table.
@@ -1185,7 +1240,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     && query.status.is_none()
             {
                 let mut stmt = conn
-                    .prepare_cached(
+                    .prepare_cached(&format!(
                         "SELECT id, url, version, name, title, status
                          FROM code_systems
                          WHERE (?1 IS NULL OR url = ?1)
@@ -1193,9 +1248,9 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                            AND (?3 IS NULL OR name = ?3)
                            AND (?4 IS NULL OR title = ?4)
                            AND (?5 IS NULL OR status = ?5)
-                         ORDER BY created_at
+                         ORDER BY {order_by}
                          LIMIT ?6 OFFSET ?7",
-                    )
+                    ))
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
                     .query_map(
@@ -1220,35 +1275,39 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         },
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+                let reported = super::fhir_ids::reported_ids(&conn, "code_systems", &ids)?;
                 let mut results = Vec::new();
-                for row in rows {
-                    let (id, url, version, name, title, status) =
-                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for (id, url, version, name, title, status) in &rows {
+                    let id = reported.get(id).unwrap_or(id);
                     results.push(build_synthetic_resource(
                         "CodeSystem",
-                        &id,
-                        &url,
+                        id,
+                        url,
                         version.as_deref(),
                         name.as_deref(),
                         title.as_deref(),
-                        &status,
+                        status,
                     ));
                 }
                 return Ok(results);
             }
 
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                .prepare_cached(&format!(
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM code_systems
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
                        AND (?3 IS NULL OR name = ?3)
                        AND (?4 IS NULL OR title = ?4)
                        AND (?5 IS NULL OR status = ?5)
-                     ORDER BY created_at
+                     ORDER BY {order_by}
                      LIMIT ?6 OFFSET ?7",
-                )
+                ))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt
@@ -1271,6 +1330,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -1278,10 +1338,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         build_synthetic_resource(
@@ -1294,6 +1354,10 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)
@@ -1361,6 +1425,26 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         })
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
+    async fn supplements_for_system(
+        &self,
+        _ctx: &TenantContext,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        if let Some(hit) = self
+            .supplements_cache
+            .read()
+            .ok()
+            .and_then(|g| g.get(system_url).cloned())
+        {
+            return Ok(hit);
+        }
+        let found = self.supplements_for_system_uncached(system_url).await?;
+        if let Ok(mut w) = self.supplements_cache.write() {
+            super::bounded_cache_insert(&mut *w, system_url.to_owned(), found.clone(), 10_000);
+        }
+        Ok(found)
     }
 
     async fn supplement_designations(
@@ -1455,7 +1539,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         supplement_urls: &[String],
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if supplement_urls.is_empty() || codes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1492,7 +1576,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 format!(" AND cp.property IN ({prop_ph})")
             };
             let sql = format!(
-                "SELECT c.code, cp.property, cp.value
+                "SELECT c.code, cp.property, cp.value, cp.value_type
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
                  JOIN code_systems s ON s.id = c.system_id
@@ -1517,20 +1601,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     params.push(p as &dyn rusqlite::ToSql);
                 }
             }
-            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
                 std::collections::HashMap::new();
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        PropertyValue {
+                            code: row.get(1)?,
+                            value: row.get(2)?,
+                            value_type: row.get(3)?,
+                            description: None,
+                        },
                     ))
                 })
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             for r in rows {
-                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-                out.entry(code).or_default().push((prop, value));
+                let (code, property) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push(property);
             }
             Ok(out)
         })
@@ -2191,6 +2279,62 @@ pub(super) fn build_synthetic_resource(
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+impl SqliteTerminologyBackend {
+    /// `supplements_for_system` without the memo.
+    async fn supplements_for_system_uncached(
+        &self,
+        system_url: &str,
+    ) -> Result<Vec<SupplementInfo>, HtsError> {
+        let pool = self.pool().clone();
+        let system_url = system_url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // `supplements` may carry the target's `|version`; match the bare
+            // URL either way. One row per supplement URL — the precedence
+            // order puts the preferred version first and we dedupe on url.
+            let sql = format!(
+                "SELECT url, version FROM code_systems \
+                 WHERE content = 'supplement' \
+                   AND (json_extract(resource_json, '$.supplements') = ?1 \
+                        OR json_extract(resource_json, '$.supplements') LIKE ?1 || '|%') \
+                 ORDER BY url, {}",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
+            let mut stmt = conn
+                .prepare_cached(&sql)
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![system_url], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            let mut out: Vec<SupplementInfo> = Vec::new();
+            for (url, version) in rows {
+                if out
+                    .iter()
+                    .any(|s| s.supplement_canonical.split('|').next() == Some(url.as_str()))
+                {
+                    continue;
+                }
+                out.push(SupplementInfo {
+                    target_url: system_url.clone(),
+                    supplement_canonical: match version {
+                        Some(v) => format!("{url}|{v}"),
+                        None => url,
+                    },
+                });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+}
 
 #[cfg(test)]
 mod tests {

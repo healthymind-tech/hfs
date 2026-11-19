@@ -33,13 +33,19 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_LOG_LEVEL` | `info` | Log level: error, warn, info, debug, trace |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. `false` = headless (`/ui` returns 404 + OperationOutcome). Replaces the removed `headless` build feature (#975) |
 | `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
 | `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
+
+Set `HFS_BASE_URL` explicitly for containers and reverse proxies. Include any
+published path prefix. HFS rejects non-HTTP(S) values, credentials, query
+strings, and fragments, and it never derives the public base from request
+forwarding headers. A loopback base that conflicts with the listener produces
+a startup warning.
 
 ## Limits
 
@@ -74,11 +80,17 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | none | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
+| `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT` | `8` | Seconds the graceful shutdown spends flushing the composite sync queue to the search backend (#2277). What is still queued when it runs out is recorded as needs-reindex instead of written; `0` skips the flush. Runs after the bulk workers drain (`HFS_WORKER_SHUTDOWN_TIMEOUT`, 20 by default), so the two fit the usual 30 s grace period. Without a ledger (S3-backed composite) those items are only counted and logged |
+| `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` | `512` | Documents per cursor batch of a SQL-on-FHIR scan (`1` to `100000`; anything else fails startup). Lower = lower first-row latency on selective views (the first row waits for one full batch); higher = fewer round trips against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at `512`, about 7,000 at `256`). Memory is bounded by this many documents per reply. |
+
+MongoDB pool and timeout options resolve as: an explicitly set `HFS_MONGODB_*` variable (`MAX_CONNECTIONS`, `CONNECT_TIMEOUT_MS`, `SERVER_SELECTION_TIMEOUT_MS`) > the same option in the connection URI (`maxPoolSize`, `connectTimeoutMS`, `serverSelectionTimeoutMS`) > the HFS default (pool `10`, idle `60s`). `appName` and `maxIdleTimeMS` have no variable: URI, else the default (`helios-persistence`, `60s`). An unset variable defers to the URI; an unparsable one is treated as unset. `waitQueueTimeoutMS` has no effect (the Rust driver has no checkout timeout); watch `mongodb_pool_waiting_callers` and `mongodb_pool_checkout_wait_seconds` on `/metrics`. Full table: `README.md`, "MongoDB pool and timeout precedence".
+
+A large transaction Bundle on the native MongoDB backend writes its search rows after the commit (#1975); what a crash, the Bundle deadline or a failed batch leaves in the `search_index_pending` ledger is finished by a repair task (`HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`, default `60` seconds, `0` turns it off). Watch `mongodb_deferred_search_index_oldest_pending_seconds` (age of the oldest unfinished Bundle: committed, not fully searchable) and `mongodb_deferred_search_index_pending_chunks` on `/metrics`; the repair pass sets both, so they are absent while it is off and as fresh as its last pass. `mongodb_deferred_search_index_repair_failed_chunks_total`, `mongodb_deferred_search_index_step_seconds`, `mongodb_deferred_search_index_step_rows_total` and `mongodb_deferred_search_index_steps_incomplete_total{reason}` (`deadline` or `failure`) report repair failures and the post-commit step itself. No tenant or Bundle labels. Meaning, log lines and an alert: `crates/persistence/README.md`, "Deferred search indexing for large MongoDB transaction Bundles".
 
 Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
 
@@ -127,6 +139,8 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
@@ -217,7 +231,7 @@ for the rest):
 
 | Prefix | Contents |
 |---|---|
-| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history (`history/_keyspace.json` is the per-tenant layout marker; the policy must allow `GetObject`/`PutObject` on it) |
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
@@ -307,11 +321,21 @@ curl -H "X-Tenant-ID: clinic-a" http://localhost:8080/Patient
 curl http://localhost:8080/clinic-a/Patient
 ```
 
+## Clustering
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_CLUSTER` | `false` | Declares this process one of N instances: flips cluster-safe defaults and fails fast on unsafe combinations |
+| `HFS_JOB_STORE_BACKEND` | `memory` (`database` under `HFS_CLUSTER`) | Unified async-job store selector (SoF export, reindex); parsed today, wired as the phases land |
+| `HFS_SUBSCRIPTIONS_FANOUT` | `memory` (`pg-notify` under `HFS_CLUSTER`) | Subscriptions cluster delivery (Phase 3): shared counters/tokens/outbox on the Postgres primary + LISTEN/NOTIFY fan-out; non-Postgres primaries warn and stay per-instance |
+
+`HFS_CLUSTER=true` refuses to boot on: a SQLite primary (F1), `HFS_AUTH_JTI_BACKEND=memory` with auth enabled (C1), `local-fs` bulk export/submit output (F2), `HFS_AUDIT_BACKEND=file` (F4), or an explicit `memory` job store. Design and status: `docs/cluster-capable-state-design.md`; operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`). Under `HFS_CLUSTER=true` subscriptions additionally require `HFS_SUBSCRIPTIONS_FANOUT` unset or `pg-notify` and a Postgres primary.
+
 ## Behavior
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: R4, R4B, R5, R6 |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: R4, R4B, R5, R6 |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources instead of 404 |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
@@ -331,13 +355,18 @@ StructureDefinitions (per tenant) become validatable profiles on write.
 | `HFS_VALIDATION_UNKNOWN_PROFILE` | `warn` | Unresolvable profiles: `warn`, `error`, or `ignore` |
 | `HFS_VALIDATION_CONSTRAINTS` | `true` | Evaluate FHIRPath invariants |
 | `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | `dom-6` | Comma-separated constraint ids to skip |
-| `HFS_VALIDATION_TERMINOLOGY` | `off` | Required-binding checks: `off` or `remote` (`ValueSet/$validate-code` against `HFS_TERMINOLOGY_SERVER`) |
+| `HFS_VALIDATION_TERMINOLOGY` | `embedded` | Required-binding checks: `off`; `embedded` (offline, the FHIR core value sets shipped with the validator); `remote` (embedded core value sets first, then `ValueSet/$validate-code` against `HFS_TERMINOLOGY_SERVER` for every value set the pack cannot judge, with `url\|version` canonicals split into `url` + `valueSetVersion`); `remote-only` (every binding goes to the server) |
 | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | `3000` | Per-check terminology timeout |
-| `HFS_VALIDATION_TERMINOLOGY_FAIL` | `open` | Terminology outage posture: `open` (warn) or `closed` (error) |
-| `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions |
+| `HFS_VALIDATION_TERMINOLOGY_FAIL` | `open` | Terminology failure posture on required bindings: `open` (warn), `closed` (error, outages included), or `closed-required` (a ValueSet the server does not know is an error, an outage is a warning) |
+| `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions (registered on create/update, removed on delete) |
+| `HFS_VALIDATION_REHYDRATE` | `true` | Replay stored StructureDefinitions into the profile registries at startup (count and duration are logged) |
+| `HFS_VALIDATION_REHYDRATE_BATCH_SIZE` | `100` | StructureDefinitions per storage round-trip during startup rehydration |
+| `HFS_VALIDATION_REHYDRATE_WAIT_MS` | `60000` | While startup rehydration runs, validation (`$validate` and write-path checks) waits up to this long for it instead of answering from a partly filled registry |
+| `HFS_VALIDATION_SHADOW_CORE` | `false` | Let a stored StructureDefinition with a core canonical (`http://hl7.org/fhir/StructureDefinition/…`) override the embedded definition. Off, so importing `hl7.fhir.r4.core` cannot replace the base types |
 
-Note: tenant profile registries are in-memory and populated by
-StructureDefinition writes since process start (no startup warm-load yet).
+Note: stored profiles (`derivation: constraint`, extensions) are registered
+by canonical URL only — never by `name` — so an extension such as
+`rendering-xhtml` (`name: xhtml`) cannot shadow the `xhtml` type.
 
 ## API Endpoints
 
@@ -364,6 +393,14 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | everything, instance | GET/POST | `/Patient/[id]/$everything` |
 | everything, type | GET/POST | `/Patient/$everything` |
 
+`DELETE [type]/[id]` of a resource that never existed or is already deleted
+is a no-op success (#2523): `204`, or `200` with an informational
+OperationOutcome under `Prefer: return=OperationOutcome`, as a conditional
+delete with no match answers. Batch and transaction entries answer `204` too,
+and the rest of a transaction commits. It used to be `404` (`410` on S3, and a
+`400` for the whole transaction). `If-Match` on an absent or deleted resource
+is still `412`; a read of a deleted resource is still `410`.
+
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require
 the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
@@ -371,3 +408,13 @@ the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
 standalone (no search index exists to rebuild) and its job state is per-process,
 so poll the node you kicked off against. See the
 [helios-rest README](../../../crates/rest/README.md#administrative-operations).
+
+A `batch` `PUT`/`DELETE` entry with `request.ifMatch` answers like the same
+request with `If-Match` (#2527): a stale tag is a `412` entry; a satisfied one
+writes against the version it was checked against, so another writer landing
+after the check makes the entry `409` (its version survives), and a `PUT` on a
+resource deleted after the check is `404` (no revive). Two entries with the same
+`ifMatch` for one id write once; the other is `409` if checked before the winner
+wrote, `412` if after (always `412` on SQLite, which runs entries serially).
+Entries without `ifMatch` stay last-writer-wins. Code: `check_entry_if_match` in
+`crates/rest/src/handlers/batch.rs`; tests: `crates/rest/tests/if_match_write_race.rs`.

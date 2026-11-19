@@ -84,6 +84,7 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
     match ctx {
         Ctx::Schema => keys_of(&FhirSchema {
             url: Some(String::new()),
+            version: Some(String::new()),
             name: Some(String::new()),
             base: Some(String::new()),
             kind: Some(String::new()),
@@ -101,12 +102,18 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             choice_of: Some(String::new()),
             fixed: Some(Value::Null),
             pattern: Some(Value::Null),
+            min_value: Some(Value::Null),
+            max_value: Some(Value::Null),
+            max_length: Some(0),
+            min_length: Some(0),
+            max_size: Some(0),
             binding: Some(Binding {
                 value_set: String::new(),
                 strength: None,
             }),
             constraints: Some(Default::default()),
             refers: Some(Vec::new()),
+            type_profiles: Some(Vec::new()),
             slicing: Some(Slicing {
                 slices: Default::default(),
                 rules: None,
@@ -166,7 +173,20 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // treats "not an array" as "must be singular" (`engine/walk.rs`) —
         // stricter than the format's tri-state, so nothing is lost on packs we
         // generate ourselves.
-        Ctx::Schema => &["scalar"],
+        //
+        // `minValue` / `maxValue`: the packs predate the keywords (stored and
+        // IG profiles carry them); regenerating the packs would emit the few
+        // core ones.
+        // (`typeProfiles` and `version` used to live here; the packs
+        // regenerated at the v0.2.8 merge emit both.)
+        Ctx::Schema => &[
+            "scalar",
+            "minValue",
+            "maxValue",
+            "maxLength",
+            "minLength",
+            "maxSize",
+        ],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.
         // (`order` used to live here — the converter now emits it under

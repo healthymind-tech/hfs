@@ -1,0 +1,144 @@
+# Alert rules for HFS / HTS / PostgreSQL. Thresholds are starting points for a
+# single-site hospital deployment; tune after two weeks of baseline data.
+# Every alert carries a runbook pointer into docs/ops/monitoring.md.
+groups:
+  - name: hfs-availability
+    rules:
+      - alert: HfsDown
+        expr: up{job="hfs"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "HFS /metrics unreachable for 2 minutes"
+          runbook: "docs/ops/monitoring.md#hfsdown--htsdown"
+      - alert: HtsDown
+        expr: up{job="hts"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "HTS /metrics unreachable for 2 minutes"
+          runbook: "docs/ops/monitoring.md#hfsdown--htsdown"
+      - alert: HeliosRestarting
+        expr: resets(uptime_seconds[30m]) > 2
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} restarted more than twice in 30 minutes"
+          runbook: "docs/ops/monitoring.md#heliosrestarting"
+
+  - name: hfs-traffic
+    rules:
+      - record: service:http_requests:rate5m
+        expr: sum by (service) (rate(http_requests_total[5m]))
+      - record: service:http_errors_5xx:rate5m
+        expr: sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+      - record: service:http_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
+      - alert: HeliosHigh5xxRate
+        expr: |
+          service:http_errors_5xx:rate5m / clamp_min(service:http_requests:rate5m, 0.001) > 0.05
+          and service:http_requests:rate5m > 0.2
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service }}: more than 5% of requests fail with 5xx"
+          runbook: "docs/ops/monitoring.md#helioshigh5xxrate"
+      - alert: HeliosSlowRequests
+        expr: service:http_request_duration_seconds:p95_5m > 2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }}: p95 latency above 2 s for 15 minutes"
+          runbook: "docs/ops/monitoring.md#heliosslowrequests"
+
+  - name: hfs-db-pool
+    rules:
+      - alert: PostgresPoolWaiting
+        expr: max_over_time(postgres_pool_waiting_callers[5m]) > 0 and min_over_time(postgres_pool_waiting_callers[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} pool {{ $labels.pool }}: requests queueing for a DB connection for 5 minutes"
+          runbook: "docs/ops/monitoring.md#postgrespoolwaiting--postgrespoolsaturated"
+      - alert: PostgresPoolSaturated
+        expr: (postgres_pool_connections - postgres_pool_available_connections) / postgres_pool_max_connections > 0.9
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} pool {{ $labels.pool }} above 90% busy for 10 minutes"
+          runbook: "docs/ops/monitoring.md#postgrespoolwaiting--postgrespoolsaturated"
+
+  - name: postgres
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "PostgreSQL is not answering the exporter"
+          runbook: "docs/ops/monitoring.md#postgresdown"
+      - alert: PostgresConnectionsNearMax
+        expr: sum(pg_stat_activity_count) / max(pg_settings_max_connections) > 0.8
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "PostgreSQL connections above 80% of max_connections"
+          runbook: "docs/ops/monitoring.md#postgresconnectionsnearmax"
+      - alert: PostgresLongTransaction
+        expr: max(pg_stat_activity_max_tx_duration{state!="idle"}) > 900
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A PostgreSQL transaction has been open for more than 15 minutes"
+          runbook: "docs/ops/monitoring.md#postgreslongtransaction"
+      - alert: PostgresDeadlocks
+        expr: increase(pg_stat_database_deadlocks{datname=~"hfs|hts"}[15m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "Deadlocks in {{ $labels.datname }}"
+          runbook: "docs/ops/monitoring.md#postgresdeadlocks"
+      - alert: PostgresWalArchiveFailing
+        expr: increase(pg_stat_archiver_failed_count[15m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "WAL archiving is failing: point-in-time recovery is degrading"
+          runbook: "docs/ops/monitoring.md#postgreswalarchivefailing--postgreswalarchivestale"
+      - alert: PostgresWalArchiveStale
+        expr: pg_stat_archiver_last_archive_age > 1800
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "No WAL segment archived for 30 minutes (archive_timeout is 5 min)"
+          runbook: "docs/ops/monitoring.md#postgreswalarchivefailing--postgreswalarchivestale"
+      - alert: PostgresCacheHitLow
+        expr: |
+          sum by (datname) (rate(pg_stat_database_blks_hit{datname="hfs"}[30m]))
+          / clamp_min(sum by (datname) (rate(pg_stat_database_blks_hit{datname="hfs"}[30m]) + rate(pg_stat_database_blks_read{datname="hfs"}[30m])), 1) < 0.95
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "hfs buffer cache hit ratio below 95% for an hour (consider more shared_buffers / RAM)"
+          runbook: "docs/ops/monitoring.md#postgrescachehitlow"
+
+  - name: backups
+    rules:
+      - alert: BackupMissing
+        expr: time() - hfs_backup_last_success_timestamp_seconds > 26 * 3600
+        labels: {severity: critical}
+        annotations:
+          summary: "No successful logical backup of {{ $labels.db }} in 26 hours"
+          runbook: "docs/ops/monitoring.md#backupmissing"
+      - alert: BackupFailed
+        expr: hfs_backup_last_status != 0
+        labels: {severity: critical}
+        annotations:
+          summary: "The last pg-backup.sh run failed for {{ $labels.db }}"
+          runbook: "docs/ops/monitoring.md#backupmissing"
+
+  - name: host
+    rules:
+      - alert: DiskWillFillIn3Days
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[6h], 3 * 86400) < 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} is predicted to fill within 3 days"
+          runbook: "docs/ops/monitoring.md#diskwillfillin3days"

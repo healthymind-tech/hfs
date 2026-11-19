@@ -415,6 +415,22 @@ fn replace_cursor_param(url: &str, cursor: &str) -> String {
     format!("{base}{sep}_cursor={cursor}")
 }
 
+/// One distinct value of a resource-level metadata search parameter, as
+/// [`SearchProvider::distinct_meta_values`] reads it from the search index:
+/// a token (`_tag`, `_security`) has a system and code, a uri (`_profile`)
+/// has the uri alone.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DistinctMetaValue {
+    /// The token's system, when it has one.
+    pub system: Option<String>,
+    /// The token's code.
+    pub code: Option<String>,
+    /// The token's display, when it was indexed.
+    pub display: Option<String>,
+    /// The uri value (profile canonical).
+    pub uri: Option<String>,
+}
+
 /// Basic search provider for single resource type queries.
 ///
 /// This trait provides search functionality for a single resource type,
@@ -506,6 +522,12 @@ pub trait SearchProvider: ResourceStorage {
     /// the resource itself. `None` means the provider has no such path for
     /// this query; the resolver then drains the matches page by page and
     /// extracts the references itself.
+    ///
+    /// Implemented by SQLite (from the reference index), Elasticsearch
+    /// (a partitioned `terms` aggregation over `search_params.reference`)
+    /// and MongoDB (an id-only drain of the matches, then their reference
+    /// rows in the search index); `CompositeStorage` forwards it to its
+    /// search provider.
     async fn search_reference_values(
         &self,
         tenant: &TenantContext,
@@ -540,6 +562,24 @@ pub trait SearchProvider: ResourceStorage {
     fn search_param_registry(&self, tenant: &TenantContext)
     -> Arc<RwLock<SearchParameterRegistry>>;
 
+    /// Whether [`search`](Self::search) is really implemented, as opposed to
+    /// answering `UnsupportedCapability`.
+    ///
+    /// Defaults to `true`: a type that implements the required `search` serves
+    /// it. A storage whose `search` is a stub overrides this from its declared
+    /// [`BackendCapability::BasicSearch`](crate::core::BackendCapability::BasicSearch)
+    /// (standalone S3 does), and a wrapper that forwards `search` to an inner
+    /// storage forwards this too; `CompositeStorage` answers for whichever
+    /// provider its `search` reaches.
+    ///
+    /// The REST layer builds `GET /metadata` from this: `search-type` and the
+    /// `searchParam` / `searchInclude` / `searchRevInclude` lists are advertised
+    /// only where it is `true`, so the statement and the `501` a search request
+    /// gets from a stub `search` cannot disagree (#514).
+    fn supports_search(&self) -> bool {
+        true
+    }
+
     /// Whether this backend can evaluate `_contained=true|both` searches (which
     /// require contained-resource indexing). Defaults to `false`; backends that
     /// index `contained[]` entries override this. The REST layer uses it to
@@ -560,6 +600,30 @@ pub trait SearchProvider: ResourceStorage {
     fn modifiers_for_param_type(&self, param_type: SearchParamType) -> Vec<&'static str> {
         let _ = param_type;
         Vec::new()
+    }
+
+    /// The distinct values of a resource-level token or uri search parameter
+    /// — `_tag`, `_security`, `_profile` — across the live (not deleted)
+    /// resources of `resource_type`, or of every type when `None`.
+    ///
+    /// Backs the type- and system-level `$meta` operation, which reports
+    /// every profile, tag and security label in use. Read from the search
+    /// index, so it reflects what a `_tag=` / `_profile=` search would match.
+    ///
+    /// Defaults to "not supported" (a `501` at the REST layer); backends with
+    /// a queryable index override it.
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<DistinctMetaValue>> {
+        let _ = (tenant, resource_type, param);
+        Err(crate::error::StorageError::Search(
+            crate::error::SearchError::IncludeNotSupported {
+                operation: "type- and system-level $meta".to_string(),
+            },
+        ))
     }
 
     /// Makes every write this storage acknowledged before the call visible
@@ -589,6 +653,30 @@ pub trait SearchProvider: ResourceStorage {
     ) -> StorageResult<()> {
         let _ = (tenant, resource_types);
         Ok(())
+    }
+
+    /// Which of `members` can hold a resource in the compartment named by
+    /// `compartment_ref` (`Patient/123`).
+    ///
+    /// `members` pairs each candidate resource type with the search
+    /// parameters through which it joins the compartment. The answer may be a
+    /// superset — a type it names can still turn out empty — but never omits
+    /// a type that has a member: callers use it to skip compartment queries
+    /// that would certainly return nothing, so a missing type would silently
+    /// drop resources. `Patient/$everything` walks every Patient-compartment
+    /// type (about sixty in R4), and on a patient with data in a dozen of them
+    /// the empty queries were most of its latency.
+    ///
+    /// `Ok(None)` means the backend cannot answer cheaply and the caller must
+    /// query every type, which is the default.
+    async fn compartment_member_types(
+        &self,
+        tenant: &TenantContext,
+        compartment_ref: &str,
+        members: &[(String, Vec<String>)],
+    ) -> StorageResult<Option<HashSet<String>>> {
+        let _ = (tenant, compartment_ref, members);
+        Ok(None)
     }
 }
 

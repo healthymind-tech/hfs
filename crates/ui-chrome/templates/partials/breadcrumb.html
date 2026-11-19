@@ -1,0 +1,16 @@
+{#
+  SHARED CHROME -- a breadcrumb trail, rendered by
+  `helios_ui_chrome::breadcrumb()`. Separators come from `.breadcrumb__item +
+  .breadcrumb__item::before` in app.css, so assistive technology reads only
+  the steps.
+#}<nav class="breadcrumb" aria-label="{{ i18n.t("breadcrumb-label") }}">
+  <ol class="breadcrumb__list">
+{%- for crumb in crumbs %}
+    <li class="breadcrumb__item">
+      {%- if let Some(href) = crumb.href.as_deref() %}<a href="{{ href }}">{{ crumb.label }}</a>
+      {%- else %}<span aria-current="page">{{ crumb.label }}</span>{% endif -%}
+    </li>
+{%- endfor %}
+  </ol>
+</nav>
+{#- -#}

@@ -19,15 +19,26 @@
 //! enforced (pinned by `tests/fixtures/extended/slicing_rules.json`), and a
 //! `max: 0` prohibited slice is enforced (the reference skips falsy bounds).
 //!
-//! Match types other than `pattern` (`type`, `profile`, `binding`,
-//! `resolve-ref`) are deliberately not evaluated yet — they arrive in a later
-//! phase alongside the converter's discriminator translation. A slice whose
-//! matcher we cannot evaluate matches nothing, and a slice with no `match`
-//! at all (a constraining slice) also matches nothing.
+//! Match types: `pattern` (partial deep match) and `all` — the converter's
+//! translation of `type`/`profile`/`exists` discriminators, whose parts are
+//! a pattern, a type check on the value at a path (`resourceType`, or the
+//! choice branch key), a profile check (a `meta.profile` claim, or a
+//! structural validation of the value against the profile in the walk's
+//! context, never across resource types), a presence check, and — for
+//! discriminators through `resolve()` — type/profile checks on the
+//! resource a Reference resolves to (contained, or inside the enclosing
+//! Bundle by the fullUrl rules). `binding` matchers (value-set
+//! membership) need a terminology service: the walk defers them
+//! ([`Deferred::SliceMembership`]) together with the `closed` check and the
+//! cardinality of those slices. A
+//! slice whose matcher we cannot evaluate matches nothing — and then makes
+//! `closed`/`openAtEnd` unjudgeable for unmatched items — and a slice with
+//! no `match` at all (a constraining slice) also matches nothing.
 
-use super::errors::{self, ErrorKind};
+use super::errors::{self, ErrorKind, Severity};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
-use crate::schema::{Slice, Slicing};
+use crate::effects::{Deferred, SliceBinding};
+use crate::schema::{FhirSchema, Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -36,8 +47,38 @@ use std::sync::Arc;
 /// The reserved slice name that absorbs unmatched items in closed slicing.
 const DEFAULT_SLICE: &str = "@default";
 
+/// The match type of a slice whose membership is value-set membership (a
+/// `value`/`pattern` discriminator answered by a required binding).
+const BINDING_MATCH: &str = "binding";
+
+/// The precondition of a binding-matched slice compiled from several
+/// discriminators: the constants of the others (`{"url": ...}`), which an
+/// item must partially match before its value-set membership counts.
+fn binding_pattern(slice: &Slice) -> Option<&Value> {
+    let m = slice.match_.as_ref()?;
+    if m.type_.as_deref() != Some(BINDING_MATCH) {
+        return None;
+    }
+    m.value.as_ref()?.get("pattern")
+}
+
+/// `(path, valueSet)` of a binding-matched slice.
+fn binding_of(slice: &Slice) -> Option<(&str, &str)> {
+    let m = slice.match_.as_ref()?;
+    if m.type_.as_deref() != Some(BINDING_MATCH) {
+        return None;
+    }
+    let v = m.value.as_ref()?;
+    Some((
+        v.get("path").and_then(Value::as_str).unwrap_or("$this"),
+        v.get("valueSet").and_then(Value::as_str)?,
+    ))
+}
+
 struct LayerMark {
     slicing: Slicing,
+    /// The profile the slicing came from, when its layer key names one.
+    source: Option<String>,
     /// Matched-item count per slice, in declaration order.
     counters: IndexMap<String, u64>,
     /// For each array item, the slice names it matched (declaration order).
@@ -46,19 +87,22 @@ struct LayerMark {
 
 /// Run the slicing pass over an array element. Returns the indices of items
 /// that were already fully validated (consumed) here.
-pub(super) fn validate_slices(
-    ctx: &mut WalkCtx<'_>,
+pub(super) fn validate_slices<'a>(
+    ctx: &mut WalkCtx<'a>,
     elset: &SchemaSet,
-    items: &[Value],
+    items: &'a [Value],
 ) -> HashSet<usize> {
-    let slicings: Vec<Slicing> = elset.schemas().filter_map(|s| s.slicing.clone()).collect();
+    let slicings: Vec<(Slicing, Option<String>)> = elset
+        .iter()
+        .filter_map(|(key, s)| Some((s.slicing.clone()?, super::walk::key_origin(key))))
+        .collect();
     if slicings.is_empty() {
         return HashSet::new();
     }
 
     // ---- mark ----
     let mut marks: Vec<LayerMark> = Vec::with_capacity(slicings.len());
-    for slicing in slicings {
+    for (slicing, source) in slicings {
         let mut counters: IndexMap<String, u64> =
             slicing.slices.keys().map(|k| (k.clone(), 0)).collect();
         let mut item_matches: Vec<Vec<String>> = vec![Vec::new(); items.len()];
@@ -67,7 +111,7 @@ pub(super) fn validate_slices(
                 if name == DEFAULT_SLICE {
                     continue;
                 }
-                if slice_matches(slice, item) {
+                if slice_matches_in(Some(&*ctx), slice, item) {
                     *counters.get_mut(name).expect("counter exists") += 1;
                     item_matches[index].push(name.clone());
                 }
@@ -82,9 +126,40 @@ pub(super) fn validate_slices(
         }
         marks.push(LayerMark {
             slicing,
+            source,
             counters,
             item_matches,
         });
+    }
+
+    // An item may belong to one slice of a slicing (re-slices aside).
+    for mark in &marks {
+        for (index, matches) in mark.item_matches.iter().enumerate() {
+            let top: Vec<&String> = matches
+                .iter()
+                .filter(|name| mark.slicing.slices[*name].reslice.is_none() && !name.contains('/'))
+                .collect();
+            // Profile-matched slices are matched structurally here (no
+            // invariants or terminology), more loosely than the HL7
+            // validator's full profile check: overlap among them is no
+            // evidence of a real ambiguity.
+            let by_profile = top
+                .iter()
+                .any(|name| matches_by_profile(&mark.slicing.slices[*name]));
+            if top.len() > 1 && !by_profile {
+                ctx.path.push_index(index);
+                let names: Vec<&str> = top.iter().map(|n| n.as_str()).collect();
+                let message = match &mark.source {
+                    Some(profile) => format!(
+                        "Profile {profile}, Element matches more than one slice - {}",
+                        names.join(", ")
+                    ),
+                    None => format!("Element matches more than one slice - {}", names.join(", ")),
+                };
+                ctx.error(ErrorKind::SliceUnmatched, message);
+                ctx.path.pop();
+            }
+        }
     }
 
     // ---- validate matched items (item order), consuming them ----
@@ -93,8 +168,9 @@ pub(super) fn validate_slices(
         let mut slice_schemas: Vec<(String, Arc<crate::schema::FhirSchema>)> = Vec::new();
         for mark in &marks {
             for name in &mark.item_matches[index] {
-                if let Some(schema) = &mark.slicing.slices[name].schema {
-                    slice_schemas.push((name.clone(), Arc::clone(schema)));
+                let slice = &mark.slicing.slices[name];
+                if let Some(schema) = &slice.schema {
+                    slice_schemas.push((slice_key(slice, name), Arc::clone(schema)));
                 }
             }
         }
@@ -102,8 +178,8 @@ pub(super) fn validate_slices(
             continue;
         }
         let mut extended = elset.clone();
-        for (name, schema) in &slice_schemas {
-            add_schemas_to_set(ctx, &mut extended, Arc::clone(schema), name);
+        for (key, schema) in &slice_schemas {
+            add_schemas_to_set(ctx, &mut extended, Arc::clone(schema), key);
         }
         ctx.path.push_index(index);
         validate_node(ctx, &extended, item);
@@ -115,7 +191,14 @@ pub(super) fn validate_slices(
     for mark in &marks {
         let rules = mark.slicing.rules.as_deref().unwrap_or("open");
 
-        if rules == "closed" {
+        // An item no slice matched may still belong to a slice whose
+        // membership we cannot decide: then closed/openAtEnd say nothing.
+        let decidable = mark
+            .slicing
+            .slices
+            .iter()
+            .all(|(name, slice)| name == DEFAULT_SLICE || is_decidable(slice));
+        if rules == "closed" && decidable {
             let default_slice = mark.slicing.slices.get(DEFAULT_SLICE);
             for (index, item) in items.iter().enumerate() {
                 if !mark.item_matches[index].is_empty() {
@@ -139,15 +222,18 @@ pub(super) fn validate_slices(
                     }
                     None => {
                         ctx.path.push_index(index);
-                        ctx.error(
+                        ctx.error_from(
                             ErrorKind::SliceUnmatched,
                             errors::msg_slice_closed_unmatched(),
+                            Severity::Error,
+                            mark.source.clone(),
                         );
                         ctx.path.pop();
                     }
                 }
             }
         } else if rules == "openAtEnd"
+            && decidable
             && let Some(last_matched) = mark.item_matches.iter().rposition(|m| !m.is_empty())
         {
             for (index, matches) in mark.item_matches.iter().enumerate().take(last_matched) {
@@ -179,15 +265,84 @@ pub(super) fn validate_slices(
             }
         }
 
+        // The element the slicing sits on, without array indices, for the
+        // HL7 wording (`Observation.component:SystolicBP`).
+        let element = ctx.path.render_unindexed();
+
+        // Slices decided by value-set membership: the items no other slice
+        // took, and the cardinality of those slices, are judged in the
+        // effects pass, where a terminology service can answer.
+        let binding_slices: Vec<SliceBinding> = mark
+            .slicing
+            .slices
+            .iter()
+            .filter_map(|(name, slice)| {
+                let (path, value_set) = binding_of(slice)?;
+                Some(SliceBinding {
+                    name: name.clone(),
+                    value_set: value_set.to_string(),
+                    min: slice.min,
+                    max: slice.max,
+                    path: path.to_string(),
+                })
+            })
+            .collect();
+        if !binding_slices.is_empty() {
+            let others_decidable = mark.slicing.slices.iter().all(|(name, slice)| {
+                name == DEFAULT_SLICE || is_decidable(slice) || binding_of(slice).is_some()
+            });
+            let closed = rules == "closed"
+                && others_decidable
+                && !mark.slicing.slices.contains_key(DEFAULT_SLICE);
+            let unmatched: Vec<(usize, Vec<Value>)> = items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mark.item_matches[*index].is_empty())
+                .map(|(index, item)| {
+                    let values = binding_slices
+                        .iter()
+                        .map(|b| {
+                            let precondition = mark
+                                .slicing
+                                .slices
+                                .get(&b.name)
+                                .and_then(binding_pattern);
+                            if precondition.is_some_and(|p| !is_partial_match(item, p)) {
+                                return Value::Null;
+                            }
+                            values_at(item, &b.path)
+                                .first()
+                                .map_or(Value::Null, |v| (*v).clone())
+                        })
+                        .collect();
+                    (index, values)
+                })
+                .collect();
+            ctx.defer(Deferred::SliceMembership {
+                path: ctx.path.render_dotted(),
+                element: element.clone(),
+                source: mark.source.clone(),
+                closed,
+                items: unmatched,
+                slices: binding_slices,
+            });
+        }
+
         for (name, slice) in &mark.slicing.slices {
+            if binding_of(slice).is_some() {
+                continue; // judged with the membership answers
+            }
             let found = mark.counters[name];
             if let Some(min) = slice.min
                 && min > 0
                 && found < min
             {
-                ctx.error(
+                ctx.error_full(
                     ErrorKind::SliceCardinality,
                     errors::msg_slice_min(min, found),
+                    Severity::Error,
+                    mark.source.clone(),
+                    Some(errors::hl7_slice_min(&element, name, min, found)),
                 );
             }
             // Unlike the reference validator (which skips falsy bounds),
@@ -196,9 +351,12 @@ pub(super) fn validate_slices(
             if let Some(max) = slice.max
                 && found > max
             {
-                ctx.error(
+                ctx.error_full(
                     ErrorKind::SliceCardinality,
                     errors::msg_slice_max(max, found),
+                    Severity::Error,
+                    mark.source.clone(),
+                    Some(errors::hl7_slice_max(&element, name, max, found)),
                 );
             }
         }
@@ -207,12 +365,78 @@ pub(super) fn validate_slices(
     consumed
 }
 
-/// Does an item belong to a slice? Only `pattern` matching is evaluated
-/// today; a missing `match` (constraining slice) matches nothing, and a
-/// `match` with no `value` matches everything (lodash `_.isMatch` semantics
-/// for an empty source).
+/// Whether a slice's membership is decided by profile conformance (a
+/// `profile` part, or a `type`/`profile` part through `resolve()`).
+fn matches_by_profile(slice: &Slice) -> bool {
+    slice
+        .match_
+        .as_ref()
+        .filter(|m| m.type_.as_deref() == Some("all"))
+        .and_then(|m| m.value.as_ref())
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("profile" | "profile-element")
+                ) || p.get("resolve").and_then(Value::as_bool) == Some(true)
+            })
+        })
+}
+
+/// The schema-set key a matched slice's schema joins under: the extension
+/// URL for an extension slice (so issues inside it name the extension
+/// definition as their source), else the slice name.
+fn slice_key(slice: &Slice, name: &str) -> String {
+    slice
+        .match_
+        .as_ref()
+        .and_then(|m| m.value.as_ref())
+        .and_then(|v| v.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| url.contains("://"))
+        .map_or_else(|| name.to_string(), str::to_string)
+}
+
+/// Does an item belong to a slice? (No walk context: `profile` parts match
+/// by the item's `meta.profile` claims only, references do not resolve.)
 pub(crate) fn slice_matches(slice: &Slice, item: &Value) -> bool {
+    slice_matches_in(None, slice, item)
+}
+
+/// Can the slice's membership be decided at all? A slice compiled without
+/// a matcher (a discriminator we cannot evaluate, such as a `pattern`
+/// discriminator answered by a required binding) matches nothing, so under
+/// `rules: closed` an unmatched item may well belong to it.
+fn is_decidable(slice: &Slice) -> bool {
+    slice
+        .match_
+        .as_ref()
+        .is_some_and(|m| m.type_.as_deref() != Some(BINDING_MATCH))
+        || slice
+            .schema
+            .as_ref()
+            .is_some_and(|s| s.pattern.is_some() || s.fixed.is_some())
+}
+
+/// Does an item belong to a slice? A `pattern` match is a partial deep
+/// match; an `all` match (compiled from `type`/`profile`/`exists`
+/// discriminators, possibly with a pattern part) requires every part. A
+/// missing `match` (constraining slice) matches nothing, and a `match` with
+/// no `value` matches everything (lodash `_.isMatch` semantics for an empty
+/// source).
+fn slice_matches_in<'a>(ctx: Option<&WalkCtx<'a>>, slice: &Slice, item: &'a Value) -> bool {
     if let Some(match_) = &slice.match_ {
+        if match_.type_.as_deref() == Some(BINDING_MATCH) {
+            // Value-set membership: decided in the effects pass.
+            return false;
+        }
+        if match_.type_.as_deref() == Some("all") {
+            return match match_.value.as_ref() {
+                Some(Value::Array(parts)) => parts.iter().all(|p| part_matches(ctx, p, item)),
+                _ => false,
+            };
+        }
         return match match_.value.as_ref() {
             Some(pattern) => is_partial_match(item, pattern),
             None => true,
@@ -229,6 +453,297 @@ pub(crate) fn slice_matches(slice: &Slice, item: &Value) -> bool {
         }
     }
     false
+}
+
+/// One part of an `all` match. A part with `resolve: true` judges the
+/// resources the References at `path` resolve to (`resolve()`
+/// discriminators); a Reference that resolves to nothing at hand matches
+/// nothing, as in the HL7 validator.
+fn part_matches<'a>(ctx: Option<&WalkCtx<'a>>, part: &Value, item: &'a Value) -> bool {
+    let path = part.get("path").and_then(Value::as_str).unwrap_or("$this");
+    let strings = |key: &str| -> Vec<&str> {
+        part.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    };
+    if part.get("resolve").and_then(Value::as_bool) == Some(true) {
+        let Some(ctx) = ctx else {
+            return false;
+        };
+        let targets: Vec<&'a Value> = values_at(item, path)
+            .into_iter()
+            .filter_map(|r| r.get("reference").and_then(Value::as_str))
+            .filter_map(|r| ctx.resolve_reference(r))
+            .collect();
+        let profiles = strings("profiles");
+        if part.get("type").and_then(Value::as_str) == Some("profile-value") {
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = profiles
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return !targets.is_empty();
+            }
+            return targets.iter().any(|t| {
+                values_at(t, rest)
+                    .into_iter()
+                    .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+            });
+        }
+        return match part.get("type").and_then(Value::as_str) {
+            Some("profile") => targets
+                .iter()
+                .any(|t| conforms_to_any(Some(ctx), t, &profiles)),
+            Some("type") => targets.iter().any(|t| {
+                let rt = t.get("resourceType").and_then(Value::as_str);
+                profiles
+                    .iter()
+                    .any(|p| rt.is_some() && profile_type(ctx, p).as_deref() == rt)
+            }),
+            _ => false,
+        };
+    }
+    match part.get("type").and_then(Value::as_str) {
+        Some("profile-value") => {
+            let Some(ctx) = ctx else {
+                return false;
+            };
+            let rest = part.get("rest").and_then(Value::as_str).unwrap_or_default();
+            let constants: Vec<Value> = strings("profiles")
+                .iter()
+                .filter_map(|p| ctx.resolver().resolve(p.split('|').next().unwrap_or(p)))
+                .filter_map(|schema| schema_constant(&schema, rest))
+                .collect();
+            if constants.is_empty() {
+                return true; // no profile fixes a value there
+            }
+            values_at(item, path)
+                .into_iter()
+                .any(|v| constants.iter().any(|c| is_partial_match(v, c)))
+        }
+        Some("profile-element") => {
+            let (Some(ctx), Some(url), Some(element)) = (
+                ctx,
+                part.get("url").and_then(Value::as_str),
+                part.get("element").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            library_slice(ctx, url, element)
+                .is_some_and(|slice| slice_matches_in(Some(ctx), &slice, item))
+        }
+        Some("pattern") => part
+            .get("value")
+            .is_none_or(|pattern| is_partial_match(item, pattern)),
+        Some("type") => type_matches(item, path, &strings("codes")),
+        Some("profile") => values_at(item, path)
+            .into_iter()
+            .any(|v| conforms_to_any(ctx, v, &strings("profiles"))),
+        Some("exists") => {
+            let wanted = part.get("exists").and_then(Value::as_bool).unwrap_or(true);
+            values_at(item, path).is_empty() != wanted
+        }
+        _ => false,
+    }
+}
+
+/// The fixed or pattern value a schema states at a dotted element path.
+fn schema_constant(schema: &FhirSchema, path: &str) -> Option<Value> {
+    let mut current = schema;
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        current = current.elements.as_ref()?.get(segment)?;
+    }
+    current.fixed.clone().or_else(|| current.pattern.clone())
+}
+
+/// The slice `element` (`Composition.section:codeA`) of the profile at
+/// `url`.
+fn library_slice(ctx: &WalkCtx<'_>, url: &str, element: &str) -> Option<Slice> {
+    let root = ctx
+        .resolver()
+        .resolve(url.split('|').next().unwrap_or(url))?;
+    let mut schema: Arc<FhirSchema> = root;
+    let mut found: Option<Slice> = None;
+    for segment in element.split('.').skip(1) {
+        let (name, slice) = match segment.split_once(':') {
+            Some((n, s)) => (n, Some(s)),
+            None => (segment, None),
+        };
+        let child = Arc::clone(schema.elements.as_ref()?.get(name)?);
+        found = None;
+        schema = child;
+        if let Some(slice) = slice {
+            let s = schema.slicing.as_ref()?.slices.get(slice)?.clone();
+            if let Some(inner) = &s.schema {
+                schema = Arc::clone(inner);
+            }
+            found = Some(s);
+        }
+    }
+    found
+}
+
+/// The resource type a (target) profile constrains: the name itself for a
+/// core resource URL, else the resolved profile's `type`.
+fn profile_type(ctx: &WalkCtx<'_>, profile: &str) -> Option<String> {
+    const CORE: &str = "http://hl7.org/fhir/StructureDefinition/";
+    let url = profile.split('|').next().unwrap_or(profile);
+    if let Some(name) = url.strip_prefix(CORE)
+        && !name.contains('-')
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+    {
+        return Some(name.to_string());
+    }
+    ctx.resolver().resolve(url)?.type_.clone()
+}
+
+/// The objects holding the last step of `path`, and that step's name.
+fn parents_at<'v>(item: &'v Value, path: &str) -> (Vec<&'v Value>, Option<String>) {
+    let path = path.strip_prefix("$this.").unwrap_or(path);
+    if path == "$this" || path.is_empty() {
+        return (vec![item], None);
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    let (last, parents) = segments.split_last().expect("split yields a segment");
+    let mut current = vec![item];
+    for segment in parents {
+        let mut next = Vec::new();
+        // `ofType(Observation)`: the resources of that type.
+        if let Some(ty) = segment
+            .strip_prefix("ofType(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            current.retain(|v| {
+                v.get("resourceType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|rt| rt == ty)
+            });
+            continue;
+        }
+        for value in current {
+            match value.get(*segment) {
+                Some(Value::Array(items)) => next.extend(items.iter()),
+                Some(v) => next.push(v),
+                None => {}
+            }
+        }
+        current = next;
+    }
+    let last = last.strip_suffix("[x]").unwrap_or(last).to_string();
+    (current, Some(last))
+}
+
+/// The values at `path` (arrays flattened; `$this` is the item). A last
+/// step naming a choice element (`value`) reads its typed key
+/// (`valueCodeableConcept`).
+fn values_at<'v>(item: &'v Value, path: &str) -> Vec<&'v Value> {
+    let (parents, last) = parents_at(item, path);
+    match last {
+        None => parents,
+        Some(last) => parents
+            .iter()
+            .filter_map(|p| p.get(&last).or_else(|| choice_value(p, &last)))
+            .flat_map(|v| match v {
+                Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .collect(),
+    }
+}
+
+/// `type` discriminator: the value at `path` is one of `codes` — a resource
+/// by its `resourceType`, a choice element by its branch key
+/// (`valueQuantity` for `Quantity`). A non-resource item at `$this` is of
+/// its element's declared type, which every slice of a `type@$this`
+/// slicing on a single-typed element shares (TW Core EMR slices
+/// `code.coding` this way): it matches.
+fn type_matches(item: &Value, path: &str, codes: &[&str]) -> bool {
+    let is_type = |value: &Value| match value.get("resourceType").and_then(Value::as_str) {
+        Some(rt) => codes.contains(&rt),
+        None => false,
+    };
+    let (parents, last) = parents_at(item, path);
+    let Some(last) = last else {
+        return parents.iter().any(|v| match v.get("resourceType") {
+            Some(_) => is_type(v),
+            None => true,
+        });
+    };
+    parents.iter().any(|parent| {
+        let Some(obj) = parent.as_object() else {
+            return false;
+        };
+        if let Some(value) = obj.get(&last) {
+            return match value {
+                Value::Array(items) => items.iter().any(is_type),
+                v if v.get("resourceType").is_some() => is_type(v),
+                // A non-resource element of a single declared type.
+                _ => codes.len() == 1,
+            };
+        }
+        codes
+            .iter()
+            .any(|code| obj.contains_key(&choice_key(&last, code)))
+    })
+}
+
+/// The value of choice element `base` in `obj` under its typed key
+/// (`value` → `valueCodeableConcept`), when exactly one such key exists.
+fn choice_value<'v>(obj: &'v Value, base: &str) -> Option<&'v Value> {
+    let mut found = obj.as_object()?.iter().filter(|(k, _)| {
+        k.strip_prefix(base)
+            .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    });
+    let (_, value) = found.next()?;
+    found.next().is_none().then_some(value)
+}
+
+fn choice_key(base: &str, code: &str) -> String {
+    let mut chars = code.chars();
+    match chars.next() {
+        Some(first) => format!("{base}{}{}", first.to_uppercase(), chars.as_str()),
+        None => base.to_string(),
+    }
+}
+
+/// `profile` discriminator: `value` conforms to one of `profiles` — it
+/// claims it in `meta.profile`, or (with a walk context) it validates
+/// against it without structural errors, as the HL7 validator decides
+/// slice membership. A resource never conforms to a resource profile of
+/// another type.
+fn conforms_to_any<'a>(ctx: Option<&WalkCtx<'a>>, value: &'a Value, profiles: &[&str]) -> bool {
+    let unversioned = |url: &str| url.split('|').next().unwrap_or(url).to_string();
+    let claimed: Vec<String> = value
+        .get("meta")
+        .and_then(|m| m.get("profile"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(unversioned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let resource_type = value.get("resourceType").and_then(Value::as_str);
+    profiles.iter().any(|profile| {
+        let Some(ctx) = ctx else {
+            return claimed.contains(&unversioned(profile));
+        };
+        let Some(schema) = ctx.resolver().resolve(profile) else {
+            return claimed.contains(&unversioned(profile));
+        };
+        if let (Some(rt), Some(ty)) = (resource_type, schema.type_.as_deref())
+            && crate::editor::is_resource(&schema)
+            && rt != ty
+            && !matches!(ty, "Resource" | "DomainResource")
+        {
+            return false;
+        }
+        claimed.contains(&unversioned(profile)) || ctx.conforms_to(value, profile)
+    })
 }
 
 #[cfg(test)]

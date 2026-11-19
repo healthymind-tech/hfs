@@ -6,6 +6,7 @@
 
 use crate::fhir_model::{AuditEvent, AuditEventAgent, AuditEventEntity, AuditEventSource, Meta};
 
+use crate::agent::AuditAgent;
 use crate::balp::{self, AuditAction, code_systems};
 use crate::helpers::*;
 
@@ -29,7 +30,7 @@ pub struct AuditEventBuilder {
     resource_type: Option<String>,
     resource_id: Option<String>,
     patient_reference: Option<String>,
-    agent_who: Option<String>,
+    agent: Option<AuditAgent>,
     agent_name: Option<String>,
     agent_requestor: bool,
     source_observer: String,
@@ -38,6 +39,10 @@ pub struct AuditEventBuilder {
     extra_entities: Vec<AuditEventEntity>,
     event_type_system: Option<String>,
     event_type_code: Option<String>,
+    subtype_override: Option<(String, String)>,
+    agent_display: Option<String>,
+    agent_address: Option<String>,
+    tenant: Option<String>,
 }
 
 impl AuditEventBuilder {
@@ -50,7 +55,7 @@ impl AuditEventBuilder {
             resource_type: None,
             resource_id: None,
             patient_reference: None,
-            agent_who: None,
+            agent: None,
             agent_name: None,
             agent_requestor: true,
             source_observer: source_observer.into(),
@@ -59,6 +64,10 @@ impl AuditEventBuilder {
             extra_entities: Vec::new(),
             event_type_system: None,
             event_type_code: None,
+            subtype_override: None,
+            agent_display: None,
+            agent_address: None,
+            tenant: None,
         }
     }
 
@@ -94,11 +103,34 @@ impl AuditEventBuilder {
         self
     }
 
-    /// Set the agent (who performed the action).
-    pub fn agent(mut self, who: impl Into<String>, name: Option<String>, requestor: bool) -> Self {
-        self.agent_who = Some(who.into());
-        self.agent_name = name;
-        self.agent_requestor = requestor;
+    /// Set the agent (who performed the action) from a single string.
+    ///
+    /// A literal reference (`Practitioner/123`, an absolute URL) is recorded
+    /// as `who.reference`; anything else, such as a bare token `sub`, as
+    /// `who.identifier`. See [`AuditAgent::from_who`].
+    pub fn agent(self, who: &str, name: Option<String>, requestor: bool) -> Self {
+        let mut builder = self.agent_identity(AuditAgent::from_who(who));
+        builder.agent_name = name;
+        builder.agent_requestor = requestor;
+        builder
+    }
+
+    /// Set the requesting agent from a full identity (#1515).
+    pub fn agent_identity(mut self, agent: AuditAgent) -> Self {
+        self.agent = Some(agent);
+        self.agent_requestor = true;
+        self
+    }
+
+    /// Tag the event with the tenant it describes (#1515).
+    ///
+    /// The database sink stores every event in the reserved system tenant, so
+    /// the originating tenant is carried as a `meta.tag` in the
+    /// [`code_systems::HFS_TENANT`] system, searchable with `_tag`. An empty id
+    /// leaves the event untagged.
+    pub fn tenant(mut self, tenant_id: impl Into<String>) -> Self {
+        let tenant_id = tenant_id.into();
+        self.tenant = (!tenant_id.is_empty()).then_some(tenant_id);
         self
     }
 
@@ -127,6 +159,22 @@ impl AuditEventBuilder {
     pub fn event_type(mut self, system: &str, code: &str) -> Self {
         self.event_type_system = Some(system.to_string());
         self.event_type_code = Some(code.to_string());
+        self
+    }
+
+    /// Override the subtype coding (default: the restful-interaction code of
+    /// the action).
+    pub fn subtype(mut self, system: &str, code: &str) -> Self {
+        self.subtype_override = Some((system.to_string(), code.to_string()));
+        self
+    }
+
+    /// Name the agent by display text (an actor without a FHIR reference,
+    /// such as `admin` or a client address) and, optionally, its network
+    /// address.
+    pub fn agent_display(mut self, display: impl Into<String>, address: Option<String>) -> Self {
+        self.agent_display = Some(display.into());
+        self.agent_address = address;
         self
     }
 
@@ -185,6 +233,7 @@ impl AuditEventBuilder {
         entities.extend(self.extra_entities);
 
         // Build the subtype coding (maps action code to restful-interaction)
+        let subtype_override = self.subtype_override.clone();
         let subtype = self.action.map(|a| {
             let interaction = match a {
                 AuditAction::Create => "create",
@@ -198,6 +247,10 @@ impl AuditEventBuilder {
             };
             vec![coding(code_systems::RESTFUL_INTERACTION, interaction)]
         });
+        let subtype = match subtype_override {
+            Some((system, code)) => Some(vec![coding(&system, &code)]),
+            None => subtype,
+        };
 
         // Event type: use override if set, otherwise default to "rest"
         let type_system = self
@@ -208,10 +261,19 @@ impl AuditEventBuilder {
 
         AuditEvent {
             id: Some(fhir_string(uuid::Uuid::new_v4().to_string())),
-            meta: Some(Meta {
-                profile: Some(vec![canonical(profile_url)]),
-                ..Default::default()
-            }),
+            // A profile is claimed only when the event conforms (fork, BALP);
+            // the tenant tag is upstream's #1515.
+            meta: {
+                let tag = self
+                    .tenant
+                    .as_deref()
+                    .map(|t| vec![coding(code_systems::HFS_TENANT, t)]);
+                (profile_url.is_some() || tag.is_some()).then(|| Meta {
+                    profile: profile_url.map(|url| vec![canonical(url)]),
+                    tag,
+                    ..Default::default()
+                })
+            },
             r#type: coding(type_system, type_code),
             subtype,
             action: self.action.map(|a| code(a.to_code())),
@@ -219,7 +281,30 @@ impl AuditEventBuilder {
             outcome: self.outcome.map(code),
             outcome_desc: self.outcome_desc.map(fhir_string),
             agent: Some(vec![AuditEventAgent {
-                who: self.agent_who.as_deref().map(reference),
+                who: match (
+                    self.agent.as_ref().and_then(AuditAgent::to_reference),
+                    self.agent_display.as_deref(),
+                ) {
+                    (Some(mut who), Some(display)) => {
+                        if who.display.is_none() {
+                            who.display = Some(fhir_string(display));
+                        }
+                        Some(who)
+                    }
+                    (Some(who), None) => Some(who),
+                    (None, Some(display)) => Some(crate::fhir_model::Reference {
+                        display: Some(fhir_string(display)),
+                        ..Default::default()
+                    }),
+                    (None, None) => None,
+                },
+                network: self.agent_address.as_deref().map(|a| {
+                    crate::fhir_model::AuditEventAgentNetwork {
+                        address: Some(fhir_string(a)),
+                        r#type: Some(code("2")),
+                        ..Default::default()
+                    }
+                }),
                 name: self.agent_name.map(fhir_string),
                 requestor: boolean(self.agent_requestor),
                 ..Default::default()
@@ -241,6 +326,20 @@ impl AuditEventBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_subtype_and_display_agent() {
+        let e = AuditEventBuilder::new("Device/hts")
+            .action(AuditAction::Delete)
+            .subtype("urn:helios:hts:admin-action", "delete-code-system")
+            .agent_display("admin", Some("10.0.0.9".into()))
+            .build();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["subtype"][0]["code"], "delete-code-system");
+        assert_eq!(v["agent"][0]["who"]["display"], "admin");
+        assert!(v["agent"][0]["who"].get("reference").is_none());
+        assert_eq!(v["agent"][0]["network"]["address"], "10.0.0.9");
+    }
 
     #[test]
     fn test_minimal_build() {
@@ -327,6 +426,71 @@ mod tests {
             Some("Dr. Smith")
         );
         assert_eq!(agent.requestor.value, Some(true));
+    }
+
+    #[test]
+    fn test_agent_identity_populates_identifier_reference_and_display() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .agent_identity(AuditAgent {
+                subject: "937f5c4f".into(),
+                issuer: Some("https://idp.example.org/realms/fhir".into()),
+                reference: Some("Practitioner/123".into()),
+                display: Some("demo".into()),
+            })
+            .build();
+        let agent = &event.agent.as_ref().unwrap()[0];
+        let who = agent.who.as_ref().unwrap();
+        assert_eq!(
+            who.reference.as_ref().and_then(|s| s.value.as_deref()),
+            Some("Practitioner/123")
+        );
+        assert_eq!(
+            who.display.as_ref().and_then(|s| s.value.as_deref()),
+            Some("demo")
+        );
+        let identifier = who.identifier.as_ref().unwrap();
+        assert_eq!(
+            identifier.value.as_ref().and_then(|s| s.value.as_deref()),
+            Some("937f5c4f")
+        );
+        assert_eq!(agent.requestor.value, Some(true));
+    }
+
+    #[test]
+    fn test_bare_subject_agent_is_not_a_reference() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .agent("937f5c4f-1b2c", None, true)
+            .build();
+        let who = event.agent.as_ref().unwrap()[0].who.as_ref().unwrap();
+        assert!(who.reference.is_none());
+        assert_eq!(
+            who.identifier
+                .as_ref()
+                .and_then(|i| i.value.as_ref())
+                .and_then(|s| s.value.as_deref()),
+            Some("937f5c4f-1b2c")
+        );
+    }
+
+    #[test]
+    fn test_tenant_tag() {
+        let event = AuditEventBuilder::new("Device/hfs").tenant("acme").build();
+        let tags = event.meta.as_ref().unwrap().tag.as_ref().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags[0].system.as_ref().and_then(|s| s.value.as_deref()),
+            Some(code_systems::HFS_TENANT)
+        );
+        assert_eq!(
+            tags[0].code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn test_no_tenant_no_tag() {
+        let event = AuditEventBuilder::new("Device/hfs").tenant("").build();
+        assert!(event.meta.as_ref().unwrap().tag.is_none());
     }
 
     #[test]

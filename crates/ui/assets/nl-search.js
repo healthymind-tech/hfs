@@ -23,6 +23,21 @@
   if (!page || !pane || !urlInput || !window.fetch || !window.hfsBusy) return;
   var hfsBusy = window.hfsBusy;
 
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
+
   var text = document.getElementById("nl-text");
   var submit = document.getElementById("nl-submit");
   var answer = document.getElementById("nl-answer");
@@ -132,7 +147,7 @@
     hfsBusy.during([submit], function () {
       showMessage("nl-answer--working", messages.msgWorking);
 
-      return fetch("/$nl-search", {
+      return fetch(fhirUrl("/$nl-search"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

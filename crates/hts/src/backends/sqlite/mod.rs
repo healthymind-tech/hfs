@@ -11,13 +11,24 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
+pub mod admin;
 pub mod schema;
 
 mod code_system;
 mod concept_map;
+pub(crate) mod fhir_ids;
 mod value_set;
 
+/// See `value_set::record_dependencies` (used by the schema migrations).
+pub(crate) fn record_value_set_dependencies(
+    conn: &rusqlite::Connection,
+    vs_id: &str,
+) -> Result<(), HtsError> {
+    value_set::record_dependencies(conn, vs_id)
+}
+
 pub(crate) use code_system::invalidate_cs_language_cache;
+pub(crate) use value_set::drop_implicit_fts;
 pub(crate) use value_set::invalidate_cs_id_cache;
 
 use std::collections::{HashMap, HashSet};
@@ -94,12 +105,14 @@ fn search_resources_in_transaction(
     synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
     let metadata_sql = format!(
-        "SELECT id, url, version, name, title, status
+        "SELECT {columns}
          FROM {table}
          WHERE (?1 IS NULL OR url = ?1)
            AND (?2 IS NULL OR version = ?2)
            AND (?3 IS NULL OR status = ?3)
-         ORDER BY created_at"
+         ORDER BY {order_by}",
+        columns = crate::string_search::metadata_select_list(table, &search, false),
+        order_by = crate::backends::search_order_by(table, &query)
     );
     let mut statement = conn
         .prepare(&metadata_sql)
@@ -111,21 +124,20 @@ fn search_resources_in_transaction(
                 query.version.as_deref(),
                 query.status.as_deref()
             ],
-            |row| {
-                Ok(ResourceSearchRow {
-                    id: row.get(0)?,
-                    url: row.get(1)?,
-                    version: row.get(2)?,
-                    name: row.get(3)?,
-                    title: row.get(4)?,
-                    status: row.get(5)?,
-                })
-            },
+            search_row,
         )
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let rows = with_fhir_ids(conn, table, rows, &search)?;
     let selected = filter_rows(rows, &query, &search);
+    let has_fhir_id = fhir_ids::TABLES.contains(&table);
+    let reported = if has_fhir_id {
+        let ids: Vec<&str> = selected.iter().map(|row| row.id.as_str()).collect();
+        fhir_ids::reported_ids(conn, table, &ids)?
+    } else {
+        HashMap::new()
+    };
 
     let use_synthetic = synthetic_summary && query.summary.as_deref() == Some("true");
     let mut stored_resources = HashMap::<String, Option<String>>::new();
@@ -157,7 +169,7 @@ fn search_resources_in_transaction(
 
     let mut results = Vec::with_capacity(selected.len());
     for row in selected {
-        let resource = stored_resources
+        let mut resource = stored_resources
             .remove(&row.id)
             .flatten()
             .and_then(|json| serde_json::from_str(&json).ok())
@@ -172,17 +184,36 @@ fn search_resources_in_transaction(
                     &row.status,
                 )
             });
+        if let Some(id) = reported.get(&row.id) {
+            crate::resource_ids::apply_id(&mut resource, id);
+        }
         results.push(resource);
     }
     Ok(results)
+}
+
+/// Fill [`ResourceSearchRow::fhir_id`] when the search filters on `_id`.
+fn with_fhir_ids(
+    conn: &rusqlite::Connection,
+    table: &str,
+    mut rows: Vec<ResourceSearchRow>,
+    search: &ResourceStringSearch,
+) -> Result<Vec<ResourceSearchRow>, HtsError> {
+    if search.needs_fhir_id() && fhir_ids::TABLES.contains(&table) {
+        let mut all = fhir_ids::all_fhir_ids(conn, table)?;
+        for row in &mut rows {
+            row.fhir_id = all.remove(&row.id).flatten();
+        }
+    }
+    Ok(rows)
 }
 
 /// Count the resources in `table` matching `query`, ignoring `_count` and
 /// `_offset`, so a searchset Bundle can report the full match count.
 ///
 /// Uses the same predicates as the search paths: exact `url`/`version`/
-/// `status` in SQL and, when present, FHIR string matching of `name`/`title`
-/// over the metadata rows.
+/// `status` in SQL and, when present, the Rust-side filters
+/// ([`ResourceStringSearch`]) over the metadata rows.
 fn count_resources(
     conn: &rusqlite::Connection,
     table: &str,
@@ -207,25 +238,40 @@ fn count_resources(
     }
 
     let mut statement = conn
-        .prepare_cached(&format!("SELECT name, title FROM {table} {filter}"))
+        .prepare_cached(&format!(
+            "SELECT {columns} FROM {table} {filter}",
+            columns = crate::string_search::metadata_select_list(table, &search, false)
+        ))
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
-        .query_map(params, |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        })
+        .query_map(params, search_row)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
-    let mut count = 0;
-    for row in rows {
-        let (name, title) = row.map_err(|error| HtsError::StorageError(error.to_string()))?;
-        if search.matches(name.as_deref(), title.as_deref()) {
-            count += 1;
-        }
-    }
-    Ok(count)
+    let rows = with_fhir_ids(conn, table, rows, &search)?;
+    Ok(rows.iter().filter(|row| search.matches_row(row)).count() as u64)
 }
+
+/// Map a row of [`crate::string_search::metadata_select_list`].
+fn search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceSearchRow> {
+    Ok(ResourceSearchRow {
+        id: row.get(0)?,
+        url: row.get(1)?,
+        version: row.get(2)?,
+        name: row.get(3)?,
+        title: row.get(4)?,
+        status: row.get(5)?,
+        content: row.get(6)?,
+        supplements: row.get(7)?,
+        publisher: row.get(8)?,
+        updated_at: row.get(9)?,
+        fhir_id: row.get(10)?,
+    })
+}
+
+/// Newly full-text-indexed rows at startup below which planner statistics
+/// are left as they are (see `finalize_after_bootstrap`).
+const STARTUP_ANALYZE_MIN_ROWS: usize = 200_000;
 
 impl SqliteTerminologyBackend {
     /// Async wrapper around [`count_resources`] for the per-type search traits.
@@ -246,48 +292,7 @@ impl SqliteTerminologyBackend {
     }
 }
 
-/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
-/// the map is already at `max` capacity.
-///
-/// The response and concept-flag caches are read under a shared (`read`) lock
-/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
-/// track per-entry recency: true LRU would require taking a write lock on every
-/// read to bump a recency counter, serializing the very lookups the cache
-/// exists to speed up. Instead, when the map is full we evict a single
-/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
-/// this is effectively random replacement) and admit the new key.
-///
-/// This replaces the previous "insert only while `len < max`" policy, which
-/// *froze* each cache once it filled: the first `max` distinct keys held their
-/// slots permanently and every later key missed forever, making the cache
-/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
-/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
-/// same memory ceiling while letting hot keys re-enter the cache.
-pub(crate) fn bounded_cache_insert<K, V, S>(
-    map: &mut HashMap<K, V, S>,
-    key: K,
-    value: V,
-    max: usize,
-) where
-    K: std::hash::Hash + Eq + Clone,
-    S: std::hash::BuildHasher,
-{
-    if max == 0 {
-        return;
-    }
-    // Only evict when inserting a genuinely new key would exceed the bound;
-    // overwriting an existing key does not grow the map.
-    if map.len() >= max && !map.contains_key(&key) {
-        // Clone one key to end the immutable borrow before removing. The keys
-        // here are small (`String` / `(String, String)`) and this only runs on
-        // a cache miss, so the clone is negligible next to the SQLite work that
-        // produced `value`.
-        if let Some(evict) = map.keys().next().cloned() {
-            map.remove(&evict);
-        }
-    }
-    map.insert(key, value);
-}
+pub(crate) use crate::backends::bounded_cache_insert;
 
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
@@ -440,6 +445,11 @@ pub struct SqliteTerminologyBackend {
     /// `resource_json` only to discard everything except `is_empty()`.
     /// Invalidated alongside the other per-instance caches on `import_bundle`.
     pub(crate) cs_exists_cache: Arc<RwLock<BoolMap>>,
+    /// `supplements_for_system` memo, keyed by the base CodeSystem URL. The
+    /// query reads `supplements` out of each supplement's `resource_json`,
+    /// i.e. parses every supplement's full JSON (megabytes for a translation
+    /// supplement of ICD-10) on every uncached `$lookup` / `$expand`.
+    pub(crate) supplements_cache: Arc<RwLock<HashMap<String, Vec<crate::traits::SupplementInfo>>>>,
 }
 
 impl SqliteTerminologyBackend {
@@ -554,6 +564,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_concept_maps_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy concept_maps.url UNIQUE: {e}"
+                ))
+            })?;
             schema::migrate_bootstrap_imports_columns(&conn).map_err(|e| {
                 HtsError::StorageError(format!(
                     "Failed to apply bootstrap_imports column migration: {e}"
@@ -565,11 +580,41 @@ impl SqliteTerminologyBackend {
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
+            schema::migrate_current_pin(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
+            })?;
+            schema::migrate_search_param_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
+            })?;
+            // Unique reported ids across versions (see `crate::resource_ids`):
+            // add the columns, then repair rows written without them —
+            // including databases where versions still share one id.
+            fhir_ids::migrate_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply fhir_id migration: {e}"))
+            })?;
+            fhir_ids::repair(&conn)?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
+            // Must run before `migrate_concept_closure` would be useful again:
+            // it drops the closure of the systems it repairs, so run the
+            // closure migration once more afterwards.
+            schema::migrate_property_hierarchy(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
+            })?;
+            schema::migrate_p25_data(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
+            })?;
+            schema::migrate_p25_data2(&conn)?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
 
             // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
@@ -638,6 +683,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -684,12 +730,23 @@ impl SqliteTerminologyBackend {
         // Only refresh planner statistics when we actually built something:
         // ANALYZE stats persist on disk across restarts, so a no-op boot needs
         // none.
+        // Statistics are refreshed only when the boot indexed a lot. A few
+        // new systems (an IG's CodeSystems) barely move them, and a full
+        // ANALYZE of a database holding SNOMED CT and LOINC reads every page:
+        // on a spinning disk with a cold page cache that kept the server from
+        // binding for over 20 minutes, `analysis_limit` or not. Imports still
+        // run their own ANALYZE.
         let built = value_set::prebuild_concepts_fts(&conn);
-        if built > 0 {
+        if built >= STARTUP_ANALYZE_MIN_ROWS {
             let _ = conn.execute_batch(
                 "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
                  ANALYZE concept_properties; ANALYZE concept_designations; \
                  ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+            );
+        } else if built > 0 {
+            tracing::info!(
+                rows = built,
+                "skipping startup ANALYZE: too few newly indexed rows to matter"
             );
         }
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
@@ -738,15 +795,50 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_concept_maps_drop_url_unique(&mut conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to drop legacy concept_maps.url UNIQUE: {e}"
+                ))
+            })?;
             // See the on-disk path: must follow the drop_url_unique rebuilds.
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // Also after the rebuilds (same reason as authority_rank).
+            schema::migrate_version_sort(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply version_sort migration: {e}"))
+            })?;
+            schema::migrate_current_pin(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply current_pin migration: {e}"))
+            })?;
+            schema::migrate_search_param_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply search column migration: {e}"))
+            })?;
+            // Unique reported ids across versions (see `crate::resource_ids`):
+            // add the columns, then repair rows written without them —
+            // including databases where versions still share one id.
+            fhir_ids::migrate_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply fhir_id migration: {e}"))
+            })?;
+            fhir_ids::repair(&conn)?;
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
+            // Must run before `migrate_concept_closure` would be useful again:
+            // it drops the closure of the systems it repairs, so run the
+            // closure migration once more afterwards.
+            schema::migrate_property_hierarchy(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
+            })?;
+            schema::migrate_p25_data(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
+            })?;
+            schema::migrate_p25_data2(&conn)?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply concept closure migration: {e}"))
             })?;
         }
 
@@ -769,6 +861,7 @@ impl SqliteTerminologyBackend {
             validate_code_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
+            supplements_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -817,6 +910,19 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
     /// Returns `None` when the ID is unknown.
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
         let conn = self.pool.get().ok()?;
+        // The row reporting `id` (unique per stored version), else the
+        // legacy storage-id / declared-id matching below.
+        let table = match resource_type {
+            "CodeSystem" => Some("code_systems"),
+            "ValueSet" => Some("value_sets"),
+            "ConceptMap" => Some("concept_maps"),
+            _ => None,
+        };
+        if let Some(table) = table
+            && let Some((sid, _)) = fhir_ids::resolve(&conn, table, id)
+        {
+            return fhir_ids::instance_canonical(&conn, table, &sid);
+        }
         match resource_type {
             "CodeSystem" => {
                 if let Ok(url) = conn.query_row(
@@ -865,6 +971,33 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
                 .ok(),
             _ => None,
         }
+    }
+
+    fn resource_json_by_id(&self, resource_type: &str, id: &str) -> Option<serde_json::Value> {
+        let conn = self.pool.get().ok()?;
+        let table = match resource_type {
+            "CodeSystem" => "code_systems",
+            "ValueSet" => "value_sets",
+            "ConceptMap" => "concept_maps",
+            _ => return None,
+        };
+        // The row reporting `id`, a storage id (best version by precedence),
+        // or `<declared>-<version>` — all index lookups. Deliberately no
+        // unindexed `json_extract(resource_json, '$.id')` scan: that is a full
+        // scan of every stored resource (~2.3 s over 21k ValueSets) on every
+        // miss, i.e. on every 404.
+        let (sid, reported) = fhir_ids::resolve(&conn, table, id)?;
+        let raw: Option<String> = conn
+            .query_row(
+                &format!("SELECT resource_json FROM {table} WHERE id = ?1"),
+                [&sid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let mut resource: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+        crate::resource_ids::apply_id(&mut resource, &reported);
+        Some(resource)
     }
 }
 
@@ -956,6 +1089,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         } = self;
 
         // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
@@ -984,6 +1118,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             validate_code_response_cache,
             cs_version_for_url_cache,
             cs_exists_cache,
+            supplements_cache,
         );
 
         // Process-global caches shared by every backend instance in this
@@ -992,6 +1127,7 @@ impl TerminologyCaches for SqliteTerminologyBackend {
         // regardless of which resource type was written, and both are cheap.
         invalidate_cs_id_cache();
         invalidate_cs_language_cache();
+        crate::loinc_filters::clear();
     }
 }
 
@@ -1045,6 +1181,28 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         result
     }
 
+    /// Rebuild closures for systems left with hierarchy but none, on a blocking
+    /// thread — the build is a recursive SQL walk that can take tens of seconds
+    /// for a large system.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        let pool = self.pool.clone();
+        let rebuilt = tokio::task::spawn_blocking(move || -> Result<usize, HtsError> {
+            let conn = pool.get().map_err(|e| {
+                HtsError::StorageError(format!("Failed to acquire connection: {e}"))
+            })?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+
+        if rebuilt > 0 {
+            self.invalidate_caches();
+        }
+        Ok(rebuilt)
+    }
+
     async fn code_system_has_concepts(
         &self,
         _ctx: &TenantContext,
@@ -1070,6 +1228,241 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
+    async fn import_refset_members(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        let written = tokio::task::spawn_blocking(move || -> Result<u64, HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            write_refset_members(&mut conn, &url, version.as_deref(), &members)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        // Cached expansions may hold ECL `^` results.
+        self.invalidate_caches();
+        Ok(written)
+    }
+
+    async fn import_snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        let pool = self.pool.clone();
+        let (url, version) = (url.to_string(), version.map(str::to_string));
+        let written = tokio::task::spawn_blocking(move || -> Result<u64, HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            crate::snomed::store::write_sqlite(&mut conn, &url, version.as_deref(), &data)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        self.invalidate_caches();
+        Ok(written)
+    }
+
+    async fn write_concept_properties(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+        clear: &[String],
+        properties: Vec<crate::import::PropertyRow>,
+        designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        let pool = self.pool.clone();
+        let (url, version, clear) = (url.to_string(), version.map(str::to_string), clear.to_vec());
+        let nothing = clear.is_empty() && properties.is_empty() && designations.is_empty();
+        let written = tokio::task::spawn_blocking(move || -> Result<(u64, u64), HtsError> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            write_concept_properties(
+                &mut conn,
+                &url,
+                version.as_deref(),
+                &clear,
+                &properties,
+                &designations,
+            )
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+        if !nothing {
+            self.invalidate_caches();
+        }
+        Ok(written)
+    }
+}
+
+/// The `code_systems.id` of `url|version`; with no version, of the only
+/// stored version of `url`.
+fn resolve_system_id(
+    conn: &rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+) -> Result<String, HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let ids: Vec<String> = match version {
+        Some(v) => conn
+            .prepare("SELECT id FROM code_systems WHERE url = ?1 AND version = ?2")
+            .map_err(err)?
+            .query_map(rusqlite::params![url, v], |r| r.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?,
+        None => conn
+            .prepare("SELECT id FROM code_systems WHERE url = ?1")
+            .map_err(err)?
+            .query_map(rusqlite::params![url], |r| r.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?,
+    };
+    match ids.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Err(HtsError::NotFound(format!(
+            "CodeSystem {url}{} is not imported",
+            version.map(|v| format!("|{v}")).unwrap_or_default()
+        ))),
+        _ => Err(HtsError::InvalidRequest(format!(
+            "CodeSystem {url} is stored in {} versions; name the version",
+            ids.len()
+        ))),
+    }
+}
+
+/// [`BundleImportBackend::write_concept_properties`] in one transaction.
+fn write_concept_properties(
+    conn: &mut rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+    clear: &[String],
+    properties: &[crate::import::PropertyRow],
+    designations: &[(String, String, String)],
+) -> Result<(u64, u64), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(err)?;
+    let system_id = resolve_system_id(&tx, url, version)?;
+    if !clear.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "DELETE FROM concept_properties
+                 WHERE property = ?2
+                   AND concept_id IN (SELECT id FROM concepts WHERE system_id = ?1)",
+            )
+            .map_err(err)?;
+        for property in clear {
+            stmt.execute(rusqlite::params![system_id, property])
+                .map_err(err)?;
+        }
+    }
+    let mut props = 0u64;
+    if !properties.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO concept_properties (concept_id, property, value_type, value)
+                 SELECT id, ?3, ?4, ?5 FROM concepts WHERE system_id = ?1 AND code = ?2",
+            )
+            .map_err(err)?;
+        for row in properties {
+            props += stmt
+                .execute(rusqlite::params![
+                    system_id,
+                    row.code,
+                    row.property,
+                    row.value_type,
+                    row.value
+                ])
+                .map_err(err)? as u64;
+        }
+    }
+    let mut desigs = 0u64;
+    if !designations.is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO concept_designations (concept_id, language, value)
+                 SELECT c.id, ?3, ?4 FROM concepts c
+                 WHERE c.system_id = ?1 AND c.code = ?2
+                   AND lower(COALESCE(c.display, '')) <> lower(?4)
+                   AND NOT EXISTS (SELECT 1 FROM concept_designations d
+                                   WHERE d.concept_id = c.id
+                                     AND d.language IS ?3
+                                     AND lower(d.value) = lower(?4))",
+            )
+            .map_err(err)?;
+        for (code, language, value) in designations {
+            desigs += stmt
+                .execute(rusqlite::params![system_id, code, language, value])
+                .map_err(err)? as u64;
+        }
+    }
+    if !clear.is_empty() || props > 0 || desigs > 0 {
+        crate::import::fhir_bundle::invalidate_expansion_cache_for_system(&tx, url)?;
+        crate::import::fhir_bundle::invalidate_implicit_expansions(&tx, url)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok((props, desigs))
+}
+
+/// Replace the `refset_members` rows of the CodeSystem `url|version` in one
+/// transaction (a delete by primary-key prefix, then the inserts).
+fn write_refset_members(
+    conn: &mut rusqlite::Connection,
+    url: &str,
+    version: Option<&str>,
+    members: &[(String, String)],
+) -> Result<u64, HtsError> {
+    use rusqlite::OptionalExtension;
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(err)?;
+    let system_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM code_systems WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![url, version],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(system_id) = system_id else {
+        return Err(HtsError::NotFound(format!(
+            "CodeSystem {url}|{} is not imported; cannot store its reference set members",
+            version.unwrap_or("")
+        )));
+    };
+    tx.execute(
+        "DELETE FROM refset_members WHERE system_id = ?1",
+        [&system_id],
+    )
+    .map_err(err)?;
+    let mut written = 0u64;
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO refset_members (system_id, refset_id, referenced_code)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(err)?;
+        for (refset, code) in members {
+            written += stmt.execute([&system_id, refset, code]).map_err(err)? as u64;
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(written)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1078,6 +1471,78 @@ impl BundleImportBackend for SqliteTerminologyBackend {
 mod tests {
     use super::*;
     use crate::traits::TerminologyMetadata;
+
+    /// A database written before the p25-data fixes: a flat CDCREC and a
+    /// cached expansion over it. The one-time migration adds the hierarchy and
+    /// drops the cache, once.
+    #[tokio::test]
+    async fn p25_data_migration_repairs_flat_cdcrec_and_drops_stale_expansions() {
+        use crate::import::BundleImportBackend;
+        let b = SqliteTerminologyBackend::in_memory().unwrap();
+        let bundle = serde_json::json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"resource": {"resourceType": "CodeSystem", "id": "CDCREC",
+              "url": "urn:oid:2.16.840.1.113883.6.238", "version": "1.2", "content": "complete",
+              "concept": [{"code": "1000-9"}, {"code": "2028-9"}, {"code": "2039-6"}]}},
+            {"resource": {"resourceType": "ValueSet", "id": "dr", "url": "http://t/vs/dr",
+              "compose": {"include": [{"system": "urn:oid:2.16.840.1.113883.6.238",
+                "filter": [{"property": "concept", "op": "descendent-of", "value": "1000-9"}]}]}}},
+            {"resource": {"resourceType": "ValueSet", "id": "dr7", "url": "http://t/vs/dr7",
+              "compose": {"include": [{"valueSet": ["http://t/vs/dr"]}]}}}
+        ]});
+        b.import_bundle(
+            &helios_persistence::tenant::TenantContext::system(),
+            &serde_json::to_vec(&bundle).unwrap(),
+        )
+        .await
+        .unwrap();
+        let conn = b.pool().get().unwrap();
+        let edges = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM concept_hierarchy h JOIN code_systems cs ON cs.id = h.system_id \
+                 WHERE cs.url = 'urn:oid:2.16.840.1.113883.6.238'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(edges(&conn), 2, "the importer supplies the hierarchy");
+        // Simulate the old state.
+        conn.execute_batch(
+            "DELETE FROM concept_hierarchy; DELETE FROM concept_closure;
+             DELETE FROM bootstrap_imports WHERE path LIKE '#migration:cdcrec%';",
+        )
+        .unwrap();
+        let vs_id: String = conn
+            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
+             VALUES (?1, 'http://terminology.hl7.org/CodeSystem/v3-NullFlavor', 'UNK')",
+            [&vs_id],
+        )
+        .unwrap();
+        // A value set built from other value sets (US Core 7 detailed-race)
+        // holds only the null-flavor part of a stale expansion.
+        let vs7: String = conn
+            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr7'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
+             VALUES (?1, 'http://terminology.hl7.org/CodeSystem/v3-NullFlavor', 'UNK')",
+            [&vs7],
+        )
+        .unwrap();
+        schema::migrate_p25_data(&conn).unwrap();
+        assert_eq!(edges(&conn), 2);
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM value_set_expansions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0, "stale expansions over CDCREC and of value-set-built sets dropped");
+        // Runs once.
+        conn.execute_batch("DELETE FROM concept_hierarchy").unwrap();
+        schema::migrate_p25_data(&conn).unwrap();
+        assert_eq!(edges(&conn), 0);
+    }
 
     fn backend() -> SqliteTerminologyBackend {
         SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise")

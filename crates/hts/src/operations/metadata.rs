@@ -313,8 +313,19 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
         {"name": "version", "type": "token",  "documentation": "Business version"},
         {"name": "name",    "type": "string", "documentation": "Computer-friendly name"},
         {"name": "title",   "type": "string", "documentation": "Human-friendly title"},
-        {"name": "status",  "type": "token",  "documentation": "Publication status"}
+        {"name": "status",  "type": "token",  "documentation": "Publication status"},
+        {"name": "publisher", "type": "string", "documentation": "Name of the publisher"},
+        {"name": "_id",     "type": "token",  "documentation": "Logical id"},
+        {"name": "_lastUpdated", "type": "date", "documentation": "When the resource was last stored"}
     ]);
+    let mut code_system_search_params = search_params.clone();
+    if let Some(list) = code_system_search_params.as_array_mut() {
+        list.extend([
+            json!({"name": "system", "type": "uri", "documentation": "The system for any codes defined by this code system (same as url)"}),
+            json!({"name": "supplements", "type": "reference", "documentation": "Find code system supplements for the referenced code system (url or url|version)"}),
+            json!({"name": "content-mode", "type": "token", "documentation": "not-present | example | fragment | complete | supplement"}),
+        ]);
+    }
 
     // ── Standard interactions supported by all three CRUD resources ───────────
     let interactions = json!([
@@ -368,7 +379,8 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "CodeSystem",
                     "interaction": interactions,
-                    "searchParam": search_params,
+                    "updateCreate": true,
+                    "searchParam": code_system_search_params,
                     "operation": [
                         {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
                         {"name": "validate-code", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"},
@@ -378,6 +390,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ValueSet",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
@@ -387,6 +400,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ConceptMap",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
@@ -528,26 +542,31 @@ mod tests {
         assert!(types.contains(&"CodeSystem"));
         assert!(types.contains(&"ValueSet"));
         assert!(types.contains(&"ConceptMap"));
+        for resource in resources {
+            assert_eq!(resource["updateCreate"], true, "{}", resource["type"]);
+        }
     }
 
     #[test]
-    fn capability_statement_each_resource_has_five_search_params() {
+    fn capability_statement_lists_the_supported_search_params() {
         let cs = build_capability_statement(&backend());
         for res in cs["rest"][0]["resource"].as_array().unwrap() {
             let params = res["searchParam"].as_array().unwrap();
-            assert_eq!(
-                params.len(),
-                5,
-                "expected 5 search params for {}",
-                res["type"]
-            );
             let names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
-            for expected in ["url", "version", "name", "title", "status"] {
-                assert!(
-                    names.contains(&expected),
-                    "missing search param '{expected}'"
-                );
+            let mut expected = vec![
+                "url",
+                "version",
+                "name",
+                "title",
+                "status",
+                "publisher",
+                "_id",
+                "_lastUpdated",
+            ];
+            if res["type"] == "CodeSystem" {
+                expected.extend(["system", "supplements", "content-mode"]);
             }
+            assert_eq!(names, expected, "search params for {}", res["type"]);
         }
     }
 

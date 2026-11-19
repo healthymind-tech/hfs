@@ -80,7 +80,15 @@ async fn accept_language_selects_the_ui_language() {
         .await
         .unwrap();
 
-    assert!(response.headers().get(header::SET_COOKIE).is_none());
+    // No language cookie without an explicit ?lang= (the console-presence
+    // cookie, helios_hfs_console, is unrelated to the language).
+    assert!(
+        !response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|c| c.to_str().unwrap_or("").starts_with("hfs_lang="))
+    );
     let vary: Vec<_> = response
         .headers()
         .get_all(header::VARY)

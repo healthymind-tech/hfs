@@ -13,11 +13,13 @@
 //! | [`snomed_rf2`] | SNOMED CT RF2 (`.zip`) | NRC license required |
 //! | [`loinc_csv`] | LOINC CSV (`.zip`) | Free Regenstrief registration |
 //! | [`icd10_cm`] | ICD-10-CM tabular XML | Free (CMS / CDC) |
+//! | [`icd10_pcs`] | ICD-10-PCS order file (`icd10pcs_codes_YYYY.txt`, or the CMS ZIP) | Free (CMS) |
 //! | [`icd9_cm`]  | ICD-9-CM pipe-delimited text  | Free (public domain, retired 2015) |
 //! | [`rxnorm_rrf`] | RxNorm RRF (folder or `.zip`) | Free NLM Terms of Service |
 //! | [`ndc`] | FDA NDC Directory (`product.txt` or `.zip`) | Free (public domain) |
 //!
-//! All importers are invoked from the CLI (`hts import`) via `main.rs` using
+//! All importers are invoked through [`dispatch::dispatch_import`] — by the CLI
+//! (`hts import`) and by the admin import jobs ([`crate::admin`]) — using
 //! the format auto-detection in [`crate::config::detect_format`], or
 //! programmatically via [`BundleImportBackend::import_bundle`] for HTTP-based
 //! Bundle imports.
@@ -25,15 +27,18 @@
 pub mod bundle_builder;
 pub mod bundle_parser;
 pub mod dicom;
+pub mod dispatch;
 pub mod fhir_bundle;
 pub mod hl7_v2_tables;
 pub mod icd10_cm;
+pub mod icd10_pcs;
 pub mod icd9_cm;
 pub mod loinc_csv;
 pub mod mesh;
 pub mod nci_thesaurus;
 pub mod ndc;
 pub mod nucc;
+pub mod progress;
 pub mod rxnorm_rrf;
 pub mod snomed_rf2;
 pub mod tgz;
@@ -169,6 +174,12 @@ pub struct ImportStats {
     /// The import continues past these; fatal errors are returned as `Err`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<String>,
+    /// Non-fatal notes: resources deliberately not written (e.g. a smaller
+    /// copy of a complete CodeSystem that is already stored, see
+    /// [`bundle_parser::truncated_copy_warning`]). Unlike `errors` these do
+    /// not make the import partial (no 207).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 impl ImportStats {
@@ -187,6 +198,7 @@ impl ImportStats {
         self.concept_maps = self.concept_maps.saturating_add(other.concept_maps);
         self.concepts = self.concepts.saturating_add(other.concepts);
         self.errors.extend(other.errors);
+        self.warnings.extend(other.warnings);
     }
 }
 
@@ -220,6 +232,20 @@ impl ImportResult {
     }
 }
 
+/// One concept property for [`BundleImportBackend::write_concept_properties`]:
+/// `value_type` uses the stored labels (`string`, `code`, `coding`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyRow {
+    /// The concept's code.
+    pub code: String,
+    /// The property code (e.g. `SCALE_TYP`).
+    pub property: String,
+    /// The stored value type label.
+    pub value_type: String,
+    /// The value (for `coding`, the code of the target concept).
+    pub value: String,
+}
+
 /// Backend capability for FHIR Bundle import.
 ///
 /// Separate from [`crate::traits::TerminologyBackend`] so that backends can opt
@@ -251,6 +277,21 @@ pub trait BundleImportBackend: Send + Sync {
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError>;
 
+    /// [`Self::import_bundle`] for one batch of a chunked bulk load: sets
+    /// [`bundle_parser::ParsedBundle::defer_closure`] so a code system that
+    /// already holds concepts does not get its closure rebuilt after every
+    /// batch. The caller must arrange a closure rebuild once the load is done
+    /// (the CLI and bootstrap paths run `finalize_after_bootstrap`).
+    async fn import_bundle_deferred(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+    ) -> Result<ImportStats, HtsError> {
+        let mut parsed = bundle_parser::parse_bundle(data)?;
+        parsed.defer_closure = true;
+        self.import_parsed(ctx, parsed).await
+    }
+
     /// `true` when the code system at `url` already has at least one concept
     /// stored. Chunked importers call this **once** before a bulk load to decide
     /// whether it is a fresh first-time import (no prior concepts) — in which
@@ -268,6 +309,90 @@ pub trait BundleImportBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Replace the reference set membership of the CodeSystem `url` (at
+    /// `version`) with `members`, given as `(refset_id, referenced_code)`
+    /// pairs, and return how many were stored. The CodeSystem must already be
+    /// imported. Read by ECL `^` and `?fhir_vs=refset/<id>`.
+    ///
+    /// The default stores nothing, for a backend without an ECL evaluator to
+    /// read the rows; both shipped backends override it.
+    async fn import_refset_members(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _members: Vec<(String, String)>,
+    ) -> Result<u64, HtsError> {
+        Ok(0)
+    }
+
+    /// Replace the SNOMED CT concept model rows (`crate::snomed::store`) of
+    /// the CodeSystem `url` (at `version`); returns the rows stored. The
+    /// default stores nothing.
+    async fn import_snomed_model(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _data: crate::snomed::ModelImport,
+    ) -> Result<u64, HtsError> {
+        Ok(0)
+    }
+
+    /// Add concept properties and designations to the already imported
+    /// CodeSystem `url` (at `version`) without touching its concepts — the
+    /// LOINC property backfill (`hts import --format loinc-properties`).
+    ///
+    /// First every stored value of the properties named in `clear` is deleted
+    /// for the whole system (pass them with the first chunk only, so a rerun
+    /// replaces rather than duplicates). Then each [`PropertyRow`] is stored
+    /// against its concept, and each designation row
+    /// `(code, language, value)` is added unless the concept already has that
+    /// value in that language. Rows for codes the system does not have are
+    /// skipped. Cached expansions over the system are dropped. Returns
+    /// `(properties written, designations written)`.
+    ///
+    /// The default stores nothing, for a backend that cannot do it; both
+    /// shipped backends override it.
+    async fn write_concept_properties(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+        _version: Option<&str>,
+        _clear: &[String],
+        _properties: Vec<PropertyRow>,
+        _designations: Vec<(String, String, String)>,
+    ) -> Result<(u64, u64), HtsError> {
+        Err(HtsError::NotSupported(
+            "this terminology backend cannot add properties to an imported code system".into(),
+        ))
+    }
+
+    /// Build `concept_closure` for every system that has hierarchy edges but no
+    /// closure rows, and return the number of systems rebuilt.
+    ///
+    /// A deferred batch ([`Self::import_bundle_deferred`], or a parsed bundle
+    /// with [`bundle_parser::ParsedBundle::defer_closure`]) deletes the closure
+    /// of a system that already had concepts and does not rebuild it, because
+    /// rebuilding after every chunk of a bulk load is O(n²) — for SNOMED CT
+    /// that is hours. The CLI and bootstrap loads run this once at the end. A
+    /// *chunked import into an already-running server* (`POST
+    /// /import?defer_closure=true`) has no such end step of its own, so the
+    /// system is left with hierarchy but no closure, which silently answers
+    /// `not-subsumed` from `$subsumes` on SQLite and empties closure-backed
+    /// `is-a` expansion on PostgreSQL.
+    ///
+    /// Chunked importers close that gap by calling this once after the final
+    /// chunk, which is what `POST /import?finalize=true` does. It is idempotent
+    /// and only touches systems that are actually missing closure rows, so a
+    /// call on an up-to-date database costs one query.
+    ///
+    /// The default returns `Ok(0)`: a backend with no closure table has nothing
+    /// to rebuild.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        Ok(0)
+    }
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
     /// Called by the CRUD DELETE handler after the persistence soft-delete so
@@ -281,6 +406,22 @@ pub trait BundleImportBackend: Send + Sync {
         &self,
         _resource_type: &str,
         _resource_url: &str,
+    ) -> Result<(), HtsError> {
+        Ok(())
+    }
+
+    /// Remove the HTS normalized rows of the resource with FHIR id `id` —
+    /// what the SQLite CRUD path does through `hts_pool`: a CodeSystem by its
+    /// storage id or `resource_json.id` (every stored version), a ValueSet by
+    /// its storage id or the `<id>|<version>` ids derived from it, a
+    /// ConceptMap by id. Cached expansions over a deleted CodeSystem go too.
+    ///
+    /// Used by the CRUD update (replace) and delete handlers for backends
+    /// wired through `terminology_importer`. The default is a no-op.
+    async fn delete_normalized_by_id(
+        &self,
+        _resource_type: &str,
+        _id: &str,
     ) -> Result<(), HtsError> {
         Ok(())
     }

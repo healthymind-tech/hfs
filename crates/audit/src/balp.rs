@@ -35,6 +35,8 @@ pub mod profiles {
 
 /// Code systems used in AuditEvent construction.
 pub mod code_systems {
+    /// HFS `meta.tag` system naming the tenant an event describes (#1515).
+    pub const HFS_TENANT: &str = "http://heliossoftware.com/fhir/CodeSystem/tenant";
     pub const AUDIT_EVENT_TYPE: &str = "http://terminology.hl7.org/CodeSystem/audit-event-type";
     pub const RESTFUL_INTERACTION: &str = "http://hl7.org/fhir/restful-interaction";
     pub const AUDIT_ENTITY_TYPE: &str = "http://terminology.hl7.org/CodeSystem/audit-entity-type";
@@ -150,8 +152,15 @@ pub fn action_from_code(code: &str) -> AuditAction {
 }
 
 /// Select the BALP profile URL for the given action and patient presence.
-pub fn select_profile(action: AuditAction, has_patient: bool) -> &'static str {
-    match (action, has_patient) {
+///
+/// `None` for [`AuditAction::Execute`]: BALP defines no profile for a generic
+/// execution (operations, auth decisions, lifecycle events), and claiming one
+/// the event does not conform to — as this once did with
+/// `OAUTHaccessTokenUse.Comprehensive` — makes every such event fail
+/// validation. REST operations get a BALP Query shape from
+/// [`crate::rest_event`] instead.
+pub fn select_profile(action: AuditAction, has_patient: bool) -> Option<&'static str> {
+    Some(match (action, has_patient) {
         (AuditAction::Create, true) => profiles::PATIENT_CREATE,
         (AuditAction::Create, false) => profiles::CREATE,
         (AuditAction::Read, true) => profiles::PATIENT_READ,
@@ -162,9 +171,8 @@ pub fn select_profile(action: AuditAction, has_patient: bool) -> &'static str {
         (AuditAction::Delete, false) => profiles::DELETE,
         (AuditAction::Query, true) => profiles::PATIENT_QUERY,
         (AuditAction::Query, false) => profiles::QUERY,
-        (AuditAction::Execute, true) => profiles::PATIENT_READ, // Fallback
-        (AuditAction::Execute, false) => profiles::AUTH_TOKEN_USE,
-    }
+        (AuditAction::Execute, _) => return None,
+    })
 }
 
 #[cfg(test)]
@@ -321,14 +329,17 @@ mod tests {
 
     #[test]
     fn test_read_without_patient() {
-        assert_eq!(select_profile(AuditAction::Read, false), profiles::READ);
+        assert_eq!(
+            select_profile(AuditAction::Read, false),
+            Some(profiles::READ)
+        );
     }
 
     #[test]
     fn test_read_with_patient() {
         assert_eq!(
             select_profile(AuditAction::Read, true),
-            profiles::PATIENT_READ
+            Some(profiles::PATIENT_READ)
         );
     }
 
@@ -336,47 +347,54 @@ mod tests {
     fn test_create_with_patient() {
         assert_eq!(
             select_profile(AuditAction::Create, true),
-            profiles::PATIENT_CREATE
+            Some(profiles::PATIENT_CREATE)
         );
     }
 
     #[test]
     fn test_create_without_patient() {
-        assert_eq!(select_profile(AuditAction::Create, false), profiles::CREATE);
+        assert_eq!(
+            select_profile(AuditAction::Create, false),
+            Some(profiles::CREATE)
+        );
     }
 
     #[test]
     fn test_update_with_patient() {
         assert_eq!(
             select_profile(AuditAction::Update, true),
-            profiles::PATIENT_UPDATE
+            Some(profiles::PATIENT_UPDATE)
         );
     }
 
     #[test]
     fn test_delete_without_patient() {
-        assert_eq!(select_profile(AuditAction::Delete, false), profiles::DELETE);
+        assert_eq!(
+            select_profile(AuditAction::Delete, false),
+            Some(profiles::DELETE)
+        );
     }
 
     #[test]
     fn test_query_without_patient_uses_query_profile() {
-        assert_eq!(select_profile(AuditAction::Query, false), profiles::QUERY);
+        assert_eq!(
+            select_profile(AuditAction::Query, false),
+            Some(profiles::QUERY)
+        );
     }
 
     #[test]
     fn test_query_with_patient_uses_patient_query_profile() {
         assert_eq!(
             select_profile(AuditAction::Query, true),
-            profiles::PATIENT_QUERY
+            Some(profiles::PATIENT_QUERY)
         );
     }
 
     #[test]
-    fn test_execute_without_patient_uses_auth_profile() {
-        assert_eq!(
-            select_profile(AuditAction::Execute, false),
-            profiles::AUTH_TOKEN_USE
-        );
+    fn test_execute_claims_no_profile() {
+        assert_eq!(select_profile(AuditAction::Execute, false), None);
+        assert_eq!(select_profile(AuditAction::Execute, true), None);
     }
 
     // ── to_code ──────────────────────────────────────────────────────────

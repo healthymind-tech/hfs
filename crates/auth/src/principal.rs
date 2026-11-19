@@ -45,6 +45,37 @@ impl Principal {
         &self.issuer
     }
 
+    /// The launch patient (`patient` claim, SMART App Launch context), when the
+    /// token carries one. `patient/` scopes reach only this patient's
+    /// compartment.
+    ///
+    /// Reads upstream's [`LaunchContext`] first (it honours a configured claim
+    /// name and accepts `Patient/<id>`), then the raw `patient` claim the
+    /// fork's SMART layer used before the merge, so both enforcement layers
+    /// agree on the patient.
+    pub fn launch_patient(&self) -> Option<&str> {
+        if let Some(id) = self
+            .launch_context
+            .as_ref()
+            .and_then(|ctx| ctx.patient_id())
+        {
+            return Some(id);
+        }
+        self.custom_claims
+            .get("patient")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// The OAuth client the token was issued to (`client_id`, else `azp`),
+    /// when the token says.
+    pub fn client_id(&self) -> Option<&str> {
+        ["client_id", "azp"]
+            .iter()
+            .find_map(|claim| self.custom_claims.get(*claim).and_then(|v| v.as_str()))
+    }
+
     /// Returns the tenant ID if present in the token.
     pub fn tenant_id(&self) -> Option<&str> {
         self.tenant_id.as_deref()

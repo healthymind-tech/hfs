@@ -7,7 +7,7 @@
 //! here: the `[x]` element becomes a `choices` declarer plus one `choiceOf`
 //! branch element per type.
 
-use super::{Ed, EdConstraint, EdDiscriminator};
+use super::{Ed, EdConstraint, EdDiscriminator, EdType};
 use crate::schema::{Binding, Constraint, FhirSchema};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -66,6 +66,16 @@ pub(super) struct Node {
     /// `max: "0"` — the element is prohibited; recorded on the parent's
     /// `excluded` and the subtree is dropped.
     pub dead: bool,
+    /// The ED's `type[].code`s, for `type` slice discriminators.
+    pub type_codes: Vec<String>,
+    /// The ED's `type[].profile`s, for `profile` slice discriminators.
+    pub type_profiles: Vec<String>,
+    /// The ED's `type[].targetProfile`s, for `type`/`profile` slice
+    /// discriminators through `resolve()`.
+    pub type_target_profiles: Vec<String>,
+    /// `(profile, element id)` of type profiles that name an element of
+    /// the profile (`elementdefinition-profile-element`).
+    pub profile_elements: Vec<(String, String)>,
 }
 
 impl Node {
@@ -89,19 +99,61 @@ pub(super) struct SliceNode {
 
 /// Apply one ElementDefinition at its navigated position.
 pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &mut Vec<String>) {
-    // Navigate to the parent of the final segment.
-    let mut node: &mut Node = root;
-    for seg in &segments[..segments.len() - 1] {
-        if node.dead {
-            return;
-        }
-        node = descend(node, seg);
-    }
+    let Some((last, parents)) = segments.split_last() else {
+        return;
+    };
+    apply_below(root, parents, last, ed, warnings);
+}
+
+/// Navigate `parents` from `node`, then apply the ED at `last`.
+///
+/// A `foo[x]` step does not name an element of the data: the children a
+/// snapshot lists under `value[x]` (`value[x].system`, `value[x].code`)
+/// constrain the concrete branch (`valueQuantity`). A step written as a type
+/// slice (`value[x]:valueQuantity`) names its branch directly; a bare
+/// `foo[x]` step resolves through the choice declarer when it allows a
+/// single type. Before, these children landed under a literal `value[x]`
+/// element no data key ever matches, so the fixed `system`/`code` of the
+/// core blood-pressure components were never checked.
+fn apply_below(
+    node: &mut Node,
+    parents: &[Segment],
+    last: &Segment,
+    ed: &Ed,
+    warnings: &mut Vec<String>,
+) {
     if node.dead {
         return;
     }
-    let last = &segments[segments.len() - 1];
+    let Some((seg, rest)) = parents.split_first() else {
+        apply_last(node, last, ed, warnings);
+        return;
+    };
+    if let Some(base_name) = seg.name.strip_suffix("[x]") {
+        let branch = match &seg.slice {
+            Some(slice) => Some(slice.clone()),
+            None => node
+                .children
+                .get(base_name)
+                .and_then(|declarer| declarer.schema.choices.as_ref())
+                .filter(|choices| choices.len() == 1)
+                .map(|choices| choices[0].clone()),
+        };
+        if let Some(branch) = branch {
+            let child = node
+                .children
+                .entry(branch.clone())
+                .or_insert_with(|| Node::new(branch));
+            apply_below(child, rest, last, ed, warnings);
+            return;
+        }
+    }
+    let child = descend(node, seg);
+    apply_below(child, rest, last, ed, warnings);
+}
 
+/// Apply an ED whose final id segment is `last` under `node`.
+fn apply_last(node: &mut Node, last: &Segment, ed: &Ed, warnings: &mut Vec<String>) {
     // Explicit choice-branch constraint: `value[x]:valueQuantity`.
     if let (true, Some(slice)) = (last.name.ends_with("[x]"), &last.slice) {
         let branch = node
@@ -130,6 +182,7 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
         {
             slice.extension_profile = Some(profile.clone());
         }
+        record_types(&mut slice.node, ed);
         // Value-level keywords on the slice ED itself apply to the slice
         // schema (shape/cardinality were consumed above as slice bounds).
         apply_value_keywords(&mut slice.node.schema, ed, warnings);
@@ -224,8 +277,29 @@ fn apply_shape(element: &mut Node, ed: &Ed) {
     }
 }
 
+/// Remember an ED's type codes and type profiles on its node: `type` and
+/// `profile` slice discriminators read them (they never reach the schema).
+fn record_types(node: &mut Node, ed: &Ed) {
+    if ed.types.is_empty() {
+        return;
+    }
+    node.type_codes = ed.types.iter().map(EdType::effective_code).collect();
+    node.type_profiles = ed
+        .types
+        .iter()
+        .flat_map(|t| t.profile.iter().cloned())
+        .collect();
+    node.type_target_profiles = ed
+        .types
+        .iter()
+        .flat_map(|t| t.target_profile.iter().cloned())
+        .collect();
+    node.profile_elements = ed.types.iter().flat_map(EdType::profile_elements).collect();
+}
+
 /// Type reference, contentReference, and the value-level keywords.
 fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>) {
+    record_types(element, ed);
     match ed.types.len() {
         0 => {
             if let Some(reference) = &ed.content_reference {
@@ -250,6 +324,27 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
+            if !t.profile.is_empty() && t.effective_code() != "Extension" {
+                element.schema.type_profiles = Some(t.profile.clone());
+            }
+        }
+        _ if is_resource_slot(ed) => {
+            // A resource slot narrowed to several resource types, each with
+            // its own profile (DTR's `Parameters.parameter:order.resource`:
+            // Appointment | Encounter | … | ServiceRequest). The element stays
+            // `Resource` (its schema follows the data's `resourceType`) and
+            // the profiles of every listed type apply to a resource of that
+            // type only (see `with_type_profiles`). Taking the first type
+            // judged a ServiceRequest as an Appointment.
+            element.schema.type_ = Some("Resource".to_string());
+            let profiles: Vec<String> = ed
+                .types
+                .iter()
+                .flat_map(|t| t.profile.iter().cloned())
+                .collect();
+            if !profiles.is_empty() {
+                element.schema.type_profiles = Some(profiles);
+            }
         }
         _ => {
             // Multiple types without `[x]` should not occur; take the first.
@@ -267,6 +362,17 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
     apply_value_keywords(&mut element.schema, ed, warnings);
 }
 
+/// An element holding a resource (`….resource`, `….contained`) whose types
+/// are all resource types.
+fn is_resource_slot(ed: &Ed) -> bool {
+    let last = ed.path.rsplit('.').next().unwrap_or_default();
+    matches!(last, "resource" | "contained")
+        && ed
+            .types
+            .iter()
+            .all(|t| t.effective_code().starts_with(|c: char| c.is_ascii_uppercase()))
+}
+
 /// Binding, constraints, fixed/pattern — the keywords that apply to a value
 /// wherever the ED lands (plain element, choice branch, or slice schema).
 fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<String>) {
@@ -276,6 +382,17 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
         schema.binding = Some(Binding {
             value_set: value_set.clone(),
             strength: binding.strength.clone(),
+        });
+    }
+    // A required additional binding on a binding that is not itself
+    // enforced (example/preferred) is the one to check.
+    if let Some(binding) = &ed.binding
+        && !matches!(binding.strength.as_deref(), Some("required" | "extensible"))
+        && let Some(value_set) = binding.required_additional()
+    {
+        schema.binding = Some(Binding {
+            value_set,
+            strength: Some("required".to_string()),
         });
     }
     apply_constraints(schema, &ed.constraint, false);
@@ -290,6 +407,33 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             && !key.starts_with('_')
         {
             schema.pattern = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("minValue")
+            && !rest.is_empty()
+        {
+            schema.min_value = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("maxValue")
+            && !rest.is_empty()
+        {
+            schema.max_value = Some(value.clone());
+        } else if key == "maxLength" {
+            schema.max_length = value.as_u64().filter(|n| *n > 0);
+        } else if key == "extension" {
+            for ext in value.as_array().into_iter().flatten() {
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/minLength")
+                {
+                    schema.min_length = ext.get("valueInteger").and_then(serde_json::Value::as_u64);
+                }
+                if ext.get("url").and_then(serde_json::Value::as_str)
+                    == Some("http://hl7.org/fhir/StructureDefinition/maxSize")
+                {
+                    schema.max_size = ext
+                        .get("valueDecimal")
+                        .or_else(|| ext.get("valueInteger"))
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|n| n as u64);
+                }
+            }
         }
     }
 }
@@ -345,6 +489,9 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         if !t.target_profile.is_empty() {
             branch.schema.refers = Some(t.target_profile.clone());
         }
+        if !t.profile.is_empty() && t.effective_code() != "Extension" {
+            branch.schema.type_profiles = Some(t.profile.clone());
+        }
         apply_value_keywords(&mut branch.schema, ed, warnings);
     }
 
@@ -352,6 +499,14 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
         .children
         .entry(base_name.to_string())
         .or_insert_with(|| Node::new(base_name.to_string()));
+    record_types(declarer, ed);
+    // A differential `foo[x]` without `type` (a binding or constraint added
+    // to `Observation.value[x]`) keeps the base's types: it declares no
+    // branches (an empty `choices` list restricts nothing) and its keywords
+    // ride on the declarer, which joins whichever branch the data uses.
+    if ed.types.is_empty() {
+        apply_value_keywords(&mut declarer.schema, ed, warnings);
+    }
     match &mut declarer.schema.choices {
         Some(existing) => {
             for name in branch_names {
@@ -375,6 +530,10 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
         slicing_rules,
         slicing_ordered,
         dead,
+        type_codes: _,
+        type_profiles: _,
+        type_target_profiles: _,
+        profile_elements: _,
     } = node;
 
     if dead {
@@ -496,5 +655,30 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod content_reference_tests {
+    #[test]
+    fn canonical_content_references_parse() {
+        let local = super::parse_content_reference("#Bundle.link");
+        assert_eq!(
+            local,
+            Some(vec!["Bundle".into(), "elements".into(), "link".into()])
+        );
+        // Upstream #410 form: the canonical names the schema the path is in
+        // (resolved by URL in the registry), not the path's first segment.
+        assert_eq!(
+            super::parse_content_reference(
+                "http://hl7.org/fhir/StructureDefinition/Bundle#Bundle.link"
+            ),
+            Some(vec![
+                "http://hl7.org/fhir/StructureDefinition/Bundle".into(),
+                "elements".into(),
+                "link".into()
+            ])
+        );
+        assert_eq!(super::parse_content_reference("Bundle.link"), None);
     }
 }

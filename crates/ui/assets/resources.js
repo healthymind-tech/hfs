@@ -13,6 +13,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
   function fhirHeaders(extra) {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -196,6 +210,7 @@
    * mounted editor outlives it. */
   function resetEditorBody() {
     renderSeq++;
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     JsonEditor.destroy(editorBody);
     var fresh = document.createElement(editorBody.tagName);
     fresh.id = editorBody.id;
@@ -245,8 +260,9 @@
     current = { type: type, id: id };
     setSubject(type + "/" + id);
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
-    fetch("/" + type + "/" + id, { headers: fhirHeaders() })
+    fetch(fhirUrl("/" + type + "/" + id), { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
       .then(renderEditor)
       .then(function (ok) {
@@ -265,6 +281,7 @@
     current = { type: type, id: "" };
     setSubject(type + " · " + "new");
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
     renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
   }
@@ -323,7 +340,7 @@
     if (current.id || target.method !== "PUT" || !window.HfsSaveTarget.isValidId(target.id)) {
       return Promise.resolve(true);
     }
-    return fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() })
+    return fetch(fhirUrl(target.url) + "?_elements=id", { method: "GET", headers: fhirHeaders() })
       .then(function (r) { return window.HfsSaveTarget.existsFromStatus(r.status); })
       .catch(function () { return false; })
       .then(function (exists) {
@@ -360,7 +377,7 @@
             : window.HfsSaveTarget.forCreate(current.type, doc);
           return confirmCreateOverExisting(target).then(function (go) {
             if (!go) return;
-            return fetch(target.url, {
+            return fetch(fhirUrl(target.url), {
               method: target.method,
               headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
               body: JSON.stringify(doc),
@@ -399,7 +416,7 @@
       var saveButton = document.getElementById("resource-save");
       var deleteButton = document.getElementById("resource-delete");
       window.hfsBusy.during([deleteButton], function () {
-        return fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
+        return fetch(fhirUrl("/" + type + "/" + id), { method: "DELETE", headers: fhirHeaders() })
           .then(function (r) {
             if (r.ok || r.status === 204) {
               // The resource no longer exists — nothing to ask about.
@@ -432,7 +449,7 @@
     }
     document.getElementById("resource-history-subject").textContent =
       current.type + "/" + current.id;
-    fetch("/" + current.type + "/" + current.id + "/_history", {
+    fetch(fhirUrl("/" + current.type + "/" + current.id + "/_history"), {
       headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -445,8 +462,11 @@
       var resource = entry.resource || {};
       var response = entry.response || {};
       var etag = /"([^"]+)"/.exec(response.etag || "");
+      var meta = resource.meta || {};
       return {
-        versionId: (resource.meta && resource.meta.versionId) || (etag && etag[1]) || "",
+        versionId: meta.versionId || (etag && etag[1]) || "",
+        lastUpdated: meta.lastUpdated || response.lastModified || "",
+        method: opKey(((entry.request || {}).method || "").toUpperCase()),
         resource: resource,
       };
     });
@@ -457,7 +477,19 @@
       var row = document.createElement("button");
       row.type = "button";
       row.className = "history-version" + (i === 0 ? " history-version--current" : "");
-      row.textContent = "v" + v.versionId + (i === 0 ? " · " + historyEl.dataset.msgCurrent : "");
+      row.dataset.index = String(i);
+      var idEl = document.createElement("span");
+      idEl.className = "history-version__id";
+      idEl.textContent = "v" + v.versionId;
+      var whenEl = document.createElement("span");
+      whenEl.className = "history-version__when";
+      whenEl.textContent = shortTime(v.lastUpdated);
+      var kindEl = document.createElement("span");
+      kindEl.className = "history-version__kind history-version__kind--" + v.method;
+      kindEl.textContent = i === 0 ? historyEl.dataset.msgCurrent : opLabel(v.method);
+      row.appendChild(idEl);
+      row.appendChild(whenEl);
+      row.appendChild(kindEl);
       row.addEventListener("click", function () { toSel.value = String(i); fromSel.value = String(Math.min(i + 1, versions.length - 1)); renderDiff(); });
       versionsHost.appendChild(row);
       fromSel.appendChild(opt(i, "v" + v.versionId));
@@ -468,12 +500,48 @@
     renderDiff();
   }
 
+  /* Local date; an unparseable value is shown raw, never as "Invalid Date". */
+  function shortTime(iso) {
+    if (!iso) return "";
+    var date = new Date(iso);
+    return isNaN(date) ? iso : date.toLocaleString();
+  }
+
+  /* POST=create, PUT=update, PATCH=patch, DELETE=delete; same mapping as history.js. */
+  function opKey(method) {
+    if (method === "POST") return "create";
+    if (method === "PUT") return "update";
+    if (method === "PATCH") return "patch";
+    if (method === "DELETE") return "delete";
+    return "version";
+  }
+
+  function opLabel(method) {
+    return historyEl.dataset["msgOp" + method.charAt(0).toUpperCase() + method.slice(1)] || method;
+  }
+
+  /* The two versions being compared get the from/to marker. */
+  function markSelected() {
+    var from = Number(fromSel.value);
+    var to = Number(toSel.value);
+    versionsHost.querySelectorAll(".history-version").forEach(function (row) {
+      var index = Number(row.dataset.index);
+      row.classList.toggle("history-version--from", index === from);
+      row.classList.toggle("history-version--to", index === to);
+    });
+  }
+
   function opt(v, label) { var o = document.createElement("option"); o.value = String(v); o.textContent = label; return o; }
 
   function renderDiff() {
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(fromSel);
+      window.HfsCombobox.refresh(toSel);
+    }
     var from = versions[Number(fromSel.value)];
     var to = versions[Number(toSel.value)];
     if (!from || !to) return;
+    markSelected();
     var body = new URLSearchParams();
     body.set("from", JSON.stringify(from.resource));
     body.set("to", JSON.stringify(to.resource));

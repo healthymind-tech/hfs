@@ -10,14 +10,14 @@
 //! - Full-text search using tsvector/tsquery
 
 use crate::backends::sql_literal::sql_string_literal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
     SearchResult, TextSearchProvider,
 };
 use crate::error::{QueryErrorExt, SearchError, StorageError, StorageResult};
@@ -29,7 +29,9 @@ use crate::types::{
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::native_has::{native_patient_code_predicate, native_patient_code_token};
+use super::search::native_has::{
+    native_patient_code_count_predicate, native_patient_code_predicate, native_patient_code_token,
+};
 use super::search::query_builder::{
     KeysetKey, PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam,
 };
@@ -55,23 +57,30 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 ///
 /// `NULLS LAST`/`NULLS FIRST` are only emitted for a nullable key: on
 /// `last_updated` they would stop the planner from walking its index.
-fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
+/// `id_column` is an internal column name: resource pages use `id`, while
+/// index-selected pages use `resource_id` for the identical tie boundary.
+fn keyset_page_clauses(
+    k: &KeysetKey,
+    id_column: &str,
+    cursor_is_null: bool,
+    backward: bool,
+) -> (String, String) {
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
     if backward {
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND id < $4))")
+            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} < $4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} $3 OR ({e} = $3 AND id < $4))")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} < $4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, id DESC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} DESC"))
     } else {
         let condition = if at_missing {
-            format!("({e} IS NOT DISTINCT FROM $3 AND id > $4)")
+            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} > $4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -79,11 +88,11 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
             } else {
                 String::new()
             };
-            format!("({e} {op} $3 OR ({e} = $3 AND id > $4){or_missing})")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} > $4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, id ASC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} ASC"))
     }
 }
 
@@ -301,26 +310,110 @@ async fn reject_legacy_composites(
     Ok(())
 }
 
-/// Decides whether a page can be resolved from `search_index` alone, returning
-/// the predicate to resolve it with.
+/// ` AND <column> = '<version>'` restricting a `resources` scan to the
+/// FHIR version the query names (#2254), or empty for a version-blind query,
+/// whose SQL text (and so its cached statement and plan) stays exactly as
+/// before. The value comes from a closed enum
+/// ([`helios_fhir::FhirVersion::as_mime_param`]), so the inlined literal
+/// cannot carry anything but `4.0`, `4.3`, `5.0` or `6.0`; inlining it keeps
+/// every statement's `$n` layout unchanged.
+fn fhir_version_clause(query: &SearchQuery, column: &str) -> String {
+    query
+        .stored_fhir_version()
+        .map(|v| format!(" AND {column} = '{v}'"))
+        .unwrap_or_default()
+}
+
+/// Pieces of the newest-first fast-path statement.
+struct FastPathParts<'a> {
+    pred: &'a str,
+    guard: &'a str,
+    boundary: &'a str,
+    order: &'a str,
+    offset: &'a str,
+    outer_order: &'a str,
+    limit: usize,
+    /// Keep the `index_eligible` probe and the fallback sentinel arm.
+    with_probe: bool,
+}
+
+/// Builds the fast-path statement. With the probe, rows carrying a NULL
+/// `last_updated` for the predicate turn the page into a single
+/// `needs_fallback` sentinel row; without it the page is returned directly.
+/// In both shapes the `LEFT JOIN` carries `is_deleted = FALSE` in its `ON`, so
+/// an orphaned index row surfaces as `needs_fallback = TRUE` (no live
+/// `EXISTS` per candidate, see the call site).
+/// Both shapes select the same seven columns, so the caller reads them alike.
+fn fast_path_sql(p: &FastPathParts<'_>) -> String {
+    let probe_cte = if p.with_probe {
+        format!(
+            "WITH index_eligible AS MATERIALIZED ( \
+               SELECT NOT EXISTS (SELECT 1 FROM search_index \
+                                  WHERE tenant_id = $1 AND resource_type = $2 \
+                                    AND last_updated IS NULL AND {pred}) AS usable \
+             ) ",
+            pred = p.pred
+        )
+    } else {
+        String::new()
+    };
+    let usable = if p.with_probe {
+        " WHERE (SELECT usable FROM index_eligible)"
+    } else {
+        ""
+    };
+    let sentinel = if p.with_probe {
+        " UNION ALL \
+         SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
+                NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
+         WHERE NOT (SELECT usable FROM index_eligible)"
+    } else {
+        ""
+    };
+    format!(
+        "{probe_cte}\
+         SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                r.last_updated AS sort_key, (r.id IS NULL) AS needs_fallback \
+         FROM ( \
+           SELECT DISTINCT resource_id, last_updated FROM search_index \
+           WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
+           ORDER BY {order} LIMIT {lim}{offset} \
+         ) c \
+         LEFT JOIN resources r \
+           ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+          AND r.is_deleted = FALSE{usable}{sentinel} \
+         ORDER BY {outer_order}",
+        pred = p.pred,
+        guard = p.guard,
+        boundary = p.boundary,
+        order = p.order,
+        offset = p.offset,
+        lim = p.limit,
+        outer_order = p.outer_order,
+    )
+}
+
+/// Decides whether page identities can be selected from `search_index` before
+/// loading resource bodies, returning the predicate to resolve them with.
 ///
 /// Gates, and why each one is load-bearing:
 /// - `Denormalized` layout: on a legacy database the rows carry no sort key, so
 ///   the fast path would order by NULL and return an arbitrary page.
-/// - no cursor, no offset: both paginate against `resources`.
-/// - default sort: any other sort key is not on the index row.
+/// - default or one descending `_lastUpdated` sort: these share the timestamp
+///   carried by the index row, including their cursor and offset pages.
 /// - exactly one membership test: a conjunction needs rows that jointly satisfy
 ///   it, which a single-row predicate cannot express.
 fn fast_index_pred(
     query: &SearchQuery,
     filter_sql: Option<&str>,
     layout: super::schema::IndexLayout,
-    has_cursor: bool,
 ) -> Option<String> {
+    let descending_timestamp = query.sort.is_empty()
+        || matches!(query.sort.as_slice(), [sort]
+            if sort.parameter == "_lastUpdated"
+                && sort.direction == crate::types::SortDirection::Descending);
     if !query.reverse_chains.is_empty()
-        || has_cursor
-        || query.offset.is_some()
-        || !query.sort.is_empty()
+        || !descending_timestamp
         || layout != super::schema::IndexLayout::Denormalized
     {
         return None;
@@ -429,17 +522,419 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     })
 }
 
+/// The `search_index` value column a range-capable membership of this type
+/// filters on, when the planner's estimate for it needs
+/// [`range_estimate_correction`].
+fn range_value_column(param_type: crate::types::SearchParamType) -> Option<&'static str> {
+    use crate::types::SearchParamType;
+    match param_type {
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        _ => None,
+    }
+}
+
+/// Factor that undoes the planner's independent null-fraction penalty on a
+/// range membership's row estimate.
+///
+/// `search_index` keeps every parameter type in one table, so a value column
+/// such as `value_date` is NULL on every row that is not a date (91% of rows
+/// on the 2.2M-resource benchmark). For `param_name = 'date' AND value_date_end
+/// > $x` the planner multiplies the range selectivity by `1 - null_frac` as if
+/// the NULLs were independent of `param_name`, when in fact a date
+/// parameter's rows are never NULL there. The estimate comes out low by
+/// exactly `1 / (1 - null_frac)` — 45k for 485k real rows — and that made the
+/// broad-conjunction walk pick the date as its driver for
+/// `Observation?category=vital-signs&date=ge2020-01-01` (720 ms instead of
+/// ~10 ms). Extended statistics cannot express the correlation (functional
+/// dependencies are equality-only). Token memberships are equalities covered
+/// by the dependency statistics and need no correction.
+pub(super) fn range_estimate_correction(null_frac: Option<f64>) -> f64 {
+    match null_frac {
+        // Guard against a column that is almost entirely NULL in a tiny
+        // table: never scale an estimate by more than 1000x.
+        Some(f) if f.is_finite() && (0.0..1.0).contains(&f) => (1.0 / (1.0 - f)).min(1000.0),
+        _ => 1.0,
+    }
+}
+
+/// How a membership may take part in the broad walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkRole {
+    /// Token, reference, string, uri: an equality PostgreSQL walks in
+    /// `last_updated` order reliably and estimates well.
+    TokenLike,
+    /// A date, number or quantity range that maps to an index range
+    /// (`le`/`lt` dates, quantity and number comparisons).
+    Range,
+    /// An upward-open date (`ge`/`gt`/`sa`): its predicate is
+    /// `value_date_end > $a OR (value_date >= $b AND …)`, which no index can
+    /// walk in `last_updated` order, so PostgreSQL scans and sorts every
+    /// matching row — 485k for `date=ge2020` (0.5–3.6 s). It is only ever
+    /// probed while another membership can drive.
+    OpenRange,
+}
+
+fn walk_role(param_type: crate::types::SearchParamType, predicate_sql: &str) -> WalkRole {
+    if range_value_column(param_type).is_none() {
+        WalkRole::TokenLike
+    } else if predicate_sql.contains("value_date_end >") {
+        WalkRole::OpenRange
+    } else {
+        WalkRole::Range
+    }
+}
+
+/// Which membership the broad-conjunction walk drives from.
+///
+/// The walk visits the driver's rows newest first and probes the others, so
+/// it should start from a membership PostgreSQL can walk in order and that is
+/// not much larger than the alternatives. Measured on 2.24M resources (token
+/// driver vs range driver, both with per-row probes):
+///
+/// | shape | token rows | range rows | token drives | range drives |
+/// |---|---|---|---|---|
+/// | `status=final&date=ge2020` | 655k | 485k (open) | 0.4 ms | 3,626 ms |
+/// | `clinical-status=active&onset-date=ge2015` | 93k | 66k (open) | 0.5 ms | 549 ms |
+/// | `category=vital-signs&value-quantity=gt100` | 139k | 99k | 4.8 ms | 2.6 ms |
+/// | `category=laboratory&date=le2012` | 452k | 117k | 14 ms | 1.7 ms |
+/// | `category=vital-signs&date=le1975` | 139k | 8.9k | 57 ms | 14 ms |
+/// | `category=survey&value-quantity=gt1000` | 43k | 1.4k | 586 ms | 13 ms |
+///
+/// So the smallest token-like or walkable-range membership drives (with the
+/// range estimate corrected by [`range_estimate_correction`]); an
+/// upward-open date ([`WalkRole::OpenRange`]) drives only when nothing else
+/// can.
+fn choose_walk_driver(estimates: &[f64], roles: &[WalkRole]) -> usize {
+    let smallest = |accept: &dyn Fn(WalkRole) -> bool| {
+        (0..estimates.len())
+            .filter(|&i| accept(roles[i]))
+            .min_by(|&a, &b| estimates[a].total_cmp(&estimates[b]))
+    };
+    smallest(&|r| r != WalkRole::OpenRange)
+        .or_else(|| smallest(&|_| true))
+        .unwrap_or(0)
+}
+
+/// Token lists with more values than this are reduced to the codes present
+/// before the search is planned; see
+/// `PostgresBackend::reduce_long_token_lists`.
+const TOKEN_LIST_REDUCE_MIN: usize = 1000;
+
+/// How long the null fractions read from `pg_stats` are reused.
+const VALUE_NULL_FRACTION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A membership the planner expects to match at most this many index rows is
+/// selective: the general plan, which PostgreSQL drives from it, is already
+/// cheap.
+const BROAD_MEMBERSHIP_ROWS: i64 = 1_000;
+
+fn bind_sql_params(
+    leading: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    params: &[SqlParam],
+) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+    let mut out = leading;
+    for param in params {
+        match param {
+            SqlParam::Text(s) => out.push(Box::new(s.clone())),
+            SqlParam::TextArray(ids) => out.push(Box::new(ids.clone())),
+            SqlParam::Float(f) => out.push(Box::new(*f)),
+            SqlParam::Integer(i) => out.push(Box::new(*i)),
+            SqlParam::Bool(b) => out.push(Box::new(*b)),
+            SqlParam::Timestamp(dt) => out.push(Box::new(*dt)),
+            SqlParam::Null => out.push(Box::new(Option::<String>::None)),
+        }
+    }
+    out
+}
+
+/// The first page of a conjunction of broad memberships, resolved from
+/// `search_index` before `resources` is touched.
+///
+/// `Observation?code=X&date=ge2019` took ~320 ms on the 527k-resource
+/// benchmark database. Both memberships match ~15k rows (896 together), the
+/// planner estimated ~2k and ~6k, and it chose to join all 13,457 date matches
+/// to `resources` and then probe each one's index rows for the code: ~25k
+/// probes for a 51-row page. Here the page walks one membership's index rows
+/// newest first, keeps a row when every other membership has a row for the
+/// same resource (a correlated probe), and joins only the page to
+/// `resources`, as the single-parameter fast path does: ~35 ms.
+///
+/// The walk is bounded by the size of the membership it walks, so that is the
+/// one the planner expects to be smallest: walking a 260k-row `status=final`
+/// against a 17k-row code took 132 ms, against 8 ms the other way round. A
+/// conjunction with a membership expected to be selective
+/// ([`BROAD_MEMBERSHIP_ROWS`]) keeps the general plan, which PostgreSQL
+/// already drives from that membership.
+///
+/// Like the fast path, the page is of top-level rows (`last_updated IS NOT
+/// NULL`; see there) and it is the first page only: no cursor, offset or
+/// explicit sort.
+fn broad_conjunction_sql(predicates: &[SqlFragment], driver: usize, limit: usize) -> String {
+    let mut probes = String::new();
+    for (i, other) in predicates.iter().enumerate() {
+        if i != driver {
+            // `OFFSET 0` keeps the probe a correlated subplan, run once per
+            // walked row until the page is full. Without it PostgreSQL may turn
+            // the `EXISTS` into a hash semi-join and read the whole probed
+            // membership first; it does exactly that for a range membership,
+            // whose estimate is low (see `range_estimate_correction`):
+            // `Condition?clinical-status=active&onset-date=ge2015` hashed 66k
+            // onset rows (385 ms) for a 21-row page that ~50 probes fill
+            // (0.3 ms), and `code=…&value-quantity=gt20` hashed 251k quantity
+            // rows (313 ms vs 0.5 ms).
+            probes.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM search_index o \
+                   WHERE o.resource_id = search_index.resource_id AND {} OFFSET 0)",
+                other.sql
+            ));
+        }
+    }
+    format!(
+        "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                r.last_updated AS sort_key \
+         FROM ( \
+           SELECT DISTINCT resource_id, last_updated FROM search_index \
+           WHERE {driver} AND last_updated IS NOT NULL{probes} \
+           ORDER BY last_updated DESC, resource_id ASC LIMIT {limit} \
+         ) c \
+         JOIN resources r \
+           ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+         WHERE r.is_deleted = FALSE \
+         ORDER BY c.last_updated DESC, c.resource_id ASC",
+        driver = predicates[driver].sql,
+    )
+}
+
 impl PostgresBackend {
-    /// Page and count build precisely the same search predicate. Only cursor
-    /// bindings change the initial offset.
+    /// The memberships of a first-page search whose filter is a conjunction
+    /// of broad memberships, and the one to walk; see
+    /// [`broad_conjunction_sql`]. `None` for any other search.
+    async fn broad_conjunction(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        has_cursor: bool,
+        general_filter: Option<&str>,
+    ) -> StorageResult<Option<(Vec<SqlFragment>, usize)>> {
+        // The patient-scoped composite and quantity probes (#1579) keep their
+        // measured special form. Repeated names and the code/value-quantity
+        // pair folded into an `INTERSECT` (#1416, #1580) keep theirs unless a
+        // token-like membership can drive the walk (decided below): the
+        // `INTERSECT` evaluates every arm in full, so `category=X&date=ge…&
+        // date=lt…` read 657k date rows for a one-month window (1.3 s), while
+        // walking `category` and probing each date occurrence is bounded by
+        // the page.
+        if general_filter.is_some_and(|sql| sql.contains("EXISTS (WITH scoped_")) {
+            return Ok(None);
+        }
+        let set_form = general_filter.is_some_and(|sql| sql.contains(" INTERSECT "));
+        if query.parameters.len() < 2
+            || has_cursor
+            || query.offset.is_some()
+            || !query.sort.is_empty()
+            || self.index_layout() != super::schema::IndexLayout::Denormalized
+            || self.supports_native_reverse_chains(tenant, query)
+        {
+            return Ok(None);
+        }
+        // A plain reference match names one resource's dependents (a
+        // patient's Observations): selective in practice, and the general
+        // plan is driven from it. Deciding that costs no estimates, which the
+        // commonest conjunction, `patient=X&code=Y`, would otherwise pay.
+        if query.parameters.iter().any(|p| {
+            p.param_type == crate::types::SearchParamType::Reference
+                && matches!(
+                    p.modifier,
+                    None | Some(crate::types::SearchModifier::Type(_))
+                )
+        }) {
+            return Ok(None);
+        }
+        let Some(predicates) =
+            PostgresQueryBuilder::membership_predicates(query, 2, self.index_layout())
+        else {
+            return Ok(None);
+        };
+        // The planner's row estimate for each membership on its own, each
+        // built alone so its placeholders start at `$3`. Counting the rows
+        // instead was dearer than the page itself: a date range is a bitmap
+        // scan that cannot stop at a `LIMIT`, and the two probes of
+        // `code&date` took 45 ms. An underestimate only keeps the general
+        // plan; the estimates are what order the walk.
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut estimates = Vec::with_capacity(query.parameters.len());
+        for param in &query.parameters {
+            let mut single = SearchQuery::new(query.resource_type.clone());
+            single.parameters = vec![param.clone()];
+            let Some(alone) =
+                PostgresQueryBuilder::membership_predicates(&single, 2, self.index_layout())
+            else {
+                return Ok(None);
+            };
+            let leading: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+                Box::new(tenant_id.to_string()),
+                Box::new(query.resource_type.clone()),
+            ];
+            let bound = bind_sql_params(leading, &alone[0].params);
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let row = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (FORMAT JSON) SELECT 1 FROM search_index WHERE {}",
+                        alone[0].sql
+                    ),
+                    &refs,
+                )
+                .await
+                .or_query_error("Failed to estimate a search membership")?;
+            let plan: serde_json::Value = row.get(0);
+            let rows = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap_or(0.0);
+            let factor = match range_value_column(param.param_type) {
+                Some(column) => range_estimate_correction(
+                    self.value_null_fraction(client, column).await,
+                ),
+                None => 1.0,
+            };
+            estimates.push(rows * factor);
+        }
+        if estimates
+            .iter()
+            .any(|rows| *rows <= BROAD_MEMBERSHIP_ROWS as f64)
+        {
+            return Ok(None);
+        }
+        let roles: Vec<WalkRole> = query
+            .parameters
+            .iter()
+            .zip(&predicates)
+            .map(|(p, pred)| walk_role(p.param_type, &pred.sql))
+            .collect();
+        let driver = choose_walk_driver(&estimates, &roles);
+        if set_form && roles[driver] != WalkRole::TokenLike {
+            return Ok(None);
+        }
+        Ok(Some((predicates, driver)))
+    }
+
+    /// The query with every very long token list cut down to the codes that
+    /// occur at all for that parameter, or `None` when nothing needs it.
+    ///
+    /// PostgreSQL estimates `value_token_code = ANY(<constant array>)` element
+    /// by element against the column's MCV list, so planning grows with the
+    /// list: a 5,000-code `code:in` (an eCQM ValueSet) planned for 160 ms and
+    /// executed in 2 ms on 2.24M resources. Most codes of such a ValueSet
+    /// never occur in a given database (297 distinct Condition codes there).
+    /// One correlated probe per distinct code — `unnest($codes)` against
+    /// `idx_search_token_code`, ~7 µs each — finds the ones that do, and only
+    /// those reach the search. Dropping a code that has no row for this
+    /// tenant, type and parameter cannot change which resources match, with
+    /// or without `:not`; a list left with no present code keeps its first
+    /// value so it still matches nothing (rather than being dropped).
+    ///
+    /// Lists of at most [`TOKEN_LIST_REDUCE_MIN`] values are left alone: their
+    /// planning costs less than the probe.
+    async fn reduce_long_token_lists(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<SearchQuery>> {
+        fn code_of(value: &str) -> &str {
+            value.split_once('|').map_or(value, |(_, code)| code)
+        }
+        let eligible = |p: &crate::types::SearchParameter| {
+            p.param_type == crate::types::SearchParamType::Token
+                && p.values.len() > TOKEN_LIST_REDUCE_MIN
+                // `_id` is answered from `resources`, not `search_index`.
+                && !super::search::writer::answered_from_resources(&p.name)
+                && p.chain.is_empty()
+                && matches!(p.modifier, None | Some(crate::types::SearchModifier::Not))
+                && p.values.iter().all(|v| !code_of(&v.value).is_empty())
+        };
+        if !query.parameters.iter().any(eligible) {
+            return Ok(None);
+        }
+        let mut reduced = query.clone();
+        let tenant_id = tenant.tenant_id().as_str();
+        for param in reduced.parameters.iter_mut().filter(|p| eligible(p)) {
+            let mut codes: Vec<String> = param
+                .values
+                .iter()
+                .map(|v| code_of(&v.value).to_string())
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            let rows = client
+                .query(
+                    "SELECT t.v FROM unnest($4::text[]) AS t(v)
+                     WHERE EXISTS (SELECT 1 FROM search_index s
+                                   WHERE s.tenant_id = $1 AND s.resource_type = $2
+                                     AND s.param_name = $3 AND s.value_token_code = t.v
+                                   OFFSET 0)",
+                    &[&tenant_id, &query.resource_type, &param.name, &codes],
+                )
+                .await
+                .or_query_error("Failed to reduce a long token list")?;
+            let present: HashSet<String> = rows.into_iter().map(|r| r.get(0)).collect();
+            let first = param.values[0].clone();
+            param.values.retain(|v| present.contains(code_of(&v.value)));
+            if param.values.is_empty() {
+                param.values.push(first);
+            }
+        }
+        Ok(Some(reduced))
+    }
+
+    /// `pg_stats.null_frac` of a `search_index` value column, cached for
+    /// [`VALUE_NULL_FRACTION_TTL`]. `None` before the table is analysed or
+    /// when the statistics cannot be read; the estimate is then used as is.
+    async fn value_null_fraction(
+        &self,
+        client: &deadpool_postgres::Client,
+        column: &str,
+    ) -> Option<f64> {
+        if let Some((read_at, fractions)) = self.value_null_fractions.read().as_ref()
+            && read_at.elapsed() < VALUE_NULL_FRACTION_TTL
+        {
+            return fractions.get(column).copied();
+        }
+        let rows = client
+            .query(
+                "SELECT attname::text, null_frac::float8 FROM pg_stats
+                 WHERE schemaname = current_schema() AND tablename = 'search_index'
+                   AND attname IN ('value_date', 'value_number', 'value_quantity_value')",
+                &[],
+            )
+            .await
+            .ok()?;
+        let fractions: HashMap<String, f64> = rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))
+            .collect();
+        let value = fractions.get(column).copied();
+        *self.value_null_fractions.write() = Some((std::time::Instant::now(), fractions));
+        value
+    }
+
+    /// Page and `_id`-restricted count share this correlated predicate. A broad
+    /// native count adds a code prefilter before the same exact source guard.
+    /// Cursor bindings change the page's initial offset.
     fn search_filter(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
         offset: usize,
     ) -> StorageResult<Option<SqlFragment>> {
+        // A parameter with values and no condition is a 400, not a wider
+        // search (#2508).
         let ordinary =
-            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout());
+            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout())?;
         if !self.supports_native_reverse_chains(tenant, query) {
             if query.reverse_chains.is_empty() {
                 return Ok(ordinary);
@@ -478,6 +973,8 @@ impl PostgresBackend {
             query,
             self.supports_native_reverse_chains(tenant, query),
         )?;
+        let reduced = self.reduce_long_token_lists(client, tenant, query).await?;
+        let query = reduced.as_ref().unwrap_or(query);
 
         reject_legacy_composites(client, tenant, query, self.index_layout()).await?;
 
@@ -514,26 +1011,54 @@ impl PostgresBackend {
         } else {
             None
         };
-        // v18 fast path: resolve the page from `search_index` alone.
+        // v18 fast path: choose page identities before loading resource bodies.
         //
         // The sort key lives on every index row (see `migrate_v16_to_v17`), so a
-        // single-parameter search can take its top-n before touching `resources`
-        // and then fetch only the rows it returns. The general form below has to
+        // single-parameter search can take its top-n after checking live resource
+        // identities and then fetch only the bodies it returns. The general form has to
         // join every match first — 42,927 whole resources for a 21-row page on
         // the benchmark dataset — because the planner cannot estimate a range
         // predicate whose selectivity is conditional on `param_name`.
-        let fast_index_pred = fast_index_pred(
-            query,
-            search_filter.as_ref().map(|f| f.sql.as_str()),
-            self.index_layout(),
-            cursor.is_some(),
-        );
+        //
+        // A version-restricted search (#2254) takes the general statement:
+        // the fast path picks its page from `search_index`, which carries no
+        // FHIR version, before it reaches `resources`.
+        let fast_index_pred = if query.fhir_version.is_some() {
+            None
+        } else {
+            fast_index_pred(
+                query,
+                search_filter.as_ref().map(|f| f.sql.as_str()),
+                self.index_layout(),
+            )
+        };
+        let version_clause = fhir_version_clause(query, "fhir_version");
+
+        // Fork (hm/p3-pgops2): a conjunction of broad memberships walks one
+        // of them. Not for a version-restricted search, which takes the
+        // general statement like the fast path does (#2254).
+        let broad = if fast_index_pred.is_none() && query.fhir_version.is_none() {
+            self.broad_conjunction(
+                client,
+                tenant,
+                query,
+                cursor.is_some(),
+                search_filter.as_ref().map(|f| f.sql.as_str()),
+            )
+            .await?
+        } else {
+            None
+        };
 
         let filter_clause = search_filter
             .as_ref()
             .map(|f| format!(" AND ({})", f.sql))
             .unwrap_or_default();
-        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
+        let search_params = match &broad {
+            // The broad page binds its own per-parameter predicates.
+            Some((predicates, _)) => predicates.iter().flat_map(|p| p.params.clone()).collect(),
+            None => search_filter.map(|f| f.params).unwrap_or_default(),
+        };
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -551,10 +1076,103 @@ impl PostgresBackend {
             PostgresQueryBuilder::build_order_by(query)
         };
 
-        // Build query based on pagination mode.
-        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
-            // `keyset` is always `Some` here: the fast path requires the default
-            // sort, which yields the `last_updated` keyset.
+        let general_page_sql = || {
+            if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+                let backward = cursor.direction() == CursorDirection::Previous;
+                let (condition, order) =
+                    keyset_page_clauses(k, "id", cursor_value_is_null(cursor), backward);
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
+                 AND {condition} \
+                 ORDER BY {order} LIMIT {lim}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    lim = count + 1,
+                );
+                // Backward: the placeholder is replaced by the extra-row check below.
+                (sql, !backward)
+            } else if let Some(offset) = query.offset {
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
+                 {order} LIMIT {lim} OFFSET {off}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    order = order_by,
+                    lim = count + 1,
+                    off = offset,
+                );
+                (sql, offset > 0)
+            } else {
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
+                 {order} LIMIT {lim}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    order = order_by,
+                    lim = count + 1,
+                );
+                (sql, false)
+            }
+        };
+
+        // The per-statement eligibility probe is redundant when a cached fact
+        // says the searched parameter has no NULL-`last_updated` rows; see
+        // `null_timestamp_facts`. Any doubt keeps the probe.
+        let skip_eligibility_probe = match fast_index_pred.as_deref() {
+            Some(pred) if super::null_timestamp_facts::enabled() => {
+                match super::null_timestamp_facts::param_name_of(pred) {
+                    Some(param) => {
+                        super::null_timestamp_facts::param_has_no_null_rows(
+                            client,
+                            tenant_id,
+                            resource_type,
+                            &param,
+                        )
+                        .await
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+
+        // Index eligibility and candidate selection share one database snapshot.
+        let (sql, has_previous) = if let Some((predicates, driver)) = &broad {
+            (broad_conjunction_sql(predicates, *driver, count + 1), false)
+        } else if let Some(pred) = &fast_index_pred {
+            // Eligible sorts share the non-null `last_updated` keyset. Apply
+            // the same boundary to index identities, retaining the bind layout.
+            let backward = cursor
+                .as_ref()
+                .is_some_and(|c| c.direction() == CursorDirection::Previous);
+            let (boundary, order) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+                let (condition, order) =
+                    keyset_page_clauses(k, "resource_id", cursor_value_is_null(cursor), backward);
+                (format!(" AND {condition}"), order)
+            } else {
+                (
+                    String::new(),
+                    "last_updated DESC, resource_id ASC".to_string(),
+                )
+            };
+            // A valid cursor takes precedence over an offset, as on the general
+            // path. Nonzero offsets still bypass the statement cache below.
+            let offset = if cursor.is_none() {
+                query
+                    .offset
+                    .map(|n| format!(" OFFSET {n}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let outer_order = if backward {
+                "sort_key ASC, id DESC"
+            } else {
+                "sort_key DESC, id ASC"
+            };
             // Gate the ordered scan on the predicate matching anything at all;
             // see `open_range_needs_empty_guard`. The subquery is uncorrelated,
             // so it is an InitPlan run once against the value-first index, and
@@ -567,60 +1185,42 @@ impl PostgresBackend {
             } else {
                 String::new()
             };
-            let sql = format!(
-                "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
-                        r.last_updated AS sort_key \
-                 FROM ( \
-                   SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
-                   ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
-                 ) c \
-                 JOIN resources r \
-                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
-                 WHERE r.is_deleted = FALSE \
-                 ORDER BY c.last_updated DESC, c.resource_id ASC",
-                pred = pred,
-                guard = guard,
-                lim = count + 1,
-            );
-            (sql, false)
-        } else if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
-            let backward = cursor.direction() == CursorDirection::Previous;
-            let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 AND {condition} \
-                 ORDER BY {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                lim = count + 1,
-            );
-            // Backward: the placeholder is replaced by the extra-row check below.
-            (sql, !backward)
-        } else if let Some(offset) = query.offset {
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 {order} LIMIT {lim} OFFSET {off}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-                off = offset,
-            );
-            (sql, offset > 0)
+            // NULL timestamps are outside the denormalized ordering invariant
+            // (normal contained memberships carry NULL). Probe that timestamp
+            // range using the same predicate, rather than scanning all contained
+            // rows of the tenant, and materialize only the eligibility boolean.
+            //
+            // There is deliberately no `EXISTS (... resources ... is_deleted =
+            // FALSE)` inside the pre-`LIMIT` subquery: the outer join to
+            // `resources` already filters `is_deleted = FALSE`, and every path
+            // that sets `is_deleted` (soft delete in `storage.rs`/`transaction.rs`)
+            // or removes a resource (`purge`, `purge_all`, tenant purge) deletes
+            // the resource's `search_index` rows in the same transaction, so the
+            // candidate set holds no deleted resources. The per-candidate probe
+            // cost one `resources_pkey` lookup per matching row. Orphaned index
+            // rows (which no HFS write path creates, but a restored dump or a
+            // hand-edited database can) are still handled: the join is a
+            // `LEFT JOIN` whose `ON` carries `is_deleted = FALSE`, so a dead
+            // candidate surfaces as a row with `needs_fallback = TRUE` and the
+            // caller re-runs the page with the general statement.
+            let sql = fast_path_sql(&FastPathParts {
+                pred,
+                guard: &guard,
+                boundary: &boundary,
+                order: &order,
+                offset: &offset,
+                outer_order,
+                limit: count + 1,
+                with_probe: !skip_eligibility_probe,
+            });
+            let has_previous = if cursor.is_some() {
+                !backward
+            } else {
+                query.offset.unwrap_or(0) > 0
+            };
+            (sql, has_previous)
         } else {
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-            );
-            (sql, false)
+            general_page_sql()
         };
 
         // Build parameter list for binding.
@@ -647,12 +1247,25 @@ impl PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let rows = if statement_is_reusable(query) {
+        let mut rows = if statement_is_reusable(query) {
             query_dyn_cached(client, &sql, &param_refs).await
         } else {
             client.query(&sql, &param_refs).await
         }
         .or_query_error("Failed to execute search")?;
+        // Matching NULL timestamps cannot safely participate in index ordering.
+        // Contained memberships normally carry NULL under their parent's identity.
+        // The same-statement sentinel preserves unique parent identities and
+        // contained-only matches even when CRUD changes the representation.
+        if fast_index_pred.is_some() && rows.iter().any(|row| row.get::<_, bool>(6)) {
+            let (sql, _) = general_page_sql();
+            rows = if statement_is_reusable(query) {
+                query_dyn_cached(client, &sql, &param_refs).await
+            } else {
+                client.query(&sql, &param_refs).await
+            }
+            .or_query_error("Failed to execute search fallback")?;
+        }
 
         // Parse rows, capturing the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -799,6 +1412,54 @@ impl SearchProvider for PostgresBackend {
         self.search_with_client(&client, tenant, query, total).await
     }
 
+    /// One statement answers for every candidate type: an index probe per
+    /// type that stops at its first `search_index` row referencing the
+    /// compartment through any of the candidates' parameters. Matching on the
+    /// union of all parameter names can only add types (a superset is allowed),
+    /// and the rows are the same ones the compartment search reads, so a type
+    /// it would find is never left out. A database whose search is offloaded
+    /// holds no such rows and answers `None`.
+    async fn compartment_member_types(
+        &self,
+        tenant: &TenantContext,
+        compartment_ref: &str,
+        members: &[(String, Vec<String>)],
+    ) -> StorageResult<Option<HashSet<String>>> {
+        if self.is_search_offloaded() {
+            return Ok(None);
+        }
+        if members.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let types: Vec<String> = members.iter().map(|(t, _)| t.clone()).collect();
+        let mut params: Vec<String> = members
+            .iter()
+            .flat_map(|(_, p)| p.iter().cloned())
+            .collect();
+        params.sort();
+        params.dedup();
+        let reference = compartment_ref
+            .split("/_history/")
+            .next()
+            .unwrap_or(compartment_ref)
+            .to_string();
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT t.resource_type FROM unnest($2::text[]) AS t(resource_type)
+                 WHERE EXISTS (
+                     SELECT 1 FROM search_index si
+                     WHERE si.tenant_id = $1 AND si.resource_type = t.resource_type
+                       AND si.param_name = ANY($3::text[]) AND si.value_reference = $4
+                 )",
+                &[&tenant_id, &types, &params, &reference],
+            )
+            .await
+            .or_query_error("Failed to find compartment member types")?;
+        Ok(Some(rows.iter().map(|row| row.get(0)).collect()))
+    }
+
     async fn search_ids(
         &self,
         tenant: &TenantContext,
@@ -841,7 +1502,7 @@ impl SearchProvider for PostgresBackend {
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
         let search_filter = if !query.parameters.is_empty() {
-            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())?
         } else {
             None
         };
@@ -858,9 +1519,10 @@ impl SearchProvider for PostgresBackend {
             ""
         };
         let count = query.count.unwrap_or(100) as usize;
+        let version_clause = fhir_version_clause(query, "fhir_version");
         let sql = format!(
             "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter_clause}{cursor_clause} \
+             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter_clause}{cursor_clause} \
              ORDER BY last_updated DESC, id ASC LIMIT {}",
             count + 1
         );
@@ -943,8 +1605,11 @@ impl SearchProvider for PostgresBackend {
 
         let client = self.get_client().await?;
         reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
+        let reduced = self.reduce_long_token_lists(&client, tenant, query).await?;
+        let query = reduced.as_ref().unwrap_or(query);
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
+        let version_clause = fhir_version_clause(query, "fhir_version");
 
         let (sql, params): (
             String,
@@ -953,7 +1618,17 @@ impl SearchProvider for PostgresBackend {
             || query.compartment.is_some()
             || !query.reverse_chains.is_empty()
         {
-            let filter = self.search_filter(tenant, query, 2)?;
+            let filter = if query.parameters.is_empty()
+                && self.supports_native_reverse_chains(tenant, query)
+            {
+                let registry = self.search_param_registry(tenant);
+                let (system, code) = native_patient_code_token(query, &registry.read())
+                    .ok_or(StorageError::Search(SearchError::ReverseChainNotSupported))?;
+                // Count already binds tenant at $1 and resource type at $2.
+                Some(native_patient_code_count_predicate(&system, &code, 2, 1))
+            } else {
+                self.search_filter(tenant, query, 2)?
+            };
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
@@ -973,17 +1648,84 @@ impl SearchProvider for PostgresBackend {
                     }
                 }
 
-                let sql = format!(
-                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
-                    fragment.sql
-                );
+                // A lone membership test is counted from `search_index` alone.
+                // The general form below joins `resources` once per match to
+                // check `is_deleted` — ~11 µs a probe, ~200 ms of the 243 ms
+                // `Observation?code=<17,837 matches>&_summary=count` took — and
+                // the check cannot fail here: every delete path removes the
+                // resource's `search_index` rows in the same transaction (the
+                // soft delete in `storage.rs` and in `transaction.rs`; a purge
+                // removes the resource outright), and a reindex writes rows
+                // only for resources it finds live. So the distinct
+                // `resource_id`s of the matching rows are exactly the live
+                // matches.
+                //
+                // It counts the resources the single-parameter page returns:
+                // top-level rows (`last_updated IS NOT NULL`, see the fast path
+                // in `search_with_client`), grouped by `(last_updated,
+                // resource_id)`, which is one group per resource because a
+                // resource's top-level rows all carry its `last_updated`. That
+                // pair is the tail of the token, date and quantity `*_recent`
+                // indexes, so for an equality on their leading columns the
+                // groups arrive in index order and are counted as they stream
+                // past: 15 ms for 17,837 matches, against 21 ms hashing the
+                // distinct ids and 55 ms for `COUNT(DISTINCT resource_id)`,
+                // which sorts. Any other predicate is grouped as before.
+                // Not for a version-restricted count (#2254): `search_index`
+                // carries no FHIR version.
+                // Only when the parameter is known to have no NULL-`last_updated`
+                // rows (`null_timestamp_facts`): legacy top-level rows written
+                // before `last_updated` was denormalized carry NULL and would
+                // be missed (upstream #2074 legacy fallback).
+                // Disabled at the v0.2.9 merge: upstream tolerates orphan
+                // `search_index` rows (no live resource; #2074) and a count from
+                // the index alone includes them. The resources-joined count
+                // below is exact; `_summary=count` on a broad token pays for it
+                // (~240 ms at 18k matches instead of ~15 ms).
+                let single = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
+                    .filter(|_| query.fhir_version.is_none())
+                    .filter(|_| COUNT_FROM_INDEX_ALONE);
+                let single = match single {
+                    Some(pred) if super::null_timestamp_facts::enabled() => {
+                        match super::null_timestamp_facts::param_name_of(&pred) {
+                            Some(param)
+                                if super::null_timestamp_facts::param_has_no_null_rows(
+                                    &client,
+                                    tenant_id,
+                                    resource_type,
+                                    &param,
+                                )
+                                .await =>
+                            {
+                                Some(pred)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let sql = match single {
+                    Some(pred) => format!(
+                        "SELECT COUNT(*) FROM (SELECT DISTINCT resource_id FROM search_index \
+                         WHERE tenant_id = $1 AND resource_type = $2 AND {pred} \
+                           AND last_updated IS NOT NULL) matches"
+                    ),
+                    None => format!(
+                        "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause} AND ({})",
+                        fragment.sql
+                    ),
+                };
                 (sql, params)
             } else {
-                let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+                let sql = format!(
+                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}"
+                );
                 (sql, params)
             }
         } else {
-            let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+            let sql = format!(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}"
+            );
             let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
                 Box::new(resource_type.to_string()),
@@ -996,9 +1738,9 @@ impl SearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // No `LIMIT`/`OFFSET` in this one at all: the text varies only by
+        // No pagination-dependent `LIMIT`/`OFFSET`: the text varies only by
         // predicate shape and inlined `param_name`, so it is unconditionally
-        // reusable.
+        // reusable (the broad native count's candidate cap is constant).
         let row = query_one_dyn_cached(&client, &sql, &param_refs)
             .await
             .or_query_error("Failed to count resources")?;
@@ -1025,6 +1767,49 @@ impl SearchProvider for PostgresBackend {
         param_type: crate::types::SearchParamType,
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
+    }
+
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<DistinctMetaValue>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // Joined to `resources` so a deleted resource's rows (and any rows a
+        // reindex has not yet rewritten) do not count.
+        let mut sql = String::from(
+            "SELECT DISTINCT si.value_token_system, si.value_token_code, si.value_token_display, si.value_uri \
+             FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             WHERE si.tenant_id = $1 AND si.param_name = $2 AND r.is_deleted = FALSE",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(tenant_id.to_string()), Box::new(param.to_string())];
+        if let Some(resource_type) = resource_type {
+            sql.push_str(" AND si.resource_type = $3");
+            params.push(Box::new(resource_type.to_string()));
+        }
+        sql.push_str(" ORDER BY 1, 2, 4");
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = client
+            .query(sql.as_str(), &param_refs)
+            .await
+            .or_query_error("Failed to execute $meta query")?;
+        Ok(rows
+            .iter()
+            .map(|row| DistinctMetaValue {
+                system: row.get(0),
+                code: row.get(1),
+                display: row.get(2),
+                uri: row.get(3),
+            })
+            .filter(|value| value.code.is_some() || value.uri.is_some())
+            .collect())
     }
 }
 
@@ -1178,8 +1963,8 @@ impl RevincludeProvider for PostgresBackend {
                     AND r.resource_type = si.resource_type
                     AND r.id = si.resource_id
                  WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE
-                 AND si.param_name = {}
-                 AND si.value_reference IN ({})",
+                 AND si.param_name = {0}
+                 AND (si.value_reference IN ({1}) OR si.value_reference_target IN ({1}))",
                 sql_string_literal(&revinclude.search_param),
                 placeholders.join(", ")
             );
@@ -1583,7 +2368,7 @@ impl PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let contained_type = query.resource_type.as_str();
         let matches: Vec<(String, String, Option<String>)> =
-            match PostgresQueryBuilder::build_contained(query) {
+            match PostgresQueryBuilder::build_contained(query)? {
                 Some(fragment) => {
                     let client = self.get_client().await?;
                     let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
@@ -1605,7 +2390,20 @@ impl PostgresBackend {
                         .iter()
                         .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                         .collect();
-                    let rows = query_dyn_cached(&client, &fragment.sql, &param_refs)
+                    // A version-restricted search (#2254) keeps the contained
+                    // matches whose live container is stored under that version.
+                    let sql = match query.stored_fhir_version() {
+                        Some(version) => format!(
+                            "SELECT m.resource_type, m.resource_id, m.contained_local_id \
+                             FROM ({}) m WHERE EXISTS (SELECT 1 FROM resources r \
+                             WHERE r.tenant_id = $1 AND r.resource_type = m.resource_type \
+                             AND r.id = m.resource_id AND r.is_deleted = FALSE \
+                             AND r.fhir_version = '{version}')",
+                            fragment.sql
+                        ),
+                        None => fragment.sql.clone(),
+                    };
+                    let rows = query_dyn_cached(&client, &sql, &param_refs)
                         .await
                         .or_query_error("Failed to execute contained query")?;
                     rows.iter()
@@ -1633,7 +2431,7 @@ struct ContainedPlan {
 
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
 /// sort key. A client-crafted bad request (400), not a server fault (#1120).
-fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
     StorageError::Search(SearchError::InvalidCursor {
         cursor: cursor.encode(),
     })
@@ -1733,12 +2531,12 @@ mod keyset_page_clause_tests {
     #[test]
     fn a_present_cursor_places_missing_values_last() {
         let (next, next_order) =
-            keyset_page_clauses(&key(true, SortDirection::Descending), false, false);
+            keyset_page_clauses(&key(true, SortDirection::Descending), "id", false, false);
         assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4) OR k IS NULL)");
         assert_eq!(next_order, "k DESC NULLS LAST, id ASC");
 
         let (prev, prev_order) =
-            keyset_page_clauses(&key(true, SortDirection::Descending), false, true);
+            keyset_page_clauses(&key(true, SortDirection::Descending), "id", false, true);
         assert_eq!(prev, "(k > $3 OR (k = $3 AND id < $4))");
         assert_eq!(prev_order, "k ASC NULLS FIRST, id DESC");
     }
@@ -1747,10 +2545,11 @@ mod keyset_page_clause_tests {
     /// by id; backward reaches every present value as well.
     #[test]
     fn a_missing_cursor_pages_within_and_out_of_the_missing_values() {
-        let (next, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, false);
+        let (next, _) =
+            keyset_page_clauses(&key(true, SortDirection::Ascending), "id", true, false);
         assert_eq!(next, "(k IS NOT DISTINCT FROM $3 AND id > $4)");
 
-        let (prev, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, true);
+        let (prev, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), "id", true, true);
         assert_eq!(
             prev,
             "(k IS NOT NULL OR (k IS NOT DISTINCT FROM $3 AND id < $4))"
@@ -1761,9 +2560,20 @@ mod keyset_page_clause_tests {
     #[test]
     fn a_non_nullable_key_is_unchanged() {
         let (next, order) =
-            keyset_page_clauses(&key(false, SortDirection::Descending), false, false);
+            keyset_page_clauses(&key(false, SortDirection::Descending), "id", false, false);
         assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4))");
         assert_eq!(order, "k DESC, id ASC");
+    }
+
+    #[test]
+    fn postgres_2074_index_identity_uses_the_same_forward_and_backward_boundaries() {
+        let k = key(false, SortDirection::Descending);
+        let (next, order) = keyset_page_clauses(&k, "resource_id", false, false);
+        assert_eq!(next, "(k < $3 OR (k = $3 AND resource_id > $4))");
+        assert_eq!(order, "k DESC, resource_id ASC");
+        let (previous, order) = keyset_page_clauses(&k, "resource_id", false, true);
+        assert_eq!(previous, "(k > $3 OR (k = $3 AND resource_id < $4))");
+        assert_eq!(order, "k ASC, resource_id DESC");
     }
 }
 
@@ -1819,6 +2629,7 @@ mod fast_path_tests {
 
     fn filter_of(query: &SearchQuery) -> String {
         PostgresQueryBuilder::build_search_query(query, 2)
+            .expect("the query builds")
             .expect("condition")
             .sql
     }
@@ -1826,7 +2637,7 @@ mod fast_path_tests {
     #[test]
     fn taken_for_a_default_sorted_single_parameter_page() {
         let q = date_query();
-        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized);
         assert_eq!(
             pred.as_deref(),
             Some("param_name = 'date' AND value_date_end > $3")
@@ -1848,7 +2659,7 @@ mod fast_path_tests {
             chain: vec![],
             components: vec![],
         });
-        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized);
         assert_eq!(
             pred.as_deref(),
             Some(
@@ -1864,18 +2675,39 @@ mod fast_path_tests {
         // The decisive gate: legacy rows have no `last_updated`, so ordering by
         // it would return an arbitrary page rather than the first one.
         let q = date_query();
-        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy, false).is_none());
+        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy).is_none());
     }
 
     #[test]
-    fn refused_with_a_cursor_or_offset() {
-        let q = date_query();
+    fn postgres_2074_taken_with_a_cursor_or_offset() {
+        let mut q = date_query();
+        q.cursor =
+            Some(PageCursor::new(vec![CursorValue::from("2024-01-01T00:00:00Z")], "obs").encode());
         let filter = filter_of(&q);
-        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, true).is_none());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_some());
 
         let mut q2 = date_query();
         q2.offset = Some(40);
-        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized).is_some());
+    }
+
+    #[test]
+    fn postgres_2074_taken_for_exactly_one_descending_last_updated_sort() {
+        let mut q = date_query();
+        q.sort = vec![SortDirective::parse("-_lastUpdated")];
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_some());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Legacy).is_none());
+
+        for sort in ["_lastUpdated", "-date"] {
+            q.sort = vec![SortDirective::parse(sort)];
+            assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
+        }
+        q.sort = vec![
+            SortDirective::parse("-_lastUpdated"),
+            SortDirective::parse("_id"),
+        ];
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
     }
 
     #[test]
@@ -1887,13 +2719,13 @@ mod fast_path_tests {
             param_type: Some(SearchParamType::Token),
         }];
         let filter = filter_of(&q);
-        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
     }
 
     #[test]
     fn refused_without_a_filter() {
         let q = SearchQuery::new("Encounter");
-        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized).is_none());
     }
 
     /// A repeated parameter is now one membership test over the occurrences'
@@ -1914,7 +2746,7 @@ mod fast_path_tests {
 
         assert!(filter.contains(" INTERSECT "), "{filter}");
         assert!(
-            fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none(),
+            fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none(),
             "{filter}"
         );
     }
@@ -1967,6 +2799,87 @@ mod cursor_tests {
             PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, false, &ok)
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod range_estimate_tests {
+    use super::{
+        WalkRole, choose_walk_driver, range_estimate_correction, range_value_column, walk_role,
+    };
+    use crate::types::SearchParamType;
+
+    #[test]
+    fn the_driver_follows_the_measured_shapes() {
+        use WalkRole::{OpenRange as O, Range as R, TokenLike as T};
+        // status=final & date=ge2020: an open date never drives
+        assert_eq!(choose_walk_driver(&[655_000.0, 437_000.0], &[T, O]), 0);
+        assert_eq!(choose_walk_driver(&[655_000.0, 4_000.0], &[T, O]), 0);
+        // category=vital-signs & value-quantity=gt100: the smaller range
+        assert_eq!(choose_walk_driver(&[139_000.0, 99_000.0], &[T, R]), 1);
+        // code (13k) & value-quantity=gt20 (251k): the token
+        assert_eq!(choose_walk_driver(&[13_000.0, 251_000.0], &[T, R]), 0);
+        // category=laboratory & date=le2012
+        assert_eq!(choose_walk_driver(&[452_000.0, 117_000.0], &[T, R]), 1);
+        // category=survey & value-quantity=gt1000
+        assert_eq!(choose_walk_driver(&[43_000.0, 1_400.0], &[T, R]), 1);
+        // two tokens: the smaller, as before
+        assert_eq!(choose_walk_driver(&[50_000.0, 9_000.0], &[T, T]), 1);
+        // only ranges: the smallest walkable one, else the smallest
+        assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, R]), 1);
+        assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, O]), 0);
+        // token + ge date + lt date (a window): the smaller of token and lt
+        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 191_000.0], &[T, O, R]), 0);
+        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 20_000.0], &[T, O, R]), 2);
+    }
+
+    #[test]
+    fn open_dates_are_recognised_from_the_predicate() {
+        let ge = "param_name = 'date' AND (value_date_end > $3 OR (value_date >= $4 AND value_date < $5 AND value_date_end <= $5))";
+        let le = "param_name = 'date' AND (value_date < $3 OR (value_date >= $3 AND value_date < $4))";
+        assert_eq!(walk_role(SearchParamType::Date, ge), WalkRole::OpenRange);
+        assert_eq!(walk_role(SearchParamType::Date, le), WalkRole::Range);
+        assert_eq!(
+            walk_role(SearchParamType::Quantity, "value_quantity_value > $3"),
+            WalkRole::Range
+        );
+        assert_eq!(walk_role(SearchParamType::Token, ge), WalkRole::TokenLike);
+    }
+
+    #[test]
+    fn only_range_typed_memberships_are_corrected() {
+        assert_eq!(range_value_column(SearchParamType::Date), Some("value_date"));
+        assert_eq!(range_value_column(SearchParamType::Number), Some("value_number"));
+        assert_eq!(
+            range_value_column(SearchParamType::Quantity),
+            Some("value_quantity_value")
+        );
+        for t in [
+            SearchParamType::Token,
+            SearchParamType::Reference,
+            SearchParamType::String,
+            SearchParamType::Uri,
+        ] {
+            assert_eq!(range_value_column(t), None);
+        }
+    }
+
+    /// The benchmark's case: `value_date` NULL on 91.4% of rows turns a 45k
+    /// estimate back into the ~485k rows the date membership really has.
+    #[test]
+    fn correction_undoes_the_null_fraction() {
+        let f = range_estimate_correction(Some(0.914));
+        assert!((45_000.0 * f - 523_000.0).abs() < 2_000.0, "{f}");
+        assert_eq!(range_estimate_correction(Some(0.0)), 1.0);
+    }
+
+    #[test]
+    fn missing_or_degenerate_statistics_leave_the_estimate_alone() {
+        assert_eq!(range_estimate_correction(None), 1.0);
+        assert_eq!(range_estimate_correction(Some(1.0)), 1.0);
+        assert_eq!(range_estimate_correction(Some(f64::NAN)), 1.0);
+        assert_eq!(range_estimate_correction(Some(-0.1)), 1.0);
+        assert_eq!(range_estimate_correction(Some(0.99999)), 1000.0);
     }
 }
 
@@ -2368,3 +3281,197 @@ mod composite_slot_runtime_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod fast_path_sql_tests {
+    use super::*;
+
+    fn parts(with_probe: bool) -> FastPathParts<'static> {
+        FastPathParts {
+            pred: "param_name = 'birthdate' AND value_date < $3",
+            guard: "",
+            boundary: "",
+            order: "last_updated DESC, resource_id ASC",
+            offset: "",
+            outer_order: "sort_key DESC, id ASC",
+            limit: 21,
+            with_probe,
+        }
+    }
+
+    #[test]
+    fn probe_shape_keeps_cte_and_sentinel() {
+        let sql = fast_path_sql(&parts(true));
+        assert!(sql.starts_with("WITH index_eligible AS MATERIALIZED ("));
+        assert!(sql.contains("AND last_updated IS NULL AND param_name = 'birthdate'"));
+        assert!(sql.contains("(SELECT usable FROM index_eligible)"));
+        assert!(sql.contains("UNION ALL"));
+        assert!(sql.contains("TRUE AS needs_fallback"));
+        assert!(sql.ends_with("ORDER BY sort_key DESC, id ASC"));
+    }
+
+    #[test]
+    fn direct_shape_has_no_probe_and_same_columns() {
+        let direct = fast_path_sql(&parts(false));
+        assert!(!direct.contains("index_eligible"));
+        assert!(!direct.contains("UNION ALL"));
+        assert!(!direct.contains("last_updated IS NULL"));
+        assert!(direct.contains("AND r.is_deleted = FALSE ORDER BY sort_key DESC, id ASC"));
+        assert!(direct.contains("(r.id IS NULL) AS needs_fallback"));
+        assert!(!direct.contains("EXISTS"));
+        assert!(direct.contains("ORDER BY last_updated DESC, resource_id ASC LIMIT 21"));
+        // The page body is shared byte for byte with the probe shape.
+        let probe = fast_path_sql(&parts(true));
+        let body = |s: &str| {
+            let start = s.find("SELECT r.id").unwrap();
+            let marker = "AND r.is_deleted = FALSE";
+            let end = s.find(marker).unwrap() + marker.len();
+            s[start..end].to_string()
+        };
+        assert_eq!(body(&direct), body(&probe));
+    }
+
+    #[test]
+    fn guard_boundary_and_offset_are_spliced_in_both_shapes() {
+        for with_probe in [true, false] {
+            let mut p = parts(with_probe);
+            p.guard = " AND EXISTS (SELECT 1 FROM search_index g WHERE x)";
+            p.boundary = " AND (last_updated, resource_id) < ($3, $4)";
+            p.offset = " OFFSET 5";
+            let sql = fast_path_sql(&p);
+            assert!(sql.contains(p.guard) && sql.contains(p.boundary));
+            assert!(sql.contains("LIMIT 21 OFFSET 5"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod eligible_cache_runtime_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::{SearchParamType, SearchParameter, SearchValue};
+    use serde_json::json;
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    fn gender_query() -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".into(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("male")],
+            ..Default::default()
+        })
+    }
+
+    async fn ids(backend: &PostgresBackend, scope: &TenantContext) -> Vec<String> {
+        backend
+            .search(scope, &gender_query())
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn null_last_updated_rows_force_the_fallback_and_match_the_probe_path() {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .unwrap();
+        let config = PostgresConfig {
+            host: container.get_host().await.unwrap().to_string(),
+            port: container.get_host_port_ipv4(5432).await.unwrap(),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await.unwrap();
+        backend.init_schema().await.unwrap();
+        let tenant = "elig-cache";
+        let scope = TenantContext::new(TenantId::new(tenant), TenantPermissions::full_access());
+        for id in ["a", "b", "c"] {
+            backend
+                .create(
+                    &scope,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id,"gender":"male"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+
+        // 1. No NULL rows: the fact is learned and the direct shape is used.
+        let first = ids(&backend, &scope).await;
+        assert_eq!(first, vec!["c", "b", "a"]);
+        assert!(
+            crate::backends::postgres::null_timestamp_facts::param_has_no_null_rows(
+                &client, tenant, "Patient", "gender"
+            )
+            .await
+        );
+
+        // 2. Both SQL shapes return identical rows when no NULL row exists.
+        let pred = "param_name = 'gender' AND value_token_code = $3";
+        let run = |with_probe: bool| {
+            let sql = fast_path_sql(&FastPathParts {
+                pred,
+                guard: "",
+                boundary: "",
+                order: "last_updated DESC, resource_id ASC",
+                offset: "",
+                outer_order: "sort_key DESC, id ASC",
+                limit: 21,
+                with_probe,
+            });
+            let client = &client;
+            async move {
+                client
+                    .query(&sql, &[&tenant, &"Patient", &"male"])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.get::<_, Option<String>>(0), r.get::<_, bool>(6)))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(run(true).await, run(false).await);
+
+        // 3. A NULL row appears behind the cache's back (another process).
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, is_contained, contained_type, contained_local_id) \
+                 VALUES ($1, 'Patient', 'a', 'gender', 'male', TRUE, 'Patient', 'x')",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+        // The probe shape now yields only the fallback sentinel...
+        assert_eq!(run(true).await, vec![(None, true)]);
+        // ...and once the fact is re-learned, the cache refuses the direct path.
+        crate::backends::postgres::null_timestamp_facts::forget_tenant_for_tests(tenant);
+        assert!(
+            !crate::backends::postgres::null_timestamp_facts::param_has_no_null_rows(
+                &client, tenant, "Patient", "gender"
+            )
+            .await
+        );
+        // Results through the fallback equal the earlier ones (the duplicate
+        // NULL row must not duplicate or reorder the page).
+        assert_eq!(ids(&backend, &scope).await, first);
+    }
+}
+
+/// Whether `search_count` may count a lone membership test from
+/// `search_index` without joining `resources` (fork hm/p3-pgops2). Off: the
+/// index can hold orphan rows (see upstream #2074), which that count includes.
+const COUNT_FROM_INDEX_ALONE: bool = false;

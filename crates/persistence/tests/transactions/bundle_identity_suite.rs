@@ -28,6 +28,8 @@ use helios_persistence::tenant::TenantContext;
 
 use super::conditional_url_suite::{conditional_delete, conditional_put, seed_identified_patient};
 
+use crate::seeding::SeedingStorage;
+
 /// `POST Observation` whose subject is `subject`.
 fn observation_of(subject: &str) -> BundleEntry {
     BundleEntry {
@@ -266,6 +268,54 @@ pub async fn two_puts_on_one_id_roll_back<B: BundleProvider>(backend: &B, tenant
     assert_eq!(count(backend, tenant, "Patient").await, 0);
 }
 
+/// A PUT to the id of a soft-deleted resource restores it, as the same PUT
+/// outside a Bundle does (FHIR http.html#delete): the entry answers 201, the
+/// version chain continues (create 1, delete 2, restore 3) and the resource
+/// counts as live again. Every backend used to create instead and collide with
+/// the tombstone's row, failing the whole Bundle as "already exists" (#2145).
+pub async fn put_over_a_deleted_id_restores_it<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    backend
+        .seed_create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "restored", "gender": "male"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed");
+    backend
+        .seed_delete(tenant, "Patient", "restored")
+        .await
+        .expect("soft delete");
+
+    let result = backend
+        .process_transaction(
+            tenant,
+            vec![put(
+                "restored",
+                json!({"resourceType": "Patient", "id": "restored", "gender": "female"}),
+                None,
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the PUT restores the deleted id");
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[0].effect.live_count_delta(), 1);
+
+    let restored = backend
+        .read(tenant, "Patient", "restored")
+        .await
+        .expect("read")
+        .expect("the restored resource is live");
+    assert_eq!(restored.version_id(), "3", "the version chain continues");
+    assert_eq!(restored.content()["gender"], "female");
+    assert_eq!(count(backend, tenant, "Patient").await, 1);
+}
+
 /// A conditional DELETE that matched nothing answers 204 but reports that
 /// nothing was deleted, so no live count moves (#1078).
 pub async fn conditional_delete_without_a_match_reports_not_found<B: BundleProvider>(
@@ -279,6 +329,100 @@ pub async fn conditional_delete_without_a_match_reports_not_found<B: BundleProvi
     assert_eq!(result.entries[0].status, 204);
     assert_eq!(result.entries[0].effect, BundleEntryEffect::NotFound);
     assert_eq!(result.entries[0].effect.live_count_delta(), 0);
+}
+
+/// An instance `DELETE` with nothing to delete — an id never stored, and one
+/// already deleted — answers `204` and reports that nothing was deleted, and
+/// the rest of the transaction commits (#2523). SQLite and PostgreSQL used to
+/// fail the whole Bundle as "resource not found"; MongoDB already answered
+/// this. Nothing is written for it: the tombstone keeps its history and its
+/// `lastUpdated`, and the never-stored id gets no tombstone.
+pub async fn instance_delete_with_nothing_to_delete_reports_not_found<B>(
+    backend: &B,
+    tenant: &TenantContext,
+) where
+    B: BundleProvider + helios_persistence::core::InstanceHistoryProvider,
+{
+    use helios_persistence::core::HistoryParams;
+
+    backend
+        .seed_create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "tombstone"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed");
+    backend
+        .seed_delete(tenant, "Patient", "tombstone")
+        .await
+        .expect("soft delete");
+
+    let history = |id: &'static str| async move {
+        backend
+            .history_instance(
+                tenant,
+                "Patient",
+                id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .map(|page| {
+                page.items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.resource.version_id().to_string(),
+                            item.resource.last_modified(),
+                            item.resource.is_deleted(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let before = history("tombstone").await;
+    assert_eq!(before.len(), 2, "create + delete: {before:?}");
+
+    let delete = |url: &str| BundleEntry {
+        method: BundleMethod::Delete,
+        url: url.to_string(),
+        ..Default::default()
+    };
+    let result = backend
+        .process_transaction(
+            tenant,
+            vec![
+                delete("Patient/never-stored"),
+                delete("Patient/tombstone"),
+                put(
+                    "committed",
+                    json!({"resourceType": "Patient", "id": "committed"}),
+                    None,
+                ),
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("nothing to delete does not fail the transaction");
+    for entry in &result.entries[..2] {
+        assert_eq!(entry.status, 204, "{entry:?}");
+        assert_eq!(entry.effect, BundleEntryEffect::NotFound, "{entry:?}");
+        assert_eq!(entry.effect.live_count_delta(), 0);
+    }
+    assert_eq!(result.entries[2].status, 201, "{:?}", result.entries[2]);
+
+    assert!(
+        backend
+            .read(tenant, "Patient", "committed")
+            .await
+            .expect("read")
+            .is_some(),
+        "the rest of the transaction committed"
+    );
+    assert_eq!(history("tombstone").await, before);
+    assert!(history("never-stored").await.is_empty());
 }
 
 /// A forward-referenced `ifNoneExist` create pins the id it would create

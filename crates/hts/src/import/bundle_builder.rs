@@ -146,6 +146,8 @@ fn parsed_property(code: &str, value_key: &str, value: &str) -> ParsedProperty {
         "valueInteger" => "integer",
         "valueDecimal" => "decimal",
         "valueDateTime" => "dateTime",
+        // Stored as the target code; the system is the CodeSystem's own.
+        "valueCoding" => "coding",
         _ => "string",
     };
     let is_parent_edge = code == "parent" && value_type == "code";
@@ -158,8 +160,28 @@ fn parsed_property(code: &str, value_key: &str, value: &str) -> ParsedProperty {
     }
 }
 
+/// [`build_parsed_code_system`] marked as one batch of a native bulk load
+/// ([`ParsedBundle::chunked`]): the write layer skips the per-batch closure
+/// rebuild (the CLI, the admin import job's `closure` step, the bootstrap and
+/// the next server start build it once — rebuilding the whole closure after
+/// every batch is quadratic) and the same-`url|version` replacement policy,
+/// which would otherwise see each batch of a re-import as a truncated copy
+/// (see [`super::bundle_parser::truncated_copy_warning`]). Every native
+/// importer sends its seed and concept batches through this.
+pub(crate) fn build_native_batch(
+    meta: &CodeSystemMeta<'_>,
+    concepts: &[BuilderConcept<'_>],
+) -> ParsedBundle {
+    let mut parsed = build_parsed_code_system(meta, concepts);
+    parsed.chunked = true;
+    parsed
+}
+
 /// Build a single-entry FHIR Bundle containing a CodeSystem resource with the
 /// given metadata and concept batch.  Returns the serialised JSON bytes.
+/// (The importers write through [`build_native_batch`]; this JSON form is what
+/// the parsed form is tested against.)
+#[cfg(test)]
 pub(crate) fn build_code_system_bundle(
     meta: &CodeSystemMeta<'_>,
     concepts: &[BuilderConcept<'_>],
@@ -224,6 +246,13 @@ fn encode_concept(c: &BuilderConcept<'_>) -> Value {
         }));
     }
     for p in c.extra_properties {
+        if p.value_key == "valueCoding" {
+            properties.push(json!({
+                "code": p.code,
+                "valueCoding": {"code": p.value},
+            }));
+            continue;
+        }
         properties.push(json!({
             "code": p.code,
             p.value_key: p.value,

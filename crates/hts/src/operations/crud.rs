@@ -40,6 +40,7 @@ mod inner {
         import_code_system as hts_import_cs, import_concept_map as hts_import_cm,
         import_value_set as hts_import_vs,
         invalidate_expansion_cache_for_system as hts_invalidate_expansion_cache,
+        rebuild_closure_for_code_system as hts_rebuild_cs_closure,
     };
 
     use super::super::format::{ResponseFormat, fhir_respond, negotiate_format};
@@ -120,6 +121,20 @@ mod inner {
                 "Unsupported resource type for CRUD: {resource_type}"
             )));
         }
+        // Same validation and errors as the SQLite path's `import_*`: a
+        // resource the parser rejects (no `url`) is a 400, and a write
+        // failure is not swallowed into a 201.
+        use crate::import::bundle_parser;
+        let parsable = match resource_type {
+            "CodeSystem" => bundle_parser::parse_code_system_value(&content).is_some(),
+            "ValueSet" => bundle_parser::parse_value_set_value(&content).is_some(),
+            _ => bundle_parser::parse_concept_map_value(&content).is_some(),
+        };
+        if !parsable {
+            return Err(HtsError::InvalidRequest(format!(
+                "{resource_type}.url is required"
+            )));
+        }
         let bundle = serde_json::json!({
             "resourceType": "Bundle",
             "type": "collection",
@@ -127,10 +142,16 @@ mod inner {
         });
         let bytes =
             serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail");
-        importer
+        let stats = importer
             .import_bundle(ctx, &bytes)
             .await
             .map_err(|e| HtsError::StorageError(format!("HTS re-index failed: {e}")))?;
+        if !stats.errors.is_empty() {
+            return Err(HtsError::StorageError(format!(
+                "HTS re-index failed: {}",
+                stats.errors.join("; ")
+            )));
+        }
         Ok(())
     }
 
@@ -154,10 +175,6 @@ mod inner {
     /// normalized rows before re-importing, so a failure part-way through leaves
     /// storage genuinely changed, and caches must be dropped anyway. The
     /// invariant is that a cache may be colder than storage, never hotter.
-    // `replace_id` is consumed only by the SQLite delete-then-reimport branch;
-    // a postgres-only build would otherwise trip `unused_variables` under the
-    // workspace's deny-warnings clippy job.
-    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
     async fn hts_reindex<B: TerminologyBackend>(
         state: &AppState<B>,
         resource_type: &'static str,
@@ -193,7 +210,11 @@ mod inner {
 
                 let mut stats = ImportStats::default();
                 match resource_type {
-                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
+                    // A CodeSystem written through REST must be immediately
+                    // usable by `$subsumes` and is-a filters, both of which read
+                    // `concept_closure`; `write_code_system` only clears it.
+                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats)
+                        .map(|_| hts_rebuild_cs_closure(&conn, &content)),
                     "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
                     "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
                     _ => Err(HtsError::InvalidRequest(format!(
@@ -206,9 +227,16 @@ mod inner {
             return joined;
         }
 
-        // PostgreSQL: `import_bundle` upserts by URL, so no explicit delete is
-        // needed for the update path.
+        // PostgreSQL: same contract as the SQLite branch — the update path
+        // drops the replaced resource's rows first (so concepts the new
+        // content no longer has go away), then the importer re-indexes it and
+        // rebuilds the closure of the now-empty CodeSystem.
         if let Some(importer) = state.terminology_importer.clone() {
+            if let Some(ref resource_id) = replace_id {
+                importer
+                    .delete_normalized_by_id(resource_type, resource_id)
+                    .await?;
+            }
             return hts_reindex_via_importer(&*importer, resource_type, content, ctx).await;
         }
 
@@ -228,7 +256,7 @@ mod inner {
     /// recorded for its URL by any earlier `$expand` / `$lookup` that 404'd, or
     /// the server keeps denying that a resource it just returned `201` for
     /// exists (issue #304).
-    async fn create_resource<B: TerminologyBackend>(
+    pub(crate) async fn create_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         body: Value,
@@ -276,7 +304,7 @@ mod inner {
     ///
     /// Returns **200 OK** with `ETag` header, or **404 Not Found** if the
     /// resource does not exist or has been deleted.
-    async fn read_resource<B: TerminologyBackend>(
+    pub(crate) async fn read_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
@@ -296,7 +324,14 @@ mod inner {
                 }
                 Ok(response)
             }
-            Ok(Some(_)) | Ok(None) => Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+            // Soft-deleted in the store: gone for good.
+            Ok(Some(_)) => Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+            // Never written through REST — but `POST /import`, the CLI
+            // importer and bootstrap write only the normalized tables, and
+            // those resources must still be readable by id.
+            Ok(None) => read_normalized_resource(&state, resource_type, &id)
+                .map(|content| fhir_respond(content, format))
+                .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}"))),
             // The persistence layer returns Gone for soft-deleted resources;
             // from the caller's perspective that is still a 404.
             Err(e) if is_gone_or_not_found(&e) => {
@@ -321,7 +356,7 @@ mod inner {
     /// then shadowed by pre-update bytes held in the handler-level `$expand` /
     /// `$lookup` / `$validate-code` caches and the backend's own response memos
     /// (issue #304).
-    async fn update_resource<B: TerminologyBackend>(
+    pub(crate) async fn update_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
@@ -335,12 +370,16 @@ mod inner {
 
         let ctx = ctx();
 
-        // 1. Read current version.
+        // 1. Read current version. A PUT to an id the store does not hold is
+        //    an update-as-create (FHIR R4 §3.1.0.4.2): the resource is created
+        //    with the client-assigned id and the response is 201. This also
+        //    covers resources that so far exist only in the normalized tables
+        //    (`POST /import`): the re-index below replaces those rows.
         let current = match store.read(&ctx, resource_type, &id).await {
             Ok(Some(r)) if !r.is_deleted() => r,
-            Ok(_) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+            Ok(_) => return update_as_create(resource_type, state, id, body, format).await,
             Err(e) if is_gone_or_not_found(&e) => {
-                return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
+                return update_as_create(resource_type, state, id, body, format).await;
             }
             Err(e) => return Err(HtsError::StorageError(e.to_string())),
         };
@@ -385,6 +424,78 @@ mod inner {
         Ok(response)
     }
 
+    /// PUT to an id the store does not hold: create the resource with that id
+    /// (**201 Created**), replacing any normalized rows that an import left
+    /// under the same id.
+    async fn update_as_create<B: TerminologyBackend>(
+        resource_type: &'static str,
+        state: AppState<B>,
+        id: String,
+        mut body: Value,
+        format: ResponseFormat,
+    ) -> Result<Response, HtsError> {
+        let store = state
+            .active_resource_store()
+            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
+        let ctx = ctx();
+
+        if let Some(body_id) = body.get("id").and_then(|v| v.as_str())
+            && body_id != id
+        {
+            return Err(HtsError::InvalidRequest(format!(
+                "Resource id '{body_id}' does not match the URL id '{id}'"
+            )));
+        }
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("id".into(), Value::String(id.clone()));
+        }
+
+        let (stored, _created) = store
+            .create_or_update(
+                &ctx,
+                resource_type,
+                &id,
+                body,
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        let reindexed = hts_reindex(
+            &state,
+            resource_type,
+            stored.content().clone(),
+            &ctx,
+            Some(id.clone()),
+        )
+        .await;
+        evict_caches_after_write(&state);
+        reindexed?;
+
+        let etag = stored.etag().to_string();
+        let location = format!("/{resource_type}/{id}");
+        let mut response = fhir_respond(stored.content().clone(), format);
+        *response.status_mut() = StatusCode::CREATED;
+        let headers = response.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&location) {
+            headers.insert(header::LOCATION, v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&etag) {
+            headers.insert(header::ETAG, v);
+        }
+        Ok(response)
+    }
+
+    /// Stored JSON for a resource that lives only in the normalized tables
+    /// (imported, bootstrapped or CLI-loaded rather than written via REST).
+    fn read_normalized_resource<B: TerminologyBackend>(
+        state: &AppState<B>,
+        resource_type: &str,
+        id: &str,
+    ) -> Option<Value> {
+        state.backend().resource_json_by_id(resource_type, id)
+    }
+
     /// DELETE /<ResourceType>/:id — soft-delete a resource.
     ///
     /// 1. Reads the current resource to extract its canonical URL (needed for
@@ -394,7 +505,7 @@ mod inner {
     ///    - SQLite path: via `hts_pool` spawn-blocking helpers.
     ///    - PostgreSQL path: via `terminology_importer.delete_normalized()`.
     /// 4. Returns **204 No Content**.
-    async fn delete_resource<B: TerminologyBackend>(
+    pub(crate) async fn delete_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
@@ -408,21 +519,33 @@ mod inner {
         let terminology_importer = state.terminology_importer.clone();
         let ctx = ctx();
 
-        // 1. Read the resource URL before deleting (needed by both HTS cleanup paths).
-        let resource_url: Option<String> = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => r
-                .content()
-                .get("url")
-                .and_then(|u| u.as_str())
-                .map(str::to_owned),
-            _ => None,
+        // 1. Locate the resource: in the persistence store (written via REST)
+        //    or only in the normalized tables (imported). Neither → 404.
+        let stored: Option<Value> = match store.read(&ctx, resource_type, &id).await {
+            Ok(Some(r)) if !r.is_deleted() => Some(r.content().clone()),
+            Ok(_) => None,
+            Err(e) if is_gone_or_not_found(&e) => None,
+            Err(e) => return Err(HtsError::StorageError(e.to_string())),
         };
+        let normalized: Option<Value> = if stored.is_none() {
+            read_normalized_resource(&state, resource_type, &id)
+        } else {
+            None
+        };
+        if stored.is_none() && normalized.is_none() {
+            return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
+        }
 
-        // 2. Soft-delete in persistence store.
-        store
-            .delete(&ctx, resource_type, &id)
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        // 2. Soft-delete in the persistence store (when it holds the resource).
+        if stored.is_some() {
+            match store.delete(&ctx, resource_type, &id).await {
+                Ok(_) => {}
+                Err(e) if is_gone_or_not_found(&e) => {
+                    return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
+                }
+                Err(e) => return Err(HtsError::StorageError(e.to_string())),
+            }
+        }
 
         // 3. Delete from HTS normalized tables.
         #[allow(unused_mut, unused_assignments)]
@@ -449,17 +572,13 @@ mod inner {
             })
             .await
             .map_err(|e| HtsError::Internal(e.to_string()))?;
-        } else if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        } else if let Some(importer) = terminology_importer.as_deref() {
+            removed = importer.delete_normalized_by_id(resource_type, &id).await;
         }
 
         #[cfg(not(feature = "sqlite"))]
-        if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        if let Some(importer) = terminology_importer.as_deref() {
+            removed = importer.delete_normalized_by_id(resource_type, &id).await;
         }
 
         // Evict both cache tiers so a deleted ValueSet (and any CodeSystem whose

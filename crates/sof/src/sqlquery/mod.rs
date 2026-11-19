@@ -13,16 +13,20 @@ pub mod engine;
 pub mod library;
 pub mod output;
 pub mod params;
+pub mod projection;
 pub mod scan;
+pub mod terminology;
 
 pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
 pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
 pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library};
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
+pub use projection::{project_view_definition, referenced_identifiers};
 pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
+pub use terminology::{TerminologyFlattenError, TerminologyKind, TerminologyRelation};
 
 use std::fmt;
 
@@ -36,6 +40,10 @@ pub enum DependencyKind {
     ViewDefinition,
     /// An interior SQL View Library, materialized by running its SQL.
     SqlView,
+    /// A ValueSet, materialized from its expansion.
+    ValueSet,
+    /// A ConceptMap, materialized from its mappings.
+    ConceptMap,
 }
 
 impl fmt::Display for DependencyKind {
@@ -43,6 +51,8 @@ impl fmt::Display for DependencyKind {
         match self {
             Self::ViewDefinition => f.write_str("ViewDefinition"),
             Self::SqlView => f.write_str("SQL View"),
+            Self::ValueSet => f.write_str("ValueSet"),
+            Self::ConceptMap => f.write_str("ConceptMap"),
         }
     }
 }
@@ -119,6 +129,14 @@ pub enum SqlQueryError {
     /// folded into [`SqlQueryError::MalformedLibrary`].
     #[error("dependency source failed: {0}")]
     SourceStream(String),
+
+    /// The store feeding a `depends-on` dependency was unavailable: it could
+    /// not be reached, was throttling, or could not read an object after
+    /// retries (#2048). Like [`SqlQueryError::SourceStream`] it is never the
+    /// client's fault, but it is transient, so the REST layer answers it with
+    /// `503` and a `Retry-After` hint rather than `500`.
+    #[error("dependency source unavailable: {0}")]
+    SourceUnavailable(String),
 
     /// A failure in the server's own execution machinery rather than in the
     /// client's request — e.g. the blocking worker that materializes a

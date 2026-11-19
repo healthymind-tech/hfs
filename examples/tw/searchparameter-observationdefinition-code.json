@@ -1,0 +1,16 @@
+{
+  "resourceType": "SearchParameter",
+  "id": "tw-observationdefinition-code",
+  "url": "https://terminology.healthymind.tw/SearchParameter/ObservationDefinition-code",
+  "version": "1.0.0",
+  "name": "ObservationDefinitionCode",
+  "status": "active",
+  "experimental": false,
+  "publisher": "healthymind-tech (HFS fork)",
+  "description": "Token search on ObservationDefinition.code. FHIR R4 defines no standard search parameter for ObservationDefinition (R5 adds `code`); this fills the gap so `/ObservationDefinition?code=http://loinc.org|2345-7` works.",
+  "code": "code",
+  "base": ["ObservationDefinition"],
+  "type": "token",
+  "expression": "ObservationDefinition.code",
+  "xpathUsage": "normal"
+}

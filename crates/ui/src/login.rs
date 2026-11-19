@@ -467,11 +467,13 @@ mod selfcall_tests {
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
+            terminology_public_url: None,
             settings: None,
             bulk_provider: None,
             write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             login: sessions.map(|sessions| Arc::new(LoginRuntime { sessions })),
+            admin_gate: helios_admin_auth::AdminGate::Open,
         }
     }
 

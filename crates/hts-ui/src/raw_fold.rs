@@ -128,6 +128,33 @@ pub struct RawFold {
 }
 
 impl RawFold {
+    /// The request URL without its origin — `/CodeSystem/$lookup?…` rather
+    /// than `http://127.0.0.1:8090/CodeSystem/$lookup?…`. The origin is where
+    /// *this process* reaches HTS (loopback, or an internal service name
+    /// behind a reverse proxy) and means nothing to the operator reading the
+    /// page; the path is what they can reproduce against the public
+    /// terminology endpoint. A value that is not an absolute URL passes
+    /// through untouched.
+    pub fn request_path(&self) -> &str {
+        public_path(&self.request_url)
+    }
+}
+
+/// `url` with its scheme and authority removed, when it has them.
+pub(crate) fn public_path(url: &str) -> &str {
+    match url.find("://") {
+        Some(scheme_end) => {
+            let rest = &url[scheme_end + 3..];
+            match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                None => "/",
+            }
+        }
+        None => url,
+    }
+}
+
+impl RawFold {
     /// The fold for a call that reached the upstream and came back.
     pub fn new(request_url: &str, request_body: &str, response_body: &str) -> Self {
         Self {
@@ -275,5 +302,21 @@ mod tests {
     fn a_form_rejected_before_sending_has_no_fold() {
         assert!(RawFold::default().is_empty());
         assert!(!RawFold::new("http://hts/CodeSystem/$lookup", "", "").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod public_path_tests {
+    use super::public_path;
+
+    #[test]
+    fn strips_the_origin_and_keeps_the_rest() {
+        assert_eq!(
+            public_path("http://127.0.0.1:8090/CodeSystem/$lookup?code=E11.9"),
+            "/CodeSystem/$lookup?code=E11.9"
+        );
+        assert_eq!(public_path("http://hts:8090"), "/");
+        assert_eq!(public_path("/already/a/path"), "/already/a/path");
+        assert_eq!(public_path(""), "");
     }
 }

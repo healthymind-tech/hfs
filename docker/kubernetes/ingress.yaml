@@ -1,0 +1,33 @@
+# Path layout matches docker/production/nginx.conf: /fhir -> hfs, /tx -> hts,
+# /ui/hts -> hts, everything else -> hfs. /metrics is not routed.
+# ingress-nginx annotations; adapt for other controllers. HTS paging links need
+# the /tx prefix re-inserted (see nginx.conf sub_filter) -- with ingress-nginx
+# use a configuration-snippet or keep the nginx container from
+# docker/production in front of HTS.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hfs
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 256m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location ~ ^/(fhir/|tx/)?metrics$ { return 404; }
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [fhir.hospital.example]
+      secretName: fhir-hospital-tls
+  rules:
+    - host: fhir.hospital.example
+      http:
+        paths:
+          - path: /fhir(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: {service: {name: hfs, port: {name: http}}}
+          - path: /tx(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: {service: {name: hts, port: {name: http}}}

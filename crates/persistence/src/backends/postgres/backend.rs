@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime, SslMode};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,99 @@ use crate::search::{
 /// definitions, keyed by tenant id. Postgres queries are async but the per-tenant
 /// registry loader must be sync, so async paths (startup, TTL refresh, and
 /// SearchParameter writes) populate this map and the loader reads it.
-type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
+type StoredByTenant = Arc<RwLock<HashMap<String, StoredOverlay>>>;
+
+/// One tenant's cached stored-SearchParameter overlay.
+struct StoredOverlay {
+    /// The persisted rows this overlay was read from, when a write validated
+    /// it (see [`PostgresBackend::write_extractor`]). `None` after the
+    /// all-tenant refresh, which does not fingerprint: the next write for the
+    /// tenant re-reads and fingerprints once.
+    fingerprint: Option<OverlayFingerprint>,
+    /// The tenant's stored active definitions, read by the registry loader.
+    definitions: Vec<SearchParameterDefinition>,
+    /// The registry a validated write extracts with: the shared base when the
+    /// overlay is empty, otherwise the base with the overlay registered on
+    /// top. Built once per fingerprint, never per write.
+    registry: Option<Arc<RwLock<SearchParameterRegistry>>>,
+    /// When the fingerprint probe last confirmed this overlay against the
+    /// database. A write within the backend's fingerprint TTL of this instant
+    /// reuses the overlay without probing. Replaced (so `None`) by every
+    /// local SearchParameter write, whose cache reload drops the entry.
+    validated_at: Option<std::time::Instant>,
+}
+
+/// Default window in which a write trusts a validated overlay without probing
+/// the database again: zero, i.e. every write probes (the exact, previous
+/// behavior). Opt in with `HFS_PG_SP_FINGERPRINT_TTL_MS=<ms>` (for example
+/// `1000`): a SearchParameter committed by this process still invalidates the
+/// cache immediately; only one committed by another HFS process can then take
+/// up to that long to be seen by ordinary writes.
+const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::ZERO;
+
+fn overlay_fingerprint_ttl_from_env() -> Duration {
+    std::env::var("HFS_PG_SP_FINGERPRINT_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OVERLAY_FINGERPRINT_TTL)
+}
+
+/// How fresh the overlay a write extracts with must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayFreshness {
+    /// An overlay validated within the fingerprint TTL is reused without a
+    /// probe. For ordinary single-resource and Bundle writes, where a
+    /// SearchParameter committed by another process may take up to the TTL to
+    /// be seen.
+    WithinTtl,
+    /// Always probe the database fingerprint, whatever the TTL. For callers
+    /// whose batch takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before that point (bulk submit).
+    Authoritative,
+}
+
+impl OverlayFreshness {
+    /// Whether a recently validated cached overlay may stand in for a probe.
+    fn may_skip_probe(self, ttl: Duration, pending_search_parameter: bool) -> bool {
+        self == Self::WithinTtl && !pending_search_parameter && !ttl.is_zero()
+    }
+}
+
+/// The tenant's validated overlay registry, if it was confirmed against the
+/// database within `ttl`. `None` means the caller must probe.
+fn fresh_overlay_registry(
+    stored: &StoredByTenant,
+    tenant_id: &str,
+    ttl: Duration,
+) -> Option<Arc<RwLock<SearchParameterRegistry>>> {
+    let stored = stored.read();
+    let overlay = stored.get(tenant_id)?;
+    overlay
+        .validated_at
+        .is_some_and(|t| t.elapsed() < ttl)
+        .then(|| overlay.registry.clone())
+        .flatten()
+}
+
+/// A cheap summary of a tenant's live `SearchParameter` rows (#1897).
+///
+/// Every mutation of a live row moves it: a create or update bumps the newest
+/// `last_updated`, a delete lowers the live count (or, for the newest row,
+/// the maximum). Only a delete paired with a create whose timestamp does not
+/// exceed the previous maximum — clock skew between HFS processes within one
+/// write — leaves both unchanged, and the TTL refresh bounds that case as it
+/// does every other backend's cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayFingerprint {
+    live: i64,
+    newest: Option<DateTime<Utc>>,
+}
+
+/// `pg_stats.null_frac` per range-typed `search_index` column, with the time
+/// it was read.
+pub(super) type ValueNullFractions =
+    Arc<RwLock<Option<(std::time::Instant, HashMap<String, f64>)>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
 ///
@@ -35,11 +128,17 @@ type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: Pool,
+    /// This pool's share of the server's connection budget, handed back to the
+    /// other pools when the last clone is dropped. `None` when the server's
+    /// `max_connections` could not be read.
+    _pool_registration: Option<Arc<super::pool_budget::PoolRegistration>>,
     config: PostgresConfig,
     /// Per-tenant search parameter registries (shared base + per-tenant overlay).
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// How long a validated overlay is trusted without a fingerprint probe.
+    overlay_fingerprint_ttl: Duration,
     /// `search_index` layout, read from the marker once the schema is initialized.
     /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
     /// is correct against either layout.
@@ -58,12 +157,22 @@ pub struct PostgresBackend {
     pub(super) reindex_admission: Arc<Semaphore>,
     pub(super) reindex_width: usize,
     pub(super) cleanup_tracker: Arc<super::cleanup::CleanupTracker>,
+    /// `pg_stats.null_frac` of the range-typed `search_index` value columns,
+    /// with the time it was read; see `search_impl::range_estimate_correction`.
+    pub(super) value_null_fractions: ValueNullFractions,
+    /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
+    /// shared by clones; see `bulk_index_rebuild.rs`.
+    pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
     #[cfg(test)]
     pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
     #[cfg(test)]
     pub(super) reindex_test_pause: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(super) reindex_test_entered: Option<Arc<tokio::sync::Notify>>,
+    /// Memoized subscription event fan-out: one LISTEN connection per
+    /// backend, spawned lazily by the first `subscription_fanout()` call
+    /// (which must happen inside a Tokio runtime) and stopped on drop.
+    subscription_fanout: std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>>,
 }
 
 impl Debug for PostgresBackend {
@@ -76,7 +185,9 @@ impl Debug for PostgresBackend {
 }
 
 /// Configuration for the PostgreSQL backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password never reaches a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
     /// PostgreSQL host.
     #[serde(default = "default_host")]
@@ -105,6 +216,17 @@ pub struct PostgresConfig {
     /// Maximum number of connections in the pool.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// Treat `max_connections` as a default to fit the server, not a fixed size.
+    ///
+    /// When set, [`PostgresBackend::new`] limits the pool at startup to its share of
+    /// half of the server's `max_connections`, shared with the other pools this
+    /// process opens against the same host and port (#2216). The URL and
+    /// environment constructors set it when `HFS_PG_MAX_CONNECTIONS` gives no
+    /// size; a config built by hand keeps `max_connections` as given unless the
+    /// caller sets it.
+    #[serde(default)]
+    pub limit_pool_to_server: bool,
 
     /// Upper bound, in seconds, for establishing a connection to the server.
     ///
@@ -308,6 +430,14 @@ fn default_user() -> String {
 /// The old fixed default of 10 throttled search badly — at 30 concurrent clients
 /// with multi-second queries, two-thirds of every request's latency was spent
 /// waiting for a connection (issue #224).
+///
+/// Doubling it did not help on a database with cores of its own: 300 concurrent
+/// CRUD clients against 8 dedicated PostgreSQL cores ran at a median ~4,400 req/s
+/// with 64 connections against ~5,030 with 32, using more database CPU per
+/// request (#2216). A database sharing the cores with `hfs` and bound on the WAL
+/// flush gained from 64; set `HFS_PG_MAX_CONNECTIONS` there. Started from the
+/// URL or the environment, the default is also limited by what the server
+/// accepts, see [`PostgresConfig::limit_pool_to_server`].
 fn default_max_connections() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -372,6 +502,52 @@ fn default_pool_wait_timeout_secs() -> u64 {
     10
 }
 
+impl Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            host,
+            port,
+            dbname,
+            user,
+            password,
+            ssl_mode,
+            max_connections,
+            limit_pool_to_server,
+            connect_timeout_secs,
+            statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
+            plan_cache_mode,
+            pool_wait_timeout_secs,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+        } = self;
+        f.debug_struct("PostgresConfig")
+            .field("host", host)
+            .field("port", port)
+            .field("dbname", dbname)
+            .field("user", user)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("ssl_mode", ssl_mode)
+            .field("max_connections", max_connections)
+            .field("limit_pool_to_server", limit_pool_to_server)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field(
+                "count_by_tenant_statement_timeout_ms",
+                count_by_tenant_statement_timeout_ms,
+            )
+            .field("plan_cache_mode", plan_cache_mode)
+            .field("pool_wait_timeout_secs", pool_wait_timeout_secs)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .finish()
+    }
+}
+
 impl Default for PostgresConfig {
     fn default() -> Self {
         Self {
@@ -382,6 +558,7 @@ impl Default for PostgresConfig {
             password: None,
             ssl_mode: PostgresSslMode::default(),
             max_connections: default_max_connections(),
+            limit_pool_to_server: false,
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
             count_by_tenant_statement_timeout_ms: default_count_by_tenant_statement_timeout_ms(),
@@ -403,11 +580,17 @@ impl PostgresConfig {
     /// only overwrote host/port/user/password/dbname — so the pool size was pinned
     /// at its default and *no* environment variable could change it (issue #224).
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = std::env::var("HFS_PG_MAX_CONNECTIONS")
+        // A size that does not parse is ignored like the other knobs, and leaves
+        // the default, so it is limited to the server like an unset variable.
+        match std::env::var("HFS_PG_MAX_CONNECTIONS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.max_connections = v;
+            Some(v) => {
+                self.max_connections = v;
+                self.limit_pool_to_server = false;
+            }
+            None => self.limit_pool_to_server = true,
         }
         if let Some(v) = std::env::var("HFS_PG_STATEMENT_TIMEOUT_MS")
             .ok()
@@ -523,7 +706,7 @@ impl PostgresBackend {
     }
 
     /// Creates a new PostgreSQL backend with the given configuration.
-    pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
+    pub async fn new(mut config: PostgresConfig) -> StorageResult<Self> {
         check_count_by_tenant_statement_timeout_ms(config.count_by_tenant_statement_timeout_ms)
             .map_err(|message| {
                 crate::error::StorageError::Backend(BackendError::Internal {
@@ -548,7 +731,31 @@ impl PostgresBackend {
                 message: e.to_string(),
             })
         })?;
+
+        // Keep default-sized pools within what the server accepts, together with
+        // the other pools of this process on the same server (see `pool_budget`).
+        // An explicit size is used as given, with a warning when the pools add up
+        // to more than the server's limit. A failed probe leaves the pool alone.
+        let server_max = client
+            .query_one("SELECT current_setting('max_connections')::int4", &[])
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<_, i32>(0).ok())
+            .and_then(|n| usize::try_from(n).ok());
         drop(client);
+        let pool_registration = server_max.map(|server_max| {
+            Arc::new(super::pool_budget::register(
+                &config.host,
+                config.port,
+                server_max,
+                config.max_connections,
+                config.limit_pool_to_server,
+                &pool,
+            ))
+        });
+        if pool_registration.is_some() && config.limit_pool_to_server {
+            config.max_connections = pool.status().max_size;
+        }
 
         // Initialize the per-tenant search parameter registries. Base params
         // (embedded + spec + custom) go into the shared base; each tenant's
@@ -565,7 +772,7 @@ impl PostgresBackend {
                     loader_cache
                         .read()
                         .get(tenant_id)
-                        .cloned()
+                        .map(|overlay| overlay.definitions.clone())
                         .unwrap_or_default(),
                 )
             },
@@ -574,15 +781,20 @@ impl PostgresBackend {
 
         Ok(Self {
             pool,
+            _pool_registration: pool_registration,
             config,
             registries,
             stored_by_tenant,
+            overlay_fingerprint_ttl: overlay_fingerprint_ttl_from_env(),
             index_layout: Arc::new(std::sync::OnceLock::new()),
             patient_export_index_ready: Arc::new(AtomicBool::new(false)),
             fts_table_exists: Arc::new(std::sync::OnceLock::new()),
             reindex_admission: Arc::new(Semaphore::new(1)),
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
+            subscription_fanout: std::sync::OnceLock::new(),
+            value_null_fractions: Arc::new(RwLock::new(None)),
+            bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -590,6 +802,15 @@ impl PostgresBackend {
             #[cfg(test)]
             reindex_test_entered: None,
         })
+    }
+
+    /// Sets how long a write trusts a validated SearchParameter overlay
+    /// without probing the database (see `HFS_PG_SP_FINGERPRINT_TTL_MS`).
+    /// `Duration::ZERO` probes on every write.
+    #[doc(hidden)]
+    pub fn with_overlay_fingerprint_ttl(mut self, ttl: Duration) -> Self {
+        self.overlay_fingerprint_ttl = ttl;
+        self
     }
 
     /// Selects the maximum number of concurrent reindex writers on this instance.
@@ -606,6 +827,12 @@ impl PostgresBackend {
         self.reindex_admission = Arc::new(Semaphore::new(width));
         self.reindex_width = width;
         self
+    }
+
+    /// The reindex width [`Self::with_reindex_concurrency`] selected: how
+    /// many reindex write groups this instance admits at once.
+    pub fn reindex_width(&self) -> usize {
+        self.reindex_width
     }
 
     /// Waits until exceptional rollback tasks have settled or discarded their
@@ -643,7 +870,8 @@ impl PostgresBackend {
     /// - `HFS_PG_DBNAME` (default: "helios")
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
-    /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64)
+    /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64 and, at
+    ///   startup, to this pool's share of half of the server's `max_connections`)
     /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
@@ -908,6 +1136,15 @@ impl PostgresBackend {
     async fn init_schema_with_patient_export_index(&self, build_index: bool) -> StorageResult<()> {
         self.patient_export_index_ready
             .store(false, Ordering::Release);
+        // A bulk index rebuild that died inside its window left value
+        // indexes dropped and recorded; rebuild them before the migrations
+        // look at `search_index` (a no-op unless such a record exists and no
+        // other process's run is inside its window).
+        if let Err(error) = self.heal_deferred_search_indexes().await {
+            tracing::warn!(
+                "could not rebuild search_index indexes left by an interrupted bulk index rebuild: {error}"
+            );
+        }
         let mut client = self.get_client().await?;
         let index_ready =
             super::schema::initialize_schema_with_patient_export_index(&mut client, build_index)
@@ -934,6 +1171,20 @@ impl PostgresBackend {
             .get()
             .copied()
             .unwrap_or(super::schema::IndexLayout::Legacy)
+    }
+
+    /// Declares that `search_index` rows of `(tenant, resource_type, param)`
+    /// carry a NULL `last_updated`, exactly as a writer in this process does
+    /// through `note_null_rows` before it commits such rows.
+    ///
+    /// HFS only ever writes NULL `last_updated` for contained-resource
+    /// memberships (`is_contained`), which the eligibility cache learns from the
+    /// database. A test that fabricates NULLs by raw `UPDATE` on ordinary rows
+    /// plays an out-of-band writer the cache cannot see, so it declares them
+    /// here. `#[doc(hidden)] pub` only for the integration tests.
+    #[doc(hidden)]
+    pub fn declare_null_last_updated_rows(&self, tenant: &str, resource_type: &str, param: &str) {
+        super::null_timestamp_facts::note_null_rows(tenant, resource_type, param);
     }
 
     /// The statement [`Self::reload_stored_cache`] runs to read every tenant's
@@ -1022,7 +1273,7 @@ impl PostgresBackend {
             .map_err(|e| internal("Failed to finish SearchParameter refresh", e))?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut by_tenant: HashMap<String, Vec<SearchParameterDefinition>> = HashMap::new();
+        let mut by_tenant: HashMap<String, StoredOverlay> = HashMap::new();
         let mut count = 0;
         for row in rows {
             let tenant_id: String = row.get(0);
@@ -1031,7 +1282,16 @@ impl PostgresBackend {
                 && def.status == SearchParameterStatus::Active
             {
                 def.source = SearchParameterSource::Stored;
-                by_tenant.entry(tenant_id).or_default().push(def);
+                by_tenant
+                    .entry(tenant_id)
+                    .or_insert_with(|| StoredOverlay {
+                        fingerprint: None,
+                        definitions: Vec::new(),
+                        registry: None,
+                        validated_at: None,
+                    })
+                    .definitions
+                    .push(def);
                 count += 1;
             }
         }
@@ -1040,18 +1300,55 @@ impl PostgresBackend {
         Ok(count)
     }
 
-    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    /// The statement a write runs to validate its cached overlay (#1897):
+    /// the tenant's live `SearchParameter` count and newest `last_updated`.
+    /// Both come from `idx_resources_search (tenant_id, resource_type,
+    /// last_updated DESC, id) WHERE is_deleted = FALSE`, so this is an
+    /// index-only scan of the tenant's ~1,400 seeded entries, not a read and
+    /// decode of their ~1.5 MB of JSONB.
     ///
-    /// The process-local overlay cache can lag writes from another HFS process.
-    /// Reindex groups and guarded mutations therefore read the persisted overlay
-    /// after taking the tenant gate. The caller keeps this extractor for one
-    /// immutable extraction phase; this method never writes the cache or checks
-    /// out another connection.
-    pub(crate) async fn authoritative_extractor<C>(
+    /// `#[doc(hidden)] pub` only so the integration tests can `EXPLAIN` the
+    /// exact statement and pin that plan.
+    #[doc(hidden)]
+    pub const OVERLAY_FINGERPRINT_SQL: &'static str = "SELECT COUNT(*)::bigint, MAX(last_updated) \
+         FROM resources \
+         WHERE tenant_id = $1 AND resource_type = 'SearchParameter' \
+           AND is_deleted = FALSE";
+
+    async fn overlay_fingerprint<C>(
         &self,
         client: &C,
         tenant_id: &str,
-    ) -> StorageResult<SearchParameterExtractor>
+    ) -> StorageResult<OverlayFingerprint>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let row = client
+            .query_one(Self::OVERLAY_FINGERPRINT_SQL, &[&tenant_id])
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to fingerprint tenant SearchParameters: {e}"),
+                    source: None,
+                })
+            })?;
+        Ok(OverlayFingerprint {
+            live: row.get(0),
+            newest: row.get(1),
+        })
+    }
+
+    /// Reads the tenant's stored overlay on the caller's connection: every
+    /// live `SearchParameter` row that is active and whose canonical URL is
+    /// not already in the shared base. Seeded core definitions cannot
+    /// override their canonical URL in the base, so they are skipped before
+    /// parsing.
+    async fn read_stored_overlay<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<Vec<SearchParameterDefinition>>
     where
         C: GenericClient + Sync + ?Sized,
     {
@@ -1072,14 +1369,11 @@ impl PostgresBackend {
                 })
             })?;
 
-        let base = self.registries.base().clone();
         let overlays: Vec<serde_json::Value> = {
-            let registry = base.read();
+            let registry = self.registries.base().read();
             rows.into_iter()
                 .filter_map(|row| {
                     let data: serde_json::Value = row.get(0);
-                    // Seeded core definitions cannot override their canonical
-                    // URL in the base. Skip parsing them on every write.
                     let duplicate = data
                         .get("url")
                         .and_then(serde_json::Value::as_str)
@@ -1088,52 +1382,243 @@ impl PostgresBackend {
                 })
                 .collect()
         };
-        if overlays.is_empty() {
-            // The common case has no tenant overlay. The base is loaded at
-            // construction and remains shared, so a write need not clone its
-            // 1,389 definitions before extracting one resource.
-            return Ok(SearchParameterExtractor::new(base));
-        }
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = base.read().clone();
-        for data in overlays {
-            if let Ok(mut definition) = loader.parse_resource(&data) {
-                if definition.status == SearchParameterStatus::Active {
-                    definition.source = SearchParameterSource::Stored;
-                    // Match TenantSearchRegistries::build_and_cache: a stored
-                    // duplicate canonical URL cannot override the base entry.
-                    let _ = registry.register(definition);
-                }
-            }
+        Ok(overlays
+            .iter()
+            .filter_map(|data| loader.parse_resource(data).ok())
+            .filter(|definition| definition.status == SearchParameterStatus::Active)
+            .map(|mut definition| {
+                definition.source = SearchParameterSource::Stored;
+                definition
+            })
+            .collect())
+    }
+
+    /// The registry for a stored overlay: the shared base itself when the
+    /// overlay is empty — the common case, loaded at construction and shared,
+    /// so a write need not clone its 1,389 definitions before extracting one
+    /// resource — otherwise a clone of the base with the overlay registered.
+    fn overlay_registry(
+        &self,
+        definitions: &[SearchParameterDefinition],
+    ) -> Arc<RwLock<SearchParameterRegistry>> {
+        let base = self.registries.base();
+        if definitions.is_empty() {
+            return base.clone();
         }
-        Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
-            registry,
-        ))))
+        let mut registry = base.read().clone();
+        for definition in definitions {
+            // Match TenantSearchRegistries::build_and_cache: a stored
+            // duplicate canonical URL cannot override the base entry.
+            let _ = registry.register(definition.clone());
+        }
+        Arc::new(RwLock::new(registry))
+    }
+
+    /// Fingerprint of a tenant's live stored `SearchParameter` rows: their
+    /// count and an `md5` over `id@version_id@last_updated` in id order.
+    ///
+    /// Every path that changes a resource's body also assigns a new
+    /// `version_id` and `last_updated` (create, update, delete, restore, the
+    /// bulk-submit writers), and a purge removes the row, so two reads that
+    /// return the same fingerprint saw the same set of definitions — which is
+    /// what lets [`Self::authoritative_extractor`] reuse a registry it built
+    /// earlier instead of decoding every stored definition again. Stricter
+    /// than [`Self::OVERLAY_FINGERPRINT_SQL`] (which only a write's TTL path
+    /// relies on): a delete paired with a create that does not move the
+    /// newest `last_updated` still changes the digest. The epoch form of the
+    /// timestamp keeps the text independent of the session's
+    /// `DateStyle`/`TimeZone`. One index-range read of the tenant's
+    /// SearchParameter rows (a few hundred microseconds for the ~1,400 `hfs`
+    /// seeds) in place of transferring and decoding ~1.5 MB of JSONB.
+    const STORED_SEARCH_PARAMETER_FINGERPRINT_SQL: &'static str = "\
+        SELECT count(*)::bigint, \
+               md5(string_agg(id || '@' || version_id || '@' \
+                              || extract(epoch FROM last_updated)::text, \
+                              ',' ORDER BY id)) \
+        FROM resources \
+        WHERE tenant_id = $1 AND resource_type = 'SearchParameter' AND is_deleted = FALSE";
+
+    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    ///
+    /// The process-local overlay cache can lag writes from another HFS process.
+    /// Reindex groups therefore read the persisted overlay after taking the
+    /// tenant gate, never through that TTL-governed cache. The caller keeps
+    /// this extractor for one immutable extraction phase; this method never
+    /// checks out another connection.
+    ///
+    /// Reading the overlay means decoding every stored `SearchParameter` of
+    /// the tenant — 1,377 rows, ~1.5 MB of JSONB, on every tenant `hfs`
+    /// seeds — and it was done once per 128-resource reindex group (574 times
+    /// over a 72k-resource rebuild: 21% of its wall clock at width 1, 29% at
+    /// width 8). The registry that read produces is now kept per tenant in
+    /// [`TenantSearchRegistries`], tagged with the
+    /// [`Self::STORED_SEARCH_PARAMETER_FINGERPRINT_SQL`] fingerprint of the
+    /// rows it was built from; a call first reads the fingerprint under the
+    /// caller's locks and only reads the definitions when it changed. A write
+    /// from another process changes the fingerprint, so the cache is exactly
+    /// as fresh as the full read was; a local `SearchParameter` write also
+    /// drops it through `TenantSearchRegistries::invalidate`.
+    pub(crate) async fn authoritative_extractor<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let fingerprint = {
+            let statement = client
+                .prepare_cached(Self::STORED_SEARCH_PARAMETER_FINGERPRINT_SQL)
+                .await
+                .map_err(|e| {
+                    crate::error::StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("Failed to prepare the SearchParameter fingerprint: {e}"),
+                        source: None,
+                    })
+                })?;
+            let row = client
+                .query_one(&statement, &[&tenant_id])
+                .await
+                .map_err(|e| {
+                    crate::error::StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("Failed to fingerprint tenant SearchParameters: {e}"),
+                        source: None,
+                    })
+                })?;
+            let count: i64 = row.get(0);
+            let digest: Option<String> = row.get(1);
+            format!("{count}:{}", digest.unwrap_or_default())
+        };
+        if let Some(registry) = self
+            .registries
+            .authoritative_cached(tenant_id, &fingerprint)
+        {
+            return Ok(SearchParameterExtractor::new(registry));
+        }
+        let definitions = self.read_stored_overlay(client, tenant_id).await?;
+        let registry = self.overlay_registry(&definitions);
+        self.registries
+            .cache_authoritative(tenant_id, fingerprint, registry.clone());
+        Ok(SearchParameterExtractor::new(registry))
     }
 
     /// The extractor a write hands to its index step.
     ///
     /// When `extracts` is false the write indexes nothing in PostgreSQL —
     /// search is offloaded (#939) or deferred to a later rebuild (#903) — so
-    /// reading the persisted overlay would be pure cost: one query and one
-    /// JSONB decode per stored SearchParameter (1,375 seeded, ~1.5 MB) on
-    /// every call. The shared base stands in; nothing extracts with it.
+    /// reading the persisted overlay would be pure cost. The shared base
+    /// stands in; nothing extracts with it.
+    ///
+    /// Otherwise the write validates the cached overlay instead of re-reading
+    /// it (#1897). Before this, every indexed write ran the authoritative
+    /// read: one query and one JSONB decode per stored SearchParameter (1,372
+    /// seeded, ~1.5 MB) per call, 93% of the database's time in the benchmark
+    /// crud suite at 24.8 ms a call. Now it fingerprints the tenant's live
+    /// `SearchParameter` rows with one index-only probe
+    /// ([`Self::OVERLAY_FINGERPRINT_SQL`]) on the same guarded connection, so
+    /// a SearchParameter committed by another HFS process is still seen by the
+    /// next write here, and only a changed fingerprint pays the full read,
+    /// which then re-fingerprints the cache for the tenant.
+    ///
+    /// `pending_search_parameter` says the caller's transaction has itself
+    /// written a `SearchParameter` it has not committed. The fingerprint and
+    /// the read both see that row, so the extractor is right either way, but
+    /// the cache must not: the transaction may still roll back, and the
+    /// search path reads the same cache. The caller reloads the cache after
+    /// its commit, as every SearchParameter write path does.
     pub(crate) async fn write_extractor<C>(
         &self,
         client: &C,
         tenant_id: &str,
         extracts: bool,
+        pending_search_parameter: bool,
     ) -> StorageResult<SearchParameterExtractor>
     where
         C: GenericClient + Sync + ?Sized,
     {
-        if extracts {
-            self.authoritative_extractor(client, tenant_id).await
-        } else {
-            Ok(SearchParameterExtractor::new(
+        self.write_extractor_with(
+            client,
+            tenant_id,
+            extracts,
+            pending_search_parameter,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
+    }
+
+    /// [`Self::write_extractor`] with the freshness the caller needs. Callers
+    /// that must see every SearchParameter committed before their snapshot
+    /// pass [`OverlayFreshness::Authoritative`], which always runs the
+    /// fingerprint probe (and so fails if the database cannot answer it);
+    /// the full overlay read still happens only when the fingerprint moved.
+    pub(crate) async fn write_extractor_with<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        extracts: bool,
+        pending_search_parameter: bool,
+        freshness: OverlayFreshness,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        if !extracts {
+            return Ok(SearchParameterExtractor::new(
                 self.registries.base().clone(),
-            ))
+            ));
         }
+        // Fast path: this overlay was validated moments ago and this
+        // transaction has no uncommitted SearchParameter of its own, so skip
+        // the probe. Local SearchParameter writes drop the entry on commit;
+        // other processes' are seen within the TTL.
+        if freshness.may_skip_probe(self.overlay_fingerprint_ttl, pending_search_parameter)
+            && let Some(registry) = fresh_overlay_registry(
+                &self.stored_by_tenant,
+                tenant_id,
+                self.overlay_fingerprint_ttl,
+            )
+        {
+            return Ok(SearchParameterExtractor::new(registry));
+        }
+        let fingerprint = self.overlay_fingerprint(client, tenant_id).await?;
+        let cached = self
+            .stored_by_tenant
+            .read()
+            .get(tenant_id)
+            .and_then(|overlay| {
+                (overlay.fingerprint == Some(fingerprint))
+                    .then(|| overlay.registry.clone())
+                    .flatten()
+            });
+        if let Some(registry) = cached {
+            if !pending_search_parameter
+                && let Some(overlay) = self.stored_by_tenant.write().get_mut(tenant_id)
+                && overlay.fingerprint == Some(fingerprint)
+            {
+                overlay.validated_at = Some(std::time::Instant::now());
+            }
+            return Ok(SearchParameterExtractor::new(registry));
+        }
+        let definitions = self.read_stored_overlay(client, tenant_id).await?;
+        let registry = self.overlay_registry(&definitions);
+        if !pending_search_parameter {
+            self.stored_by_tenant.write().insert(
+                tenant_id.to_string(),
+                StoredOverlay {
+                    fingerprint: Some(fingerprint),
+                    definitions,
+                    registry: Some(registry.clone()),
+                    validated_at: Some(std::time::Instant::now()),
+                },
+            );
+            // The search path's registry for this tenant was built from the
+            // previous overlay; drop it so it rebuilds from the fresh one.
+            self.registries.invalidate(tenant_id);
+        }
+        Ok(SearchParameterExtractor::new(registry))
     }
 
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and
@@ -1142,6 +1627,38 @@ impl PostgresBackend {
     /// transaction, even if this cache has not yet refreshed.
     pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         self.reload_stored_cache().await
+    }
+
+    /// Sum of every tenant's SearchParameter epoch (migration v47's
+    /// trigger-maintained counters). Changes whenever any instance — or any
+    /// other writer — creates, updates or deletes a stored SearchParameter, so
+    /// a cluster instance can poll it and refresh its query-side registry
+    /// instead of waiting for the `HFS_SEARCH_PARAM_CACHE_TTL` sweep.
+    pub async fn search_parameter_epoch_sum(&self) -> StorageResult<i64> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(epoch), 0)::BIGINT FROM search_parameter_epochs",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to query SearchParameter epochs: {e}"),
+                    source: None,
+                })
+            })?;
+        Ok(row.get(0))
+    }
+
+    /// A handle on this backend's connection pool, for process-level
+    /// services that keep their own small tables in the primary database
+    /// (the shared administrator session store of a cluster deployment).
+    /// Not stable API, like [`Self::get_client`].
+    #[doc(hidden)]
+    pub fn shared_pool(&self) -> deadpool_postgres::Pool {
+        self.pool()
     }
 
     /// Get a client from the pool.
@@ -1237,6 +1754,14 @@ impl PostgresBackend {
     /// retries is not counted.
     pub fn pool_status(&self) -> super::PoolStatus {
         self.pool.status()
+    }
+
+    /// Returns the memoization slot for the subscription event fan-out
+    /// (see the field docs on [`PostgresBackend`]).
+    pub(crate) fn fanout_slot(
+        &self,
+    ) -> &std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>> {
+        &self.subscription_fanout
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -1452,12 +1977,20 @@ impl PostgresBackend {
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
-            // `not-in` is intentionally omitted: it returns 501 (negated
-            // value-set filtering is unimplemented), so it must not be
-            // advertised as supported.
-            SearchParamType::Token => {
-                vec!["not", "text", "code-text", "in", "of-type", "missing"]
-            }
+            // The terminology-backed modifiers (`in`, `not-in`, and `below` /
+            // `above` on a token) are expanded by the REST layer into the
+            // plain (or `:not`) token OR-lists this backend answers natively.
+            SearchParamType::Token => vec![
+                "not",
+                "text",
+                "code-text",
+                "in",
+                "not-in",
+                "below",
+                "above",
+                "of-type",
+                "missing",
+            ],
             SearchParamType::Reference => vec![
                 "identifier",
                 "contains",
@@ -1501,6 +2034,71 @@ fn is_transient_connect_failure(e: &deadpool_postgres::PoolError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = PostgresConfig {
+            host: "db.internal".to_string(),
+            password: Some("pg-s3cret-pw".to_string()),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("pg-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(out.contains("db.internal"), "{out}");
+    }
+
+    fn overlay(validated_at: Option<std::time::Instant>) -> StoredOverlay {
+        StoredOverlay {
+            fingerprint: Some(OverlayFingerprint {
+                live: 1,
+                newest: None,
+            }),
+            definitions: Vec::new(),
+            registry: Some(Arc::new(RwLock::new(SearchParameterRegistry::new()))),
+            validated_at,
+        }
+    }
+
+    /// Only `WithinTtl` may skip the probe, and never with a pending
+    /// SearchParameter or a zero TTL; `Authoritative` always probes.
+    #[test]
+    fn authoritative_freshness_never_skips_the_probe() {
+        let ttl = Duration::from_secs(60);
+        assert!(OverlayFreshness::WithinTtl.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(Duration::ZERO, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(Duration::ZERO, false));
+    }
+
+    /// The write-path fast path skips the fingerprint probe only for an
+    /// overlay validated within the TTL; a reload (which replaces the entry
+    /// with an unvalidated one), an expired validation, a missing tenant and a
+    /// zero TTL all force a probe.
+    #[test]
+    fn fingerprint_probe_is_skipped_only_within_ttl() {
+        let stored: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let ttl = Duration::from_secs(60);
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+
+        stored
+            .write()
+            .insert("t".into(), overlay(Some(std::time::Instant::now())));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_some());
+        assert!(fresh_overlay_registry(&stored, "other", ttl).is_none());
+        assert!(fresh_overlay_registry(&stored, "t", Duration::ZERO).is_none());
+
+        // A SearchParameter write reloads the cache: entry replaced, unvalidated.
+        stored.write().insert("t".into(), overlay(None));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+
+        // Expired validation.
+        let old = std::time::Instant::now() - Duration::from_secs(120);
+        stored.write().insert("t".into(), overlay(Some(old)));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+    }
 
     /// #1793: only a connect that failed before reaching the server is
     /// retried; pool exhaustion, a closed pool and timeouts are not.
@@ -1637,6 +2235,14 @@ mod tests {
         // #224 established as useful — and never the old fixed 10.
         let n = default_max_connections();
         assert!((16..=64).contains(&n), "pool default {n} out of band");
+    }
+
+    #[test]
+    fn pool_default_is_cores_times_four_within_the_band() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert_eq!(default_max_connections(), (cores * 4).clamp(16, 64));
     }
 
     #[test]
@@ -1796,6 +2402,46 @@ mod tests {
         // A value that fails to parse is ignored (parse → None), leaving the
         // default untouched rather than zeroing the pool.
         assert_eq!(cfg.max_connections, before);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+        }
+    }
+
+    #[test]
+    fn only_a_size_from_the_environment_escapes_the_server_limit() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A config built by hand keeps its size.
+        assert!(!PostgresConfig::default().limit_pool_to_server);
+
+        // Unset, empty or unparseable: the default, limited to the server (#2216).
+        for raw in [None, Some(""), Some("lots")] {
+            // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+            unsafe {
+                match raw {
+                    Some(raw) => std::env::set_var("HFS_PG_MAX_CONNECTIONS", raw),
+                    None => std::env::remove_var("HFS_PG_MAX_CONNECTIONS"),
+                }
+            }
+            let mut cfg = PostgresConfig::default();
+            cfg.apply_env_overrides();
+            assert!(cfg.limit_pool_to_server, "{raw:?}");
+            assert_eq!(cfg.max_connections, default_max_connections(), "{raw:?}");
+        }
+
+        // A size that parses is used as given, even when it equals the default.
+        for size in [40, default_max_connections()] {
+            // SAFETY: see above.
+            unsafe {
+                std::env::set_var("HFS_PG_MAX_CONNECTIONS", size.to_string());
+            }
+            let mut cfg = PostgresConfig::default();
+            cfg.apply_env_overrides();
+            assert!(!cfg.limit_pool_to_server, "{size}");
+            assert_eq!(cfg.max_connections, size);
+        }
 
         // SAFETY: see above.
         unsafe {

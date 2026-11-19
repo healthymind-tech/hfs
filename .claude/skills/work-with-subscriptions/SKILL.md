@@ -15,6 +15,7 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 - Endpoint safety: rest-hook delivery to private/loopback endpoints is blocked unless `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`.
 - Notification bundles follow the topic-based subscription spec; delivery failures retry with backoff (`engine/retry.rs`).
 - WebSocket subscriptions use binding tokens (`ws_token`) managed per connection (`ws_manager`).
+- Cluster mode (Phase 3, #170): with `HFS_SUBSCRIPTIONS_FANOUT=pg-notify` (the default under `HFS_CLUSTER`, Postgres primary) the engine attaches `ClusterHandles` — shared counters/status/tokens/outbox in persistence (migration v17) plus a LISTEN/NOTIFY fan-out. Registries hydrate at boot (`hydrate()`) and sync via lifecycle envelopes; push channels deliver from a durable leased outbox (at-least-once); WS notifications fan out to every instance's local sockets. Topic registry is tenant-scoped (`(tenant_id, canonical_url)`).
 
 ## Channels (`crates/subscriptions/src/channels/`)
 
@@ -25,11 +26,13 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 | Variable | Description |
 |---|---|
 | `HFS_SUBSCRIPTIONS_ENABLED` | Master switch for the subscriptions engine |
+| `HFS_SUBSCRIPTIONS_FANOUT` | `memory` (default) or `pg-notify` (cluster delivery; defaults to `pg-notify` under `HFS_CLUSTER`) |
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | Enable the messaging channel |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | Allow rest-hook delivery to private/loopback URLs (opt-in) |
 | `HFS_BASE_URL` | Base URL used in notification links |
 | `HFS_SUBSCRIPTION_PERSIST_STATUS` | Write server-driven status transitions back into the stored `Subscription` (default `true`) |
 | `HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS` | Per-write timeout for that write-back (default `5000`) |
+| `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | Events remembered per subscription for `$events` (default `100`, `0` disables; in memory only, empty after a restart) |
 | `HFS_SUBSCRIPTION_REHYDRATE` | Replay stored topics/subscriptions into the engine at startup (default `true`) |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | Re-run activation for stored `requested`/`error` subscriptions (default `true`) |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY` | Cap on concurrent startup handshakes (default `8`) |
@@ -64,10 +67,14 @@ Things to know when working here:
   `error` → `active`.
 - `$status` / `$events` fall back to the stored resource when the engine does
   not hold the subscription, instead of `404`.
+- `$events` returns a `query-event` status (R4 `Parameters`, R4B+ `SubscriptionStatus`) with
+  an absolute subscription reference plus id-only entries for the requested
+  `eventsSinceNumber`/`eventsUntilNumber` range; an invalid range is `400` + `OperationOutcome`,
+  but `eventsSinceNumber` past the latest event (polling) is `200` with no events.
 
 ## Key API
 
-`SubscriptionEngine`, `SubscriptionConfig` / `MessagingSettings`, `ResourceEvent` / `ResourceEventType`, `WebSocketManager`, `WsBindingTokenManager`, `MessagingChannel`, `SubscriptionError`.
+`SubscriptionEngine` (+ `ClusterHandles`, `hydrate()`, `subscription_snapshot()`, `generate_ws_token()`/`redeem_ws_token()`, `run_next_subscription_delivery()`), `SubscriptionConfig` / `MessagingSettings`, `ResourceEvent` / `ResourceEventType`, `WebSocketManager`, `WsBindingTokenManager`, `MessagingChannel`, `SubscriptionError`.
 
 ## Code map / tests
 

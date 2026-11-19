@@ -633,6 +633,256 @@ mod update_xml {
 }
 
 // =============================================================================
+// Patch Response Format Tests (#863)
+// =============================================================================
+
+/// `PATCH [type]/[id]` and `PATCH [type]?[criteria]` negotiate the response
+/// format like every other write. The patch document stays JSON (RFC 6902 /
+/// RFC 7386 / FHIRPath Patch carry no XML form); only the answer is negotiated.
+mod patch_xml {
+    use super::*;
+
+    const JSON_PATCH: &str = "application/json-patch+json";
+    const MERGE_PATCH: &str = "application/merge-patch+json";
+
+    fn rename(family: &str) -> Value {
+        json!([{ "op": "replace", "path": "/name/0/family", "value": family }])
+    }
+
+    /// A patch request carrying `body` in the patch format `content_type` names.
+    fn patch_request(
+        server: &TestServer,
+        url: &str,
+        content_type: &'static str,
+        body: &Value,
+    ) -> axum_test::TestRequest {
+        server
+            .patch(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(CONTENT_TYPE, HeaderValue::from_static(content_type))
+            .bytes(Bytes::from(body.to_string()))
+    }
+
+    fn content_type_of(response: &axum_test::TestResponse) -> String {
+        response
+            .headers()
+            .get("content-type")
+            .expect("Should have Content-Type")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Reads the stored resource back as JSON: the patch must have been applied
+    /// whatever format the answer was written in.
+    async fn stored_family(server: &TestServer, id: &str) -> String {
+        let response = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        body["name"][0]["family"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_patch_accept_xml_returns_xml() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient/patient-1",
+            JSON_PATCH,
+            &rename("PatchedXml"),
+        )
+        .add_header(ACCEPT, HeaderValue::from_static("application/fhir+xml"))
+        .await;
+
+        response.assert_status_ok();
+
+        let ct = content_type_of(&response);
+        assert!(
+            ct.starts_with("application/fhir+xml"),
+            "XML body must not be labelled as JSON, got Content-Type: {ct}"
+        );
+        assert!(
+            response.headers().get("etag").is_some(),
+            "ETag is format-independent and must survive negotiation"
+        );
+        assert!(response.headers().get("last-modified").is_some());
+
+        let body = response.text();
+        assert!(
+            body.trim_start().starts_with('<'),
+            "body should be XML, got: {body}"
+        );
+        assert!(body.contains("<Patient"), "Should contain Patient element");
+        assert!(
+            body.contains("PatchedXml"),
+            "XML should carry the patched value: {body}"
+        );
+
+        assert_eq!(stored_family(&server, "patient-1").await, "PatchedXml");
+    }
+
+    #[tokio::test]
+    async fn test_patch_default_accept_returns_json() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient/patient-1",
+            JSON_PATCH,
+            &rename("PatchedJson"),
+        )
+        .await;
+
+        response.assert_status_ok();
+        assert_eq!(content_type_of(&response), "application/fhir+json");
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "Patient");
+        assert_eq!(body["name"][0]["family"], "PatchedJson");
+    }
+
+    #[tokio::test]
+    async fn test_patch_explicit_accept_json_returns_json() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient/patient-1",
+            JSON_PATCH,
+            &rename("ExplicitJson"),
+        )
+        .add_header(ACCEPT, HeaderValue::from_static("application/fhir+json"))
+        .await;
+
+        response.assert_status_ok();
+        assert_eq!(content_type_of(&response), "application/fhir+json");
+        let body: Value = response.json();
+        assert_eq!(body["name"][0]["family"], "ExplicitJson");
+    }
+
+    #[tokio::test]
+    async fn test_patch_return_operation_outcome_accept_xml() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient/patient-1",
+            JSON_PATCH,
+            &rename("OutcomeXml"),
+        )
+        .add_header(ACCEPT, HeaderValue::from_static("application/fhir+xml"))
+        .add_header(
+            HeaderName::from_static("prefer"),
+            HeaderValue::from_static("return=OperationOutcome"),
+        )
+        .await;
+
+        response.assert_status_ok();
+        let ct = content_type_of(&response);
+        assert!(
+            ct.starts_with("application/fhir+xml"),
+            "XML body must not be labelled as JSON, got Content-Type: {ct}"
+        );
+        let body = response.text();
+        assert!(
+            body.contains("<OperationOutcome"),
+            "should be an XML OperationOutcome: {body}"
+        );
+        assert_eq!(stored_family(&server, "patient-1").await, "OutcomeXml");
+    }
+
+    #[tokio::test]
+    async fn test_patch_return_minimal_has_no_body_whatever_the_accept() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient/patient-1",
+            JSON_PATCH,
+            &rename("MinimalXml"),
+        )
+        .add_header(ACCEPT, HeaderValue::from_static("application/fhir+xml"))
+        .add_header(
+            HeaderName::from_static("prefer"),
+            HeaderValue::from_static("return=minimal"),
+        )
+        .await;
+
+        response.assert_status_ok();
+        assert!(response.text().is_empty(), "return=minimal has no body");
+        assert!(response.headers().get("etag").is_some());
+        assert_eq!(stored_family(&server, "patient-1").await, "MinimalXml");
+    }
+
+    #[tokio::test]
+    async fn test_conditional_patch_accept_xml_returns_xml() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+        seed_patient(&backend, "patient-2", "Jones").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient?family=Smith",
+            MERGE_PATCH,
+            &json!({ "name": [{ "family": "CondPatchedXml" }] }),
+        )
+        .add_header(ACCEPT, HeaderValue::from_static("application/fhir+xml"))
+        .await;
+
+        response.assert_status_ok();
+
+        let ct = content_type_of(&response);
+        assert!(
+            ct.starts_with("application/fhir+xml"),
+            "XML body must not be labelled as JSON, got Content-Type: {ct}"
+        );
+        assert!(response.headers().get("etag").is_some());
+
+        let body = response.text();
+        assert!(
+            body.trim_start().starts_with('<'),
+            "body should be XML, got: {body}"
+        );
+        assert!(body.contains("<Patient"), "Should contain Patient element");
+        assert!(
+            body.contains("CondPatchedXml"),
+            "XML should carry the patched value: {body}"
+        );
+
+        assert_eq!(stored_family(&server, "patient-1").await, "CondPatchedXml");
+        assert_eq!(stored_family(&server, "patient-2").await, "Jones");
+    }
+
+    #[tokio::test]
+    async fn test_conditional_patch_default_accept_returns_json() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = patch_request(
+            &server,
+            "/Patient?family=Smith",
+            MERGE_PATCH,
+            &json!({ "active": false }),
+        )
+        .await;
+
+        response.assert_status_ok();
+        assert_eq!(content_type_of(&response), "application/fhir+json");
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "Patient");
+        assert_eq!(body["active"], false);
+    }
+}
+
+// =============================================================================
 // Search XML Tests
 // =============================================================================
 
@@ -821,5 +1071,56 @@ mod mixed_format {
         assert_eq!(body["resourceType"], "Patient");
         assert_eq!(body["name"][0]["family"], "ConsistencyTest");
         assert_eq!(body["active"], true);
+    }
+}
+
+// =============================================================================
+// Lossless XML parsing (HL7 validator test cases patient-extension-bad*)
+// =============================================================================
+
+mod lossless_parsing {
+    use super::*;
+
+    /// `$validate` judges the XML as sent: an unknown element and an
+    /// extension without a url are reported instead of vanishing in the
+    /// typed model, and a value the model cannot hold is a validation issue,
+    /// not a parse failure.
+    #[tokio::test]
+    async fn validate_sees_unknown_elements_and_bad_values() {
+        let (server, _backend) = create_test_server().await;
+        let xml = r#"<Patient xmlns="http://hl7.org/fhir">
+              <extension><valueString value="no url"/></extension>
+              <active value="yes"/>
+              <bogus value="1"/>
+            </Patient>"#;
+        let response = server
+            .post("/Patient/$validate")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+xml"),
+            )
+            .add_header(ACCEPT, HeaderValue::from_static("application/fhir+json"))
+            .bytes(Bytes::from(xml))
+            .await;
+        response.assert_status_ok();
+        let outcome: Value = response.json();
+        let errors: Vec<String> = outcome["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["severity"] == "error")
+            .map(|i| i["expression"][0].as_str().unwrap_or_default().to_string())
+            .collect();
+        for expected in [
+            "Patient.bogus",
+            "Patient.active",
+            "Patient.extension[0].url",
+        ] {
+            assert!(
+                errors.iter().any(|e| e == expected),
+                "{expected} not reported: {outcome:#}"
+            );
+        }
     }
 }

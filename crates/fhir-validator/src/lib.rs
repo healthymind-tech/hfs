@@ -43,15 +43,19 @@
 //!
 //! ## Current limitations (hardening backlog)
 //!
-//! - Slice matchers: only `pattern` matching is evaluated. `type`,
-//!   `profile`, `binding`, and `resolve-ref` matchers are parsed but inert
+//! - Slice matchers: `value`/`pattern` (including constants inside nested
+//!   slices), `type` and `profile` discriminators are evaluated; `exists`,
+//!   `binding`, and paths through `resolve()` or `extension(...)` are not
 //!   (such slices match nothing and never enforce a minimum; the converter
-//!   emits a warning when it cannot build a pattern match).
+//!   emits a warning when it cannot build a match). `profile` matching
+//!   validates the item structurally against the profile.
 //! - `refers` (reference target types) is carried but not enforced.
-//! - `extensible`-strength bindings are never checked (only `required`,
-//!   per the FHIR Schema spec); a warning mode may come later.
+//! - `extensible`-strength bindings are only checked on request
+//!   ([`EffectHandlers::check_extensible`], warning severity); the FHIR
+//!   Schema spec enforces `required` only.
 //! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
-//!   resource and evaluates via `path.all(expr)`, so invariants relying on
+//!   resource and evaluates a nested invariant once per focused node (with
+//!   `%context` bound to that node), so invariants relying on
 //!   nested-resource `%resource` semantics can misfire (helios-fhirpath
 //!   limitation; see `fhirpath_effects`).
 //! - Schema sets are assembled per node without cross-resource memoization;
@@ -69,6 +73,8 @@ pub mod packs;
 pub mod resolver;
 pub mod schema;
 pub mod terminology;
+#[cfg(feature = "xml")]
+pub mod xml;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
@@ -80,12 +86,16 @@ pub use editor::{
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, TerminologyError, TerminologyProvider,
+    EffectHandlers, MemberOfAnswers, SliceBinding, TerminologyError, TerminologyErrorKind,
+    TerminologyFailMode,
+    TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{
-    ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
-    Validator, dotted_to_fhirpath,
+    ErrorKind, Severity, SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy,
+    ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
-pub use terminology::{CoreTerminology, core_terminology};
+pub use terminology::{
+    CompositeTerminologyProvider, CoreTerminology, core_terminology, is_hl7_namespace,
+};

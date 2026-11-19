@@ -142,6 +142,30 @@ fn is_permanent(outcome: &StorageResult<usize>) -> bool {
     )
 }
 
+/// The message of an `Unavailable` outcome: the text REST sends the client as the
+/// 503 body and bulk ingest copies into receipts (#2385).
+fn unavailable_message(outcome: &StorageResult<usize>) -> String {
+    match outcome {
+        Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => message.clone(),
+        other => panic!("expected an Unavailable outcome, got {other:?}"),
+    }
+}
+
+/// The client text names no node, no `_bulk` path and nothing Elasticsearch
+/// answered (`answers` are fragments of what the stub answered), only the
+/// operation and the fixed advice (#2385).
+fn assert_without_elasticsearch_answer(message: &str, server: &MockServer, answers: &[&str]) {
+    let node = server.address().to_string();
+    assert!(!message.contains(&node), "{message}");
+    assert!(!message.contains("_bulk"), "{message}");
+    for answer in answers {
+        assert!(
+            !message.contains(answer),
+            "{answer} leaked into the client text: {message}"
+        );
+    }
+}
+
 fn assert_all_ok(outcomes: &[StorageResult<usize>]) {
     for (n, outcome) in outcomes.iter().enumerate() {
         assert!(outcome.is_ok(), "resource {n} failed: {outcome:?}");
@@ -245,6 +269,16 @@ async fn a_single_document_that_times_out_is_a_transient_failure() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The client text names the operation and the timeout only (#2385): the
+        // transport error names the node and the `_bulk` path.
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Bulk index request for a single document timed out after 750 ms: the search index is temporarily unavailable; retry the request"
+        );
+        let node = server.address().to_string();
+        assert!(!message.contains(&node), "{message}");
+        assert!(!message.contains("_bulk"), "{message}");
     }
     // The pair, then `a` alone; `b` is failed without waiting out another timeout.
     assert_eq!(bulk_requests(&server).await.len(), 2);
@@ -366,7 +400,7 @@ async fn a_throttled_request_is_resent_whole() {
 async fn throttling_that_never_clears_is_a_transient_failure() {
     let server = cluster().await;
     on_bulk(&server, |_| {
-        ResponseTemplate::new(429).set_body_string("too many requests")
+        ResponseTemplate::new(429).set_body_string("es-body-429 index hfs_bulk-stub_patient")
     })
     .await;
     let backend = backend_with(&server, |_| {});
@@ -376,6 +410,56 @@ async fn throttling_that_never_clears_is_a_transient_failure() {
         .await;
 
     assert!(is_transient(&outcomes[0]), "{:?}", outcomes[0]);
+    assert_eq!(bulk_requests(&server).await.len(), BULK_MAX_ATTEMPTS);
+    // Elasticsearch's answer goes to the log, not into the client text (#2385).
+    let message = unavailable_message(&outcomes[0]);
+    assert_eq!(
+        message,
+        "Bulk index request throttled (status 429) 5 times: the search index is temporarily unavailable; retry the request"
+    );
+    assert_without_elasticsearch_answer(&message, &server, &["es-body-429", "hfs_"]);
+}
+
+/// Elasticsearch's flood-stage block answers each item `429`
+/// `cluster_block_exception`, naming the index, and does not clear until the disk
+/// does. After the resends run out every receipt must carry the fixed text only
+/// (#2385).
+#[tokio::test]
+async fn a_flood_stage_block_that_never_clears_keeps_the_index_out_of_the_receipts() {
+    let server = cluster().await;
+    on_bulk(&server, |request| {
+        let items: Vec<Value> = bulk_ids(request)
+            .iter()
+            .map(|_| {
+                json!({"index": {"status": 429, "error": {
+                    "type": "cluster_block_exception",
+                    "reason": "index [hfs_bulk-stub_patient] blocked by: [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block]"
+                }}})
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({"errors": true, "items": items}))
+    })
+    .await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b", "c"]))
+        .await;
+
+    assert_eq!(outcomes.len(), 3);
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to index document (status 429, throttled 5 times): the search index is temporarily unavailable; retry the request"
+        );
+        assert_without_elasticsearch_answer(
+            &message,
+            &server,
+            &["hfs_", "cluster_block_exception", "flood-stage"],
+        );
+    }
     assert_eq!(bulk_requests(&server).await.len(), BULK_MAX_ATTEMPTS);
 }
 
@@ -424,7 +508,7 @@ async fn an_item_rejection_stays_permanent_and_names_its_type_and_reason() {
 async fn a_server_error_on_the_whole_request_is_transient_and_not_split() {
     let server = cluster().await;
     on_bulk(&server, |_| {
-        ResponseTemplate::new(503).set_body_string("unavailable")
+        ResponseTemplate::new(503).set_body_string("es-body-503 index hfs_bulk-stub_patient")
     })
     .await;
     let backend = backend_with(&server, |_| {});
@@ -435,8 +519,199 @@ async fn a_server_error_on_the_whole_request_is_transient_and_not_split() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The status stays; Elasticsearch's answer goes to the log (#2385).
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Bulk index request failed (status 503): the search index is temporarily unavailable; retry the request"
+        );
+        assert_without_elasticsearch_answer(&message, &server, &["es-body-503", "hfs_"]);
     }
     assert_eq!(bulk_requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_single_document_answered_504_is_transient_without_the_response_body() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        ResponseTemplate::new(504).set_body_string("es-body-504 index hfs_bulk-stub_patient")
+    })
+    .await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Bulk index request for a single document timed out (status 504): the search index is temporarily unavailable; retry the request"
+        );
+        assert_without_elasticsearch_answer(&message, &server, &["es-body-504", "hfs_"]);
+    }
+    // The pair, then each document alone.
+    assert_eq!(bulk_requests(&server).await.len(), 3);
+}
+
+#[tokio::test]
+async fn an_item_answered_with_a_server_error_is_transient_without_its_error() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        let unavailable = json!({"index": {"status": 503, "error": {
+            "type": "unavailable_shards_exception",
+            "reason": "[hfs_bulk-stub_patient][0] primary shard is not active"
+        }}});
+        ResponseTemplate::new(200).set_body_json(json!({
+            "errors": true,
+            "items": [{"index": {"status": 201}}, unavailable, unavailable]
+        }))
+    })
+    .await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b", "c"]))
+        .await;
+
+    assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+    for outcome in &outcomes[1..] {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to index document (status 503): the search index is temporarily unavailable; retry the request"
+        );
+        assert_without_elasticsearch_answer(&message, &server, &["hfs_", "shard"]);
+    }
+    assert_eq!(
+        bulk_requests(&server).await.len(),
+        1,
+        "a server error on an item is not resent"
+    );
+}
+
+/// A `200` that is not JSON makes reqwest fail to decode it, and its error text
+/// ends with ` for url (http://<node>/_bulk)`. That must not reach the client.
+#[tokio::test]
+async fn an_unreadable_bulk_response_is_transient_without_the_url() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        ResponseTemplate::new(200).set_body_string("not json")
+    })
+    .await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to read bulk index response: the search index is temporarily unavailable; retry the request"
+        );
+        assert_without_elasticsearch_answer(&message, &server, &["not json", "hfs_"]);
+    }
+    assert_eq!(bulk_requests(&server).await.len(), 1);
+}
+
+/// A node that answers `HEAD` with `head_status` and drops the connection on any
+/// other request, so a `_bulk` or an index creation fails in the transport rather
+/// than with a status. wiremock always answers, so it cannot play this node.
+/// Returns the node's URI.
+async fn node_that_drops_writes(head_status: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a local port");
+    let uri = format!("http://{}", listener.local_addr().expect("local address"));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                loop {
+                    let read = match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => read,
+                    };
+                    if !buffer[..read].starts_with(b"HEAD ") {
+                        // Dropping the socket closes the connection mid-request.
+                        return;
+                    }
+                    let reply =
+                        format!("HTTP/1.1 {head_status} Status\r\ncontent-length: 0\r\n\r\n");
+                    if socket.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    uri
+}
+
+fn backend_at(node: &str) -> ElasticsearchBackend {
+    ElasticsearchBackend::new(ElasticsearchConfig {
+        nodes: vec![node.to_string()],
+        request_timeout_ms: 2_000,
+        ..Default::default()
+    })
+    .expect("client construction is lazy")
+}
+
+#[tokio::test]
+async fn a_bulk_request_that_never_reaches_the_cluster_is_transient_without_the_node() {
+    let node = node_that_drops_writes(200).await;
+    let backend = backend_at(&node);
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to send bulk index request: the search index is temporarily unavailable; retry the request"
+        );
+        let port = node.rsplit(':').next().expect("a port");
+        for leaked in ["127.0.0.1", port, "_bulk", "hfs_"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_index_creation_that_never_reaches_the_cluster_is_transient_without_the_node() {
+    let node = node_that_drops_writes(404).await;
+    let backend = backend_at(&node);
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to create index: the search index is temporarily unavailable; retry the request"
+        );
+        let port = node.rsplit(':').next().expect("a port");
+        for leaked in ["127.0.0.1", port, "hfs_"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+    }
 }
 
 // ============================================================================
@@ -482,7 +757,11 @@ async fn the_byte_cap_bounds_every_request_body() {
 async fn a_page_over_500_operations_takes_more_than_one_request() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
-    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    // One chain: the 500-operation count cap alone cuts the page.
+    let backend = backend_with(&server, |config| {
+        config.bulk_max_bytes = 0;
+        config.bulk_concurrency = 1;
+    });
     let ids: Vec<String> = (0..501).map(|n| format!("p{n}")).collect();
     let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
 
@@ -499,20 +778,69 @@ async fn a_page_over_500_operations_takes_more_than_one_request() {
     assert_eq!(sizes, vec![500, 1]);
 }
 
+/// At the default `bulk_concurrency` (4) a page is cut into requests of
+/// near-equal size, so several are in flight, instead of 500-operation
+/// chunks — but into at most one per 250 operations, rounded up: 1,000 ops
+/// make four requests, 501 make three (not 500 + 1), 200 stay one.
+#[tokio::test]
+async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    let ids: Vec<String> = (0..1000).map(|n| format!("p{n}")).collect();
+    let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &resources)
+        .await;
+
+    assert_all_ok(&outcomes);
+    let requests = bulk_requests(&server).await;
+    let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![250, 250, 250, 250]);
+    let sent: HashSet<String> = requests.iter().flat_map(bulk_ids).collect();
+    assert_eq!(sent.len(), 1000, "every document is sent exactly once");
+
+    for (page, expected) in [(501, vec![167, 167, 167]), (200, vec![200])] {
+        let server = cluster().await;
+        on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+        let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+        let resources: Vec<StoredResource> =
+            (0..page).map(|n| patient(&format!("q{n}"), 0)).collect();
+        assert_all_ok(
+            &backend
+                .write_search_entries_page(&tenant(), &resources)
+                .await,
+        );
+        let mut sizes: Vec<usize> = bulk_requests(&server)
+            .await
+            .iter()
+            .map(|r| bulk_ids(r).len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, expected, "a page of {page}");
+    }
+}
+
+/// A rebuild's `_bulk` writes follow `reindex_refresh` alone: unset sends no
+/// `refresh` even under `write_refresh = wait_for` (one refresh wait per
+/// request made a rebuild 13× slower, #1749), and an explicit policy is sent
+/// whatever the ordinary writes do.
 #[tokio::test]
 async fn a_rebuild_uses_its_own_refresh_policy() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
-    let follows = backend_with(&server, |config| {
+    let unset = backend_with(&server, |config| {
         config.write_refresh = WriteRefreshPolicy::WaitFor;
     });
     let own = backend_with(&server, |config| {
-        config.write_refresh = WriteRefreshPolicy::WaitFor;
-        config.reindex_refresh = Some(WriteRefreshPolicy::False);
+        config.write_refresh = WriteRefreshPolicy::False;
+        config.reindex_refresh = Some(WriteRefreshPolicy::WaitFor);
     });
 
     assert_all_ok(
-        &follows
+        &unset
             .write_search_entries_page(&tenant(), &page(&["a"]))
             .await,
     );
@@ -525,15 +853,39 @@ async fn a_rebuild_uses_its_own_refresh_policy() {
     assert_eq!(requests.len(), 2);
     let query = |request: &Request| request.url.query().unwrap_or_default().to_string();
     assert!(
-        query(&requests[0]).contains("refresh=wait_for"),
-        "{}",
+        !query(&requests[0]).contains("refresh"),
+        "unset must not inherit wait_for: {}",
         query(&requests[0])
     );
     assert!(
-        !query(&requests[1]).contains("refresh"),
+        query(&requests[1]).contains("refresh=wait_for"),
         "{}",
         query(&requests[1])
     );
+}
+
+/// Composite sync writes the same `_bulk` page as a rebuild, but under the
+/// ordinary write policy: a rebuild that skips the refresh wait must not cost
+/// a transaction bundle its read-your-writes search.
+#[tokio::test]
+async fn a_synced_page_uses_the_write_refresh_policy_not_the_rebuilds() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| {
+        config.write_refresh = WriteRefreshPolicy::WaitFor;
+        config.reindex_refresh = Some(WriteRefreshPolicy::False);
+    });
+
+    assert_all_ok(
+        &backend
+            .write_synced_entries_page(&tenant(), &page(&["a"]))
+            .await,
+    );
+
+    let requests = bulk_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    let query = requests[0].url.query().unwrap_or_default().to_string();
+    assert!(query.contains("refresh=wait_for"), "{query}");
 }
 
 // ============================================================================
@@ -555,6 +907,14 @@ async fn an_unreachable_cluster_while_ensuring_the_index_is_transient() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The transport error names the node and the index (#2385).
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to check index existence: the search index is temporarily unavailable; retry the request"
+        );
+        assert!(!message.contains("127.0.0.1"), "{message}");
+        assert!(!message.contains("hfs_bulk-stub"), "{message}");
     }
 }
 
@@ -574,6 +934,13 @@ async fn an_index_check_answered_with_a_server_error_is_transient() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The status stays; the index name goes to the log (#2385).
+        let message = unavailable_message(outcome);
+        assert!(
+            message.starts_with("Failed to check index existence (status 503"),
+            "{message}"
+        );
+        assert!(!message.contains("hfs_"), "{message}");
     }
     assert!(
         bulk_requests(&server).await.is_empty(),
@@ -599,6 +966,15 @@ async fn an_index_creation_answered_with_a_server_error_is_transient() {
         .await;
 
     assert!(is_transient(&outcomes[0]), "{:?}", outcomes[0]);
+    // The status stays; the index name and Elasticsearch's answer go to the log
+    // (#2385).
+    let message = unavailable_message(&outcomes[0]);
+    assert!(
+        message.starts_with("Failed to create index (status 500"),
+        "{message}"
+    );
+    assert!(!message.contains("boom"), "{message}");
+    assert!(!message.contains("hfs_"), "{message}");
 }
 
 #[tokio::test]
@@ -654,12 +1030,13 @@ async fn concurrent_chains_index_every_document_of_a_page_exactly_once() {
     assert_all_ok(&outcomes);
 
     let requests = bulk_requests(&server).await;
-    // 1200 operations at 500 per request: three root chunks, hence three
-    // chains however much concurrency was asked for. Sorted, because the
-    // chains answer in whatever order the cluster serves them.
+    // 1200 operations at concurrency 4: the page is cut into four root
+    // chunks of 300 (not three of 500/500/200, which left the fourth chain
+    // idle), hence four chains. Sorted, because the chains answer in
+    // whatever order the cluster serves them.
     let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
     sizes.sort_unstable();
-    assert_eq!(sizes, vec![200, 500, 500]);
+    assert_eq!(sizes, vec![300, 300, 300, 300]);
 
     let mut sent: Vec<String> = requests.iter().flat_map(bulk_ids).collect();
     assert_eq!(sent.len(), 1_200, "no document is sent twice");

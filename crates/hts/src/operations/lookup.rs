@@ -41,8 +41,8 @@ use crate::types::{DesignationValue, LookupRequest, PropertyValue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
-    property_value_part, query_params_to_fhir_params,
+    collect_str_params, extract_parameter_array, find_str_param, normalize_canonical_params,
+    parse_query_string, property_value_part, query_params_to_fhir_params,
 };
 
 /// Build a canonical cache key for a `$lookup` request from its normalised
@@ -137,10 +137,22 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// A `serde_json::Value` representing a FHIR `Parameters` resource, or an
 /// [`HtsError`] (400 when `system`/`code` are missing, 404 when the code is
 /// not found, 501 when `expression` is supplied).
-async fn process_lookup<B: TerminologyBackend>(
+pub(crate) async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` is folded into `system=X` + `version=V` so the cache key and
+    // the backend lookup agree on which CodeSystem version is meant.
+    let mut params = params;
+    normalize_canonical_params(&mut params, "system", Some("version"))?;
+    // `version=http://snomed.info/sct/<module>[/version/<date>]` → the stored
+    // SNOMED CT release it names.
+    crate::operations::snomed_version::normalize_snomed_versions(
+        state.backend(),
+        &helios_persistence::tenant::TenantContext::system(),
+        &mut params,
+    )
+    .await;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
@@ -171,7 +183,7 @@ async fn process_lookup<B: TerminologyBackend>(
             return Err(HtsError::NotFound(format!("Concept not found: {code}")));
         }
     }
-    let result = process_lookup_inner(state, params).await;
+    let result = snomed_lookup(state, params).await;
     match (&result, cache_key) {
         (Ok(value), Some(key)) => {
             lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
@@ -184,6 +196,245 @@ async fn process_lookup<B: TerminologyBackend>(
     result
 }
 
+/// `$lookup` with the SNOMED CT specifics: a post-coordinated expression is
+/// looked up as its focus concept, then described as itself (see
+/// [`crate::snomed::ops::lookup_response`]); every SNOMED CT response names
+/// the description types, the attribute and value terms, and the concept's
+/// effective time and module, and leaves the preferred-for-language
+/// designations to the display.
+async fn snomed_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    use crate::snomed::{SNOMED_URL, ops};
+    if find_str_param(&params, "system").as_deref() != Some(SNOMED_URL) {
+        return process_lookup_inner(state, params).await;
+    }
+    let code = find_str_param(&params, "code").unwrap_or_default();
+    let version = find_str_param(&params, "version");
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let is_expression = code
+        .contains(|c: char| matches!(c, ':' | '+' | '|' | '{' | '(' | '=') || c.is_whitespace());
+    if is_expression {
+        if let Some(model) = state
+            .backend()
+            .snomed_model(&ctx, SNOMED_URL, version.as_deref())
+            .await?
+        {
+            return match ops::check(&model, &code) {
+                ops::Checked::Invalid(reason) => {
+                    Err(HtsError::Coded(Box::new(crate::error::CodedIssue {
+                        code: "code-invalid",
+                        tx_code: "invalid-code",
+                        text: format!(
+                            "Unknown code '{code}' in the CodeSystem '{SNOMED_URL}' version '{}': {reason}",
+                            model.version.as_deref().unwrap_or_default()
+                        ),
+                        expression: Some("code".into()),
+                    })))
+                }
+                ops::Checked::Valid { expr, display, .. } => {
+                    let focus = expr.body.focus[0].id.clone();
+                    let mut focus_params = params.clone();
+                    focus_params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("code"));
+                    focus_params.push(json!({"name": "code", "valueCode": focus}));
+                    let looked_up = process_lookup_inner(state, focus_params.clone()).await?;
+                    let looked_up = snomed_lookup_details(state, &focus_params, looked_up).await;
+                    Ok(ops::lookup_response(
+                        &model, &code, &display, &expr, looked_up,
+                    ))
+                }
+            };
+        }
+    }
+    let looked_up = process_lookup_inner(state, params.clone()).await?;
+    Ok(snomed_lookup_details(state, &params, looked_up).await)
+}
+
+/// The SNOMED CT details of a `$lookup` response (see [`snomed_lookup`]).
+async fn snomed_lookup_details<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+    mut value: Value,
+) -> Value {
+    use crate::snomed::SNOMED_URL;
+    let ctx = helios_persistence::tenant::TenantContext::system();
+    let code = find_str_param(params, "code").unwrap_or_default();
+    let version = find_str_param(params, "version");
+    let requested = collect_str_params(params, "property");
+    let wanted = |p: &str| requested.is_empty() || requested.iter().any(|r| r == p || r == "*");
+    let Some(list) = value.get_mut("parameter").and_then(|v| v.as_array_mut()) else {
+        return value;
+    };
+    // Codes whose terms the properties need.
+    let mut codes: Vec<String> = vec![code.clone()];
+    let part_str = |parts: &[Value], name: &str| -> Option<String> {
+        parts
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|p| {
+                ["valueCode", "valueString", "valueCoding"]
+                    .iter()
+                    .find_map(|k| p.get(*k))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+                    })
+            })
+    };
+    for p in list.iter() {
+        if p.get("name").and_then(|v| v.as_str()) != Some("property") {
+            continue;
+        }
+        let Some(parts) = p.get("part").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if let Some(c) = part_str(parts, "code") {
+            if c.bytes().all(|b| b.is_ascii_digit()) {
+                codes.push(c);
+            }
+        }
+        if let Some(v) = part_str(parts, "value") {
+            codes.push(v);
+        }
+    }
+    let rows = state
+        .backend()
+        .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &codes)
+        .await
+        .unwrap_or_default();
+    let module = rows.get(&code).and_then(|info| info.row.module.clone());
+    let module_display = match &module {
+        Some(m) => state
+            .backend()
+            .snomed_concepts(&ctx, SNOMED_URL, version.as_deref(), &[m.clone()])
+            .await
+            .ok()
+            .and_then(|r| r.get(m).and_then(|i| i.display.clone())),
+        None => None,
+    };
+    let display_of = |c: &str| rows.get(c).and_then(|i| i.display.clone());
+    list.retain(|p| {
+        p.get("name").and_then(|v| v.as_str()) != Some("designation")
+            || !p
+                .get("part")
+                .and_then(|v| v.as_array())
+                .is_some_and(|parts| {
+                    parts.iter().any(|x| {
+                        x.get("valueCoding")
+                            .and_then(|c| c.get("code"))
+                            .and_then(|c| c.as_str())
+                            == Some("preferredForLanguage")
+                    })
+                })
+    });
+    // Designations in description id order.
+    if let Some(info) = rows.get(&code) {
+        let first = list
+            .iter()
+            .position(|p| p.get("name").and_then(|v| v.as_str()) == Some("designation"));
+        if let Some(first) = first {
+            let mut designations: Vec<Value> = Vec::new();
+            list.retain(|p| {
+                if p.get("name").and_then(|v| v.as_str()) == Some("designation") {
+                    designations.push(p.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let rank = |d: &Value| {
+                let value = d
+                    .get("part")
+                    .and_then(|v| v.as_array())
+                    .and_then(|parts| {
+                        parts
+                            .iter()
+                            .find(|x| x.get("name").and_then(|v| v.as_str()) == Some("value"))
+                    })
+                    .and_then(|x| x.get("valueString"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                info.row
+                    .terms
+                    .iter()
+                    .position(|t| t == value)
+                    .unwrap_or(usize::MAX)
+            };
+            designations.sort_by_key(|d| rank(d));
+            for (i, d) in designations.into_iter().enumerate() {
+                list.insert(first + i, d);
+            }
+        }
+    }
+    for p in list.iter_mut() {
+        let name = p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(parts) = p.get_mut("part").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        if name == "designation" {
+            for x in parts.iter_mut() {
+                if let Some(coding) = x.get_mut("valueCoding") {
+                    let use_code = coding
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    if let Some(n) = crate::snomed::description_type_name(use_code) {
+                        coding["display"] = json!(n);
+                    }
+                }
+            }
+            continue;
+        }
+        if name != "property" {
+            continue;
+        }
+        let prop = part_str(parts, "code").unwrap_or_default();
+        let has = |parts: &Vec<Value>, n: &str| {
+            parts
+                .iter()
+                .any(|x| x.get("name").and_then(|v| v.as_str()) == Some(n))
+        };
+        let attribute = prop.bytes().all(|b| b.is_ascii_digit()) && !prop.is_empty();
+        if attribute && !has(parts, "code-display") {
+            if let Some(d) = display_of(&prop) {
+                parts.push(json!({"name": "code-display", "valueString": d}));
+            }
+        }
+        if (attribute || prop == "parent" || prop == "child") && !has(parts, "description") {
+            if let Some(d) = part_str(parts, "value").and_then(|v| display_of(&v)) {
+                parts.push(json!({"name": "description", "valueString": d}));
+            }
+        }
+    }
+    if let Some(info) = rows.get(&code) {
+        if wanted("effectiveTime") {
+            if let Some(t) = info.row.effective_time.as_deref().filter(|t| t.len() == 8) {
+                list.push(json!({"name": "property", "part": [
+                    {"name": "code", "valueCode": "effectiveTime"},
+                    {"name": "value", "valueDateTime": format!("{}-{}-{}", &t[..4], &t[4..6], &t[6..])},
+                ]}));
+            }
+        }
+        if wanted("module") {
+            if let Some(m) = &module {
+                let mut parts = vec![json!({"name": "code", "valueCode": "module"})];
+                if let Some(d) = &module_display {
+                    parts.push(json!({"name": "description", "valueString": d}));
+                }
+                parts.push(json!({"name": "value", "valueCode": m}));
+                list.push(json!({"name": "property", "part": parts}));
+            }
+        }
+    }
+    value
+}
+
 async fn process_lookup_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -194,13 +445,33 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let code = find_str_param(&params, "code")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
+    // UCUM: any well-formed unit expression, described from its atoms.
+    if system == crate::ucum_validate::UCUM_URL {
+        return ucum_lookup(state, &code).await;
+    }
+
+    // `property` names what to return; `*` (or nothing) means everything.
+    // `abstract` is reported whatever was asked for, so the backend is also
+    // asked for `notSelectable`.
+    let requested_properties = collect_str_params(&params, "property");
+    let want_all_properties = requested_properties.iter().any(|p| p == "*");
+    let property_filter: Option<Vec<String>> =
+        if requested_properties.is_empty() || want_all_properties {
+            None
+        } else {
+            Some(requested_properties.clone())
+        };
+    let mut backend_properties = requested_properties.clone();
+    if property_filter.is_some() && !backend_properties.iter().any(|p| p == "notSelectable") {
+        backend_properties.push("notSelectable".into());
+    }
     let req = LookupRequest {
         system: system.clone(),
         code: code.clone(),
         version: find_str_param(&params, "version"),
         display_language: find_str_param(&params, "displayLanguage"),
         expression: find_str_param(&params, "expression"),
-        properties: collect_str_params(&params, "property"),
+        properties: backend_properties,
         date: find_str_param(&params, "date"),
         use_supplements: collect_str_params(&params, "useSupplement"),
     };
@@ -208,12 +479,13 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     let ctx = TenantContext::system();
 
     // ── Resolve supplements ──────────────────────────────────────────────────
-    // Accept either valueCanonical or valueUri on `useSupplement`. For each,
+    // Accept any canonical-ish value type on `useSupplement`. For each,
     // verify it points at a stored CodeSystem with `content=supplement` whose
     // `supplements` URL matches the lookup `system`. Mismatches and unknown
     // supplements both reject with NotFound (issue.code=not-found) per the
     // IG fixtures.
-    let supplement_inputs: Vec<String> = collect_supplement_inputs(&params);
+    let mut supplement_inputs: Vec<String> =
+        crate::operations::params::collect_use_supplements(&params);
     let mut applied_supplements: Vec<SupplementInfo> = Vec::new();
     for raw in &supplement_inputs {
         let bare = raw.split('|').next().unwrap_or(raw).to_string();
@@ -227,7 +499,47 @@ async fn process_lookup_inner<B: TerminologyBackend>(
         }
     }
 
+    // Auto-apply every stored supplement of this CodeSystem (e.g. a zh-Hant
+    // translation supplement) unless the operator turned that off
+    // (`HTS_AUTO_SUPPLEMENTS=false`). Explicitly named supplements keep
+    // precedence; discovered ones are appended once.
+    if state.auto_supplements {
+        for info in state
+            .backend()
+            .supplements_for_system(&ctx, &system)
+            .await
+            .unwrap_or_default()
+        {
+            let bare = info
+                .supplement_canonical
+                .split('|')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if supplement_inputs
+                .iter()
+                .any(|s| s.split('|').next() == Some(bare.as_str()))
+                || state.auto_supplements_skip.contains(&bare)
+            {
+                continue;
+            }
+            supplement_inputs.push(info.supplement_canonical.clone());
+            applied_supplements.push(info);
+        }
+    }
+
+    let display_language = find_str_param(&params, "displayLanguage");
     let mut resp = state.backend().lookup(&ctx, req).await?;
+    // Did the base CodeSystem already satisfy `displayLanguage`? (The backend
+    // keeps only matching designations when the parameter is set.) Decides
+    // whether a supplement designation may take over `display` below.
+    let base_lang_matched = display_language.as_deref().is_some_and(|lang| {
+        resp.designations.iter().any(|d| {
+            d.language
+                .as_deref()
+                .is_some_and(|l| crate::language::lang_matches(lang, l))
+        })
+    });
 
     // Surface the default display as a synthesised "preferredForLanguage"
     // designation tagged with the CodeSystem's primary language. The IG
@@ -281,6 +593,16 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             .unwrap_or_default();
         if let Some(list) = supp_desigs.get(&code) {
             for d in list {
+                // `displayLanguage` filters supplement designations the same
+                // way the backend filters the base ones.
+                if let Some(lang) = display_language.as_deref()
+                    && !d
+                        .language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                {
+                    continue;
+                }
                 resp.designations.push(DesignationValue {
                     language: d.language.clone(),
                     use_system: d.use_system.clone(),
@@ -288,6 +610,18 @@ async fn process_lookup_inner<B: TerminologyBackend>(
                     value: d.value.clone(),
                     source: d.source.clone(),
                 });
+            }
+            // When the base CodeSystem has no designation in the requested
+            // language but a supplement does, that translation becomes the
+            // display — the whole point of a translation supplement.
+            if let Some(lang) = display_language.as_deref()
+                && !base_lang_matched
+                && let Some(idx) = crate::language::best_lang_match_index(
+                    lang,
+                    list.iter().map(|d| d.language.as_deref()),
+                )
+            {
+                resp.display = Some(list[idx].value.clone());
             }
         }
 
@@ -308,11 +642,17 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             .await
             .unwrap_or_default();
         if let Some(list) = supp_props.get(&code) {
-            for (prop, value) in list {
+            for property in list {
                 resp.properties.push(PropertyValue {
-                    code: prop.clone(),
-                    value_type: "string".into(),
-                    value: value.clone(),
+                    code: property.code.clone(),
+                    // A whole stored Coding (upstream #2095) stays a Coding;
+                    // every other supplement value is reported as a string.
+                    value_type: if property.value_type == "Coding" {
+                        "Coding".into()
+                    } else {
+                        "string".into()
+                    },
+                    value: property.value.clone(),
                     description: None,
                 });
             }
@@ -340,16 +680,69 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     // when set.
     parameter.push(json!({"name": "system", "valueUri": system}));
     parameter.push(json!({"name": "code", "valueCode": code}));
-    if resp
+    let is_abstract = resp
         .properties
         .iter()
-        .any(|p| p.code == "notSelectable" && p.value == "true")
-    {
-        parameter.push(json!({"name": "abstract", "valueBoolean": true}));
+        .any(|p| p.code == "notSelectable" && p.value == "true");
+    // `abstract` when the concept is abstract, or when every property was
+    // asked for — then also as the `notSelectable` property (IG
+    // `simple/simple-lookup-1`, `simple-lookup-zxx`).
+    if is_abstract || want_all_properties {
+        parameter.push(json!({"name": "abstract", "valueBoolean": is_abstract}));
+    }
+    if want_all_properties && !resp.properties.iter().any(|p| p.code == "notSelectable") {
+        resp.properties.push(PropertyValue {
+            code: "notSelectable".into(),
+            value_type: "boolean".into(),
+            value: "false".into(),
+            description: None,
+        });
+    }
+    if let Some(filter) = property_filter.as_ref() {
+        // Only what was asked for, plus the notSelectable flag of an
+        // abstract concept; designations are a property too.
+        resp.properties.retain(|p| {
+            filter.contains(&p.code) || (p.code == "notSelectable" && p.value == "true")
+        });
+        if !filter.iter().any(|p| p == "designation") {
+            resp.designations.clear();
+        }
+    }
+    // A single requested display language the code system has nothing in.
+    if let Some(lang) = display_language.as_deref().filter(|l| {
+        !l.contains(',')
+            && l.split('-').next().is_some_and(|p| {
+                (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic())
+            })
+    }) {
+        let has_lang = base_lang_matched
+            || cs_language
+                .as_deref()
+                .is_some_and(|cl| crate::language::lang_matches(lang, cl))
+            || resp.designations.iter().any(|d| {
+                d.language
+                    .as_deref()
+                    .is_some_and(|dl| crate::language::lang_matches(lang, dl))
+            });
+        if !has_lang {
+            parameter.push(json!({
+                "name": "warning",
+                "valueString": format!(
+                    "The code system {system} has no display or designation in the requested \
+                     language '{lang}'"
+                ),
+            }));
+        }
     }
 
     for prop in resp.properties {
-        let value_part = property_value_part(&prop.value_type, &prop.value);
+        // A Coding property is stored as the code of a concept of this
+        // same system (LOINC part links: `SCALE_TYP` → `LP32888-7`).
+        let value_part = if prop.value_type == "coding" {
+            json!({"name": "value", "valueCoding": {"system": system, "code": prop.value}})
+        } else {
+            property_value_part(&prop.value_type, &prop.value)?
+        };
         let mut parts = vec![json!({"name": "code", "valueCode": prop.code}), value_part];
         if let Some(desc) = prop.description {
             parts.push(json!({"name": "description", "valueString": desc}));
@@ -402,6 +795,56 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     }))
 }
 
+/// `$lookup` of a UCUM unit expression (see [`crate::ucum`]): the code is its
+/// own display, with its description (`(milligram) / (deciliter)`) and the
+/// common units value set's name for it as designations.
+async fn ucum_lookup<B: TerminologyBackend>(
+    state: &AppState<B>,
+    code: &str,
+) -> Result<Value, HtsError> {
+    use crate::ucum_validate::{UCUM_URL, is_valid_ucum_code};
+    if !is_valid_ucum_code(code) {
+        return Err(HtsError::coded(
+            "code-invalid",
+            "invalid-code",
+            format!(
+                "Unknown code '{code}' in the CodeSystem '{UCUM_URL}': {}",
+                crate::ucum::error_message(code)
+            ),
+            Some("code"),
+        ));
+    }
+    let version = crate::ucum::stored_version(state.backend()).await;
+    let (common, _) = crate::ucum::common_units(state.backend()).await;
+    let mut parameter = vec![
+        json!({"name": "name", "valueString": "UCUM"}),
+        json!({"name": "version", "valueString": version}),
+        json!({"name": "display", "valueString": code}),
+        json!({"name": "system", "valueUri": UCUM_URL}),
+        json!({"name": "code", "valueCode": code}),
+        json!({"name": "property", "part": [
+            {"name": "code", "valueCode": "inactive"},
+            {"name": "value", "valueBoolean": false}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": code}]}),
+        json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "value", "valueString": crate::ucum::description(code)}]}),
+    ];
+    if let Some(name) = common
+        .iter()
+        .find(|(c, _)| c == code)
+        .and_then(|(_, d)| d.as_deref())
+    {
+        parameter.push(json!({"name": "designation", "part": [
+            {"name": "language", "valueCode": "en"},
+            {"name": "use", "valueCoding": {"system": "http://snomed.info/sct", "code": "900000000000013009"}},
+            {"name": "value", "valueString": name}]}));
+    }
+    Ok(json!({"resourceType": "Parameters", "parameter": parameter}))
+}
+
 /// `POST /CodeSystem/$lookup`
 ///
 /// Accepts a FHIR `Parameters` body.  The `system` (CodeSystem URL) and `code`
@@ -418,7 +861,10 @@ pub async fn lookup_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/$lookup?system=<url>&code=<code>`
@@ -437,22 +883,6 @@ pub async fn get_lookup_handler<B: TerminologyBackend>(
     let mut params = query_params_to_fhir_params(pairs);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
-}
-
-/// Collect every `useSupplement` input from a Parameters body, accepting
-/// either `valueCanonical` or `valueUri`. Returns the raw values so callers
-/// can later strip an optional `|version` suffix when looking up the CS.
-fn collect_supplement_inputs(params: &[Value]) -> Vec<String> {
-    params
-        .iter()
-        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some("useSupplement"))
-        .filter_map(|p| {
-            p.get("valueCanonical")
-                .or_else(|| p.get("valueUri"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect()
 }
 
 /// Inject (or replace) the `system` parameter in a FHIR params list.
@@ -502,7 +932,10 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
         .unwrap_or_default();
     let mut params = inject_system(raw_params, system);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        dispatch_tx!(state, params, process_lookup)?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/{id}/$lookup?code=<code>`
@@ -860,6 +1293,16 @@ mod tests {
     // `source = supplement_url|version` plus a `used-supplement` parameter
     // echoing the applied supplement.
     fn make_supplement_app() -> Router {
+        make_supplement_app_with(supplement_backend(), true)
+    }
+
+    fn make_supplement_app_strict() -> Router {
+        make_supplement_app_with(supplement_backend(), false)
+    }
+
+    /// Base CodeSystem `extensions` + supplement `supplement` contributing a
+    /// Dutch designation for `code1`.
+    fn supplement_backend() -> SqliteTerminologyBackend {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         {
             let conn = backend.pool().get().unwrap();
@@ -887,13 +1330,78 @@ mod tests {
             )
             .unwrap();
         }
-        let state = AppState::new(backend);
+        backend
+    }
+
+    /// `auto_supplements=false` restores the strict FHIR behaviour where a
+    /// supplement applies only when named (`useSupplement`).
+    fn make_supplement_app_with(
+        backend: SqliteTerminologyBackend,
+        auto_supplements: bool,
+    ) -> Router {
+        let state = AppState::new(backend).with_auto_supplements(auto_supplements);
         Router::new()
             .route(
                 "/CodeSystem/$lookup",
-                post(lookup_handler::<SqliteTerminologyBackend>),
+                post(lookup_handler::<SqliteTerminologyBackend>)
+                    .get(get_lookup_handler::<SqliteTerminologyBackend>),
             )
             .with_state(state)
+    }
+
+    async fn get(app: Router, uri: &str) -> axum::response::Response {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn has_designation(json: &Value, value: &str) -> bool {
+        json["parameter"].as_array().unwrap().iter().any(|p| {
+            p["name"] == "designation"
+                && p["part"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|q| q["valueString"] == value))
+        })
+    }
+
+    /// GET turns every query parameter into a `valueString`; `useSupplement`
+    /// must still be honoured (it was read from valueCanonical/valueUri only,
+    /// so GET silently dropped it).
+    #[tokio::test]
+    async fn get_lookup_honours_use_supplement() {
+        let app = make_supplement_app_strict();
+        let base =
+            "/CodeSystem/$lookup?system=http://hl7.org/fhir/test/CodeSystem/extensions&code=code1";
+        let without = body_json(get(app.clone(), base).await).await;
+        assert!(!has_designation(&without, "ectenoot"), "{without}");
+
+        let resp = get(
+            app.clone(),
+            &format!("{base}&useSupplement=http://hl7.org/fhir/test/CodeSystem/supplement"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        assert!(has_designation(&json, "ectenoot"), "{json}");
+        assert!(
+            json["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "used-supplement"),
+            "{json}"
+        );
+
+        let resp = get(
+            app,
+            &format!("{base}&useSupplement=http://does-not-exist/cs"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            404,
+            "unknown supplement must be rejected on GET too"
+        );
     }
 
     /// Build an app with a small hierarchy so we can exercise the synthesised
@@ -980,8 +1488,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_without_use_supplement_omits_supplement_designation() {
+    async fn lookup_auto_applies_stored_supplement_by_default() {
         let app = make_supplement_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://hl7.org/fhir/test/CodeSystem/extensions"},
+                {"name": "code", "valueCode": "code1"}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$lookup", body).await;
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let has_ectenoot = params.iter().any(|p| {
+            p["name"] == "designation"
+                && p["part"]
+                    .as_array()
+                    .map(|parts| parts.iter().any(|q| q["valueString"] == "ectenoot"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            has_ectenoot,
+            "stored supplement must be auto-applied: {json}"
+        );
+        assert!(
+            params.iter().any(|p| p["name"] == "used-supplement"
+                && p["valueCanonical"] == "http://hl7.org/fhir/test/CodeSystem/supplement|0.1.1"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_without_use_supplement_omits_supplement_designation() {
+        // Strict mode (`HTS_AUTO_SUPPLEMENTS=false`): supplements apply only
+        // when named explicitly.
+        let app = make_supplement_app_strict();
         let body = json!({
             "resourceType": "Parameters",
             "parameter": [

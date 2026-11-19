@@ -17,7 +17,7 @@
 //!
 //! All user-visible text is resolved from the Fluent catalogs in `locales/`
 //! against the locale negotiated per request by [`i18n::negotiate_locale`]
-//! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
+//! (see `crates/ui/docs/multi-language.md`); templates hold catalog keys, not prose.
 //!
 //! ## Dashboard data
 //!
@@ -38,6 +38,7 @@
 //! picker's option list widens from the tenant's stored types to every
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
+mod admin_login;
 mod bulk_export;
 mod bulk_import;
 mod capability;
@@ -71,7 +72,9 @@ pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use admin_login::ADMIN_COOKIE;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
+pub use tenants::register_tenant_purge_output;
 
 #[doc(hidden)]
 pub use conformance::{
@@ -95,7 +98,7 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Query, RawQuery, State},
+    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -204,6 +207,11 @@ struct WebState {
     /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
     /// configured â€” powers the editor's live `$expand` pickers (#365).
     terminology: Option<String>,
+    /// Browser-reachable terminology console URL (`HFS_TERMINOLOGY_PUBLIC_URL`),
+    /// when one is configured — the sidebar's Terminology link. Distinct from
+    /// `terminology`, which is where *this process* calls the server and is
+    /// often an internal address a browser cannot open.
+    terminology_public_url: Option<String>,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
@@ -220,6 +228,9 @@ struct WebState {
     /// with [`set_interactive_login`]. `None` means no login and no session
     /// gate — the pre-#1449 behaviour.
     login: Option<Arc<login::LoginRuntime>>,
+    /// The administrator sign-in (`HFS_ADMIN_PASSWORD`) guarding the admin
+    /// pages, as installed with [`set_admin_gate`]; `Open` when none was.
+    admin_gate: helios_admin_auth::AdminGate,
 }
 
 impl WebState {
@@ -306,6 +317,9 @@ pub(crate) struct RequestTenant {
     /// tenant, because it is the same per-request rendering context the
     /// topbar draws from.
     pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
+    /// The administrator signed in with `HFS_ADMIN_PASSWORD`, when this
+    /// request carries a live admin session (stamped by the admin guard).
+    pub(crate) admin_user: Option<String>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -327,6 +341,7 @@ where
                 display: None,
                 multi: false,
                 signed_in: None,
+                admin_user: None,
             }))
     }
 }
@@ -355,12 +370,17 @@ async fn resolve_prefs(
         .extensions()
         .get::<login::SignedIn>()
         .map(|s| s.0.clone());
+    let admin_user = request
+        .extensions()
+        .get::<helios_admin_auth::AdminUser>()
+        .map(|u| u.0.clone());
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
         signed_in: signed_in.clone(),
+        admin_user: admin_user.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -388,6 +408,7 @@ async fn resolve_prefs(
                 display: record.display_name,
                 multi: false,
                 signed_in: signed_in.clone(),
+                admin_user: admin_user.clone(),
             };
         }
     }
@@ -443,6 +464,34 @@ pub(crate) struct Status {
     /// every browser-originated FHIR call is refused, so the shell says so
     /// once instead of each page failing with the API's 401 text.
     bearer_only_auth: bool,
+    /// The path under which the FHIR API is reachable from the browser — the
+    /// path component of `HFS_BASE_URL`, without a trailing slash, so `""`
+    /// when the server sits at the origin root and `"/fhir"` behind a
+    /// reverse proxy that mounts it under a prefix. The layout emits it as
+    /// `<meta name="hfs-fhir-base">` and every browser-issued FHIR call is
+    /// built on it; before that, page scripts assumed the root and broke
+    /// behind any prefix.
+    fhir_base: String,
+}
+
+/// The browser-facing FHIR API path prefix for `public_base_url`
+/// (`HFS_BASE_URL`): its path with any trailing slash removed, so a root
+/// deployment yields `""` and `https://example.org/fhir/` yields `"/fhir"`.
+/// Only the path is taken, never the origin: the browser reaches the API on
+/// whatever host it reached the UI on, which may be a different name than
+/// the configured public one (a port-forward, a loopback check), and an
+/// origin mismatch would turn every call into a blocked cross-origin request.
+pub(crate) fn fhir_base_path(public_base_url: &str) -> String {
+    let path = match reqwest::Url::parse(public_base_url) {
+        Ok(url) => url.path().to_string(),
+        Err(_) => String::new(),
+    };
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// What the account menu shows for a signed-in user, derived once per request
@@ -463,6 +512,10 @@ pub(crate) struct UserSummary {
     initials: String,
     /// Avatar image URL, when the IdP sent a `picture` claim.
     photo: Option<String>,
+    /// The administrator signed in with `HFS_ADMIN_PASSWORD` rather than an
+    /// IdP user: the secondary line then says "Administrator", and Sign out
+    /// ends the admin session.
+    admin: bool,
 }
 
 impl UserSummary {
@@ -484,6 +537,19 @@ impl UserSummary {
             display,
             secondary,
             photo: principal.picture.clone(),
+            admin: false,
+        })
+    }
+
+    /// The administrator of an `HFS_ADMIN_PASSWORD` session.
+    fn admin(user: Option<&str>) -> Option<Self> {
+        let user = user?;
+        Some(Self {
+            initials: initials_of(user),
+            display: user.to_string(),
+            secondary: String::new(),
+            photo: None,
+            admin: true,
         })
     }
 }
@@ -495,34 +561,80 @@ enum TerminologyNavigation {
 }
 
 impl TerminologyNavigation {
-    fn from_config(value: Option<&str>) -> Self {
-        let Some(raw) = value else {
+    /// The browser destination for the Terminology link.
+    ///
+    /// `server` is `HFS_TERMINOLOGY_SERVER`, where this process calls the
+    /// terminology server; `public` is `HFS_TERMINOLOGY_PUBLIC_URL`, an
+    /// explicit browser-reachable console URL. The public one wins when set
+    /// and valid. Without it, a server URL whose host is one a browser could
+    /// never reach — loopback, a private range, or a single-label name such
+    /// as the `hts` of a container network — is replaced by `/ui/hts` on the
+    /// UI's own origin, the path the reverse proxy in front of both consoles
+    /// conventionally serves it at; a public server URL is linked as before.
+    fn from_config(server: Option<&str>, public: Option<&str>) -> Self {
+        if let Some(public) = public {
+            return match Self::browser_safe(public) {
+                Some(url) => Self::Valid(url),
+                None => Self::Invalid,
+            };
+        }
+        let Some(raw) = server else {
             return Self::Unconfigured;
         };
-
-        if raw.is_empty() || raw.trim() != raw {
-            return Self::Invalid;
+        match Self::browser_safe(raw) {
+            Some(url) if Self::is_internal_host(&url) => Self::Valid("/ui/hts".to_string()),
+            Some(url) => Self::Valid(url),
+            None => Self::Invalid,
         }
+    }
 
-        let Ok(url) = reqwest::Url::parse(raw) else {
-            return Self::Invalid;
-        };
+    /// `raw` when it is a clean absolute HTTP(S) URL with no credentials,
+    /// query or fragment (#611).
+    fn browser_safe(raw: &str) -> Option<String> {
+        if raw.is_empty() || raw.trim() != raw {
+            return None;
+        }
+        let url = reqwest::Url::parse(raw).ok()?;
         let valid = matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none();
+        valid.then(|| raw.to_string())
+    }
 
-        if valid {
-            Self::Valid(raw.to_string())
-        } else {
-            Self::Invalid
+    /// Whether the URL's host is one only this process can reach: loopback,
+    /// an RFC 1918 / link-local address, or a bare single-label hostname (a
+    /// Docker service name, never a public DNS name).
+    fn is_internal_host(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if let Some(domain) = parsed.domain() {
+            let domain = domain.trim_end_matches('.');
+            return domain.eq_ignore_ascii_case("localhost") || !domain.contains('.');
+        }
+        let Some(host) = parsed.host_str() else {
+            return true;
+        };
+        match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+            Err(_) => true,
         }
     }
 }
 
 impl Status {
+    /// Whether FHIR package administration is enabled (`HFS_ADMIN_UI`), so
+    /// the nav links the IG Packages page.
+    pub(crate) fn package_admin(&self) -> bool {
+        package_admin()
+    }
+
     /// Display label (`"R4"`, `"R5"`, â€¦) of the request's effective FHIR
     /// version â€” the user's stored choice when one is set, else the server
     /// default. Rendered by the sidebar selector and the dashboard's
@@ -571,8 +683,9 @@ impl Status {
         self.user.as_ref().and_then(|u| u.photo.as_deref())
     }
 
-    /// Whether the menu offers Sign out — only for an interactive session,
-    /// which `/ui/logout` ends (#1449).
+    /// Whether the menu offers Sign out — for an interactive session, which
+    /// `/ui/logout` ends (#1449), or an admin session, which
+    /// `/ui/admin/logout` ends.
     pub(crate) fn user_can_logout(&self) -> bool {
         self.user.is_some()
     }
@@ -585,17 +698,53 @@ impl Status {
     /// passes template fields to a method call by reference, so the generated
     /// code hands us `&self.i18n`.
     pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        let admin = self.user.as_ref().is_some_and(|u| u.admin);
+        let admin_hint = i18n.t("admin-user-hint");
         helios_ui_chrome::user_menu(
             i18n,
             helios_ui_chrome::UserIdentity {
                 display: self.user_display(),
-                secondary: self.user_secondary(),
+                secondary: if admin {
+                    Some(admin_hint.as_str())
+                } else {
+                    self.user_secondary()
+                },
                 initials: self.user_initials(),
                 photo: self.user_photo(),
                 can_logout: self.user_can_logout(),
-                logout_href: "/ui/logout",
+                logout_href: if admin {
+                    admin_login::LOGOUT_PATH
+                } else {
+                    "/ui/logout"
+                },
             },
         )
+    }
+
+    /// The topbar theme switcher, shared with HTS through `helios-ui-chrome`:
+    /// one button cycling system -> light -> dark (`assets/theme.js`).
+    pub(crate) fn theme_toggle(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_toggle(i18n)
+    }
+
+    /// The topbar product switcher (FHIR Server | Terminology), shared with
+    /// HTS through `helios-ui-chrome` (UI/UX review §4.2). The Terminology
+    /// entry is the same browser-safe destination as the sidebar's
+    /// Terminology link; with none configured the switcher is not rendered.
+    pub(crate) fn product_switcher(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::product_switcher(
+            i18n,
+            helios_ui_chrome::ProductLinks {
+                current: helios_ui_chrome::Product::Fhir,
+                fhir: Some(helios_ui_chrome::HFS_CONSOLE_PATH),
+                terminology: self.terminology_url(),
+            },
+        )
+    }
+
+    /// The inline first-paint theme stamp for `<head>` (shared with HTS).
+    pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::theme_boot()
     }
 
     /// A browser-safe terminology destination, when the configured value is a
@@ -617,6 +766,13 @@ impl Status {
     /// read (#344).
     pub(crate) fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+
+    /// The FHIR API path prefix for the `hfs-fhir-base` meta tag browser
+    /// calls read: `""` at the origin root, `"/fhir"` behind a prefix. See
+    /// [`fhir_base_path`].
+    pub(crate) fn fhir_base(&self) -> &str {
+        &self.fhir_base
     }
 
     /// The effective tenant's display label: its registry display name, or the
@@ -1284,6 +1440,45 @@ struct BatchPage {
     max_body_size: usize,
 }
 
+/// Validate without importing (/ui/validate): a static shell like Batch;
+/// validate-page.js sends the pasted/uploaded resource to the FHIR API's own
+/// `POST [base]/[type]/$validate` and renders the OperationOutcome.
+#[derive(Template)]
+#[template(path = "pages/validate.html")]
+struct ValidatePage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`), checked
+    /// client-side before the resource is sent, as on the Batch page.
+    max_body_size: usize,
+}
+
+/// FHIR package (IG) management (/ui/packages): a static shell whose
+/// packages.js drives the admin API (`/admin/packages`) — the Installed list,
+/// the marketplace, `.tgz` upload and the install wizard.
+#[derive(Template)]
+#[template(path = "pages/packages.html")]
+struct PackagesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// `HFS_ADMIN_UI`: when off the page explains how to enable it.
+    enabled: bool,
+}
+
+/// One installed package (/ui/packages/{name}/{version}).
+#[derive(Template)]
+#[template(path = "pages/package-detail.html")]
+struct PackageDetailPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    enabled: bool,
+    name: String,
+    version: String,
+}
+
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
 #[derive(Template)]
 #[template(path = "partials/json-view.html")]
@@ -1364,6 +1559,64 @@ struct HistoryPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// `?type=` of a deep link (`/ui/history?type=Patient&id=a12`), else
+    /// empty. The locate form is a plain GET form, so loading another
+    /// instance is a navigation that lands here with both set.
+    resource_type: String,
+    /// `?id=` of a deep link, else empty.
+    resource_id: String,
+}
+
+impl HistoryPage {
+    /// `History · Patient/a12`, or just the page name before an instance is
+    /// chosen — the `<h1>` and the head of the `<title>`.
+    fn heading(&self) -> String {
+        if self.resource_type.is_empty() || self.resource_id.is_empty() {
+            self.i18n.t("history-heading")
+        } else {
+            self.i18n.t_arg(
+                "history-heading-for",
+                "subject",
+                format!("{}/{}", self.resource_type, self.resource_id),
+            )
+        }
+    }
+
+    /// Resources › Patient › a12 › History (UI/UX review §4.2).
+    fn breadcrumb(&self) -> Result<String, askama::Error> {
+        let (resource_type, resource_id) = if self.resource_id.is_empty() {
+            ("", "")
+        } else {
+            (self.resource_type.as_str(), self.resource_id.as_str())
+        };
+        helios_ui_chrome::breadcrumb(
+            &self.i18n,
+            &editor::resource_crumbs(
+                &self.i18n,
+                resource_type,
+                resource_id,
+                Some(self.i18n.t("history-crumb")),
+            ),
+        )
+    }
+
+    /// The locate form's type field: the deep link's type, else `Patient`.
+    fn type_value(&self) -> &str {
+        if self.resource_type.is_empty() {
+            "Patient"
+        } else {
+            &self.resource_type
+        }
+    }
+}
+
+/// `?type=&id=` on `/ui/history`.
+#[derive(serde::Deserialize, Default)]
+struct HistoryQuery {
+    #[serde(rename = "type", default)]
+    resource_type: String,
+    #[serde(default)]
+    id: String,
 }
 
 /// The rendered diff fragment, swapped in when the version selection changes.
@@ -1463,6 +1716,7 @@ pub fn mount_with_body_limit(
         outbound_auth,
         fhir_version,
         terminology,
+        None,
         public_base_url,
         max_body_size,
         false,
@@ -1489,6 +1743,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1513,6 +1768,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        terminology_public_url,
         public_base_url,
         max_body_size,
         tenant_path_routing,
@@ -1627,6 +1883,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         source,
         fhir_version,
         terminology,
+        None,
         public_base_url.clone(),
         max_body_size,
         tenant_path_routing,
@@ -1652,6 +1909,7 @@ pub fn mount_with_conformance_source_and_runtime(
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
     terminology: Option<String>,
+    terminology_public_url: Option<String>,
     public_base_url: String,
     max_body_size: usize,
     tenant_path_routing: bool,
@@ -1718,6 +1976,23 @@ pub fn mount_with_conformance_source_and_runtime(
                 },
             ),
         )
+        // Validate a resource or Bundle against FHIR rules and profiles
+        // without storing it ($validate).
+        .route(
+            "/ui/validate",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    validate_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
+        // FHIR package (IG) management: install, upgrade and remove IGs
+        // from the registries, the marketplace or an uploaded .tgz.
+        .route("/ui/packages", get(packages_page))
+        .route("/ui/packages/{name}/{version}", get(package_detail_page))
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -1839,7 +2114,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/status", get(status))
         .route("/ui/history", get(history_page))
         // The diff is computed server-side (the decision in
-        // docs/history-diff-rendering.md); the browser posts the two versions
+        // crates/ui/docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route(
@@ -1926,7 +2201,17 @@ pub fn mount_with_conformance_source_and_runtime(
         // Answer 404 until a login is installed (see `login::installed`).
         .route("/ui/login", get(login::login))
         .route("/ui/callback", get(login::callback))
-        .route("/ui/logout", axum::routing::post(login::logout));
+        .route("/ui/logout", axum::routing::post(login::logout))
+        // Administrator sign-in (`HFS_ADMIN_PASSWORD`): the form, and the
+        // sign-out its session's account menu offers.
+        .route(
+            admin_login::LOGIN_PATH,
+            get(admin_login::login_page).post(admin_login::login_submit),
+        )
+        .route(
+            admin_login::LOGOUT_PATH,
+            axum::routing::post(admin_login::logout),
+        );
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
@@ -1963,6 +2248,7 @@ pub fn mount_with_conformance_source_and_runtime(
         fhir_version,
         default_tenant,
         terminology,
+        terminology_public_url,
         public_base_url,
         self_base_url,
         outbound_auth,
@@ -1972,6 +2258,7 @@ pub fn mount_with_conformance_source_and_runtime(
         ))),
         tenant_path_routing,
         login: login::installed(),
+        admin_gate: installed_admin_gate(),
     };
 
     router
@@ -1989,9 +2276,27 @@ pub fn mount_with_conformance_source_and_runtime(
         // One negotiated locale per request, in request extensions; every
         // handler and template reads this same value.
         .layer(middleware::from_fn(i18n::negotiate_locale))
+        // Lets a HTS console on the same origin offer the way back here in
+        // its product switcher (UI/UX review §4.2).
+        .layer(middleware::from_fn(advertise_console))
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // The administrator sign-in: refuses the admin pages without a
+        // session (to `/ui/admin/login`) and stamps the signed-in
+        // administrator for the account menu. Outside `resolve_prefs`, which
+        // reads that stamp; inside the OIDC session gate, so a server with
+        // both asks for the IdP login first.
+        .layer(middleware::from_fn_with_state(
+            helios_admin_auth::Guard {
+                gate: state.admin_gate.clone(),
+                protects: admin_login::protects,
+                style: helios_admin_auth::Style::Browser {
+                    login_path: admin_login::LOGIN_PATH,
+                },
+            },
+            helios_admin_auth::guard,
+        ))
         // Every self-call a page makes on the user's behalf carries the
         // browser's credential, else the signed-in session's bearer, ahead
         // of the outbound service credential (#1671).
@@ -2082,6 +2387,43 @@ async fn scope_request_authorization(
         .await
         .authorization;
     conformance::with_request_authorization(authorization, next.run(request)).await
+}
+
+/// Middleware: tell a HTS console served from the same origin that this
+/// console exists, so its topbar product switcher can link back to `/ui`
+/// (UI/UX review §4.2 — before this, HTS had no way back to HFS at all).
+/// HTS cannot know otherwise: it is configured independently and may well
+/// run on another host. A `Path=/` cookie carrying nothing but "there is
+/// one" is the smallest signal that is only ever true on a shared origin.
+/// Sent on successful `GET`s of HTML pages only (never beside a sign-in
+/// response's own cookies), and only until the browser has it.
+async fn advertise_console(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let is_get = request.method() == axum::http::Method::GET;
+    let known = !is_get
+        || helios_ui_chrome::has_hfs_console_cookie(
+            request
+                .headers()
+                .get_all(axum::http::header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+    let mut response = next.run(request).await;
+    let is_html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if !known
+        && is_html
+        && response.status() == StatusCode::OK
+        && let Ok(value) =
+            axum::http::HeaderValue::from_str(&helios_ui_chrome::hfs_console_set_cookie())
+    {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+    response
 }
 
 /// The UI routes whose handlers act on storage themselves — the tenant
@@ -2421,9 +2763,15 @@ async fn index(
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
+            // Deduplicated and capped at what the chart can plot, so a
+            // repeated or overlong list cannot become a distinct cached
+            // snapshot of its own (#2186).
+            let mut seen = std::collections::HashSet::new();
             csv.split(',')
                 .map(str::trim)
                 .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .filter(|t| seen.insert(*t))
+                .take(CHART_MAX_SERIES)
                 .map(str::to_string)
                 .collect()
         })
@@ -3250,7 +3598,7 @@ async fn search_parameters(
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.sp_catalog.invalidate(&rt.id, fhir_version);
     }
@@ -3355,6 +3703,72 @@ async fn batch_page(
         i18n: I18n::new(locale),
         active_page: "batch",
         max_body_size,
+    })
+}
+
+/// The Validate page: the shell only. validate-page.js and the shared
+/// fhir-validate.js call `$validate` against the ordinary FHIR API, so this
+/// crate never touches storage or the validator.
+async fn validate_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    max_body_size: usize,
+) -> Response {
+    render(ValidatePage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "validate",
+        max_body_size,
+    })
+}
+
+/// The IG Packages page: the shell only; packages.js calls the admin API.
+async fn packages_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(PackagesPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "packages",
+        enabled: package_admin(),
+    })
+}
+
+/// One installed package. The name and version are only echoed into data
+/// attributes (auto-escaped) for the script; a package that is not
+/// installed is reported by the script from the API's 404.
+async fn package_detail_page(
+    State(state): State<WebState>,
+    Path((name, version)): Path<(String, String)>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let safe = |s: &str, extra: &[u8]| {
+        !s.is_empty()
+            && s.len() <= 214
+            && s.as_bytes()[0].is_ascii_alphanumeric()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    if !safe(&name, b".-_") || !safe(&version, b".-+_") {
+        let back = i18n.t("packages-back");
+        return render_not_found(status, i18n, "packages", "/ui/packages", back);
+    }
+    render(PackageDetailPage {
+        status,
+        i18n,
+        active_page: "packages",
+        enabled: package_admin(),
+        name,
+        version,
     })
 }
 
@@ -3787,15 +4201,19 @@ async fn resolve_vd_by_id(
 
 /// For View Definitions: the "Recently used" group's rows, resolved against
 /// this render's own page of the server-paged rail search so
-/// label/meta/href/current match what the list already shows. "The group
-/// is never itself filtered by `?filter=`" falls out for free: an id the
+/// label/meta/href/current match what the list already shows. An id the
 /// current page/filter excludes is simply absent from `summaries` (and so
 /// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_views::VdSummary],
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -3812,11 +4230,22 @@ fn resolve_vd_recents(
             )
         })
         .collect();
-    rail.resolve_recents(
+    let mut recents = rail.resolve_recents(
         &live,
         |id| format!("/ui/sql/view-definitions?vd={id}"),
         None,
-    )
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+/// Header the SQL rails' filter inputs send while filtering as you type
+/// (#1275). Such a request re-renders the page only to swap the rail, so it
+/// must not record the echoed `?vd=`/`?lib=` as a user pick.
+const RAIL_FILTER_HEADER: &str = "x-rail-filter";
+
+fn is_live_rail_filter(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RAIL_FILTER_HEADER)
 }
 
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
@@ -3827,6 +4256,8 @@ fn resolve_vd_recents(
 /// carried over into `name:contains` — it was never a documented part of
 /// #649 and has no standard FHIR search expression (see
 /// [`sql_views::rail_search_params`] for why).
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -3834,9 +4265,11 @@ async fn sql_view_definitions_page(
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let live_filter = is_live_rail_filter(&headers);
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
     // stale or hand-edited `?page=` is a navigation mistake, not an error.
     let page = query
@@ -3905,15 +4338,21 @@ async fn sql_view_definitions_page(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    rail_state::RailPage::ViewDefinitions,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?vd=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    record_snapshot_selection(
+                        &state,
+                        &settings.user_key,
+                        &rt.id,
+                        rail_state::RailPage::ViewDefinitions,
+                        rail_before,
+                        entry,
+                    )
+                    .await
+                };
                 (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
             None => {
@@ -3932,6 +4371,11 @@ async fn sql_view_definitions_page(
                 (None, None, rail)
             }
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -3992,8 +4436,12 @@ async fn sql_view_definitions_page(
     )
     .await;
 
-    let recent_entries =
-        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
 
     // `?saved=1` (Save's own redirect) runs the just-stored definition
     // through $sql-run once, server-side, so the nojs path shows results
@@ -4953,7 +5401,7 @@ struct LibParamsCard {
 /// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
 /// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
 /// from* only needs the classification; the Columns card's own origin
-/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// lookup ([`resolve_column_sources`]) is what needs a ViewDefinition's
 /// document itself, to read its `select[].column[]` list.
 async fn resolve_table_reference(
     state: &WebState,
@@ -5006,10 +5454,82 @@ async fn resolve_table_reference(
                     let target = sql_libraries::classify_table_artifact("Library", lib);
                     (target, Some(lib.clone()))
                 }
-                None => (TableTarget::NotFound, None),
+                None => match resolve_terminology_reference(state, reference).await {
+                    Some((target, artifact)) => (target, Some(artifact)),
+                    None => (TableTarget::NotFound, None),
+                },
             }
         }
     }
+}
+
+/// Resolves a canonical `reference` that names no stored ViewDefinition or
+/// Library on the terminology server (`HFS_TERMINOLOGY_SERVER`), mirroring
+/// `crates/rest/.../sof/terminology.rs`'s own `fetch_relation` (#1824): first
+/// as a value set to expand (`POST ValueSet/$expand`, `count=0` — only
+/// whether it expands matters here, never its rows), then as a concept map
+/// (`GET ConceptMap?url=[&version=]`). `None` when no terminology server is
+/// configured, it knows neither, or it cannot be reached within the same
+/// 2500ms budget the editor's own `$expand` picker uses — the row then shows
+/// as not found, which is what `$sql-run` would report too.
+async fn resolve_terminology_reference(
+    state: &WebState,
+    reference: &str,
+) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
+    use helios_sof::sqlquery::TerminologyKind;
+    let base = state.terminology.as_deref()?.trim_end_matches('/');
+    let client = editor::terminology_client();
+    let timeout = std::time::Duration::from_millis(2500);
+
+    let expand = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": reference},
+            {"name": "count", "valueInteger": 0}
+        ]
+    });
+    if let Ok(response) = client
+        .post(format!("{base}/ValueSet/$expand"))
+        .header("Content-Type", "application/fhir+json")
+        .header("Accept", "application/fhir+json")
+        .json(&expand)
+        .timeout(timeout)
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(value_set) = response.json::<serde_json::Value>().await
+        && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
+    {
+        let target = sql_libraries::classify_terminology_artifact(
+            TerminologyKind::ValueSet,
+            &value_set,
+            reference,
+        );
+        return Some((target, value_set));
+    }
+
+    let (canonical, version) = sql_libraries::split_canonical_version(reference);
+    let mut query = vec![("url", canonical)];
+    if let Some(version) = version {
+        query.push(("version", version));
+    }
+    let response = client
+        .get(format!("{base}/ConceptMap"))
+        .query(&query)
+        .header("Accept", "application/fhir+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())?;
+    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
+    let target = sql_libraries::classify_terminology_artifact(
+        TerminologyKind::ConceptMap,
+        &concept_map,
+        reference,
+    );
+    Some((target, concept_map))
 }
 
 /// Resolves every dependency in `deps` via [`resolve_table_reference`],
@@ -5018,8 +5538,8 @@ async fn resolve_table_reference(
 /// once per render (#842's own "no redundant requests"). Returns each
 /// dependency's own [`sql_libraries::TableRow`] paired with the resolved
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
-/// former; [`resolve_view_definition_dependencies`] filters the latter down
-/// to the ViewDefinitions the Columns card needs.
+/// former; [`resolve_column_sources`] turns the pair into the table schemas
+/// the Columns card needs.
 async fn resolve_table_rows(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -5054,13 +5574,13 @@ async fn resolve_table_rows(
     rows
 }
 
-/// Resolves every dependency in `deps` down to the ViewDefinitions among
-/// them — the Columns card's own origin lookup (#842/04): `(label,
-/// resolved document)` for each dependency [`resolve_table_rows`] resolved
-/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
-/// that fails to resolve, or resolves to a SQL View or anything else, is
-/// simply absent — SQL Views never contribute a column origin (#842's own
-/// "out of scope" rule).
+/// Resolves every dependency in `deps` down to the table schemas the
+/// Columns card's own origin lookup reads (#842/04): `(label, schema)` for
+/// each dependency [`resolve_table_rows`] resolved to a ViewDefinition, a
+/// ValueSet or a ConceptMap (#1824), in declaration order
+/// ([`sql_libraries::column_sources`]). A dependency that fails to resolve,
+/// or resolves to a SQL View or anything else, is simply absent — SQL Views
+/// never contribute a column origin (#842's own "out of scope" rule).
 ///
 /// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
 /// performs the identical fetch [`resolve_table_rows`] does for the Tables
@@ -5068,23 +5588,14 @@ async fn resolve_table_rows(
 /// ran at all — a good run's own dependency resolution "happens once per
 /// dependency", not once per keystroke that leaves the run unable to
 /// happen.
-async fn resolve_view_definition_dependencies(
+async fn resolve_column_sources(
     state: &WebState,
     version: helios_fhir::FhirVersion,
     tenant: &str,
     deps: &[sql_libraries::TableDependency],
     libraries: &[serde_json::Value],
-) -> Vec<(String, serde_json::Value)> {
-    resolve_table_rows(state, version, tenant, deps, libraries)
-        .await
-        .into_iter()
-        .filter_map(|(row, doc)| match (row.target, doc) {
-            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
-                Some((row.label, doc))
-            }
-            _ => None,
-        })
-        .collect()
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    sql_libraries::column_sources(resolve_table_rows(state, version, tenant, deps, libraries).await)
 }
 
 /// [`analyze_tables`]'s pure result: everything the Tables panel needs from
@@ -5245,6 +5756,19 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
                 &format!("/ui/sql/views?lib={id}"),
                 Some(origin),
             )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::Terminology { kind, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t(match kind {
+                helios_sof::sqlquery::TerminologyKind::ValueSet => "lib-tables-kind-value-set",
+                helios_sof::sqlquery::TerminologyKind::ConceptMap => "lib-tables-kind-concept-map",
+            }),
+            chip_class: "type",
+            // The artifact lives on the terminology server, which has no
+            // page of its own on this UI to link to.
+            link_href: None,
             link_label: Some(name),
             detail: None,
         },
@@ -5877,16 +6401,18 @@ fn resolve_lib_of_kind(
 /// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. "The group is never itself filtered by `?filter=`"
-/// falls out for free: an id the current filter excludes is simply absent
+/// list already shows. An id the current filter excludes is simply absent
 /// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
-/// `{name, meta}` snapshot instead.
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
 fn resolve_lib_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_libraries::LibSummary],
     base_href: &str,
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -5903,7 +6429,9 @@ fn resolve_lib_recents(
             )
         })
         .collect();
-    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5917,8 +6445,9 @@ async fn sql_library_page(
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
+    live_filter: bool,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
         Ok(resources) => (resources, None),
         Err(error) => {
@@ -5959,10 +6488,7 @@ async fn sql_library_page(
         .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| e.name.to_lowercase().contains(&needle));
-        }
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
         s
     };
 
@@ -5992,7 +6518,13 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = rail_before.select(entry).unwrap_or(rail_before);
+                // Typing in the rail filter echoes the page's selection back
+                // as `?lib=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    rail_before.select(entry).unwrap_or(rail_before)
+                };
                 (
                     Some(SelectedLib {
                         id,
@@ -6010,6 +6542,11 @@ async fn sql_library_page(
             // evidence of deletion. The existence sweep already decided it.
             None => (None, None, rail_before),
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -6070,6 +6607,7 @@ async fn sql_library_page(
         &summaries,
         kind.base_href,
         selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
     );
 
     // `?saved=1` (Save's own redirect) runs the just-stored Library through
@@ -6234,7 +6772,7 @@ async fn sql_library_page(
             match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
                     // #842/04's own NF1: the Columns card's origin lookup
-                    // resolves dependencies to ViewDefinitions only after a
+                    // resolves dependencies to table schemas only after a
                     // run has actually succeeded — and only the ones the
                     // SQL actually reads (`dependencies_used_by_sql`), so a
                     // stale, no-longer-queried label never manufactures a
@@ -6244,15 +6782,10 @@ async fn sql_library_page(
                         .map(|s| s.sql.as_str())
                         .unwrap_or_default();
                     let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
-                    let view_definitions = resolve_view_definition_dependencies(
-                        &state, rv.0, &rt.id, &used_deps, &libraries,
-                    )
-                    .await;
-                    let columns = sql_libraries::analyze_columns(
-                        &table.columns,
-                        &raw_rows,
-                        &view_definitions,
-                    );
+                    let sources =
+                        resolve_column_sources(&state, rv.0, &rt.id, &used_deps, &libraries).await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &sources);
                     (
                         standard_notice(RunResultsState::Success(table, ms)),
                         columns,
@@ -6915,9 +7448,9 @@ struct LibRunFragment {
 ///
 /// Builds the `/run` fragment's own Columns update for a *successful* run
 /// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
-/// `deps` the SQL actually reads down to their ViewDefinitions
+/// `deps` the SQL actually reads down to their table schemas
 /// (`sql_libraries::dependencies_used_by_sql`,
-/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// [`resolve_column_sources`]), and analyzes `table`/
 /// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
 /// Query and a SQL View share this identical "good run" shape, differing
 /// only in whether declared parameters were involved getting here — called
@@ -6937,9 +7470,8 @@ async fn columns_fragment_for_success(
     libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
-    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    let sources = resolve_column_sources(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &sources);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
 
@@ -8011,9 +8543,11 @@ async fn sql_queries_page(
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
@@ -8024,6 +8558,7 @@ async fn sql_queries_page(
         &SQL_QUERY_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -8103,9 +8638,11 @@ async fn sql_views_page(
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
@@ -8116,6 +8653,7 @@ async fn sql_views_page(
         &SQL_VIEW_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -8539,7 +9077,7 @@ async fn compartments_page(
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.compartments.invalidate(&rt.id, fhir_version);
     }
@@ -8636,11 +9174,14 @@ async fn history_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    Query(query): Query<HistoryQuery>,
 ) -> Response {
     render(HistoryPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "history",
+        resource_type: query.resource_type.trim().to_string(),
+        resource_id: query.id.trim().to_string(),
     })
 }
 
@@ -8783,6 +9324,53 @@ fn dashboard_refresh() -> DashboardRefresh {
         .ok()
         .and_then(|guard| *guard)
         .unwrap_or_default()
+}
+
+static PACKAGE_ADMIN: RwLock<bool> = RwLock::new(false);
+
+static ADMIN_GATE: RwLock<Option<helios_admin_auth::AdminGate>> = RwLock::new(None);
+
+/// Install the administrator sign-in (`HFS_ADMIN_PASSWORD`) that guards the
+/// console's admin pages — IG Packages, Tenants, Bulk Import/Export, SQL
+/// Export and every state-changing form outside the read-only previews —
+/// and backs `/ui/admin/login`. Called once from the server's startup before
+/// the UI is mounted (the mount captures it); the most recent call wins. The
+/// server must guard its `/admin` API with the same gate, since the IG
+/// Packages page's script calls that API with the session cookie.
+///
+/// Without a call the UI mounts with [`helios_admin_auth::AdminGate::Open`]
+/// — no sign-in, the pre-existing behaviour — so an embedder that enables
+/// administration must install a gate (the `hfs` binary always does, and
+/// builds it to fail closed).
+pub fn set_admin_gate(gate: helios_admin_auth::AdminGate) {
+    *ADMIN_GATE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+}
+
+fn installed_admin_gate() -> helios_admin_auth::AdminGate {
+    ADMIN_GATE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or(helios_admin_auth::AdminGate::Open)
+}
+
+/// Record whether FHIR package administration is enabled
+/// (`HFS_ADMIN_UI=true`): the nav then links `/ui/packages` and the page
+/// offers install and remove. Called once from the server's startup; the
+/// most recent call wins. The admin API (`/admin/packages`) enforces the same
+/// switch on its own, so this only decides what the console shows.
+pub fn set_package_admin(enabled: bool) {
+    *PACKAGE_ADMIN
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
+fn package_admin() -> bool {
+    *PACKAGE_ADMIN
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
@@ -9719,9 +10307,16 @@ pub(crate) fn current_status(
         tenant_id: tenant.id.clone(),
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
-        terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
-        user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        terminology: TerminologyNavigation::from_config(
+            state.terminology.as_deref(),
+            state.terminology_public_url.as_deref(),
+        ),
+        // An IdP session names the user; failing that, an administrator
+        // signed in with the admin password.
+        user: UserSummary::from_session(tenant.signed_in.as_ref())
+            .or_else(|| UserSummary::admin(tenant.admin_user.as_deref())),
         bearer_only_auth: bearer_only_auth(),
+        fhir_base: fhir_base_path(&state.public_base_url),
     }
 }
 
@@ -9875,6 +10470,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -10063,6 +10659,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n("en"),
         }
@@ -10217,7 +10814,20 @@ mod tests {
         let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("PATCH"));
-        assert!(source.contains("hfs-theme"), "localStorage cache stays");
+        assert!(
+            source.contains("hfs-theme"),
+            "legacy localStorage key is migrated"
+        );
+        assert!(
+            source.contains(&format!(r#"COOKIE = "{}""#, helios_ui_chrome::THEME_COOKIE)),
+            "theme.js writes the shared cookie the boot script reads"
+        );
+        assert!(source.contains("BroadcastChannel"), "live cross-tab sync");
+        assert!(source.contains("startViewTransition"), "animated switch");
+        assert!(
+            source.contains("prefers-reduced-motion"),
+            "motion is optional"
+        );
     }
 
     #[test]
@@ -10258,6 +10868,7 @@ mod tests {
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
                 bearer_only_auth: false,
+                fhir_base: String::new(),
             },
             i18n: i18n(lang),
             active_page: "search",
@@ -10481,8 +11092,20 @@ mod tests {
             .render()
             .expect("index renders");
 
-        assert!(html.contains(r#"data-set-theme="light""#));
-        assert!(html.contains(r#"data-set-theme="dark""#));
+        // One cycling button (system -> light -> dark), not one per mode.
+        assert_eq!(html.matches("data-theme-cycle").count(), 1);
+        assert!(!html.contains("data-set-theme"));
+        assert!(html.contains(r#"aria-label="Theme: follow system""#));
+        // The first-paint stamp is inline in <head>, ahead of the deferred
+        // behaviour script.
+        let head = &html[..html.find("</head>").expect("head")];
+        let boot = head
+            .find("hfs_theme=(system|light|dark)")
+            .expect("inline boot");
+        let script = head
+            .find(r#"<script src="/ui/assets/theme.js" defer></script>"#)
+            .expect("deferred theme.js");
+        assert!(boot < script);
         assert!(html.contains("<svg"));
         assert!(html.contains(r#"fill="currentColor""#));
     }
@@ -11359,7 +11982,35 @@ mod user_summary_tests {
             terminology: TerminologyNavigation::Unconfigured,
             user,
             bearer_only_auth: false,
+            fhir_base: String::new(),
         }
+    }
+
+    #[test]
+    fn packages_page_explains_how_to_enable_it_when_admin_is_off() {
+        let html = PackagesPage {
+            status: status_with(None),
+            i18n: I18n::new(RequestLocale::default()),
+            active_page: "packages",
+            enabled: false,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains(r#"id="pkg-disabled""#));
+        assert!(html.contains("HFS_ADMIN_UI=true"));
+        assert!(!html.contains(r#"id="pkg-app""#));
+        assert!(!html.contains("packages.js"));
+    }
+
+    #[test]
+    fn fhir_base_path_is_the_public_base_urls_path_without_a_trailing_slash() {
+        assert_eq!(fhir_base_path("http://localhost:8080"), "");
+        assert_eq!(fhir_base_path("http://localhost:8080/"), "");
+        assert_eq!(fhir_base_path("https://example.org/fhir"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/fhir/"), "/fhir");
+        assert_eq!(fhir_base_path("https://example.org/a/b/"), "/a/b");
+        // Not a URL at all: fall back to the root rather than guess.
+        assert_eq!(fhir_base_path("not a url"), "");
     }
 
     #[test]
@@ -11449,5 +12100,69 @@ mod user_summary_tests {
             .unwrap();
         assert!(!html.contains("user-menu__out"), "{html}");
         assert!(!html.contains("/ui/logout"), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod terminology_navigation_tests {
+    use super::TerminologyNavigation;
+
+    fn link(server: Option<&str>, public: Option<&str>) -> Option<String> {
+        match TerminologyNavigation::from_config(server, public) {
+            TerminologyNavigation::Valid(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_public_url_wins() {
+        assert_eq!(
+            link(
+                Some("http://hts:8090"),
+                Some("https://fhir.example.org/ui/hts")
+            )
+            .as_deref(),
+            Some("https://fhir.example.org/ui/hts")
+        );
+        // Explicit but unusable: invalid, not silently replaced.
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("http://hts:8090"), Some("not a url")),
+            TerminologyNavigation::Invalid
+        ));
+    }
+
+    #[test]
+    fn internal_server_hosts_never_reach_the_browser() {
+        for internal in [
+            "http://hts:8090",
+            "http://localhost:8090",
+            "http://127.0.0.1:8090",
+            "http://10.0.0.5:8090",
+            "http://192.168.1.20",
+            "http://172.16.0.9:8090",
+            "http://[::1]:8090",
+        ] {
+            assert_eq!(
+                link(Some(internal), None).as_deref(),
+                Some("/ui/hts"),
+                "{internal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_server_url_is_linked_as_is() {
+        assert_eq!(
+            link(Some("https://tx.fhir.org/r4"), None).as_deref(),
+            Some("https://tx.fhir.org/r4")
+        );
+        assert!(matches!(
+            TerminologyNavigation::from_config(None, None),
+            TerminologyNavigation::Unconfigured
+        ));
+        assert!(matches!(
+            TerminologyNavigation::from_config(Some("ftp://hts"), None),
+            TerminologyNavigation::Invalid
+        ));
     }
 }

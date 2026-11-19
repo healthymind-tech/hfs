@@ -7,13 +7,30 @@
 //!   a create, including an update that created or restored a resource, `-1`
 //!   for a delete of a live resource, `0` otherwise). The dashboard counters
 //!   read this.
-//! - `notice` — what resource notifications should say, decided exactly as the
-//!   handlers decided subscription events before this funnel existed. `None` is
-//!   a deliberate "do not notify": conditional create/update/delete, conditional
-//!   patch and conditional batch entries never announced, and still do not.
+//! - `notice` — what resource notifications should say. A write that changed a
+//!   resource announces: conditional create (`If-None-Exist`), conditional
+//!   update (an update, or the create of its upsert), conditional patch and
+//!   conditional delete announce exactly as their unconditional counterparts
+//!   do, whether sent directly or as a batch or transaction entry (#862; they
+//!   were silent until then). A conditional write that wrote nothing — a
+//!   matched `If-None-Exist`, a conditional delete with no match — is not
+//!   reported by the direct and batch handlers at all. The one exception is
+//!   inherited: a transaction entry decides its notice by HTTP status (#1023),
+//!   so a matched `ifNoneExist` entry (200) still carries an Update notice,
+//!   with a live delta of 0. `None` remains how a handler says "count, but do
+//!   not notify".
 //!
 //! Consumers (the dashboard counters, the subscriptions engine) subscribe to
 //! [`AppState::write_observer`]; nothing here depends on which are wired.
+//!
+//! A write whose commit outcome stays unknown (`RestError::CommitOutcomeUnknown`)
+//! reports nothing: the handler's `?` returns before [`report`], and the write
+//! may not have happened. The MongoDB backend first settles such an outcome with
+//! one read and answers `Ok` when the write is stored (#2304), so the handler
+//! runs its post-write steps as for any other committed write. See the
+//! persistence README ("Single-resource write and read errors") for how the
+//! subscriptions, the dashboard counts and the profile registry catch up after a
+//! write that stays unknown.
 
 use chrono::Utc;
 use helios_fhir::FhirVersion;

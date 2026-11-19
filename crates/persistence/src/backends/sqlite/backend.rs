@@ -123,6 +123,17 @@ pub(crate) fn load_tenant_stored_params_with_conn(
 /// Counter for generating unique in-memory database names.
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The page cache every pooled connection gets, in KiB (the negative form
+/// of `PRAGMA cache_size`): 64 MiB, or `HFS_EXPERIMENT_CACHE_KB`. The bulk
+/// index rebuild's `CREATE INDEX` tail raises it on its own connection and
+/// resets it to this value afterwards.
+pub(crate) fn connection_cache_kb() -> i64 {
+    std::env::var("HFS_EXPERIMENT_CACHE_KB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(65536)
+}
+
 /// SQLite backend for FHIR resource storage.
 ///
 /// Cloning is cheap — the pool and the registries are shared handles — and
@@ -133,10 +144,21 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
+    /// This process's queue for SQLite's single write lock. See
+    /// [`SqliteBackend::write_permit`].
+    write_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// How long a write may wait in this process's write queue before it is
+/// answered 503. Long on purpose: the queue is first-come first-served, so a
+/// write only waits this long behind this many seconds of other writes.
+const WRITE_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Debug for SqliteBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -347,13 +369,7 @@ impl SqliteBackend {
             // INSERT cost 1.71→1.24 ms and commit cost 1.95→1.72 ms per
             // entry. The limit is per pooled connection (pool of 10), but
             // only connections that touch that many pages grow their cache.
-            conn.execute_batch(&format!(
-                "PRAGMA cache_size = -{};",
-                std::env::var("HFS_EXPERIMENT_CACHE_KB")
-                    .ok()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(65536)
-            ))?;
+            conn.execute_batch(&format!("PRAGMA cache_size = -{};", connection_cache_kb()))?;
             // Checkpoint every ~50,000 WAL pages (~200 MiB) instead of every
             // 1,000 (~4 MiB). A bulk-ingest batch writes far more than 4 MiB
             // of WAL, so with the default every batch commit also ran a
@@ -374,6 +390,11 @@ impl SqliteBackend {
             // never fsyncs anyway.
             if enable_wal && !is_memory {
                 conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
             }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
@@ -500,11 +521,18 @@ impl SqliteBackend {
             );
         }
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
+            wal_path,
             registries,
+            write_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // Configure the connection
@@ -663,6 +691,50 @@ impl SqliteBackend {
         })?
     }
 
+    /// Waits for this process's turn at SQLite's single write lock.
+    ///
+    /// SQLite admits one writer at a time, and a connection that finds the
+    /// lock taken sleeps in the busy handler and polls again — 1, 2, 5, 10 …
+    /// 100 ms apart, in no order — until `busy_timeout` (30 s) expires. Under
+    /// concurrent writes that is the worst of both worlds: creates that take
+    /// 2 ms each queue for hundreds of milliseconds (8 VUs dropped from 375 to
+    /// 108 creates/s), and an unlucky transaction bundle keeps losing the race
+    /// until it fails 500 "rolled back" after 30-50 s while the lock was
+    /// changing hands all along.
+    ///
+    /// Writers in this process therefore queue here first, in arrival order,
+    /// and only the head of the queue asks SQLite for the lock — which it then
+    /// almost always gets at once. `busy_timeout` still covers writers in
+    /// other processes and the few write paths that do not queue.
+    ///
+    /// Taken before a pooled connection, so queued writers hold no
+    /// connection and readers are never starved of one. Never take it while
+    /// already holding it (it is not re-entrant): only the outermost write
+    /// entry points — CRUD and `begin_transaction` — call this.
+    pub(crate) async fn write_permit(&self) -> StorageResult<tokio::sync::OwnedSemaphorePermit> {
+        match tokio::time::timeout(WRITE_QUEUE_TIMEOUT, self.write_gate.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_closed)) => Err(crate::error::StorageError::Backend(
+                BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: "write queue closed".to_string(),
+                    source: None,
+                },
+            )),
+            Err(_elapsed) => Err(crate::error::StorageError::Backend(
+                BackendError::Unavailable {
+                    backend_name: "sqlite".to_string(),
+                    message: format!(
+                        "waited {} s for the write lock",
+                        WRITE_QUEUE_TIMEOUT.as_secs()
+                    ),
+                },
+            )),
+        }
+    }
+
     /// The per-tenant registry container (shared with a co-located ES backend).
     pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
         &self.registries
@@ -722,6 +794,11 @@ impl SqliteBackend {
         }
 
         Ok(())
+    }
+
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
     }
 
     /// Returns whether this is an in-memory database.
@@ -952,14 +1029,18 @@ impl SqliteBackend {
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
-            // `not-in` is intentionally omitted: the SQLite backend returns 501
-            // for it (negated value-set filtering is unimplemented), so it must
-            // not be advertised. `text-advanced` is implemented by the token
-            // handler and was previously under-advertised.
+            // The terminology-backed modifiers (`in`, `not-in`, and `below` /
+            // `above` on a token) are expanded by the REST layer into the
+            // plain (or `:not`) token OR-lists this backend answers natively.
+            // `text-advanced` is implemented by the token handler and was
+            // previously under-advertised.
             SearchParamType::Token => vec![
                 "not",
                 "text",
                 "in",
+                "not-in",
+                "below",
+                "above",
                 "of-type",
                 "code-text",
                 "text-advanced",
@@ -1029,6 +1110,77 @@ mod tests {
             synchronous, 1,
             "a WAL file backend should use synchronous=NORMAL"
         );
+    }
+
+    /// #2365: `init_schema`, the entry point every SQLite start goes through,
+    /// refuses a database that records a newer `schema_version`, names the
+    /// database, and leaves the recorded version alone.
+    #[test]
+    fn init_schema_refuses_a_newer_schema_version_and_names_the_database() {
+        let newer = schema::SCHEMA_VERSION + 1;
+        let set_newer = |backend: &SqliteBackend| {
+            let conn = backend.get_connection().unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [newer])
+                .unwrap();
+        };
+        let stored = |backend: &SqliteBackend| -> i32 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // A database file written by a "newer" build, opened by this one. The
+        // assertion is on the file name, not the full path, because
+        // `sqlite3_db_filename` normalises the path on Windows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        {
+            let backend =
+                SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+            backend.init_schema().unwrap();
+            set_newer(&backend);
+        }
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        let err = backend
+            .init_schema()
+            .expect_err("a newer database must be refused");
+        let message = match err {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                ..
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        };
+        assert!(message.contains("SQLite database '"), "{message}");
+        assert!(message.contains("newer.db'"), "{message}");
+        assert!(
+            message.contains(&format!("has schema_version {newer}")),
+            "{message}"
+        );
+        assert!(!message.contains(":memory:"), "{message}");
+        assert_eq!(
+            stored(&backend),
+            newer,
+            "the stored version must not change"
+        );
+
+        // An in-memory database has no file; `conn.path()` is empty for the
+        // shared-cache URI, so it is labelled `:memory:`.
+        let backend = SqliteBackend::in_memory().unwrap();
+        backend.init_schema().unwrap();
+        set_newer(&backend);
+        let err = backend
+            .init_schema()
+            .expect_err("a newer in-memory database must be refused");
+        assert!(
+            err.to_string().contains("SQLite database ':memory:'"),
+            "{err}"
+        );
+        assert_eq!(stored(&backend), newer);
     }
 
     #[test]
@@ -1136,8 +1288,12 @@ mod tests {
         // `:code` is a non-spec modifier and must not be advertised.
         assert!(!token_mods.contains(&"code"));
         assert!(token_mods.contains(&"text-advanced"));
-        // `not-in` returns 501, so it must not be advertised as supported.
-        assert!(!token_mods.contains(&"not-in"));
+        // The terminology-backed modifiers are resolved by the REST layer into
+        // plain / `:not` token searches, which this backend answers.
+        assert!(token_mods.contains(&"in"));
+        assert!(token_mods.contains(&"not-in"));
+        assert!(token_mods.contains(&"below"));
+        assert!(token_mods.contains(&"above"));
 
         // Reference modifiers
         let ref_mods = SqliteBackend::modifiers_for_type(SearchParamType::Reference);

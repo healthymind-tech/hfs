@@ -43,6 +43,20 @@ pub trait ConceptMapOperations: Send + Sync {
         req: TranslateRequest,
     ) -> Result<TranslateResponse, HtsError>;
 
+    /// The ConceptMaps (`url`, `version` — the default version of each URL)
+    /// that map from `system` (`reverse = false`: an element's source
+    /// system) or into it (`reverse = true`: a target system). `$translate`
+    /// consults them for `noMap` / `unmapped` rules, which have no element
+    /// row for the code.
+    async fn concept_maps_for_system(
+        &self,
+        _ctx: &TenantContext,
+        _system: &str,
+        _reverse: bool,
+    ) -> Result<Vec<(String, Option<String>)>, HtsError> {
+        Ok(Vec::new())
+    }
+
     /// Compute the transitive closure for a set of concepts.
     ///
     /// Returns a ConceptMap resource (as JSON) representing the set of

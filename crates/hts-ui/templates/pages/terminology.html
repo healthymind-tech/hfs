@@ -1,0 +1,176 @@
+{#-
+  Terminology inventory (plan F "術語總覽"): every stored CodeSystem
+  version with concept count, size, import provenance and the current-version
+  flag, plus the pin / delete actions and the database maintenance card.
+
+  Data: `GET /admin/terminology` (counts are cached server-side; while the
+  first scan of a large database runs the API answers `stats_pending`, and
+  this page re-polls itself with htmx until the counts arrive).
+  Actions are plain forms (303 back here, or to the job they queue), so the
+  page works without JavaScript.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t("hts-term-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 id="hts-term-heading" class="page-head__title">{{ chrome.i18n.t("hts-term-title") }}</h1>
+    <p class="page-head__lede">{{ chrome.i18n.t("hts-term-lede") }}</p>
+  </div>
+  <div class="page-head__actions">
+    <a class="btn btn--primary" href="/ui/hts/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
+    <a class="btn" href="/ui/hts/jobs">{{ chrome.i18n.t("hts-nav-jobs") }}</a>
+  </div>
+</section>
+
+{% if let Some(n) = notice %}
+<p class="notice" role="status" data-flash="notice">{{ chrome.i18n.t(format!("hts-term-notice-{}", n).as_str()) }}</p>
+{% endif %}
+{% if let Some(e) = error %}
+<p class="alert" role="alert" data-flash="error">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>
+{% endif %}
+
+{% if let Some(u) = unavailable %}
+  {% include "partials/hts-admin-unavailable.html" %}
+{% else %}
+<div id="hts-term-body"
+     {% if stats_pending %}hx-get="{{ refresh_url }}" hx-trigger="load delay:3s" hx-select="#hts-term-body" hx-swap="outerHTML"{% endif %}>
+  <section class="stat-grid" aria-label="{{ chrome.i18n.t("hts-term-summary") }}">
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-db") }}</span>
+      <span class="stat__value">{% if let Some(s) = db_size %}{{ s }}{% else %}&mdash;{% endif %}</span>
+      {% if let Some(r) = db_reclaimable %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-reclaimable", "size", r.to_string()) }}</span>{% endif %}
+    </article>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-systems") }}</span>
+      <span class="stat__value">{{ systems }}</span>
+      <span class="stat__sub">{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
+    </article>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-concepts") }}</span>
+      <span class="stat__value">{% if let Some(c) = concepts %}{{ c }}{% else %}&mdash;{% endif %}</span>
+      {% if let Some(at) = stats_at %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-counted", "when", at.to_string()) }}</span>{% endif %}
+    </article>
+    <article class="card stat">
+      <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-other") }}</span>
+      <span class="stat__value">{{ value_sets }} / {{ concept_maps }}</span>
+      <span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-other-sub") }}</span>
+    </article>
+  </section>
+
+  {% if stats_pending %}
+  <p class="notice" role="status" data-stats="pending"><span class="spinner" aria-hidden="true"></span> {{ chrome.i18n.t("hts-term-stats-pending") }}</p>
+  {% endif %}
+
+  <section class="card table-card">
+    <form class="toolbar" method="get" action="/ui/hts/terminology" aria-label="{{ chrome.i18n.t("hts-term-filter") }}">
+      <label class="toolbar__search">
+        <input type="search" name="q" value="{{ q }}" placeholder="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" aria-label="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="chip"><input type="checkbox" name="sort" value="size"{% if sort_size %} checked{% endif %}> {{ chrome.i18n.t("hts-term-sort-size") }}</label>
+      <label class="chip"><input type="checkbox" name="all" value="1"{% if show_all %} checked{% endif %}> {{ chrome.i18n.t("hts-term-show-all") }}</label>
+      <button class="btn" type="submit">{{ chrome.i18n.t("hts-term-filter-apply") }}</button>
+    </form>
+    <div class="table-wrap" tabindex="0">
+      <table class="data-table data-table--stack" aria-describedby="hts-term-heading" id="hts-term-table">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-term-table-caption") }}</caption>
+        <thead>
+          <tr>
+            <th scope="col" class="col-name">{{ chrome.i18n.t("hts-term-col-system") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-term-col-version") }}</th>
+            <th scope="col" class="col-num">{{ chrome.i18n.t("hts-term-col-concepts") }}</th>
+            <th scope="col" class="col-num">{{ chrome.i18n.t("hts-term-col-size") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-term-col-imported") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-term-col-source") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-term-col-current") }}</th>
+            <th scope="col" class="col-actions">{{ chrome.i18n.t("hts-term-col-actions") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if rows.is_empty() %}
+          <tr class="data-table__empty"><td colspan="8">{{ chrome.i18n.t("hts-term-empty") }}</td></tr>
+          {% endif %}
+          {% for r in rows %}
+          <tr data-system="{{ r.url }}" data-version="{{ r.version_param }}"{% if r.current %} data-current="true"{% endif %}>
+            <td class="col-name">
+              {% if !r.title.is_empty() %}{% if r.first_of_system %}<strong>{{ r.title }}</strong>{% else %}{{ r.title }}{% endif %}<br>{% endif %}
+              <span class="url">{{ r.url }}</span>
+              {% if r.status != "active" %} <span class="tag tag--retired">{{ r.status }}</span>{% endif %}
+              {% if r.is_supplement %} <span class="tag tag--muted">{{ chrome.i18n.t("hts-term-supplement") }}</span>{% endif %}
+            </td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
+            <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>
+            <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-current") }}">
+              {% if r.current %}<span class="tag tag--active">{{ chrome.i18n.t("hts-term-current") }}</span>{% endif %}
+              {% if r.pinned %}<span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
+            </td>
+            <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
+              {% if !r.is_supplement %}
+              <form method="post" action="/ui/hts/terminology/current" class="form-actions form-actions--start">
+                <input type="hidden" name="url" value="{{ r.url }}">
+                <input type="hidden" name="version" value="{{ r.version_param }}">
+                <input type="hidden" name="back" value="{{ back }}">
+                {% if r.pinned %}
+                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
+                {% else if r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
+                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
+                {% endif %}
+              </form>
+              {% endif %}
+              <a class="btn btn--danger" href="/ui/hts/terminology/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if let Some((label, href)) = more %}
+    <div class="table-foot"><span>{{ label }}</span> <a class="btn" href="{{ href }}" data-show-all>{{ chrome.i18n.t("hts-term-show-all-rows") }}</a></div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card" aria-labelledby="hts-term-other-heading">
+  <div class="card-head"><h3 id="hts-term-other-heading">{{ chrome.i18n.t("hts-term-other-heading") }}</h3></div>
+  <form class="panel" method="post" action="/ui/hts/terminology/delete-resource">
+    <p class="field__hint">{{ chrome.i18n.t("hts-term-other-help") }}</p>
+    <div class="field-row">
+      <label class="field">
+        <span class="field__label">{{ chrome.i18n.t("hts-term-other-type") }}</span>
+        <select class="field__input" name="type">
+          <option value="ValueSet">ValueSet</option>
+          <option value="ConceptMap">ConceptMap</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="field__label">{{ chrome.i18n.t("hts-term-other-url") }}</span>
+        <input class="field__input" name="url" required placeholder="http://example.org/ValueSet/x" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="field__label">{{ chrome.i18n.t("hts-term-col-version") }}</span>
+        <input class="field__input" name="version" spellcheck="false">
+      </label>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn--danger" type="submit">{{ chrome.i18n.t("hts-term-other-delete") }}</button>
+    </div>
+  </form>
+</section>
+
+<section class="card" aria-labelledby="hts-term-maint-heading">
+  <div class="card-head"><h3 id="hts-term-maint-heading">{{ chrome.i18n.t("hts-term-maint-heading") }}</h3></div>
+  <form class="panel" method="post" action="/ui/hts/terminology/compact">
+    <p class="notice notice--warn">{{ chrome.i18n.t("hts-term-compact-warning") }}</p>
+    {% if let Some(r) = db_reclaimable %}<p>{{ chrome.i18n.t_arg("hts-term-stat-reclaimable", "size", r.to_string()) }}</p>{% endif %}
+    <div class="form-actions">
+      <button class="btn" type="submit">{{ chrome.i18n.t("hts-term-compact") }}</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

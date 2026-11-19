@@ -1,0 +1,11 @@
+# Build settings shared by every checkout of the workspace.
+
+[env]
+# libsqlite3-sys compiles the bundled SQLite with SQLITE_ENABLE_MEMORY_MANAGEMENT.
+# That option exists for sqlite3_release_memory() and the soft heap limit, which
+# nothing here calls, and its cost is that every connection shares one page
+# cache behind one global mutex (pcache1 "mode 2"): each page fetch and unpin of
+# every pooled connection takes the same lock. Undefining it gives each
+# connection a private cache group, SQLite's default. See LIBSQLITE3_FLAGS in
+# libsqlite3-sys's build.rs.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"

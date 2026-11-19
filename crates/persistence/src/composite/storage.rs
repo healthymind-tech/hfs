@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -52,14 +53,16 @@ use crate::core::{
     StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
     TypeHistoryProvider, VersionedStorage,
 };
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
+use crate::error::{
+    BackendError, ResourceError, SearchError, StorageError, StorageResult, TransactionError,
+};
 use crate::tenant::TenantContext;
 use crate::types::{IncludeDirective, Page, Pagination, SearchQuery, StoredResource};
 
 use super::config::{CompositeConfig, SyncMode};
 use super::merger::ResultMerger;
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
-use super::sync::{SyncEvent, SyncManager, SyncStatus};
+use super::sync::{SyncDrainReport, SyncEvent, SyncManager, SyncStatus};
 use super::sync_failures::{
     SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
 };
@@ -94,6 +97,69 @@ pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 
 /// Type alias for a purgable backend.
 pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
+
+/// Rebuilds the primary's [`StoredResource`] from a bundle entry body.
+///
+/// Production bundle results use [`StoredResource::content_with_meta`], so
+/// `meta.versionId` and `meta.lastUpdated` are present. Older or partial
+/// entries still have to fan out — dropping them leaves the secondary
+/// missing a write that sits beside a delete in the same bundle. Version
+/// then comes from `Location` (`Type/id/_history/{vid}`), then `"1"`;
+/// `lastUpdated` from the entry header, then now.
+fn stored_from_synced_body(
+    resource: &Value,
+    tenant_id: crate::tenant::TenantId,
+    fhir_version: FhirVersion,
+    location: Option<&str>,
+    last_modified: Option<&str>,
+) -> Option<StoredResource> {
+    let resource_type = resource.get("resourceType")?.as_str()?;
+    let id = resource.get("id")?.as_str()?;
+    let version = resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+        .or_else(|| version_from_location(location))
+        .unwrap_or_else(|| {
+            warn!(
+                resource_type,
+                resource_id = id,
+                "Bundle entry has no primary versionId; syncing as version 1"
+            );
+            "1".to_string()
+        });
+    let last_updated = resource
+        .pointer("/meta/lastUpdated")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .or_else(|| last_modified.and_then(parse_rfc3339))
+        .unwrap_or_else(Utc::now);
+    Some(StoredResource::from_storage(
+        resource_type,
+        id,
+        version,
+        tenant_id,
+        resource.clone(),
+        last_updated,
+        last_updated,
+        None,
+        fhir_version,
+    ))
+}
+
+fn parse_rfc3339(instant: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(instant)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+fn version_from_location(location: Option<&str>) -> Option<String> {
+    let location = location?;
+    let (_, after) = location.split_once("/_history/")?;
+    let version = after.split(['/', '?']).next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
 
 /// Composite storage that coordinates multiple backends.
 ///
@@ -190,6 +256,33 @@ impl Default for BackendHealth {
 }
 
 impl CompositeStorage {
+    /// Records the primary's health after an update and syncs the stored
+    /// version to the secondaries — what [`ResourceStorage::update`] and
+    /// [`ResourceStorage::update_verbatim`] share.
+    async fn finish_update(
+        &self,
+        result: StorageResult<StoredResource>,
+    ) -> StorageResult<StoredResource> {
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        self.update_health(
+            primary_id,
+            result.is_ok(),
+            result.as_ref().err().map(|e| e.to_string()),
+        );
+
+        let stored = result?;
+
+        // Sync to secondaries
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
+            .await
+        {
+            warn!(error = %e, "Failed to sync update to secondaries; recorded as needing a reindex");
+        }
+
+        Ok(stored)
+    }
+
     fn has_dedicated_search_backend(&self) -> bool {
         self.config
             .backends_with_role(super::config::BackendRole::Search)
@@ -543,6 +636,22 @@ impl CompositeStorage {
             .map(|manager| manager.failure_recorder())
     }
 
+    /// Flushes the asynchronous secondary-sync queue for a shutdown (#2277).
+    ///
+    /// Waits up to `timeout` for every queued write to reach the secondaries;
+    /// whatever is still queued after that is recorded as needing a reindex
+    /// rather than written. Does nothing without secondaries, or when no
+    /// asynchronous worker was started (synchronous mode).
+    pub async fn drain_sync_queue(&self, timeout: std::time::Duration) -> SyncDrainReport {
+        match self.sync_manager {
+            Some(ref manager) => manager.drain(timeout).await,
+            None => SyncDrainReport {
+                drained: true,
+                recorded: 0,
+            },
+        }
+    }
+
     /// Routes and executes a search query.
     ///
     /// With a dedicated Search backend the whole query goes there; otherwise
@@ -704,6 +813,11 @@ impl CompositeStorage {
                     .unwrap_or_default();
 
                 let mut aux_query = SearchQuery::new(&query.resource_type);
+                // The version filter (#2254) narrows the auxiliary id set too:
+                // it is harmless when the primary answers (the primary page is
+                // already filtered) and required when this auxiliary is
+                // promoted to own the page below.
+                aux_query.fhir_version = query.fhir_version;
                 for param in part_params {
                     aux_query = aux_query.with_parameter(param);
                 }
@@ -810,7 +924,7 @@ impl CompositeStorage {
     /// Syncs bundle results to secondaries by extracting resource info from responses.
     ///
     /// Entries are grouped by resource type and synced as batches
-    /// ([`Self::sync_creates_to_secondaries`]) rather than one event each: a
+    /// ([`SyncManager::sync_events`]) rather than one event each: a
     /// transaction Bundle's entries each waited on the secondary in turn, and
     /// under Elasticsearch `refresh=wait_for` (one refresh interval per write)
     /// a bundle of a few dozen entries outran the 30s request timeout.
@@ -823,7 +937,7 @@ impl CompositeStorage {
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
-        let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
+        let mut by_type: Vec<(String, Vec<StoredResource>)> = Vec::new();
         let mut deletes: Vec<(String, String)> = Vec::new();
         for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
             if entry_result.effect == BundleEntryEffect::Deleted {
@@ -837,7 +951,7 @@ impl CompositeStorage {
                     continue;
                 };
                 if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
-                    group.retain(|(id, _)| *id != resource_id);
+                    group.retain(|resource| resource.id() != resource_id);
                 }
                 deletes.push((resource_type, resource_id));
                 continue;
@@ -864,37 +978,45 @@ impl CompositeStorage {
                     by_type.last_mut().expect("just pushed")
                 }
             };
-            group
-                .1
-                .push((resource_id.to_string(), resource_json.clone()));
+            if let Some(stored) = stored_from_synced_body(
+                resource_json,
+                tenant.tenant_id().clone(),
+                fhir_version,
+                entry_result.location.as_deref(),
+                entry_result.last_modified.as_deref(),
+            ) {
+                group.1.push(stored);
+            }
         }
         // Deletes go first, in the primary's own processing order: a create
         // that preceded a delete of the same resource was dropped from
         // `by_type` above, so what remains there is still live.
-        for (resource_type, resource_id) in deletes {
-            if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Delete {
-                    resource_type: resource_type.clone(),
-                    resource_id: resource_id.clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                })
-                .await
-            {
-                warn!(
-                    error = %e,
-                    resource_type = resource_type,
-                    resource_id = resource_id,
-                    "Failed to sync bundle entry delete to secondaries"
-                );
-            }
-        }
-        for (resource_type, resources) in by_type {
-            // The bundle path has no per-entry receipt to correct on a
-            // rejection; the per-backend statuses are for callers that do
-            // (bulk-submit), so this one discards them.
-            let _ = self
-                .sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
-                .await;
+        let mut events: Vec<SyncEvent> = deletes
+            .into_iter()
+            .map(|(resource_type, resource_id)| SyncEvent::Delete {
+                resource_type,
+                resource_id,
+                tenant_id: tenant.tenant_id().clone(),
+            })
+            .collect();
+        events.extend(
+            by_type
+                .into_iter()
+                .flat_map(|(_, resources)| resources.into_iter().map(SyncEvent::created)),
+        );
+        let Some(ref sync_manager) = self.sync_manager else {
+            return;
+        };
+        // One hand-off for the whole bundle: in asynchronous mode a single
+        // queue item, so a request dropped while the queue is full cannot
+        // leave part of the committed bundle queued and the rest unrecorded
+        // (#1545). The bundle path has no per-entry receipt to correct on a
+        // rejection, so the per-backend statuses are not needed here.
+        if let Err(e) = sync_manager.sync_events(events, &self.secondaries).await {
+            warn!(
+                error = %e,
+                "Failed to sync transaction bundle results to secondaries; recorded as needing a reindex"
+            );
         }
     }
 
@@ -912,8 +1034,7 @@ impl CompositeStorage {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-        fhir_version: FhirVersion,
-        resources: Vec<(String, Value)>,
+        resources: Vec<StoredResource>,
     ) -> Vec<SyncStatus> {
         if resources.is_empty() {
             return Vec::new();
@@ -925,7 +1046,6 @@ impl CompositeStorage {
             .sync_creates(
                 tenant.tenant_id(),
                 resource_type,
-                fhir_version,
                 resources,
                 &self.secondaries,
             )
@@ -936,7 +1056,7 @@ impl CompositeStorage {
                 warn!(
                     error = %e,
                     resource_type,
-                    "Failed to sync batch of resources to secondaries"
+                    "Failed to sync batch of resources to secondaries; recorded as needing a reindex"
                 );
                 Vec::new()
             }
@@ -1018,6 +1138,70 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn package_store(&self) -> Option<Arc<dyn crate::core::PackageStore>> {
+        // Bookkeeping lives with the primary store, where all writes land.
+        self.primary.package_store()
+    }
+
+    // The cluster seams all live on the primary store (the shared database
+    // every instance writes to), so a composite forwards each one. Without
+    // these a postgres-elasticsearch composite would silently report "no
+    // cluster stores" and stay per-instance.
+
+    fn cluster_job_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        self.primary.cluster_job_store()
+    }
+
+    fn cluster_change_feed(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_change_feed::ClusterChangeFeed>> {
+        self.primary.cluster_change_feed()
+    }
+
+    fn package_job_coordinator(
+        &self,
+    ) -> Option<Arc<dyn crate::core::package_jobs::PackageJobCoordinator>> {
+        self.primary.package_job_coordinator()
+    }
+
+    fn subscription_state_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        self.primary.subscription_state_store()
+    }
+
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+        self.primary.subscription_hydration_source()
+    }
+
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>> {
+        self.primary.subscription_delivery_outbox()
+    }
+
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        self.primary.ws_binding_token_store()
+    }
+
+    fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
+        self.primary.subscription_fanout()
+    }
+
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        // Terminology relations live beside the SQL-on-FHIR runner, in the
+        // primary store.
+        self.primary.sof_terminology_store()
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,
@@ -1043,16 +1227,10 @@ impl ResourceStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: stored.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            })
+            .sync_to_secondaries(SyncEvent::created(stored.clone()))
             .await
         {
-            warn!(error = %e, "Failed to sync create to secondaries");
+            warn!(error = %e, "Failed to sync create to secondaries; recorded as needing a reindex");
             // Don't fail the operation - primary succeeded
         }
 
@@ -1088,16 +1266,16 @@ impl ResourceStorage for CompositeStorage {
         });
         self.update_health(primary_id, backend_failure.is_none(), backend_failure);
 
-        let created: Vec<(String, Value)> = results
+        let created: Vec<StoredResource> = results
             .iter()
             .filter_map(|result| result.as_ref().ok())
-            .map(|stored| (stored.id().to_string(), stored.content().clone()))
+            .cloned()
             .collect();
         // `create_many` has no per-entry receipt to correct either — that is
         // `CompositeSubmitJobs::sync_ingested`'s job, which calls
         // `sync_creates_to_secondaries` itself and inspects the statuses.
         let _ = self
-            .sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
+            .sync_creates_to_secondaries(tenant, resource_type, created)
             .await;
 
         results
@@ -1135,26 +1313,13 @@ impl ResourceStorage for CompositeStorage {
         // backends whose `create` rejects an existing id would otherwise drop
         // the write and go stale.
         let event = if created && stored.version_id() == "1" {
-            SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            }
+            SyncEvent::created(stored.clone())
         } else {
-            SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version,
-            }
+            SyncEvent::updated(stored.clone())
         };
 
         if let Err(e) = self.sync_to_secondaries(event).await {
-            warn!(error = %e, "Failed to sync create_or_update to secondaries");
+            warn!(error = %e, "Failed to sync create_or_update to secondaries; recorded as needing a reindex");
         }
 
         Ok((stored, created))
@@ -1187,33 +1352,22 @@ impl ResourceStorage for CompositeStorage {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let result = self.primary.update(tenant, current, resource.clone()).await;
+        let result = self.primary.update(tenant, current, resource).await;
+        self.finish_update(result).await
+    }
 
-        let primary_id = self.config.primary_id().unwrap_or("primary");
-        self.update_health(
-            primary_id,
-            result.is_ok(),
-            result.as_ref().err().map(|e| e.to_string()),
-        );
-
-        let stored = result?;
-
-        // Sync to secondaries
-        if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: current.resource_type().to_string(),
-                resource_id: current.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
-            .await
-        {
-            warn!(error = %e, "Failed to sync update to secondaries");
-        }
-
-        Ok(stored)
+    #[instrument(skip(self, tenant, resource), fields(resource_type = %current.resource_type(), id = %current.id()))]
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let result = self
+            .primary
+            .update_verbatim(tenant, current, resource)
+            .await;
+        self.finish_update(result).await
     }
 
     #[instrument(skip(self, tenant), fields(resource_type = %resource_type, id = %id))]
@@ -1225,11 +1379,21 @@ impl ResourceStorage for CompositeStorage {
     ) -> StorageResult<()> {
         let result = self.primary.delete(tenant, resource_type, id).await;
 
+        // Nothing to delete (`NotFound`) is the primary answering, not the
+        // primary failing. The REST layer turns it into a `204` no-op (#2523),
+        // so clients may repeat deletes freely; counting each repeat as a
+        // failure would let them mark the primary unhealthy. Nothing changed,
+        // so nothing is synced to the secondaries either.
+        let refused = matches!(result, Err(StorageError::Resource(_)));
         let primary_id = self.config.primary_id().unwrap_or("primary");
         self.update_health(
             primary_id,
-            result.is_ok(),
-            result.as_ref().err().map(|e| e.to_string()),
+            result.is_ok() || refused,
+            result
+                .as_ref()
+                .err()
+                .filter(|_| !refused)
+                .map(|e| e.to_string()),
         );
 
         result?;
@@ -1243,7 +1407,7 @@ impl ResourceStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete to secondaries");
+            warn!(error = %e, "Failed to sync delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(())
@@ -1294,7 +1458,7 @@ impl ResourceStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete to secondaries");
+            warn!(error = %e, "Failed to sync delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(())
@@ -1549,6 +1713,48 @@ impl SearchProvider for CompositeStorage {
         result
     }
 
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Same selection as `search_ids`. A routed auxiliary merge filters the
+        // page by id sets, which a one-pass distinct-value read would skip, so
+        // the resolver keeps paging in that case.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let Some(provider) = self.search_providers.get(backend_id) else {
+            return Ok(None);
+        };
+        let result = provider
+            .search_reference_values(tenant, query, reference_param)
+            .await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
@@ -1607,6 +1813,25 @@ impl SearchProvider for CompositeStorage {
         ))
     }
 
+    fn supports_search(&self) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider. No provider at all means
+        // `search` answers `UnsupportedCapability`, so `false` (#514).
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.supports_search();
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.supports_search())
+            .unwrap_or(false)
+    }
+
     fn supports_contained_search(&self) -> bool {
         // Same routing as `search`: defer to the dedicated Search backend when
         // configured, otherwise the primary provider.
@@ -1644,6 +1869,39 @@ impl SearchProvider for CompositeStorage {
             .get(self.config.primary_id().unwrap_or("primary"))
             .map(|p| p.modifiers_for_param_type(param_type))
             .unwrap_or_default()
+    }
+
+    async fn distinct_meta_values(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+        param: &str,
+    ) -> StorageResult<Vec<crate::core::DistinctMetaValue>> {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            && let Some(provider) = self.search_providers.get(&search_backend.id)
+        {
+            return provider
+                .distinct_meta_values(tenant, resource_type, param)
+                .await;
+        }
+        match self
+            .search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+        {
+            Some(provider) => {
+                provider
+                    .distinct_meta_values(tenant, resource_type, param)
+                    .await
+            }
+            None => Err(StorageError::Search(SearchError::IncludeNotSupported {
+                operation: "type- and system-level $meta".to_string(),
+            })),
+        }
     }
 
     /// A composite's search lags its primary on two axes, and this closes
@@ -1692,9 +1950,9 @@ impl ConditionalStorage for CompositeStorage {
     /// Composed, not copied from the primary (#1384). With a dedicated search
     /// backend the composite resolves the criteria itself and needs only plain
     /// CRUD from the primary — which is how `s3-elasticsearch` serves all four
-    /// over a primary that declares none. Patch included (#1406): the patch is
-    /// applied by the shared [`apply_patch`](crate::core::apply_patch), not by
-    /// the primary.
+    /// over a primary that declares only an identifier-scoped create (#1435).
+    /// Patch included (#1406): the patch is applied by the shared
+    /// [`apply_patch`](crate::core::apply_patch), not by the primary.
     fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
         if self.has_dedicated_search_backend() {
             return true;
@@ -1757,16 +2015,10 @@ impl ConditionalStorage for CompositeStorage {
                         .await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Create {
-                            resource_type: resource_type.to_string(),
-                            resource_id: created.id().to_string(),
-                            content: created.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            fhir_version,
-                        })
+                        .sync_to_secondaries(SyncEvent::created(created.clone()))
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_create to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_create to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalCreateResult::Created(created))
@@ -1792,16 +2044,10 @@ impl ConditionalStorage for CompositeStorage {
         // Sync created resource to secondaries
         if let ConditionalCreateResult::Created(ref stored) = result {
             if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Create {
-                    resource_type: resource_type.to_string(),
-                    resource_id: stored.id().to_string(),
-                    content: stored.content().clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                    fhir_version,
-                })
+                .sync_to_secondaries(SyncEvent::created(stored.clone()))
                 .await
             {
-                warn!(error = %e, "Failed to sync conditional_create to secondaries");
+                warn!(error = %e, "Failed to sync conditional_create to secondaries; recorded as needing a reindex");
             }
         }
 
@@ -1836,18 +2082,12 @@ impl ConditionalStorage for CompositeStorage {
                             .await?;
 
                         if let Err(e) = self
-                            .sync_to_secondaries(SyncEvent::Create {
-                                resource_type: resource_type.to_string(),
-                                resource_id: created.id().to_string(),
-                                content: created.content().clone(),
-                                tenant_id: tenant.tenant_id().clone(),
-                                fhir_version,
-                            })
+                            .sync_to_secondaries(SyncEvent::created(created.clone()))
                             .await
                         {
                             warn!(
                                 error = %e,
-                                "Failed to sync conditional_update create to secondaries"
+                                "Failed to sync conditional_update create to secondaries; recorded as needing a reindex"
                             );
                         }
 
@@ -1870,17 +2110,10 @@ impl ConditionalStorage for CompositeStorage {
                     let updated = self.primary.update(tenant, &current, resource).await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Update {
-                            resource_type: resource_type.to_string(),
-                            resource_id: updated.id().to_string(),
-                            content: updated.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            version: updated.version_id().to_string(),
-                            fhir_version: updated.fhir_version(),
-                        })
+                        .sync_to_secondaries(SyncEvent::updated(updated.clone()))
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_update to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_update to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalUpdateResult::Updated(updated))
@@ -1912,31 +2145,18 @@ impl ConditionalStorage for CompositeStorage {
         match &result {
             ConditionalUpdateResult::Created(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Create {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version,
-                    })
+                    .sync_to_secondaries(SyncEvent::created(stored.clone()))
                     .await
                 {
-                    warn!(error = %e, "Failed to sync conditional_update create to secondaries");
+                    warn!(error = %e, "Failed to sync conditional_update create to secondaries; recorded as needing a reindex");
                 }
             }
             ConditionalUpdateResult::Updated(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Update {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        version: stored.version_id().to_string(),
-                        fhir_version: stored.fhir_version(),
-                    })
+                    .sync_to_secondaries(SyncEvent::updated(stored.clone()))
                     .await
                 {
-                    warn!(error = %e, "Failed to sync conditional_update to secondaries");
+                    warn!(error = %e, "Failed to sync conditional_update to secondaries; recorded as needing a reindex");
                 }
             }
             _ => {}
@@ -1988,7 +2208,7 @@ impl ConditionalStorage for CompositeStorage {
                         })
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_delete to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalDeleteResult::Deleted(current))
@@ -2019,7 +2239,7 @@ impl ConditionalStorage for CompositeStorage {
                 })
                 .await
         {
-            warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+            warn!(error = %e, "Failed to sync conditional_delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(result)
@@ -2066,17 +2286,10 @@ impl VersionedStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
-            warn!(error = %e, "Failed to sync update_with_match to secondaries");
+            warn!(error = %e, "Failed to sync update_with_match to secondaries; recorded as needing a reindex");
         }
 
         Ok(stored)
@@ -2109,7 +2322,7 @@ impl VersionedStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete_with_match to secondaries");
+            warn!(error = %e, "Failed to sync delete_with_match to secondaries; recorded as needing a reindex");
         }
 
         Ok(())
@@ -2482,6 +2695,17 @@ impl TextSearchProvider for CompositeStorage {
     }
 }
 
+/// A summary of the composite's system-level interactions.
+///
+/// The CapabilityStatement HFS serves at `GET /metadata` is **not** generated
+/// from this: `helios-rest` builds it from the per-capability methods
+/// ([`SearchProvider::supports_search`], [`SearchProvider::supports_contained_search`],
+/// [`SearchProvider::modifiers_for_param_type`],
+/// [`ConditionalStorage::supports_conditional`] and
+/// [`BundleProvider::supports_atomic_transactions`]), each of which the
+/// composite routes to the backend that serves the request. `resources` is left
+/// empty: no per-resource capabilities are populated here, and nothing reads
+/// them.
 impl CapabilityProvider for CompositeStorage {
     fn capabilities(&self) -> StorageCapabilities {
         use std::collections::HashSet;
@@ -2499,7 +2723,10 @@ impl CapabilityProvider for CompositeStorage {
             system_interactions.insert(crate::core::SystemInteraction::Transaction);
         }
         system_interactions.insert(crate::core::SystemInteraction::Batch);
-        system_interactions.insert(crate::core::SystemInteraction::SearchSystem);
+        // No `SearchSystem`: `GET [base]?params` and `POST [base]/_search` are
+        // refused with `501` by the REST layer, and `/metadata` dropped
+        // `search-system` for that reason (#1338). This summary still claimed
+        // it (#514).
         system_interactions.insert(crate::core::SystemInteraction::HistorySystem);
 
         StorageCapabilities {
@@ -2508,7 +2735,7 @@ impl CapabilityProvider for CompositeStorage {
             resources: resource_caps,
             system_interactions,
             supports_system_history: true,
-            supports_system_search: true,
+            supports_system_search: false,
             supported_sorts: vec!["_lastUpdated".to_string(), "_id".to_string()],
             supports_total: true,
             max_page_size: Some(1000),
@@ -3154,6 +3381,176 @@ mod tests {
             .unwrap()
     }
 
+    /// Minimal mock primary that exposes every cluster seam (the shape of a
+    /// shared-database primary like Postgres), for the delegation tests.
+    struct MockClusterPrimary;
+
+    #[async_trait]
+    impl ResourceStorage for MockClusterPrimary {
+        fn backend_name(&self) -> &'static str {
+            "cluster-mock"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Ok(StoredResource::new(
+                resource_type,
+                &id,
+                tenant.tenant_id().clone(),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Ok(StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                tenant.tenant_id().clone(),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        fn cluster_job_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+            Some(Arc::new(
+                crate::core::cluster_job_store::testing::InMemoryClusterJobStore::new(),
+            ))
+        }
+
+        fn subscription_state_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+            Some(Arc::new(
+                crate::core::subscription_state::testing::InMemorySubscriptionStateStore::new(),
+            ))
+        }
+
+        fn subscription_hydration_source(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>> {
+            Some(Arc::new(
+                crate::core::subscription_state::testing::InMemoryHydrationSource::new(),
+            ))
+        }
+
+        fn subscription_delivery_outbox(
+            &self,
+        ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>>
+        {
+            Some(Arc::new(
+                crate::core::subscription_delivery::testing::InMemoryDeliveryOutbox::new(),
+            ))
+        }
+
+        fn ws_binding_token_store(
+            &self,
+        ) -> Option<Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+            Some(Arc::new(
+                crate::core::ws_binding_tokens::testing::InMemoryWsTokenStore::new(),
+            ))
+        }
+
+        fn subscription_fanout(&self) -> Option<Arc<dyn crate::core::event_fanout::EventFanout>> {
+            Some(Arc::new(
+                crate::core::event_fanout::testing::InMemoryEventFanout::default(),
+            ))
+        }
+    }
+
+    /// Every cluster seam forwards to the primary: a composite over a
+    /// seam-capable primary exposes them all; one over a seam-less primary
+    /// inherits `None` for them all.
+    #[test]
+    fn cluster_seams_delegate_to_the_primary() {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Postgres)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(MockClusterPrimary) as DynStorage,
+        );
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        assert!(composite.cluster_job_store().is_some());
+        assert!(composite.subscription_state_store().is_some());
+        assert!(composite.subscription_hydration_source().is_some());
+        assert!(composite.subscription_delivery_outbox().is_some());
+        assert!(composite.ws_binding_token_store().is_some());
+        assert!(composite.subscription_fanout().is_some());
+
+        let plain = make_composite_no_secondary();
+        assert!(plain.cluster_job_store().is_none());
+        assert!(plain.subscription_state_store().is_none());
+        assert!(plain.subscription_hydration_source().is_none());
+        assert!(plain.subscription_delivery_outbox().is_none());
+        assert!(plain.ws_binding_token_store().is_none());
+        assert!(plain.subscription_fanout().is_none());
+    }
+
     // ── PurgableStorage fan-out ────────────────────────────────────
 
     /// Records purge calls, and optionally refuses them.
@@ -3524,6 +3921,8 @@ mod tests {
         /// When set, `search` answers `UnsupportedCapability`, as a primary
         /// without the routed feature does.
         unsupported: std::sync::atomic::AtomicBool,
+        /// Reference parameters passed to `search_reference_values`.
+        reference_calls: Mutex<Vec<String>>,
     }
 
     impl RecordingSearchProvider {
@@ -3535,7 +3934,15 @@ mod tests {
                 registry: None,
                 native_reverse: std::sync::atomic::AtomicBool::new(false),
                 unsupported: std::sync::atomic::AtomicBool::new(false),
+                reference_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn reference_call_count(&self) -> usize {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .len()
         }
 
         /// Attaches a search-parameter registry so `search_param_registry`
@@ -3632,6 +4039,12 @@ mod tests {
 
     #[async_trait]
     impl SearchProvider for RecordingSearchProvider {
+        /// A provider whose `search` answers `UnsupportedCapability` says so,
+        /// as S3 does.
+        fn supports_search(&self) -> bool {
+            !self.unsupported.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn supports_native_reverse_chains(&self, _: &TenantContext, _: &SearchQuery) -> bool {
             self.native_reverse
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -3656,6 +4069,19 @@ mod tests {
                 SearchResult::new(Page::new(self.results.clone(), PageInfo::end()))
                     .with_total(self.results.len() as u64),
             )
+        }
+
+        async fn search_reference_values(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+            reference_param: &str,
+        ) -> StorageResult<Option<Vec<String>>> {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .push(reference_param.to_string());
+            Ok(Some(vec![format!("Patient/{}", self.name)]))
         }
 
         async fn search_count(
@@ -3782,6 +4208,99 @@ mod tests {
             StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
                 if backend_name == "primary"
         ));
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_uses_the_same_provider_fallback_as_search_ids() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Observation");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(vec![], vec![]);
+
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/search".to_string()]));
+        assert_eq!(search.reference_call_count(), 1);
+        assert_eq!(primary.reference_call_count(), 0);
+
+        composite.search_providers.remove("search");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, None, "no provider means the resolver pages");
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) = make_composite_no_search_backend(vec![]);
+        let values = composite
+            .search_reference_values(&tenant, &SearchQuery::new("Observation"), "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_is_none_when_routing_has_auxiliary_targets() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .graph_backend("graph", BackendKind::Sqlite)
+            .with_routing_rule(
+                super::super::config::RoutingRule::new("reverse", "graph")
+                    .with_trigger(super::super::analyzer::QueryFeature::ReverseChaining),
+            )
+            .build()
+            .unwrap();
+        let primary = Arc::new(RecordingSearchProvider::new("primary", vec![]));
+        let graph = Arc::new(RecordingSearchProvider::new("graph", vec![]));
+        let mut backends = HashMap::new();
+        backends.insert("primary".into(), primary.clone() as DynStorage);
+        backends.insert("graph".into(), graph.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".into(), primary.clone() as DynSearchProvider);
+        providers.insert("graph".into(), graph.clone() as DynSearchProvider);
+        let merged = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+
+        let mut query = SearchQuery::new("Patient");
+        query
+            .reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Observation",
+                "patient",
+                "code",
+                SearchValue::eq("http://loinc.org|8302-2"),
+            ));
+        let values = merged
+            .search_reference_values(&tenant, &query, "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, None);
+        assert_eq!(primary.reference_call_count(), 0);
+        assert_eq!(graph.reference_call_count(), 0);
     }
 
     #[test]
@@ -3983,6 +4502,68 @@ mod tests {
         assert_eq!(page.sort.len(), 1);
         assert_eq!(page.count, Some(2));
         assert_eq!(page.offset, Some(2));
+    }
+
+    /// #2254: a split search keeps the version filter on every leg — the
+    /// primary page, the auxiliary id drain, and the auxiliary page when it is
+    /// promoted — and a version-blind query sends none.
+    #[tokio::test]
+    async fn split_search_carries_the_fhir_version_to_every_leg() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let version = helios_fhir::FhirVersion::R4;
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![fake_patient("a")], vec![fake_patient("a")]);
+        composite
+            .search(&tenant, &split_page_query().with_fhir_version(version))
+            .await
+            .unwrap();
+        let primary_calls = primary.calls.lock().unwrap().clone();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert!(
+            primary_calls
+                .iter()
+                .chain(&aux_calls)
+                .all(|call| call.fhir_version == Some(version)),
+            "primary and auxiliary both filter"
+        );
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![], vec![fake_patient("a")]);
+        primary
+            .unsupported
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        composite
+            .search(&tenant, &split_page_query().with_fhir_version(version))
+            .await
+            .unwrap();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert_eq!(aux_calls.len(), 2, "id drain, then the promoted page");
+        assert!(
+            aux_calls
+                .iter()
+                .all(|call| call.fhir_version == Some(version)),
+            "the promoted page owns the result, so it must filter"
+        );
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![fake_patient("a")], vec![fake_patient("a")]);
+        composite
+            .search(&tenant, &split_page_query())
+            .await
+            .unwrap();
+        let primary_calls = primary.calls.lock().unwrap().clone();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert!(
+            primary_calls
+                .iter()
+                .chain(&aux_calls)
+                .all(|call| call.fhir_version.is_none()),
+            "no version named: none sent"
+        );
     }
 
     #[tokio::test]
@@ -4538,6 +5119,59 @@ mod tests {
         assert_eq!(health.failure_count, threshold);
     }
 
+    /// #2523: a delete with nothing to delete is a `204` no-op on the wire, so
+    /// clients may repeat it. The primary's `NotFound` is the primary
+    /// answering; counting it as a failure let repeated deletes mark a healthy
+    /// primary unhealthy. Still `NotFound` to the caller, which is what the
+    /// REST layer turns into the no-op.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn delete_with_nothing_to_delete_keeps_the_primary_healthy() {
+        use crate::backends::sqlite::SqliteBackend;
+
+        let primary = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        primary.init_schema().expect("init schema");
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+        let tenant = make_tenant();
+
+        composite
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        composite.delete(&tenant, "Patient", "p1").await.unwrap();
+
+        let threshold = composite.config.health_config.failure_threshold;
+        for id in std::iter::repeat_n(["p1", "never-existed"], threshold as usize).flatten() {
+            let err = composite
+                .delete(&tenant, "Patient", id)
+                .await
+                .expect_err("nothing to delete");
+            assert!(
+                matches!(
+                    err,
+                    StorageError::Resource(crate::error::ResourceError::NotFound { .. })
+                ),
+                "{id}: {err:?}"
+            );
+        }
+
+        let health = composite.backend_health("primary").unwrap();
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.failure_count, 0);
+        assert!(health.last_error.is_none());
+    }
+
     #[test]
     fn test_update_health_ignores_unknown_backend() {
         let composite = make_composite_no_secondary();
@@ -4639,6 +5273,98 @@ mod tests {
         let composite = make_composite_no_secondary();
         let caps = composite.capabilities();
         assert_eq!(caps.backend_name, "composite");
+    }
+
+    /// The summary no longer claims system-level search: `GET [base]?params`
+    /// is refused with `501` by the REST layer, and `/metadata` dropped
+    /// `search-system` for that reason (#1338). It still claimed it until #514.
+    /// The statement HFS serves is built from the per-capability methods, not
+    /// from this, and no resource-level capabilities are populated.
+    #[test]
+    fn test_capabilities_do_not_claim_system_search() {
+        use crate::core::SystemInteraction;
+
+        let composite = make_composite_no_secondary();
+        let caps = composite.capabilities();
+        assert!(!caps.supports_system_search);
+        assert!(
+            !caps
+                .system_interactions
+                .contains(&SystemInteraction::SearchSystem)
+        );
+        assert!(!composite.supports_system_interaction(SystemInteraction::SearchSystem));
+        // What it does serve is unchanged.
+        assert!(caps.supports_system_history);
+        assert!(composite.supports_system_interaction(SystemInteraction::HistorySystem));
+        assert!(composite.supports_system_interaction(SystemInteraction::Batch));
+        assert!(caps.resources.is_empty());
+    }
+
+    /// `supports_search` follows the provider `search` reaches (#514): the
+    /// dedicated Search backend when one is configured, the primary's
+    /// provider otherwise, and `false` when there is none. Each answer is
+    /// checked against what a `search` call really does.
+    #[tokio::test]
+    async fn supports_search_follows_the_provider_search_reaches() {
+        use std::sync::atomic::Ordering;
+
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient");
+        let is_unsupported = |result: StorageResult<SearchResult>| {
+            matches!(
+                result,
+                Err(StorageError::Backend(
+                    BackendError::UnsupportedCapability { .. }
+                ))
+            )
+        };
+
+        // A dedicated Search backend answers for the composite, whatever the
+        // primary says.
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        search.unsupported.store(true, Ordering::Relaxed);
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+
+        search.unsupported.store(false, Ordering::Relaxed);
+        primary.unsupported.store(true, Ordering::Relaxed);
+        assert!(
+            composite.supports_search(),
+            "the primary is not consulted while a search backend is configured"
+        );
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        // A configured Search backend with no provider registered falls back
+        // to the primary, in `supports_search` as in `search`.
+        composite.search_providers.remove("search");
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+        primary.unsupported.store(false, Ordering::Relaxed);
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        // No provider at all: `search` is `UnsupportedCapability`.
+        composite.search_providers.remove("primary");
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+
+        // No Search backend configured: the primary's provider answers.
+        let (composite, primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+        primary.unsupported.store(true, Ordering::Relaxed);
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
     }
 
     #[test]
@@ -5355,6 +6081,7 @@ mod tests {
                 reference_param: pair[0].0.to_string(),
                 target_type: pair[0].1.map(str::to_string),
                 target_param: pair[1].0.to_string(),
+                has: None,
             })
             .collect();
 

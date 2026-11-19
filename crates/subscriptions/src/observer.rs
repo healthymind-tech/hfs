@@ -8,7 +8,8 @@
 //! [`SubscriptionEngine::on_resource_event`] on a spawned task.
 //!
 //! What gets announced is decided by the write path, not here: a write whose
-//! notice is `None` (for example a conditional create) is deliberately silent,
+//! notice is `None` is deliberately silent (conditional writes are not such a
+//! case: they announce like their unconditional counterparts, upstream #862),
 //! and aggregate [`WriteEvent::Counts`] and purge [`WriteEvent::Erased`] events
 //! never produce a notification.
 
@@ -214,7 +215,7 @@ mod tests {
 
         let engine = engine();
         let topic_url = "http://example.org/topic/patient-create";
-        engine.topic_registry().add_topic(TopicDefinition {
+        engine.topic_registry().add_topic("acme", TopicDefinition {
             canonical_url: topic_url.to_string(),
             title: None,
             resource_triggers: vec![ResourceTrigger {

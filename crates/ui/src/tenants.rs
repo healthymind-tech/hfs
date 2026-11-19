@@ -55,13 +55,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use helios_persistence::core::{
-    CountBasis, DiscoveryCoverage, ErasedScope, ResourceStorage, TenantDataEvidence, TenantRecord,
-    WriteEvent,
+    CountBasis, DiscoveryCoverage, ErasedScope, ExportOutputStore, ResourceStorage,
+    TenantDataEvidence, TenantRecord, WriteEvent, delete_tenant_outputs_everywhere,
 };
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::tenant_inventory::{InventoryPhase, InventoryView, ResourceCell, ResourceTotal};
@@ -108,9 +108,24 @@ struct TenantRow {
     /// The background job for this id failed; carries the error message shown
     /// as the row's tooltip.
     failed: Option<String>,
+    /// The server's default tenant (`HFS_DEFAULT_TENANT`): every request
+    /// without a tenant lands here, so the page offers no Delete for it and
+    /// [`delete`] refuses it (UI/UX review §3.8, fork hm/p25-backlog).
+    is_default: bool,
 }
 
 impl TenantRow {
+    /// The `count` argument of the deregister dialog's impact sentence
+    /// (`tenants-delete-impact`): the measured figure when the inventory has
+    /// one (so the plural selects), else the cell's placeholder text.
+    fn impact_count(&self, i18n: &I18n) -> fluent_templates::fluent_bundle::FluentValue<'static> {
+        match self.count {
+            ResourceCell::Number { value, .. } => value.into(),
+            ResourceCell::MeasuredZero { .. } => 0u64.into(),
+            _ => self.count_view(i18n).text.into(),
+        }
+    }
+
     /// The date portion of `created_at` (`YYYY-MM-DD`), or an em dash when the
     /// tenant has no registration (data-only) and thus no known creation date.
     fn created_date(&self) -> String {
@@ -450,23 +465,19 @@ pub struct DeleteQuery {
 /// the single reservation authority shared with the `/admin/tenants` API, the
 /// request-time tenant extractor, and the storage-layer lifecycle guard, so this
 /// page cannot drift from them (issue #317).
-fn validate_id(id: &str) -> Result<(), String> {
+fn validate_id(i18n: &I18n, id: &str) -> Result<(), String> {
     use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId, TenantIdError};
 
     TenantId::parse(id).map(|_| ()).map_err(|e| match e {
-        TenantIdError::Empty => "Tenant id must not be empty.".to_string(),
-        TenantIdError::TooLong { .. } => {
-            format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters.")
-        }
-        TenantIdError::ReservedSegment { .. } => {
-            "That id is reserved for internal shared resources.".to_string()
-        }
-        TenantIdError::InvalidCharacter { .. } => {
-            "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string()
-        }
-        TenantIdError::EmptySegment => {
-            "Tenant id must not begin or end with '/' or contain an empty segment.".to_string()
-        }
+        TenantIdError::Empty => i18n.t("tenants-error-id-empty"),
+        TenantIdError::TooLong { .. } => i18n.t_arg(
+            "tenants-error-id-too-long",
+            "max",
+            MAX_TENANT_ID_LEN.to_string(),
+        ),
+        TenantIdError::ReservedSegment { .. } => i18n.t("tenants-error-id-reserved"),
+        TenantIdError::InvalidCharacter { .. } => i18n.t("tenants-error-id-invalid-character"),
+        TenantIdError::EmptySegment => i18n.t("tenants-error-id-empty-segment"),
         // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
         // back to its own `Display` rather than failing to compile here.
         other => other.to_string(),
@@ -476,11 +487,14 @@ fn validate_id(id: &str) -> Result<(), String> {
 /// Reads the tenant registry: the only read a Tenants response awaits to
 /// render its rows (#1851). Resource counts and data-only tenants come from
 /// the inventory instead.
-async fn load_registry(storage: &Arc<dyn ResourceStorage>) -> Result<Vec<TenantRecord>, String> {
+async fn load_registry(
+    i18n: &I18n,
+    storage: &Arc<dyn ResourceStorage>,
+) -> Result<Vec<TenantRecord>, String> {
     storage
         .list_tenants()
         .await
-        .map_err(|e| format!("Failed to list tenants: {e}"))
+        .map_err(|e| i18n.t_arg("tenants-error-list", "detail", e.to_string()))
 }
 
 /// The inventory's current snapshot for this app, without awaiting storage
@@ -536,6 +550,7 @@ fn merge_rows(
                 count: ResourceCell::Unknown,
                 provisioning: true,
                 failed: None,
+                is_default: false,
             }),
             Provisioning::Failed {
                 display_name,
@@ -550,6 +565,7 @@ fn merge_rows(
                         count: ResourceCell::Unknown,
                         provisioning: false,
                         failed: Some(message.clone()),
+                        is_default: false,
                     });
                 }
             }
@@ -583,6 +599,7 @@ fn merge_rows(
             id: rec.id.clone(),
             provisioning: false,
             failed: None,
+            is_default: false,
         });
     }
     // Data-only tenants (hold data but were never registered, or were
@@ -600,6 +617,7 @@ fn merge_rows(
             count: view.cell(id),
             provisioning: false,
             failed: None,
+            is_default: false,
         });
     }
     rows
@@ -892,9 +910,13 @@ async fn load_table_with_jobs(
     poll: u32,
     i18n: &I18n,
 ) -> TenantTable {
-    let registry = load_registry(storage).await;
+    let registry = load_registry(i18n, storage).await;
     let view = inventory_view(state);
-    TenantTable::build(registry, &jobs, &view, q, poll, i18n)
+    let mut table = TenantTable::build(registry, &jobs, &view, q, poll, i18n);
+    for row in &mut table.rows {
+        row.is_default = row.id == state.default_tenant;
+    }
+    table
 }
 
 /// `GET /ui/tenants` — the full page.
@@ -1015,7 +1037,7 @@ pub async fn create(
         create_response(i18n, table, err)
     };
 
-    if let Err(msg) = validate_id(&id) {
+    if let Err(msg) = validate_id(&i18n, &id) {
         return load(Some(msg)).await;
     }
     let display_name = {
@@ -1028,7 +1050,9 @@ pub async fn create(
     };
 
     match storage.get_tenant(&id).await {
-        Ok(Some(_)) => return load(Some(format!("Tenant '{id}' already exists."))).await,
+        Ok(Some(_)) => {
+            return load(Some(i18n.t_arg("tenants-error-exists", "id", id.clone()))).await;
+        }
         Ok(None) => {}
         Err(e) => return load(Some(e.to_string())).await,
     }
@@ -1060,7 +1084,12 @@ pub async fn create(
         }
     };
     let Some(claimed) = claimed else {
-        return load(Some(format!("Tenant '{id}' is already being provisioned."))).await;
+        return load(Some(i18n.t_arg(
+            "tenants-error-provisioning",
+            "id",
+            id.clone(),
+        )))
+        .await;
     };
 
     // Provision in the background: the claimed row above reports progress,
@@ -1130,6 +1159,30 @@ pub async fn create(
     response
 }
 
+/// The bulk export and submit output stores a tenant purge must empty (#2279).
+static PURGE_OUTPUT_STORES: RwLock<Vec<Arc<dyn ExportOutputStore>>> = RwLock::new(Vec::new());
+
+/// Registers a bulk export or submit output store whose files a tenant purge
+/// from this page must delete (#2279). Process-wide, like
+/// [`crate::set_dashboard_refresh`]: the server builds its output stores
+/// alongside the REST state, before the UI is mounted. Without it, a purge
+/// from this page drops the job rows the expiry sweeps start from and leaves
+/// the tenant's NDJSON files behind for good.
+pub fn register_tenant_purge_output(store: Arc<dyn ExportOutputStore>) {
+    match PURGE_OUTPUT_STORES.write() {
+        Ok(mut guard) => guard.push(store),
+        Err(poisoned) => poisoned.into_inner().push(store),
+    }
+}
+
+/// The registered output stores, cloned out so no lock is held across an await.
+fn purge_output_stores() -> Vec<Arc<dyn ExportOutputStore>> {
+    match PURGE_OUTPUT_STORES.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 /// `DELETE /ui/tenants/{id}` — deregister (and optionally purge), return rows.
 ///
 /// Deregister-only by default; data teardown requires the explicit
@@ -1166,8 +1219,20 @@ pub async fn delete(
     // `/ui/*` being mounted outside the auth layer is deliberately untouched
     // here; the storage-layer guard in `helios-persistence` backs this up
     // regardless of how the route is reached.
-    if let Err(message) = validate_id(&id) {
+    if let Err(message) = validate_id(&i18n, &id) {
         return load(Some(message)).await;
+    }
+
+    // The default tenant is where every request without a tenant lands;
+    // deregistering it from the console is refused like a reserved id (the
+    // page offers no Delete for it either — UI/UX review §3.8).
+    if id == state.default_tenant {
+        return load(Some(i18n.t_arg(
+            "tenants-error-delete-default",
+            "id",
+            id.clone(),
+        )))
+        .await;
     }
 
     // A provisioning job owns this id (#581): an in-flight job is refused
@@ -1195,7 +1260,12 @@ pub async fn delete(
     };
     match outcome {
         JobOutcome::InFlight => {
-            return load(Some(format!("Tenant '{id}' is still being provisioned."))).await;
+            return load(Some(i18n.t_arg(
+                "tenants-error-still-provisioning",
+                "id",
+                id.clone(),
+            )))
+            .await;
         }
         JobOutcome::Dismissed => return load(None).await,
         JobOutcome::None => {}
@@ -1209,7 +1279,14 @@ pub async fn delete(
     // every resource. `purge_tenant_data` is transactional on the SQL backends,
     // so on failure nothing was removed and a retry is safe.
     let purge_error = if query.purge {
-        match storage.purge_tenant_data(&id).await {
+        // Output files before rows (#2279): with the job rows gone nothing can
+        // find the files again, so a failure here stops before the purge and a
+        // retry still reaches both.
+        let purged = match delete_tenant_outputs_everywhere(&purge_output_stores(), &id).await {
+            Ok(()) => storage.purge_tenant_data(&id).await,
+            Err(e) => Err(e),
+        };
+        match purged {
             Ok(_) => {
                 // The tenant's data is gone; whoever holds figures for it (the
                 // dashboard's live counters) must drop them, or the Home chart
@@ -1227,8 +1304,12 @@ pub async fn delete(
                 }
                 None
             }
-            Err(e) => Some(format!(
-                "Tenant '{id}' was deregistered but its data was NOT purged: {e}"
+            Err(e) => Some(i18n.t_arg2(
+                "tenants-error-not-purged",
+                "id",
+                id.clone(),
+                "detail",
+                e.to_string(),
             )),
         }
     } else {
@@ -1389,6 +1470,7 @@ mod table_tests {
                     count: *cell,
                     provisioning: false,
                     failed: None,
+                    is_default: false,
                 };
                 (*id, row.count_view(&i18n))
             })
@@ -1453,6 +1535,7 @@ mod table_tests {
                 count: *cell,
                 provisioning: false,
                 failed: None,
+                is_default: false,
             })
             .collect();
         let mut table = table(&[], &view, "", 0);
@@ -1732,11 +1815,13 @@ mod inventory_hook_tests {
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
+            terminology_public_url: None,
             settings: None,
             bulk_provider: None,
             write_observer,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             login: None,
+            admin_gate: helios_admin_auth::AdminGate::Open,
         }
     }
 
@@ -1878,7 +1963,7 @@ mod provisioning_row_tests {
         );
 
         let view = inventory_view_for_tests();
-        let registered = load_registry(&storage).await.expect("registry");
+        let registered = load_registry(&I18n::new(RequestLocale::default()), &storage).await.expect("registry");
         let rows = merge_rows(&registered, &jobs, &view);
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1, "one row per tenant, not one per source");

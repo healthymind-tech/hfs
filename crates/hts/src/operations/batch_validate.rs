@@ -125,34 +125,7 @@ fn has_validatable_input(v_params: &[Value]) -> bool {
 
 /// Build the IG-pinned OperationOutcome for the "no validatable input" path.
 fn no_code_to_validate_outcome() -> Value {
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": "error",
-            "code": "invalid",
-            "details": { "text": NO_CODE_TO_VALIDATE_TEXT }
-        }]
-    })
-}
-
-/// Convert an `HtsError` into an OperationOutcome resource for embedding in a
-/// per-validation slot. Keeps the diagnostic text in the `details.text` field
-/// (where the IG fixtures compare it).
-fn err_to_outcome(err: &HtsError) -> Value {
-    let (severity, code, text) = match err {
-        HtsError::InvalidRequest(m) => ("error", "invalid", m.clone()),
-        HtsError::NotFound(m) => ("error", "not-found", m.clone()),
-        HtsError::VsInvalid(m) => ("error", "invalid", m.clone()),
-        other => ("error", "exception", other.to_string()),
-    };
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": severity,
-            "code": code,
-            "details": { "text": text }
-        }]
-    })
+    HtsError::InvalidRequest(NO_CODE_TO_VALIDATE_TEXT.into()).to_operation_outcome()
 }
 
 /// Forward batch-level inheritable parameters into a per-validation params
@@ -202,7 +175,12 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
-    let principal_vs = principal_value_set(&params);
+    // A batch-level VCL `url` is translated once into the principal ValueSet
+    // that every item validates against.
+    let principal_vs = match find_str_param(&params, "url").filter(|u| crate::vcl::is_vcl_url(u)) {
+        Some(url) => Some(crate::vcl::value_set_from_vcl_url(&url)?),
+        None => principal_value_set(&params),
+    };
 
     let mut output_validations: Vec<Value> = Vec::new();
 
@@ -232,7 +210,7 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
 
         let result_resource = match process_vs_validate_code(state, delegated_params).await {
             Ok(value) => value,
-            Err(err) => err_to_outcome(&err),
+            Err(err) => err.to_operation_outcome(),
         };
 
         output_validations.push(json!({
@@ -258,7 +236,7 @@ pub async fn vs_batch_validate_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let params = extract_parameter_array(&body)?;
     Ok(fhir_respond(
-        process_vs_batch_validate(&state, params).await?,
+        dispatch_tx!(state, params, process_vs_batch_validate)?,
         format,
     ))
 }

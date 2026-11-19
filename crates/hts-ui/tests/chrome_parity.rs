@@ -643,7 +643,7 @@ async fn account_menu_is_the_shared_chrome_component() {
     // cross-crate dev-dependency to state.
     //
     // `RequestLocale::default()` is `en`, which is what a request with no
-    // `?lang=`, no `hts_lang` cookie and no `Accept-Language` negotiates.
+    // `?lang=`, no `hfs_lang` cookie and no `Accept-Language` negotiates.
     let i18n = helios_hts_ui::I18n::new(helios_hts_ui::RequestLocale::default());
     // `UserIdentity::default()` is the signed-out local-operator state both
     // products render today (#320): no display name, no photo, no Sign out.
@@ -674,7 +674,7 @@ async fn dead_language_switcher_and_placeholder_avatar_are_gone() {
     // class="lang-switcher">` of three links and the hardcoded `K` initial in
     // the avatar were both HTS-only inventions; the language options now live
     // inside the shared menu, and the avatar falls back to the generic user
-    // icon. Only the *markup* went — `?lang=` and the `hts_lang` cookie in
+    // icon. Only the *markup* went — `?lang=` and the language cookie in
     // `src/i18n.rs` are untouched and still drive the options in their new home.
     let response = app()
         .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())

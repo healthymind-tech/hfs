@@ -1,0 +1,242 @@
+# Production-grade single-host deployment of HFS + HTS on PostgreSQL 16.
+#
+#   cp .env.example .env && $EDITOR .env        # passwords, image tags, paths
+#   docker compose up -d                          # core stack
+#   docker compose --profile monitoring up -d     # + Prometheus/Grafana/exporters
+#
+# Differences from a quick-start compose, and why (docs/ops/deployment.md):
+#   * images pinned by tag in .env -- never :latest in production
+#   * PostgreSQL data and the WAL archive on host paths you choose (SSD for
+#     data; a different disk or a network mount for the archive), not docker
+#     volumes on whatever disk /var/lib/docker happens to be
+#   * WAL archiving on (point-in-time recovery, scripts/ops/pg-pitr-restore.sh)
+#   * separate database roles for hfs and hts (initdb/10-roles.sh)
+#   * slow-query logging + pg_stat_statements for the index review loop
+#   * explicit pool sizes so hfs + hts never exceed max_connections
+#   * /metrics reachable only on the internal network (nginx denies it)
+#   * log rotation on every container
+name: ${COMPOSE_PROJECT_NAME:-hfs}
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "50m", max-file: "5"}
+
+services:
+  db:
+    image: postgres:16.15-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-hfs}-db
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set in .env}
+      POSTGRES_DB: postgres
+      HFS_DB_PASSWORD: ${HFS_DB_PASSWORD:?set in .env}
+      HTS_DB_PASSWORD: ${HTS_DB_PASSWORD:?set in .env}
+    # Sized for a 64 GB host shared with hfs/hts (PostgreSQL gets ~24 GB).
+    # docs/ops/postgresql.md explains every value and how to scale it.
+    command: >-
+      postgres
+      -c shared_buffers=${PG_SHARED_BUFFERS:-6GB}
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-24GB}
+      -c work_mem=32MB
+      -c maintenance_work_mem=1GB
+      -c max_connections=200
+      -c random_page_cost=${PG_RANDOM_PAGE_COST:-1.1}
+      -c effective_io_concurrency=${PG_EFFECTIVE_IO_CONCURRENCY:-200}
+      -c max_wal_size=8GB
+      -c min_wal_size=1GB
+      -c checkpoint_timeout=15min
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=64MB
+      -c wal_compression=lz4
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_timeout=300
+      -c "archive_command=test ! -f /wal-archive/%f.gz && gzip -c %p > /wal-archive/%f.gz.tmp && mv /wal-archive/%f.gz.tmp /wal-archive/%f.gz"
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.max=5000
+      -c track_io_timing=on
+      -c log_min_duration_statement=1000
+      -c log_autovacuum_min_duration=10s
+      -c log_lock_waits=on
+      -c log_temp_files=64MB
+      -c idle_in_transaction_session_timeout=10min
+      -c autovacuum_max_workers=4
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_analyze_scale_factor=0.02
+      -c jit=off
+    shm_size: 2g
+    volumes:
+      - ${PG_DATA_DIR:?set in .env}:/var/lib/postgresql/data
+      - ${PG_WAL_ARCHIVE_DIR:?set in .env}:/wal-archive
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hfs"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    stop_grace_period: 2m   # let PostgreSQL finish a fast shutdown checkpoint
+    networks: [backend]
+
+  hts:
+    image: ${HTS_IMAGE:?set in .env}
+    container_name: ${COMPOSE_PROJECT_NAME:-hfs}-hts
+    restart: unless-stopped
+    logging: *logging
+    expose: ["8090"]
+    environment:
+      HTS_STORAGE_BACKEND: postgres
+      HTS_DATABASE_URL: postgresql://hts:${HTS_DB_PASSWORD}@db:5432/hts
+      HTS_PG_POOL_SIZE: "16"                 # terminology pool
+      HTS_PG_POOL_WAIT_TIMEOUT_SECS: "60"    # fail instead of queueing forever
+      HTS_PG_CONNECT_TIMEOUT_SECS: "10"
+      HFS_PG_MAX_CONNECTIONS: "8"            # HTS's FHIR resource store (helios-persistence pool)
+      HTS_REQUEST_TIMEOUT: "600"
+      HTS_MAX_BODY_SIZE: "268435456"
+      HTS_ADMIN_DATA_DIR: /data/hts-admin
+      HTS_ADMIN_UI: "true"
+      HTS_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set in .env}
+      HTS_ADMIN_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      HTS_ADMIN_COOKIE_SECURE: "true"
+      HTS_IMPORT_DIR: /import
+      HTS_LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}   # needs an image built with the `otel` feature
+    volumes:
+      - hts-data:/data
+      - ${TERMINOLOGY_SOURCE_DIR:?set in .env}:/import:ro
+    depends_on:
+      db: {condition: service_healthy}
+    stop_grace_period: 60s
+    networks: [backend]
+
+  hfs:
+    image: ${HFS_IMAGE:?set in .env}
+    container_name: ${COMPOSE_PROJECT_NAME:-hfs}-hfs
+    restart: unless-stopped
+    logging: *logging
+    expose: ["8080"]
+    environment:
+      HFS_STORAGE_BACKEND: postgres
+      HFS_DATABASE_URL: postgres://hfs:${HFS_DB_PASSWORD}@db:5432/hfs
+      HFS_PG_MAX_CONNECTIONS: "32"
+      HFS_PG_STATEMENT_TIMEOUT_MS: "60000"
+      HFS_PG_POOL_WAIT_TIMEOUT_SECS: "10"
+      HFS_PG_CONNECT_TIMEOUT_SECS: "10"
+      HFS_BASE_URL: ${PUBLIC_BASE_URL:?set in .env}/fhir
+      HFS_DEFAULT_FHIR_VERSION: R4
+      HFS_PACKAGE_CACHE_DIR: /data/packages
+      HFS_BULK_EXPORT_OUTPUT_DIR: /data/export
+      HFS_TERMINOLOGY_SERVER: http://hts:8090
+      HFS_TERMINOLOGY_SERVER_TOKEN: ${ADMIN_PASSWORD}
+      HFS_TERMINOLOGY_TIMEOUT_SECS: "30"     # per $expand page; cold eCQM ValueSets can exceed 10 s (docs/ops/index-strategy.md §6)
+      HFS_VALIDATION_MODE: "off"
+      HFS_VALIDATION_STORED_PROFILES: "true"
+      HFS_VALIDATION_TERMINOLOGY: embedded
+      HFS_ADMIN_UI: "true"
+      HFS_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      HFS_ADMIN_TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      HFS_ADMIN_COOKIE_SECURE: "true"
+      HFS_MAX_BODY_SIZE: "268435456"
+      HFS_REQUEST_TIMEOUT: "600"
+      HFS_LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - hfs-data:/data
+    depends_on:
+      db: {condition: service_healthy}
+      hts: {condition: service_started}
+    stop_grace_period: 60s
+    networks: [backend]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-hfs}-nginx
+    restart: unless-stopped
+    logging: *logging
+    ports: ["${HTTP_BIND:-127.0.0.1:8082}:80"]   # TLS is terminated in front (docs/ops/deployment.md)
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [hfs, hts]
+    networks: [backend]
+
+  # ---------------------------------------------------------------- monitoring
+  postgres-exporter:
+    profiles: [monitoring]
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      DATA_SOURCE_URI: db:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: postgres
+      DATA_SOURCE_PASS: ${POSTGRES_SUPERUSER_PASSWORD}
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    command: ["--collector.stat_statements", "--collector.long_running_transactions"]
+    networks: [backend]
+
+  node-exporter:
+    profiles: [monitoring]
+    image: quay.io/prometheus/node-exporter:v1.9.1
+    restart: unless-stopped
+    logging: *logging
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/textfile
+    volumes:
+      - /:/host:ro,rslave
+      - ${PROM_TEXTFILE_DIR:-./textfile}:/textfile:ro
+    pid: host
+    networks: [backend]
+
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    logging: *logging
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    networks: [backend]
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    logging: *logging
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [backend]
+
+  # Traces: point OTEL_EXPORTER_OTLP_ENDPOINT at http://otel-collector:4317.
+  otel-collector:
+    profiles: [tracing]
+    image: otel/opentelemetry-collector-contrib:0.131.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ../monitoring/otel-collector.yml:/etc/otelcol/config.yml:ro
+    networks: [backend]
+  jaeger:
+    profiles: [tracing]
+    image: jaegertracing/all-in-one:1.72.0
+    restart: unless-stopped
+    ports: ["127.0.0.1:16686:16686"]
+    networks: [backend]
+
+networks:
+  backend: {}
+
+volumes:
+  hts-data:
+  hfs-data:
+  prometheus-data:
+  grafana-data:

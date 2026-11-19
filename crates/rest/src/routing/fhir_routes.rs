@@ -6,7 +6,7 @@
 use axum::{
     Router,
     body::Body,
-    extract::Request,
+    extract::{Path, Request, State},
     routing::{delete, get, head, patch, post, put},
 };
 use helios_fhir::FhirVersion;
@@ -239,12 +239,29 @@ where
         + Sync
         + 'static,
 {
-    create_fhir_router()
+    let fhir = create_fhir_router()
+        // This router is mounted behind `fallback_service` (tenant-prefix
+        // rewrite), so the outer metrics middleware cannot see which route
+        // matched; publish the template on the response for it.
+        .route_layer(axum::middleware::from_fn(
+            helios_observability::middleware::expose_matched_path,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             reject_unknown_resource_type::<S>,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    // SMART access control finer than a resource type (patient compartment,
+    // granular scopes, bundle filtering). In front of route matching, so a
+    // search it rewrites into a compartment search is routed as one; a
+    // `Router::layer` on a router whose only route is the fallback wraps that
+    // fallback, which is the whole FHIR router.
+    Router::new()
+        .fallback_service(fhir)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::middleware::smart_access::smart_access_middleware::<S>,
+        ))
 }
 
 /// Creates the core FHIR router with all endpoints.
@@ -360,6 +377,12 @@ where
             "/bulk-submit-file/{poll_token}/{part}",
             get(handlers::bulk_submit_file_handler::<S>),
         )
+        // $meta — system level. Registered before the type-level routes so
+        // `/$meta` is not swallowed by `/{resource_type}`.
+        .route(
+            "/$meta",
+            get(handlers::meta_system_handler::<S>).post(handlers::meta_system_handler::<S>),
+        )
         // $reindex — system level. Registered before the type-level routes so
         // `/$reindex` is not swallowed by `/{resource_type}`.
         .route("/$reindex", post(handlers::reindex_system_handler::<S>))
@@ -378,6 +401,29 @@ where
             "/{resource_type}/{id}/$validate",
             get(handlers::validate_instance_get_handler::<S>)
                 .post(handlers::validate_instance_post_handler::<S>),
+        )
+        // `$meta`, `$meta-add`, `$meta-delete` — before the catch-alls, like
+        // `$validate`. System and type level answer the labels in use (fork);
+        // instance and version level the resource's own meta.
+        .route(
+            "/{resource_type}/$meta",
+            get(handlers::meta_type_handler::<S>).post(handlers::meta_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta",
+            get(handlers::meta_instance_handler::<S>).post(handlers::meta_instance_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta",
+            get(handlers::meta_version_handler::<S>).post(handlers::meta_version_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-add",
+            post(handlers::meta_add_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-delete",
+            post(handlers::meta_delete_handler::<S>),
         )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
@@ -501,9 +547,45 @@ where
         // operations-capability.html#partial-operation-support requires such a
         // server to publish its own definition — with `base` naming the
         // guide's — and to cite that from its CapabilityStatement.
+        //
+        // Only those ids are routed here: a `/OperationDefinition/{id}` route
+        // would shadow every other OperationDefinition interaction (reading
+        // the ones IG packages install, PUT, DELETE, `$validate`).
         .route(
-            "/OperationDefinition/{id}",
-            get(handlers::sof::sof_operation_definition_handler::<S>),
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::SQL_RUN_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::SQL_RUN_DEFINITION_ID.to_string()),
+                )
+            }),
+        )
+        .route(
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::SQL_EXPORT_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::SQL_EXPORT_DEFINITION_ID.to_string()),
+                )
+            }),
+        )
+        .route(
+            &format!(
+                "/OperationDefinition/{}",
+                handlers::sof::REINDEX_DEFINITION_ID
+            ),
+            get(|state: State<AppState<S>>| {
+                handlers::sof::sof_operation_definition_handler::<S>(
+                    state,
+                    Path(handlers::sof::REINDEX_DEFINITION_ID.to_string()),
+                )
+            }),
         )
         // `$sql-run` — system level only (`system=true, type=false,
         // instance=false`). The subject is named by `subjectCanonical`,

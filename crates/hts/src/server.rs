@@ -31,6 +31,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::RequestDecompressionLayer,
@@ -88,11 +89,62 @@ async fn root_redirect() -> Response {
 ///
 /// Does not panic.  Invalid CORS origin strings are silently dropped because
 /// [`CorsLayer`] validates origins lazily at request time.
+/// The cluster-shared administrator session store, set by the `hts` binary
+/// before [`create_app`] when it runs on PostgreSQL (see
+/// `helios_admin_auth::store`). Unset: sessions stay per process.
+pub static ADMIN_SESSION_STORE: std::sync::OnceLock<
+    std::sync::Arc<dyn helios_admin_auth::AdminSessionStore>,
+> = std::sync::OnceLock::new();
+
 pub fn create_app<B>(config: &HtsConfig, state: AppState<B>) -> Router
 where
-    B: TerminologyBackend + BundleImportBackend + Clone,
+    B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
     let cors = build_cors(config);
+    let audit = state.audit.clone();
+
+    // Terminology management (`HTS_ADMIN_UI=true`): the `/admin` API and its
+    // background job worker. Built before the UI so the console can mount the
+    // same router under its own prefix.
+    let admin = if config.admin_ui {
+        build_admin(config, &state)
+    } else {
+        None
+    };
+
+    // Administrator sign-in (`HTS_ADMIN_PASSWORD`). Fails closed: with the
+    // admin API on and no password, every admin endpoint answers 503. The
+    // same gate guards `/admin`, the console's `/ui/hts/api/admin` mount of
+    // it, and the console's management pages.
+    let gate = helios_admin_auth::AdminGate::configure(
+        "HTS",
+        config
+            .admin_auth
+            .clone()
+            .unwrap_or_else(|| helios_admin_auth::AdminSettings::from_env("HTS")),
+        config.admin_ui,
+        helios_hts_ui::ADMIN_COOKIE,
+    );
+    // Multi-instance: share administrator sessions and the lockout through
+    // the database when the binary opened a store (PostgreSQL backend).
+    if let (Some(auth), Some(store)) = (gate.auth(), ADMIN_SESSION_STORE.get()) {
+        auth.attach_store(store.clone());
+    }
+    let bearer = crate::write_guard::bearer_provider_from_env();
+    let writes_gate = writes_gate(&gate, config.require_auth_for_writes, bearer.is_some());
+    let admin = admin.map(|router| {
+        router
+            // Inside the admin gate: who the administrator is, for the audit trail.
+            .layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+            .layer(axum::middleware::from_fn_with_state(
+                helios_admin_auth::Guard {
+                    gate: gate.clone(),
+                    protects: |_, _| true,
+                    style: helios_admin_auth::Style::Api { fhir: false },
+                },
+                helios_admin_auth::guard,
+            ))
+    });
 
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
@@ -113,7 +165,16 @@ where
     let hts_ui = if config.ui_enabled {
         let upstream_url = std::env::var("HTS_UI_UPSTREAM_URL")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
-        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).unwrap_or_else(|err| {
+        let upstream = helios_hts_ui::UpstreamClient::new(upstream_url).map(|client| {
+            // The console's management pages call `/admin` over loopback with
+            // the administrator's credential; the page guard has already
+            // required the browser to sign in.
+            match gate.auth() {
+                Some(auth) => client.with_admin_authorization(auth.service_authorization()),
+                None => client,
+            }
+        });
+        let upstream = upstream.unwrap_or_else(|err| {
             // reqwest's builder fails only under very degenerate conditions
             // (e.g. no TLS backend, which cannot happen here — we use
             // default_features = false with no TLS feature). Log loudly if
@@ -151,7 +212,11 @@ where
             // Starts empty; the Home page's own 15 s poll fills it.
             metrics_ring: Default::default(),
         });
-        Some(helios_hts_ui::router(ui_state))
+        Some(helios_hts_ui::router_with_admin(
+            ui_state,
+            admin.clone(),
+            gate.clone(),
+        ))
     } else {
         None
     };
@@ -197,6 +262,8 @@ where
             get(get_translate_handler::<B>).post(translate_handler::<B>),
         )
         .route("/ConceptMap/$closure", post(closure_handler::<B>))
+        // `$closure` is a system-level operation (`[base]/$closure`).
+        .route("/$closure", post(closure_handler::<B>))
         // ── Resource CRUD + Search ────────────────────────────────────────────────
         // GET /CodeSystem searches; POST /CodeSystem creates.
         .route(
@@ -251,7 +318,19 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state);
+        .with_state(state)
+        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+        // Terminology writes need the administrator (`HTS_REQUIRE_AUTH_FOR_WRITES`).
+        // A route layer, so only matched routes are guarded, and inside the
+        // decompression layer below, so a batch body is classified decompressed.
+        .route_layer(axum::middleware::from_fn_with_state(
+            crate::write_guard::WriteGuard {
+                gate: writes_gate,
+                max_body_size: config.max_body_size,
+                bearer,
+            },
+            crate::write_guard::guard,
+        ));
 
     // Merge the optional UI router before wrapping the whole app in the
     // observability / cors / timeout / trace layers so the UI benefits from
@@ -267,6 +346,48 @@ where
     // trailing-slash canonicalization; the existing `POST /` batch handler
     // is unaffected because axum's `Router::route` merges compatible method
     // routers on the same path.
+    let router = match admin {
+        Some(admin) => router.nest("/admin", admin),
+        None => router,
+    };
+
+    // The audit trail (`HTS_AUDIT_*`): `GET /AuditEvent` over the store, for
+    // the administrator only, and the recording layer around the terminology
+    // API and `/admin` (not the console's pages).
+    let router = match &audit {
+        Some(audit) => {
+            // The trail is sensitive: without an administrator password it is
+            // locked rather than open (unlike reads of the terminology).
+            let trail_gate = match &gate {
+                helios_admin_auth::AdminGate::Open => {
+                    helios_admin_auth::AdminGate::Locked(Arc::from(
+                        "the audit trail needs HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+                    ))
+                }
+                other => other.clone(),
+            };
+            let router = match &audit.search {
+                Some(search) => router.merge(
+                    crate::audit::router(Arc::clone(search))
+                        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+                        .route_layer(axum::middleware::from_fn_with_state(
+                            helios_admin_auth::Guard {
+                                gate: trail_gate,
+                                protects: |_, _| true,
+                                style: helios_admin_auth::Style::Api { fhir: true },
+                            },
+                            helios_admin_auth::guard,
+                        )),
+                ),
+                None => router,
+            };
+            router.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&audit.middleware),
+                helios_audit::middleware::audit_middleware,
+            ))
+        }
+        None => router,
+    };
     let router = if let Some(ui) = hts_ui {
         router.route("/", get(root_redirect)).nest("/ui", ui)
     } else {
@@ -291,11 +412,128 @@ where
             helios_observability::middleware::track,
         ))
         .layer(cors)
+        // `POST /import?finalize=true` stops waiting on its closure rebuild
+        // after `AppState::import_finalize_wait` (20 s) and answers 202, so
+        // keep that below this limit if either changes.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
+            Duration::from_secs(config.request_timeout.max(1)),
         ))
-        .layer(TraceLayer::new_for_http())
+        // Method and path only: the default span logs the query string (#2149).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(helios_observability::middleware::request_span),
+        )
+}
+
+/// The gate for state-changing terminology requests: the admin gate when
+/// `HTS_REQUIRE_AUTH_FOR_WRITES` is on (default: on when a password is set),
+/// else open — logged, since anyone can then rewrite the terminology.
+fn writes_gate(
+    admin: &helios_admin_auth::AdminGate,
+    require: Option<bool>,
+    bearer: bool,
+) -> helios_admin_auth::AdminGate {
+    use helios_admin_auth::AdminGate;
+    let has_password = matches!(admin, AdminGate::Password(_));
+    if !require.unwrap_or(has_password || bearer) {
+        if has_password {
+            tracing::warn!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=false: CodeSystem/ValueSet/ConceptMap create, \
+                 update and delete, /import and write batches are open to anyone"
+            );
+        } else {
+            tracing::warn!(
+                "terminology writes (CodeSystem/ValueSet/ConceptMap create, update and delete, \
+                 /import, write batches) are unauthenticated: set HTS_ADMIN_PASSWORD to require \
+                 the administrator for them"
+            );
+        }
+        return AdminGate::Open;
+    }
+    match admin {
+        AdminGate::Open if bearer => {
+            tracing::info!(
+                "terminology writes require a SMART/OIDC bearer token (no HTS_ADMIN_PASSWORD, so \
+                 the administrator credential is not available)"
+            );
+            AdminGate::Locked(std::sync::Arc::from(
+                "terminology writes need a bearer token with write scopes on the terminology types",
+            ))
+        }
+        AdminGate::Open => {
+            tracing::error!(
+                "HTS_REQUIRE_AUTH_FOR_WRITES=true but no HTS_ADMIN_PASSWORD is set: terminology \
+                 writes answer 503 until one is"
+            );
+            AdminGate::Locked(std::sync::Arc::from(
+                "terminology writes are locked: HTS_REQUIRE_AUTH_FOR_WRITES=true needs \
+                 HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+            ))
+        }
+        gate => {
+            tracing::info!("terminology writes require the administrator credential");
+            gate.clone()
+        }
+    }
+}
+
+/// Wire the admin core to this app's backend and caches and start its worker.
+///
+/// Returns `None` (admin stays off, with an error logged) when the data
+/// directory cannot be created, rather than failing the whole server.
+fn build_admin<B>(config: &HtsConfig, state: &AppState<B>) -> Option<Router>
+where
+    B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
+{
+    let admin_config = crate::admin::AdminConfig::from_hts(config);
+    let ops: Arc<dyn crate::admin::TerminologyAdmin> = state.backend.clone();
+    let importer: Arc<dyn BundleImportBackend> = state.backend.clone();
+    let on_change = {
+        let st = state.clone();
+        Arc::new(move || {
+            st.clear_expand_cache();
+            st.backend().invalidate_caches();
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let core = match crate::admin::AdminCore::new(
+        admin_config,
+        ops,
+        importer,
+        state.active_resource_store(),
+        on_change,
+    ) {
+        Ok(core) => core,
+        Err(err) => {
+            tracing::error!(%err, "HTS_ADMIN_UI: cannot create the admin data directory; admin API disabled");
+            return None;
+        }
+    };
+    if let Some(audit) = &state.audit {
+        core.audit.attach_sink(
+            Arc::clone(&audit.middleware.sink),
+            audit.middleware.config.source_observer.clone(),
+        );
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        crate::admin::jobs::start_worker(core.clone());
+        let c = core.clone();
+        tokio::spawn(async move {
+            let n = c.uploads.purge_stale(chrono::Duration::days(7)).await;
+            if n > 0 {
+                tracing::info!(removed = n, "purged stale incomplete uploads");
+            }
+        });
+    } else {
+        tracing::error!("HTS_ADMIN_UI: no Tokio runtime at router build; jobs will not run");
+    }
+    tracing::info!(
+        data_dir = %core.config.data_dir.display(),
+        import_dir = ?core.config.import_dir,
+        registry = ?core.config.registry_url,
+        "terminology admin API enabled at /admin"
+    );
+    Some(crate::admin::routes::router(core))
 }
 
 /// Recursively size a directory in bytes. Small utility used at HTS-UI

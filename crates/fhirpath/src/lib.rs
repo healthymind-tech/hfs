@@ -270,6 +270,7 @@ mod collection_navigation;
 mod contains_function;
 mod conversion_functions;
 mod format_functions;
+mod html_checks;
 mod interval_functions;
 mod json_utils;
 pub mod ucum;
@@ -279,6 +280,7 @@ pub mod date_operation;
 mod datetime_impl;
 pub mod debug_trace;
 mod distinct_functions;
+mod document_functions;
 mod extension_function;
 // Curated catalog of built-in functions; re-exported below.
 mod fhir_type_hierarchy;
@@ -291,10 +293,13 @@ mod repeat_all_function;
 mod repeat_function;
 mod resolve_function;
 mod resource_type;
+pub mod semantic_check;
 mod set_operations;
 mod subset_functions;
 mod terminology_client;
 mod terminology_functions;
+#[cfg(test)]
+mod terminology_stub;
 mod trace_function;
 mod type_function;
 pub mod type_inference;
@@ -312,7 +317,8 @@ pub mod evaluator;
 pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
-pub use evaluator::EvaluationContext;
+pub use evaluator::MemberOfResolver;
+pub use evaluator::{EvaluationContext, UnresolvedIdentifierPolicy};
 pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
 pub use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 pub use terminology_functions::TerminologySession;

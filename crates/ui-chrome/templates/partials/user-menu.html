@@ -56,6 +56,7 @@
               <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-en") }}">EN</a>
               <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-es") }}">ES</a>
               <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-de") }}">DE</a>
+              <a href="?lang=zh-Hant"{% if i18n.lang() == "zh-Hant" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-zh-hant") }}">繁中</a>
             </div>
             {% if user.can_logout %}
             <form class="user-menu__out-form" method="post" action="{{ user.logout_href }}">

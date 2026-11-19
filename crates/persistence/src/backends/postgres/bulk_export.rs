@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::core::bulk_export::{
@@ -1153,7 +1154,7 @@ impl ExportDataProvider for PostgresBackend {
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         if !request.resource_types.is_empty() {
@@ -1175,7 +1176,18 @@ impl ExportDataProvider for PostgresBackend {
             return Ok(valid_types);
         }
 
-        let rows = client
+        // The all-types listing reads every live row of the tenant to find a
+        // few dozen distinct types, so its cost follows the tenant's size.
+        // Lift the session `statement_timeout` for this one statement, as the
+        // reindex listing does (#2040); the session keeps it afterwards.
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin export type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for export type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources
                  WHERE tenant_id = $1 AND is_deleted = FALSE
@@ -1184,6 +1196,9 @@ impl ExportDataProvider for PostgresBackend {
             )
             .await
             .or_query_error("Failed to query types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish export type listing")?;
 
         let types: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         Ok(types)
@@ -1303,6 +1318,79 @@ impl ExportDataProvider for PostgresBackend {
     }
 }
 
+/// Appends the `(last_updated, id)` keyset predicate of an export page
+/// cursor (`<rfc3339>|<id>`, the form every PostgreSQL export path uses) and
+/// returns the next free parameter index. Walked with `idx_resources_search`
+/// `(tenant_id, resource_type, last_updated DESC, id)`.
+fn push_export_cursor(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    cursor: Option<&str>,
+    param_idx: usize,
+) -> usize {
+    if let Some((ts, id)) = cursor.and_then(|c| c.split_once('|')) {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+            sql.push_str(&format!(
+                " AND (last_updated, id) > (${}, ${})",
+                param_idx,
+                param_idx + 1
+            ));
+            params.push(Box::new(dt.with_timezone(&Utc)));
+            params.push(Box::new(id.to_string()));
+            return param_idx + 2;
+        }
+    }
+    param_idx
+}
+
+fn export_cursor(last_updated: &DateTime<Utc>, id: &str) -> String {
+    format!("{}|{}", last_updated.to_rfc3339(), id)
+}
+
+/// Candidate keys of one small patient-set export, all types at once.
+///
+/// The GIN scan behind a small Group or patient-list export returned the
+/// candidates of every type, and it ran again for every page of every type:
+/// ~0.9 s per page for 500 patients on 3.2M resources, the whole cost of the
+/// export. It now runs once per (database, tenant, patient set, window); the
+/// keys — `(last_updated, id)` per type, sorted — are kept here and each
+/// page is a slice of them plus a primary-key read of its rows.
+struct CandidateSet {
+    used: std::time::Instant,
+    by_type: std::collections::HashMap<String, Arc<Vec<(DateTime<Utc>, String)>>>,
+}
+
+type CandidateKey = (String, String, u64, Option<i64>, Option<i64>);
+
+/// Most candidate keys one cached set may hold (~60 bytes each). A patient
+/// set past it — a sizable cohort of a big hospital — keeps the per-page scan.
+const CANDIDATE_CACHE_MAX_KEYS: usize = 1_000_000;
+/// Cached sets kept at once, and how long an unused one lives.
+const CANDIDATE_CACHE_ENTRIES: usize = 8;
+const CANDIDATE_CACHE_TTL: StdDuration = StdDuration::from_secs(600);
+
+static CANDIDATE_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<CandidateKey, CandidateSet>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn patient_set_hash(patient_ids: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut ids: Vec<&str> = patient_ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ids.len().hash(&mut h);
+    for id in ids {
+        id.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// A patient set this large a share of the tenant's patients is exported by
+/// walking the type in `(last_updated, id)` order instead of through the
+/// patient-reference index (see `fetch_patient_compartment_batch`).
+const LARGE_PATIENT_SET_SHARE: usize = 20; // 1/20 = 5 %
+
 #[async_trait]
 impl PatientExportProvider for PostgresBackend {
     async fn list_patient_ids(
@@ -1389,50 +1477,30 @@ impl PatientExportProvider for PostgresBackend {
             .map(|id| format!("Patient/{id}"))
             .collect();
         let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
+        let selected: HashSet<&str> = patient_ids.iter().map(String::as_str).collect();
 
-        // Candidate selection reads the JSONB payload rather than search_index,
-        // which can be empty when search is offloaded. Materializing the GIN
-        // matches before applying the tenant, type and ordering predicates keeps
-        // PostgreSQL from choosing the chronological index and evaluating the
-        // JSON expression across the whole resources table. `matcher` still
-        // applies the exact compartment rules to each candidate.
         let client = self.get_client().await?;
-        let indexed_candidates =
-            self.has_patient_export_index() && !(is_patient && matcher.is_empty());
-        let mut sql = if indexed_candidates {
-            let refs_idx = if is_patient { 4 } else { 3 };
-            let mut sql = format!(
-                "WITH candidates AS MATERIALIZED (
-                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
-                     FROM resources
-                     WHERE is_deleted = FALSE
-                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
-            );
-            if is_patient {
-                // A Patient may be in its own compartment by ID even without a
-                // reference. Exclude rows already selected by the GIN branch so
-                // a self-referencing Patient cannot appear twice in the export.
-                sql.push_str(
-                    " UNION ALL
-                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
-                     FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2
-                       AND is_deleted = FALSE AND id = ANY($3::text[])
-                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
-                );
-            }
-            sql.push_str(
-                ") SELECT id, data, last_updated, version_id FROM candidates
-                   WHERE tenant_id = $1 AND resource_type = $2",
-            );
-            sql
-        } else {
-            "SELECT id, data, last_updated, version_id FROM resources
-             WHERE tenant_id = $1
-                AND resource_type = $2
-                AND is_deleted = FALSE"
-                .to_string()
-        };
+        let indexed = self.has_patient_export_index() && !(is_patient && matcher.is_empty());
+
+        // Three plans, all paging on `(last_updated, id)` like system export,
+        // all feeding the same exact compartment matcher below:
+        //
+        // * a small patient set goes through the patient-reference GIN index.
+        //   The candidates are materialized as keys only — never the
+        //   payloads — before the type, window and cursor predicates apply,
+        //   which keeps PostgreSQL from walking a whole type evaluating the
+        //   JSON expression; only the page's rows are then read in full.
+        // * a large set (a Group of a sizable share of the patients) walks the
+        //   type along `idx_resources_search`, like system export, and the
+        //   matcher tests each row. Its candidates are most of
+        //   the database, and re-materializing them for every page made each
+        //   page cost a full scan: a 14,000-patient Group hit the 30 s
+        //   statement timeout on its first page and the export failed.
+        // * a small set without the index (search offloaded) evaluates the
+        //   JSON predicate in the same ordered walk.
+        let large = self
+            .is_large_patient_set(&client, tenant_id, patient_ids.len())
+            .await?;
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1443,51 +1511,112 @@ impl PatientExportProvider for PostgresBackend {
                  WHERE split_part(r #>> '{{}}', '/_history/', 1) = ANY(${idx}::text[]))"
             )
         };
-        let next_idx = if indexed_candidates && is_patient {
-            params.push(Box::new(patient_ids.to_vec()));
-            params.push(Box::new(patient_ref_list));
-            5
-        } else if indexed_candidates {
-            params.push(Box::new(patient_ref_list));
-            4
-        } else if is_patient && matcher.is_empty() {
-            sql.push_str(" AND id = ANY($3::text[])");
-            params.push(Box::new(patient_ids.to_vec()));
-            4
-        } else if is_patient {
-            sql.push_str(&format!(
-                " AND (id = ANY($3::text[]) OR {})",
-                mentions_a_patient(4)
-            ));
-            params.push(Box::new(patient_ids.to_vec()));
-            params.push(Box::new(patient_ref_list));
-            5
-        } else {
-            sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
-            params.push(Box::new(patient_ref_list));
-            4
-        };
-        let param_idx = push_export_window(&mut sql, &mut params, request, next_idx);
-
-        if let Some(cursor) = cursor {
-            let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-            if parts.len() == 2 {
-                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
-                    sql.push_str(&format!(
-                        " AND (last_updated, id) > (${}, ${})",
-                        param_idx,
-                        param_idx + 1
-                    ));
-                    params.push(Box::new(dt.with_timezone(&Utc)));
-                    params.push(Box::new(parts[1].to_string()));
-                }
+        if indexed && !large {
+            if let Some(batch) = self
+                .cached_compartment_page(
+                    &client,
+                    tenant_id,
+                    request,
+                    resource_type,
+                    patient_ids,
+                    &patient_ref_list,
+                    &selected,
+                    &matcher,
+                    &patient_refs,
+                    cursor,
+                    batch_size,
+                )
+                .await?
+            {
+                return Ok(batch);
             }
         }
-
-        sql.push_str(&format!(
-            " ORDER BY last_updated, id LIMIT {}",
-            batch_size + 1
-        ));
+        let sql = if indexed && !large {
+            // Too many candidates to hold (see `CANDIDATE_CACHE_MAX_KEYS`):
+            // the per-page form.
+            let refs_idx = if is_patient { 4 } else { 3 };
+            let mut sql = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT tenant_id, resource_type, id, last_updated
+                     FROM resources
+                     WHERE is_deleted = FALSE
+                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
+            );
+            if is_patient {
+                // A Patient may be in its own compartment by ID even without a
+                // reference. Exclude rows already selected by the GIN branch so
+                // a self-referencing Patient cannot appear twice in the export.
+                sql.push_str(
+                    " UNION ALL
+                     SELECT tenant_id, resource_type, id, last_updated
+                     FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2
+                       AND is_deleted = FALSE AND id = ANY($3::text[])
+                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
+                );
+                params.push(Box::new(patient_ids.to_vec()));
+            }
+            params.push(Box::new(patient_ref_list));
+            sql.push_str(
+                "), page AS (
+                     SELECT id, last_updated FROM candidates WHERE tenant_id = $1 AND resource_type = $2",
+            );
+            let idx = push_export_window(&mut sql, &mut params, request, refs_idx + 1);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}
+                 )
+                 SELECT r.id, r.data, r.last_updated, r.version_id
+                 FROM page JOIN resources r
+                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = page.id
+                 ORDER BY page.last_updated, page.id",
+                batch_size + 1
+            ));
+            sql
+        } else if large {
+            // No reference predicate at all: overlapping each row's references
+            // with an array of thousands of patients costs PostgreSQL ~2 ms a
+            // row (the overlap is a nested loop), and nearly every row matches
+            // anyway. The matcher below, with a hash set, decides.
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
+                .to_string();
+            let idx = push_export_window(&mut sql, &mut params, request, 3);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
+            sql
+        } else {
+            let mut sql = "SELECT id, data, last_updated, version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE"
+                .to_string();
+            let next_idx = if is_patient && matcher.is_empty() {
+                sql.push_str(" AND id = ANY($3::text[])");
+                params.push(Box::new(patient_ids.to_vec()));
+                4
+            } else if is_patient {
+                sql.push_str(&format!(
+                    " AND (id = ANY($3::text[]) OR {})",
+                    mentions_a_patient(4)
+                ));
+                params.push(Box::new(patient_ids.to_vec()));
+                params.push(Box::new(patient_ref_list));
+                5
+            } else {
+                sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
+                params.push(Box::new(patient_ref_list));
+                4
+            };
+            let idx = push_export_window(&mut sql, &mut params, request, next_idx);
+            push_export_cursor(&mut sql, &mut params, cursor, idx);
+            sql.push_str(&format!(
+                " ORDER BY last_updated, id LIMIT {}",
+                batch_size + 1
+            ));
+            sql
+        };
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -1517,18 +1646,17 @@ impl PatientExportProvider for PostgresBackend {
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
             let version_id: String = row.get(3);
-            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
 
-            let in_compartment = (is_patient && patient_ids.contains(&id))
+            let in_compartment = (is_patient && selected.contains(id.as_str()))
                 || matcher.is_member(&resource, &patient_refs);
-            if !in_compartment {
-                continue;
+            if in_compartment {
+                // The blob carries no server meta; merge it from the row (#1273).
+                let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
+                let line = serde_json::to_string(&resource)
+                    .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
+                lines.push(line);
             }
-            // The blob carries no server meta; merge it from the row (#1273).
-            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
-            let line = serde_json::to_string(&resource)
-                .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
-            lines.push(line);
+            last_cursor = Some(export_cursor(&last_updated, &id));
         }
 
         Ok(NdjsonBatch {
@@ -1536,6 +1664,233 @@ impl PatientExportProvider for PostgresBackend {
             next_cursor: if has_more { last_cursor } else { None },
             is_last: !has_more,
         })
+    }
+}
+
+impl PostgresBackend {
+    /// One page of a small patient-set export from the cached candidate keys
+    /// (see [`CandidateSet`]), or `None` when the set has too many candidates
+    /// to cache.
+    #[allow(clippy::too_many_arguments)]
+    async fn cached_compartment_page(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        request: &ExportRequest,
+        resource_type: &str,
+        patient_ids: &[String],
+        patient_ref_list: &[String],
+        selected: &HashSet<&str>,
+        matcher: &PatientCompartmentMatcher,
+        patient_refs: &HashSet<String>,
+        cursor: Option<&str>,
+        batch_size: u32,
+    ) -> StorageResult<Option<NdjsonBatch>> {
+        let cfg = self.config();
+        let key: CandidateKey = (
+            format!("{}:{}/{}", cfg.host, cfg.port, cfg.dbname),
+            tenant_id.to_string(),
+            patient_set_hash(patient_ids),
+            request.since.map(|t| t.timestamp_micros()),
+            request.until.map(|t| t.timestamp_micros()),
+        );
+        let cached = {
+            let mut cache = CANDIDATE_CACHE.lock();
+            cache.retain(|_, set| set.used.elapsed() < CANDIDATE_CACHE_TTL);
+            cache.get_mut(&key).map(|set| {
+                set.used = std::time::Instant::now();
+                set.by_type.get(resource_type).cloned().unwrap_or_default()
+            })
+        };
+        let keys = match cached {
+            Some(keys) => keys,
+            None => {
+                let Some(by_type) = self
+                    .scan_compartment_candidates(
+                        client,
+                        tenant_id,
+                        request,
+                        patient_ids,
+                        patient_ref_list,
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let keys = by_type.get(resource_type).cloned().unwrap_or_default();
+                let mut cache = CANDIDATE_CACHE.lock();
+                if cache.len() >= CANDIDATE_CACHE_ENTRIES {
+                    if let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, set)| set.used)
+                        .map(|(k, _)| k.clone())
+                    {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(
+                    key.clone(),
+                    CandidateSet {
+                        used: std::time::Instant::now(),
+                        by_type,
+                    },
+                );
+                keys
+            }
+        };
+
+        let after = cursor.and_then(|c| c.split_once('|')).and_then(|(ts, id)| {
+            DateTime::parse_from_rfc3339(ts)
+                .ok()
+                .map(|dt| (dt.with_timezone(&Utc), id.to_string()))
+        });
+        let start = match &after {
+            Some((ts, id)) => keys.partition_point(|(k_ts, k_id)| (k_ts, k_id) <= (ts, id)),
+            None => 0,
+        };
+        let end = (start + batch_size as usize).min(keys.len());
+        let page = &keys[start..end];
+        let has_more = end < keys.len();
+        if !has_more {
+            // This type is done; the next job to need it rescans.
+            if let Some(set) = CANDIDATE_CACHE.lock().get_mut(&key) {
+                set.by_type.remove(resource_type);
+            }
+        }
+
+        let ids: Vec<String> = page.iter().map(|(_, id)| id.clone()).collect();
+        let rows = if ids.is_empty() {
+            Vec::new()
+        } else {
+            client
+                .query(
+                    "SELECT id, data, last_updated, version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+                       AND id = ANY($3::text[])",
+                    &[&tenant_id, &resource_type, &ids],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to read compartment page: {e}")))?
+        };
+        let mut by_id: std::collections::HashMap<String, tokio_postgres::Row> = rows
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row))
+            .collect();
+        let is_patient = resource_type == "Patient";
+        let mut lines = Vec::with_capacity(page.len());
+        for (_, id) in page {
+            // Deleted since the scan: gone from the export, as it would be
+            // from a fresh scan.
+            let Some(row) = by_id.remove(id) else {
+                continue;
+            };
+            let resource: Value = row.get(1);
+            let last_updated: DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            let in_compartment = (is_patient && selected.contains(id.as_str()))
+                || matcher.is_member(&resource, patient_refs);
+            if in_compartment {
+                let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
+                let line = serde_json::to_string(&resource)
+                    .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
+                lines.push(line);
+            }
+        }
+        Ok(Some(NdjsonBatch {
+            lines,
+            next_cursor: if has_more {
+                page.last().map(|(ts, id)| export_cursor(ts, id))
+            } else {
+                None
+            },
+            is_last: !has_more,
+        }))
+    }
+
+    /// Every candidate key of a patient set, grouped by type and sorted on
+    /// `(last_updated, id)`: rows whose references name one of the patients
+    /// (the GIN index), plus the selected Patients themselves. `None` past
+    /// [`CANDIDATE_CACHE_MAX_KEYS`].
+    async fn scan_compartment_candidates(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        request: &ExportRequest,
+        patient_ids: &[String],
+        patient_ref_list: &[String],
+    ) -> StorageResult<Option<std::collections::HashMap<String, Arc<Vec<(DateTime<Utc>, String)>>>>>
+    {
+        let mut sql = "WITH candidates AS MATERIALIZED (
+                 SELECT tenant_id, resource_type, id, last_updated
+                 FROM resources
+                 WHERE is_deleted = FALSE AND hfs_patient_references_v1(data) && $2::text[]
+                 UNION
+                 SELECT tenant_id, resource_type, id, last_updated
+                 FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND is_deleted = FALSE AND id = ANY($3::text[])
+             ) SELECT resource_type, id, last_updated FROM candidates WHERE tenant_id = $1"
+            .to_string();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(patient_ref_list.to_vec()),
+            Box::new(patient_ids.to_vec()),
+        ];
+        push_export_window(&mut sql, &mut params, request, 4);
+        sql.push_str(&format!(" LIMIT {}", CANDIDATE_CACHE_MAX_KEYS + 1));
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to scan compartment candidates: {e}")))?;
+        if rows.len() > CANDIDATE_CACHE_MAX_KEYS {
+            return Ok(None);
+        }
+        let mut by_type: std::collections::HashMap<String, Vec<(DateTime<Utc>, String)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            by_type
+                .entry(row.get::<_, String>(0))
+                .or_default()
+                .push((row.get(2), row.get(1)));
+        }
+        Ok(Some(
+            by_type
+                .into_iter()
+                .map(|(t, mut keys)| {
+                    keys.sort_unstable();
+                    (t, Arc::new(keys))
+                })
+                .collect(),
+        ))
+    }
+
+    /// Whether `n` patients are at least 1/[`LARGE_PATIENT_SET_SHARE`] of the
+    /// tenant's live patients. Counts at most `n * LARGE_PATIENT_SET_SHARE`
+    /// index entries, so a small set never pays for counting a big tenant.
+    async fn is_large_patient_set(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        n: usize,
+    ) -> StorageResult<bool> {
+        let probe = (n.saturating_mul(LARGE_PATIENT_SET_SHARE)).min(i64::MAX as usize) as i64;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM (
+                     SELECT 1 FROM resources
+                     WHERE tenant_id = $1 AND resource_type = 'Patient' AND is_deleted = FALSE
+                     LIMIT $2
+                 ) AS probe",
+                &[&tenant_id, &probe],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to size the patient set: {e}")))?;
+        let patients: i64 = row.get(0);
+        Ok(patients < probe)
     }
 }
 

@@ -7,9 +7,15 @@
 //! `docs/guide/mental-model.md` in the FHIR Schema repo for the model, and
 //! `walk.rs` for the deterministic error-emission order.
 
+mod attachment;
+mod bounds;
+mod bundle;
 mod errors;
+mod narrative;
 mod path;
 mod primitives;
+mod references;
+mod resource_rules;
 pub(crate) mod slicing;
 mod walk;
 
@@ -22,10 +28,16 @@ pub use path::dotted_to_fhirpath;
 /// template catalog lives in `errors.rs`, the single source of truth).
 pub(crate) mod messages {
     pub(crate) use super::errors::{
+        hl7_slice_max, hl7_slice_min, msg_code_system_unknown as code_system_unknown,
         msg_constraint_not_evaluable as constraint_not_evaluable,
+        msg_constraints_not_evaluable as constraints_not_evaluable,
+        msg_extensible_binding as extensible_binding,
         msg_fhirpath_constraint as fhirpath_constraint,
-        msg_terminology_binding as terminology_binding,
+        msg_slice_closed_unmatched as slice_closed_unmatched, msg_slice_max as slice_max,
+        msg_slice_min as slice_min, msg_terminology_binding as terminology_binding,
         msg_terminology_unavailable as terminology_unavailable,
+        msg_unknown_code_system_version as unknown_code_system_version,
+        msg_url_unresolved as url_unresolved, msg_wrong_display as wrong_display,
     };
 }
 
@@ -35,8 +47,9 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Policy for profile references (`meta.profile` / caller-supplied) that the
-/// resolver cannot resolve.
+/// Policy for `meta.profile` claims the resolver cannot resolve. A profile
+/// the caller asked for ([`ValidationOptions::profiles`]) that cannot be
+/// resolved is always an error: the requested validation did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnknownProfilePolicy {
     /// Report as a warning-severity issue (default).
@@ -65,6 +78,30 @@ pub struct ValidationOptions {
     /// hundreds of canonical resources — useful to a profile author,
     /// noise to everyone else.
     pub check_extension_context: bool,
+    /// How an extension whose url resolves to no definition is reported.
+    pub unknown_extensions: UnknownExtensionPolicy,
+    /// Profiles that loaded ImplementationGuides declare in
+    /// `ImplementationGuide.global`, as `(resource type, profile canonical)`:
+    /// every resource of that type — the root and every nested resource
+    /// (Bundle entries, contained, parameters) — is held to the profile, as
+    /// the HL7 validator applies the global profiles of its loaded IGs.
+    /// An unresolvable one follows [`Self::unknown_profile`].
+    pub global_profiles: Vec<(String, String)>,
+}
+
+/// Policy for extensions whose url resolves to no StructureDefinition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownExtensionPolicy {
+    /// FHIR lets receivers accept extensions they do not know: only a url
+    /// in HL7's own namespaces (where every extension is published) draws a
+    /// warning, when HL7's extension definitions are loaded (default).
+    #[default]
+    Lenient,
+    /// The HL7 validator's default: any unresolvable extension is an error
+    /// ("could not be found so is not allowed here"), except example urls
+    /// (`example.org`, `acme.com`), `nema.org` (DICOM), HL7 tooling
+    /// extensions and cross-version extensions.
+    Error,
 }
 
 impl Default for ValidationOptions {
@@ -74,6 +111,8 @@ impl Default for ValidationOptions {
             use_meta_profiles: true,
             check_extension_context: false,
             unknown_profile: UnknownProfilePolicy::default(),
+            unknown_extensions: UnknownExtensionPolicy::default(),
+            global_profiles: Vec::new(),
         }
     }
 }
@@ -85,6 +124,158 @@ pub struct SyncOutcome {
     pub errors: Vec<ValidationError>,
     /// Constraint/binding obligations for the async effects pass (Phase 4).
     pub deferred: Vec<Deferred>,
+}
+
+/// `batch`/`transaction` entries whose `request.url` addresses a different
+/// resource type than the entry's `resource`: `POST Patient` carrying an
+/// Observation would be stored as an Observation the client asked to file
+/// as a Patient. Only relative URLs are judged (`Type`, `Type/id`,
+/// `Type?criteria`); an absolute URL's base cannot be told apart from its
+/// type without knowing the server base. Methods without a resource body
+/// (GET, DELETE, HEAD) are skipped.
+fn bundle_entry_type_mismatches(resource: &Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Bundle")
+        || !matches!(
+            resource.get("type").and_then(Value::as_str),
+            Some("batch" | "transaction")
+        )
+    {
+        return errors;
+    }
+    let Some(entries) = resource.get("entry").and_then(Value::as_array) else {
+        return errors;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(request) = entry.get("request") else {
+            continue;
+        };
+        if !matches!(
+            request.get("method").and_then(Value::as_str),
+            Some("POST" | "PUT" | "PATCH")
+        ) {
+            continue;
+        }
+        let (Some(url), Some(actual)) = (
+            request.get("url").and_then(Value::as_str),
+            entry
+                .get("resource")
+                .and_then(|r| r.get("resourceType"))
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if url.contains("://") {
+            continue;
+        }
+        let path = url.split(['?', '#']).next().unwrap_or_default();
+        let Some(addressed) = path.trim_start_matches('/').split('/').next() else {
+            continue;
+        };
+        // `Parameters` is a PATCH body (FHIRPath Patch), not the target.
+        if addressed.is_empty()
+            || addressed.starts_with('$')
+            || addressed == actual
+            || actual == "Parameters"
+            || actual == "Binary"
+        {
+            continue;
+        }
+        errors.push(ValidationError::new(
+            ErrorKind::BundleEntryMismatch,
+            format!("Bundle.entry.{index}.request.url"),
+            format!(
+                "request.url '{url}' addresses resource type {addressed}, but the entry's resource is of type {actual}"
+            ),
+        ));
+    }
+    errors
+}
+
+/// `urn:uuid:` / `urn:oid:` references inside a Bundle's entries that no
+/// entry's `fullUrl` provides. A URN names nothing outside the Bundle, so
+/// such a reference cannot be resolved by anyone. In a `transaction` or
+/// `batch` the server has to resolve it to process the entry, so it is an
+/// error; in other Bundles a warning, as the HL7 validator reports it.
+/// References inside a nested Bundle belong to that Bundle and are skipped.
+fn bundle_unresolved_urns(resource: &Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if resource.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
+        return errors;
+    }
+    let Some(entries) = resource.get("entry").and_then(Value::as_array) else {
+        return errors;
+    };
+    let severity = match resource.get("type").and_then(Value::as_str) {
+        Some("transaction" | "batch") => Severity::Error,
+        _ => Severity::Warning,
+    };
+    let full_urls: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("fullUrl").and_then(Value::as_str))
+        .collect();
+
+    fn walk(
+        value: &Value,
+        path: &mut String,
+        full_urls: &std::collections::HashSet<&str>,
+        severity: Severity,
+        out: &mut Vec<ValidationError>,
+    ) {
+        match value {
+            Value::Object(map) => {
+                if let Some(reference) = map.get("reference").and_then(Value::as_str)
+                    && (reference.starts_with("urn:uuid:") || reference.starts_with("urn:oid:"))
+                    && !full_urls.contains(reference)
+                {
+                    out.push(
+                        ValidationError::new(
+                            ErrorKind::ReferenceUnresolved,
+                            path.clone(),
+                            errors::msg_reference_urn_unresolved(reference),
+                        )
+                        .with_severity(severity),
+                    );
+                }
+                for (key, child) in map {
+                    if child
+                        .get("resourceType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|rt| rt == "Bundle")
+                    {
+                        continue;
+                    }
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(key);
+                    walk(child, path, full_urls, severity, out);
+                    path.truncate(len);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(&index.to_string());
+                    walk(item, path, full_urls, severity, out);
+                    path.truncate(len);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(res) = entry.get("resource") else {
+            continue;
+        };
+        if res.get("resourceType").and_then(Value::as_str) == Some("Bundle") {
+            continue;
+        }
+        let mut path = format!("Bundle.entry.{index}.resource");
+        walk(res, &mut path, &full_urls, severity, &mut errors);
+    }
+    errors
 }
 
 /// The validator: a resolver plus the walk.
@@ -101,7 +292,32 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        walk::validate(self.resolver.as_ref(), resource, opts)
+        self.validate_sync_with(resource, opts, None)
+    }
+
+    /// [`Self::validate_sync`], with invariants evaluated where the walk
+    /// must choose among type profiles.
+    fn validate_sync_with<'a>(
+        &'a self,
+        resource: &'a Value,
+        opts: &ValidationOptions,
+        invariants: Option<&'a walk::InvariantCheck<'a>>,
+    ) -> SyncOutcome {
+        let mut outcome = walk::validate(self.resolver.as_ref(), resource, opts, invariants);
+        outcome
+            .errors
+            .extend(bundle_entry_type_mismatches(resource));
+        outcome.errors.extend(bundle_unresolved_urns(resource));
+        let resolver = self.resolver.as_ref();
+        let is_resource_type = |name: &str| {
+            resolver
+                .resolve(name)
+                .is_some_and(|s| crate::editor::is_resource(&s))
+        };
+        outcome
+            .errors
+            .extend(bundle::bundle_rules_with(resource, &is_resource_type));
+        outcome
     }
 
     /// Full validation: the structural walk plus execution of the deferred
@@ -115,11 +331,65 @@ impl Validator {
         opts: &ValidationOptions,
         effects: &EffectHandlers<'_>,
     ) -> Vec<ValidationError> {
+        let check = |root: &Value, path: &str, id: &str, expression: &str| -> bool {
+            let Some(evaluator) = effects.constraints else {
+                return true;
+            };
+            let c = [crate::effects::DeferredConstraint {
+                path,
+                id,
+                expression,
+                own_resource: false,
+            }];
+            !matches!(
+                evaluator.evaluate_all(root, version, &c).first(),
+                Some(crate::effects::ConstraintOutcome::Failed)
+            )
+        };
+        let invariants: Option<&walk::InvariantCheck<'_>> = effects
+            .constraints
+            .is_some()
+            .then_some(&check as &walk::InvariantCheck<'_>);
         let SyncOutcome {
             mut errors,
             deferred,
-        } = self.validate_sync(resource, opts);
-        crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
+        } = self.validate_sync_with(resource, opts, invariants);
+        if effects.narrative_links {
+            errors.extend(narrative::narrative_link_errors(resource));
+        }
+        if effects.resource_rules {
+            errors.extend(resource_rules::resource_rule_errors(resource));
+        }
+        if effects.best_practice {
+            errors.extend(narrative::best_practice_warnings(resource));
+        }
+        let resolver = Arc::clone(&self.resolver);
+        let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {
+            let opts = ValidationOptions {
+                profiles: vec![profile.to_string()],
+                use_meta_profiles: false,
+                ..Default::default()
+            };
+            // Structure, plus the core value sets' required bindings
+            // (embedded, so answerable synchronously).
+            let outcome = Validator::new(Arc::clone(&resolver)).validate_sync(value, &opts);
+            let tx = crate::terminology::core_terminology(version)
+                .required_binding_errors(&outcome.deferred);
+            outcome
+                .errors
+                .iter()
+                .chain(&tx)
+                .all(|e| e.severity != Severity::Error)
+        });
+        crate::effects::execute_with(
+            resource,
+            version,
+            &deferred,
+            effects,
+            Some(conformance),
+            &mut errors,
+        )
+        .await;
         errors
     }
 }

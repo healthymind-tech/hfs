@@ -1,0 +1,24 @@
+{#
+  SHARED CHROME -- the one-button theme switcher (system -> light -> dark).
+
+  Rendered by `helios_ui_chrome::theme_toggle()` for BOTH `crates/ui` (HFS)
+  and `crates/hts-ui` (HTS). Behaviour lives in `crates/ui/assets/theme.js`
+  (served to both consoles from the shared asset embed): a click cycles the
+  stored preference, which is written to the shared `hfs_theme` cookie.
+
+  All three icons are rendered; `app.css` shows the one matching
+  `<html data-theme-pref>`, which the inline boot script
+  (`partials/theme-boot.html`) stamps before first paint, so the icon never
+  flashes the wrong mode. `aria-label`/`title` start on the default ("follow
+  system") and `theme.js` swaps in the matching `data-label-*` text as soon
+  as it runs, before the button can be clicked.
+#}        <button type="button" class="theme-toggle" data-theme-cycle
+                aria-label="{{ i18n.t("theme-toggle-system") }}" title="{{ i18n.t("theme-toggle-system") }}"
+                data-label-system="{{ i18n.t("theme-toggle-system") }}"
+                data-label-light="{{ i18n.t("theme-toggle-light") }}"
+                data-label-dark="{{ i18n.t("theme-toggle-dark") }}">
+          <span class="theme-toggle__icon theme-toggle__icon--system" aria-hidden="true">{% include "icons/monitor.svg" %}</span>
+          <span class="theme-toggle__icon theme-toggle__icon--light" aria-hidden="true">{% include "icons/sun.svg" %}</span>
+          <span class="theme-toggle__icon theme-toggle__icon--dark" aria-hidden="true">{% include "icons/moon.svg" %}</span>
+        </button>
+{#- -#}

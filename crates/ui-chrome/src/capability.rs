@@ -82,14 +82,14 @@ impl DocsVersion {
     }
 
     /// The published documentation root for this release, trailing slash
-    /// included. R6 is still balloting, so it is pinned to the ballot the
+    /// included. R6 is not yet published, so it is pinned to the pre-release the
     /// generated models track rather than to a `6.0.0` path that 404s.
     pub fn docs_root(self) -> &'static str {
         match self {
             Self::R4 => "https://hl7.org/fhir/R4/",
             Self::R4B => "https://hl7.org/fhir/R4B/",
             Self::R5 => "https://hl7.org/fhir/R5/",
-            Self::R6 => "https://hl7.org/fhir/6.0.0-ballot4/",
+            Self::R6 => "https://hl7.org/fhir/6.0.0-snapshot1/",
         }
     }
 }
@@ -149,6 +149,44 @@ pub struct CapabilitySummary {
     pub kind: String,
     pub date: String,
     pub formats: Vec<String>,
+}
+
+impl CapabilitySummary {
+    /// `date` for a human: a FHIR `dateTime` such as
+    /// `2026-10-13T12:00:43.504193199+00:00` reads as `2026-10-13 12:00:43 UTC`
+    /// (fractional seconds dropped, `Z`/`+00:00` spelled as UTC, any other
+    /// offset kept); a date-only or oddly shaped value is passed through
+    /// untouched. The template keeps the raw value in `<time datetime>`.
+    pub fn date_display(&self) -> String {
+        format_fhir_datetime(&self.date)
+    }
+}
+
+/// See [`CapabilitySummary::date_display`]. Pure string shaping, so this crate
+/// stays free of a date library.
+pub fn format_fhir_datetime(raw: &str) -> String {
+    let Some((date, rest)) = raw.split_once('T') else {
+        return raw.to_string();
+    };
+    if date.len() != 10 || !date.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return raw.to_string();
+    }
+    // Split the clock from the offset: the first `Z`, `+` or `-` after it.
+    let offset_at = rest.find(['Z', '+', '-']);
+    let (clock, offset) = match offset_at {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let clock = clock.split('.').next().unwrap_or(clock);
+    if clock.len() < 5 || !clock.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return raw.to_string();
+    }
+    let zone = match offset {
+        "" => String::new(),
+        "Z" | "+00:00" | "-00:00" => " UTC".to_string(),
+        other => format!(" UTC{other}"),
+    };
+    format!("{date} {clock}{zone}")
 }
 
 /// One system-level interaction (`rest[].interaction[]`).
@@ -751,7 +789,7 @@ mod tests {
         assert_eq!(DocsVersion::R5.docs_root(), "https://hl7.org/fhir/R5/");
         assert_eq!(
             DocsVersion::R6.docs_root(),
-            "https://hl7.org/fhir/6.0.0-ballot4/"
+            "https://hl7.org/fhir/6.0.0-snapshot1/"
         );
     }
 
@@ -778,7 +816,7 @@ mod tests {
             (DocsVersion::R5, "https://hl7.org/fhir/R5/patient.html"),
             (
                 DocsVersion::R6,
-                "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+                "https://hl7.org/fhir/6.0.0-snapshot1/patient.html",
             ),
         ] {
             let statement = json!({"rest": [{"resource": [{
@@ -858,7 +896,7 @@ mod tests {
             (DocsVersion::R4, "https://hl7.org/fhir/R4/"),
             (DocsVersion::R4B, "https://hl7.org/fhir/R4B/"),
             (DocsVersion::R5, "https://hl7.org/fhir/R5/"),
-            (DocsVersion::R6, "https://hl7.org/fhir/6.0.0-ballot4/"),
+            (DocsVersion::R6, "https://hl7.org/fhir/6.0.0-snapshot1/"),
         ] {
             for (code, fragment) in [
                 ("transaction", "http.html#transaction"),
@@ -1293,7 +1331,7 @@ mod tests {
 
         assert!(html.contains(r#"<section class="card capability-raw-card""#));
         assert!(!html.contains("<details class=\"card json-fold\""));
-        assert!(html.contains(r#"<h3 id="capability-json-heading">"#));
+        assert!(html.contains(r#"<h2 id="capability-json-heading">"#));
         assert!(html.contains(r#"data-capability-json-actions hidden"#));
         assert!(html.contains(r#"role="region""#));
         assert!(html.contains(r#"aria-labelledby="capability-json-heading""#));
@@ -1318,5 +1356,35 @@ mod tests {
         assert!(!html.contains("data-capability-json-actions"));
         assert!(!html.contains("data-capability-json-expand-all"));
         assert!(!html.contains("data-capability-json-body"));
+    }
+}
+
+#[cfg(test)]
+mod datetime_display_tests {
+    use super::format_fhir_datetime;
+
+    #[test]
+    fn instants_read_as_date_clock_and_zone() {
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T12:00:43.504193199+00:00"),
+            "2026-10-13 12:00:43 UTC"
+        );
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T12:00:43Z"),
+            "2026-10-13 12:00:43 UTC"
+        );
+        assert_eq!(
+            format_fhir_datetime("2026-10-13T08:00:43.1-04:00"),
+            "2026-10-13 08:00:43 UTC-04:00"
+        );
+        assert_eq!(format_fhir_datetime("2026-10-13T12:00"), "2026-10-13 12:00");
+    }
+
+    #[test]
+    fn anything_else_passes_through() {
+        assert_eq!(format_fhir_datetime("2026-08-24"), "2026-08-24");
+        assert_eq!(format_fhir_datetime(""), "");
+        assert_eq!(format_fhir_datetime("yesterday"), "yesterday");
+        assert_eq!(format_fhir_datetime("2026-10-13Tnoon"), "2026-10-13Tnoon");
     }
 }

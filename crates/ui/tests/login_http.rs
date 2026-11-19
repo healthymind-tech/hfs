@@ -446,6 +446,7 @@ async fn a_signed_in_page_self_calls_with_the_session_bearer_not_the_service_tok
         Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
         helios_fhir::FhirVersion::R4,
         None,
+        None,
         base,
         10 * 1024 * 1024,
         false,

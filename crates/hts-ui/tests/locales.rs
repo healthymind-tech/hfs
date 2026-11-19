@@ -1,11 +1,11 @@
-//! Fluent catalog invariants for `locales/{en,es,de}/main.ftl`.
+//! Fluent catalog invariants for `locales/{en,es,de,zh-Hant}/main.ftl`.
 //!
 //! Every user-visible string in the HTS UI is a catalog key (#551 D5), and
 //! `I18n::t` renders an unknown key *as the key itself* rather than crashing.
 //! That failure mode is invisible in a passing render test, so the catalogs
 //! are checked structurally here instead:
 //!
-//! - all three locales define exactly the same key set, so switching language
+//! - all four locales define exactly the same key set, so switching language
 //!   can never drop a label;
 //! - every `.ftl` still parses, so a bad edit fails the ring rather than
 //!   silently truncating the catalog at the malformed entry.
@@ -18,7 +18,7 @@ use fluent_syntax::ast;
 use fluent_syntax::parser;
 use std::collections::BTreeSet;
 
-const LOCALES: [&str; 3] = ["en", "es", "de"];
+const LOCALES: [&str; 4] = ["en", "es", "de", "zh-Hant"];
 
 /// Message and term identifiers defined by one catalog.
 fn key_set(locale: &str) -> BTreeSet<String> {
@@ -68,7 +68,7 @@ fn every_locale_defines_the_same_key_set() {
 fn the_home_chart_keys_exist_in_every_locale() {
     // Named explicitly because 153 dead keys were pruned recently: a key that
     // exists nowhere renders as its own name in the UI, and the parity test
-    // above would happily accept it being absent from all three.
+    // above would happily accept it being absent from all four.
     const CHART_KEYS: [&str; 20] = [
         "hts-home-chart-title",
         "hts-home-chart-window",

@@ -76,7 +76,7 @@ mod mode_tests {
 
 use std::time::Duration;
 
-use futures::stream::TryStreamExt;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use mongodb::{
     Database,
     bson::{Bson, Document, doc},
@@ -85,14 +85,17 @@ use mongodb::{
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::schema::{
-    contained_rows_moved, drop_index_if_present, get_search_index_generation,
-    set_contained_rows_moved, set_search_index_generation,
+    contained_rows_moved, drop_index_if_present, get_reference_normalize_last_id,
+    get_search_index_boot_record, get_search_index_generation, references_normalized,
+    set_contained_rows_moved, set_reference_normalize_last_id, set_references_normalized,
+    set_search_index_empty_at_generation, set_search_index_generation,
 };
 use super::search_index_catalog::{
-    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
+    DATE_RANGE_GENERATION, IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
     SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
     superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
 };
+use crate::types::{absolute_reference_target, strip_reference_version};
 
 /// What one run of the builder did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +124,7 @@ pub enum BuildOutcome {
 
 /// How long to wait between `listIndexes` polls while another process's
 /// build of one of our names is in progress.
-const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
+pub(super) const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 
 /// Bound on how long `run_inner` waits for a *foreign* build (another
 /// process's `createIndexes`, or a `buildUUID` that never clears) of one of
@@ -131,13 +134,24 @@ const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 /// even a very large collection scan and still short enough that `inline`
 /// mode (which awaits this from `init_schema`) does not hang boot forever
 /// (I3).
-const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Page size for [`SearchIndexBuilder::move_contained_rows`]. Small enough
 /// that a crash mid-move only replays one page's worth of work on the next
 /// boot, large enough that moving even a sizeable backlog of contained rows
 /// takes few round trips.
 const MOVE_PAGE: usize = 1_000;
+
+/// Page size for [`SearchIndexBuilder::normalize_reference_rows`] (#2394).
+const NORMALIZE_PAGE: usize = 1_000;
+
+/// The reference backfill records its `_id` checkpoint every this many
+/// pages. A crash replays at most this many pages, which is harmless: the
+/// rewrite is idempotent.
+const NORMALIZE_CHECKPOINT_PAGES: usize = 10;
+
+/// Concurrent `update_many` calls per page in the reference backfill.
+const NORMALIZE_UPDATE_CONCURRENCY: usize = 8;
 
 /// `listIndexes` option keys, beyond `v`/`key`/`name`/`partialFilterExpression`,
 /// that change query results or index maintenance if present on a
@@ -185,13 +199,13 @@ struct Inspection {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ListedIndex {
     pub(super) name: String,
-    key: Document,
-    partial: Option<Document>,
+    pub(super) key: Document,
+    pub(super) partial: Option<Document>,
     pub(super) in_progress: bool,
     /// Names of any [`EXTRA_OPTION_KEYS`] present on this entry (or its
     /// `spec`). Non-empty means a generation-2 name is conflicting even when
     /// its key and partial filter match the catalog (I2).
-    extra_options: Vec<String>,
+    pub(super) extra_options: Vec<String>,
 }
 
 impl ListedIndex {
@@ -202,26 +216,157 @@ impl ListedIndex {
     }
 }
 
-/// Whether moving to the current generation should warn that date rows
-/// written before #1391 lack `value_date_end` (#1391), given the generation
-/// recorded before this boot (`None`: never recorded) and whether
-/// `search_index` is empty.
-///
-/// Only on the transition: a database already at the current generation has
-/// nothing left to say, and an empty one (a new database, or a collection
-/// nobody has written to) has no old rows to reindex.
-fn unindexed_date_ranges_warning_due(recorded: Option<i32>, search_index_is_empty: bool) -> bool {
-    recorded.is_none_or(|generation| generation < SEARCH_INDEX_GENERATION) && !search_index_is_empty
+/// What `search_index` held when this process booted (#2268), read by
+/// [`SearchIndexBuilder::rows_at_boot`] before `init_schema` spawns the
+/// builder, so before any write of this boot can land. `record_if_needed`
+/// decides the #1391 reminder from this, not from a count taken when it
+/// records: in `background` mode the server takes writes while the build runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowsAtBoot {
+    /// No row predates [`DATE_RANGE_GENERATION`]: `search_index` was empty, or a
+    /// boot of that generation or later found it empty while no generation was
+    /// recorded (`search_indexes.empty_at_generation`).
+    NoEarlierRows,
+    /// `search_index` held rows; any of them may predate #1391.
+    Present,
+    /// [`DATE_RANGE_GENERATION`] or a later generation was already recorded, so
+    /// this database has no #1391 reminder due, even when it moves to a newer
+    /// generation (#2274): nothing was counted.
+    DateRangesRecorded,
+    /// The boot-time read failed, so whether earlier rows exist is unknown.
+    Unknown { reason: String },
+}
+
+/// The answer `rows_at_boot` has without counting `search_index`, or `None`
+/// when it must count. `empty_at_generation` counts only while no generation is
+/// recorded: a rollback binary records its own generation, and may have written
+/// rows without `value_date_end`. Keyed to [`DATE_RANGE_GENERATION`], not the
+/// current generation: only a database below it can hold date rows without
+/// `value_date_end` (#2274).
+fn rows_at_boot_without_count(
+    recorded: Option<i32>,
+    empty_at_generation: Option<i32>,
+) -> Option<RowsAtBoot> {
+    match recorded {
+        Some(generation) if generation >= DATE_RANGE_GENERATION => {
+            Some(RowsAtBoot::DateRangesRecorded)
+        }
+        None if empty_at_generation
+            .is_some_and(|generation| generation >= DATE_RANGE_GENERATION) =>
+        {
+            Some(RowsAtBoot::NoEarlierRows)
+        }
+        _ => None,
+    }
+}
+
+/// Classifies the boot-time count of `search_index`, and says whether to record
+/// `empty_at_generation`: only for an empty collection with no generation
+/// recorded, the state a restart before the first record would otherwise take
+/// for an upgrade. A failed count records nothing, so the next boot counts again.
+fn classify_boot_count(recorded: Option<i32>, count: Result<u64, String>) -> (RowsAtBoot, bool) {
+    match count {
+        Ok(0) => (RowsAtBoot::NoEarlierRows, recorded.is_none()),
+        Ok(_) => (RowsAtBoot::Present, false),
+        Err(reason) => (RowsAtBoot::Unknown { reason }, false),
+    }
+}
+
+/// What `record_if_needed` logs about date rows written before #1391.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DateRowsNotice {
+    Silent,
+    /// The #1391 reminder to run `$reindex`.
+    Reindex,
+    /// The boot-time read failed: say so, and name `$reindex` for an upgraded
+    /// database.
+    ReindexIfUpgraded {
+        reason: String,
+    },
+}
+
+/// Only on a transition from below [`DATE_RANGE_GENERATION`] (`recorded`: the
+/// generation recorded before this record, `None` when never). A later
+/// transition, such as 4 to 5, has no date rows to reindex (#2274). And only for
+/// rows that were in `search_index` at boot: rows this boot wrote while its
+/// build ran are not old rows (#2268).
+fn date_rows_notice(recorded: Option<i32>, at_boot: &RowsAtBoot) -> DateRowsNotice {
+    if !recorded.is_none_or(|generation| generation < DATE_RANGE_GENERATION) {
+        return DateRowsNotice::Silent;
+    }
+    match at_boot {
+        RowsAtBoot::Present => DateRowsNotice::Reindex,
+        RowsAtBoot::Unknown { reason } => DateRowsNotice::ReindexIfUpgraded {
+            reason: reason.clone(),
+        },
+        RowsAtBoot::NoEarlierRows | RowsAtBoot::DateRangesRecorded => DateRowsNotice::Silent,
+    }
 }
 
 pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
+    rows_at_boot: RowsAtBoot,
+    /// Published to `MongoBackend` once the reference backfill is complete
+    /// (#2394). `None` in tests that do not care.
+    references_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SearchIndexBuilder {
-    pub(super) fn new(database: Database, mode: IndexBuildMode) -> Self {
-        Self { database, mode }
+    pub(super) fn new(database: Database, mode: IndexBuildMode, rows_at_boot: RowsAtBoot) -> Self {
+        Self {
+            database,
+            mode,
+            rows_at_boot,
+            references_flag: None,
+        }
+    }
+
+    /// Sets the flag [`Self::normalize_reference_rows`] raises when the
+    /// `value_reference` backfill is complete.
+    pub(super) fn with_references_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.references_flag = Some(flag);
+        self
+    }
+
+    /// What `search_index` held at boot (#2268). `init_schema` awaits this
+    /// before it spawns the builder, so no write of this boot is counted.
+    /// Records `empty_at_generation` for an empty collection with no generation
+    /// recorded. Never fails: an error becomes [`RowsAtBoot::Unknown`], since
+    /// all this decides is a log line.
+    pub(super) async fn rows_at_boot(database: &Database) -> RowsAtBoot {
+        let (recorded, empty_at_generation) = match get_search_index_boot_record(database).await {
+            Ok(record) => record,
+            Err(e) => {
+                return RowsAtBoot::Unknown {
+                    reason: format!("reading schema_version failed: {}", e.kind),
+                };
+            }
+        };
+        if let Some(rows) = rows_at_boot_without_count(recorded, empty_at_generation) {
+            return rows;
+        }
+        // Collection metadata, no scan; a collection that does not exist counts 0.
+        let count = database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .estimated_document_count()
+            .await
+            .map_err(|e| format!("counting search_index failed: {}", e.kind));
+        let (rows, record_empty) = classify_boot_count(recorded, count);
+        if record_empty
+            && let Err(e) =
+                set_search_index_empty_at_generation(database, SEARCH_INDEX_GENERATION).await
+        {
+            tracing::warn!(
+                error = %e,
+                "could not record that search_index was empty at boot; a restart before the first \
+                 build records generation {SEARCH_INDEX_GENERATION} may log the #1391 reindex reminder"
+            );
+        }
+        rows
     }
 
     /// Inspect, build, drop, record. Never returns an `Err`: every failure is
@@ -260,6 +405,23 @@ impl SearchIndexBuilder {
             tracing::info!(
                 moved,
                 "moved contained search_index rows to search_index_contained"
+            );
+        }
+
+        // Same class of fix as the move above: runs in every mode, ahead of
+        // the index work, and wraps its errors so `run` does not report them
+        // as an index-build failure (#2394).
+        let normalized = self.normalize_reference_rows().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("reference normalization failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })?;
+        if normalized > 0 {
+            tracing::info!(
+                normalized,
+                "normalized value_reference rows in search_index / search_index_contained"
             );
         }
 
@@ -374,37 +536,46 @@ impl SearchIndexBuilder {
     async fn record_if_needed(&self) -> StorageResult<()> {
         let recorded = get_search_index_generation(&self.database).await?;
         if recorded != Some(SEARCH_INDEX_GENERATION) {
-            // The one moment the upgrade is visible: once generation 4 is
-            // recorded this branch is never taken again, so the check costs
-            // nothing on later boots.
-            if unindexed_date_ranges_warning_due(recorded, self.search_index_is_empty().await) {
-                tracing::warn!(
-                    from_generation = ?recorded,
-                    to_generation = SEARCH_INDEX_GENERATION,
-                    "search_index date rows written before #1391 have no value_date_end and will \
-                     not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
-                     they are reindexed, and a Period indexed before #1391 is still two \
-                     independent point rows, so even lt and sa compare each of its ends on its \
-                     own until then; run `$reindex` to rebuild them (rows written by this \
-                     version are not affected)"
-                );
+            // The one moment an upgrade is visible: once this generation is
+            // recorded, this branch is not taken again. `date_rows_notice`
+            // gives the #1391 reminder only on a transition from below
+            // `DATE_RANGE_GENERATION` (#2274). It decides from what
+            // `search_index` held at boot, not from a count taken now: in
+            // `background` mode this boot's own writes are already in the
+            // collection (#2268). `DateRangesRecorded` boots do no count.
+            match date_rows_notice(recorded, &self.rows_at_boot) {
+                DateRowsNotice::Silent => {}
+                DateRowsNotice::Reindex => {
+                    tracing::warn!(
+                        from_generation = ?recorded,
+                        to_generation = SEARCH_INDEX_GENERATION,
+                        "search_index date rows written before #1391 have no value_date_end and will \
+                         not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
+                         they are reindexed, and a Period indexed before #1391 is still two \
+                         independent point rows, so even lt and sa compare each of its ends on its \
+                         own until then; run `$reindex` to rebuild them (rows written by this \
+                         version are not affected)"
+                    );
+                }
+                DateRowsNotice::ReindexIfUpgraded { reason } => {
+                    tracing::warn!(
+                        from_generation = ?recorded,
+                        to_generation = SEARCH_INDEX_GENERATION,
+                        error = %reason,
+                        "could not tell whether search_index held rows before this boot, so date rows \
+                         written before #1391 may be present: if this database was upgraded from a version \
+                         before #1391, run `$reindex` so date searches match them (rows written by this \
+                         version are not affected)"
+                    );
+                }
             }
+            // From the same read as this record: a rollback may have written
+            // rows without `tuple_code` that the markers would cover once
+            // this generation is recorded. Fails closed (`composite_layout`).
+            super::composite_layout::drop_untrusted_tuple_markers(&self.database, recorded).await?;
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;
         }
         Ok(())
-    }
-
-    /// Whether `search_index` holds no rows, from collection metadata: no
-    /// scan, however large the collection. A collection that does not exist
-    /// counts as empty; a failed count as not empty (it only decides whether
-    /// a warning is logged).
-    async fn search_index_is_empty(&self) -> bool {
-        self.database
-            .collection::<Document>(SEARCH_INDEX_COLLECTION)
-            .estimated_document_count()
-            .await
-            .map(|count| count == 0)
-            .unwrap_or(false)
     }
 
     /// Raw `listIndexes`, because the driver's `IndexModel` does not expose
@@ -511,6 +682,132 @@ impl SearchIndexBuilder {
         set_contained_rows_moved(&self.database).await?;
         Ok(moved)
     }
+
+    /// One-time rewrite of `value_reference` to its normalized form (#2394):
+    /// version suffix stripped, and `value_reference_target` (`Type/id`) set
+    /// for absolute URLs. Covers `search_index` and
+    /// `search_index_contained`. Walks each collection by ascending `_id` in
+    /// pages, computing the new values with the same helpers the writer
+    /// uses, so the two cannot diverge. Idempotent (a normalized row is
+    /// left alone) and resumable (an `_id` checkpoint is recorded). Runs in
+    /// every mode. On completion records the marker and raises the
+    /// in-memory flag. Returns the number of rows rewritten.
+    async fn normalize_reference_rows(&self) -> StorageResult<u64> {
+        if references_normalized(&self.database).await? {
+            self.publish_references_normalized();
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+            total += self.normalize_collection(collection).await?;
+        }
+        set_references_normalized(&self.database).await?;
+        self.publish_references_normalized();
+        Ok(total)
+    }
+
+    fn publish_references_normalized(&self) {
+        if let Some(flag) = &self.references_flag {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn normalize_collection(&self, name: &str) -> StorageResult<u64> {
+        let coll = self.database.collection::<Document>(name);
+        let mut last = get_reference_normalize_last_id(&self.database, name).await?;
+        let mut rewritten = 0u64;
+        let mut pages = 0usize;
+        loop {
+            let mut filter = doc! { "value_reference": { "$exists": true } };
+            if let Some(last) = &last {
+                filter.insert("_id", doc! { "$gt": last.clone() });
+            }
+            let mut cursor = coll
+                .find(filter)
+                .projection(doc! { "value_reference": 1, "value_reference_target": 1 })
+                .sort(doc! { "_id": 1 })
+                .limit(NORMALIZE_PAGE as i64)
+                .await?;
+            let mut page = Vec::with_capacity(NORMALIZE_PAGE);
+            while let Some(row) = cursor.try_next().await? {
+                page.push(row);
+            }
+            let Some(page_last) = page.last().and_then(|r| r.get("_id").cloned()) else {
+                break;
+            };
+            let full_page = page.len() == NORMALIZE_PAGE;
+
+            // Group the rows that need a rewrite by their new values.
+            let mut groups: std::collections::HashMap<(String, Option<String>), Vec<Bson>> =
+                std::collections::HashMap::new();
+            for row in &page {
+                let Ok(old) = row.get_str("value_reference") else {
+                    continue;
+                };
+                let new_value = strip_reference_version(old);
+                let target = absolute_reference_target(old);
+                let current_target = row.get_str("value_reference_target").ok();
+                if new_value == old && target.as_deref() == current_target {
+                    continue;
+                }
+                if let Some(id) = row.get("_id") {
+                    groups
+                        .entry((new_value.to_string(), target))
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
+            let updates: Vec<(Document, Document)> = groups
+                .into_iter()
+                .map(|((value, target), ids)| {
+                    let mut set = doc! { "value_reference": value };
+                    let mut update = Document::new();
+                    match target {
+                        Some(t) => {
+                            set.insert("value_reference_target", t);
+                        }
+                        None => {
+                            update.insert("$unset", doc! { "value_reference_target": "" });
+                        }
+                    }
+                    update.insert("$set", set);
+                    (doc! { "_id": { "$in": ids } }, update)
+                })
+                .collect();
+            let results: Vec<u64> = stream::iter(updates)
+                .map(|(filter, update)| {
+                    let coll = coll.clone();
+                    async move {
+                        let r = coll.update_many(filter, update).await?;
+                        Ok::<u64, StorageError>(r.modified_count)
+                    }
+                })
+                .buffer_unordered(NORMALIZE_UPDATE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            rewritten += results.iter().sum::<u64>();
+
+            last = Some(page_last);
+            pages += 1;
+            if pages.is_multiple_of(NORMALIZE_CHECKPOINT_PAGES)
+                && let Some(last) = &last
+            {
+                set_reference_normalize_last_id(&self.database, name, last.clone()).await?;
+                tracing::info!(
+                    collection = name,
+                    rewritten,
+                    "normalizing value_reference rows"
+                );
+            }
+            if !full_page {
+                break;
+            }
+        }
+        if let Some(last) = last {
+            set_reference_normalize_last_id(&self.database, name, last).await?;
+        }
+        Ok(rewritten)
+    }
 }
 
 /// The superseded names present in `existing` (a `search_index`
@@ -583,7 +880,7 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
         tracing::warn!(
             index = spec.name,
             "HFS_MONGODB_INDEX_BUILD=off: generation-{SEARCH_INDEX_GENERATION} search_index index is missing; \
-             build it with docs/mongodb/search-index-v2.mongosh.js"
+             build it with crates/persistence/mongodb/search-index-v2.mongosh.js"
         );
     }
     for name in &inspection.superseded_present {
@@ -720,7 +1017,7 @@ pub(super) fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
 /// How one `listIndexes` entry compares to the generation-2 spec it is named
 /// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecStatus {
+pub(super) enum SpecStatus {
     /// Different key, different partial filter, or an [`EXTRA_OPTION_KEYS`]
     /// option present (I2) — a person built something under our name.
     Conflicting,
@@ -733,7 +1030,7 @@ enum SpecStatus {
 /// Classifies one existing index against the catalog spec it is named for.
 /// Pure and side-effect-free so the conflict rule (I2, and the key/partial
 /// comparison it already had) is unit-testable without a live server.
-fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
+pub(super) fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
     // Numeric literals from mongosh land as doubles even when the catalog
     // spec's keys/partial filter are `1_i32`; normalise before comparing so
     // a pre-built database (e.g. from the shipped mongosh script) is never
@@ -838,26 +1135,175 @@ mod builder_tests {
         );
     }
 
-    /// #1391: the warning is for an upgrade with rows to reindex, once.
+    /// #1391: the reminder is for an upgrade with rows to reindex, once, and
+    /// (#2268) only for rows that were there at boot.
     #[test]
-    fn unindexed_date_ranges_warning_is_due_only_on_an_upgrade_with_rows() {
-        let current = SEARCH_INDEX_GENERATION;
-        // Never recorded, rows present: a database from before generations.
-        assert!(unindexed_date_ranges_warning_due(None, false));
-        // Every earlier generation, rows present.
-        for generation in 1..current {
-            assert!(
-                unindexed_date_ranges_warning_due(Some(generation), false),
+    fn date_rows_notice_reminds_only_for_rows_present_at_boot() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        // Never recorded, rows present at boot: a database from before generations.
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::Present),
+            DateRowsNotice::Reindex
+        );
+        // Every earlier generation, rows present at boot.
+        for generation in 1..date_ranges {
+            assert_eq!(
+                date_rows_notice(Some(generation), &RowsAtBoot::Present),
+                DateRowsNotice::Reindex,
                 "generation {generation}"
             );
         }
-        // A new database, or one nobody wrote to.
-        assert!(!unindexed_date_ranges_warning_due(None, true));
-        assert!(!unindexed_date_ranges_warning_due(Some(current - 1), true));
-        // Already there (or newer, from a later binary): silent on every boot.
-        assert!(!unindexed_date_ranges_warning_due(Some(current), false));
-        assert!(!unindexed_date_ranges_warning_due(Some(current), true));
-        assert!(!unindexed_date_ranges_warning_due(Some(current + 1), false));
+        // #2268: rows exist by the time the generation is recorded, but none
+        // did at boot, so every one was written by this version.
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::NoEarlierRows),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges - 1), &RowsAtBoot::NoEarlierRows),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::DateRangesRecorded),
+            DateRowsNotice::Silent
+        );
+        // At or past the date-range generation (including a later transition,
+        // or a database from a later binary): silent on every boot.
+        assert_eq!(
+            date_rows_notice(Some(date_ranges), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges + 1), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+    }
+
+    /// #2268: a failed boot read is neither the reminder nor silence.
+    #[test]
+    fn date_rows_notice_hedges_when_the_boot_read_failed() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        let unknown = RowsAtBoot::Unknown {
+            reason: "boom".to_string(),
+        };
+        assert_eq!(
+            date_rows_notice(None, &unknown),
+            DateRowsNotice::ReindexIfUpgraded {
+                reason: "boom".to_string()
+            }
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges - 1), &unknown),
+            DateRowsNotice::ReindexIfUpgraded {
+                reason: "boom".to_string()
+            }
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges), &unknown),
+            DateRowsNotice::Silent
+        );
+    }
+
+    #[test]
+    fn rows_at_boot_without_count_needs_no_count_only_when_the_answer_is_known() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges), None),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges + 1), Some(date_ranges)),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges + 1)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        assert_eq!(rows_at_boot_without_count(None, None), None);
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges - 1)),
+            None
+        );
+        // The marker is ignored once a generation is recorded.
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges - 1), Some(date_ranges)),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_boot_count_marks_only_an_empty_collection_with_no_generation() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        assert_eq!(
+            classify_boot_count(None, Ok(0)),
+            (RowsAtBoot::NoEarlierRows, true)
+        );
+        // A recorded generation (any, here one below the date-range generation)
+        // never writes the empty marker.
+        assert_eq!(
+            classify_boot_count(Some(date_ranges - 1), Ok(0)),
+            (RowsAtBoot::NoEarlierRows, false)
+        );
+        assert_eq!(
+            classify_boot_count(None, Ok(7)),
+            (RowsAtBoot::Present, false)
+        );
+        assert_eq!(
+            classify_boot_count(None, Err("x".to_string())),
+            (
+                RowsAtBoot::Unknown {
+                    reason: "x".to_string()
+                },
+                false
+            )
+        );
+    }
+
+    /// #2274: the reminder belongs to the generation that added `value_date_end`
+    /// (4), not to the current one. A database recorded at 4 moving to a later
+    /// generation (5 is hypothetical today) has nothing to reindex.
+    #[test]
+    fn a_transition_past_the_date_range_generation_logs_no_reminder() {
+        // Pinned: the generation of #1391 never moves.
+        assert_eq!(DATE_RANGE_GENERATION, 4);
+        // Recorded at 4: no boot count is needed, whatever generation comes next.
+        assert_eq!(
+            rows_at_boot_without_count(Some(4), None),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            date_rows_notice(Some(4), &RowsAtBoot::DateRangesRecorded),
+            DateRowsNotice::Silent
+        );
+        // Silent even if rows were counted, or the read failed.
+        assert_eq!(
+            date_rows_notice(Some(4), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(
+                Some(4),
+                &RowsAtBoot::Unknown {
+                    reason: "boom".into()
+                }
+            ),
+            DateRowsNotice::Silent
+        );
+        // A generation-4 empty marker still spares a later binary the count.
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(4)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        // A pre-#1391 database that jumps past 4 is still reminded.
+        assert_eq!(
+            date_rows_notice(Some(3), &RowsAtBoot::Present),
+            DateRowsNotice::Reindex
+        );
+        assert_eq!(rows_at_boot_without_count(Some(3), None), None);
     }
 
     #[test]
@@ -1004,5 +1450,139 @@ mod builder_tests {
     fn off_mode_decision_is_none_when_nothing_missing_or_superseded() {
         let inspection = Inspection::default();
         assert_eq!(off_mode_decision(&inspection), None);
+    }
+}
+
+/// `record_if_needed` against a real server (`HFS_TEST_MONGODB_URL`; skipped
+/// without it unless `HFS_TEST_REQUIRE_MONGODB` is set): the `tuple_code`
+/// markers it must delete before it records the current generation.
+#[cfg(test)]
+mod tuple_marker_record_tests {
+    use super::*;
+
+    const MARKER: &str = "t|composite_tuple_code_v2";
+
+    /// A fresh database on the test server, `None` (and a skip line) without
+    /// one. The caller drops it.
+    async fn scratch_database(label: &str) -> Option<Database> {
+        let Ok(uri) = std::env::var("HFS_TEST_MONGODB_URL") else {
+            if std::env::var("HFS_TEST_REQUIRE_MONGODB").is_ok_and(|value| !value.is_empty()) {
+                panic!("{label}: HFS_TEST_MONGODB_URL unset");
+            }
+            eprintln!("Skipping {label}: HFS_TEST_MONGODB_URL unset");
+            return None;
+        };
+        let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+        Some(client.database(&format!(
+            "hfs_tuple_record_{}",
+            uuid::Uuid::new_v4().simple()
+        )))
+    }
+
+    /// A database whose recorded generation is `generation` and which holds
+    /// one tenant marker, as a binary of this generation left it.
+    async fn seed(database: &Database, generation: i32) {
+        database
+            .collection::<Document>("schema_version")
+            .insert_one(doc! {
+                "_id": "schema_version",
+                "search_indexes": { "generation": generation },
+            })
+            .await
+            .unwrap();
+        database
+            .collection::<Document>("search_layout")
+            .insert_one(doc! {
+                "_id": MARKER,
+                "tenant_id": "t",
+                "resource_type": Bson::Null,
+                "layout": "composite_tuple_code_v2",
+            })
+            .await
+            .unwrap();
+    }
+
+    fn builder(database: &Database) -> SearchIndexBuilder {
+        SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Off,
+            RowsAtBoot::DateRangesRecorded,
+        )
+    }
+
+    async fn marker_count(database: &Database) -> u64 {
+        database
+            .collection::<Document>("search_layout")
+            .count_documents(doc! { "_id": MARKER })
+            .await
+            .unwrap()
+    }
+
+    /// N1: this binary booted while generation 6 was recorded, so nothing at
+    /// boot touched the markers; then an older binary booted, recorded its own
+    /// generation (5 for #2394, 4 before it) and wrote rows without
+    /// `tuple_code`. When this builder records 6 the markers must already be
+    /// gone, or they would cover those rows for good.
+    #[tokio::test]
+    async fn recording_over_an_older_generation_deletes_the_markers_first() {
+        for older in [4, 5] {
+            let Some(database) = scratch_database("recording_over_an_older_generation").await
+            else {
+                return;
+            };
+            seed(&database, older).await;
+
+            builder(&database).record_if_needed().await.unwrap();
+
+            let recorded = get_search_index_generation(&database).await.unwrap();
+            let markers = marker_count(&database).await;
+            database.drop().await.unwrap();
+            assert_eq!(recorded, Some(SEARCH_INDEX_GENERATION));
+            assert_eq!(
+                markers, 0,
+                "a marker survived the record of generation {SEARCH_INDEX_GENERATION} over {older}"
+            );
+        }
+    }
+
+    /// The markers of a database already at this generation are kept.
+    #[tokio::test]
+    async fn recording_nothing_new_keeps_the_markers() {
+        let Some(database) = scratch_database("recording_nothing_new").await else {
+            return;
+        };
+        seed(&database, SEARCH_INDEX_GENERATION).await;
+
+        builder(&database).record_if_needed().await.unwrap();
+
+        let markers = marker_count(&database).await;
+        database.drop().await.unwrap();
+        assert_eq!(markers, 1);
+    }
+
+    /// N2: when the markers cannot be deleted, the generation that would
+    /// trust them is not recorded. The failure is a `search_layout` that is a
+    /// view: every delete on it fails.
+    #[tokio::test]
+    async fn a_failed_marker_delete_records_no_generation() {
+        let Some(database) = scratch_database("a_failed_marker_delete").await else {
+            return;
+        };
+        database
+            .collection::<Document>("schema_version")
+            .insert_one(doc! { "_id": "schema_version", "search_indexes": { "generation": 5 } })
+            .await
+            .unwrap();
+        database
+            .run_command(doc! { "create": "search_layout", "viewOn": "absent", "pipeline": [] })
+            .await
+            .unwrap();
+
+        let outcome = builder(&database).record_if_needed().await;
+
+        let recorded = get_search_index_generation(&database).await.unwrap();
+        database.drop().await.unwrap();
+        assert!(outcome.is_err(), "the delete on a view must fail");
+        assert_eq!(recorded, Some(5));
     }
 }

@@ -27,7 +27,7 @@ use helios_persistence::tenant::TenantContext;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
-use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_system_bundle};
+use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_native_batch};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -155,8 +155,8 @@ pub async fn import_icd9_cm(
         definition: Some("header"),
         ..Default::default()
     };
-    let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_native_batch(&meta, std::slice::from_ref(&root));
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -173,8 +173,8 @@ pub async fn import_icd9_cm(
                 ..Default::default()
             })
             .collect();
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let bytes = build_native_batch(&meta, &builder);
+        let chunk = backend.import_parsed(ctx, bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(
@@ -219,7 +219,10 @@ fn read_zip_contents(path: &Path) -> Result<Icd9ZipContents, HtsError> {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
+        let name = entry
+            .name()
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
         if !name.ends_with(".txt") {
             continue;
         }
@@ -554,8 +557,11 @@ E800  Railway accidents\n";
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("CMS32_DESC_LONG_DX.txt", zip::write::FileOptions::default())
-                    .unwrap();
+                zip.start_file(
+                    "CMS32_DESC_LONG_DX.txt",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
                 zip.finish().unwrap();
             }
@@ -567,7 +573,7 @@ E800  Railway accidents\n";
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
                 for (name, content) in entries {
-                    zip.start_file(*name, zip::write::FileOptions::default())
+                    zip.start_file(*name, zip::write::SimpleFileOptions::default())
                         .unwrap();
                     zip.write_all(content.as_bytes()).unwrap();
                 }

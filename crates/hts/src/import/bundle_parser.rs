@@ -44,6 +44,24 @@ pub struct ParsedBundle {
     /// is purely a fast-path for first-time bulk loads. Importers MUST leave it
     /// `false` whenever the target may already contain concepts (re-import).
     pub fresh_load: bool,
+    /// `true` when this bundle is one concept batch of a chunked bulk load
+    /// (SNOMED RF2, LOINC). The importer's caller builds the closure once
+    /// when the whole load is in (`hts import`, the admin import job, the
+    /// bootstrap), so the write layer does not rebuild it after every batch —
+    /// which, for a hierarchy below the inline-rebuild limit, meant one full
+    /// closure build per batch.
+    pub chunked: bool,
+    /// When `true`, the write layer does not rebuild `concept_closure` for code
+    /// systems that already held concepts before this bundle. Rebuilding after
+    /// every batch of a chunked bulk load (SNOMED RF2, LOINC, RxNorm, …) is
+    /// O(n²), so those importers set this on each batch and leave the single
+    /// rebuild to `finalize_after_bootstrap` / `migrate_concept_closure*`.
+    /// Systems that were empty before the bundle are still rebuilt (cheap).
+    ///
+    /// Defaults to `false`: every code system the bundle writes gets its
+    /// closure rebuilt before the import returns, so a plain re-import never
+    /// leaves `$subsumes` / `is-a` answering from a wiped closure (#2128).
+    pub defer_closure: bool,
 }
 
 /// Authority rank for a resource we have POSITIVE evidence is authoritative:
@@ -339,9 +357,12 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
 
     let mut concepts: Vec<ParsedConcept> = Vec::new();
 
+    let edges = HierarchyProperties::from_code_system(cs);
     if let Some(top_level) = cs["concept"].as_array() {
-        flatten_concepts(top_level, None, &mut concepts);
+        flatten_concepts(top_level, None, &edges, &mut concepts);
     }
+    edges.apply_child_edges(&mut concepts);
+    fill_known_hierarchy(url, &mut concepts);
 
     Some(ParsedCodeSystem {
         id,
@@ -357,14 +378,248 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
     })
 }
 
+/// Same canonical `url|version`, different content: the replacement policy.
+///
+/// Returns the warning to record when the incoming CodeSystem must NOT be
+/// written over the stored row with the same `url|version`, `None` when it may.
+///
+/// A CodeSystem version is immutable content, so two different copies under
+/// one `url|version` mean one of them is wrong. The common wrong copy is a
+/// truncated sample: TW Core 1.0.0 ships every Taiwan ICD-10-CM/PCS code
+/// system with 5–18 example codes (still labelled `content=complete`) under
+/// the same `url|version` as TW Core 0.3.2's full tables (91–97 k codes).
+/// HTS merges concepts on re-import, but the smaller copy's metadata
+/// (`content`, `count`, resource JSON) replaced the stored one's, and on a
+/// server that only ever saw the sample the full table could not be loaded
+/// without being "replaced back" by a later package install.
+///
+/// Policy: when the stored row is `complete` and the incoming copy has fewer
+/// concepts, all of which the stored row already defines, the incoming copy
+/// is a subset — a fragment, sample or stub — and is skipped with a warning.
+/// A larger copy, or one with codes the stored row lacks, is written as
+/// before (concepts merge). Chunked bulk loads (one batch = a subset by
+/// design) never reach this check.
+pub fn truncated_copy_warning(
+    cs: &ParsedCodeSystem,
+    stored_content: &str,
+    stored_concepts: i64,
+    incoming_missing_from_stored: i64,
+) -> Option<String> {
+    let incoming = cs.concepts.len() as i64;
+    if stored_content != "complete" || incoming >= stored_concepts || incoming_missing_from_stored > 0
+    {
+        return None;
+    }
+    Some(format!(
+        "CodeSystem {}|{} not replaced: the stored copy is complete with {stored_concepts} \
+         concepts; the incoming copy (content={}) has {incoming}, all already present",
+        cs.url,
+        cs.version.as_deref().unwrap_or(""),
+        cs.content
+    ))
+}
+
+/// Code systems HTS loads from their publisher's current release under the
+/// version `current` (native importers: NUCC, NDC, RxNorm, ICD-10-CM), whose
+/// codes are stable across releases.
+///
+/// Value sets (VSAC above all) pin the release they were authored against —
+/// `{"system": "http://nucc.org/provider-taxonomy", "version": "23.1"}` —
+/// and HTS answered UNKNOWN_CODESYSTEM_VERSION for every code because only
+/// `current` is stored (CARIN's `EOB-careteam-qualification` invariant
+/// failed under remote terminology). For these systems a compose
+/// `include.version` / `exclude.version` is advisory: it is dropped from the
+/// stored compose (the resource JSON keeps it), so the include resolves to the
+/// stored release, as tx.fhir.org effectively does for these systems.
+pub const ADVISORY_VERSION_SYSTEMS: [&str; 4] = [
+    "http://nucc.org/provider-taxonomy",
+    "http://hl7.org/fhir/sid/ndc",
+    "http://www.nlm.nih.gov/research/umls/rxnorm",
+    "http://hl7.org/fhir/sid/icd-10-cm",
+];
+
+/// Drop the advisory `version` of compose includes / excludes over
+/// [`ADVISORY_VERSION_SYSTEMS`]. Returns whether anything changed.
+pub fn strip_advisory_versions(compose: &mut Value) -> bool {
+    let mut changed = false;
+    for key in ["include", "exclude"] {
+        if let Some(items) = compose.get_mut(key).and_then(Value::as_array_mut) {
+            for inc in items {
+                let advisory = inc
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| ADVISORY_VERSION_SYSTEMS.contains(&s));
+                if advisory
+                    && let Some(obj) = inc.as_object_mut()
+                    && obj.remove("version").is_some()
+                {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// CDC Race & Ethnicity (CDCREC).
+pub const CDCREC_URL: &str = "urn:oid:2.16.840.1.113883.6.238";
+
+/// `<child>\t<parent>` edges of the CDCREC race and ethnicity trees.
+const CDCREC_HIERARCHY: &str = include_str!("../data/cdcrec-hierarchy.tsv");
+
+/// Supply the hierarchy of a code system known to be distributed flat.
+///
+/// The CDCREC CodeSystem that reaches HTS (VSAC / PHIN VADS 1.2, 966 codes;
+/// THO's own copy is `not-present`) lists its concepts without nesting or
+/// parent properties, so `is-a` / `descendent-of 1000-9` filters (US Core
+/// `detailed-race`, `detailed-ethnicity`) expanded to nothing and every
+/// detailed race code failed validation. The CDCREC trees are the same as
+/// THO's `v3-Race` and `v3-Ethnicity` code systems under the abstract roots
+/// `1000-9` (Race) and `2133-7` (Ethnicity); the edges are embedded from them.
+///
+/// Only applies when the incoming content carries no hierarchy at all — a
+/// CDCREC with its own nesting or parent properties is kept as published —
+/// and only links codes the code system itself defines.
+/// The embedded CDCREC `(child, parent)` edges.
+pub fn cdcrec_edges() -> Vec<(&'static str, &'static str)> {
+    CDCREC_HIERARCHY
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('\t'))
+        .collect()
+}
+
+/// One-time repair marker (`bootstrap_imports` sentinel row) for databases
+/// written before the fixes of the p25-data line: flat CDCREC rows get their
+/// hierarchy, and cached expansions over CDCREC and UCUM (computed when
+/// enumerated UCUM units and CDCREC descendants were dropped) are cleared.
+pub const P25_DATA_MIGRATION_MARKER: &str = "#migration:cdcrec-hierarchy-ucum-enum-p25data";
+
+/// One-time repair marker of the p25-data2 fixes: stored composes lose the
+/// advisory versions of [`ADVISORY_VERSION_SYSTEMS`], and cached expansions
+/// get their `value_set_dependencies` rows.
+pub const P25_DATA2_MIGRATION_MARKER: &str = "#migration:advisory-versions-vs-dependencies-p25data2";
+
+/// URLs whose cached expansions the p25-data migration clears.
+pub const P25_DATA_SYSTEMS: [&str; 2] = [CDCREC_URL, "http://unitsofmeasure.org"];
+
+fn fill_known_hierarchy(url: &str, concepts: &mut [ParsedConcept]) {
+    if url != CDCREC_URL || concepts.is_empty() || concepts.iter().any(|c| c.parent_code.is_some())
+    {
+        return;
+    }
+    let present: std::collections::HashSet<String> =
+        concepts.iter().map(|c| c.code.clone()).collect();
+    let parents: std::collections::HashMap<&str, &str> = cdcrec_edges().into_iter().collect();
+    let mut linked = 0usize;
+    for c in concepts.iter_mut() {
+        if let Some(parent) = parents.get(c.code.as_str())
+            && present.contains(*parent)
+        {
+            c.parent_code = Some((*parent).to_owned());
+            linked += 1;
+        }
+    }
+    tracing::info!(
+        url,
+        linked,
+        concepts = concepts.len(),
+        "flat CDCREC CodeSystem: supplied the race/ethnicity hierarchy"
+    );
+}
+
+/// Which concept properties of a CodeSystem encode hierarchy edges.
+///
+/// FHIR defines the standard properties `parent` and `child`
+/// (`http://hl7.org/fhir/concept-properties#parent` / `#child`); a CodeSystem
+/// may declare them under any local code via `CodeSystem.property[].uri`. The
+/// HL7 v3 code systems on terminology.hl7.org (v3-ActCode, v3-RoleCode, …)
+/// use a flat `concept[]` list with a `subsumedBy` property for the parent
+/// link, and nothing else — without recognising it, `is-a` filters and
+/// `$subsumes` see no hierarchy at all (fork issue T3, `_ActEncounterCode`).
+#[derive(Debug, Default)]
+pub(crate) struct HierarchyProperties {
+    /// Property codes whose `valueCode` names the concept's parent.
+    parent_codes: Vec<String>,
+    /// Property codes whose `valueCode` names a child of the concept.
+    child_codes: Vec<String>,
+}
+
+impl HierarchyProperties {
+    pub(crate) fn from_code_system(cs: &Value) -> Self {
+        let mut me = Self {
+            parent_codes: vec!["parent".into(), "subsumedBy".into()],
+            child_codes: vec!["child".into()],
+        };
+        if let Some(defs) = cs["property"].as_array() {
+            for def in defs {
+                let (Some(code), Some(uri)) = (def["code"].as_str(), def["uri"].as_str()) else {
+                    continue;
+                };
+                match uri {
+                    "http://hl7.org/fhir/concept-properties#parent"
+                        if !me.parent_codes.iter().any(|c| c == code) =>
+                    {
+                        me.parent_codes.push(code.to_owned());
+                    }
+                    "http://hl7.org/fhir/concept-properties#child"
+                        if !me.child_codes.iter().any(|c| c == code) =>
+                    {
+                        me.child_codes.push(code.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        me
+    }
+
+    fn is_parent(&self, code: &str) -> bool {
+        self.parent_codes.iter().any(|c| c == code)
+    }
+
+    fn is_child(&self, code: &str) -> bool {
+        self.child_codes.iter().any(|c| c == code)
+    }
+
+    /// `child` properties point the other way: `X child Y` means Y's parent
+    /// is X. Fill in `parent_code` for children that have no parent yet.
+    fn apply_child_edges(&self, concepts: &mut [ParsedConcept]) {
+        if self.child_codes.is_empty() {
+            return;
+        }
+        let mut parent_of: Vec<(String, String)> = Vec::new();
+        for c in concepts.iter() {
+            for p in &c.properties {
+                if p.value_type == "code" && self.is_child(&p.code) {
+                    parent_of.push((p.value.clone(), c.code.clone()));
+                }
+            }
+        }
+        if parent_of.is_empty() {
+            return;
+        }
+        for (child, parent) in parent_of {
+            if let Some(c) = concepts.iter_mut().find(|c| c.code == child)
+                && c.parent_code.is_none()
+            {
+                c.parent_code = Some(parent);
+            }
+        }
+    }
+}
+
 /// Recursively flatten a nested concept tree into a flat `Vec<ParsedConcept>`.
 ///
 /// `parent_code` is propagated to each child via the nesting relationship.
-/// A `"parent"` property on a concept also generates a hierarchy edge to the
-/// property's `valueCode` (in addition to or instead of the nesting edge).
+/// A parent-edge property on a concept (`parent`, `subsumedBy`, or any
+/// property declared with the `concept-properties#parent` URI — see
+/// [`HierarchyProperties`]) also generates a hierarchy edge to the property's
+/// `valueCode` (in addition to or instead of the nesting edge).
 fn flatten_concepts(
     concepts: &[Value],
     nesting_parent: Option<&str>,
+    edges: &HierarchyProperties,
     out: &mut Vec<ParsedConcept>,
 ) {
     for concept_val in concepts {
@@ -382,7 +637,7 @@ fn flatten_concepts(
 
         if let Some(props) = concept_val["property"].as_array() {
             for prop in props {
-                if let Some(p) = parse_property(prop) {
+                if let Some(p) = parse_property(prop, edges) {
                     if p.is_parent_edge {
                         if let Some(ref pv) = p.parent_code_value {
                             property_parent = Some(pv.clone());
@@ -418,19 +673,19 @@ fn flatten_concepts(
 
         // Recurse into nested children.
         if let Some(children) = concept_val["concept"].as_array() {
-            flatten_concepts(children, Some(&code), out);
+            flatten_concepts(children, Some(&code), edges, out);
         }
     }
 }
 
-fn parse_property(prop: &Value) -> Option<ParsedProperty> {
+fn parse_property(prop: &Value, edges: &HierarchyProperties) -> Option<ParsedProperty> {
     let code = prop["code"].as_str()?.to_owned();
     let (value_type, value) = extract_property_value(prop);
     if value.is_empty() {
         return None;
     }
 
-    let is_parent_edge = code == "parent" && value_type == "code";
+    let is_parent_edge = edges.is_parent(&code) && value_type == "code";
     let parent_code_value = if is_parent_edge {
         Some(value.clone())
     } else {
@@ -482,6 +737,13 @@ pub fn extract_property_value(prop: &Value) -> (String, String) {
     if let Some(v) = prop["value"].as_str() {
         return ("string".into(), v.into());
     }
+    // A Coding property is stored as its code (filters compare codes).
+    if let Some(v) = prop["valueCoding"]["code"].as_str() {
+        return ("coding".into(), v.into());
+    }
+    if prop["valueCoding"].is_object() {
+        return ("Coding".into(), prop["valueCoding"].to_string());
+    }
     ("string".into(), String::new())
 }
 
@@ -497,7 +759,12 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
 
     let compose_json = vs["compose"]
         .as_object()
-        .map(|_| serde_json::to_string(&vs["compose"]).unwrap_or_default());
+        .map(|_| {
+            let mut compose = vs["compose"].clone();
+            strip_advisory_versions(&mut compose);
+            serde_json::to_string(&compose).unwrap_or_default()
+        })
+        .or_else(|| compose_from_expansion(vs).map(|c| c.to_string()));
 
     Some(ParsedValueSet {
         id,
@@ -510,6 +777,56 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         resource_json: vs.clone(),
         authority_rank: AUTHORITY_UNKNOWN,
     })
+}
+
+/// The membership of a ValueSet published with only an `expansion` (VSAC /
+/// eCQM content, cqf-tooling output) as an enumerated compose: one include
+/// per system, in expansion order, nested `contains` flattened, abstract
+/// groupers left out. The expansion's code system versions are not pinned:
+/// the stored expansion already names its members, and pinning e.g. a SNOMED
+/// US edition or LOINC 2.72 would make the ValueSet unexpandable on a server
+/// that loaded other editions. `None` when there is no expansion to use.
+fn compose_from_expansion(vs: &Value) -> Option<Value> {
+    fn collect(contains: &[Value], includes: &mut Vec<(String, Vec<Value>)>) {
+        for c in contains {
+            if let (Some(system), Some(code)) = (c["system"].as_str(), c["code"].as_str()) {
+                if c["abstract"].as_bool() != Some(true) {
+                    let mut concept = serde_json::json!({ "code": code });
+                    if let Some(display) = c["display"].as_str() {
+                        concept["display"] = Value::String(display.to_owned());
+                    }
+                    match includes.iter_mut().find(|(s, _)| s == system) {
+                        Some((_, concepts)) => concepts.push(concept),
+                        None => includes.push((system.to_owned(), vec![concept])),
+                    }
+                }
+            }
+            if let Some(nested) = c["contains"].as_array() {
+                collect(nested, includes);
+            }
+        }
+    }
+    let contains = vs["expansion"]["contains"].as_array()?;
+    let mut includes: Vec<(String, Vec<Value>)> = Vec::new();
+    collect(contains, &mut includes);
+    if includes.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "include": includes
+            .into_iter()
+            .map(|(system, concept)| {
+                serde_json::json!({
+                    "extension": [{
+                        "url": crate::backends::STORED_EXPANSION_INCLUDE_EXT,
+                        "valueBoolean": true
+                    }],
+                    "system": system,
+                    "concept": concept
+                })
+            })
+            .collect::<Vec<_>>()
+    }))
 }
 
 // ── ConceptMap parsing ────────────────────────────────────────────────────────
@@ -601,6 +918,98 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
 mod tests {
     use super::*;
 
+    fn parent_of<'a>(cs: &'a ParsedCodeSystem, code: &str) -> Option<&'a str> {
+        cs.concepts
+            .iter()
+            .find(|c| c.code == code)
+            .and_then(|c| c.parent_code.as_deref())
+    }
+
+    #[test]
+    fn flat_cdcrec_gets_the_race_and_ethnicity_hierarchy() {
+        let cs = parse_code_system(&serde_json::json!({
+            "resourceType": "CodeSystem", "url": CDCREC_URL, "version": "1.2",
+            "content": "complete",
+            "concept": [
+                {"code": "1000-9", "display": "Race"},
+                {"code": "1002-5", "display": "American Indian or Alaska Native"},
+                {"code": "1004-1", "display": "American Indian"},
+                {"code": "2028-9", "display": "Asian"},
+                {"code": "2039-6", "display": "Japanese"},
+                {"code": "2133-7", "display": "Ethnicity"},
+                {"code": "2135-2", "display": "Hispanic or Latino"},
+                {"code": "2148-5", "display": "Mexican"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&cs, "1000-9"), None);
+        assert_eq!(parent_of(&cs, "1002-5"), Some("1000-9"));
+        assert_eq!(parent_of(&cs, "1004-1"), Some("1002-5"));
+        assert_eq!(parent_of(&cs, "2039-6"), Some("2028-9"));
+        assert_eq!(parent_of(&cs, "2133-7"), None);
+        assert_eq!(parent_of(&cs, "2135-2"), Some("2133-7"));
+        assert_eq!(parent_of(&cs, "2148-5"), Some("2135-2"));
+    }
+
+    #[test]
+    fn advisory_versions_are_dropped_from_the_stored_compose_only() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet", "url": "http://cts/vs/1066", "compose": {
+                "include": [
+                    {"system": "http://nucc.org/provider-taxonomy", "version": "23.1"},
+                    {"system": "http://loinc.org", "version": "2.77", "concept": [{"code": "1-8"}]}
+                ],
+                "exclude": [{"system": "http://hl7.org/fhir/sid/ndc", "version": "x",
+                             "concept": [{"code": "0777-3105-02"}]}]
+            }
+        });
+        let parsed = parse_value_set(&vs).unwrap();
+        let compose: Value = serde_json::from_str(parsed.compose_json.as_deref().unwrap()).unwrap();
+        assert!(compose["include"][0].get("version").is_none());
+        assert_eq!(compose["include"][1]["version"], "2.77", "other systems keep their pin");
+        assert!(compose["exclude"][0].get("version").is_none());
+        assert_eq!(parsed.resource_json["compose"]["include"][0]["version"], "23.1");
+    }
+
+    #[test]
+    fn cdcrec_table_covers_all_966_codes_in_two_trees() {
+        let edges: Vec<(&str, &str)> = CDCREC_HIERARCHY
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('\t'))
+            .collect();
+        assert_eq!(edges.len(), 964, "966 codes minus the two roots");
+        let parents: std::collections::HashMap<&str, &str> = edges.iter().copied().collect();
+        for (child, _) in &edges {
+            let mut cur = *child;
+            let mut steps = 0;
+            while let Some(p) = parents.get(cur) {
+                cur = p;
+                steps += 1;
+                assert!(steps < 10, "cycle at {child}");
+            }
+            assert!(cur == "1000-9" || cur == "2133-7", "{child} roots at {cur}");
+        }
+    }
+
+    #[test]
+    fn cdcrec_with_its_own_hierarchy_and_other_systems_are_untouched() {
+        let nested = parse_code_system(&serde_json::json!({
+            "url": CDCREC_URL, "concept": [
+                {"code": "1000-9", "concept": [{"code": "2028-9"}]},
+                {"code": "1002-5"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&nested, "2028-9"), Some("1000-9"));
+        assert_eq!(parent_of(&nested, "1002-5"), None);
+        let other = parse_code_system(&serde_json::json!({
+            "url": "http://example.org/cs", "concept": [{"code": "1000-9"}, {"code": "1002-5"}]
+        }))
+        .unwrap();
+        assert_eq!(parent_of(&other, "1002-5"), None);
+    }
+
     fn minimal_bundle() -> &'static [u8] {
         br#"{
             "resourceType": "Bundle",
@@ -687,6 +1096,67 @@ mod tests {
         let compose: serde_json::Value =
             serde_json::from_str(vs.compose_json.as_ref().unwrap()).unwrap();
         assert!(compose["include"].is_array());
+    }
+
+    /// VSAC-style ValueSets (the eCQM content, cqf tooling output) carry
+    /// only an `expansion` — no `compose`. Their membership is that stored
+    /// expansion; without a compose it used to expand to nothing, so a CQL
+    /// retrieve `[Condition: "Diabetes"]` (via HFS `code:in`) found nothing.
+    #[test]
+    fn value_set_expansion_only_derives_enumerated_compose() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet",
+            "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113883.3.464.1003.103.12.1001",
+            "version": "20190315",
+            "expansion": {
+                "timestamp": "2019-03-15T00:00:00Z",
+                "contains": [
+                    {"system": "http://hl7.org/fhir/sid/icd-10-cm", "version": "2019",
+                     "code": "E11.9", "display": "Type 2 diabetes mellitus without complications"},
+                    {"system": "http://snomed.info/sct",
+                     "version": "http://snomed.info/sct/731000124108/version/20190301",
+                     "code": "44054006", "display": "Diabetes mellitus type 2"},
+                    {"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "E10", "abstract": true,
+                     "contains": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "E10.9"}]}
+                ]
+            }
+        });
+        let parsed = parse_value_set_value(&vs).unwrap();
+        let compose: Value = serde_json::from_str(parsed.compose_json.as_deref().unwrap()).unwrap();
+        let includes = compose["include"].as_array().unwrap();
+        assert_eq!(includes.len(), 2, "one include per system: {compose}");
+        let icd = includes
+            .iter()
+            .find(|i| i["system"] == "http://hl7.org/fhir/sid/icd-10-cm")
+            .unwrap();
+        let codes: Vec<&str> = icd["concept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["code"].as_str().unwrap())
+            .collect();
+        // nested contains flattened; the abstract grouper is not a member
+        assert_eq!(codes, vec!["E11.9", "E10.9"]);
+        // the expansion's code system versions are not pinned: the stored
+        // expansion already names its members, whatever editions are loaded
+        assert!(includes.iter().all(|i| i.get("version").is_none()));
+        assert_eq!(icd["concept"][0]["display"], "Type 2 diabetes mellitus without complications");
+        // the stored resource itself is untouched
+        assert!(parsed.resource_json.get("compose").is_none());
+    }
+
+    /// A ValueSet with a compose keeps it, even when it also has an expansion.
+    #[test]
+    fn value_set_compose_wins_over_expansion() {
+        let vs = serde_json::json!({
+            "resourceType": "ValueSet", "url": "http://example.org/vs",
+            "compose": {"include": [{"system": "http://example.org/cs", "concept": [{"code": "A"}]}]},
+            "expansion": {"contains": [{"system": "http://example.org/cs", "code": "B"}]}
+        });
+        let parsed = parse_value_set_value(&vs).unwrap();
+        assert!(parsed.compose_json.unwrap().contains("\"A\""));
+        let empty = serde_json::json!({"resourceType": "ValueSet", "url": "http://example.org/e"});
+        assert!(parse_value_set_value(&empty).unwrap().compose_json.is_none());
     }
 
     #[test]
@@ -816,6 +1286,91 @@ mod tests {
             let (vt, v) = extract_property_value(prop);
             assert_eq!(vt, *expected_type);
             assert_eq!(v, *expected_value);
+        }
+    }
+
+    #[test]
+    fn scalar_values_keep_precedence_when_coding_is_also_present() {
+        let cases = [
+            ("valueCode", serde_json::json!("ABC"), "code", "ABC"),
+            ("valueBoolean", serde_json::json!(false), "boolean", "false"),
+            ("valueInteger", serde_json::json!(0), "integer", "0"),
+            ("valueDecimal", serde_json::json!(1.25), "decimal", "1.25"),
+            ("valueString", serde_json::json!("text"), "string", "text"),
+            (
+                "valueDateTime",
+                serde_json::json!("2026-01-01"),
+                "dateTime",
+                "2026-01-01",
+            ),
+            ("value", serde_json::json!("text"), "string", "text"),
+        ];
+        for (field, value, expected_type, expected_value) in cases {
+            let mut property = serde_json::json!({"valueCoding": {"code": "A"}});
+            property[field] = value;
+            assert_eq!(
+                extract_property_value(&property),
+                (expected_type.to_owned(), expected_value.to_owned()),
+                "{field} must retain its existing precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn coding_property_preserves_the_complete_object() {
+        // Fork: a Coding with a `code` is stored as that code (filters compare
+        // codes; `$expand` restores the full Coding from the stored resource).
+        // Only a Coding without a code keeps the whole object (upstream #2095).
+        let coding = serde_json::json!({
+            "system": "http://example.org/target",
+            "version": "2026",
+            "code": "A",
+            "display": "Alpha",
+            "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let edges = HierarchyProperties::default();
+        let property = parse_property(
+            &serde_json::json!({"code": "maps-to", "valueCoding": coding}),
+            &edges,
+        )
+        .unwrap();
+        assert_eq!(property.value_type, "coding");
+        assert_eq!(property.value, "A");
+        assert!(!property.is_parent_edge);
+
+        let codeless = serde_json::json!({
+            "system": "http://example.org/target",
+            "display": "Alpha"
+        });
+        let property = parse_property(
+            &serde_json::json!({"code": "maps-to", "valueCoding": codeless}),
+            &edges,
+        )
+        .unwrap();
+        assert_eq!(property.value_type, "Coding");
+        assert_eq!(
+            serde_json::from_str::<Value>(&property.value).unwrap(),
+            codeless
+        );
+    }
+
+    #[test]
+    fn non_object_coding_properties_are_skipped() {
+        for value in [
+            Value::Null,
+            serde_json::json!("A"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                parse_property(
+                    &serde_json::json!({"code": "maps-to", "valueCoding": value}),
+                    &HierarchyProperties::default(),
+                )
+                .is_none()
+            );
         }
     }
 }

@@ -70,6 +70,8 @@ pub mod converters;
 pub mod date_value;
 pub mod errors;
 pub mod extractor;
+pub mod implied_system;
+pub mod in_resolver;
 pub mod list_resolver;
 pub mod loader;
 pub mod metadata_modifier;
@@ -81,6 +83,10 @@ pub mod reindex;
 /// them it is dead code, which the single-backend clippy matrix refuses.
 #[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 pub(crate) mod reindex_prepare;
+/// Only the SQLite, PostgreSQL and MongoDB sources split a type into id
+/// ranges; an S3-only build would otherwise carry it as dead code.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) mod reindex_split;
 mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
@@ -92,8 +98,8 @@ pub mod writer;
 
 // Re-export main types
 pub use chain_resolver::{
-    ChainResolveOptions, TerminologyExpander, TerminologyExpansion, query_has_chains,
-    resolve_chains, resolve_chains_with,
+    ChainResolveOptions, TerminologyExpander, TerminologyExpansion, infer_target_type,
+    query_has_chains, resolve_chains, resolve_chains_with,
 };
 pub use composite_value::validate_composite_values;
 pub use conditional::{
@@ -110,7 +116,14 @@ pub use date_value::{
     validate_date_values,
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
-pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use extractor::{
+    ContainedExtraction, ExtractedValue, ExtractionFailure, SearchParameterExtractor,
+};
+pub use implied_system::{
+    NO_TOKEN_SYSTEM, implied_code_system, narrow_implied_code_systems,
+    narrow_parameter_implied_code_systems,
+};
+pub use in_resolver::{query_has_in, resolve_in};
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use metadata_modifier::reject_unsupported_metadata_modifier;
@@ -124,10 +137,10 @@ pub use registry::{
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexIdRange, ReindexOnFinish,
-    ReindexOperation, ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest,
-    ReindexSource, ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef,
-    SkippedResource,
+    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, MAX_AUTO_REINDEX_STREAMS, ReindexCoverage,
+    ReindexIdRange, ReindexOnFinish, ReindexOperation, ReindexPageStats, ReindexProgress,
+    ReindexProgressError, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
+    ReindexableStorage, ResourcePage, ResourceRef, SkippedResource, auto_reindex_streams,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

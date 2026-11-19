@@ -28,6 +28,12 @@ use serde_json::{Value, json};
 
 /// Builds a test server with the bulk-export subsystem wired in, plus the
 /// SQLite backend and the local-FS output store (for driving a worker).
+thread_local! {
+    /// Export batch size for the next server a test builds on this thread
+    /// (the `#[tokio::test]` runtime is single-threaded).
+    static BATCH_SIZE_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 async fn create_bulk_export_server() -> (
     TestServer,
     Arc<SqliteBackend>,
@@ -111,6 +117,10 @@ async fn create_bulk_export_server_wrapping(
         default_tenant: default_tenant.to_string(),
         ..ServerConfig::for_testing()
     };
+    let mut config = config;
+    if let Some(batch) = BATCH_SIZE_OVERRIDE.with(|b| b.get()) {
+        config.bulk_export.batch_size = batch;
+    }
 
     let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
         backend.clone() as Arc<dyn BulkExportJobStore>,
@@ -1703,6 +1713,112 @@ async fn test_unfiltered_type_is_exported_whole_next_to_a_filtered_one() {
     .await;
     assert_eq!(condition_lines.len(), 1);
     assert_eq!(condition_lines[0]["id"], "c-active");
+}
+
+/// A `_typeFilter` on a system export is walked by the search engine: the
+/// matching resources come out across several search pages (batch size 2),
+/// complete, once each, with server meta, and the export window still bounds
+/// them.
+#[tokio::test]
+async fn test_type_filter_pages_through_matches_with_search() {
+    BATCH_SIZE_OVERRIDE.with(|b| b.set(Some(2)));
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    BATCH_SIZE_OVERRIDE.with(|b| b.set(None));
+    let tenant = test_tenant();
+    let mut active = Vec::new();
+    for i in 0..9 {
+        let status = if i % 3 == 0 { "resolved" } else { "active" };
+        let id = format!("c{i}");
+        if status == "active" {
+            active.push(id.clone());
+        }
+        backend
+            .create(
+                &tenant,
+                "Condition",
+                json!({
+                    "resourceType": "Condition",
+                    "id": id,
+                    "subject": {"reference": "Patient/p1"},
+                    "clinicalStatus": {"coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        "code": status
+                    }]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let run = |since: &'static str| {
+        let server = &server;
+        let backend = &backend;
+        let output = &output;
+        async move {
+            let resp = server
+                .get("/$export")
+                .add_header("x-tenant-id", "test-tenant")
+                .add_header("prefer", "respond-async")
+                .add_query_param("_type", "Condition")
+                .add_query_param("_since", since)
+                .add_query_param("_typeFilter", "Condition?clinical-status=active")
+                .await;
+            assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+            let status_url = resp
+                .headers()
+                .get("content-location")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let status_path = status_url
+                .strip_prefix("http://localhost:8080")
+                .unwrap()
+                .to_string();
+            drain_workers(backend, output).await;
+            let done = server
+                .get(&status_path)
+                .add_header("x-tenant-id", "test-tenant")
+                .await;
+            assert_eq!(done.status_code(), StatusCode::OK);
+            let manifest: Value = done.json();
+            let mut lines = Vec::new();
+            for file in manifest["output"].as_array().unwrap() {
+                lines.extend(
+                    fetch_ndjson_lines(
+                        server,
+                        file["url"].as_str().unwrap(),
+                        "http://localhost:8080",
+                    )
+                    .await,
+                );
+            }
+            lines
+        }
+    };
+
+    let lines = run("2000-01-01T00:00:00Z").await;
+    let mut ids: Vec<String> = lines
+        .iter()
+        .map(|l| l["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), active.len(), "every match once: {ids:?}");
+    ids.sort();
+    active.sort();
+    assert_eq!(ids, active);
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["meta"]["versionId"].is_string() && l["meta"]["lastUpdated"].is_string()),
+        "exported lines carry server meta"
+    );
+
+    let none = run("2999-01-01T00:00:00Z").await;
+    assert!(
+        none.is_empty(),
+        "the window applies to filtered types: {none:?}"
+    );
 }
 
 #[tokio::test]

@@ -17,9 +17,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use helios_audit::{AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter};
+use helios_audit::{AuditAction, AuditEventBuilder, AuditSink, ExclusionFilter};
+
+use crate::audit::AttributeToPrincipal;
 use helios_auth::{
-    AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
+    AccessScope, AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
     SmartScopePolicy,
 };
 use helios_fhir::FhirVersion;
@@ -55,6 +57,82 @@ pub struct AuthMiddlewareState {
     /// authenticated with no change to the validation, scope or audit path.
     /// `None` when the interactive login is not configured.
     pub sessions: Option<Arc<helios_auth::SessionStore>>,
+    /// The administrator sign-in (`HFS_ADMIN_PASSWORD`), when configured.
+    /// Its credential — `Authorization: Basic`, a non-JWT `Bearer <password>`,
+    /// or the admin session cookie (same-site writes only) — authenticates as
+    /// an administrator principal holding every scope, so the password keeps
+    /// working for the console and scripts alongside SMART tokens.
+    pub admin: Option<helios_admin_auth::AdminGate>,
+}
+
+/// Issuer stamped on the principal an administrator credential produces.
+pub const ADMIN_ISSUER: &str = "urn:helios:admin";
+
+/// Scopes granted to the administrator principal: every resource permission
+/// and every operation scope.
+const ADMIN_SCOPES: &str = "system/*.cruds system/purge system/reindex system/bulk-submit";
+
+fn admin_principal(user: &str) -> Principal {
+    let mut claims = serde_json::Map::new();
+    claims.insert("admin".to_string(), serde_json::Value::Bool(true));
+    Principal {
+        subject: user.to_string(),
+        issuer: ADMIN_ISSUER.to_string(),
+        tenant_id: None,
+        scopes: helios_auth::ScopeSet::parse(ADMIN_SCOPES),
+        jti: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        custom_claims: claims,
+        launch_context: None,
+    }
+}
+
+/// Whether an `Authorization` value is a bearer JWT (three base64url parts,
+/// the first a JSON object, so `eyJ…`), as opposed to Basic or a bearer
+/// password.
+fn is_jwt_bearer(value: &str) -> bool {
+    value
+        .strip_prefix("Bearer ")
+        .is_some_and(|t| t.starts_with("eyJ") && t.split('.').count() == 3 && !t.contains(' '))
+}
+
+/// Whether an anonymous request may proceed in write-protect mode: reads and
+/// searches, `$validate` and `$everything` (also in their POST forms) — but
+/// not bulk export, job status/output, or per-user settings, which act for
+/// or on behalf of someone.
+pub fn anonymous_read_allowed(method: &str, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let needs_identity = segments.iter().any(|s| {
+        matches!(
+            *s,
+            "$export"
+                | "export"
+                | "export-status"
+                | "export-file"
+                | "$bulk-submit"
+                | "$bulk-submit-status"
+                | "bulk-submit-status"
+                | "bulk-submit-file"
+                | "$reindex"
+                | "$reindex-status"
+                | "$purge"
+                | "_user"
+                | "$sql-run"
+                | "$sql-export"
+                | "$nl-search"
+                | "$get-ws-binding-token"
+        )
+    });
+    if needs_identity {
+        return false;
+    }
+    match method {
+        "GET" | "HEAD" | "OPTIONS" => true,
+        "POST" => segments
+            .last()
+            .is_some_and(|last| matches!(*last, "_search" | "$validate" | "$everything")),
+        _ => false,
+    }
 }
 
 /// Paths that are exempt from authentication.
@@ -142,9 +220,68 @@ pub async fn auth_middleware(
         },
     };
 
+    // The administrator credential (`HFS_ADMIN_PASSWORD`) authenticates as an
+    // administrator: Basic or a bearer password, or the admin session cookie
+    // when no `Authorization` was sent. A bearer JWT always goes to the IdP
+    // validation below.
+    if let Some(auth) = auth_state.admin.as_ref().and_then(|gate| gate.auth()) {
+        let credential = auth_header.as_deref().is_some_and(|h| !is_jwt_bearer(h));
+        let cookie = auth_header.is_none() && auth.session_user(request.headers()).is_some();
+        if credential || cookie {
+            let peer = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip());
+            match auth.authorize(request.method(), request.headers(), peer) {
+                Ok(granted) => {
+                    debug!(user = %granted.user, "Authenticated with the administrator credential");
+                    let principal = admin_principal(&granted.user);
+                    request
+                        .extensions_mut()
+                        .insert(crate::audit::audit_agent(&principal));
+                    request.extensions_mut().insert(principal);
+                    return next.run(request).await;
+                }
+                Err(helios_admin_auth::Denial::CrossOrigin) => {
+                    return forbidden_response("cross-site request refused");
+                }
+                Err(helios_admin_auth::Denial::RateLimited(left)) => {
+                    let mut response = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "throttled",
+                                       "diagnostics": "too many failed sign-in attempts"}]
+                        })),
+                    )
+                        .into_response();
+                    if let Ok(v) = left.as_secs().max(1).to_string().parse() {
+                        response.headers_mut().insert(header::RETRY_AFTER, v);
+                    }
+                    return response;
+                }
+                Err(_) if credential => {
+                    return unauthorized_response_with(
+                        "invalid administrator credentials",
+                        Some("invalid_token"),
+                    );
+                }
+                // A cookie whose session just lapsed: carry on as anonymous.
+                Err(_) => {}
+            }
+        }
+    }
+
     let auth_header = match auth_header {
         Some(h) => h,
         None => {
+            // Write-protect mode: anonymous reads pass with no principal (the
+            // authorization layers then have nothing to check).
+            if auth_state.config.effective_mode() == helios_auth::AuthMode::WriteProtect
+                && anonymous_read_allowed(&method, &path)
+            {
+                return next.run(request).await;
+            }
             if !auth_state
                 .audit_exclusion_filter
                 .is_excluded(&path, &method)
@@ -162,7 +299,19 @@ pub async fn auth_middleware(
 
     // Validate token
     match auth_state.provider.authenticate(&auth_header).await {
-        Ok(principal) => {
+        Ok(mut principal) => {
+            // Providers that predate upstream's `launch_context` (the fork's
+            // SMART layer reads the claims directly) leave it unset; derive it
+            // from the configured claim names so upstream's handler-level
+            // patient-compartment checks see the same launch patient.
+            if principal.launch_context.is_none() {
+                principal.launch_context = helios_auth::LaunchContext::from_claims(
+                    &principal.custom_claims,
+                    &auth_state.config.patient_claim,
+                    &auth_state.config.encounter_claim,
+                    &auth_state.config.fhir_user_claim,
+                );
+            }
             debug!(
                 sub = %principal.subject(),
                 iss = %principal.issuer(),
@@ -175,13 +324,13 @@ pub async fn auth_middleware(
                 let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
                     .action(AuditAction::Execute)
                     .outcome("0")
-                    .agent(principal.subject(), None, true)
+                    .principal(&principal)
                     .build();
                 auth_state.audit_sink.record(event).await;
             }
             request
                 .extensions_mut()
-                .insert(AuditAgent(principal.subject().to_string()));
+                .insert(crate::audit::audit_agent(&principal));
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
@@ -198,7 +347,14 @@ pub async fn auth_middleware(
                     .build();
                 auth_state.audit_sink.record(event).await;
             }
-            unauthorized_response(&err.to_string())
+            if let AuthError::JwksFetchError(_) = err {
+                // The IdP's keys are unreachable: the token may be fine, so
+                // do not tell the client to throw it away.
+                return service_unavailable_response(
+                    "the identity provider's signing keys are unavailable; retry shortly",
+                );
+            }
+            unauthorized_response_with(&err.to_string(), Some("invalid_token"))
         }
     }
 }
@@ -208,11 +364,22 @@ pub async fn auth_middleware(
 /// Checks the [`Principal`]'s SMART scopes against the requested FHIR operation
 /// and resource type. Returns 403 Forbidden if the principal lacks sufficient scopes.
 ///
+/// The grant's [`AccessScope`] is stored in the request extensions for the
+/// handlers. When it is [`AccessScope::PatientCompartment`] — the operation is
+/// granted only by a `patient/` scope — the request is confined to the launch
+/// patient's compartment (#1618): the path must be one the handlers know how to
+/// confine ([`patient_compartment_path_check`]), and the handlers then filter
+/// searches and check instance payloads through
+/// [`crate::patient_compartment::PatientCompartment`]. A token whose resource
+/// scopes are all `patient/` scopes is also refused every endpoint this layer
+/// does not classify, except the root batch endpoint whose handler authorizes
+/// each entry itself.
+///
 /// If no [`Principal`] is present in extensions (exempt path or auth disabled),
 /// the request passes through.
 pub async fn authz_middleware(
     State(auth_state): State<Arc<AuthMiddlewareState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // If no principal, pass through (exempt path or auth disabled)
@@ -224,50 +391,192 @@ pub async fn authz_middleware(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
+    // System-level reads that span every type (`/_history`, `$export`,
+    // SQL-on-FHIR, natural-language search, `/$meta`) need a token that reads
+    // every type; per-type classification below returns `None` for them.
+    if let Some(what) = system_wide_read(&path, auth_state.tenant_url_routing)
+        && !principal.scopes.reads_everything()
+    {
+        warn!(sub = %principal.subject(), path = %path, "System-wide read denied");
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!("Forbidden: {what} needs a scope that reads every type"))
+            .agent(principal.subject(), None, true)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(&format!(
+            "{what} needs a system/*.r or user/*.r scope (it reads every resource type)"
+        ));
+    }
+
     // Determine the FHIR operation and resource type from the path. Under
     // URL-path tenant routing the tenant prefix has not been stripped yet (that
     // happens downstream, inside the FHIR router), so strip it here first.
-    if let Some((resource_type, operation)) =
-        extract_operation_for_routing(&path, method.as_str(), auth_state.tenant_url_routing)
-    {
-        match SmartScopePolicy::check(&principal, &resource_type, operation) {
-            Ok(()) => {
-                debug!(
-                    sub = %principal.subject(),
-                    resource_type = %resource_type,
-                    operation = %operation,
-                    "Authorization granted"
-                );
-                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
-                    .action(AuditAction::Execute)
-                    .outcome("0")
-                    .outcome_desc(format!("Granted: {operation} on {resource_type}"))
-                    .agent(principal.subject(), None, true)
-                    .resource(&resource_type, "")
-                    .build();
-                auth_state.audit_sink.record(event).await;
-            }
-            Err(err) => {
-                warn!(
-                    sub = %principal.subject(),
-                    resource_type = %resource_type,
-                    operation = %operation,
-                    "Authorization denied"
-                );
-                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
-                    .action(AuditAction::Execute)
-                    .outcome("8")
-                    .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
-                    .agent(principal.subject(), None, true)
-                    .resource(&resource_type, "")
-                    .build();
-                auth_state.audit_sink.record(event).await;
-                return forbidden_response(&err.to_string());
+    let routed = routed_path(&path, auth_state.tenant_url_routing);
+    match extract_operation(&routed, method.as_str()) {
+        Some((resource_type, operation)) => {
+            let shared = auth_state.config.patient_shared_read_types();
+            match SmartScopePolicy::check(&principal, &resource_type, operation) {
+                Ok(scope) => {
+                    if scope.is_patient_compartment() {
+                        request
+                            .extensions_mut()
+                            .insert(crate::patient_compartment::PatientSharedTypes(
+                                shared.to_vec(),
+                            ));
+                    }
+                    if let AccessScope::PatientCompartment { patient_id } = &scope
+                        && let Err(reason) =
+                            patient_compartment_path_check(&routed, method.as_str(), patient_id)
+                    {
+                        warn!(
+                            sub = %principal.subject(),
+                            resource_type = %resource_type,
+                            operation = %operation,
+                            "Authorization denied: not available under a patient/ scope"
+                        );
+                        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                            .action(AuditAction::Execute)
+                            .outcome("8")
+                            .outcome_desc(format!(
+                                "Forbidden: {operation} on {resource_type} under a patient/ scope"
+                            ))
+                            .principal(&principal)
+                            .resource(&resource_type, "")
+                            .build();
+                        auth_state.audit_sink.record(event).await;
+                        return forbidden_response(&reason);
+                    }
+                    debug!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        access = ?scope,
+                        "Authorization granted"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("0")
+                        .outcome_desc(format!("Granted: {operation} on {resource_type}"))
+                        .principal(&principal)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    request.extensions_mut().insert(scope);
+                }
+                Err(err) => {
+                    warn!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        "Authorization denied"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("8")
+                        .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
+                        .principal(&principal)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    return forbidden_response(&err.to_string());
+                }
             }
         }
+        // An endpoint this layer does not classify (system history, system
+        // `$export`, `$bulk-submit`, the console, …) is either unauthorized
+        // here or authorizes itself in its handler. None of them can be
+        // confined to a patient compartment, so a token that holds nothing
+        // but `patient/` scopes is refused all of them — except the root
+        // batch/transaction endpoint, whose handler judges every entry.
+        None if principal.scopes.is_patient_only()
+            && !patient_only_unclassified_path_allowed(&routed) =>
+        {
+            warn!(
+                sub = %principal.subject(),
+                path = %path,
+                "Authorization denied: endpoint not available under a patient/ scope"
+            );
+            let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                .action(AuditAction::Execute)
+                .outcome("8")
+                .outcome_desc(format!("Forbidden: {path} under a patient/ scope"))
+                .principal(&principal)
+                .build();
+            auth_state.audit_sink.record(event).await;
+            return forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED);
+        }
+        None => {}
     }
 
     next.run(request).await
+}
+
+/// The refusal for an endpoint a `patient/` scope cannot reach.
+const PATIENT_SCOPE_ENDPOINT_REFUSED: &str = "This endpoint is not available under a patient/ scope: it cannot be confined to the launch patient's compartment";
+
+/// Whether an unclassified path may proceed for a token holding only
+/// `patient/` scopes: the root batch/transaction endpoint only, whose handler
+/// authorizes each entry itself.
+fn patient_only_unclassified_path_allowed(routed_path: &str) -> bool {
+    routed_path.split('/').all(str::is_empty)
+}
+
+/// The request shapes a compartment-confined grant may proceed with — those
+/// whose handlers confine themselves to the launch patient's compartment
+/// (#1618). Anything else is refused with the reason returned.
+///
+/// Allowed:
+/// - `GET|HEAD /{type}` and `POST /{type}/_search` (the search is filtered to
+///   the compartment), `POST /{type}` (the payload is checked);
+/// - `GET|HEAD|PUT|PATCH|DELETE /{type}/{id}` and `GET /{type}/{id}/_history`,
+///   `GET /{type}/{id}/_history/{vid}` (the stored payload is checked);
+/// - `GET /Patient/{launch}/{type}` and `/Patient/{launch}/*` compartment
+///   searches, and `Patient/{launch}/$everything`, for the launch patient only;
+/// - type-level `Patient/$everything` and `Patient/$export`, which narrow to the
+///   launch patient themselves.
+///
+/// Refused: type and system history, conditional (type-level) update, patch
+/// and delete, another patient's or another compartment's searches and
+/// `$everything`, `Group/{id}/$export`, and every other `$`-operation.
+fn patient_compartment_path_check(
+    routed_path: &str,
+    method: &str,
+    patient_id: &str,
+) -> Result<(), String> {
+    let segments: Vec<&str> = routed_path.split('/').filter(|s| !s.is_empty()).collect();
+    let refuse = |what: &str| {
+        Err(format!(
+            "{what} is not available under a patient/ scope: it cannot be confined to the launch patient's compartment"
+        ))
+    };
+    let is_control = |s: &str| s.starts_with('_') || s.starts_with('$');
+    match segments.as_slice() {
+        // Type-level: search and create confine themselves; conditional
+        // update/patch/delete resolve their target by criteria the handler
+        // cannot vouch for.
+        [_type] => match method {
+            "GET" | "HEAD" | "POST" => Ok(()),
+            _ => refuse("a conditional update, patch or delete"),
+        },
+        [_type, "_search"] => Ok(()),
+        [_type, "_history"] => refuse("type-level history"),
+        ["Patient", "$everything"] | ["Patient", "$export"] => Ok(()),
+        [_type, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, second] if is_control(second) => refuse(routed_path),
+        // Instance level: the handler checks the stored payload.
+        [_type, _id] => Ok(()),
+        [_type, _id, "_history"] => Ok(()),
+        ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
+        [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
+        // Compartment search: the launch patient's own compartment only.
+        ["Patient", id, _target] if *id == patient_id => Ok(()),
+        [_compartment, _id, _target] => refuse("a search in another compartment"),
+        [_type, _id, "_history", _vid] => Ok(()),
+        _ => refuse(routed_path),
+    }
 }
 
 /// Authorization middleware for the console's **cross-tenant** admin endpoints
@@ -305,7 +614,7 @@ pub async fn admin_authz_middleware(
             .action(AuditAction::Execute)
             .outcome("0")
             .outcome_desc(format!("Granted: console admin access to {path}"))
-            .agent(principal.subject(), None, true)
+            .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
         next.run(request).await
@@ -321,7 +630,7 @@ pub async fn admin_authz_middleware(
             .outcome_desc(format!(
                 "Forbidden: console admin access to {path} requires a system-level scope"
             ))
-            .agent(principal.subject(), None, true)
+            .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
         forbidden_response("This endpoint requires a system-level scope (system/*.read)")
@@ -347,31 +656,61 @@ pub async fn admin_authz_middleware(
 ///
 /// In `header_only` mode `tenant_url_routing` is `false` and the raw path is
 /// used verbatim, leaving behaviour byte-for-byte unchanged.
+#[cfg(test)]
 fn extract_operation_for_routing(
     path: &str,
     method: &str,
     tenant_url_routing: bool,
 ) -> Option<(String, FhirOperation)> {
-    // Strip a URL-path tenant prefix BEFORE classifying, mirroring the router.
-    // Classifying the raw path first would wrongly `None`-out (and thus skip the
-    // scope check for) a path whose tenant segment happens to look system-like to
-    // `extract_operation` — e.g. `/_x/Patient/123`, where `_x` is a valid,
-    // non-reserved tenant the router strips, yet `extract_operation` sees the
-    // leading `_` and returns `None`. `extract_tenant_from_path` returns `None`
-    // for reserved first segments (real FHIR resource types, `metadata`,
-    // `_history`, `console`, …), so those fall through to the raw classification
-    // and behave exactly as before.
-    if tenant_url_routing {
-        if let Some((_tenant, remaining)) =
-            extract_tenant_from_path(path, &FhirVersion::default_enabled())
-        {
-            // Classify against the tenant-stripped path the router will actually
-            // dispatch to.
-            return extract_operation(&remaining, method);
-        }
-    }
+    extract_operation(&routed_path(path, tenant_url_routing), method)
+}
 
-    extract_operation(path, method)
+/// The path the FHIR router will dispatch to: the request path with its
+/// URL-path tenant prefix stripped, when that routing mode is on.
+///
+/// Strip a URL-path tenant prefix BEFORE classifying, mirroring the router.
+/// Classifying the raw path first would wrongly `None`-out (and thus skip the
+/// scope check for) a path whose tenant segment happens to look system-like to
+/// `extract_operation` — e.g. `/_x/Patient/123`, where `_x` is a valid,
+/// non-reserved tenant the router strips, yet `extract_operation` sees the
+/// leading `_` and returns `None`. `extract_tenant_from_path` returns `None`
+/// for reserved first segments (real FHIR resource types, `metadata`,
+/// `_history`, `console`, …), so those fall through to the raw classification
+/// and behave exactly as before.
+fn routed_path(path: &str, tenant_url_routing: bool) -> String {
+    if tenant_url_routing
+        && let Some((_tenant, remaining)) =
+            extract_tenant_from_path(path, &FhirVersion::default_enabled())
+    {
+        return remaining;
+    }
+    path.to_string()
+}
+
+/// The system-level endpoints that read across every resource type, by the
+/// (tenant-stripped) path; `None` for anything else.
+fn system_wide_read(path: &str, tenant_url_routing: bool) -> Option<&'static str> {
+    let stripped;
+    let path = if tenant_url_routing {
+        match extract_tenant_from_path(path, &FhirVersion::default_enabled()) {
+            Some((_tenant, remaining)) => {
+                stripped = remaining;
+                stripped.as_str()
+            }
+            None => path,
+        }
+    } else {
+        path
+    };
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        ["_history", ..] => Some("system history"),
+        ["$export"] => Some("system-level $export"),
+        ["$sql-run"] | ["$sql-export"] => Some("SQL-on-FHIR across the server"),
+        ["$nl-search"] => Some("natural-language search"),
+        ["$meta"] => Some("system-level $meta"),
+        _ => None,
+    }
 }
 
 /// Operation endpoints whose handlers run their own scope check, so the
@@ -399,7 +738,17 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 /// forms already are, so kicking one off with `POST` needs the same read scope,
 /// not a write one (#1123). System-level `/$export` is `$`-first and so is
 /// already method-agnostic (handled by the system-path guard below).
-const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+///
+/// `$validate` persists nothing and returns only an OperationOutcome, so a
+/// token that may read the type may validate an instance of it (fork).
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export", "$validate", "$meta"];
+
+/// Operations that write the resource they are invoked on: `POST
+/// /{type}/{id}/$meta-add` and `$meta-delete` change its `meta` and store a new
+/// version, so they are authorized as `FhirOperation::Update` of the
+/// first-segment type, exactly as a `PUT` of that resource is — not as the
+/// `POST` → `Create` fallthrough would classify them.
+const UPDATE_SHAPED_OPERATIONS: &[&str] = &["$meta-add", "$meta-delete"];
 
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
@@ -470,6 +819,12 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     {
         return Some((resource_type, FhirOperation::Read));
     }
+    if segments
+        .last()
+        .is_some_and(|s| UPDATE_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Update));
+    }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
     // The third segment is the actual resource type being accessed, so the
@@ -515,6 +870,20 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
 }
 
 fn unauthorized_response(message: &str) -> Response {
+    unauthorized_response_with(message, None)
+}
+
+/// Quotes a value for an RFC 6750 `WWW-Authenticate` auth-param.
+fn challenge_param(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '"' && *c != '\\')
+        .collect()
+}
+
+/// `401` with an RFC 6750 challenge: `Bearer realm="hfs"` for a missing
+/// credential, plus `error="invalid_token"` and a description for a rejected one.
+pub(crate) fn unauthorized_response_with(message: &str, error: Option<&str>) -> Response {
     let body = serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -523,13 +892,36 @@ fn unauthorized_response(message: &str) -> Response {
             "details": { "text": message }
         }]
     });
+    let challenge = match error {
+        Some(error) => format!(
+            "Bearer realm=\"hfs\", error=\"{error}\", error_description=\"{}\"",
+            challenge_param(message)
+        ),
+        None => "Bearer realm=\"hfs\"".to_string(),
+    };
+    let challenge = axum::http::HeaderValue::from_str(&challenge)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer realm=\"hfs\""));
 
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            axum::http::HeaderValue::from_static("Bearer"),
-        )],
+        [(header::WWW_AUTHENTICATE, challenge)],
+        Json(body),
+    )
+        .into_response()
+}
+
+fn service_unavailable_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "transient",
+            "details": { "text": message }
+        }]
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, axum::http::HeaderValue::from_static("5"))],
         Json(body),
     )
         .into_response()
@@ -544,8 +936,19 @@ fn forbidden_response(message: &str) -> Response {
             "details": { "text": message }
         }]
     });
-
-    (StatusCode::FORBIDDEN, Json(body)).into_response()
+    let challenge = format!(
+        "Bearer realm=\"hfs\", error=\"insufficient_scope\", error_description=\"{}\"",
+        challenge_param(message)
+    );
+    match axum::http::HeaderValue::from_str(&challenge) {
+        Ok(challenge) => (
+            StatusCode::FORBIDDEN,
+            [(header::WWW_AUTHENTICATE, challenge)],
+            Json(body),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::FORBIDDEN, Json(body)).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +962,7 @@ mod tests {
         assert!(is_exempt_path("/_liveness"));
         assert!(is_exempt_path("/_readiness"));
         assert!(is_exempt_path("/.well-known/smart-configuration"));
+        assert!(is_exempt_path("/.well-known/bulk-submit-jwks.json"));
         assert!(is_exempt_path("/$versions"));
 
         assert!(!is_exempt_path("/Patient"));
@@ -571,8 +975,140 @@ mod tests {
         assert!(!is_exempt_path("/Device/_liveness"));
         assert!(!is_exempt_path("/Patient/_readiness"));
         assert!(!is_exempt_path("/Patient/.well-known/smart-configuration"));
+        assert!(!is_exempt_path(
+            "/Patient/.well-known/bulk-submit-jwks.json"
+        ));
         assert!(!is_exempt_path("/tenant/metadata"));
         assert!(!is_exempt_path("/tenant/$versions"));
+    }
+
+    fn allowed(path: &str, method: &str) -> bool {
+        patient_compartment_path_check(path, method, "p1").is_ok()
+    }
+
+    #[test]
+    fn patient_compartment_path_check_allows_what_handlers_confine() {
+        for (path, method) in [
+            ("/Observation", "GET"),
+            ("/Observation", "HEAD"),
+            ("/Observation", "POST"),
+            ("/Observation/_search", "POST"),
+            ("/Observation/o1", "GET"),
+            ("/Observation/o1", "HEAD"),
+            ("/Observation/o1", "PUT"),
+            ("/Observation/o1", "PATCH"),
+            ("/Observation/o1", "DELETE"),
+            ("/Observation/o1/_history", "GET"),
+            ("/Observation/o1/_history/3", "GET"),
+            ("/Patient/p1/Observation", "GET"),
+            ("/Patient/p1/*", "GET"),
+            ("/Patient/p1/$everything", "GET"),
+            ("/Patient/p1/$everything", "POST"),
+            ("/Patient/$everything", "GET"),
+            ("/Patient/$export", "GET"),
+            ("/Patient/$export", "POST"),
+        ] {
+            assert!(allowed(path, method), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn patient_compartment_path_check_refuses_what_cannot_be_confined() {
+        for (path, method) in [
+            // Type-level conditional writes.
+            ("/Observation", "PUT"),
+            ("/Observation", "PATCH"),
+            ("/Observation", "DELETE"),
+            // Type history.
+            ("/Observation/_history", "GET"),
+            ("/Patient/_history", "GET"),
+            // Operations other than the two that narrow themselves.
+            ("/Observation/$validate", "POST"),
+            ("/ValueSet/$expand", "GET"),
+            ("/Observation/$export", "GET"),
+            ("/Group/$export", "GET"),
+            ("/Observation/o1/$validate", "POST"),
+            ("/Group/g1/$export", "GET"),
+            // Another patient, another compartment.
+            ("/Patient/p2/Observation", "GET"),
+            ("/Patient/p2/*", "GET"),
+            ("/Patient/p2/$everything", "GET"),
+            ("/Encounter/e1/Observation", "GET"),
+            ("/Encounter/p1/Observation", "GET"),
+            // Unknown shapes.
+            ("/Observation/o1/_tags", "GET"),
+            ("/Observation/o1/_history/3/x", "GET"),
+            ("/Observation/o1/sub/4/5", "GET"),
+        ] {
+            let outcome = patient_compartment_path_check(path, method, "p1");
+            assert!(outcome.is_err(), "{method} {path}");
+            assert!(
+                outcome.unwrap_err().contains("patient/ scope"),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn patient_only_unclassified_paths_allow_the_batch_root_only() {
+        assert!(patient_only_unclassified_path_allowed("/"));
+        assert!(patient_only_unclassified_path_allowed(""));
+        for path in [
+            "/_history",
+            "/$export",
+            "/$bulk-submit",
+            "/_user/settings",
+            "/console/metrics/resource-counts",
+            "/_search",
+        ] {
+            assert!(!patient_only_unclassified_path_allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn anonymous_reads_in_write_protect_mode() {
+        assert!(anonymous_read_allowed("GET", "/Patient"));
+        assert!(anonymous_read_allowed("GET", "/Patient/1/_history"));
+        assert!(anonymous_read_allowed("POST", "/Patient/_search"));
+        assert!(anonymous_read_allowed("POST", "/Patient/$validate"));
+        assert!(anonymous_read_allowed("POST", "/Patient/1/$everything"));
+        assert!(!anonymous_read_allowed("POST", "/Patient"));
+        assert!(!anonymous_read_allowed("PUT", "/Patient/1"));
+        assert!(!anonymous_read_allowed("DELETE", "/Patient/1"));
+        assert!(!anonymous_read_allowed("PATCH", "/Patient/1"));
+        assert!(!anonymous_read_allowed("POST", "/"));
+        assert!(!anonymous_read_allowed("GET", "/$export"));
+        assert!(!anonymous_read_allowed("GET", "/Patient/$export"));
+        assert!(!anonymous_read_allowed("GET", "/export-status/1"));
+        assert!(!anonymous_read_allowed("GET", "/_user/settings"));
+        assert!(!anonymous_read_allowed("POST", "/ViewDefinition/$sql-run"));
+    }
+
+    #[test]
+    fn jwt_bearers_are_told_apart_from_passwords() {
+        assert!(is_jwt_bearer("Bearer eyJhbGciOi.eyJzdWIi.sig"));
+        assert!(!is_jwt_bearer("Bearer aaa.bbb.ccc"));
+        assert!(!is_jwt_bearer("Bearer correct horse battery"));
+        assert!(!is_jwt_bearer("Bearer secret"));
+        assert!(!is_jwt_bearer("Basic YWRtaW46eA=="));
+    }
+
+    #[test]
+    fn system_wide_reads_are_recognised() {
+        assert!(system_wide_read("/_history", false).is_some());
+        assert!(system_wide_read("/$export", false).is_some());
+        assert!(system_wide_read("/$sql-run", false).is_some());
+        assert!(system_wide_read("/acme/_history", true).is_some());
+        assert!(system_wide_read("/Patient/_history", false).is_none());
+        assert!(system_wide_read("/Patient/$export", false).is_none());
+        assert!(system_wide_read("/metadata", false).is_none());
+    }
+
+    #[test]
+    fn validate_is_read_shaped() {
+        let (rt, op) = extract_operation("/Patient/$validate", "POST").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
     }
 
     #[test]
@@ -659,6 +1195,27 @@ mod tests {
             let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
             assert_eq!(rt, "Patient", "method={method}");
             assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn meta_is_read_and_meta_add_delete_are_updates() {
+        for path in ["/Task/t1/$meta", "/Task/t1/_history/2/$meta", "/Task/$meta"] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    extract_operation(path, method),
+                    Some(("Task".to_string(), FhirOperation::Read)),
+                    "{method} {path}"
+                );
+            }
+        }
+        // Writes of the named resource: an update scope, never a create one.
+        for path in ["/Task/t1/$meta-add", "/Task/t1/$meta-delete"] {
+            assert_eq!(
+                extract_operation(path, "POST"),
+                Some(("Task".to_string(), FhirOperation::Update)),
+                "{path}"
+            );
         }
     }
 

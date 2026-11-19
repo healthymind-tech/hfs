@@ -14,7 +14,9 @@
 //! includes) are absent from the map; for those the provider returns `Ok(true)`
 //! — "not disproved here" — so it never blocks on codes it cannot check.
 
-use crate::effects::{CodedValue, Deferred, TerminologyError, TerminologyProvider, coded_value};
+use crate::effects::{
+    CodedValue, Deferred, TerminologyError, TerminologyProvider, TxCheck, TxVerdict, coded_value,
+};
 use crate::engine::{ErrorKind, ValidationError};
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
@@ -26,6 +28,14 @@ use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "R4")]
 static R4_TX: &[u8] = include_bytes!("../packs/terminology_r4.json.gz");
+#[cfg(feature = "R4")]
+static R4_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r4.json.gz");
+#[cfg(feature = "R4B")]
+static R4B_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r4b.json.gz");
+#[cfg(feature = "R5")]
+static R5_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r5.json.gz");
+#[cfg(feature = "R6")]
+static R6_DISPLAYS: &[u8] = include_bytes!("../packs/terminology_displays_r6.json.gz");
 #[cfg(feature = "R4B")]
 static R4B_TX: &[u8] = include_bytes!("../packs/terminology_r4b.json.gz");
 #[cfg(feature = "R5")]
@@ -40,22 +50,30 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4_TX, "4.0"))))
+            Arc::clone(TX.get_or_init(|| {
+                Arc::new(CoreTerminology::from_gz(R4_TX, FhirVersion::R4, "4.0"))
+            }))
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4B_TX, "4.3"))))
+            Arc::clone(TX.get_or_init(|| {
+                Arc::new(CoreTerminology::from_gz(R4B_TX, FhirVersion::R4B, "4.3"))
+            }))
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R5_TX, "5.0"))))
+            Arc::clone(TX.get_or_init(|| {
+                Arc::new(CoreTerminology::from_gz(R5_TX, FhirVersion::R5, "5.0"))
+            }))
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX, "6.0"))))
+            Arc::clone(TX.get_or_init(|| {
+                Arc::new(CoreTerminology::from_gz(R6_TX, FhirVersion::R6, "6.0"))
+            }))
         }
         // Feature unification can add FhirVersion variants beyond the packs
         // this crate was built with: `helios-audit`'s R5/R6 features enable
@@ -71,19 +89,136 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
 /// Codes of one value set, indexed by code → the systems that define it here.
 type ValueSetCodes = HashMap<String, Vec<String>>;
 
+/// system → code → the code's display and designation values.
+type Displays = HashMap<String, HashMap<String, Vec<String>>>;
+
+/// The displays of the code systems the embedded value sets draw from.
+/// Parsed on first use (the display check only runs with terminology on).
+fn core_displays(version: FhirVersion) -> Option<&'static Displays> {
+    fn parse(bytes: &[u8]) -> Displays {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut json = Vec::new();
+        decoder
+            .read_to_end(&mut json)
+            .expect("embedded display pack decompresses");
+        /// `(system, [(code, [display, designation...])])`, as generated.
+        type Pack = Vec<(String, Vec<(String, Vec<String>)>)>;
+        let systems: Pack = serde_json::from_slice(&json).expect("embedded display pack parses");
+        systems
+            .into_iter()
+            .map(|(system, codes)| (system, codes.into_iter().collect()))
+            .collect()
+    }
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R4_DISPLAYS)))
+        }
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R4B_DISPLAYS)))
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R5_DISPLAYS)))
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            static D: OnceLock<Displays> = OnceLock::new();
+            Some(D.get_or_init(|| parse(R6_DISPLAYS)))
+        }
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Display comparison the HL7 validator applies: case-insensitive, with
+/// runs of whitespace collapsed.
+fn normalize_display(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Every Coding in `resource` with a `system` and a `code`, with its dotted
+/// path (numeric indices, rooted at `root`). A Coding is recognised by
+/// shape: an object with string `system` and `code` that is not a Quantity
+/// (`value`/`unit`/`comparator`) and not a ValueSet expansion entry.
+pub(crate) fn codings<'a>(resource: &'a Value, root: &str) -> Vec<(String, &'a Value)> {
+    fn walk<'a>(
+        value: &'a Value,
+        parent_key: &str,
+        path: &mut String,
+        out: &mut Vec<(String, &'a Value)>,
+    ) {
+        match value {
+            Value::Object(map) => {
+                if parent_key != "contains"
+                    && map.get("system").is_some_and(Value::is_string)
+                    && map.get("code").is_some_and(Value::is_string)
+                    && !map.contains_key("value")
+                    && !map.contains_key("unit")
+                    && !map.contains_key("comparator")
+                {
+                    out.push((path.clone(), value));
+                }
+                for (key, child) in map {
+                    if key.starts_with('_') || !(child.is_object() || child.is_array()) {
+                        continue;
+                    }
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(key);
+                    walk(child, key, path, out);
+                    path.truncate(len);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let len = path.len();
+                    path.push('.');
+                    path.push_str(&index.to_string());
+                    walk(item, parent_key, path, out);
+                    path.truncate(len);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let mut path = root.to_string();
+    walk(resource, "", &mut path, &mut out);
+    out
+}
+
+/// Whether a code-system URL is in a namespace the HL7 validator insists on
+/// resolving (`hl7.org`, `fhir.org`; unknown ones there are errors). The
+/// `http://hl7.org/fhir/sid/` identifiers (CVX, NDC, ICD-10, NPI ...) are
+/// external systems the validator knows by name.
+pub fn is_hl7_namespace(system: &str) -> bool {
+    (system.contains("hl7.org") || system.contains("fhir.org"))
+        && !system.starts_with("http://hl7.org/fhir/sid/")
+}
+
 /// An offline terminology provider over the embedded core value sets.
 pub struct CoreTerminology {
     /// The FHIR release (`major.minor`) these value sets come from.
     release: &'static str,
     /// Value-set URL (version-stripped) → its expanded codes.
     sets: HashMap<String, ValueSetCodes>,
+    /// The FHIR version of the packs (selects the display pack).
+    version: FhirVersion,
 }
 
 /// Canonical prefix of the value sets the FHIR core specification defines.
 pub const CORE_VALUE_SET_PREFIX: &str = "http://hl7.org/fhir/ValueSet/";
 
 /// The FHIR release (`major.minor`) of a FHIR version string: `4.0.1` →
-/// `4.0`, `6.0.0-ballot4` → `6.0`. `None` when it does not look like one.
+/// `4.0`, `6.0.0-snapshot1` → `6.0`. `None` when it does not look like one.
 pub fn fhir_release(version: &str) -> Option<&str> {
     let mut dots = version.match_indices('.').map(|(i, _)| i);
     let first = dots.next()?;
@@ -99,7 +234,7 @@ pub fn fhir_release(version: &str) -> Option<&str> {
 }
 
 impl CoreTerminology {
-    fn from_gz(bytes: &[u8], release: &'static str) -> Self {
+    fn from_gz(bytes: &[u8], version: FhirVersion, release: &'static str) -> Self {
         let mut decoder = GzDecoder::new(bytes);
         let mut json = Vec::new();
         decoder
@@ -115,7 +250,49 @@ impl CoreTerminology {
             }
             sets.insert(url, by_code);
         }
-        Self { release, sets }
+        Self {
+            release,
+            sets,
+            version,
+        }
+    }
+
+    /// The code-system check of one Coding, when the embedded packs know its
+    /// code system: a `display` that is neither the code's display nor one
+    /// of its designations is wrong (compared case-insensitively, whitespace
+    /// collapsed, as the HL7 validator does). `None` = system not embedded;
+    /// codes the pack does not list are not judged.
+    pub fn coding_verdict(&self, coding: &Value) -> Option<TxVerdict> {
+        let displays = core_displays(self.version)?;
+        let (system, code) = coding_parts(coding);
+        let codes = displays.get(system?)?;
+        let mut verdict = TxVerdict::valid();
+        if let Some(code) = code
+            && !codes.contains_key(code)
+        {
+            // The pack holds every code of these (complete) code systems.
+            verdict.unknown_code = Some(format!(
+                "Unknown code '{code}' in the CodeSystem '{}'",
+                system.unwrap_or_default()
+            ));
+            return Some(verdict);
+        }
+        let (Some(code), Some(display)) = (code, coding.get("display").and_then(Value::as_str))
+        else {
+            return Some(verdict);
+        };
+        if let Some(valid) = codes.get(code) {
+            let wanted = normalize_display(display);
+            if !valid.iter().any(|v| normalize_display(v) == wanted) {
+                verdict.wrong_display = Some(crate::engine::messages::wrong_display(
+                    display,
+                    system.unwrap_or_default(),
+                    code,
+                    valid,
+                ));
+            }
+        }
+        Some(verdict)
     }
 
     /// `Some(true/false)` when the value set is known here; `None` when it is
@@ -154,8 +331,9 @@ impl CoreTerminology {
 
     /// `Some(true)` in-set, `Some(false)` definitely out, `None` can't judge
     /// offline (value set not embedded, or shape not coded). This is the sync
-    /// core both `validate_code` and the editor's binding check share.
-    fn member(&self, value_set: &str, coded: &CodedValue) -> Option<bool> {
+    /// core both `validate_code` and the editor's binding check share, and
+    /// what [`CompositeTerminologyProvider`] consults before going remote.
+    pub fn member(&self, value_set: &str, coded: &CodedValue) -> Option<bool> {
         match coded {
             CodedValue::Code(code) => self.contains(value_set, None, code),
             CodedValue::Coding(coding) => {
@@ -243,6 +421,129 @@ impl TerminologyProvider for CoreTerminology {
         // only a definite `Some(false)` from `member` is a binding failure.
         Ok(self.member(value_set, coded).unwrap_or(true))
     }
+
+    async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        checks
+            .iter()
+            .map(|c| {
+                Ok(match c {
+                    TxCheck::InValueSet(vs, coded) => {
+                        TxVerdict::member(self.member(vs, coded).unwrap_or(true))
+                    }
+                    TxCheck::Coding(coding) => {
+                        self.coding_verdict(coding).unwrap_or_else(TxVerdict::valid)
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// Embedded core terminology first, a remote server second.
+///
+/// The embedded value sets answer every binding they enumerate — the FHIR
+/// core `required` bindings (`Patient.gender`, `Observation.status`, …) —
+/// offline, in-process, with no version-suffix pitfalls. Only bindings the
+/// pack cannot judge (IG value sets, SNOMED/LOINC-backed sets, filtered
+/// includes) go to the remote server. Base bindings are therefore always
+/// checked, even when the terminology server is down or lacks the core
+/// value sets, and the server sees a fraction of the traffic.
+pub struct CompositeTerminologyProvider {
+    embedded: Arc<CoreTerminology>,
+    remote: Arc<dyn TerminologyProvider>,
+}
+
+impl CompositeTerminologyProvider {
+    pub fn new(embedded: Arc<CoreTerminology>, remote: Arc<dyn TerminologyProvider>) -> Self {
+        Self { embedded, remote }
+    }
+}
+
+#[async_trait]
+impl TerminologyProvider for CompositeTerminologyProvider {
+    fn invalidate(&self) {
+        self.remote.invalidate();
+    }
+
+    async fn validate_code(
+        &self,
+        value_set: &str,
+        coded: &CodedValue,
+    ) -> Result<bool, TerminologyError> {
+        match self.embedded.member(value_set, coded) {
+            Some(verdict) => Ok(verdict),
+            None => self.remote.validate_code(value_set, coded).await,
+        }
+    }
+
+    /// Embedded answers locally; everything else goes to the remote
+    /// provider as one batch.
+    async fn validate_codes(
+        &self,
+        checks: &[(&str, &CodedValue)],
+    ) -> Vec<Result<bool, TerminologyError>> {
+        let mut out: Vec<Option<Result<bool, TerminologyError>>> = checks
+            .iter()
+            .map(|(value_set, coded)| self.embedded.member(value_set, coded).map(Ok))
+            .collect();
+        let remote: Vec<(usize, (&str, &CodedValue))> = checks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out[*i].is_none())
+            .map(|(i, check)| (i, *check))
+            .collect();
+        if !remote.is_empty() {
+            let requests: Vec<(&str, &CodedValue)> = remote.iter().map(|(_, c)| *c).collect();
+            let verdicts = self.remote.validate_codes(&requests).await;
+            for ((index, _), verdict) in remote.iter().zip(verdicts) {
+                out[*index] = Some(verdict);
+            }
+        }
+        out.into_iter()
+            .map(|v| v.unwrap_or_else(|| Err(TerminologyError::new("no verdict"))))
+            .collect()
+    }
+
+    /// Value sets and code systems the embedded packs know are answered
+    /// locally; everything else goes to the remote provider as one batch.
+    async fn check(&self, checks: &[TxCheck<'_>]) -> Vec<Result<TxVerdict, TerminologyError>> {
+        self.check_in_language(checks, None).await
+    }
+
+    /// [`check`](Self::check); the remote provider judges displays in
+    /// `language`.
+    async fn check_in_language(
+        &self,
+        checks: &[TxCheck<'_>],
+        language: Option<&str>,
+    ) -> Vec<Result<TxVerdict, TerminologyError>> {
+        let mut out: Vec<Option<Result<TxVerdict, TerminologyError>>> = checks
+            .iter()
+            .map(|c| match c {
+                TxCheck::InValueSet(vs, coded) => self
+                    .embedded
+                    .member(vs, coded)
+                    .map(|v| Ok(TxVerdict::member(v))),
+                TxCheck::Coding(coding) => self.embedded.coding_verdict(coding).map(Ok),
+            })
+            .collect();
+        let remote: Vec<(usize, TxCheck<'_>)> = checks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out[*i].is_none())
+            .map(|(i, c)| (i, *c))
+            .collect();
+        if !remote.is_empty() {
+            let requests: Vec<TxCheck<'_>> = remote.iter().map(|(_, c)| *c).collect();
+            let verdicts = self.remote.check_in_language(&requests, language).await;
+            for ((index, _), verdict) in remote.iter().zip(verdicts) {
+                out[*index] = Some(verdict);
+            }
+        }
+        out.into_iter()
+            .map(|v| v.unwrap_or_else(|| Err(TerminologyError::new("no verdict"))))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -286,10 +587,88 @@ mod tests {
         assert!(res, "an unembedded value set must not be disproved offline");
     }
 
+    /// Records what reaches it and answers `false`.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TerminologyProvider for Recording {
+        async fn validate_code(
+            &self,
+            value_set: &str,
+            _coded: &CodedValue,
+        ) -> Result<bool, TerminologyError> {
+            self.0.lock().unwrap().push(value_set.to_string());
+            Ok(false)
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn composite_batches_only_the_remote_checks_in_order() {
+        let remote = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let provider = CompositeTerminologyProvider::new(
+            core_terminology(FhirVersion::R4),
+            Arc::clone(&remote) as Arc<dyn TerminologyProvider>,
+        );
+        let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
+        let ig_a = "http://example.org/ValueSet/a";
+        let ig_b = "http://example.org/ValueSet/b";
+        let male = CodedValue::Code("male".into());
+        let bad = CodedValue::Code("masculino".into());
+        let any = CodedValue::Code("x".into());
+        let verdicts = provider
+            .validate_codes(&[(ig_a, &any), (gender, &male), (ig_b, &any), (gender, &bad)])
+            .await;
+        let verdicts: Vec<bool> = verdicts.into_iter().map(|v| v.unwrap()).collect();
+        assert_eq!(verdicts, [false, true, false, false]);
+        assert_eq!(
+            remote.0.lock().unwrap().as_slice(),
+            [ig_a.to_string(), ig_b.to_string()]
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn composite_answers_core_sets_locally_and_delegates_the_rest() {
+        let remote = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let provider = CompositeTerminologyProvider::new(
+            core_terminology(FhirVersion::R4),
+            Arc::clone(&remote) as Arc<dyn TerminologyProvider>,
+        );
+        // Core set, with the version suffix the HL7 StructureDefinitions carry.
+        let gender = "http://hl7.org/fhir/ValueSet/administrative-gender|4.0.1";
+        assert!(
+            provider
+                .validate_code(gender, &CodedValue::Code("male".into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .validate_code(gender, &CodedValue::Code("masculino".into()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            remote.0.lock().unwrap().is_empty(),
+            "embedded sets never reach the remote server"
+        );
+
+        // An IG value set the pack does not know goes remote.
+        let ig = "https://twcore.mohw.gov.tw/ig/twcore/ValueSet/identifier-type-tw";
+        assert!(
+            !provider
+                .validate_code(ig, &CodedValue::Code("MR".into()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(remote.0.lock().unwrap().as_slice(), [ig.to_string()]);
+    }
+
     #[test]
     fn fhir_release_is_major_minor() {
         assert_eq!(fhir_release("4.0.1"), Some("4.0"));
-        assert_eq!(fhir_release("6.0.0-ballot4"), Some("6.0"));
+        assert_eq!(fhir_release("6.0.0-snapshot1"), Some("6.0"));
         assert_eq!(fhir_release("5.0"), Some("5.0"));
         assert_eq!(fhir_release("2014-03-26"), None);
         assert_eq!(fhir_release("current"), None);

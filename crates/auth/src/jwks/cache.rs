@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::fetcher::JwksFetcher;
+use crate::config::redact_url;
 use crate::error::AuthError;
 
 /// Default cache TTL when no Cache-Control header is present.
@@ -20,6 +21,7 @@ pub struct JwksCache {
     expires_at: Arc<RwLock<Instant>>,
     last_refresh: Arc<RwLock<Instant>>,
     min_refresh_interval: Duration,
+    max_ttl: Duration,
 }
 
 impl JwksCache {
@@ -36,17 +38,47 @@ impl JwksCache {
                 Instant::now() - Duration::from_secs(min_refresh_interval_secs + 1),
             )),
             min_refresh_interval: Duration::from_secs(min_refresh_interval_secs),
+            max_ttl: DEFAULT_CACHE_TTL,
         }
+    }
+
+    /// Caps how long a fetched key set is trusted before it is refetched,
+    /// whatever the IdP's `Cache-Control` says (or when it says nothing, as
+    /// Keycloak does). This bounds how long a key the IdP has retired — or
+    /// revoked after a compromise — keeps validating tokens here.
+    pub fn with_max_ttl(mut self, max_ttl_secs: u64) -> Self {
+        self.max_ttl = Duration::from_secs(max_ttl_secs.max(1));
+        self
     }
 
     /// Perform the initial JWKS fetch. Must be called before serving requests.
     ///
     /// Also spawns a background task to refresh keys before expiry.
     pub async fn initial_fetch(&self) -> Result<(), AuthError> {
-        info!(url = %self.jwks_url, "Performing initial JWKS fetch");
+        // Redacted: a JWKS URL may carry userinfo or a query credential (#2149).
+        info!(url = %redact_url(&self.jwks_url), "Performing initial JWKS fetch");
         self.refresh().await?;
         self.spawn_background_refresh();
         Ok(())
+    }
+
+    /// Start the cache without requiring the IdP to be reachable right now.
+    ///
+    /// Tries the initial fetch and, whatever its outcome, spawns the
+    /// background refresher. When the IdP is down at startup the server still
+    /// comes up: every token is refused (`401`/`503`) until a refresh — on the
+    /// first unknown `kid`, or the background retry — reaches the JWKS. Use
+    /// [`initial_fetch`](Self::initial_fetch) to fail fast instead.
+    pub async fn start(&self) {
+        info!(url = %self.jwks_url, "Performing initial JWKS fetch");
+        if let Err(err) = self.refresh().await {
+            warn!(
+                url = %self.jwks_url,
+                error = %err,
+                "Initial JWKS fetch failed; starting anyway and retrying in the background"
+            );
+        }
+        self.spawn_background_refresh();
     }
 
     /// Get the decoding key for a given key ID.
@@ -89,7 +121,7 @@ impl JwksCache {
     async fn refresh(&self) -> Result<(), AuthError> {
         let response = self.fetcher.fetch(&self.jwks_url).await?;
 
-        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
+        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL).min(self.max_ttl);
 
         {
             let mut keys = self.keys.write().await;
@@ -116,6 +148,7 @@ impl JwksCache {
         let url = self.jwks_url.clone();
         let fetcher = self.fetcher.clone();
         let min_interval = self.min_refresh_interval;
+        let max_ttl = self.max_ttl;
 
         tokio::spawn(async move {
             loop {
@@ -128,16 +161,17 @@ impl JwksCache {
                         // Refresh at 75% of TTL to avoid edge cases
                         remaining.mul_f64(0.75)
                     } else {
-                        min_interval
+                        // Expired or never fetched: retry, but never spin.
+                        min_interval.max(Duration::from_secs(5))
                     }
                 };
 
                 tokio::time::sleep(sleep_duration).await;
 
-                debug!(url = %url, "Background JWKS refresh triggered");
+                debug!(url = %redact_url(&url), "Background JWKS refresh triggered");
                 match fetcher.fetch(&url).await {
                     Ok(response) => {
-                        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
+                        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL).min(max_ttl);
                         {
                             let mut k = keys.write().await;
                             *k = response.keys;

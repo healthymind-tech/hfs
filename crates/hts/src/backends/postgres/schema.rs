@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS code_systems (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
 CREATE INDEX IF NOT EXISTS idx_code_systems_url ON code_systems(url);
+-- CRUD and `/CodeSystem/{id}` resolve a FHIR id through the stored resource
+-- (`resource_json->>'id'`), since multi-version rows carry synthetic ids.
+CREATE INDEX IF NOT EXISTS idx_code_systems_json_id ON code_systems ((resource_json->>'id'));
+CREATE INDEX IF NOT EXISTS idx_code_systems_id_base ON code_systems (split_part(id, '|', 1));
+-- Reported FHIR id, unique per stored version (see `crate::resource_ids`):
+-- versions sharing a declared id report `<id>` (the default version) and
+-- `<id>-<version>`. Maintained on write, repaired at startup.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_code_systems_fhir_id ON code_systems (fhir_id);
+-- A ValueSet URL that names no stored ValueSet is tried as a CodeSystem's
+-- `valueSet` (its implicit all-codes ValueSet): an index probe instead of
+-- reading every CodeSystem's JSON.
+CREATE INDEX IF NOT EXISTS idx_code_systems_json_valueset ON code_systems ((resource_json->>'valueSet'));
 
 -- Legacy installs created code_systems with `url TEXT NOT NULL UNIQUE`, which
 -- bakes uniqueness into a hidden constraint that blocks multi-version imports.
@@ -84,6 +97,11 @@ CREATE TABLE IF NOT EXISTS concepts (
 -- lookups.
 DROP INDEX IF EXISTS idx_concepts_system_code;
 CREATE INDEX IF NOT EXISTS idx_concepts_display_trgm ON concepts USING gin(display gin_trgm_ops);
+-- LOINC part names (`SCALE_TYP = DOC` names the part LP32888-7, see
+-- `loinc_filters`): one probe instead of reading all ~117 k LP rows of a
+-- LOINC version (8.8 s cold on the production HDD). Partial: LP codes only.
+CREATE INDEX IF NOT EXISTS idx_concepts_loinc_part_name
+    ON concepts (system_id, lower(display)) WHERE code >= 'LP' AND code < 'LQ';
 
 -- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
 CREATE TABLE IF NOT EXISTS concept_hierarchy (
@@ -127,6 +145,13 @@ CREATE TABLE IF NOT EXISTS concept_designations (
 -- equivalent idx_props_concept.)
 CREATE INDEX IF NOT EXISTS idx_designations_concept
     ON concept_designations(concept_id);
+-- Case-insensitive designation lookups: LOINC part names stored as
+-- designations (`PartName`, e.g. CLASS = DOC.ONTOLOGY) and supplement
+-- de-duplication. Without it the part-name lookup of a filtered LOINC
+-- expansion was a parallel sequential scan of every designation (5.4 M rows,
+-- 14.8 s cold on the production HDD).
+CREATE INDEX IF NOT EXISTS idx_designations_lower_value
+    ON concept_designations (lower(value));
 
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_sets (
@@ -146,6 +171,12 @@ CREATE TABLE IF NOT EXISTS value_sets (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
 CREATE INDEX IF NOT EXISTS idx_value_sets_url ON value_sets(url);
+-- FHIR-id resolution of versioned rows (`<id>|<version>` storage ids).
+CREATE INDEX IF NOT EXISTS idx_value_sets_json_id ON value_sets ((resource_json->>'id'));
+CREATE INDEX IF NOT EXISTS idx_value_sets_id_base ON value_sets (split_part(id, '|', 1));
+-- See code_systems.fhir_id.
+ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_value_sets_fhir_id ON value_sets (fhir_id);
 
 -- Drop any legacy column-level UNIQUE on value_sets.url for the same reason
 -- code_systems above had it removed: tx-ecosystem ships per-version VS
@@ -164,6 +195,10 @@ BEGIN
         EXECUTE format('ALTER TABLE value_sets DROP CONSTRAINT %I', cons_name);
     END LOOP;
 END $$;
+
+-- Metadata listing (`GET /CodeSystem`, `/ValueSet`) orders by created_at.
+CREATE INDEX IF NOT EXISTS idx_code_systems_created_at ON code_systems(created_at);
+CREATE INDEX IF NOT EXISTS idx_value_sets_created_at ON value_sets(created_at);
 
 -- ── Value Set Expansions (materialized cache) ─────────────────────────────────
 -- `version` carries the resolved CodeSystem version for each cached entry so
@@ -184,11 +219,22 @@ CREATE TABLE IF NOT EXISTS value_set_expansions (
 -- Legacy installs may have a value_set_expansions table without the `version`
 -- column; add it idempotently so upgrades round-trip.
 ALTER TABLE value_set_expansions ADD COLUMN IF NOT EXISTS version TEXT;
+-- Re-importing or deleting a CodeSystem drops the cached expansions over it.
+CREATE INDEX IF NOT EXISTS idx_value_set_expansions_system ON value_set_expansions(system_url);
+
+-- What a cached expansion was computed from (code system and value set
+-- canonicals its compose names, transitively); see the SQLite schema.
+CREATE TABLE IF NOT EXISTS value_set_dependencies (
+    value_set_id TEXT NOT NULL REFERENCES value_sets(id) ON DELETE CASCADE,
+    dep_url      TEXT NOT NULL,
+    PRIMARY KEY (value_set_id, dep_url)
+);
+CREATE INDEX IF NOT EXISTS idx_value_set_dependencies_url ON value_set_dependencies(dep_url);
 
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id            TEXT PRIMARY KEY,
-    url           TEXT NOT NULL UNIQUE,
+    url           TEXT NOT NULL,
     version       TEXT,
     name          TEXT,
     title         TEXT,
@@ -198,6 +244,31 @@ CREATE TABLE IF NOT EXISTS concept_maps (
     resource_json JSONB,
     created_at    TEXT NOT NULL
 );
+-- Multi-version like code_systems: one row per (url, version). Databases
+-- created with `url TEXT NOT NULL UNIQUE` drop that constraint here (before,
+-- importing version 2 of a map replaced version 1).
+DO $$
+DECLARE
+    cons_name text;
+BEGIN
+    FOR cons_name IN
+        SELECT conname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'concept_maps'
+          AND c.contype = 'u'
+          AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
+    LOOP
+        EXECUTE format('ALTER TABLE concept_maps DROP CONSTRAINT %I', cons_name);
+    END LOOP;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_maps_url_version
+    ON concept_maps(url, COALESCE(version, ''));
+CREATE INDEX IF NOT EXISTS idx_concept_maps_url ON concept_maps(url);
+-- See code_systems.version_sort / fhir_id.
+ALTER TABLE concept_maps ADD COLUMN IF NOT EXISTS version_sort TEXT;
+ALTER TABLE concept_maps ADD COLUMN IF NOT EXISTS fhir_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_concept_maps_fhir_id ON concept_maps (fhir_id);
+CREATE INDEX IF NOT EXISTS idx_concept_maps_json_id ON concept_maps ((resource_json->>'id'));
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_map_elements (
@@ -211,6 +282,13 @@ CREATE TABLE IF NOT EXISTS concept_map_elements (
 );
 CREATE INDEX IF NOT EXISTS idx_map_source
     ON concept_map_elements(map_id, source_system, source_code);
+-- Forward and reverse $translate by code without a map url (the common
+-- `system`+`code` form): without these every such request scans every
+-- ConceptMap element. Same indexes as the SQLite schema.
+CREATE INDEX IF NOT EXISTS idx_map_elements_source_code
+    ON concept_map_elements(source_code, source_system, map_id);
+CREATE INDEX IF NOT EXISTS idx_map_elements_target_code
+    ON concept_map_elements(target_code, target_system, map_id);
 
 -- ── Transitive ancestor closure ────────────────────────────────────────────────
 -- Precomputed (ancestor, descendant) pairs for every code system, including
@@ -227,6 +305,62 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+
+-- ── Reference set membership ──────────────────────────────────────────────────
+-- Active members of SNOMED CT Simple reference sets (RF2
+-- der2_Refset_Simple*): ECL `^ refset` and `?fhir_vs=refset/<id>` read it.
+-- Replaced per system on re-import; goes with the CodeSystem row. Mirrors the
+-- SQLite table of the same name.
+CREATE TABLE IF NOT EXISTS refset_members (
+    system_id       TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    refset_id       TEXT NOT NULL,
+    referenced_code TEXT NOT NULL,
+    PRIMARY KEY (system_id, refset_id, referenced_code)
+);
+
+-- ── SNOMED CT concept model ───────────────────────────────────────────────────
+-- What the in-memory SNOMED CT model (`crate::snomed::model`) is built from:
+-- per-concept status, definition status, effective time, module and active /
+-- inactive description terms (in description id order, newline-separated);
+-- every active inferred relationship with its group (is-a included, concrete
+-- values marked); and the MRCM attribute domain and range rules. Written by
+-- the RF2 importer, replaced per system on re-import. `snomed_model_stamps`
+-- names the import, so a cached model is rebuilt after a re-import.
+CREATE TABLE IF NOT EXISTS snomed_concepts (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    code           TEXT COLLATE \"C\" NOT NULL,
+    active         BOOLEAN NOT NULL,
+    primitive      BOOLEAN NOT NULL,
+    effective_time TEXT,
+    module_id      TEXT,
+    terms          TEXT NOT NULL DEFAULT '',
+    inactive_terms TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (system_id, code)
+);
+CREATE TABLE IF NOT EXISTS snomed_relationships (
+    system_id   TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    source_code TEXT COLLATE \"C\" NOT NULL,
+    rel_group   INTEGER NOT NULL,
+    type_code   TEXT COLLATE \"C\" NOT NULL,
+    value       TEXT COLLATE \"C\" NOT NULL,
+    concrete    BOOLEAN NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_relationships_system
+    ON snomed_relationships(system_id);
+CREATE TABLE IF NOT EXISTS snomed_mrcm (
+    system_id      TEXT NOT NULL REFERENCES code_systems(id) ON DELETE CASCADE,
+    kind           TEXT NOT NULL,
+    attribute_code TEXT COLLATE \"C\" NOT NULL,
+    c1             TEXT NOT NULL,
+    c2             TEXT NOT NULL,
+    c3             TEXT NOT NULL,
+    c4             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snomed_mrcm_system ON snomed_mrcm(system_id);
+CREATE TABLE IF NOT EXISTS snomed_model_stamps (
+    system_id TEXT PRIMARY KEY REFERENCES code_systems(id) ON DELETE CASCADE,
+    stamp     TEXT NOT NULL
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -294,6 +428,29 @@ BEGIN
     END IF;
 END $$;
 
+-- ── version_sort (semantic version ordering) ───────────────────────────────────
+-- Byte-sortable key derived from `version` (see `version_order.rs`) so the
+-- precedence ORDER BY picks the semantically newest version. Backfilled by
+-- `migrate_version_sort_pg` right after this schema is applied.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS version_sort TEXT;
+-- Operator-pinned current version (admin API); see the SQLite schema.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS current_pin INTEGER;
+ALTER TABLE value_sets ADD COLUMN IF NOT EXISTS version_sort TEXT;
+
+-- ── JSON-derived search columns (supplements / publisher) ─────────────────────
+-- Back the CodeSystem `supplements` and `publisher` search parameters. STORED
+-- generated columns, so every write path (and `hts migrate`'s COPY) fills them
+-- without knowing about them. Adding them to an existing database rewrites the
+-- code_systems rows once (a few thousand rows, ~25 MB of JSON in production;
+-- never the concept tables); after that it is a no-op. ValueSet/ConceptMap
+-- `publisher` reads the JSON on demand instead (see
+-- `string_search::metadata_select_list`): value_sets holds hundreds of MB.
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS supplements TEXT
+    GENERATED ALWAYS AS (CASE WHEN content = 'supplement'
+                              THEN resource_json->>'supplements' END) STORED;
+ALTER TABLE code_systems ADD COLUMN IF NOT EXISTS publisher TEXT
+    GENERATED ALWAYS AS (resource_json->>'publisher') STORED;
+
 -- ── ICD-9-CM re-import backfill (issue #802) ────────────────────────────────────
 -- The importer previously required a pipe delimiter that the real bundled CMS
 -- file never has, so every code silently failed to parse while the file was
@@ -313,7 +470,171 @@ BEGIN
         VALUES ('#migration:icd9cm-space-delimited-802', '', 0);
     END IF;
 END $$;
+
+-- ── Hierarchy from subsumedBy/parent properties (fork P1-B) ────────────────────
+-- Mirrors sqlite `migrate_property_hierarchy`: CodeSystems imported before the
+-- parser recognised `subsumedBy` as a parent edge (THO v3-*) get their
+-- concept_hierarchy derived from the stored properties; their closure rows are
+-- dropped so `migrate_concept_closure_pg` (run right after apply) rebuilds them.
+DO $$
+DECLARE
+    sid text;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM bootstrap_imports WHERE path = '#migration:hierarchy-from-subsumedby-p1b'
+    ) THEN
+        FOR sid IN
+            SELECT c.system_id
+              FROM concept_properties cp
+              JOIN concepts c ON c.id = cp.concept_id
+             WHERE cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+             GROUP BY c.system_id
+            HAVING COUNT(*) > 2 * (SELECT COUNT(*) FROM concept_hierarchy h
+                                    WHERE h.system_id = c.system_id)
+        LOOP
+            INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+            SELECT c.system_id, cp.value, c.code
+              FROM concept_properties cp
+              JOIN concepts c ON c.id = cp.concept_id
+             WHERE c.system_id = sid
+               AND cp.property IN ('subsumedBy', 'parent') AND cp.value_type = 'code'
+               AND cp.value <> c.code
+            ON CONFLICT DO NOTHING;
+            DELETE FROM concept_closure WHERE system_id = sid;
+        END LOOP;
+        INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+        VALUES ('#migration:hierarchy-from-subsumedby-p1b', '', 0);
+    END IF;
+END $$;
+
+-- ── Byte-order collation for codes and versions ───────────────────────────────
+-- SQLite compares TEXT bytewise (BINARY). A PostgreSQL database usually runs a
+-- linguistic default collation (`en_US.utf8` in the official image), under
+-- which `ORDER BY code` puts LOINC `10000-8` before `1000-9`, `version_sort`
+-- keys (`2:…`, `1:…`) stop sorting as bytes and storage-id prefix ranges stop
+-- being prefixes. Code, hierarchy, closure, refset, map and version columns are
+-- therefore `COLLATE \"C\"`: identical order to SQLite, and cheaper (memcmp)
+-- comparisons. Display and designation text keep the database collation so
+-- case folding stays Unicode-aware. Every column a code is compared with is in
+-- the list, so joins never mix collations. On an existing database this
+-- rewrites the affected indexes once.
+DO $$
+DECLARE
+    c_coll oid := (SELECT oid FROM pg_collation
+                   WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace);
+    r record;
+BEGIN
+    FOR r IN
+        SELECT a.attrelid::regclass AS tbl,
+               string_agg(format('ALTER COLUMN %I TYPE text COLLATE \"C\"', a.attname), ', ') AS alters
+        FROM pg_attribute a
+        JOIN (VALUES
+                ('concepts', 'code'),
+                ('concept_hierarchy', 'parent_code'),
+                ('concept_hierarchy', 'child_code'),
+                ('concept_closure', 'ancestor_code'),
+                ('concept_closure', 'descendant_code'),
+                ('concept_properties', 'value'),
+                ('value_set_expansions', 'code'),
+                ('value_set_expansions', 'system_url'),
+                ('refset_members', 'refset_id'),
+                ('refset_members', 'referenced_code'),
+                ('concept_map_elements', 'source_code'),
+                ('concept_map_elements', 'target_code'),
+                ('code_systems', 'version'),
+                ('code_systems', 'version_sort'),
+                ('value_sets', 'version'),
+                ('value_sets', 'version_sort'),
+                ('concept_maps', 'version'),
+                ('concept_maps', 'version_sort')
+             ) AS want(tbl, col)
+          ON a.attrelid = to_regclass(want.tbl) AND a.attname = want.col
+        WHERE NOT a.attisdropped AND a.attcollation <> c_coll
+        GROUP BY a.attrelid
+    LOOP
+        EXECUTE format('ALTER TABLE %s %s', r.tbl, r.alters);
+    END LOOP;
+END $$;
+
+-- ── Cross-instance cache coherence ─────────────────────────────────────────────
+-- Every HTS process keeps response caches ($expand, $lookup, $validate-code,
+-- $translate, $subsumes, CodeSystem/ValueSet metadata). A write served by one
+-- replica (or by `hts import`, or by hand-written SQL) must reach the others.
+-- `terminology_epoch` is a single counter: the triggers below bump it inside
+-- every transaction that touches a terminology header row, the server bumps it
+-- once more after each write it completes, and every server polls it
+-- (`HTS_CACHE_SYNC_INTERVAL_MS`) and drops its caches when it moves.
+-- Statement-level triggers on the three header tables only: concept rows are
+-- written in bulk, and a per-statement bump there would serialize parallel
+-- import writers on this one row.
+CREATE TABLE IF NOT EXISTS terminology_epoch (
+    id    SMALLINT PRIMARY KEY CHECK (id = 1),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO terminology_epoch (id, epoch) VALUES (1, 1) ON CONFLICT (id) DO NOTHING;
+CREATE OR REPLACE FUNCTION hts_bump_terminology_epoch() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE terminology_epoch SET epoch = epoch + 1 WHERE id = 1;
+    RETURN NULL;
+END
+$$;
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON code_systems;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON code_systems
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON value_sets;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON value_sets
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
+DROP TRIGGER IF EXISTS trg_terminology_epoch ON concept_maps;
+CREATE TRIGGER trg_terminology_epoch
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON concept_maps
+    FOR EACH STATEMENT EXECUTE FUNCTION hts_bump_terminology_epoch();
 ";
+
+/// Advisory lock key guarding bootstrap terminology import
+/// (`crates/hts/src/main.rs`'s `bootstrap_sync_postgres`). Distinct from
+/// `apply`'s own `HTS_SCHEMA_LOCK` (schema DDL is a separate critical section
+/// from the bootstrap import that follows it) but packed the same way — the
+/// ASCII bytes of `"HTS_BOOT"`.
+pub const HTS_BOOTSTRAP_LOCK: i64 = 0x4854_535f_424f_4f54u64 as i64; // "HTS_BOOT"
+
+/// Runs `work` while holding [`HTS_BOOTSTRAP_LOCK`] on one dedicated
+/// connection checked out from `pool`.
+///
+/// Serializes concurrent bootstrap terminology imports across instances
+/// cold-starting against the same database — `work` is typically the whole
+/// directory-sync pass (every terminology file in one call), not a
+/// per-file unit, so a single lock scope covers all of it. Whatever
+/// idempotent ledger re-check `work` performs internally naturally sees the
+/// winner's already-imported state once a loser acquires the lock — no
+/// separate "did someone else already run bootstrap" flag is needed. The
+/// lock is released on both the success and error path: a session-level
+/// advisory lock left held in a pooled connection would otherwise wedge
+/// every other caller sharing that pool forever.
+pub async fn with_bootstrap_lock<F, Fut, T>(
+    pool: &deadpool_postgres::Pool,
+    work: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let client = pool.get().await?;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_BOOTSTRAP_LOCK])
+        .await?;
+
+    let result = work().await;
+
+    // Always release the lock, even if `work` failed.
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_BOOTSTRAP_LOCK])
+        .await;
+
+    result
+}
 
 /// Apply the HTS PostgreSQL schema to the given client connection.
 ///
@@ -331,12 +652,294 @@ pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres
     client
         .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
         .await?;
-    let result = client.batch_execute(SCHEMA).await;
+    let result = apply_if_changed(client).await;
     // Always release the lock, even if schema apply failed.
     let _ = client
         .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
         .await;
     result
+}
+
+/// Fingerprint of [`SCHEMA`] (FNV-1a), recorded once the DDL has been applied.
+fn schema_fingerprint() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in SCHEMA.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Run [`SCHEMA`] unless this exact DDL has already been applied to the
+/// database.
+///
+/// Re-running it is idempotent but not free: `ALTER TABLE … ADD COLUMN IF NOT
+/// EXISTS` and the `DO` blocks take `ACCESS EXCLUSIVE` locks even when they end
+/// up doing nothing, and the whole script runs as one implicit transaction. A
+/// server starting while another process writes (a second replica, a running
+/// `hts import`) could then deadlock against it, and every start paid for
+/// the DDL. The fingerprint row makes an up-to-date database a single
+/// lookup; any change to the DDL text re-applies it.
+/// Run [`SCHEMA`] unconditionally (under the schema advisory lock) and record
+/// its fingerprint. `hts migrate` uses it to re-create the secondary indexes
+/// it dropped for the bulk load.
+pub async fn apply_ddl(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
+        .await?;
+    let result = async {
+        client.batch_execute(SCHEMA).await?;
+        record_fingerprint(client).await
+    }
+    .await;
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
+        .await;
+    result
+}
+
+async fn record_fingerprint(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "INSERT INTO hts_schema_meta (key, value) VALUES ('schema_fingerprint', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            &[&schema_fingerprint()],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn apply_if_changed(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hts_schema_meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             )",
+        )
+        .await?;
+    let fingerprint = schema_fingerprint();
+    let current: Option<String> = client
+        .query_opt(
+            "SELECT value FROM hts_schema_meta WHERE key = 'schema_fingerprint'",
+            &[],
+        )
+        .await?
+        .map(|r| r.get(0));
+    if current.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    client.batch_execute(SCHEMA).await?;
+    record_fingerprint(client).await
+}
+
+/// One-time repair for the p25-data2 fixes (marker
+/// [`P25_DATA2_MIGRATION_MARKER`](crate::import::bundle_parser::P25_DATA2_MIGRATION_MARKER)):
+/// stored composes drop the advisory versions of native `current` systems
+/// (`strip_advisory_versions`; their cached expansions are dropped), and every
+/// remaining cached expansion gets its `value_set_dependencies` rows so later
+/// CodeSystem / ValueSet writes invalidate it.
+pub async fn migrate_p25_data2_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), crate::error::HtsError> {
+    use crate::import::bundle_parser::{
+        ADVISORY_VERSION_SYSTEMS, P25_DATA2_MIGRATION_MARKER, strip_advisory_versions,
+    };
+    let db = |e: tokio_postgres::Error| crate::error::HtsError::StorageError(e.to_string());
+    if client
+        .query_opt(
+            "SELECT 1 FROM bootstrap_imports WHERE path = $1",
+            &[&P25_DATA2_MIGRATION_MARKER],
+        )
+        .await
+        .map_err(db)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let patterns: Vec<String> = ADVISORY_VERSION_SYSTEMS
+        .iter()
+        .map(|s| format!("%{s}%"))
+        .collect();
+    let rows = client
+        .query(
+            "SELECT id, compose_json FROM value_sets
+              WHERE compose_json LIKE ANY($1::text[]) AND compose_json LIKE '%\"version\"%'",
+            &[&patterns],
+        )
+        .await
+        .map_err(db)?;
+    let mut stripped = 0u64;
+    for row in rows {
+        let id: String = row.get(0);
+        let Some(text) = row.get::<_, Option<String>>(1) else {
+            continue;
+        };
+        let Ok(mut compose) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if strip_advisory_versions(&mut compose) {
+            client
+                .execute(
+                    "UPDATE value_sets SET compose_json = $2 WHERE id = $1",
+                    &[&id, &compose.to_string()],
+                )
+                .await
+                .map_err(db)?;
+            client
+                .execute("DELETE FROM value_set_expansions WHERE value_set_id = $1", &[&id])
+                .await
+                .map_err(db)?;
+            stripped += 1;
+        }
+    }
+    let cached: Vec<String> = client
+        .query(
+            "SELECT DISTINCT e.value_set_id FROM value_set_expansions e
+              WHERE NOT EXISTS (SELECT 1 FROM value_set_dependencies d
+                                 WHERE d.value_set_id = e.value_set_id)",
+            &[],
+        )
+        .await
+        .map_err(db)?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    for id in &cached {
+        super::value_set::record_dependencies(client, id).await?;
+    }
+    client
+        .execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES ($1, '', 0) \
+             ON CONFLICT (path) DO NOTHING",
+            &[&P25_DATA2_MIGRATION_MARKER],
+        )
+        .await
+        .map_err(db)?;
+    tracing::info!(
+        stripped_composes = stripped,
+        cached_value_sets = cached.len(),
+        "p25-data2 migration: advisory compose versions, expansion dependencies"
+    );
+    Ok(())
+}
+
+/// One-time repair for the p25-data fixes (marker
+/// [`P25_DATA_MIGRATION_MARKER`](crate::import::bundle_parser::P25_DATA_MIGRATION_MARKER)):
+/// flat CDCREC rows (no `concept_hierarchy`) get the embedded race/ethnicity
+/// edges between codes they define — `migrate_concept_closure_pg`, run next,
+/// builds their closure — and cached expansions of value sets over CDCREC or
+/// UCUM, and of every value set built from other value sets (US Core 7
+/// `detailed-race` is VSAC's race value set plus null flavors), are dropped: they were computed while `descendent-of 1000-9` was empty
+/// and enumerated UCUM units were dropped, and a cached expansion is never
+/// recomputed on its own (an empty include leaves no row a later
+/// CodeSystem re-import would invalidate).
+pub async fn migrate_p25_data_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
+    use crate::import::bundle_parser::{
+        CDCREC_URL, P25_DATA_MIGRATION_MARKER, P25_DATA_SYSTEMS, cdcrec_edges,
+    };
+    let done = client
+        .query_opt(
+            "SELECT 1 FROM bootstrap_imports WHERE path = $1",
+            &[&P25_DATA_MIGRATION_MARKER],
+        )
+        .await?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let (children, parents): (Vec<&str>, Vec<&str>) = cdcrec_edges().into_iter().unzip();
+    let edges = client
+        .execute(
+            "INSERT INTO concept_hierarchy (system_id, parent_code, child_code)
+             SELECT cs.id, e.parent, e.child
+               FROM code_systems cs
+              CROSS JOIN UNNEST($1::text[], $2::text[]) AS e(child, parent)
+              WHERE cs.url = $3
+                AND NOT EXISTS (SELECT 1 FROM concept_hierarchy h WHERE h.system_id = cs.id)
+                AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id AND c.code = e.child)
+                AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id AND c.code = e.parent)
+             ON CONFLICT DO NOTHING",
+            &[&children, &parents, &CDCREC_URL],
+        )
+        .await?;
+    let systems: Vec<&str> = P25_DATA_SYSTEMS.to_vec();
+    let cleared = client
+        .execute(
+            // SKIP LOCKED: rows another session is (re)writing right now
+            // come from this binary's code and are current; waiting for
+            // them could deadlock against its DELETE + INSERT transaction.
+            "DELETE FROM value_set_expansions
+              WHERE ctid IN (
+                    SELECT ctid FROM value_set_expansions
+                     WHERE system_url = ANY($1::text[])
+                        OR value_set_id IN (SELECT id FROM value_sets
+                                             WHERE compose_json LIKE '%' || $2 || '%'
+                                                OR compose_json LIKE '%' || $3 || '%'
+                                                OR compose_json LIKE '%\"valueSet\"%')
+                       FOR UPDATE SKIP LOCKED)",
+            &[&systems, &systems[0], &systems[1]],
+        )
+        .await?;
+    client
+        .execute(
+            // Two backends may start at once on one database: the second
+            // finds the marker written (the steps above are idempotent).
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES ($1, '', 0) \
+             ON CONFLICT (path) DO NOTHING",
+            &[&P25_DATA_MIGRATION_MARKER],
+        )
+        .await?;
+    tracing::info!(
+        cdcrec_edges = edges,
+        cleared_expansion_rows = cleared,
+        "p25-data migration: CDCREC hierarchy, CDCREC/UCUM expansion cache"
+    );
+    Ok(())
+}
+
+/// Backfill `version_sort` for every versioned `code_systems` / `value_sets`
+/// row that does not have one yet. Mirrors the SQLite
+/// `schema::migrate_version_sort`; idempotent and cheap (one SELECT per table,
+/// one UPDATE per missing row — only on first start after the upgrade or after
+/// an older binary wrote rows without the key).
+pub async fn migrate_version_sort_pg(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
+    for table in ["code_systems", "value_sets", "concept_maps"] {
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT id, version FROM {table} \
+                     WHERE version IS NOT NULL AND version_sort IS NULL"
+                ),
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let update = client
+            .prepare(&format!(
+                "UPDATE {table} SET version_sort = $1 WHERE id = $2"
+            ))
+            .await?;
+        for row in &rows {
+            let id: String = row.get(0);
+            let version: String = row.get(1);
+            let key = crate::version_order::version_sort_key(Some(&version));
+            client.execute(&update, &[&key, &id]).await?;
+        }
+        tracing::info!(
+            table,
+            rows = rows.len(),
+            "Backfilled version_sort keys for semantic version ordering"
+        );
+    }
+    Ok(())
 }
 
 /// Build (or rebuild) the transitive ancestor closure for one code system.
@@ -371,9 +974,11 @@ pub async fn build_concept_closure_pg(
     // already gone, another writer deleted the system first, so there is
     // nothing to build.
     let tx = client.transaction().await?;
+    // FOR UPDATE (not SHARE) also serializes two builders of the same
+    // system: the pairs are streamed with COPY, which has no ON CONFLICT.
     if tx
         .query_opt(
-            "SELECT 1 FROM code_systems WHERE id = $1 FOR SHARE",
+            "SELECT 1 FROM code_systems WHERE id = $1 FOR UPDATE",
             &[&system_id],
         )
         .await?
@@ -429,22 +1034,32 @@ pub async fn build_concept_closure_pg(
     }
     drop(rows);
 
-    // BFS from every concept to enumerate descendants. Batch the resulting
-    // pairs in chunks of `BATCH` before flushing to PG via UNNEST.
-    const BATCH: usize = 50_000;
-    let mut anc_batch: Vec<&str> = Vec::with_capacity(BATCH);
-    let mut des_batch: Vec<&str> = Vec::with_capacity(BATCH);
-
+    // BFS from every concept to enumerate descendants, streaming each pair
+    // straight into a binary COPY: every (ancestor, descendant) pair is
+    // produced exactly once (per-ancestor visited marks), so no conflict
+    // handling is needed after the DELETE below. COPY is several times faster
+    // than batched INSERTs for SNOMED CT's ~10 M pairs.
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
         &[&system_id],
     )
     .await?;
 
-    let insert_sql = "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
-         SELECT $1, anc, des
-         FROM UNNEST($2::text[], $3::text[]) AS t(anc, des)
-         ON CONFLICT DO NOTHING";
+    let sink = tx
+        .copy_in(
+            "COPY concept_closure (system_id, ancestor_code, descendant_code) \
+             FROM STDIN (FORMAT binary)",
+        )
+        .await?;
+    let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
+        sink,
+        &[
+            tokio_postgres::types::Type::TEXT,
+            tokio_postgres::types::Type::TEXT,
+            tokio_postgres::types::Type::TEXT,
+        ],
+    );
+    futures::pin_mut!(writer);
 
     let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
     let mut queue: VecDeque<usize> = VecDeque::new();
@@ -461,15 +1076,10 @@ pub async fn build_concept_closure_pg(
             }
             visit_gen[idx] = g;
 
-            anc_batch.push(concepts[anc_idx].as_str());
-            des_batch.push(concepts[idx].as_str());
-
-            if anc_batch.len() >= BATCH {
-                tx.execute(insert_sql, &[&system_id, &anc_batch, &des_batch])
-                    .await?;
-                anc_batch.clear();
-                des_batch.clear();
-            }
+            writer
+                .as_mut()
+                .write(&[&system_id, &concepts[anc_idx], &concepts[idx]])
+                .await?;
 
             for &ci in &children[idx] {
                 if visit_gen[ci] != g {
@@ -478,11 +1088,7 @@ pub async fn build_concept_closure_pg(
             }
         }
     }
-
-    if !anc_batch.is_empty() {
-        tx.execute(insert_sql, &[&system_id, &anc_batch, &des_batch])
-            .await?;
-    }
+    writer.finish().await?;
 
     tx.commit().await?;
     Ok(())
@@ -501,9 +1107,11 @@ pub async fn build_concept_closure_pg(
 /// a parallel sequential scan of the 1.2M-row SNOMED hierarchy and exhausted
 /// the dynamic-shared-memory segment on CI containers with a 64 MB `/dev/shm`
 /// — even when no closure work was actually needed.
+/// Returns the number of systems rebuilt, so callers can log whether any work
+/// happened rather than guessing.
 pub async fn migrate_concept_closure_pg(
     client: &mut tokio_postgres::Client,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<usize, tokio_postgres::Error> {
     let systems_needing_closure: Vec<String> = client
         .query(
             "SELECT cs.id FROM code_systems cs
@@ -527,5 +1135,5 @@ pub async fn migrate_concept_closure_pg(
     for sid in &systems_needing_closure {
         build_concept_closure_pg(client, sid).await?;
     }
-    Ok(())
+    Ok(systems_needing_closure.len())
 }

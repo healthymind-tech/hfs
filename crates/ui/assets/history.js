@@ -14,6 +14,20 @@
 
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
+     (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
+     reverse proxy that mounts the server under a prefix. Root-relative FHIR
+     paths are built on it; absolute URLs (a Bundle's paging links) and paths
+     already carrying the prefix pass through untouched. */
+  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
+    .replace(/\/+$/, "");
+  function fhirUrl(path) {
+    if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
+    if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
+      return path;
+    }
+    return FHIR_BASE + path;
+  }
   function fhirHeaders(extra) {
     var h = { Accept: "application/fhir+json" };
     if (TENANT) h["X-Tenant-ID"] = TENANT;
@@ -44,9 +58,9 @@
   function load(type, id) {
     resourceType = type;
     resourceId = id;
-    pathEl.textContent = "/" + type + "/" + id + "/_history";
+    pathEl.textContent = fhirUrl("/" + type + "/" + id + "/_history");
 
-    fetch("/" + type + "/" + id + "/_history", {
+    fetch(fhirUrl("/" + type + "/" + id + "/_history"), {
       headers: fhirHeaders(),
     })
       .then(function (response) {
@@ -102,6 +116,12 @@
     return match ? match[1] : "";
   }
 
+  /* Translated operation name; the English key still drives the CSS modifier. */
+  function opLabel(method) {
+    var key = "msgOp" + method.charAt(0).toUpperCase() + method.slice(1);
+    return messages[key] || method;
+  }
+
   function labelFor(method) {
     if (method === "POST") return "create";
     if (method === "PUT") return "update";
@@ -131,7 +151,7 @@
       when.textContent = shortTime(version.lastUpdated);
       var kind = document.createElement("span");
       kind.className = "history-version__kind history-version__kind--" + version.method;
-      kind.textContent = index === 0 ? messages.msgCurrent : version.method;
+      kind.textContent = index === 0 ? messages.msgCurrent : opLabel(version.method);
 
       row.appendChild(id);
       row.appendChild(when);
@@ -172,6 +192,10 @@
   var diffTicket = 0;
 
   function renderDiff() {
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(fromSel);
+      window.HfsCombobox.refresh(toSel);
+    }
     var fromIndex = Number(fromSel.value);
     var toIndex = Number(toSel.value);
     var from = versions[fromIndex];
@@ -224,16 +248,17 @@
     renderDiff();
   });
 
+  /* With a type and an id the locate form submits natively (GET
+     /ui/history?type=&id=, fork hm/p25-backlog): the page comes back with that
+     instance in its URL, heading and breadcrumb, and the deep-link branch below
+     loads it. Without an id on the Type Feed tab it refreshes the feed in place
+     (#1674). */
   locateForm.addEventListener("submit", function (event) {
-    event.preventDefault();
     var type = locateForm.elements.type.value.trim();
     var id = locateForm.elements.id.value.trim();
-    if (type && id) {
-      if (activeScope() !== "instance") selectTab(tabs[0], false);
-      load(type, id);
-    } else if (activeScope() === "type") {
-      loadFeed("type", null);
-    }
+    if (type && id) return;
+    event.preventDefault();
+    if (activeScope() === "type") loadFeed("type", null);
   });
 
   /* ---- Type Feed / System Feed tabs (#1674) ---------------------------- */
@@ -304,7 +329,7 @@
     }
     feedStatus.hidden = true;
     feedMore.hidden = true;
-    fetch(url, { headers: fhirHeaders() })
+    fetch(fhirUrl(url), { headers: fhirHeaders() })
       .then(function (response) {
         if (!response.ok) throw new Error(String(response.status));
         return response.json();

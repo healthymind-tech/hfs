@@ -40,7 +40,7 @@ pub use channels::ws_manager::WebSocketManager;
 pub use channels::ws_token::WsBindingTokenManager;
 pub use config::{MessagingSettings, SubscriptionConfig};
 pub use delivery_stats::{DeliveryStats, DeliveryWindow};
-pub use engine::SubscriptionEngine;
+pub use engine::{ClusterHandles, DispatchSnapshot, SubscriptionEngine};
 pub use error::SubscriptionError;
 pub use event::{ResourceEvent, ResourceEventType};
 pub use observer::SubscriptionWriteObserver;

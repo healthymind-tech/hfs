@@ -7,7 +7,8 @@
    - #582: while the user types a display name, mirror a slug of it into the
      tenant id, until they take the id over by editing it themselves.
    - #1851: issue the row deletes (and dismissals) from an element that
-     outlives the rows, so a delete queued behind another request is sent.
+     outlives the rows, so a delete queued behind another request is sent —
+     including the fork's typed-id deregister dialog (form[data-tenant-delete]).
    - #1851: keep the count status line's live region as it is while its
      words do not change, so assistive technology does not repeat it.
    The page stays fully usable without this script. Provisioning itself now
@@ -54,6 +55,21 @@
       // response's banner; the promise rejecting is not news here.
       window.htmx.ajax("DELETE", path, { source: issuer }).catch(function () {});
     });
+  });
+
+  /* The deregister dialog (fork, UI/UX review §3.8): its form carries
+     data-tenant-delete and only submits once the typed id matches its
+     pattern. Like the trash buttons above it is not an htmx element, so the
+     DELETE is issued from [data-tenant-mutations], which outlives the rows. */
+  document.addEventListener("submit", function (event) {
+    var form = event.target && event.target.closest ? event.target.closest("form[data-tenant-delete]") : null;
+    if (!form || !window.htmx) return;
+    var issuer = document.querySelector("[data-tenant-mutations]");
+    if (!issuer) return;
+    event.preventDefault();
+    var box = form.closest("details");
+    if (box) box.removeAttribute("open");
+    window.htmx.ajax("DELETE", form.getAttribute("data-tenant-delete"), { source: issuer }).catch(function () {});
   });
 
   /* Count status line (#1851). Every rows response carries

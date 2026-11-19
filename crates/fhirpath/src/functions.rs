@@ -106,7 +106,8 @@ pub struct FunctionInfo {
 /// Includes every function from the [FHIRPath 3.0.0 specification](https://hl7.org/fhirpath/2025Jan/#functions)
 /// this crate's evaluator implements, plus the FHIR- and SQL-on-FHIR-specific
 /// extensions it also supports (`extension`, `getResourceKey`,
-/// `getReferenceKey`, `memberOf`, `hasValue`, `comparable`, `resolve`).
+/// `getReferenceKey`, `memberOf`, `hasValue`, `htmlChecks`, `htmlChecks2`,
+/// `comparable`, `resolve`).
 ///
 /// Deliberately excludes:
 /// - Infix operators (`is`, `as`, `in`, `contains`, `and`, `or`, `xor`,
@@ -188,6 +189,11 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             name: "comparable",
             signature: "comparable(other)",
             category: Other,
+        },
+        FunctionInfo {
+            name: "conformsTo",
+            signature: "conformsTo(profile)",
+            category: Terminology,
         },
         FunctionInfo {
             name: "contains",
@@ -290,6 +296,16 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: String,
         },
         FunctionInfo {
+            name: "entry",
+            signature: "entry(system, code, [min, max])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "entryIn",
+            signature: "entryIn(valueSet, [min, max])",
+            category: Other,
+        },
+        FunctionInfo {
             name: "escape",
             signature: "escape(target)",
             category: String,
@@ -335,6 +351,11 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: SqlOnFhir,
         },
         FunctionInfo {
+            name: "hasCoding",
+            signature: "hasCoding(system, code, [version])",
+            category: Other,
+        },
+        FunctionInfo {
             name: "hasValue",
             signature: "hasValue()",
             category: Existence,
@@ -342,6 +363,16 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
         FunctionInfo {
             name: "highBoundary",
             signature: "highBoundary([precision])",
+            category: Utility,
+        },
+        FunctionInfo {
+            name: "htmlChecks",
+            signature: "htmlChecks()",
+            category: Utility,
+        },
+        FunctionInfo {
+            name: "htmlChecks2",
+            signature: "htmlChecks2()",
             category: Utility,
         },
         FunctionInfo {
@@ -480,9 +511,29 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: Other,
         },
         FunctionInfo {
+            name: "resources",
+            signature: "resources(system, code, [type])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "resourcesIn",
+            signature: "resourcesIn(valueSet, [type])",
+            category: Other,
+        },
+        FunctionInfo {
             name: "round",
             signature: "round([precision])",
             category: Math,
+        },
+        FunctionInfo {
+            name: "sameSubject",
+            signature: "sameSubject([other])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "section",
+            signature: "section(system, code, [min, max])",
+            category: Other,
         },
         FunctionInfo {
             name: "select",

@@ -135,6 +135,7 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_has` (reverse chaining) | REST + backend | ✓ | ✓ | ✗ | ✗ |
 | `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
+| `_in` (R5/R6 only) | resolved application-side to an `_id` filter (List `entry.item`, enumerated Group `member.entity`); no per-backend support needed, so ○ here means "nothing to implement in the backend", not "unsupported" | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
 | `_contained` / `_containedType` | REST capability gate + backend entity matching | ✓ | ✓ | ✓ | ✓ |
 
@@ -149,6 +150,12 @@ wildcard page does not acquire a total from searches that never ran.
 `backends/sqlite/search/filter_parser.rs`). Note the REST layer does not give `_filter` special
 handling; SQLite picks it up as a recognized parameter name. On other backends `_filter` is
 effectively a no-op.
+
+Inside `_filter`, the `ap` operator follows the `ap` search prefix: on a date it uses the shared
+date window, and on a quantity column (`value-quantity`, `dose-quantity`, `age`) it is the closed
+range `[v - m, v + m]` with `m = max(0.1 * |v|, implicit_precision / 2)` (`approx_range`), emitted as
+`BETWEEN`. `ap` has no defined meaning on string, token, reference or URI columns, so it matches
+nothing there (a logged warning, never a substring match), as does a non-numeric quantity literal.
 
 ## 5. Chaining, reverse chaining, include/revinclude
 
@@ -272,6 +279,18 @@ Ordered roughly by impact:
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
    also assumes a `Type/id` reference shape.
+   - **Known backend difference (#2495):** reference `:above` with a versioned URL
+     (`subject:above=http://example.org/fhir/Patient/p1/_history/1`) does not strip the version from
+     the query value on any backend. PostgreSQL and MongoDB strip `/_history/<vid>` from the stored
+     reference when writing, so they also return a resource stored as `.../Patient/p1/_history/2`;
+     SQLite and Elasticsearch store the reference as written and return only the unversioned one.
+     Documented, not aligned; the divergences are recorded in the shared modifier parity suite.
+   - **Upgrade note (#2495):** the shared extractor now parses versioned references
+     (`.../Type/id/_history/N`, optionally with `?query`/`#fragment`) to their target `Type/id`.
+     Elasticsearch documents indexed before the upgrade carry the wrong `resource_type`/`resource_id`
+     for such references (`_history`/`N`, or none), so run a tenant-wide `POST /$reindex` after
+     upgrading for `:Type` and bare-id reference searches to find them (the same limitation applies
+     to the `reference_target` field added by #2394).
 10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
     prefixes now match against the search value's implicit-precision range boundaries per spec:
     `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,

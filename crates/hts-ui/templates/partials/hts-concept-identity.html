@@ -77,7 +77,7 @@
     </div>
 
     {% if !identity.designations.is_empty() %}
-    <div class="table-wrap">
+    <div class="table-wrap" tabindex="0">
       <table class="data-table">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-concept-designations-heading") }}</caption>
         <thead>
@@ -101,7 +101,7 @@
     {% endif %}
 
     {% if !identity.properties.is_empty() %}
-    <div class="table-wrap">
+    <div class="table-wrap" tabindex="0">
       <table class="data-table">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-concept-properties-heading") }}</caption>
         <thead>

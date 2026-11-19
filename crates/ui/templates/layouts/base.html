@@ -8,9 +8,21 @@
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
-  <!-- No `defer`: the theme attribute must land on <html> before first paint,
-       or the stored theme flashes its default first. -->
-  <script src="/ui/assets/theme.js"></script>
+  <!-- Where the FHIR API lives, as seen from the browser: the path of
+       HFS_BASE_URL without a trailing slash — empty at the origin root,
+       "/fhir" behind a reverse proxy that mounts the server under a prefix.
+       Every page script builds its FHIR calls on this instead of assuming
+       the root; the per-user settings document (#151) is read from the
+       second tag, and a layout without it (HTS) means "no such endpoint". -->
+  <meta name="hfs-fhir-base" content="{{ status.fhir_base() }}">
+  <meta name="hfs-user-settings" content="{{ status.fhir_base() }}/_user/settings">
+  <!-- Inline, ahead of everything else that can paint: stamps the stored
+       theme (shared hfs_theme cookie; default "system") on <html> before
+       first paint, so a dark choice never flashes light. Markup:
+       crates/ui-chrome/templates/partials/theme-boot.html. The behaviour
+       (cycling, sync, animation) is theme.js, deferred like the rest. -->
+  {{ status.theme_boot()?|safe }}
+  <script src="/ui/assets/theme.js" defer></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
   <!-- The shared busy states (#679); ahead of every page script by defer's
@@ -27,6 +39,8 @@
   <script src="/ui/assets/unsaved.js" defer></script>
   <script src="/ui/assets/addbox.js" defer></script>
   <script src="/ui/assets/dashboard.js" defer></script>
+  <!-- The responsive navigation drawer (phones and tablets), shared with HTS. -->
+  <script src="/ui/assets/nav.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}"
       data-msg-unsaved="{{ i18n.t("unsaved-changes") }}"
@@ -36,6 +50,9 @@
       data-msg-confirm-ok="{{ i18n.t("confirm-dialog-ok") }}"
       data-msg-confirm-cancel="{{ i18n.t("action-cancel") }}">
   <aside class="sidebar" id="sidebar">
+    <button type="button" class="sidebar__close" data-nav-close aria-label="{{ i18n.t("nav-menu-close") }}">
+      {% include "icons/x.svg" %}
+    </button>
     <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
       <div class="brand__text">
@@ -75,7 +92,7 @@
 
     <hr class="divider">
 
-    <nav class="nav">
+    <nav class="nav" aria-label="{{ i18n.t("nav-main") }}">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
       <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>
@@ -88,7 +105,7 @@
         nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
         /ui/history); they are just not in the menu.
       -->
-      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
+      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% else if active_page == "editor" || active_page == "history" || active_page == "queries" || active_page == "search" %} aria-current="true"{% endif %} title="{{ i18n.t("nav-resources") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
@@ -96,6 +113,10 @@
       <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/validate"{% if active_page == "validate" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-validate") }}">
+        <span class="icon">{% include "icons/check-circle.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-validate") }}</span>
       </a>
       <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
         <span class="icon">{% include "icons/import.svg" %}</span>
@@ -137,6 +158,12 @@
         <span class="icon">{% include "icons/building.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-tenants") }}</span>
       </a>
+      {% if status.package_admin() %}
+      <a class="nav-item" href="/ui/packages"{% if active_page == "packages" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-packages") }}">
+        <span class="icon">{% include "icons/package.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-packages") }}</span>
+      </a>
+      {% endif %}
       <a class="nav-item" href="/ui/capability-statement"{% if active_page == "capability-statement" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-capability-conformance") }}">
         <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
@@ -212,20 +239,25 @@
   -->
   {% block nav_panel %}{% endblock %}
 
+  <div class="sidebar-scrim" data-nav-scrim></div>
+
   <div class="pane">
     <header class="topbar">
+      <!-- Below the drawer breakpoint the sidebar is off-canvas; this opens it
+           (nav.js). Hidden on wide screens, where the rail is always there. -->
+      <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ i18n.t("nav-menu-open") }}">
+        {% include "icons/menu.svg" %}
+      </button>
+      <!-- FHIR Server | Terminology (UI/UX review §4.2): the same switcher
+           HTS renders, so an operator moves between the two consoles from
+           the same place in either. Absent when no terminology server is
+           configured. -->
+{{ status.product_switcher(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/product-switcher.html #}
       <div class="topbar__tools">
         <!-- The theme toggle stays in the topbar (#725): it is a one-click,
              instant-feedback control, and a click deeper behind the menu
              would slow the most common visit-time adjustment. -->
-        <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
-          <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
-            {% include "icons/sun.svg" %}
-          </button>
-          <button type="button" data-set-theme="dark" aria-label="{{ i18n.t("theme-dark") }}">
-            {% include "icons/moon.svg" %}
-          </button>
-        </div>
+{{ status.theme_toggle(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/theme-toggle.html #}
 
         <!--
           The user menu (#725): identity, language, and session actions behind

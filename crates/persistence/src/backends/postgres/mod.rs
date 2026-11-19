@@ -74,18 +74,31 @@
 
 mod backend;
 mod bulk_export;
+mod bulk_index_rebuild;
 mod bulk_provider;
 mod bulk_submit;
 mod bundle_lock_plan;
 pub(crate) mod cached;
 mod cleanup;
+mod cluster_change_feed;
+mod package_jobs;
+mod cluster_jobs;
 mod lock_protocol;
 mod login_sessions;
+mod package_registry;
+mod retention;
+pub(crate) mod null_timestamp_facts;
+mod pool_budget;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;
+mod sof_terminology;
 mod storage;
 mod sync_failures;
+mod subscription_fanout;
+mod subscription_outbox;
+mod subscription_state;
+mod subscription_ws_tokens;
 mod transaction;
 mod user_settings;
 
@@ -94,3 +107,5 @@ pub use backend::{PostgresBackend, PostgresConfig};
 /// [`PostgresBackend::pool_status`], re-exported so callers need no direct
 /// deadpool dependency.
 pub use deadpool_postgres::Status as PoolStatus;
+
+pub use transaction::PostgresTransaction;

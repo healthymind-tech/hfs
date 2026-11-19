@@ -56,6 +56,12 @@ pub struct SmartScope {
     pub resource_type: ResourceTypeSpec,
     /// The granted permissions.
     pub permissions: SmartPermissions,
+    /// SMART v2 granular-scope constraints (`?param=value&...`), ANDed.
+    ///
+    /// Empty for an ordinary scope. A scope such as
+    /// `patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory`
+    /// only grants access to resources that match every constraint.
+    pub constraints: Vec<(String, String)>,
 }
 
 impl SmartScope {
@@ -74,10 +80,19 @@ impl SmartScope {
             _ => return None,
         };
 
+        // A SMART v2 granular scope carries a query: "Observation.rs?category=...".
+        let (rest, query) = match rest.split_once('?') {
+            Some((head, query)) => (head, Some(query)),
+            None => (rest, None),
+        };
+
         // Split rest into resource type and permissions: "Patient.rs"
         let (resource_str, perm_str) = rest.split_once('.')?;
 
         if resource_str.is_empty() || perm_str.is_empty() {
+            return None;
+        }
+        if resource_str != "*" && !resource_str.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
 
@@ -87,23 +102,59 @@ impl SmartScope {
             ResourceTypeSpec::Specific(resource_str.to_string())
         };
 
-        let permissions = SmartPermissions::from_permission_str(perm_str)?;
+        // SMART v1 (`read`, `write`, `*`) or SMART v2 (`cruds` letters).
+        let permissions = match perm_str {
+            "read" => SmartPermissions::READ | SmartPermissions::SEARCH,
+            "write" => SmartPermissions::CREATE | SmartPermissions::UPDATE | SmartPermissions::DELETE,
+            "*" => SmartPermissions::all(),
+            other => SmartPermissions::from_permission_str(other)?,
+        };
+
+        let constraints = match query {
+            None => Vec::new(),
+            Some(query) => {
+                let pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                // A `?` with nothing usable after it is malformed, not unconstrained:
+                // reading it as unconstrained would widen the grant.
+                if pairs.is_empty() || pairs.iter().any(|(k, v)| k.is_empty() || v.is_empty()) {
+                    return None;
+                }
+                pairs
+            }
+        };
 
         Some(SmartScope {
             context,
             resource_type,
             permissions,
+            constraints,
         })
     }
 
-    /// Check if this scope grants the given permission on the given resource type.
-    pub fn permits(&self, resource_type: &str, permission: SmartPermissions) -> bool {
+    /// Whether the scope is a SMART v2 granular scope (carries constraints).
+    pub fn is_constrained(&self) -> bool {
+        !self.constraints.is_empty()
+    }
+
+    /// Whether this scope's resource type and permissions cover the request,
+    /// ignoring context and constraints.
+    pub fn covers(&self, resource_type: &str, permission: SmartPermissions) -> bool {
         let type_matches = match &self.resource_type {
             ResourceTypeSpec::Wildcard => true,
             ResourceTypeSpec::Specific(t) => t == resource_type,
         };
-
         type_matches && self.permissions.contains(permission)
+    }
+
+    /// Check if this scope grants the given permission on the given resource type.
+    ///
+    /// This is the coarse, type-level answer: a patient-context or granular
+    /// scope still "permits" here, and the restriction it carries is applied
+    /// by [`ScopeSet::access`](super::ScopeSet::access) callers.
+    pub fn permits(&self, resource_type: &str, permission: SmartPermissions) -> bool {
+        self.covers(resource_type, permission)
     }
 }
 
@@ -113,7 +164,14 @@ impl fmt::Display for SmartScope {
             f,
             "{}/{}.{}",
             self.context, self.resource_type, self.permissions
-        )
+        )?;
+        if !self.constraints.is_empty() {
+            let query: String = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(self.constraints.iter())
+                .finish();
+            write!(f, "?{query}")?;
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +250,70 @@ mod tests {
         assert!(scope.permits("Patient", SmartPermissions::READ));
         assert!(scope.permits("Observation", SmartPermissions::SEARCH));
         assert!(!scope.permits("Patient", SmartPermissions::DELETE));
+    }
+
+    #[test]
+    fn smart_v1_read_is_read_and_search() {
+        let scope = SmartScope::parse("patient/Observation.read").unwrap();
+        assert_eq!(scope.context, ScopeContext::Patient);
+        assert_eq!(
+            scope.permissions,
+            SmartPermissions::READ | SmartPermissions::SEARCH
+        );
+    }
+
+    #[test]
+    fn smart_v1_write_is_create_update_delete() {
+        let scope = SmartScope::parse("user/Observation.write").unwrap();
+        assert_eq!(
+            scope.permissions,
+            SmartPermissions::CREATE | SmartPermissions::UPDATE | SmartPermissions::DELETE
+        );
+        assert!(!scope.permissions.contains(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn smart_v1_star_is_everything() {
+        let scope = SmartScope::parse("user/*.*").unwrap();
+        assert_eq!(scope.resource_type, ResourceTypeSpec::Wildcard);
+        assert_eq!(scope.permissions, SmartPermissions::all());
+    }
+
+    #[test]
+    fn granular_scope_parses_constraints() {
+        let scope = SmartScope::parse(
+            "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory",
+        )
+        .unwrap();
+        assert_eq!(
+            scope.constraints,
+            vec![(
+                "category".to_string(),
+                "http://terminology.hl7.org/CodeSystem/observation-category|laboratory".to_string()
+            )]
+        );
+        assert!(scope.is_constrained());
+        assert!(scope.covers("Observation", SmartPermissions::READ));
+    }
+
+    #[test]
+    fn granular_scope_without_constraints_is_malformed() {
+        assert!(SmartScope::parse("patient/Observation.rs?").is_none());
+        assert!(SmartScope::parse("patient/Observation.rs?category=").is_none());
+        assert!(SmartScope::parse("patient/Observation.rs?=x").is_none());
+    }
+
+    #[test]
+    fn resource_type_must_be_a_name() {
+        assert!(SmartScope::parse("system/Pat-ient.rs").is_none());
+        assert!(SmartScope::parse("system/../x.rs").is_none());
+    }
+
+    #[test]
+    fn granular_display_roundtrip() {
+        let original = "patient/Observation.rs?category=laboratory";
+        let scope = SmartScope::parse(original).unwrap();
+        assert_eq!(format!("{}", scope), original);
     }
 
     #[test]

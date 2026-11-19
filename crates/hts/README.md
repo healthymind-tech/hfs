@@ -34,6 +34,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 - [CRUD and search](https://hl7.org/fhir/http.html) for CodeSystem, ValueSet, and ConceptMap resources
 - [Batch](https://hl7.org/fhir/http.html#transaction) endpoint supporting `$validate-code` and `$translate` in a single request
 - Implicit ValueSet expansion: when a CodeSystem's `valueSet` URL is requested and no explicit ValueSet exists, all codes in that system are returned ([FHIR R5 §4.8.7](https://hl7.org/fhir/codesystem.html#implicit))
+- [Value Set Composition Language (VCL)](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expressions as implicit ValueSets (`http://fhir.org/VCL?v1=<expr>`) in `$expand`, `$validate-code` and `$batch-validate-code`; see [Expand a VCL expression](#expand-a-vcl-expression)
 - Dual `/metadata` response modes: `CapabilityStatement` (default) and `TerminologyCapabilities`
 - Content negotiation (JSON / XML)
 - CORS support
@@ -51,6 +52,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 |-------------|-----------|--------|--------------------------|
 | [HL7 FHIR Core (THO)](https://terminology.hl7.org) | [HL7 International](https://www.hl7.org) | ✅ Bundled | Free - redistribution with attribution |
 | [ICD-10-CM](https://www.cdc.gov/nchs/icd/icd-10-cm/index.html) | [U.S. CDC / NCHS](https://www.cdc.gov) | ✅ Bundled | Public domain (US federal government work) |
+| [ICD-10-PCS](https://www.cms.gov/medicare/coding-billing/icd-10-codes) | [U.S. CMS](https://www.cms.gov) | 🔑 Download required | Public domain (US federal government work) - download the yearly `icd10pcs_tables_and_index` or `icd10pcs_order` ZIP from CMS; `hts import --format icd10-pcs` |
 | [ICD-9-CM](https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles) | [U.S. NCHS / CMS](https://www.cms.gov) | ✅ Bundled | Public domain - retired 2015, legacy data only |
 | [UCUM](https://ucum.org) | [Regenstrief Institute](https://www.regenstrief.org) | ✅ Bundled | Free, permissive - also in the THO package |
 | [NCI Thesaurus (NCIt)](https://evs.nci.nih.gov) | [U.S. National Cancer Institute](https://www.cancer.gov) | ✅ Bundled | Public domain |
@@ -76,7 +78,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 
 - `hts import <dir>` imports every bundled file in one command (auto-detects format per file)
 - Automatic format detection - no `--format` flag needed for most files
-- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup)
+- SQLite and PostgreSQL backends with auto-migration on startup (no manual schema setup), and `hts migrate` to move an SQLite database to PostgreSQL
 
 > **Maintainers:** the checked-in `crates/hts/terminology-data/` directory is refreshed before each release via `crates/hts/scripts/download-bundled-terminologies.sh` (Bash) or `.ps1` (PowerShell). See [RELEASING.md](../../RELEASING.md) for the refresh workflow. End users never need to run the scripts.
 
@@ -214,7 +216,7 @@ Bulk-import terminology data into the HTS database. `<PATH>` can be either a sin
 
 If the target SQLite database does not yet exist, `hts import` creates the file (default: `./data/hts.db`) and applies the schema automatically - no prior `hts run` is required. The same is true for PostgreSQL: pass `--storage-backend postgres` (or set `HTS_STORAGE_BACKEND=postgres`) along with a `postgresql://` connection string and the schema is created on first import.
 
-All 13 import formats (`hl7-npm`, `snomed-rf2`, `loinc`, `icd10-cm`, `icd9-cm`, `rxnorm`, `ucum`, `nci-thesaurus`, `mesh`, `dicom`, `hl7-v2-tables`, `nucc`, `ndc`) work against both the SQLite and PostgreSQL backends.
+All 14 import formats (`hl7-npm`, `snomed-rf2`, `loinc`, `icd10-cm`, `icd10-pcs`, `icd9-cm`, `rxnorm`, `ucum`, `nci-thesaurus`, `mesh`, `dicom`, `hl7-v2-tables`, `nucc`, `ndc`) work against both the SQLite and PostgreSQL backends.
 
 ```bash
 # HL7 FHIR NPM package (.tgz from https://terminology.hl7.org/en/downloads.html)
@@ -233,6 +235,10 @@ hts import ./Loinc_*.zip --format loinc
 
 # ICD-10-CM tabular XML (free, from cms.gov)
 hts import ./icd10cm_tabular_2025.xml
+
+# ICD-10-PCS order file (free, from cms.gov) — or the CMS ZIP containing it; version = file-name year
+hts import ./icd10pcs_codes_2025.txt
+hts import ./icd10pcs_tables_2025.zip --format icd10-pcs
 
 # ICD-9-CM pipe-delimited text (free, from cms.gov)
 hts import ./CMS32_DESC_LONG_DX.txt --format icd9-cm
@@ -383,9 +389,22 @@ Options:
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_AUTO_SUPPLEMENTS` | true | Apply stored CodeSystem supplements (`content=supplement`, `supplements=<url>`) to `$lookup` and `$expand` automatically, so translated designations are returned and honoured by `displayLanguage` without `useSupplement`. Set `false` for the strict behaviour (supplements only when named via `useSupplement` or the `valueset-supplement` extension). |
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 | `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
+| `HTS_LOINC_PARTS_AND_ANSWERS` | true | Import LOINC's `Part.csv`, `AnswerList.csv` and `LoincAnswerListLink.csv` along with the main table: all parts, answer lists and answers as concepts, one ValueSet `http://loinc.org/vs/<LL…>` per answer list, and an `answer-list` property on linked terms. `false` imports only the terms and the parts in the component hierarchy. |
+| `HTS_LOINC_PROPERTIES` | true | Store LOINC's properties: the `Loinc.csv` columns `STATUS`, `CLASSTYPE`, `ORDER_OBS`, `VersionFirstReleased`, `VersionLastChanged`, `CHNG_TYPE`, `UNITSREQUIRED`, `EXAMPLE_UCUM_UNITS`, `EXAMPLE_UNITS`, `PanelType` (strings) and one `Coding` property per `LoincPartLink_*.csv` row (`COMPONENT`, `SCALE_TYP`, `CLASS`, `document-kind`, …, without the `search` links). (Part names and term short names are stored as designations either way.) See *LOINC properties* below. |
+| `HTS_SHUTDOWN_TIMEOUT` | 9 | Seconds `hts run` may drain requests after SIGTERM/SIGINT before it exits anyway (a second signal exits at once). A signal during startup exits at once. |
+| `HTS_ADMIN_UI` | false | Enable terminology management — the `/admin` API (chunked upload, import jobs, delete, current-version pin, compaction, registry install) and the matching console pages. See [`docs/hts-terminology-admin.md`](../../docs/hts-terminology-admin.md) for this and the related `HTS_ADMIN_DATA_DIR`, `HTS_IMPORT_DIR`, `HTS_PACKAGE_REGISTRY`, `HTS_UPLOAD_CHUNK_SIZE`, `HTS_MAX_UPLOAD_SIZE` and `HTS_DISK_HEADROOM`. |
+| `HTS_ADMIN_PASSWORD` | (none) | Administrator password guarding `/admin`, `/ui/hts/api/admin` and the console's management pages (`/ui/hts/terminology`, `/jobs`, `/import`). Browsers sign in at `/ui/hts/login`; scripts use Basic (`-u admin:…`) or `Bearer <password>`. Required with `HTS_ADMIN_UI=true` (else those endpoints answer `503`). See [Administrator sign-in](../../docs/ops/admin-sign-in.md) |
+| `HTS_ADMIN_PASSWORD_FILE` | (none) | File holding the administrator password (Docker secrets); wins over `HTS_ADMIN_PASSWORD` |
+| `HTS_ADMIN_USER` | admin | Administrator user name |
+| `HTS_REQUIRE_AUTH_FOR_WRITES` | true with a password, else false | Require the administrator credential (Basic/Bearer) for CodeSystem/ValueSet/ConceptMap create/update/delete, `POST /import` and write batches; reads and `$lookup`/`$validate-code`/`$subsumes`/`$expand`/`$batch-validate-code`/`$translate`/`$closure` stay public. Without a password writes stay open, with a startup warning |
+| `HTS_ADMIN_SESSION_IDLE_MINUTES` | 480 | Idle lifetime of an admin browser session |
+| `HTS_ADMIN_TRUSTED_PROXIES` | loopback + private ranges | Proxies whose `X-Forwarded-For`/`X-Real-IP` are believed for the sign-in rate limit (CIDR list, or `none`) |
+| `HTS_ADMIN_ALLOWED_ORIGINS` | (none) | Extra origins accepted on cookie-authenticated admin writes |
+| `HTS_ADMIN_COOKIE_SECURE` | auto | `Secure` on the admin session cookie: `auto`, `true`, `false` |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected
@@ -429,7 +448,7 @@ On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches
 
 ### PostgreSQL
 
-HTS fully supports PostgreSQL as an alternative backend, with feature parity with SQLite across all terminology operations, CRUD, search, and import formats. The schema mirrors the SQLite layout and is applied automatically on first connection, so no manual migration step is required.
+HTS supports PostgreSQL as an alternative backend with the same behaviour as SQLite: every terminology operation (including ECL, reference sets and the implicit ValueSet URLs), CRUD, search, every import format and the terminology admin API. The schema mirrors the SQLite layout and is applied automatically on first connection; a database created by an older HTS is upgraded in place on the next start (new tables and indexes, and the collation change below, run once — the applied DDL is fingerprinted in `hts_schema_meta`, so an up-to-date database starts without taking DDL locks).
 
 Build with the `postgres` feature, then select the backend with `--storage-backend postgres` (or `HTS_STORAGE_BACKEND=postgres`) and a `postgresql://` connection string:
 
@@ -441,6 +460,28 @@ cargo build --release -p helios-hts --features postgres
 hts run --storage-backend postgres \
   --database-url "postgresql://user:pass@localhost/hts"
 ```
+
+Notes:
+
+- **Collation.** Code, hierarchy, closure, reference-set, property-value, map-code and version columns are `COLLATE "C"`, so codes sort byte-wise exactly as in SQLite (LOINC `1000-9` before `10000-8`) whatever the database's default collation; displays and designations keep the database collation (Unicode-aware case folding).
+- **Text filters** are served from an in-memory trigram index over the materialised expansion, with the same matching (case-insensitive substring of code or display), ordering (implicit ValueSets in code order, other expansions typeahead-ranked) and exact `expansion.total` as SQLite.
+- **Server settings.** For a SNOMED CT + LOINC sized database, `shared_buffers` of a few GB, `work_mem=64MB` and `maintenance_work_mem` ≥ 1 GB (closure builds, index rebuilds after `hts migrate`) are sensible starting points; `random_page_cost=1.1` on SSD storage.
+
+#### Moving an existing SQLite database to PostgreSQL
+
+`hts migrate` copies an SQLite `hts.db` into an empty PostgreSQL database without re-importing any source file:
+
+```bash
+# 1. stop the SQLite server (or work from a copy of hts.db)
+# 2. create the target database
+createdb -h db-host -U hts hts
+# 3. copy
+hts migrate --from /data/hts.db --to "postgresql://hts:secret@db-host/hts" --report migrate-report.json
+# 4. start the server on PostgreSQL with the same HTS_BOOTSTRAP_DIR as before
+HTS_STORAGE_BACKEND=postgres HTS_DATABASE_URL="postgresql://hts:secret@db-host/hts" hts run
+```
+
+Every normalized table (CodeSystems, ValueSets, ConceptMaps, concepts, properties, designations, hierarchy, closure, reference set members, map elements, the persistent expansion cache) is streamed with binary `COPY`, ids preserved; the `bootstrap_imports` ledger is copied, so the PostgreSQL server does not re-import the bootstrap directory; the REST-created resources of the persistence store are copied at their latest version. Secondary indexes are dropped for the load and rebuilt afterwards, then the database is `VACUUM (ANALYZE)`d (statistics plus the visibility map that index-only scans rely on) and any missing closure is built. The command prints per-table source/copied row counts and fails if any differ. The source is opened read-only. Not copied: the SQLite FTS tables and `implicit_expansion_cache` (PostgreSQL derives these in memory), and persistence version history. `--replace` empties a non-empty target first; `--skip-resources` leaves the persistence store alone. A 6.6 GB production database (3,049 CodeSystems, 1.3 M concepts, 12.1 M closure rows, 23,142 ValueSets) migrates in about 2 minutes (128 s on the test server).
 
 ## API Endpoints
 
@@ -469,6 +510,26 @@ hts run --storage-backend postgres \
 | read | GET | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+
+**Logical ids of multi-version resources.** Packages and importers reuse one
+id for every version of a resource (LOINC 2.80 and 2.83 are both `loinc`;
+LOINC answer-list ValueSets keep their `LL…` id across releases). HTS stores
+every version and gives each one its own logical id: the **default version**
+(the one a versionless request resolves to) reports the declared id, every
+other version reports `<id>-<version>`:
+
+| Stored | Reported id |
+|--------|-------------|
+| `http://loinc.org` 2.83 (default) | `loinc` |
+| `http://loinc.org` 2.80 | `loinc-2.80` |
+
+`GET /CodeSystem/loinc` therefore reads the default version, and every version
+is addressable by a unique id (`<id>-<version>` also reads the default
+version, so the versioned form is a stable address). When a newer version
+becomes the default, the plain id moves to it. `DELETE` and `_id` name exactly
+one version. A resource with a single stored version keeps its id unchanged.
+Databases written by older releases, where versions still share one id, are
+repaired at startup (only the reported ids change; concepts are untouched).
 
 ### Utility
 
@@ -571,6 +632,34 @@ curl -X POST http://localhost:8090/import \
   -d @bundle.json
 ```
 
+A plain import rebuilds the `concept_closure` of every CodeSystem it writes
+before responding, so `$subsumes` and `is-a` filters see the new hierarchy
+immediately. For a large CodeSystem loaded as a series of chunked bundles that
+rebuild is O(n²) across the load, so pass `?defer_closure=true` on every chunk
+except the last, and `?finalize=true` on the **last** chunk. Deferred chunks
+leave the system with hierarchy edges but no closure until it is finalized (or
+the server restarts), during which `$subsumes` answers `not-subsumed`. The
+finalizing response includes `closures_rebuilt`.
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d @bundle-last-chunk.json
+```
+
+The rebuild for a very large system (SNOMED CT takes 30–60 s on PostgreSQL)
+can take longer than the 30 s request timeout. If it is still running after
+20 s, the server answers `202 Accepted` with `"closures_rebuild": "pending"`
+and lets the rebuild finish in the background. A client disconnect does not
+cancel it either. To wait for it, re-send `finalize=true` with an empty Bundle
+until the status is `200`:
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Bundle","type":"collection"}'
+```
+
 ### Lookup a Concept
 
 ```bash
@@ -669,6 +758,25 @@ curl -X POST http://localhost:8090/ValueSet/\$expand \
   }'
 ```
 
+### Expand a VCL expression
+
+A [VCL](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expression is passed as the implicit ValueSet URL `http://fhir.org/VCL?v1=<percent-encoded expression>` in the `url` parameter. HTS translates it to a `ValueSet.compose` and evaluates it like an inline ValueSet, on SQLite and PostgreSQL. The expression below is `(http://snomed.info/sct)<<404684003 - (http://snomed.info/sct)<<64572001`:
+
+```bash
+curl -G http://localhost:8090/ValueSet/\$expand \
+  --data-urlencode 'url=http://fhir.org/VCL?v1=%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C404684003%20-%20%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C64572001' \
+  --data-urlencode 'count=20'
+```
+
+`$validate-code` (and `$batch-validate-code` with a batch-level `url`) accept the same URL.
+
+- `v1` is percent-decoded once; the whole `url` value must be encoded by the client.
+- Only one operator kind per nesting level (`A,B;C` is an error); use parentheses.
+- `(system)<<code` (hierarchy operator without a property) is accepted as `concept<<code`.
+- Supported: `*`, `=`, `<<`, `~<<`, `<`, `<!`, `>>`, `/` (regex), `^{a,b}` / `~^{a,b}`, `^(valueSet)`, `;` `,` `-`, grouping. Parsed but answered with 501: `!!<`, `?`, `.` (of), `^{filter…}`, `prop^URI`.
+- Malformed VCL returns 400 with an `OperationOutcome` naming the 1-based position.
+- Limits: 64 KiB expression, 32 nesting levels; `$validate-code` over very large sets returns 422 `too-costly`.
+
 ### Check Concept Hierarchy
 
 ```bash
@@ -701,6 +809,12 @@ curl -X POST http://localhost:8090/ConceptMap/\$translate \
     ]
   }'
 ```
+
+Several versions of a ConceptMap can be stored. Without `conceptMapVersion`
+(or a `url|version` canonical), `$translate` uses each map's default version —
+the semantically newest, the same rule a versionless `GET /ConceptMap?url=…`
+lists first — also when no `url` is given and every loaded map is consulted.
+`ConceptMap/{id}/$translate` uses the version that id names.
 
 ### Create a CodeSystem
 
@@ -857,6 +971,46 @@ curl -X POST http://localhost:8090/CodeSystem/\$lookup \
   -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
 ```
 
+Simple reference sets (`der2_Refset_Simple*`, e.g. *723264001
+Lateralizable body structure reference set*) are imported as membership,
+so ECL `^ <refset>` works in a compose `constraint` filter, in
+`?fhir_vs=ecl/…` and as `?fhir_vs=refset/<id>`. Map reference sets are not
+read. A database whose SNOMED CT was imported before this answers `^` with
+`501` (on either backend); re-import the release to load the members.
+
+SNOMED CT's implicit ValueSet URLs are recognised by `$expand` and
+`$validate-code` on both storage backends:
+
+| URL | Members |
+|---|---|
+| `http://snomed.info/sct?fhir_vs` | all concepts |
+| `http://snomed.info/sct?fhir_vs=isa/<id>` | `<id>` and its descendants |
+| `http://snomed.info/sct?fhir_vs=ecl/<expr>` | the URL-encoded ECL expression, e.g. `ecl/%3C%3C%2073211009` |
+| `http://snomed.info/sct?fhir_vs=refset/<id>` | the members of reference set `<id>` |
+
+**Version URIs.** The importer stores a release as its date (`20250601`),
+and HTS reports it in the FHIR form tx.fhir.org uses,
+`http://snomed.info/sct/900000000000207008/version/20250601` — in `version`
+(`$lookup`, `$validate-code`, CodeSystem resources), `used-codesystem` /
+`system-version` (`$expand`), coding and `expansion.contains` versions and
+messages. Every place a version can be given accepts the date, the release
+URI, or the edition URI `http://snomed.info/sct/900000000000207008` (the
+International edition, latest release): `version` / `systemVersion`, the
+`version` of SNOMED codings, `compose.include[].version` of stored and inline
+ValueSets, `$expand`'s `system-version` / `force-system-version` /
+`check-system-version`, `$subsumes`, and `GET /CodeSystem?url=…&version=…`.
+The translation happens at the API boundary; the stored version stays the
+date, so existing databases need no migration. An edition that is not loaded
+(the US edition `731000124108` when only International is) stays an unknown
+version: the code cannot be validated and the message lists the valid
+versions, which is also what tx.fhir.org answers for an edition it lacks.
+(The RF2 importer does not record the edition it loaded, so a date-versioned
+release is reported as International. The HL7 validator additionally reports
+`VALUESET_VALUE_MISMATCH_CHANGED` when a coding's edition differs from the
+one an unversioned ValueSet include resolves to — e.g. US Core examples
+coded with the US edition against International; that is a validator rule,
+not a terminology-server answer.)
+
 Multiple editions of the same code system (e.g. the SNOMED International
 release plus a national edition) coexist as separate versions keyed on
 `(url, version)`; unversioned requests resolve to the highest version.
@@ -876,6 +1030,52 @@ Produced by the [Regenstrief Institute](https://www.regenstrief.org) under the [
 ```bash
 hts import ./Loinc_2.80.zip   # format auto-detected from LoincTable.csv inside the ZIP
 ```
+
+Besides the main table and the component hierarchy, the importer reads the
+accessory files of the release: every part in `Part.csv`, the answer lists
+(`LL…`) and answers (`LA…`) in `AnswerList.csv`, and the term-to-answer-list
+links in `LoincAnswerListLink.csv` (as an `answer-list` property). LOINC 2.80
+yields 243 550 concepts (104 672 terms, 114 224 parts, 4 621 answer lists,
+20 033 answers). Set `HTS_LOINC_PARTS_AND_ANSWERS=false` to import only the
+terms and the parts in the hierarchy (176 668 concepts for 2.80).
+
+**LOINC properties.** Following the LOINC FHIR guidance
+(<https://loinc.org/fhir/>, property codes as in the official LOINC
+`CodeSystem`), each term carries the `Loinc.csv` string properties and the
+part links of `LoincPartLink_Primary.csv` / `LoincPartLink_Supplementary.csv`
+as `Coding` properties valued with the part code (2.80: about 1.7 million
+properties). ValueSet filters may name a part by code or by name, in any
+case — `SCALE_TYP = LP32888-7`, `SCALE_TYP = DOC` and `SCALE_TYP = Doc`
+select the same document codes, `CLASS = DOC.ONTOLOGY` = `CLASS = LP32519-8`;
+`$lookup` returns the properties (`valueCoding` for the part links). Each
+part has its `PartName` and `PartDisplayName` as `en-US` designations, so
+`Bld` validates as a display of `LP7057-5` (display `Blood`), and each term
+its `SHORTNAME` (`Calcium SerPl-mCnc` for 17861-6); `DisplayName` and
+`CONSUMER_NAME` are not displays (tx.fhir.org rejects them). The
+designations are stored also with `HTS_LOINC_PROPERTIES=false`.
+
+An import made before this has no properties and no short-name or part-name
+designations. Add them without re-importing the concepts:
+
+```bash
+hts import --format loinc-properties ./Loinc_2.80.zip   # or an admin import job, format loinc-properties
+```
+
+This deletes and rewrites only the property values it writes (a rerun does
+not duplicate them), adds the missing part-name and short-name designations
+(skipping any equal, ignoring case, to the display or a stored designation,
+so reruns and databases backfilled by an earlier version get no duplicates)
+and drops the
+cached expansions over LOINC. Run it as an admin import job on a live server,
+or restart the server after the CLI run (in-memory caches).
+
+LOINC's ValueSet URLs:
+
+| URL | Members |
+|---|---|
+| `http://loinc.org/vs` | all of LOINC (implicit, like `http://loinc.org?fhir_vs`) |
+| `http://loinc.org/vs/<LP…>` | the codes under the part in the hierarchy, not the part itself (implicit) |
+| `http://loinc.org/vs/<LL…>` | the answers of the answer list, in sequence order (a stored ValueSet the importer creates; externally defined lists have none) |
 
 **Required attribution when redistributing:**
 ```

@@ -2,6 +2,7 @@
 name = "helios-hfs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Helios FHIR Server - A high-performance FHIR R4/R4B/R5/R6 server"
 license.workspace = true
 authors.workspace = true
@@ -15,7 +16,12 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite", "ui"]
+default = ["R4", "sqlite", "ui", "mimalloc"]
+
+# mimalloc as the global allocator. glibc malloc held 4-6 GB RSS after a
+# 16-client bundle load and returned it only slowly; capping its arenas
+# (MALLOC_ARENA_MAX=2) halved that but cut load throughput 5x.
+mimalloc = ["dep:mimalloc"]
 
 # FHIR version features. `helios-ui?/…` keeps the UI's viewers (search
 # parameters, compartments) scoped to the same versions as the server when
@@ -39,7 +45,7 @@ xml = ["helios-rest/xml"]
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
-postgres = ["helios-rest/postgres"]
+postgres = ["helios-rest/postgres", "helios-admin-auth/postgres"]
 mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
@@ -60,15 +66,21 @@ otel = ["helios-observability/otel"]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
-helios-rest = { path = "../rest", version = "0.2.4", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false }
-helios-sof = { path = "../sof", version = "0.2.4", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.4" }
-helios-audit = { path = "../audit", version = "0.2.4", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.4", optional = true, default-features = false }
-helios-ui = { path = "../ui", version = "0.2.4", optional = true, default-features = false }
-helios-observability = { path = "../observability", version = "0.2.4" }
+helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
+helios-rest = { path = "../rest", version = "0.2.9", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.9" }
+# Administrator sign-in for `/admin` and the console's admin pages
+# (`HFS_ADMIN_PASSWORD`).
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+helios-audit = { path = "../audit", version = "0.2.9", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.9", optional = true, default-features = false }
+helios-ui = { path = "../ui", version = "0.2.9", optional = true, default-features = false }
+helios-observability = { path = "../observability", version = "0.2.9" }
+
+# Global allocator (feature `mimalloc`)
+mimalloc = { version = "0.1.52", optional = true, default-features = false }
 
 # Export job controller
 dashmap = "6"
@@ -100,14 +112,34 @@ async-trait = "0.1"
 chrono = "0.4"
 serde_json = "1"
 
+
 [dev-dependencies]
 # Drive the assembled router end-to-end (`oneshot`) so the UI-mount tests
 # assert what the binary actually serves, not what a `cfg` says.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `tokio::time::pause()` / `start_paused` for the deferred-index repair loop's
+# tests (#2034): the loop's first pass and its interval run on a virtual clock.
+tokio = { version = "1", features = ["full", "test-util"] }
+# A scoped subscriber that captures what the repair loop logs (#2034).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Data directories for the tests that run the binary (tests/shutdown_signal.rs).
+tempfile = "3"
+# `tests/elasticsearch_startup.rs` talks HTTP to the `hfs` binary it starts
+# and to the Elasticsearch cluster under it.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
-# Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
-# doesn't have target-platform OpenSSL dev libs).  Cargo feature unification
+# The Elasticsearch container `tests/elasticsearch_startup.rs` runs `hfs` on.
+# `watchdog` (removes it on SIGINT/SIGTERM) pulls in `signal_hook::iterator`,
+# which only compiles on Unix.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
+
+# Vendor OpenSSL when cross-compiling for Linux ARM64 (the release build's
+# zig cross-compile, release-build.yml, has no ARM64 OpenSSL to link).  Cargo feature unification
 # makes this apply to every transitive openssl-sys consumer in the workspace.
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

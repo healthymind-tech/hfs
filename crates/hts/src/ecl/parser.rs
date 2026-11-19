@@ -16,6 +16,7 @@
 //! | `<< code` | Self or descendants |
 //! | `> code` | Strict ancestors (not self) |
 //! | `>> code` | Self or ancestors |
+//! | `^ refset` | Members of a reference set (`^ *`: of any reference set; `^ (expr)`: of the reference sets `expr` selects) |
 //! | `A AND B` / `A , B` | Conjunction (intersection) |
 //! | `A OR B` | Disjunction (union) |
 //! | `A MINUS B` | Exclusion (set difference) |
@@ -71,6 +72,8 @@ pub(super) enum Token {
     LParen,
     /// `)` — close group.
     RParen,
+    /// `^` — member-of (reference set membership).
+    Caret,
 }
 
 // ── AST ───────────────────────────────────────────────────────────────────────
@@ -111,6 +114,9 @@ pub enum EclExpr {
     Or(Box<EclExpr>, Box<EclExpr>),
     /// `A MINUS B` — set difference.
     Minus(Box<EclExpr>, Box<EclExpr>),
+    /// `^ refsets` — the referenced components of every reference set the
+    /// inner expression selects (`^ id`, `^ *`, `^ (expr)`).
+    MemberOf(Box<EclExpr>),
 }
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -125,6 +131,11 @@ pub enum EclExpr {
 ///
 /// Returns `Err(message)` when an unrecognised character (e.g. `@`, `%`)
 /// is encountered outside a pipe label.
+/// Characters allowed inside a concept identifier token (after the first).
+fn is_concept_id_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
 pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0;
@@ -164,6 +175,10 @@ pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::And);
                 pos += 1;
             }
+            '^' => {
+                tokens.push(Token::Caret);
+                pos += 1;
+            }
             '<' => {
                 if pos + 1 < chars.len() && chars[pos + 1] == '<' {
                     tokens.push(Token::LtLt);
@@ -182,22 +197,20 @@ pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     pos += 1;
                 }
             }
-            c if c.is_ascii_digit() => {
+            c if c.is_ascii_digit() || c == '_' => {
                 // Allow digit-prefixed alphanumeric codes (e.g. SNOMED SCTIDs
-                // as well as codes like "404684003").
+                // as well as codes like "404684003") and underscore-prefixed
+                // abstract codes (THO v3 `_ActEncounterCode`). `.` is accepted
+                // inside a code so ICD-10-CM `E11.9` tokenizes as one id.
                 let start = pos;
-                while pos < chars.len()
-                    && (chars[pos].is_alphanumeric() || chars[pos] == '_' || chars[pos] == '-')
-                {
+                while pos < chars.len() && is_concept_id_char(chars[pos]) {
                     pos += 1;
                 }
                 tokens.push(Token::ConceptId(chars[start..pos].iter().collect()));
             }
             c if c.is_alphabetic() => {
                 let start = pos;
-                while pos < chars.len()
-                    && (chars[pos].is_alphanumeric() || chars[pos] == '_' || chars[pos] == '-')
-                {
+                while pos < chars.len() && is_concept_id_char(chars[pos]) {
                     pos += 1;
                 }
                 let word: String = chars[start..pos].iter().collect();
@@ -322,7 +335,7 @@ impl Parser {
         Ok(left)
     }
 
-    /// `focus  →  "(" or_expr ")"  |  [operator] concept_ref`
+    /// `focus  →  "(" or_expr ")"  |  [operator] concept_ref  |  "^" (concept_ref | "(" or_expr ")")`
     ///
     /// Handles both grouped sub-expressions and individual focus concept
     /// references (with or without a leading unary operator).
@@ -335,6 +348,27 @@ impl Parser {
         }
 
         let op = self.try_operator();
+        if self.peek() == Some(&Token::Caret) {
+            self.consume();
+            if op.is_some() {
+                return Err(
+                    "A constraint operator applied to a member-of (e.g. `<< ^ id`) is not supported"
+                        .to_string(),
+                );
+            }
+            let refsets = if self.peek() == Some(&Token::LParen) {
+                self.consume();
+                let inner = self.parse_or()?;
+                self.expect(&Token::RParen)?;
+                inner
+            } else {
+                EclExpr::Focus {
+                    op: None,
+                    concept: self.parse_concept_ref()?,
+                }
+            };
+            return Ok(EclExpr::MemberOf(Box::new(refsets)));
+        }
         let concept = self.parse_concept_ref()?;
         Ok(EclExpr::Focus { op, concept })
     }
@@ -390,6 +424,40 @@ mod tests {
             tokenize("404684003").unwrap(),
             vec![Token::ConceptId("404684003".into())]
         );
+    }
+
+    #[test]
+    fn parse_member_of() {
+        let id = |c: &str| EclExpr::Focus {
+            op: None,
+            concept: FocusConcept::Id(c.into()),
+        };
+        assert_eq!(
+            parse("^ 723264001 |Lateralizable body structure reference set|").unwrap(),
+            EclExpr::MemberOf(Box::new(id("723264001")))
+        );
+        assert_eq!(
+            parse("^*").unwrap(),
+            EclExpr::MemberOf(Box::new(EclExpr::Focus {
+                op: None,
+                concept: FocusConcept::Wildcard
+            }))
+        );
+        assert_eq!(
+            parse("^ (1 OR 2) AND << 3").unwrap(),
+            EclExpr::And(
+                Box::new(EclExpr::MemberOf(Box::new(EclExpr::Or(
+                    Box::new(id("1")),
+                    Box::new(id("2"))
+                )))),
+                Box::new(EclExpr::Focus {
+                    op: Some(ConceptOperator::DescendantOrSelf),
+                    concept: FocusConcept::Id("3".into())
+                })
+            )
+        );
+        assert!(parse("<< ^ 1").is_err());
+        assert!(parse("^").is_err());
     }
 
     #[test]
@@ -471,6 +539,22 @@ mod tests {
     fn tokenize_alphanumeric_code_is_concept_id() {
         let toks = tokenize("A11Y-code").unwrap();
         assert_eq!(toks, vec![Token::ConceptId("A11Y-code".into())]);
+    }
+
+    #[test]
+    fn tokenize_underscore_prefixed_code_is_concept_id() {
+        // THO v3 abstract codes (`_ActEncounterCode`) are valid ECL focus concepts.
+        let tokens = tokenize("<< _ActEncounterCode").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::LtLt, Token::ConceptId("_ActEncounterCode".into())]
+        );
+    }
+
+    #[test]
+    fn tokenize_dotted_code_is_one_concept_id() {
+        let tokens = tokenize("<< E11.9").unwrap();
+        assert_eq!(tokens, vec![Token::LtLt, Token::ConceptId("E11.9".into())]);
     }
 
     #[test]

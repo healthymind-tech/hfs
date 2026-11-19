@@ -79,3 +79,229 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
     Ok(context)
 }
+
+fn context_for(json: serde_json::Value) -> EvaluationContext {
+    let resource: r4::Resource = serde_json::from_value(json).expect("valid R4 resource");
+    EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))])
+}
+
+/// `Timing.repeat.periodUnit` is a sibling of `period`, not a `period[x]`
+/// variant: core invariant tim-5 (`period.exists() implies period >= 0`)
+/// must hold for a repeat with only `periodUnit` (IPS bundle-minimal), not
+/// fail to evaluate comparing the unit code with 0.
+#[test]
+fn timing_period_unit_is_not_a_period_variant() {
+    let context = context_for(serde_json::json!({
+        "resourceType": "MedicationStatement",
+        "status": "active",
+        "medicationCodeableConcept": { "text": "x" },
+        "subject": { "reference": "Patient/p" },
+        "dosage": [{ "timing": { "repeat": { "count": 1, "periodUnit": "d", "durationMax": 2 } } }]
+    }));
+    let repeat = "MedicationStatement.dosage.timing.repeat";
+    assert_eq!(
+        run_expression(&context, &format!("{repeat}.period.exists()")),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        run_expression(
+            &context,
+            &format!("{repeat}.all(period.exists() implies period >= 0)")
+        ),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&context, &format!("{repeat}.periodUnit")),
+        EvaluationResult::string("d".to_string())
+    );
+}
+
+/// Core invariant rng-2 (`low.empty() or high.empty() or (low <= high)`)
+/// compares two Quantity objects, also with a UCUM code the converter does
+/// not know (`/[HPF]`, IPS urine-wbc-range).
+#[test]
+fn range_low_high_quantities_compare() {
+    let range = |low: i64, high: i64, code: &str| {
+        context_for(serde_json::json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": { "text": "x" },
+            "valueRange": {
+                "low": { "value": low, "system": "http://unitsofmeasure.org", "code": code },
+                "high": { "value": high, "system": "http://unitsofmeasure.org", "code": code }
+            }
+        }))
+    };
+    let rng2 = "Observation.value.all(low.empty() or high.empty() or (low <= high))";
+    assert_eq!(
+        run_expression(&range(10, 20, "/[HPF]"), rng2),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&range(30, 20, "/[HPF]"), rng2),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        run_expression(&range(10, 20, "mg"), rng2),
+        EvaluationResult::boolean(true)
+    );
+}
+
+/// FHIRPath singleton evaluation: a single element object in a Boolean
+/// operator is true (US Core us-core-13 `practitioner or organization or
+/// healthcareService or location` on PractitionerRole).
+#[test]
+fn element_objects_are_true_in_boolean_operators() {
+    let role = context_for(serde_json::json!({
+        "resourceType": "PractitionerRole",
+        "practitioner": { "reference": "Practitioner/p" }
+    }));
+    let us_core_13 =
+        "PractitionerRole.all(practitioner or organization or healthcareService or location)";
+    assert_eq!(
+        run_expression(&role, us_core_13),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(
+            &role,
+            "PractitionerRole.all(practitioner implies practitioner)"
+        ),
+        EvaluationResult::boolean(true)
+    );
+    let empty = context_for(serde_json::json!({ "resourceType": "PractitionerRole" }));
+    assert_eq!(
+        run_expression(
+            &empty,
+            "PractitionerRole.select(practitioner or organization).empty()"
+        ),
+        EvaluationResult::boolean(true)
+    );
+}
+
+/// `CapabilityStatement.implementationGuide` is a sibling of
+/// `implementation`, not an `implementation[x]` variant: cpb-16
+/// (`kind != 'requirements' or (implementation.exists().not() and
+/// software.exists().not())`) must hold for a requirements statement that
+/// only lists implementation guides.
+#[test]
+fn implementation_guide_is_not_an_implementation_variant() {
+    let context = context_for(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "status": "active", "date": "2024-01-01", "kind": "requirements",
+        "fhirVersion": "4.0.1", "format": ["json"],
+        "implementationGuide": ["http://example.org/ImplementationGuide/x"],
+        "rest": [{ "mode": "server" }]
+    }));
+    for (expr, want) in [
+        ("CapabilityStatement.implementation.exists()", false),
+        ("implementation.exists()", false),
+        ("%resource.implementation.exists()", false),
+        ("CapabilityStatement.all((kind != 'requirements') or (implementation.exists().not() and software.exists().not()))", true),
+        ("CapabilityStatement.implementationGuide.exists()", true),
+    ] {
+        assert_eq!(
+            run_expression(&context, expr),
+            EvaluationResult::boolean(want),
+            "{expr}"
+        );
+    }
+}
+
+/// Builds an R4 evaluation context from inline resource JSON.
+fn context_from_json(json: serde_json::Value) -> EvaluationContext {
+    let resource: r4::Resource = serde_json::from_value(json).expect("valid R4 resource");
+    EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))])
+}
+
+/// Issue #2477: an absent element must not resolve to a camelCase sibling.
+///
+/// Choice lookup used to fire for any missing member, matching every field
+/// named `<name><Uppercase>…`, so `conclusion` returned `conclusionCode`,
+/// `status` returned `statusReason`, and the non-element `birth` returned
+/// `birthDate`. Only declared `[x]` elements may resolve through a typed
+/// variant.
+#[test]
+fn missing_element_does_not_resolve_to_a_camel_case_sibling() {
+    let report = context_from_json(serde_json::json!({
+        "resourceType": "DiagnosticReport",
+        "id": "mri",
+        "status": "final",
+        "code": {"text": "MRI HEAD ORBITS"},
+        "conclusionCode": [
+            {"coding": [{"system": "http://snomed.info/sct", "code": "128208008"}]},
+            {"coding": [{"system": "http://snomed.info/sct", "code": "1234"}]}
+        ]
+    }));
+    assert_eq!(
+        run_expression(&report, "conclusion"),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        run_expression(&report, "DiagnosticReport.conclusion"),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        run_expression(&report, "conclusion.exists()"),
+        EvaluationResult::boolean(false)
+    );
+    // Control: the sibling itself is still reachable by its own name.
+    assert_eq!(
+        run_expression(&report, "conclusionCode.count()"),
+        EvaluationResult::integer(2)
+    );
+
+    let patient = context_from_json(serde_json::json!({
+        "resourceType": "Patient",
+        "id": "p",
+        "birthDate": "2000-01-01"
+    }));
+    assert_eq!(run_expression(&patient, "birth"), EvaluationResult::Empty);
+
+    let no_status = context_from_json(serde_json::json!({
+        "resourceType": "Procedure",
+        "id": "proc",
+        "subject": {"reference": "Patient/p"},
+        "statusReason": {"text": "patient declined"}
+    }));
+    assert_eq!(
+        run_expression(&no_status, "status"),
+        EvaluationResult::Empty
+    );
+}
+
+/// Control for #2477: real choice elements still resolve by their base name.
+#[test]
+fn declared_choice_elements_still_resolve() {
+    let patient = context_from_json(serde_json::json!({
+        "resourceType": "Patient",
+        "id": "p",
+        "deceasedBoolean": true,
+        "multipleBirthInteger": 2
+    }));
+    assert_eq!(
+        run_expression(&patient, "deceased"),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&patient, "multipleBirth"),
+        EvaluationResult::integer(2)
+    );
+
+    let obs = context_from_json(serde_json::json!({
+        "resourceType": "Observation",
+        "id": "o",
+        "status": "final",
+        "code": {"text": "x"},
+        "effectiveDateTime": "2020-01-01",
+        "component": [{"code": {"text": "c"}, "valueString": "nested"}]
+    }));
+    assert_eq!(
+        run_expression(&obs, "effective.exists()"),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&obs, "component.value"),
+        EvaluationResult::string("nested".to_string())
+    );
+}

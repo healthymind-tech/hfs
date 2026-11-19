@@ -39,7 +39,7 @@ use mongodb::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
@@ -47,26 +47,30 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
-    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    UnindexedEntry, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
-use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkSubmitError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
 use super::bulk_ingest::BatchOutcome;
 use super::retry::{BULK_INGEST_RETRY, or_exhausted, retry_transient_with};
+use crate::perf::{self, Phase};
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -168,10 +172,140 @@ fn submission_filter(tenant: &TenantContext, id: &SubmissionId) -> Document {
 }
 
 /// The submission selector plus a manifest ID.
-fn manifest_filter(tenant: &TenantContext, id: &SubmissionId, manifest_id: &str) -> Document {
+pub(super) fn manifest_filter(
+    tenant: &TenantContext,
+    id: &SubmissionId,
+    manifest_id: &str,
+) -> Document {
     let mut filter = submission_filter(tenant, id);
     filter.insert("manifest_id", manifest_id);
     filter
+}
+
+/// The read preference of the reads that ask whether a tenant purge has run
+/// (#2310): whether a reindex page's resources, a batch's manifest or a lease's
+/// manifest is still there. The primary is where the purge's delete was
+/// acknowledged. A read from a secondary could still see the document after the
+/// purge, and the writer would leave its rows behind (or the lease check would
+/// answer wrongly). Callers also set read concern `local`, so a URI-level
+/// `readConcernLevel` that lags acknowledged writes cannot hold the answer back.
+pub(super) fn primary_selection() -> mongodb::options::SelectionCriteria {
+    mongodb::options::SelectionCriteria::ReadPreference(mongodb::options::ReadPreference::Primary)
+}
+
+/// How long a write that is counted in [`ManifestWritesInFlight`] keeps the
+/// lost-lease answer for a purged manifest back. A write whose command hangs
+/// longer than this no longer holds the manifest's job open (#2310).
+const MANIFEST_WRITE_GRACE: StdDuration = StdDuration::from_secs(300);
+
+/// The writes of each manifest that are running on this backend instance,
+/// counted per manifest id.
+///
+/// This is not a job registry and says nothing about another instance: a
+/// writer on another instance is not seen here, and it removes its own rows
+/// when its command returns (see `MongoBackend::ingest_batch`). It exists
+/// for one reason. The submit worker drops the batch it has in flight as soon as
+/// its lease keeper reports the lease lost, and a dropped batch cannot run the
+/// manifest check that removes what it wrote. A tenant purge deletes the
+/// manifest, which is what makes the keeper's next heartbeat match nothing, so
+/// while a write of the manifest runs on this instance, the backend answers
+/// that heartbeat (and the progress writes that end a sibling file) as if the
+/// lease were still held, and says it is lost only after the write has
+/// returned. The worker is always on the same instance as the batch it runs.
+///
+/// A write that hangs would hold the answer back for ever, so the answer is
+/// held back for [`MANIFEST_WRITE_GRACE`] after the manifest's most recent
+/// write began, and no longer, whether or not the write has returned.
+#[derive(Default)]
+pub(super) struct ManifestWritesInFlight {
+    /// Running writes per manifest id, with when the latest of them began.
+    /// Held only for the few instructions that read or change it, never across
+    /// an `await`.
+    counts: std::sync::Mutex<HashMap<String, (usize, tokio::time::Instant)>>,
+    /// Woken when the last running write of a manifest returns.
+    idle: tokio::sync::Notify,
+}
+
+/// A write of one manifest, counted as running until this is dropped.
+pub(super) struct ManifestWriteGuard<'a> {
+    registry: &'a ManifestWritesInFlight,
+    manifest_id: String,
+}
+
+impl ManifestWritesInFlight {
+    /// Counts a write of `manifest_id` as running until the guard is dropped.
+    pub(super) fn enter(&self, manifest_id: &str) -> ManifestWriteGuard<'_> {
+        let now = tokio::time::Instant::now();
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = counts.entry(manifest_id.to_string()).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        ManifestWriteGuard {
+            registry: self,
+            manifest_id: manifest_id.to_string(),
+        }
+    }
+
+    /// Whether a write of `manifest_id` is running and began less than
+    /// [`MANIFEST_WRITE_GRACE`] ago.
+    pub(super) fn running(&self, manifest_id: &str) -> bool {
+        self.held_until(manifest_id).is_some()
+    }
+
+    /// Returns when no write of `manifest_id` is running any more, or when the
+    /// grace of the latest one is over.
+    pub(super) async fn settled(&self, manifest_id: &str) {
+        loop {
+            // Created before the state is read: a guard dropped between the
+            // two wakes it all the same.
+            let idle = std::pin::pin!(self.idle.notified());
+            let Some(until) = self.held_until(manifest_id) else {
+                return;
+            };
+            let _ = tokio::time::timeout_at(until, idle).await;
+        }
+    }
+
+    /// When the grace of the latest running write of `manifest_id` ends, or
+    /// `None` when none is running or the grace is over.
+    fn held_until(&self, manifest_id: &str) -> Option<tokio::time::Instant> {
+        let counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (running, began) = counts.get(manifest_id)?;
+        let until = *began + MANIFEST_WRITE_GRACE;
+        (*running > 0 && tokio::time::Instant::now() < until).then_some(until)
+    }
+}
+
+impl Drop for ManifestWriteGuard<'_> {
+    fn drop(&mut self) {
+        let last = {
+            let mut counts = self
+                .registry
+                .counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match counts.get_mut(&self.manifest_id) {
+                Some(entry) if entry.0 > 1 => {
+                    entry.0 -= 1;
+                    false
+                }
+                Some(_) => {
+                    counts.remove(&self.manifest_id);
+                    true
+                }
+                None => false,
+            }
+        };
+        if last {
+            self.registry.idle.notify_waiters();
+        }
+    }
 }
 
 /// The manifest selector plus the lease's worker + fencing token — the guard
@@ -549,7 +683,7 @@ impl MongoBackend {
             .await?
             .find_one(submission_filter(tenant, id))
             .await
-            .map_err(|e| internal_error(format!("read submission: {e}")))?
+            .or_query_error("read submission")?
             .ok_or_else(|| {
                 StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
                     submitter: id.submitter.clone(),
@@ -705,7 +839,7 @@ impl MongoBackend {
             .await?
             .aggregate(pipeline)
             .await
-            .map_err(|e| internal_error(format!("sum manifest counters: {e}")))?;
+            .or_query_error("sum manifest counters")?;
         let mut out = HashMap::new();
         for group in collect(cursor).await? {
             let Ok(key) = group.get_document("_id") else {
@@ -758,7 +892,7 @@ impl MongoBackend {
             counts[slot] = results
                 .count_documents(filter)
                 .await
-                .map_err(|e| internal_error(format!("count entry results: {e}")))?;
+                .or_query_error("count entry results")?;
         }
 
         let mut summary = EntryCountSummary::new();
@@ -799,22 +933,21 @@ impl MongoBackend {
         Ok(document)
     }
 
-    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch sends
-    /// them all in one command.
+    /// One receipt split into its key and its payload.
     ///
     /// Keyed by `(manifest, file_url, line_number)`: line numbers restart in
     /// every manifest output file, so without the file every file after the
-    /// first collides with the first (#457). The upsert is what makes a worker
-    /// re-fetching a whole file after a transient failure overwrite its own
-    /// earlier rows instead of duplicating them.
-    pub(super) fn entry_result_statement(
+    /// first collides with the first (#457). The key is what the batched
+    /// insert's unique index (`idx_bulk_entry_results_line`) rejects a second
+    /// time, and what the upsert fallback then matches on.
+    fn entry_result_parts(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
-    ) -> StorageResult<Document> {
+    ) -> StorageResult<(Document, Document)> {
         let mut key = manifest_filter(tenant, submission_id, manifest_id);
         key.insert("file_url", file_url);
         key.insert("line_number", result.line_number as i64);
@@ -823,14 +956,51 @@ impl MongoBackend {
             Some(v) => Some(json_string(v)?),
             None => None,
         };
+        let fields = doc! {
+            "resource_type": &result.resource_type,
+            "resource_id": result.resource_id.as_deref(),
+            "created": result.created,
+            "outcome": result.outcome.to_string(),
+            "operation_outcome": operation_outcome,
+        };
+        Ok((key, fields))
+    }
+
+    /// One receipt as the document the batched `insert` writes: its key
+    /// fields followed by its payload — the same fields an upsert of
+    /// [`Self::entry_result_statement`] leaves behind.
+    pub(super) fn entry_result_document(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (mut document, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
+        document.extend(fields);
+        Ok(document)
+    }
+
+    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch
+    /// sends every receipt that already exists in one command.
+    ///
+    /// The upsert is what makes a worker re-fetching a whole file after a
+    /// transient failure overwrite its own earlier rows instead of
+    /// duplicating them.
+    pub(super) fn entry_result_statement(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (key, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
         let update = doc! {
-            "$set": {
-                "resource_type": &result.resource_type,
-                "resource_id": result.resource_id.as_deref(),
-                "created": result.created,
-                "outcome": result.outcome.to_string(),
-                "operation_outcome": operation_outcome,
-            },
+            "$set": fields,
             "$setOnInsert": key.clone(),
         };
 
@@ -890,6 +1060,64 @@ impl MongoBackend {
             Ok(())
         }
     }
+
+    /// Whether the leased manifest's document is gone, read from the primary at
+    /// read concern `local` so that a tenant purge's acknowledged delete is
+    /// always seen (see [`primary_selection`]). A read that fails answers
+    /// `false`, which leaves the caller's answer as it was before this check
+    /// existed.
+    async fn manifest_is_gone(&self, lease: &ManifestLease) -> bool {
+        let Ok(manifests) = self.manifests().await else {
+            return false;
+        };
+        match manifests
+            .find_one(manifest_filter(
+                &lease.tenant,
+                &lease.submission_id,
+                &lease.manifest_id,
+            ))
+            .projection(doc! { "_id": 1 })
+            .selection_criteria(primary_selection())
+            .read_concern(mongodb::options::ReadConcern::local())
+            .await
+        {
+            Ok(found) => found.is_none(),
+            Err(e) => {
+                tracing::debug!(
+                    manifest = %lease.manifest_id,
+                    error = %e,
+                    "could not check whether the manifest is gone; treating it as there"
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether a fenced write that matched nothing did so because the manifest
+    /// was purged under a write of it that is still running on this instance
+    /// (see [`ManifestWritesInFlight`]). With no such write running there is no
+    /// round trip.
+    async fn purged_under_running_writes(&self, lease: &ManifestLease) -> bool {
+        self.manifest_writes.running(&lease.manifest_id) && self.manifest_is_gone(lease).await
+    }
+
+    /// For the progress writes that end a file of the manifest: a `LeaseLost`
+    /// for a purged manifest is held back until the writes of the manifest that
+    /// are running on this instance have returned, so that the worker, which
+    /// turns it into a drop of the sibling files' batches, drops none that is
+    /// still writing (#2310). Any other result is returned as it is.
+    async fn settle_purged_manifest_writes(
+        &self,
+        lease: &ManifestLease,
+        result: Result<(), LeaseError>,
+    ) -> Result<(), LeaseError> {
+        if matches!(result, Err(LeaseError::LeaseLost { .. }))
+            && self.purged_under_running_writes(lease).await
+        {
+            self.manifest_writes.settled(&lease.manifest_id).await;
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -906,7 +1134,7 @@ impl BulkSubmitProvider for MongoBackend {
         if submissions
             .find_one(filter.clone())
             .await
-            .map_err(|e| internal_error(format!("check duplicate submission: {e}")))?
+            .or_query_error("check duplicate submission")?
             .is_some()
         {
             return Err(StorageError::BulkSubmit(
@@ -958,7 +1186,7 @@ impl BulkSubmitProvider for MongoBackend {
             .await?
             .find_one(submission_filter(tenant, id))
             .await
-            .map_err(|e| internal_error(format!("read submission: {e}")))?
+            .or_query_error("read submission")?
         else {
             return Ok(None);
         };
@@ -995,7 +1223,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find_one(submission_filter(tenant, id))
             .projection(doc! { "_id": 0, "status": 1 })
             .await
-            .map_err(|e| internal_error(format!("read submission status: {e}")))?
+            .or_query_error("read submission status")?
         else {
             return Ok(None);
         };
@@ -1034,7 +1262,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(filter)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list submissions: {e}")))?;
+            .or_query_error("list submissions")?;
 
         let page: Vec<(SubmissionId, Document)> = collect(cursor)
             .await?
@@ -1137,7 +1365,7 @@ impl BulkSubmitProvider for MongoBackend {
         let pending = manifests
             .count_documents(pending_filter.clone())
             .await
-            .map_err(|e| internal_error(format!("count pending manifests: {e}")))?;
+            .or_query_error("count pending manifests")?;
         manifests
             .update_many(
                 pending_filter,
@@ -1245,7 +1473,7 @@ impl BulkSubmitProvider for MongoBackend {
             .await?
             .find_one(manifest_filter(tenant, submission_id, manifest_id))
             .await
-            .map_err(|e| internal_error(format!("read manifest: {e}")))?;
+            .or_query_error("read manifest")?;
         found.as_ref().map(decode_manifest).transpose()
     }
 
@@ -1263,7 +1491,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(submission_filter(tenant, submission_id))
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list manifests: {e}")))?;
+            .or_query_error("list manifests")?;
         collect(cursor).await?.iter().map(decode_manifest).collect()
     }
 
@@ -1275,9 +1503,57 @@ impl BulkSubmitProvider for MongoBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.process_entries_ticketed(
+            tenant,
+            submission_id,
+            manifest_id,
+            entries,
+            options,
+            BatchTicket::unsequenced(),
+        )
+        .await
+    }
+
+    /// MongoDB takes no locks and has no transaction here (standalone
+    /// `mongod`): batches of one file may run as wide as the stream driver
+    /// is configured, bounded only by the driver's connection pool, on
+    /// which every command queues.
+    fn max_batch_writers(&self) -> u32 {
+        64
+    }
+
+    /// One batch of a file stream (see [`crate::core::bulk_submit_stream`]).
+    ///
+    /// The writes — `ingest_batch` through the receipts — run concurrently
+    /// with the file's other batches in flight; the driver guarantees no two
+    /// of them share a resource id, so the pre-read / plan / insert of one
+    /// resource is never raced. `charge_batch` is the step that reads the
+    /// file's `max_line` and charges only the lines above it, so it runs in
+    /// batch order inside the [`crate::core::bulk_submit_stream::ChargeTurn`].
+    /// A refused turn leaves the batch written but uncharged — exactly the
+    /// state a crash between the writes and `charge_batch` leaves today — and
+    /// the next run of the manifest re-walks it from the watermark.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        // Counted as running before the manifest is read (#2310). A heartbeat
+        // that finds no write of this manifest running ran before this batch's
+        // read below, and if that heartbeat saw a purged manifest, the read
+        // finds it gone too, so the batch writes nothing. Every concurrent
+        // batch of the file holds its own guard.
+        let _in_flight = self.manifest_writes.enter(manifest_id);
+        // Nothing is locked: the next batch of the file may start at once.
+        ticket.began();
         let manifests = self.manifests().await?;
         let cancel = options.cancel.as_ref();
         let filter = manifest_filter(tenant, submission_id, manifest_id);
+        let overhead_span = perf::span(Phase::BatchOverhead);
         let present = or_exhausted(
             "load manifest",
             retry_transient_with(&BULK_INGEST_RETRY, cancel, "load manifest", || async {
@@ -1325,30 +1601,49 @@ impl BulkSubmitProvider for MongoBackend {
             .await,
         )?;
 
+        drop(overhead_span);
+
         // One batch, a fixed number of commands (#1000). The per-entry pipeline
         // this replaces made ~9 round trips per resource, which held ingest at
         // ~60 resources/s with the server 68 % idle.
-        let outcome = self
-            .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
-            .await?;
+        let outcome = {
+            let _span = perf::span(Phase::Entry);
+            self.ingest_batch(tenant, submission_id, manifest_id, &entries, options)
+                .await?
+        };
         // The batch's writes are in: report them before the max-errors return
-        // and the counter update below (#1078).
-        // MongoDB's batch planner does not keep the written resources, so
-        // observers that need them re-read the ids from the primary (#1127).
+        // and the counter update below (#1078). The planner hands over the
+        // resources it wrote when an observer asked for them, so the index
+        // sink of a composite deployment indexes from memory instead of
+        // re-reading every id from the primary (#1127).
         options
-            .notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results, &[])
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &outcome.results,
+                &outcome.resources,
+            )
             .await;
         let BatchOutcome {
             results,
             error_count,
             aborted_on_max_errors,
+            ..
         } = outcome;
 
         // Charged before the max-errors return: the aborting batch's receipts
         // are already written, so its counts belong in the summary too (#1127).
-        self.charge_batch(tenant, submission_id, manifest_id, &results, options)
-            .await?;
-        self.touch_submission(tenant, submission_id).await?;
+        // And in file order (the turn): `charge_batch` counts only the lines
+        // above the file's recorded `max_line`.
+        let turn = ticket.wait_charge().await?;
+        {
+            let _span = perf::span(Phase::Commit);
+            self.charge_batch(tenant, submission_id, manifest_id, &results, options)
+                .await?;
+            self.touch_submission(tenant, submission_id).await?;
+        }
+        turn.complete();
 
         if aborted_on_max_errors {
             tracing::debug!(
@@ -1427,7 +1722,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(filter)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("query entry results: {e}")))?;
+            .or_query_error("query entry results")?;
         let entries = collect(cursor)
             .await?
             .iter()
@@ -1495,111 +1790,22 @@ impl StreamingBulkSubmitProvider for MongoBackend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the fetcher's
-                // give-up text) unprefixed so it reaches the manifest's error
-                // artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
-                    if entry.resource_type != resource_type {
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(BulkEntryOutcome::ValidationError);
-                        result.unbatched_errors += 1;
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-                    batch.push(entry);
-                }
-                Err(parse_err) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("parse error: {parse_err}")));
-                    }
-                }
-            }
-
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-                for entry_result in batch_results {
-                    result.counts.increment(entry_result.outcome);
-                }
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-            for entry_result in batch_results {
-                result.counts.increment(entry_result.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
 }
 
@@ -1638,7 +1844,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
             .find(submission_filter(tenant, submission_id))
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list changes: {e}")))?;
+            .or_query_error("list changes")?;
         Ok(collect(cursor).await?.iter().map(decode_change).collect())
     }
 
@@ -1667,7 +1873,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
                     .await?
                 {
                     Some(current) => {
-                        self.update(tenant, &current, previous_content.clone())
+                        self.update_verbatim(tenant, &current, previous_content.clone())
                             .await?;
                         Ok(true)
                     }
@@ -1716,7 +1922,7 @@ impl SubmitClaimStrategy for MongoBackend {
             .find(eligible)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("scan claimable manifests: {e}")))?;
+            .or_query_error("scan claimable manifests")?;
 
         for candidate in collect(cursor).await? {
             let (Ok(tenant_id), Ok(submitter), Ok(submission_id), Ok(manifest_id)) = (
@@ -1738,7 +1944,7 @@ impl SubmitClaimStrategy for MongoBackend {
                 .await?
                 .find_one(submission_filter(&tenant, &id))
                 .await
-                .map_err(|e| internal_error(format!("read submission for claim: {e}")))?
+                .or_query_error("read submission for claim")?
                 .and_then(|d| opt_str(&d, "status"));
             let admissible = matches!(
                 submission_status.as_deref(),
@@ -1791,12 +1997,32 @@ impl SubmitClaimStrategy for MongoBackend {
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
         let new_expiry = from_bson_time(&to_bson_time(lease.renewed_expiry()));
-        self.fenced_update(
-            lease,
-            doc! { "$set": { "lease_expiry": to_bson_time(new_expiry) } },
-        )
-        .await?;
-        Ok(new_expiry)
+        let renewed = self
+            .fenced_update(
+                lease,
+                doc! { "$set": { "lease_expiry": to_bson_time(new_expiry) } },
+            )
+            .await;
+        match renewed {
+            Ok(()) => Ok(new_expiry),
+            // A tenant purge deleted the manifest under a batch (or an artifact
+            // record) of it that is still writing on this instance. The worker
+            // drops the work it has in flight when its keeper reports the lease
+            // lost, and work that is dropped cannot run the check that removes
+            // what it wrote, so the lease is reported lost only once the work
+            // has returned (#2310). Nothing is extended, the document is gone;
+            // the keeper only learns it has a next wake-up. A fence that
+            // another worker moved on a manifest that still exists is not
+            // this case and is lost at once.
+            Err(lost @ LeaseError::LeaseLost { .. }) => {
+                if self.purged_under_running_writes(lease).await {
+                    Ok(new_expiry)
+                } else {
+                    Err(lost)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
@@ -1821,6 +2047,101 @@ impl SubmitClaimStrategy for MongoBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for MongoBackend {
+    /// #1125: the marker that says this manifest still owes a search-index
+    /// rebuild, with the types it covers (#1283). It lives on the manifest
+    /// document, so it survives a restart that loses the in-process job map.
+    /// The types are stored because deriving them again would read every
+    /// `bulk_entry_results` document of the manifest.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.manifests()
+            .await?
+            .update_one(
+                manifest_filter(&lease.tenant, &lease.submission_id, &lease.manifest_id),
+                doc! { "$set": {
+                    "index_pending": true,
+                    "index_pending_types": resource_types,
+                }},
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    fn records_index_pending(&self) -> bool {
+        true
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        self.manifests()
+            .await?
+            .update_many(
+                doc! {
+                    "tenant_id": tenant.tenant_id().as_str(),
+                    "manifest_id": manifest_id,
+                    "index_pending": true,
+                },
+                doc! { "$unset": { "index_pending": "", "index_pending_types": "" } },
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    /// Served by the partial `idx_bulk_manifests_index_pending`, which holds
+    /// only the outstanding manifests.
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let options = FindOptions::builder()
+            .sort(doc! { "added_at": 1_i32 })
+            .limit(Some(i64::from(limit)))
+            .build();
+        let cursor = self
+            .manifests()
+            .await?
+            .find(doc! { "index_pending": true })
+            .with_options(options)
+            .await
+            .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
+        Ok(collect(cursor)
+            .await?
+            .iter()
+            .filter_map(|d| {
+                let tenant_id = opt_str(d, "tenant_id")?;
+                let submitter = opt_str(d, "submitter")?;
+                let submission_id = opt_str(d, "submission_id")?;
+                let manifest_id = opt_str(d, "manifest_id")?;
+                let mut resource_types: Vec<String> = d
+                    .get_array("index_pending_types")
+                    .map(|types| {
+                        types
+                            .iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                resource_types.sort();
+                resource_types.dedup();
+                Some(PendingReindex {
+                    tenant: tenant_from_id(&tenant_id),
+                    submission: SubmissionId::new(submitter, submission_id),
+                    manifest_id,
+                    resource_types,
+                    added_at: opt_time(d, "added_at"),
+                })
+            })
+            .collect())
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,
@@ -1880,15 +2201,19 @@ impl SubmitWorkerStorage for MongoBackend {
         failed_delta: u64,
         lines_delta: u64,
     ) -> Result<(), LeaseError> {
-        self.fenced_update(
-            lease,
-            doc! { "$inc": {
-                "processed_entries": processed_delta as i64,
-                "failed_entries": failed_delta as i64,
-                "last_processed_line": lines_delta as i64,
-            }},
-        )
-        .await
+        let result = self
+            .fenced_update(
+                lease,
+                doc! { "$inc": {
+                    "processed_entries": processed_delta as i64,
+                    "failed_entries": failed_delta as i64,
+                    "last_processed_line": lines_delta as i64,
+                }},
+            )
+            .await;
+        // Not in `fenced_update_filtered`: the lease keeper writes through that
+        // inline, and must not wait on a batch.
+        self.settle_purged_manifest_writes(lease, result).await
     }
 
     async fn update_manifest_bytes(
@@ -1960,18 +2285,20 @@ impl SubmitWorkerStorage for MongoBackend {
             format!("{FILE_PROGRESS_FIELD}.file_url"),
             doc! { "$ne": file_url },
         );
-        self.fenced_update_filtered(
-            lease,
-            absent,
-            doc! { "$push": {
-                FILE_PROGRESS_FIELD: {
-                    "file_url": file_url,
-                    "max_line": 0_i64,
-                    "completed": true,
-                },
-            }},
-        )
-        .await
+        let result = self
+            .fenced_update_filtered(
+                lease,
+                absent,
+                doc! { "$push": {
+                    FILE_PROGRESS_FIELD: {
+                        "file_url": file_url,
+                        "max_line": 0_i64,
+                        "completed": true,
+                    },
+                }},
+            )
+            .await;
+        self.settle_purged_manifest_writes(lease, result).await
     }
 
     async fn record_submit_file(
@@ -1979,6 +2306,8 @@ impl SubmitWorkerStorage for MongoBackend {
         lease: &ManifestLease,
         file: &SubmitFileRecord,
     ) -> Result<(), LeaseError> {
+        // Counted as running for the whole call, like a batch (#2310).
+        let _in_flight = self.manifest_writes.enter(&lease.manifest_id);
         let manifests = self.manifests().await.map_err(LeaseError::Storage)?;
         let holds = manifests
             .find_one(fenced_filter(lease))
@@ -2014,13 +2343,55 @@ impl SubmitWorkerStorage for MongoBackend {
             },
             "$setOnInsert": key.clone(),
         };
-        self.submit_files()
-            .await
-            .map_err(LeaseError::Storage)?
-            .update_one(key, update)
+        let submit_files = self.submit_files().await.map_err(LeaseError::Storage)?;
+        submit_files
+            .update_one(key.clone(), update)
             .upsert(true)
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
+
+        // The fence check above ran before the upsert, and the upsert creates
+        // the row whatever happened in between. A tenant purge deletes the
+        // manifests first, so a manifest that is still there now means the
+        // purge's later delete of `bulk_submit_files` takes the row, and one
+        // that is gone means the row is ours to remove (#2310). The fencing
+        // token is part of `key`, so the delete can only reach this worker's
+        // row. Only the manifest is asked about, not the fence: a worker that
+        // lost its lease to another one keeps writing its own row, as before.
+        let manifest_key = manifest_filter(&lease.tenant, &lease.submission_id, &lease.manifest_id);
+        let still_there = or_exhausted(
+            "check manifest after submit file",
+            retry_transient_with(
+                &BULK_INGEST_RETRY,
+                None,
+                "check manifest after submit file",
+                || async {
+                    manifests
+                        .find_one(manifest_key.clone())
+                        .projection(doc! { "_id": 1 })
+                        .selection_criteria(primary_selection())
+                        .read_concern(mongodb::options::ReadConcern::local())
+                        .await
+                },
+            )
+            .await,
+        )
+        .map_err(LeaseError::Storage)?
+        .is_some();
+        if !still_there {
+            or_exhausted(
+                "remove submit file of a purged tenant",
+                retry_transient_with(
+                    &BULK_INGEST_RETRY,
+                    None,
+                    "remove submit file of a purged tenant",
+                    || async { submit_files.delete_one(key.clone()).await },
+                )
+                .await,
+            )
+            .map_err(LeaseError::Storage)?;
+            return Err(lease_lost(lease));
+        }
         Ok(())
     }
 
@@ -2176,7 +2547,7 @@ impl SubmitWorkerStorage for MongoBackend {
         if let Some(existing) = submissions
             .find_one(filter.clone())
             .await
-            .map_err(|e| internal_error(format!("read poll token: {e}")))?
+            .or_query_error("read poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
         {
             return Ok(existing);
@@ -2199,7 +2570,7 @@ impl SubmitWorkerStorage for MongoBackend {
         submissions
             .find_one(filter)
             .await
-            .map_err(|e| internal_error(format!("reread poll token: {e}")))?
+            .or_query_error("reread poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
             .ok_or_else(|| {
                 StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
@@ -2215,7 +2586,7 @@ impl SubmitWorkerStorage for MongoBackend {
             .await?
             .find_one(doc! { "poll_token": token })
             .await
-            .map_err(|e| internal_error(format!("resolve poll token: {e}")))?
+            .or_query_error("resolve poll token")?
         else {
             return Ok(None);
         };
@@ -2372,9 +2743,24 @@ impl SubmitWorkerStorage for MongoBackend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86_400));
+        // In-progress submissions that still have an unfinished manifest are live
+        // work (heartbeats do not touch `updated_at`): never list them. The
+        // active set is read through the `status`-prefixed claim index.
+        let active_ids = self
+            .manifests()
+            .await?
+            .distinct(
+                "submission_id",
+                doc! { "status": { "$in": [
+                    ManifestStatus::Pending.to_string(),
+                    ManifestStatus::Processing.to_string(),
+                ] } },
+            )
+            .await
+            .map_err(|e| internal_error(format!("list active manifests: {e}")))?;
         let options = FindOptions::builder()
             .sort(doc! { "updated_at": 1_i32 })
             .limit(Some(limit as i64))
@@ -2382,7 +2768,17 @@ impl SubmitWorkerStorage for MongoBackend {
         let cursor = self
             .submissions()
             .await?
-            .find(doc! { "updated_at": { "$lt": to_bson_time(cutoff) } })
+            .find(doc! {
+                "updated_at": { "$lt": to_bson_time(cutoff) },
+                "$or": [
+                    { "status": { "$in": [
+                        SubmissionStatus::Complete.to_string(),
+                        SubmissionStatus::Aborted.to_string(),
+                    ] } },
+                    { "status": SubmissionStatus::InProgress.to_string(),
+                      "submission_id": { "$nin": active_ids } },
+                ],
+            })
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("list expired submissions: {e}")))?;
@@ -2394,12 +2790,61 @@ impl SubmitWorkerStorage for MongoBackend {
                 let tenant_id = opt_str(d, "tenant_id")?;
                 let submitter = opt_str(d, "submitter")?;
                 let submission_id = opt_str(d, "submission_id")?;
-                Some((
-                    tenant_from_id(&tenant_id),
-                    SubmissionId::new(submitter, submission_id),
-                ))
+                let status = d.get_str("status").ok()?.parse::<SubmissionStatus>().ok()?;
+                Some(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: tenant_from_id(&tenant_id),
+                    id: SubmissionId::new(submitter, submission_id),
+                    status,
+                })
             })
             .collect())
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        // Only terminal, old submissions are purged; they accept no further
+        // writes (`add_manifest` rejects them, aborted manifests are `failed`).
+        let mut guard = submission_filter(tenant, id);
+        guard.insert("updated_at", doc! { "$lt": to_bson_time(cutoff) });
+        guard.insert(
+            "status",
+            doc! { "$in": [
+                SubmissionStatus::Complete.to_string(),
+                SubmissionStatus::Aborted.to_string(),
+            ] },
+        );
+        let submissions = self.submissions().await?;
+        if submissions
+            .count_documents(guard.clone())
+            .await
+            .map_err(|e| internal_error(format!("purge check: {e}")))?
+            == 0
+        {
+            return Ok(false);
+        }
+        // Children first, the submission document last: a purge cut short leaves
+        // a terminal, expired submission that the next sweep lists and resumes.
+        let filter = submission_filter(tenant, id);
+        for (name, coll) in [
+            ("entry results", self.entry_results().await?),
+            ("changes", self.submission_changes().await?),
+            ("submit files", self.submit_files().await?),
+            ("manifests", self.manifests().await?),
+        ] {
+            coll.delete_many(filter.clone())
+                .await
+                .map_err(|e| internal_error(format!("purge {name}: {e}")))?;
+        }
+        let deleted = submissions
+            .delete_one(guard)
+            .await
+            .map_err(|e| internal_error(format!("purge submission: {e}")))?
+            .deleted_count;
+        Ok(deleted > 0)
     }
 
     async fn ensure_transaction_time(
@@ -2444,11 +2889,7 @@ impl SubmitWorkerStorage for MongoBackend {
 /// Drains a cursor into a vector of documents.
 async fn collect(mut cursor: mongodb::Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut out = Vec::new();
-    while cursor
-        .advance()
-        .await
-        .map_err(|e| internal_error(format!("cursor advance: {e}")))?
-    {
+    while cursor.advance().await.or_query_error("cursor advance")? {
         out.push(
             cursor
                 .deserialize_current()
@@ -2676,5 +3117,190 @@ mod tests {
             summary.success_count + summary.error_count + summary.skipped_count,
             0
         );
+    }
+
+    /// Pins the `or_query_error` contract that the converted job-store reads
+    /// rely on (#2335), on a driver error built in place and with no server: a
+    /// dropped connection (`Io`) becomes a driver-free `Unavailable`; a
+    /// non-transient `BadValue` stays `Internal` with the byte-identical text the
+    /// call site built before and the driver error kept as its source; a server
+    /// deadline (code 50) is a `Timeout`.
+    ///
+    /// This does not show that any call site is converted. The failCommand tests
+    /// in `tests/mongodb/read_errors.rs` guard the sites themselves, each against
+    /// a real server that drops the connection.
+    #[test]
+    fn a_failed_job_store_read_is_classified_and_keeps_its_internal_text() {
+        // (a) A dropped connection is `Unavailable`, without the driver text.
+        let dropped =
+            mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let err = Err::<(), _>(dropped)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        match err {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "read submission status: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("Kind:"), "driver text leaked: {message}");
+            }
+            other => panic!("a dropped connection must be Unavailable, got {other:?}"),
+        }
+
+        // (b) A non-transient command error stays `Internal`, with the old text.
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 2,
+            "codeName": "BadValue",
+            "errmsg": "bad filter",
+        })
+        .expect("a CommandError deserializes from a server reply");
+        let bad = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command));
+        let old = format!("read submission status: {bad}");
+        let err = Err::<(), _>(bad)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        match err {
+            StorageError::Backend(BackendError::Internal {
+                message,
+                source: Some(source),
+                ..
+            }) => {
+                assert_eq!(message, old, "the Internal text must not change");
+                let driver = source
+                    .downcast_ref::<mongodb::error::Error>()
+                    .expect("the driver error stays the source");
+                match driver.kind.as_ref() {
+                    mongodb::error::ErrorKind::Command(command) => assert_eq!(command.code, 2),
+                    other => panic!("expected a Command error, got {other:?}"),
+                }
+            }
+            other => panic!("a BadValue error must stay Internal, got {other:?}"),
+        }
+
+        // (c) A server deadline (code 50) is a `Timeout`, never `Unavailable`.
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 50,
+            "codeName": "MaxTimeMSExpired",
+            "errmsg": "operation exceeded time limit",
+        })
+        .expect("a CommandError deserializes from a server reply");
+        let expired = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command));
+        let err = Err::<(), _>(expired)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Backend(BackendError::Timeout { .. })),
+            "code 50 must be Timeout, got {err:?}"
+        );
+    }
+
+    // ---- ManifestWritesInFlight (#2310) -------------------------------------
+
+    #[test]
+    fn running_follows_the_guard() {
+        let registry = ManifestWritesInFlight::default();
+        assert!(!registry.running("m1"));
+        let guard = registry.enter("m1");
+        assert!(registry.running("m1"));
+        assert!(!registry.running("m2"), "another manifest is not running");
+        drop(guard);
+        assert!(!registry.running("m1"));
+    }
+
+    #[test]
+    fn two_guards_of_one_manifest_are_counted() {
+        let registry = ManifestWritesInFlight::default();
+        let first = registry.enter("m1");
+        let second = registry.enter("m1");
+        drop(first);
+        assert!(
+            registry.running("m1"),
+            "one write of the manifest still runs"
+        );
+        drop(second);
+        assert!(!registry.running("m1"));
+        assert!(
+            registry.counts.lock().unwrap().is_empty(),
+            "an idle manifest leaves no entry behind"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_is_false_once_the_grace_is_over() {
+        let registry = ManifestWritesInFlight::default();
+        let guard = registry.enter("m1");
+        tokio::time::advance(MANIFEST_WRITE_GRACE - StdDuration::from_secs(1)).await;
+        assert!(registry.running("m1"), "inside the grace");
+        tokio::time::advance(StdDuration::from_secs(2)).await;
+        assert!(
+            !registry.running("m1"),
+            "a write that outlives the grace no longer counts, though its guard is held"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_write_renews_the_grace() {
+        let registry = ManifestWritesInFlight::default();
+        let first = registry.enter("m1");
+        tokio::time::advance(MANIFEST_WRITE_GRACE - StdDuration::from_secs(1)).await;
+        let second = registry.enter("m1");
+        tokio::time::advance(StdDuration::from_secs(2)).await;
+        assert!(
+            registry.running("m1"),
+            "the grace runs from the latest write that began"
+        );
+        drop((first, second));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_returns_when_the_last_guard_is_dropped() {
+        let registry = std::sync::Arc::new(ManifestWritesInFlight::default());
+        let first = registry.enter("m1");
+        let second = registry.enter("m1");
+        let waiter = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            async move { registry.settled("m1").await }
+        });
+        // Lets the waiter reach its wait.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "two writes run");
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one write still runs");
+        drop(second);
+        tokio::time::timeout(StdDuration::from_secs(1), waiter)
+            .await
+            .expect("settled returns when the last write has returned")
+            .expect("the waiter did not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_returns_at_once_when_nothing_runs() {
+        let registry = ManifestWritesInFlight::default();
+        tokio::time::timeout(StdDuration::from_secs(1), registry.settled("m1"))
+            .await
+            .expect("nothing runs, so there is nothing to wait for");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_gives_up_when_the_grace_is_over() {
+        let registry = std::sync::Arc::new(ManifestWritesInFlight::default());
+        let guard = registry.enter("m1");
+        let waiter = tokio::spawn({
+            let registry = std::sync::Arc::clone(&registry);
+            async move { registry.settled("m1").await }
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the write is inside its grace");
+        tokio::time::advance(MANIFEST_WRITE_GRACE + StdDuration::from_secs(1)).await;
+        tokio::time::timeout(StdDuration::from_secs(1), waiter)
+            .await
+            .expect("a hung write must not hold the answer back for ever")
+            .expect("the waiter did not panic");
+        drop(guard);
     }
 }

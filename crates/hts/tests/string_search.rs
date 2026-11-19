@@ -85,9 +85,9 @@ fn assert_id(resource: &Value, expected: &str) {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_supports_prefix_contains_exact_and_decoded_modifier_keys() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
     for (path, expected_type, expected_id) in [
@@ -124,9 +124,9 @@ async fn sqlite_supports_prefix_contains_exact_and_decoded_modifier_keys() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_applies_and_semantics_literal_matching_and_filter_before_pagination() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
     let (status, combined) = app
@@ -159,9 +159,9 @@ async fn sqlite_applies_and_semantics_literal_matching_and_filter_before_paginat
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn empty_and_normalization_empty_parameters_are_ignored_first() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
     let (_, baseline) = app.get_fhir("/CodeSystem").await;
@@ -195,9 +195,9 @@ async fn empty_and_normalization_empty_parameters_are_ignored_first() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn unsupported_modifiers_on_announced_parameters_return_operation_outcome() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     for resource_type in ["CodeSystem", "ValueSet", "ConceptMap"] {
         for parameter in ["url", "version", "name", "title", "status"] {
@@ -220,9 +220,9 @@ async fn unsupported_modifiers_on_announced_parameters_return_operation_outcome(
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_preserves_resource_specific_hydration_behavior() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
     let (_, code_system) = app.get_fhir("/CodeSystem?name=cafe").await;
@@ -250,14 +250,13 @@ async fn sqlite_preserves_resource_specific_hydration_behavior() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_matches_string_and_full_hydration_contract() {
+async fn postgres_matches_string_and_hydration_contract() {
     let app = TestAppPg::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
 
-    let (client, connection) =
-        tokio_postgres::connect(common::pg_http_url().await, tokio_postgres::NoTls)
-            .await
-            .expect("connect to PostgreSQL test database");
+    let (client, connection) = tokio_postgres::connect(app.database_url(), tokio_postgres::NoTls)
+        .await
+        .expect("connect to PostgreSQL test database");
     tokio::spawn(async move {
         connection.await.expect("PostgreSQL test connection");
     });
@@ -278,16 +277,25 @@ async fn postgres_matches_string_and_full_hydration_contract() {
         .await
         .expect("insert legacy CodeSystem metadata without resource_json");
 
-    for (path, full_field, expected_id) in [
-        ("/CodeSystem?title=cafe&_summary=true", "concept", "cafe-cs"),
+    // Same hydration contract as SQLite: `_summary=true` returns synthetic
+    // metadata for CodeSystem / ValueSet and the stored map for ConceptMap.
+    for (path, full_field, hydrated, expected_id) in [
+        (
+            "/CodeSystem?title=cafe&_summary=true",
+            "concept",
+            false,
+            "cafe-cs",
+        ),
         (
             "/ValueSet?name:contains=fevalue&_summary=true",
             "compose",
+            false,
             "cafe-vs",
         ),
         (
             "/ConceptMap?title:contains=fe%20concept&_summary=true",
             "group",
+            true,
             "cafe-cm",
         ),
     ] {
@@ -295,7 +303,7 @@ async fn postgres_matches_string_and_full_hydration_contract() {
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
         assert_eq!(entries(&body).len(), 1, "{path}: {body}");
         let resource = &entries(&body)[0]["resource"];
-        assert!(!resource[full_field].is_null(), "{path}: {body}");
+        assert_eq!(!resource[full_field].is_null(), hydrated, "{path}: {body}");
         assert_id(resource, expected_id);
     }
 
@@ -379,9 +387,9 @@ macro_rules! assert_string_search_total_and_links {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_total_counts_all_matches_and_summary_count_omits_entries() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(SEARCH_BUNDLE).await;
     assert_string_search_total_and_links!(app);
 

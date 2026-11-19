@@ -19,7 +19,7 @@ use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderProperty, CodeSystemMeta, build_native_batch,
 };
 
 // ── RxNorm constants ──────────────────────────────────────────────────────────
@@ -166,8 +166,8 @@ pub async fn import_rxnorm_rrf(
     };
 
     // Seed empty CodeSystem.
-    let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_native_batch(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -226,8 +226,8 @@ pub async fn import_rxnorm_rrf(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let bytes = build_native_batch(&meta, &builder);
+        let chunk = backend.import_parsed(ctx, bytes).await?;
         stats.errors.extend(chunk.errors);
     }
 
@@ -276,7 +276,10 @@ fn find_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, suffix: &str) ->
         archive
             .by_index(i)
             .ok()
-            .map(|e| e.name().to_ascii_lowercase().ends_with(suffix))
+            .map(|e| {
+                e.name()
+                    .is_ok_and(|n| n.to_ascii_lowercase().ends_with(suffix))
+            })
             .unwrap_or(false)
     })
 }
@@ -937,7 +940,7 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("rrf/RXNCONSO.RRF", opts).unwrap();
             zip.write_all(CONSO_RRF.as_bytes()).unwrap();
             zip.start_file("rrf/RXNREL.RRF", opts).unwrap();

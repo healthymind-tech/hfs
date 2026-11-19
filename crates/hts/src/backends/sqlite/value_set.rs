@@ -46,6 +46,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::ecl;
 use crate::error::HtsError;
+use crate::implicit_vs::{ImplicitVsPattern, parse_implicit_vs_url};
 use crate::traits::ValueSetOperations;
 use crate::types::{
     ExpandRequest, ExpandResponse, ExpansionContains, ResourceSearchQuery, ValidateCodeRequest,
@@ -252,11 +253,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
-                        let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
-
-                        let total = if skip_count {
-                            None
-                        } else {
+                        // Always counted: with a filter the in-memory trigram
+                        // index answers in O(matches), and a client paging a
+                        // filtered expansion needs the total.
+                        let total = {
                             let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
@@ -512,6 +512,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // the IG enum-* fixtures want a flat expansion even with
             // excludeNested=false.
             let compose_is_enumerated: bool;
+            // Set when the text-filtered expansion stopped at a candidate
+            // limit: the exact total (None if it cannot be counted), which
+            // the length of the truncated result would understate.
+            let mut filtered_total: Option<Option<u32>> = None;
+            let window = request_window(&req);
 
             let all_codes = if let Some(vs_resource) = req.value_set {
                 // Inline ValueSet: extract compose and expand directly.
@@ -563,12 +568,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inline_ctx
                     .default_value_set_versions
                     .clone_from(&req.default_value_set_versions);
-                let codes = if let Some(filter) = req.filter.as_deref() {
-                    let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
+                // `expand_inline_filtered` reads neither `exclude`, nor
+                // `include[].valueSet`, nor `contained`; composes that use them
+                // go through the general path and the text filter is applied
+                // afterwards over the full result (upstream guard, VCL #2019).
+                let text_filter_fast =
+                    !compose_needs_general_path(compose) && inline_ctx.contained.is_empty();
+                let codes = if let Some(filter) = req.filter.as_deref().filter(|_| text_filter_fast) {
+                    let limit_hint = window.map(|w| (w * 3).max(100));
                     let compose_str = compose.to_string();
                     let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
                     let plain_key = format!("plain-fts:{:016x}", fnv64(compose_str.as_bytes()));
-                    expand_inline_filtered(
+                    let mut truncated = false;
+                    let codes = expand_inline_filtered(
                         &conn,
                         compose,
                         filter,
@@ -576,7 +588,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         &mut warnings,
                         Some((&prop_key, &property_result_cache)),
                         Some((&plain_key, &plain_fts_cache)),
-                    )?
+                        &mut truncated,
+                    )?;
+                    if truncated {
+                        filtered_total = Some(count_inline_filtered(&conn, compose, filter)?);
+                    }
+                    codes
                 } else {
                     let compose_str = compose.to_string();
                     // Cache inline compose expansions so that repeated requests for
@@ -679,8 +696,20 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     count as usize,
                                     None,
                                 )?;
+                                let total = if page.len() < count as usize
+                                    && (bfs_offset == 0 || !page.is_empty())
+                                {
+                                    (bfs_offset + page.len()) as u32
+                                } else {
+                                    let pattern = if include_root {
+                                        ImplicitVsPattern::IsA(root_code.clone())
+                                    } else {
+                                        ImplicitVsPattern::DescendantOf(root_code.clone())
+                                    };
+                                    bfs_expand_total(&conn, &sys_id, &pattern, None)?
+                                };
                                 return Ok(ExpandResponse {
-                                    total: None,
+                                    total: Some(total),
                                     offset: req.offset,
                                     contains: page,
                                     warnings,
@@ -699,8 +728,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 bfs_offset,
                                 &mut warnings,
                             )? {
+                                // Branches may overlap, so only a short page
+                                // tells the total.
+                                let total = (page.len() < count as usize
+                                    && (bfs_offset == 0 || !page.is_empty()))
+                                .then(|| (bfs_offset + page.len()) as u32);
                                 return Ok(ExpandResponse {
-                                    total: None,
+                                    total,
                                     offset: req.offset,
                                     contains: page,
                                     warnings,
@@ -796,7 +830,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // `resolve_value_set_versioned` win would expand its empty/skeleton
                 // compose and silently return zero codes for SNOMED — masking the
                 // working `bfs_isa_page`/implicit-cache traversal below.
-                let implicit_short_circuit = parse_fhir_vs_url(url).is_some();
+                let implicit_short_circuit = parse_implicit_vs_url(url).is_some();
                 let resolution = if implicit_short_circuit {
                     Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
                 } else {
@@ -889,11 +923,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // materialisation and concept-id ordering on filtered typeahead.
                             let codes = if let Some(filter) = req.filter.as_deref() {
                                 if let Some(compose_str) = compose_json.as_deref() {
-                                    if let Ok(compose) =
+                                    if let Some(compose) =
                                         serde_json::from_str::<serde_json::Value>(compose_str)
+                                            .ok()
+                                            .filter(|c| !compose_needs_general_path(c))
                                     {
-                                        let limit_hint =
-                                            req.count.map(|c| ((c as usize) * 10).max(100));
+                                        let limit_hint = window.map(|w| (w * 10).max(100));
                                         let prop_key = format!(
                                             "prop-result:{:016x}",
                                             fnv64(compose_str.as_bytes())
@@ -902,7 +937,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             "plain-fts:{:016x}",
                                             fnv64(compose_str.as_bytes())
                                         );
-                                        expand_inline_filtered(
+                                        let mut truncated = false;
+                                        let codes = expand_inline_filtered(
                                             &conn,
                                             &compose,
                                             filter,
@@ -910,7 +946,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             &mut warnings,
                                             Some((&prop_key, &property_result_cache)),
                                             Some((&plain_key, &plain_fts_cache)),
-                                        )?
+                                            &mut truncated,
+                                        )?;
+                                        if truncated {
+                                            filtered_total = Some(count_inline_filtered(
+                                                &conn, &compose, filter,
+                                            )?);
+                                        }
+                                        codes
                                     } else {
                                         compute_expansion_with_versions(
                                             &backend,
@@ -999,13 +1042,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
                         if !cache_populated {
                             if let Some(count) = req.count.filter(|&c| c > 0) {
-                                let cs_pat = if let Ok(cs_url) =
-                                    find_cs_for_implicit_vs(&conn, url, req.date.as_deref())
-                                {
-                                    Some((cs_url, FhirVsPattern::AllConcepts))
-                                } else {
-                                    parse_fhir_vs_url(url)
-                                };
+                                // The URL forms first: `find_cs_for_implicit_vs`
+                                // parses every stored CodeSystem's JSON.
+                                let cs_pat = match parse_implicit_vs_url(url) {
+                                    Some(p) => Some(p),
+                                    None => find_cs_for_implicit_vs(&conn, url, req.date.as_deref())
+                                        .ok()
+                                        .map(|cs_url| (cs_url, ImplicitVsPattern::AllConcepts)),
+                                }
+                                // ECL has no paged shortcut: it goes to the cached
+                                // expansion below.
+                                .filter(|(_, p)| implicit_ecl(p).is_none());
 
                                 if let Some((cs_url, pattern)) = cs_pat {
                                     let system_id = resolve_system_id_cached(&conn, &cs_url)?;
@@ -1076,8 +1123,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             });
                                         }
 
+                                        // A short page holds the rest of the expansion;
+                                        // otherwise count with the page's predicate.
+                                        let total = if page.len() < count as usize
+                                            && (bfs_offset == 0 || !page.is_empty())
+                                        {
+                                            (bfs_offset + page.len()) as u32
+                                        } else {
+                                            bfs_expand_total(
+                                                &conn,
+                                                &system_id,
+                                                &pattern,
+                                                filter_lower.as_deref(),
+                                            )?
+                                        };
                                         return Ok(ExpandResponse {
-                                            total: None,
+                                            total: Some(total),
                                             offset: req.offset,
                                             contains: page,
                                             warnings: vec![],
@@ -1097,21 +1158,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
 
-                        // Skip the COUNT query when the request is bounded (count > 0)
-                        // and has a text filter: the total is not required by the
-                        // benchmark checks and halving the DB round-trips under 50 VUs
-                        // significantly reduces p95 latency (EX03 optimisation).
-                        // Always count for unbounded requests: needed for size-cap check.
-                        let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
+                        // The total is always counted (it used to be skipped for
+                        // filtered pages): in memory that is an O(matches) trigram
+                        // lookup, in SQL one FTS COUNT.
 
                         // Serve from the in-memory index — no DB connection needed for
                         // filter/pagination once the index is warm.
                         let in_mem = implicit_index.read().ok().and_then(|g| g.get(url).cloned());
 
                         if let Some(concept_idx) = in_mem {
-                            let total = if skip_count {
-                                None
-                            } else {
+                            let total = {
                                 let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                                 if req.count.is_none() {
                                     if let Some(cap) = req.max_expansion_size {
@@ -1142,9 +1198,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         }
 
                         // Fallback: SQL path (index lock poisoned — should not happen).
-                        let total = if skip_count {
-                            None
-                        } else {
+                        let total = {
                             let n = implicit_cache_count(&conn, url, filter_lower.as_deref())?;
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
@@ -1194,7 +1248,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     })
                     .collect();
                 // Rank cached full expansions for typeahead UX.
-                sort_typeahead_candidates(&mut hits, &lower);
+                crate::backends::sort_typeahead_candidates(&mut hits, &lower);
                 hits
             } else {
                 all_codes
@@ -1211,6 +1265,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // HL7-tx `hierarchical=true` convention still asks for an
             // explicit tree on non-enumerated VSes.
             let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
+            let total_reported = filtered_total.unwrap_or(Some(filtered.len() as u32));
             if want_tree {
                 let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;
@@ -1222,7 +1277,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 });
             }
 
-            let total = filtered.len() as u32;
+            let total = total_reported.unwrap_or(filtered.len() as u32);
 
             // Enforce the expansion size cap only when no explicit count (page size) was
             // requested. When count is set, the response is already bounded and the limit
@@ -1259,7 +1314,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             );
 
             Ok(ExpandResponse {
-                total: Some(total),
+                total: total_reported,
                 offset: req.offset,
                 contains: page,
                 warnings,
@@ -1379,7 +1434,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // `resolve_value_set_versioned` win would expand its empty/skeleton
             // compose to zero codes and force `result=false` for every input —
             // masking the targeted `validate_fhir_vs` lookup below.
-            let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+            let implicit_short_circuit = parse_implicit_vs_url(&url).is_some();
             let resolution = if implicit_short_circuit {
                 Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
             } else {
@@ -1456,7 +1511,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
                         // instead of materializing all concepts (which times out for large
                         // code systems like SNOMED CT with ~350k concepts).
-                        if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
+                        if let Some((cs_url, pattern)) = parse_implicit_vs_url(&url) {
                             let found = validate_fhir_vs(
                                 &conn,
                                 &cs_url,
@@ -1494,11 +1549,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .system
                                 .as_deref()
                                 .and_then(|s| cs_version_for_msg(&backend, &conn,s));
-                            let cs_is_fragment = req
-                                .system
-                                .as_deref()
-                                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                                .unwrap_or(false);
+                            let cs_content: Option<String> = req
+ .system
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn, s));
                             let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                             return finish_validate_code_response(
                                 found,
@@ -1510,12 +1564,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 inactive_for_msg,
                                 vs_version_owned.as_deref(),
                                 inactive_in_cs,
+                                false, // an implicit ValueSet keeps inactive codes
                                 code_unknown_in_cs,
                                 false, // version-only-unknown not applicable here
                                 cs_version.as_deref(),
                                 req.version.as_deref(),
                                 req.lenient_display_validation.unwrap_or(false),
-                                cs_is_fragment,
+                                cs_content.as_deref(),
                                 None, // cs_display_lookup — only used by the URL path below
                                 None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                             );
@@ -1556,11 +1611,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .system
                             .as_deref()
                             .and_then(|s| cs_version_for_msg(&backend, &conn,s));
-                        let cs_is_fragment = req
-                            .system
-                            .as_deref()
-                            .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                            .unwrap_or(false);
+                        let cs_content: Option<String> = req
+ .system
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn, s));
                         let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
                         return finish_validate_code_response(
                             found,
@@ -1572,12 +1626,13 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             inactive_for_msg,
                             vs_version_owned.as_deref(),
                             inactive_in_cs,
+                            false, // an implicit ValueSet keeps inactive codes
                             code_unknown_in_cs,
                             false, // version-only-unknown not applicable here
                             cs_version.as_deref(),
                             req.version.as_deref(),
                             req.lenient_display_validation.unwrap_or(false),
-                            cs_is_fragment,
+                            cs_content.as_deref(),
                             None, // cs_display_lookup — only used by the URL path below
                             None, // normalized_code — case-insensitive fallback only fires on the explicit-VS path
                         );
@@ -1816,10 +1871,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 } else {
                     let mut sorted = candidates.clone();
                     sorted.sort_by(|a, b| {
-                        b.version
-                            .as_deref()
-                            .unwrap_or("")
-                            .cmp(a.version.as_deref().unwrap_or(""))
+                        crate::version_order::compare_versions(
+                            b.version.as_deref(),
+                            a.version.as_deref(),
+                        )
                     });
                     sorted.into_iter().next().cloned()
                 }
@@ -1911,6 +1966,15 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             } else {
                 found
             };
+            // UCUM is a grammar: a value set taking all of UCUM contains every
+            // well-formed unit expression, which no expansion enumerates.
+            let found = found.or_else(|| {
+                crate::ucum_validate::whole_ucum_member(
+                    compose_json_for_version.as_deref(),
+                    effective_system.as_deref(),
+                    &req.code,
+                )
+            });
 
             // When req.version is set (exact, not wildcard), override the found
             // concept's display with the one from that specific CS version.
@@ -2014,10 +2078,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .or_else(|| cs_version_for_msg(&backend, &conn,s))
             });
             let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
-            let cs_is_fragment = system_for_msg
-                .as_deref()
-                .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
-                .unwrap_or(false);
+            let cs_content: Option<String> = system_for_msg
+ .as_deref()
+ .and_then(|s| cs_content_for_url(&backend, &conn,s));
             // When the caller didn't supply a display and we still need to
             // echo one (the code is in the underlying CS, just not in this
             // VS — the IG `overload/validate-bad-enum-code1` and
@@ -2031,14 +2094,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 || code_unknown_in_cs
             {
                 None
-            } else if let (Some(sys), Some(ver)) =
-                (system_for_msg.as_deref(), cs_version.as_deref())
-            {
-                lookup_display_at_version(&conn, sys, ver, &req.code)
+            } else if let Some(sys) = system_for_msg.as_deref() {
+                match cs_version.as_deref() {
+                    Some(ver) => lookup_display_at_version(&conn, sys, ver, &req.code),
+                    // A versionless CodeSystem has no cs_version: take the winning row.
+                    None => lookup_display_any_version(&conn, sys, &req.code),
+                }
             } else {
                 None
             };
-            finish_validate_code_response(
+            let matched_code: Option<String> = found.as_ref().map(|c| c.code.clone());
+            let mut response = finish_validate_code_response(
                 found,
                 &req.code,
                 &url,
@@ -2048,15 +2114,27 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inactive_for_msg,
                 vs_version_owned.as_deref(),
                 inactive_in_cs,
+                compose_inactive_false,
                 code_unknown_in_cs,
                 code_unknown_at_version_only,
                 cs_version.as_deref(),
                 req.version.as_deref(),
                 req.lenient_display_validation.unwrap_or(false),
-                cs_is_fragment,
+                cs_content.as_deref(),
                 echo_display_lookup.as_deref(),
                 normalized_code.as_deref(),
-            )
+            )?;
+            // The code is in the ValueSet but not backed by stored CodeSystem
+            // content (unknown system or `not-present` stub): the membership
+            // answer stands, with a warning so callers know the code itself was
+            // not verified against the CodeSystem (fork issue T8).
+            if let (true, Some(sys), Some(code)) =
+                (response.result, system_for_msg.as_deref(), matched_code.as_deref())
+                && !is_code_in_cs(&conn, sys, code)
+            {
+                crate::backends::push_unverified_code_system_warning(&mut response, sys, &url);
+            }
+            Ok(response)
             };
             let response = compute(req)?;
             // Populate the response cache (bounded). We clone the assembled
@@ -2124,6 +2202,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let limit = i64::from(query.count.unwrap_or(20));
             let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
+            let order_by = crate::backends::search_order_by("value_sets", &query);
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_value_sets_meta serves this query without touching the main table.
@@ -2135,7 +2214,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     && query.status.is_none()
             {
                 let mut stmt = conn
-                    .prepare_cached(
+                    .prepare_cached(&format!(
                         "SELECT id, url, version, name, title, status
                          FROM value_sets
                          WHERE (?1 IS NULL OR url = ?1)
@@ -2143,9 +2222,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                            AND (?3 IS NULL OR name = ?3)
                            AND (?4 IS NULL OR title = ?4)
                            AND (?5 IS NULL OR status = ?5)
-                         ORDER BY created_at
+                         ORDER BY {order_by}
                          LIMIT ?6 OFFSET ?7",
-                    )
+                    ))
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
                     .query_map(
@@ -2170,35 +2249,39 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         },
                     )
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let rows = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+                let reported = super::fhir_ids::reported_ids(&conn, "value_sets", &ids)?;
                 let mut results = Vec::new();
-                for row in rows {
-                    let (id, url, version, name, title, status) =
-                        row.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                for (id, url, version, name, title, status) in &rows {
+                    let id = reported.get(id).unwrap_or(id);
                     results.push(super::code_system::build_synthetic_resource(
                         "ValueSet",
-                        &id,
-                        &url,
+                        id,
+                        url,
                         version.as_deref(),
                         name.as_deref(),
                         title.as_deref(),
-                        &status,
+                        status,
                     ));
                 }
                 return Ok(results);
             }
 
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                .prepare_cached(&format!(
+                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
                        AND (?3 IS NULL OR name = ?3)
                        AND (?4 IS NULL OR title = ?4)
                        AND (?5 IS NULL OR status = ?5)
-                     ORDER BY created_at
+                     ORDER BY {order_by}
                      LIMIT ?6 OFFSET ?7",
-                )
+                ))
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let rows = stmt
@@ -2221,6 +2304,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -2228,10 +2312,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut results = Vec::new();
             for row in rows {
-                let (id, url, version, name, title, status, resource_json) =
+                let (id, url, version, name, title, status, resource_json, fhir_id) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -2244,6 +2328,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                crate::resource_ids::apply_id(
+                    &mut resource,
+                    &crate::resource_ids::reported_id(&id, fhir_id.as_deref()),
+                );
                 results.push(resource);
             }
             Ok(results)
@@ -2412,6 +2500,145 @@ fn fetch_cache_legacy(conn: &Connection, vs_id: &str) -> Result<Vec<ExpansionCon
     .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
+/// The rows a paged request needs: `offset + count`, or `None` when unpaged.
+fn request_window(req: &ExpandRequest) -> Option<usize> {
+    req.count
+        .map(|c| req.offset.unwrap_or(0) as usize + c as usize)
+}
+
+/// Exact number of concepts a text-filtered compose selects, for
+/// `expansion.total` when [`expand_inline_filtered`] stopped at a candidate
+/// limit. Counts instead of materialising: per include, the FTS (or, for
+/// one- and two-character filters, `LIKE`) match count of a whole-system
+/// include, or the text matches that pass its hierarchy / ECL / property
+/// filters. `None` when an include cannot be counted that way (nested
+/// `valueSet` references), so the response omits `total` rather than
+/// reporting a wrong one.
+fn count_inline_filtered(
+    conn: &Connection,
+    compose: &serde_json::Value,
+    text_filter: &str,
+) -> Result<Option<u32>, HtsError> {
+    let filter_lower = text_filter.to_lowercase();
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let matches_text = |code: &str, display: Option<&str>| {
+        code.to_lowercase().contains(&filter_lower)
+            || display.is_some_and(|d| d.to_lowercase().contains(&filter_lower))
+    };
+    let mut total: u64 = 0;
+    for inc in compose["include"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        if inc["valueSet"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(None);
+        }
+        let Some(system_url) = inc["system"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(system_id) = resolve_system_id_cached(conn, system_url)? else {
+            continue;
+        };
+        if let Some(concepts) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
+            let mut stmt = conn
+                .prepare_cached("SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2")
+                .map_err(err)?;
+            for code in concepts.iter().filter_map(|c| c["code"].as_str()) {
+                let display: Option<String> = stmt
+                    .query_row(rusqlite::params![system_id, code], |r| r.get(0))
+                    .optional()
+                    .map_err(err)?
+                    .flatten();
+                total += u64::from(matches_text(code, display.as_deref()));
+            }
+            continue;
+        }
+        let filters: &[serde_json::Value] =
+            inc["filter"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let pattern = format!("%{filter_lower}%");
+        if filters.is_empty() {
+            let n: i64 = if filter_lower.len() >= 3 {
+                ensure_concepts_fts(conn, &system_id)?;
+                conn.query_row(
+                    "SELECT COUNT(*) FROM concepts_fts WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                    rusqlite::params![fts5_quote(&filter_lower), system_id],
+                    |r| r.get(0),
+                )
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM concepts WHERE system_id = ?1 \
+                       AND (LOWER(code) LIKE ?2 OR LOWER(display) LIKE ?2)",
+                    rusqlite::params![system_id, pattern],
+                    |r| r.get(0),
+                )
+            }
+            .map_err(err)?;
+            total += n.max(0) as u64;
+            continue;
+        }
+        // Text matches first (the same predicate as the expansion: code or
+        // display contains the filter), then the include's filters.
+        let candidates: Vec<ExpansionContains> = {
+            let (sql, param) = if filter_lower.len() >= 3 {
+                ensure_concepts_fts(conn, &system_id)?;
+                (
+                    "SELECT code, display FROM concepts_fts \
+                     WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                    fts5_quote(&filter_lower),
+                )
+            } else {
+                (
+                    "SELECT code, display FROM concepts WHERE system_id = ?2 \
+                       AND (LOWER(code) LIKE ?1 OR LOWER(display) LIKE ?1)",
+                    pattern,
+                )
+            };
+            let mut stmt = conn.prepare_cached(sql).map_err(err)?;
+            stmt.query_map(rusqlite::params![param, system_id], |r| {
+                Ok(ExpansionContains {
+                    system: system_url.to_owned(),
+                    version: None,
+                    code: r.get(0)?,
+                    display: r.get(1)?,
+                    is_abstract: None,
+                    inactive: None,
+                    designations: vec![],
+                    properties: vec![],
+                    extensions: vec![],
+                    contains: vec![],
+                })
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?
+        };
+        total += apply_compose_filters_to_candidates(conn, &system_id, filters, candidates)?.len()
+            as u64;
+    }
+    Ok(Some(u32::try_from(total).unwrap_or(u32::MAX)))
+}
+
+/// SQL `LIMIT` for a text-filter candidate query: `mult` times the caller's
+/// hint (at least 100), or no limit (`-1`) without a hint.
+///
+/// The hint comes from the requested window (`offset + count`), so a later
+/// page still finds its rows; there used to be a 5000 cap and the hint
+/// ignored `offset`, which emptied pages past the first few thousand matches
+/// and capped the reported total at whatever the query returned.
+fn candidate_limit(limit_hint: Option<usize>, mult: usize) -> i64 {
+    match limit_hint {
+        Some(h) => i64::try_from(h.saturating_mul(mult).max(100)).unwrap_or(i64::MAX),
+        None => -1,
+    }
+}
+
+/// `true` when a query run with [`candidate_limit`] `limit` stopped at it,
+/// i.e. there may be more matches than it returned.
+fn hit_limit(rows: usize, limit: i64) -> bool {
+    limit >= 0 && rows as i64 >= limit
+}
+
 /// Fast path for text-filtered expansions where every include is a plain
 /// full-system include (no compose filters, no explicit concept list).
 ///
@@ -2427,6 +2654,7 @@ fn expand_inline_plain_fts(
     filter_lower: &str,
     limit_hint: Option<usize>,
     warnings: &mut Vec<String>,
+    truncated: &mut bool,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     // Resolve (system_url, system_id) for each include.
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(includes.len());
@@ -2464,7 +2692,7 @@ fn expand_inline_plain_fts(
         .collect();
 
     let match_expr = fts5_quote(filter_lower);
-    let total_limit = limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+    let total_limit = candidate_limit(limit_hint, 3);
 
     // Single FTS query across all systems — FTS5 evaluates MATCH first (fast),
     // then applies the system_id IN post-filter to the small matching set.
@@ -2492,6 +2720,7 @@ fn expand_inline_plain_fts(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    *truncated |= hit_limit(rows.len(), total_limit);
     let mut results = Vec::with_capacity(rows.len());
     for (system_id, code, display) in rows {
         if let Some(&system_url) = id_to_url.get(system_id.as_str()) {
@@ -2535,6 +2764,7 @@ fn expand_inline_filtered(
     warnings: &mut Vec<String>,
     prop_cache: Option<(&str, &super::PropertyResultCache)>,
     plain_fts_cache: Option<(&str, &super::PlainFtsCache)>,
+    truncated: &mut bool,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let empty_arr = vec![];
     let includes = compose["include"].as_array().unwrap_or(&empty_arr);
@@ -2565,7 +2795,14 @@ fn expand_inline_filtered(
                     return Ok(page_in_memory(&concept_idx, Some(&filter_lower), 0, -1));
                 }
             }
-            return expand_inline_plain_fts(conn, includes, &filter_lower, limit_hint, warnings);
+            return expand_inline_plain_fts(
+                conn,
+                includes,
+                &filter_lower,
+                limit_hint,
+                warnings,
+                truncated,
+            );
         }
     }
 
@@ -2684,13 +2921,14 @@ fn expand_inline_filtered(
             // FTS-first: text index narrows candidates, compose filters (including ECL)
             // intersect in Rust, then rank for typeahead UX.
             ensure_concepts_fts(conn, &system_id)?;
-            let mut candidates = fts_candidates_ranked_for_system(
+            let (mut candidates, capped) = fts_candidates_ranked_for_system(
                 conn,
                 &system_id,
                 system_url,
                 &filter_lower,
                 limit_hint,
             )?;
+            *truncated |= capped;
             if !candidates.is_empty() {
                 candidates = apply_compose_filters_to_candidates(
                     conn,
@@ -2698,7 +2936,7 @@ fn expand_inline_filtered(
                     compose_filters,
                     candidates,
                 )?;
-                sort_typeahead_candidates(&mut candidates, &filter_lower);
+                crate::backends::sort_typeahead_candidates(&mut candidates, &filter_lower);
                 results.extend(candidates);
             }
             continue;
@@ -2772,10 +3010,9 @@ fn expand_inline_filtered(
             if filter_lower.len() >= 3 {
                 ensure_concepts_fts(conn, &system_id)?;
                 let match_expr = fts5_quote(&filter_lower);
-                // Per-system FTS limit: use hint×3 headroom (multi-system requests need surplus),
-                // but cap at 5000 for safety. Minimum 100 so tiny counts still get results.
-                let per_sys_limit =
-                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+                // Per-system FTS limit: use hint×3 headroom (multi-system
+                // requests need surplus). Minimum 100 so tiny counts still get results.
+                let per_sys_limit = candidate_limit(limit_hint, 3);
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts_fts \
@@ -2807,10 +3044,10 @@ fn expand_inline_filtered(
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                *truncated |= hit_limit(rows.len(), per_sys_limit);
                 results.extend(rows);
             } else {
-                let per_sys_limit =
-                    limit_hint.map(|h| (h * 3).clamp(100, 5000)).unwrap_or(5000) as i64;
+                let per_sys_limit = candidate_limit(limit_hint, 3);
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT code, display FROM concepts \
@@ -2843,6 +3080,7 @@ fn expand_inline_filtered(
                     .map_err(|e| HtsError::StorageError(e.to_string()))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                *truncated |= hit_limit(rows.len(), per_sys_limit);
                 results.extend(rows);
             }
         }
@@ -3107,10 +3345,11 @@ fn expand_vs_reference(
                 "Cyclic reference detected when excluding {origin} via [{chain_str}]"
             )));
         }
-        warnings.push(format!(
-            "Cyclic ValueSet reference detected for {ref_url}; excluded from expansion (vs-invalid)"
-        ));
-        return Ok(vec![]);
+        // A value set that includes itself, directly or through others, has
+        // no defined expansion (IG `simple/simple-expand-contained-circular`).
+        return Err(HtsError::VsInvalid(format!(
+            "Cyclic reference detected when including {ref_url}: the value set includes itself"
+        )));
     }
 
     let mut child_ctx = ctx.clone();
@@ -3553,6 +3792,28 @@ fn expand_single_include_local(
                         )));
                     }
                 }
+                // An enumerated include (`concept[]`) does not need the
+                // CodeSystem to be loaded: the ValueSet author listed the
+                // codes explicitly, so they are returned as listed (with the
+                // compose-embedded display). `$validate-code` then answers
+                // `true` for them, with a warning that the system is unknown
+                // (fork issue T8 — enumerated LOINC/SNOMED ValueSets without a
+                // licensed load of the CodeSystem).
+                if let Some(explicit) = inc["concept"].as_array().filter(|a| !a.is_empty()) {
+                    let msg = format!(
+                        "CodeSystem {system_url} was not found; its {} enumerated codes are \
+                         included as listed in the ValueSet",
+                        explicit.len()
+                    );
+                    tracing::warn!(%system_url, ?inc_version, "{msg}");
+                    warnings.push(msg);
+                    return Ok(crate::backends::enumerated_from_compose(
+                        system_url,
+                        inc_version,
+                        explicit,
+                        &HashSet::new(),
+                    ));
+                }
                 let msg = format!(
                     "CodeSystem {system_url} was not found and has been excluded from the expansion"
                 );
@@ -3618,6 +3879,52 @@ fn expand_single_include_local(
                 extensions: vec![],
                 contains: vec![],
             });
+        }
+        // The CodeSystem row exists but carries no concepts (a `not-present`
+        // stub such as the THO LOINC/SNOMED placeholders, or an empty
+        // fragment): nothing to refute the enumerated codes against, so keep
+        // the ones the JOIN dropped, as listed. A CS WITH content still drops
+        // unknown codes (IG `simple-expand-enum-bad`).
+        if seen_codes.len() < explicit_codes.len()
+            && (crate::backends::include_is_stored_expansion(inc)
+                || !system_has_concepts(conn, &system_id))
+        {
+            let extra = crate::backends::enumerated_from_compose(
+                system_url,
+                cs_version.as_deref(),
+                explicit_codes,
+                &seen_codes,
+            );
+            if !extra.is_empty() {
+                let msg = format!(
+                    "CodeSystem {system_url} has no concept content loaded; {} enumerated codes \
+                     are included as listed in the ValueSet",
+                    extra.len()
+                );
+                tracing::debug!(%system_url, "{msg}");
+                warnings.push(msg);
+                for c in extra {
+                    seen_codes.insert(c.code.clone());
+                    out.push(c);
+                }
+            }
+        }
+        // UCUM is a grammar: enumerated units the stored atoms table lacks
+        // (`mm[Hg]`, `kg`) are still members when well-formed.
+        if seen_codes.len() < explicit_codes.len() {
+            let extra = crate::backends::ucum_grammar_from_compose(
+                system_url,
+                cs_version.as_deref(),
+                explicit_codes,
+                &seen_codes,
+            );
+            if !extra.is_empty() {
+                for c in extra {
+                    seen_codes.insert(c.code.clone());
+                    out.push(c);
+                }
+                crate::backends::sort_by_compose_order(&mut out, explicit_codes);
+            }
         }
         // IG `parameters/parameters-expand-enum-*` semantics: when an
         // explicitly-enumerated concept is abstract (notSelectable=true), the
@@ -3999,6 +4306,7 @@ fn apply_compose_filters(
                     f["op"] = serde_json::Value::String(code);
                 }
             }
+            crate::backends::apply_vsac_op_modifier(&mut f);
             f
         })
         .collect();
@@ -4030,32 +4338,31 @@ fn apply_compose_filters(
     // candidate set from phase 1 to switch from a top-down tree expansion to
     // per-candidate ancestor walks; regex filters run last so they only need
     // to materialise the (already narrowed) candidate set.
-    // Treat `op="in"` with a single non-comma value identically to `op="="`
-    // — the IG `notSelectable/notSelectable-prop-in*` fixtures use
-    // `filter: { property: notSelectable, op: in, value: "true" }`. FHIR
-    // spec `in` is a comma-separated list; the single-value case is the
-    // common one and reduces cleanly to equality. (Multi-value `in`
-    // expansion remains TODO — those fixtures aren't currently in scope.)
+    // `op="in"` is a comma-separated list of values (FHIR spec); a single
+    // value reduces to `=` — the IG `notSelectable/notSelectable-prop-in*`
+    // fixtures use `filter: { property: notSelectable, op: in, value: "true" }`.
+    // Multi-value lists are the union of the per-value equalities
+    // (`query_property_in`), and `property=concept|code` means code membership.
     let (property_filters, mut rest): (Vec<_>, Vec<_>) = filters.iter().partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        let value = f["value"].as_str().unwrap_or("");
-        let in_single_value = op == "in" && !value.contains(',');
-        (op == "=" || in_single_value) && property != "constraint"
+        (op == "=" || op == "in") && property != "constraint"
     });
-    // `not-in` (single-value) and `!=` filters select concepts whose property
-    // is NOT equal to the value (treating concepts with no such property as
-    // matching — they don't have notSelectable=true, so they pass).
-    // The IG `notSelectable/notSelectable-prop-out*` fixtures use
+    // `not-in` and `!=` filters select concepts whose property is NOT equal to
+    // any of the value(s) (treating concepts with no such property as matching
+    // — they don't have notSelectable=true, so they pass). The IG
+    // `notSelectable/notSelectable-prop-out*` fixtures use
     // `filter: { property: notSelectable, op: not-in, value: "true" }`.
     let (property_ne_filters, mut rest_ne): (Vec<_>, Vec<_>) = rest.drain(..).partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        let value = f["value"].as_str().unwrap_or("");
-        let not_in_single_value = op == "not-in" && !value.contains(',');
-        (op == "!=" || not_in_single_value) && property != "constraint"
+        (op == "!=" || op == "not-in") && property != "constraint"
     });
-    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_ne
+    // `exists`: concepts that have (value=true) / lack (value=false) the property.
+    let (property_exists_filters, mut rest_exists): (Vec<_>, Vec<_>) = rest_ne
+        .drain(..)
+        .partition(|f| f["op"].as_str() == Some("exists"));
+    let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_exists
         .drain(..)
         .partition(|f| f["op"].as_str() == Some("regex"));
 
@@ -4073,7 +4380,15 @@ fn apply_compose_filters(
             (p == "concept" || p == "code") && (o == "is-a" || o == "descendent-of")
         }
     };
-    if !property_filters.is_empty() && one_isa_hier() {
+    let all_single_valued = property_filters
+        .iter()
+        .all(|f| f["op"].as_str() == Some("=") || !f["value"].as_str().unwrap_or("").contains(','));
+    if !property_filters.is_empty()
+        && property_ne_filters.is_empty()
+        && property_exists_filters.is_empty()
+        && all_single_valued
+        && one_isa_hier()
+    {
         let hf = &hierarchy_filters[0];
         let op = hf["op"].as_str().unwrap_or("");
         let root_code = hf["value"].as_str().unwrap_or("");
@@ -4107,12 +4422,23 @@ fn apply_compose_filters(
     let mut result: Option<Vec<ExpansionContains>> = None;
     let mut any_filter_seen = false;
 
-    // ── Phase 1: property equality filters ────────────────────────────────────
+    // ── Phase 1: property equality / `in` filters ─────────────────────────────
     for f in &property_filters {
         let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
         any_filter_seen = true;
-        let concepts = query_property_eq(conn, system_url, system_id, property, value)?;
+        let concepts = if op == "in" {
+            query_property_in(
+                conn,
+                system_url,
+                system_id,
+                property,
+                &split_filter_values(value),
+            )?
+        } else {
+            query_property_eq(conn, system_url, system_id, property, value)?
+        };
         match result.as_mut() {
             Some(prev) => {
                 let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
@@ -4130,13 +4456,21 @@ fn apply_compose_filters(
     // MINUS those returned by `query_property_eq` for the same (prop, val).
     for f in &property_ne_filters {
         let property = f["property"].as_str().unwrap_or("");
+        let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
         any_filter_seen = true;
-        let excluded: HashSet<String> =
+        let matched = if op == "not-in" {
+            query_property_in(
+                conn,
+                system_url,
+                system_id,
+                property,
+                &split_filter_values(value),
+            )?
+        } else {
             query_property_eq(conn, system_url, system_id, property, value)?
-                .into_iter()
-                .map(|c| c.code)
-                .collect();
+        };
+        let excluded: HashSet<String> = matched.into_iter().map(|c| c.code).collect();
         match result.as_mut() {
             Some(prev) => {
                 prev.retain(|c| !excluded.contains(&c.code));
@@ -4149,6 +4483,36 @@ fn apply_compose_filters(
                     .filter(|c| !excluded.contains(&c.code))
                     .collect();
                 result = Some(kept);
+            }
+        }
+    }
+
+    // ── Phase 1.7: `exists` filters ───────────────────────────────────────────
+    // `value=true` keeps concepts that carry the property (any value);
+    // `value=false` keeps those that do not. `property=concept|code` is
+    // meaningless here (every concept has a code) and selects everything/nothing.
+    for f in &property_exists_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+        let want_present = parse_exists_value(value)?;
+        let having: HashSet<String> = if property == "concept" || property == "code" {
+            query_all_concepts_in_system(conn, system_url, system_id)?
+                .into_iter()
+                .map(|c| c.code)
+                .collect()
+        } else {
+            query_property_present(conn, system_id, property)?
+        };
+        match result.as_mut() {
+            Some(prev) => prev.retain(|c| having.contains(&c.code) == want_present),
+            None => {
+                let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                result = Some(
+                    all.into_iter()
+                        .filter(|c| having.contains(&c.code) == want_present)
+                        .collect(),
+                );
             }
         }
     }
@@ -4180,6 +4544,31 @@ fn apply_compose_filters(
             }
             let children = query_direct_children(conn, system_url, system_id, value)?;
             result = Some(children);
+            continue;
+        }
+
+        // `is-not-a`: every concept except the value and its descendants (the
+        // complement of `is-a`, FHIR R5 filter-operator). Without this arm the
+        // ECL fallback below treated it as unsupported and the include came
+        // back empty, so every code failed validation against such a ValueSet.
+        if (property == "concept" || property == "code") && op == "is-not-a" {
+            any_filter_seen = true;
+            let subtree: HashSet<String> =
+                query_descendants_full(conn, system_url, system_id, value, true)?
+                    .into_iter()
+                    .map(|c| c.code)
+                    .collect();
+            match result.as_mut() {
+                Some(prev) => prev.retain(|c| !subtree.contains(&c.code)),
+                None => {
+                    let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                    result = Some(
+                        all.into_iter()
+                            .filter(|c| !subtree.contains(&c.code))
+                            .collect(),
+                    );
+                }
+            }
             continue;
         }
 
@@ -4258,6 +4647,25 @@ fn apply_compose_filters(
             continue;
         }
 
+        // Slow path for is-a / descendent-of with no prior bounded set: read
+        // the subtree straight from `concept_closure` (falling back to the
+        // hierarchy CTE when the closure has not been built for this system).
+        // This never goes through the ECL tokenizer, so codes that are not
+        // valid ECL tokens — THO's `_ActEncounterCode`-style abstract codes —
+        // work like any other code.
+        if property_norm == "concept" && (op == "is-a" || op == "descendent-of") {
+            let concepts =
+                query_descendants_full(conn, system_url, system_id, value, op == "is-a")?;
+            match result.as_mut() {
+                Some(prev) => {
+                    let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                    prev.retain(|c| keep.contains(&c.code));
+                }
+                None => result = Some(concepts),
+            }
+            continue;
+        }
+
         // Slow path: no prior bounded set — compute the full ECL expansion.
         let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
         let concepts: Vec<ExpansionContains> = resolved
@@ -4304,7 +4712,7 @@ fn apply_compose_filters(
             if prev.is_empty() {
                 continue;
             }
-            if property == "code" || property.is_empty() {
+            if property == "code" || property == "concept" || property.is_empty() {
                 prev.retain(|c| regex.is_match(&c.code));
             } else {
                 let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
@@ -4534,6 +4942,83 @@ fn query_subtree_with_property(
     value: &str,
     text_filter: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for v in &values {
+        for c in query_subtree_with_property_exact(
+            conn,
+            system_url,
+            system_id,
+            root_code,
+            include_self,
+            property,
+            v,
+            text_filter,
+        )? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The values a filter value on `property` stands for: itself, plus — for
+/// a LOINC part property naming a part (`SCALE_TYP = DOC`) — the codes of
+/// the parts with that name (see [`crate::loinc_filters`]).
+fn loinc_filter_values(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<String>, HtsError> {
+    if !crate::loinc_filters::wants_name_lookup(property, value) {
+        return Ok(vec![value.to_string()]);
+    }
+    if let Some(codes) = crate::loinc_filters::cached(system_id, value) {
+        return Ok(crate::loinc_filters::with_codes(value, codes));
+    }
+    let is_loinc: bool = conn
+        .query_row(
+            "SELECT url = ?2 FROM code_systems WHERE id = ?1",
+            rusqlite::params![system_id, crate::loinc_filters::LOINC_URL],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let codes: Vec<String> = if is_loinc {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code FROM concepts c
+                 WHERE c.system_id = ?1 AND c.code >= 'LP' AND c.code < 'LQ'
+                   AND (lower(c.display) = lower(?2)
+                        OR EXISTS (SELECT 1 FROM concept_designations d
+                                   WHERE d.concept_id = c.id AND lower(d.value) = lower(?2)))
+                 ORDER BY c.code",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        stmt.query_map(rusqlite::params![system_id, value.trim()], |r| r.get(0))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+    crate::loinc_filters::remember(system_id, value, &codes);
+    Ok(crate::loinc_filters::with_codes(value, codes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_subtree_with_property_exact(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+    include_self: bool,
+    property: &str,
+    value: &str,
+    text_filter: Option<&str>,
+) -> Result<Vec<ExpansionContains>, HtsError> {
     // Property-first: idx_concept_properties_value narrows candidates to
     // O(K_property) rows before the closure PK checks ancestry.
     // For large SNOMED subtrees (e.g. "Disease" → 50 K descendants) with a
@@ -4624,6 +5109,29 @@ fn query_property_eq(
     property: &str,
     value: &str,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    if values.len() == 1 {
+        return query_property_eq_exact(conn, system_url, system_id, property, value);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for v in &values {
+        for c in query_property_eq_exact(conn, system_url, system_id, property, v)? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn query_property_eq_exact(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
     // Property-first: idx_concept_properties_value (property, value, concept_id)
     // narrows to O(K) candidates before filtering by system_id from concepts.
     let mut stmt = conn
@@ -4698,6 +5206,175 @@ fn query_all_concepts_in_system(
             contains: vec![],
         })
         .collect())
+}
+
+/// `true` when at least one concept row is stored for `system_id`.
+fn system_has_concepts(conn: &Connection, system_id: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM concepts WHERE system_id = ?1)",
+        [system_id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Split a FHIR compose-filter `value` for the list operators (`in`,
+/// `not-in`): comma-separated, whitespace-trimmed, empties dropped.
+fn split_filter_values(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Interpret the `value` of an `exists` filter. FHIR allows only `true` /
+/// `false`; anything else is a malformed ValueSet.
+fn parse_exists_value(value: &str) -> Result<bool, HtsError> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(HtsError::VsInvalid(format!(
+            "ValueSet compose filter with op='exists' requires value 'true' or 'false', got '{other}'"
+        ))),
+    }
+}
+
+/// Union of [`query_property_eq`] over every listed value — the FHIR `in`
+/// operator. `property=concept|code` selects the listed codes themselves.
+fn query_property_in(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    values: &[&str],
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    if property == "concept" || property == "code" {
+        let json_codes =
+            serde_json::to_string(values).map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concepts c
+                 WHERE  c.system_id = ?1
+                   AND  c.code IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([system_id, json_codes.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(rows
+            .into_iter()
+            .map(|(code, display)| bare_contains(system_url, code, display))
+            .collect());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<ExpansionContains> = Vec::new();
+    for v in values {
+        for c in query_property_eq(conn, system_url, system_id, property, v)? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Codes in `system_id` that carry at least one value for `property` — the
+/// FHIR `exists` operator.
+fn query_property_present(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+) -> Result<HashSet<String>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT DISTINCT c.code
+             FROM   concept_properties cp
+             JOIN   concepts c ON c.id = cp.concept_id AND c.system_id = ?1
+             WHERE  cp.property = ?2",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    stmt.query_map([system_id, property], |row| row.get::<_, String>(0))
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Every descendant of `root_code` (plus the root itself when `include_self`).
+///
+/// Reads `concept_closure` (one indexed range scan). When the closure has not
+/// been built for this system yet — a CodeSystem written moments ago, or a
+/// database that predates the closure table — falls back to the recursive
+/// `concept_hierarchy` walk the ECL evaluator uses, so the answer is the same
+/// either way. Bypasses the ECL tokenizer entirely, which matters for codes
+/// that are not valid ECL tokens (THO's `_ActEncounterCode`).
+fn query_descendants_full(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+    include_self: bool,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let closure_built: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_closure WHERE system_id = ?1)",
+            [system_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if closure_built {
+        // `concepts` is bound to the system and the closure range scan sits in
+        // an IN-subquery: this shape keeps the planner on the two primary-key
+        // indexes (the JOIN form let it scan every concept and probe the
+        // closure per row — seconds on a cold 2 GB database).
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT c.code, c.display
+                 FROM   concepts c
+                 WHERE  c.system_id = ?1
+                   AND  c.code IN (SELECT cc.descendant_code FROM concept_closure cc
+                                   WHERE cc.system_id = ?1 AND cc.ancestor_code = ?2)",
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![system_id, root_code], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| HtsError::StorageError(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        return Ok(rows
+            .into_iter()
+            .filter(|(code, _)| include_self || code != root_code)
+            .map(|(code, display)| bare_contains(system_url, code, display))
+            .collect());
+    }
+    let resolved = ecl::evaluator::fetch_descendants(conn, system_id, root_code, include_self)?;
+    Ok(resolved
+        .into_values()
+        .map(|c| bare_contains(system_url, c.code, c.display))
+        .collect())
+}
+
+/// An `expansion.contains` entry carrying only `system`/`code`/`display`.
+fn bare_contains(system_url: &str, code: String, display: Option<String>) -> ExpansionContains {
+    ExpansionContains {
+        system: system_url.to_owned(),
+        version: None,
+        code,
+        display,
+        is_abstract: None,
+        inactive: None,
+        designations: vec![],
+        properties: vec![],
+        extensions: vec![],
+        contains: vec![],
+    }
 }
 
 /// Returns the subset of `candidates` that are descendants (or self, when
@@ -4881,7 +5558,7 @@ fn query_regex_match(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let regex = compile_vs_regex(pattern)?;
 
-    if property == "code" || property.is_empty() {
+    if property == "code" || property == "concept" || property.is_empty() {
         // Match against the concept code itself.  Load all concepts for the
         // system and filter in Rust — there is no cheap SQL primitive for an
         // arbitrary regex, and concept counts in tx-ecosystem fixtures are
@@ -5039,78 +5716,61 @@ fn batch_direct_children_in_set(
 
 /// Return concepts in `system_id` matching `filter_lower`, ranked for typeahead.
 ///
-/// Prefers
-/// `concepts_search_fts` (preferred display + synonym designations) with FTS5
-/// `bm25`, then applies clinical heuristics via [`sort_typeahead_candidates`].
-/// Falls back to `concepts_fts` (display only) when the search index is empty.
+/// Searches `concepts_search_fts` (preferred display + synonym designations)
+/// with FTS5 `bm25`, then applies clinical heuristics via
+/// [`crate::backends::sort_typeahead_candidates`]. The caller must have run
+/// [`ensure_concepts_fts`] for `system_id`.
 fn fts_candidates_ranked_for_system(
     conn: &Connection,
     system_id: &str,
     system_url: &str,
     filter_lower: &str,
     limit_hint: Option<usize>,
-) -> Result<Vec<ExpansionContains>, HtsError> {
+) -> Result<(Vec<ExpansionContains>, bool), HtsError> {
     let match_expr = fts5_quote(filter_lower);
-    let limit = limit_hint
-        .map(|h| (h * 10).clamp(100, 5000))
-        .unwrap_or(5000) as i64;
+    let limit = candidate_limit(limit_hint, 10);
 
-    let search_populated: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM concepts_search_fts WHERE system_id = ?1 LIMIT 1)",
-            [system_id],
-            |r| r.get(0),
+    // A concept contributes one row per term (preferred display + each
+    // designation), so scores are collapsed per code with MIN — bm25 is
+    // negative and lower is better, i.e. the concept's best-matching term
+    // wins. The CTE must be MATERIALIZED: bm25() is an FTS5 auxiliary
+    // function and SQLite rejects it in an aggregate context, so without
+    // the fence it gets flattened into the GROUP BY and the query fails
+    // with "unable to use function bm25 in the requested context".
+    //
+    // No "is the search index populated for this system?" probe first:
+    // `system_id` is UNINDEXED, so `EXISTS(… WHERE system_id = ?)` walked the
+    // index in rowid order until it met the system — 0.6 s for SNOMED CT
+    // (its synonym rows sort after every negative designation rowid), 2 s for
+    // a system with no rows, on every filtered request. Every writer builds
+    // `concepts_search_fts` together with `concepts_fts` (callers run
+    // `ensure_concepts_fts` first), so the old display-only fallback could
+    // only ever find what this query finds.
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH hits AS MATERIALIZED (
+                 SELECT code, bm25(concepts_search_fts) AS rank
+                 FROM concepts_search_fts
+                 WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+             )
+             SELECT code, MIN(rank) AS rank
+             FROM hits
+             GROUP BY code
+             ORDER BY rank ASC
+             LIMIT ?3",
         )
-        .unwrap_or(false);
-
-    let ranked_codes: Vec<(String, f64)> = if search_populated {
-        // A concept contributes one row per term (preferred display + each
-        // designation), so scores are collapsed per code with MIN — bm25 is
-        // negative and lower is better, i.e. the concept's best-matching term
-        // wins. The CTE must be MATERIALIZED: bm25() is an FTS5 auxiliary
-        // function and SQLite rejects it in an aggregate context, so without
-        // the fence it gets flattened into the GROUP BY and the query fails
-        // with "unable to use function bm25 in the requested context".
-        let mut stmt = conn
-            .prepare_cached(
-                "WITH hits AS MATERIALIZED (
-                     SELECT code, bm25(concepts_search_fts) AS rank
-                     FROM concepts_search_fts
-                     WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
-                 )
-                 SELECT code, MIN(rank) AS rank
-                 FROM hits
-                 GROUP BY code
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let ranked_codes: Vec<(String, f64)> = stmt
+        .query_map(rusqlite::params![match_expr, system_id, limit], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })
         .map_err(|e| HtsError::StorageError(e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT code, display, bm25(concepts_fts) AS rank
-                 FROM concepts_fts
-                 WHERE concepts_fts MATCH ?1 AND system_id = ?2
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(2)?))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    let capped = hit_limit(ranked_codes.len(), limit);
     if ranked_codes.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], false));
     }
 
     let codes: Vec<String> = ranked_codes.iter().map(|(c, _)| c.clone()).collect();
@@ -5130,7 +5790,7 @@ fn fts_candidates_ranked_for_system(
         .collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    Ok(ranked_codes
+    let found = ranked_codes
         .into_iter()
         .filter_map(|(code, _rank)| {
             displays.get(&code).map(|display| ExpansionContains {
@@ -5146,59 +5806,8 @@ fn fts_candidates_ranked_for_system(
                 contains: vec![],
             })
         })
-        .collect())
-}
-
-/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
-///
-/// Secondary sort after FTS5 `bm25` in [`fts_candidates_ranked_for_system`].
-/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
-/// and short common phrases over long FSNs.
-fn sort_typeahead_candidates(candidates: &mut [ExpansionContains], query: &str) {
-    candidates.sort_by(|a, b| {
-        typeahead_match_score(query, a)
-            .cmp(&typeahead_match_score(query, b))
-            .then_with(|| {
-                a.display
-                    .as_deref()
-                    .unwrap_or("")
-                    .len()
-                    .cmp(&b.display.as_deref().unwrap_or("").len())
-            })
-            .then_with(|| a.code.cmp(&b.code))
-    });
-}
-
-fn typeahead_match_score(query: &str, hit: &ExpansionContains) -> i32 {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return i32::MAX;
-    }
-    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
-    let code = hit.code.to_lowercase();
-
-    if display == q {
-        return 0;
-    }
-    if code == q {
-        return 1;
-    }
-    if typeahead_word_match(&display, &q) {
-        return 20 + display.len() as i32;
-    }
-    if display.starts_with(&q) {
-        return 10 + display.len() as i32;
-    }
-    if let Some(pos) = display.find(&q) {
-        return 30 + pos as i32 + display.len() as i32;
-    }
-    i32::MAX
-}
-
-fn typeahead_word_match(display: &str, query: &str) -> bool {
-    display
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| word == query)
+        .collect();
+    Ok((found, capped))
 }
 
 /// Apply compose `filter[]` entries to an already-bounded candidate set.
@@ -5266,9 +5875,14 @@ fn apply_compose_filters_to_candidates(
                 let valid = batch_direct_children_in_set(conn, system_id, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
             }
+            ("concept", "is-not-a") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let subtree = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                candidates.retain(|c| !subtree.contains(&c.code));
+            }
             (_, "regex") => {
                 let regex = compile_vs_regex(value)?;
-                if property == "code" || property.is_empty() {
+                if property == "code" || property == "concept" || property.is_empty() {
                     candidates.retain(|c| regex.is_match(&c.code));
                 } else {
                     let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
@@ -5304,16 +5918,49 @@ fn apply_compose_filters_to_candidates(
                 let valid = batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
                 candidates.retain(|c| valid.contains(&c.code));
             }
-            // `not-in` (single value) and `!=`: keep candidates whose
-            // `(property, value)` does NOT match. The IG `notSelectable/
+            // `in`: comma-separated list; union of the per-value matches.
+            // `property=concept|code` means code-list membership.
+            ("concept", "in") => {
+                let wanted: HashSet<&str> = split_filter_values(value).into_iter().collect();
+                candidates.retain(|c| wanted.contains(c.code.as_str()));
+            }
+            (_, "in") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let mut valid: HashSet<String> = HashSet::new();
+                for v in split_filter_values(value) {
+                    valid.extend(batch_property_eq_in_set(
+                        conn, system_id, property, v, &codes,
+                    )?);
+                }
+                candidates.retain(|c| valid.contains(&c.code));
+            }
+            // `not-in` / `!=`: keep candidates whose `(property, value)` does
+            // NOT match any listed value. The IG `notSelectable/
             // notSelectable-prop-out*` fixtures rely on `not-in` semantics
             // — concepts with no matching property entry pass too.
+            ("concept", "not-in") => {
+                let unwanted: HashSet<&str> = split_filter_values(value).into_iter().collect();
+                candidates.retain(|c| !unwanted.contains(c.code.as_str()));
+            }
             (_, "not-in") | (_, "!=") => {
-                if !value.contains(',') {
-                    let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
-                    let excluded =
-                        batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
-                    candidates.retain(|c| !excluded.contains(&c.code));
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let mut excluded: HashSet<String> = HashSet::new();
+                for v in split_filter_values(value) {
+                    excluded.extend(batch_property_eq_in_set(
+                        conn, system_id, property, v, &codes,
+                    )?);
+                }
+                candidates.retain(|c| !excluded.contains(&c.code));
+            }
+            (_, "exists") => {
+                let want_present = parse_exists_value(value)?;
+                if property_norm == "concept" {
+                    if !want_present {
+                        candidates.clear();
+                    }
+                } else {
+                    let having = query_property_present(conn, system_id, property)?;
+                    candidates.retain(|c| having.contains(&c.code) == want_present);
                 }
             }
             _ => {}
@@ -5336,6 +5983,26 @@ fn batch_property_eq_in_set(
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
+    let values = loinc_filter_values(conn, system_id, property, value)?;
+    if values.len() == 1 {
+        return batch_property_eq_in_set_exact(conn, system_id, property, value, candidates);
+    }
+    let mut out = HashSet::new();
+    for v in &values {
+        out.extend(batch_property_eq_in_set_exact(
+            conn, system_id, property, v, candidates,
+        )?);
+    }
+    Ok(out)
+}
+
+fn batch_property_eq_in_set_exact(
+    conn: &Connection,
+    system_id: &str,
+    property: &str,
+    value: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
     let json_candidates =
         serde_json::to_string(candidates).map_err(|e| HtsError::StorageError(e.to_string()))?;
     let mut stmt = conn
@@ -5377,6 +6044,9 @@ fn try_multiinclude_hierarchy_page(
     offset: usize,
     warnings: &mut Vec<String>,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() >= 2 => a,
         _ => return Ok(None),
@@ -5494,38 +6164,13 @@ fn fnv64(data: &[u8]) -> u64 {
     h
 }
 
-/// Pattern extracted from a `?fhir_vs` implicit ValueSet URL.
-///
-/// FHIR defines query-parameter patterns on a CodeSystem URL that implicitly
-/// describe a ValueSet (FHIR R4 §4.8.7):
-///
-/// | URL form | Pattern | Meaning |
-/// |---|---|---|
-/// | `<cs>?fhir_vs` | `AllConcepts` | Every code in the CodeSystem |
-/// | `<cs>?fhir_vs=isa/<code>` | `IsA(code)` | Descendants (subsumees) of `code` |
-#[derive(Debug)]
-enum FhirVsPattern {
-    AllConcepts,
-    IsA(String),
-}
-
-/// Parse a `?fhir_vs` implicit ValueSet URL.
-///
-/// Returns `Some((cs_url, pattern))` on a recognised pattern, `None` otherwise.
-fn parse_fhir_vs_url(url: &str) -> Option<(String, FhirVsPattern)> {
-    let (base, query) = url.split_once('?')?;
-    if !query.starts_with("fhir_vs") {
-        return None;
+/// The ECL an `ecl/` or `refset/` implicit ValueSet pattern stands for.
+fn implicit_ecl(pattern: &ImplicitVsPattern) -> Option<String> {
+    match pattern {
+        ImplicitVsPattern::Ecl(expr) => Some(expr.clone()),
+        ImplicitVsPattern::Refset(id) => Some(format!("^ {id}")),
+        _ => None,
     }
-    let rest = &query["fhir_vs".len()..];
-    if rest.is_empty() {
-        return Some((base.to_owned(), FhirVsPattern::AllConcepts));
-    }
-    let value = rest.strip_prefix('=')?;
-    if let Some(code) = value.strip_prefix("isa/") {
-        return Some((base.to_owned(), FhirVsPattern::IsA(code.to_owned())));
-    }
-    None
 }
 
 /// Check whether a compose is a "simple hierarchy" and extract its parameters.
@@ -5697,6 +6342,9 @@ fn extract_simple_hierarchy_compose(
     compose: &serde_json::Value,
     warnings: &mut Vec<String>,
 ) -> Result<Option<(String, String, String, bool)>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() == 1 => a,
         _ => return Ok(None),
@@ -5746,6 +6394,80 @@ fn extract_simple_hierarchy_compose(
     )))
 }
 
+/// Number of codes [`bfs_expand_page`] pages through for `pattern` and
+/// `filter_lower`: the same predicates as a `COUNT(*)`, nothing materialised
+/// (an index range count over `concepts` or `concept_closure`, or an FTS
+/// match count).
+fn bfs_expand_total(
+    conn: &Connection,
+    system_id: &str,
+    pattern: &ImplicitVsPattern,
+    filter_lower: Option<&str>,
+) -> Result<u32, HtsError> {
+    let n: i64 = match pattern {
+        ImplicitVsPattern::AllConcepts => match filter_lower {
+            Some(f) if f.len() >= 3 => conn.query_row(
+                "SELECT COUNT(*) FROM concepts_fts WHERE concepts_fts MATCH ?1 AND system_id = ?2",
+                rusqlite::params![fts5_quote(f), system_id],
+                |r| r.get(0),
+            ),
+            Some(f) => conn.query_row(
+                "SELECT COUNT(*) FROM concepts_word_fts \
+                 WHERE concepts_word_fts MATCH ?1 AND system_id = ?2",
+                rusqlite::params![fts5_word_prefix(f), system_id],
+                |r| r.get(0),
+            ),
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+                [system_id],
+                |r| r.get(0),
+            ),
+        },
+        ImplicitVsPattern::IsA(root) | ImplicitVsPattern::DescendantOf(root) => {
+            let include_root = i64::from(matches!(pattern, ImplicitVsPattern::IsA(_)));
+            match filter_lower {
+                Some(f) if f.len() >= 3 => conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM   concepts_fts cf
+                     JOIN   concept_closure cc
+                            ON cc.system_id = ?2 AND cc.ancestor_code = ?3
+                            AND cc.descendant_code = cf.code
+                     WHERE  cf.system_id = ?2
+                       AND  concepts_fts MATCH ?1
+                       AND  (cf.code != ?3 OR ?4)",
+                    rusqlite::params![fts5_quote(f), system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+                Some(f) => conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM   concept_closure cc
+                     JOIN   concepts c ON c.system_id = ?2 AND c.code = cc.descendant_code
+                     WHERE  cc.system_id = ?2
+                       AND  cc.ancestor_code = ?3
+                       AND  (cc.descendant_code != ?3 OR ?4)
+                       AND  (LOWER(c.code) LIKE ?1 OR LOWER(COALESCE(c.display,'')) LIKE ?1)",
+                    rusqlite::params![format!("%{f}%"), system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+                None => conn.query_row(
+                    "SELECT COUNT(*) FROM concept_closure
+                     WHERE system_id = ?1 AND ancestor_code = ?2
+                       AND (descendant_code != ?2 OR ?3)",
+                    rusqlite::params![system_id, root, include_root],
+                    |r| r.get(0),
+                ),
+            }
+        }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => {
+            return Err(HtsError::Internal(
+                "bfs_expand_total called for an ECL implicit ValueSet".into(),
+            ));
+        }
+    }
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(u32::try_from(n.max(0)).unwrap_or(u32::MAX))
+}
+
 /// Serve a page of an implicit ValueSet without waiting for the full cache.
 ///
 /// Used as the "cold-cache fast path" when `ensure_implicit_cache` would block
@@ -5757,13 +6479,13 @@ fn bfs_expand_page(
     conn: &Connection,
     cs_url: &str,
     system_id: &str,
-    pattern: &FhirVsPattern,
+    pattern: &ImplicitVsPattern,
     offset: usize,
     limit: usize,
     filter_lower: Option<&str>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     match pattern {
-        FhirVsPattern::AllConcepts => {
+        ImplicitVsPattern::AllConcepts => {
             let sql_limit = limit as i64;
             let sql_offset = offset as i64;
             if let Some(f) = filter_lower {
@@ -5866,7 +6588,7 @@ fn bfs_expand_page(
                 .map_err(|e| HtsError::StorageError(e.to_string()))
             }
         }
-        FhirVsPattern::IsA(root_code) => bfs_isa_page(
+        ImplicitVsPattern::IsA(root_code) => bfs_isa_page(
             conn,
             cs_url,
             system_id,
@@ -5876,6 +6598,21 @@ fn bfs_expand_page(
             limit,
             filter_lower,
         ),
+        // http://loinc.org/vs/<LP…>: the part's descendants (`<`).
+        ImplicitVsPattern::DescendantOf(root_code) => bfs_isa_page(
+            conn,
+            cs_url,
+            system_id,
+            root_code,
+            false,
+            offset,
+            limit,
+            filter_lower,
+        ),
+        // No paged shortcut: callers send these to the cached expansion.
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => Err(HtsError::Internal(
+            "bfs_expand_page called for an ECL implicit ValueSet".into(),
+        )),
     }
 }
 
@@ -6060,6 +6797,14 @@ fn resolve_compose_system_id(
     if rows.is_empty() {
         return Ok(None);
     }
+    // A SNOMED CT edition URI names a stored release (a URI also contains
+    // dots, which would otherwise send it down the pattern branch).
+    let mapped = crate::operations::snomed_version::map_compose_version(
+        url,
+        version,
+        rows.iter().filter_map(|(_, v)| v.as_deref()),
+    );
+    let version = mapped.as_deref().or(version);
 
     // Match exactly the same rules as `resolve_ver_against_candidates`
     // (single-integer "1"/"2" => EXACT, dotted "1.0"/"1.0.0" => prefix/wildcard,
@@ -6123,13 +6868,6 @@ fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    // Build lookup: (system_url, code) → ExpansionContains.
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
-        .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
-        .collect();
-
     // Set of all (system_url, code) pairs in the expansion for fast membership checks.
     let expansion_set: HashSet<(String, String)> = flat
         .iter()
@@ -6159,8 +6897,6 @@ fn build_hierarchical_expansion(
     // both endpoints are in the expansion.
     // parent_to_children: (system_url, parent_code) → Vec<(system_url, child_code)>
     let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    // has_parent: tracks which codes have a parent within the expansion.
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
 
     for (sys_url, sys_id) in &system_id_map {
         let mut stmt = conn
@@ -6186,57 +6922,17 @@ fn build_hierarchical_expansion(
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    // Roots: concepts that appear in the expansion but have no parent within it.
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-///
-/// Looks up `key` in `items_map` to get the base node, then checks
-/// `parent_to_children` for any children of that node, recursing into each
-/// child.  Children are sorted by code before being attached, producing a
-/// deterministic tree order regardless of the order edges were stored in
-/// `concept_hierarchy`.
-///
-/// ## Parameters
-/// - `key` — `(system_url, code)` of the concept to build.
-/// - `items_map` — flat `(system_url, code)` → [`ExpansionContains`] lookup.
-/// - `parent_to_children` — adjacency map built from `concept_hierarchy` edges
-///   that are fully contained within the expansion set.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    // Shared with PostgreSQL; stops at back-edges (SNOMED CT RF2 leaves
+    // mutual parent/child pairs) and roots rootless cycles (upstream 8c1ce8fc8).
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.
@@ -6340,8 +7036,62 @@ fn populate_cache(
         }
     }
 
+    if let Err(e) = record_dependencies(conn, vs_id) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+
     conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Replace the `value_set_dependencies` rows of `vs_id` (see the PostgreSQL
+/// twin `record_dependencies`).
+pub(crate) fn record_dependencies(conn: &Connection, vs_id: &str) -> Result<(), HtsError> {
+    let db = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let compose_of = |sql: &str, key: &str| -> Result<Vec<serde_json::Value>, HtsError> {
+        let mut stmt = conn.prepare_cached(sql).map_err(db)?;
+        let rows = stmt
+            .query_map([key], |r| r.get::<_, Option<String>>(0))
+            .map_err(db)?
+            .filter_map(|r| r.ok().flatten())
+            .filter_map(|c| serde_json::from_str(&c).ok())
+            .collect();
+        Ok(rows)
+    };
+    let own = compose_of("SELECT compose_json FROM value_sets WHERE id = ?1", vs_id)?;
+    let mut deps: Vec<String> = Vec::new();
+    for compose in &own {
+        let mut failed = None;
+        let found = crate::backends::transitive_dependencies(compose, |url| {
+            match compose_of("SELECT compose_json FROM value_sets WHERE url = ?1", url) {
+                Ok(v) => v,
+                Err(e) => {
+                    failed = Some(e);
+                    Vec::new()
+                }
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        for d in found {
+            if !deps.contains(&d) {
+                deps.push(d);
+            }
+        }
+    }
+    conn.execute("DELETE FROM value_set_dependencies WHERE value_set_id = ?1", [vs_id])
+        .map_err(db)?;
+    let mut insert = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO value_set_dependencies (value_set_id, dep_url) VALUES (?1, ?2)",
+        )
+        .map_err(db)?;
+    for d in deps {
+        insert.execute(rusqlite::params![vs_id, d]).map_err(db)?;
+    }
+    Ok(())
 }
 
 /// Build a [`ValidateCodeResponse`] from an optional matching concept.
@@ -6736,6 +7486,13 @@ fn resolve_ver_against_candidates(
     candidates: &[(String, Option<String>)],
     ver: &str,
 ) -> Option<String> {
+    // A SNOMED CT edition URI names a stored release (see `snomed_version`).
+    if crate::operations::snomed_version::parse_version_uri(ver).is_some() {
+        let stored: Vec<String> = candidates.iter().filter_map(|(_, v)| v.clone()).collect();
+        if let Some(mapped) = crate::operations::snomed_version::map_version(ver, &stored) {
+            return Some(mapped);
+        }
+    }
     if ver.contains(".x") || ver == "x" || ver.contains('.') {
         // Pattern/prefix matching: "1.0" → highest "1.0.x", "1.x" → highest "1.y.z"
         super::code_system_select_version_match(candidates, ver).and_then(|(_, v)| v)
@@ -6784,6 +7541,22 @@ fn version_satisfies_wildcard(version: &str, pattern: &str) -> bool {
 }
 
 /// Look up the display for a specific code at a specific CS version.
+/// Display of `code` in the CodeSystem row that wins for `system_url`
+/// (no version pin), following the shared precedence order.
+fn lookup_display_any_version(conn: &Connection, system_url: &str, code: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT c.display FROM concepts c \
+         JOIN code_systems s ON c.system_id = s.id \
+         WHERE s.url = ?1 AND c.code = ?2 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("s")
+    );
+    conn.query_row(&sql, rusqlite::params![system_url, code], |row| {
+        row.get::<_, Option<String>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
 fn lookup_display_at_version(
     conn: &Connection,
     system_url: &str,
@@ -7237,12 +8010,13 @@ fn finish_validate_code_response(
     is_inactive: bool,
     vs_version: Option<&str>,
     is_inactive_in_underlying_cs: bool,
+    inactive_excluded_by_vs: bool,
     code_unknown_in_cs: bool,
     code_unknown_at_version_only: bool,
     cs_version_for_msg: Option<&str>,
     req_version_hint: Option<&str>,
     lenient_display: bool,
-    cs_is_fragment: bool,
+    cs_content: Option<&str>,
     cs_display_lookup: Option<&str>,
     normalized_code: Option<&str>,
 ) -> Result<ValidateCodeResponse, HtsError> {
@@ -7282,7 +8056,7 @@ fn finish_validate_code_response(
             // pair), result=true, and the `UNKNOWN_CODE_IN_FRAGMENT` message-id —
             // the missing code might still be valid in a different fragment of
             // the same system.
-            if cs_is_fragment && code_unknown_in_cs {
+            if crate::types::may_hold_unlisted_codes(cs_content, system_for_msg) && code_unknown_in_cs {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => format!(
@@ -7325,7 +8099,7 @@ fn finish_validate_code_response(
             // or activeOnly=true). The IG expects a business-rule error
             // ("valid but not active"), the not-in-vs error, AND a
             // code-comment warning ("has a status of inactive").
-            if is_inactive_in_underlying_cs {
+            if is_inactive_in_underlying_cs && inactive_excluded_by_vs {
                 issues.push(crate::types::ValidationIssue {
                     severity: "error".into(),
                     fhir_code: "business-rule".into(),
@@ -7352,7 +8126,10 @@ fn finish_validate_code_response(
             // is itself unknown — the operations layer already adds a
             // `not-found` / `not-found` issue for that case, and double-emitting
             // would inflate the issue count.
-            if code_unknown_in_cs && cs_version_for_msg.is_some() {
+            // A versionless CodeSystem is still a loaded one: report the code
+            // as unknown unless the CodeSystem is only a `not-present` stub.
+            let cs_known = cs_content.is_some_and(|c| c != "not-present");
+            if code_unknown_in_cs && (cs_version_for_msg.is_some() || cs_known) {
                 if let Some(sys) = system_for_msg {
                     let cs_text = match cs_version_for_msg {
                         Some(v) => {
@@ -7618,7 +8395,7 @@ fn finish_validate_code_response(
 fn validate_fhir_vs(
     conn: &Connection,
     cs_url: &str,
-    pattern: &FhirVsPattern,
+    pattern: &ImplicitVsPattern,
     code: &str,
     system: Option<&str>,
 ) -> Result<Option<ExpansionContains>, HtsError> {
@@ -7641,8 +8418,17 @@ fn validate_fhir_vs(
         }
     };
 
+    if let Some(expr) = implicit_ecl(pattern) {
+        // One membership test, not a full evaluation.
+        let hit = ecl::filter_candidates(conn, &system_id, &expr, &[code.to_owned()])?;
+        if hit.is_empty() {
+            return Ok(None);
+        }
+        return validate_fhir_vs(conn, cs_url, &ImplicitVsPattern::AllConcepts, code, system);
+    }
+
     match pattern {
-        FhirVsPattern::AllConcepts => {
+        ImplicitVsPattern::AllConcepts => {
             let row = conn
                 .query_row(
                     "SELECT code, display FROM concepts \
@@ -7669,7 +8455,10 @@ fn validate_fhir_vs(
                 contains: vec![],
             }))
         }
-        FhirVsPattern::IsA(root_code) => {
+        ImplicitVsPattern::IsA(root_code) | ImplicitVsPattern::DescendantOf(root_code) => {
+            if matches!(pattern, ImplicitVsPattern::DescendantOf(_)) && code == root_code {
+                return Ok(None);
+            }
             // O(1) closure lookup: is root_code an ancestor-or-self of code?
             let is_member: bool = conn
                 .query_row(
@@ -7712,6 +8501,7 @@ fn validate_fhir_vs(
                 contains: vec![],
             }))
         }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => unreachable!("handled above"),
     }
 }
 
@@ -7737,10 +8527,12 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     // Determine the code system and the set of concepts to cache.
     // AllConcepts is also used for the CodeSystem.valueSet link path.
-    let (cs_url, pattern) = if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
-        (cs_url, FhirVsPattern::AllConcepts)
-    } else if let Some((cs_url, pat)) = parse_fhir_vs_url(url) {
+    // The URL forms first: `find_cs_for_implicit_vs` parses every stored
+    // CodeSystem's JSON.
+    let (cs_url, pattern) = if let Some((cs_url, pat)) = parse_implicit_vs_url(url) {
         (cs_url, pat)
+    } else if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
+        (cs_url, ImplicitVsPattern::AllConcepts)
     } else {
         return Err(HtsError::NotFound(format!(
             "A definition for the value Set \'{url}\' could not be found"
@@ -7749,6 +8541,12 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
 
     let system_id = resolve_system_id_cached(conn, &cs_url)?
         .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+
+    // Evaluate ECL before taking the write lock.
+    let ecl_members = match implicit_ecl(&pattern) {
+        Some(expr) => Some(ecl::parse_and_evaluate(conn, &system_id, &expr)?),
+        None => None,
+    };
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
     // cannot both see an empty cache and then duplicate-write the expansion.
@@ -7775,29 +8573,48 @@ fn ensure_implicit_cache(conn: &Connection, url: &str, date: Option<&str>) -> Re
         return Ok(());
     }
 
+    // Stale FTS rows (built from earlier cache rows of this url) go too.
+    if let Err(e) = drop_implicit_fts(conn, url) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
     if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(HtsError::StorageError(e.to_string()));
     }
 
     let insert_result = match &pattern {
-        FhirVsPattern::AllConcepts => conn.execute(
+        ImplicitVsPattern::AllConcepts => conn.execute(
             "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
              SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
             rusqlite::params![url, cs_url, system_id],
         ),
-        FhirVsPattern::IsA(root_code) => {
+        ImplicitVsPattern::IsA(root_code) | ImplicitVsPattern::DescendantOf(root_code) => {
             // O(1) closure JOIN replaces the recursive CTE.
-            // << semantics: all descendants plus the root itself (self-link in closure).
+            // << semantics: all descendants plus the root itself (self-link in
+            // closure); `DescendantOf` drops the self-link.
+            let include_root = matches!(pattern, ImplicitVsPattern::IsA(_));
             conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
                  SELECT ?1, ?2, c.code, c.display
                  FROM   concept_closure cc
                  JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
-                rusqlite::params![url, cs_url, system_id, root_code],
+                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4
+                   AND  (?5 OR cc.descendant_code != ?4)",
+                rusqlite::params![url, cs_url, system_id, root_code, include_root],
             )
         }
+        ImplicitVsPattern::Ecl(_) | ImplicitVsPattern::Refset(_) => (|| {
+            let mut stmt = conn.prepare_cached(
+                "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut n = 0;
+            for c in ecl_members.iter().flatten() {
+                n += stmt.execute(rusqlite::params![url, cs_url, c.code, c.display])?;
+            }
+            Ok(n)
+        })(),
     };
 
     if let Err(e) = insert_result {
@@ -8167,95 +8984,108 @@ fn fts5_word_prefix(term: &str) -> String {
     format!("{}*", term.replace('"', "\"\""))
 }
 
-/// Count cached entries matching an optional filter for an implicit VS URL.
-///
-/// Ensure the FTS5 mirror of the implicit expansion cache is populated for `url`.
+/// Rowid range `[block << 32, (block + 1) << 32)` of one implicit-expansion
+/// url's rows in `implicit_expansion_fts` / `implicit_expansion_word_fts`.
+fn implicit_fts_rowids(block: i64) -> (i64, i64) {
+    (block << 32, ((block + 1) << 32) - 1)
+}
+
+/// The rowid block of `url`'s implicit-expansion FTS rows, if they are built.
+fn implicit_fts_block(conn: &Connection, url: &str) -> Result<Option<i64>, HtsError> {
+    conn.query_row(
+        "SELECT block FROM implicit_expansion_fts_built WHERE url = ?1",
+        [url],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))
+}
+
+/// Remove `url`'s rows from both implicit-expansion FTS tables, and its
+/// tracker row. Deletes the url's rowid block — the `url` column is
+/// `UNINDEXED`, so `DELETE … WHERE url = ?` would scan every url's rows. Run
+/// it (inside the caller's transaction) whenever `url`'s
+/// `implicit_expansion_cache` rows are replaced or removed.
+pub(crate) fn drop_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
+    let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+    let Some(block) = implicit_fts_block(conn, url)? else {
+        return Ok(());
+    };
+    let (lo, hi) = implicit_fts_rowids(block);
+    conn.execute(
+        "DELETE FROM implicit_expansion_fts WHERE rowid BETWEEN ?1 AND ?2",
+        [lo, hi],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_word_fts WHERE rowid BETWEEN ?1 AND ?2",
+        [lo, hi],
+    )
+    .map_err(err)?;
+    conn.execute(
+        "DELETE FROM implicit_expansion_fts_built WHERE block = ?1",
+        [block],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Ensure the FTS5 mirrors of the implicit expansion cache are populated for
+/// `url`, and return the url's rowid block (see [`implicit_fts_rowids`]).
 ///
 /// Populated lazily — only called when a text filter is actually needed so that
 /// unfiltered requests (e.g. EX01 hierarchy expansions) pay no FTS5 overhead.
-/// Reads rows from `implicit_expansion_cache` and bulk-inserts them into
-/// `implicit_expansion_fts` via a single `INSERT … SELECT` statement.
-fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<(), HtsError> {
-    // Check both FTS tables in one query; either missing triggers a (re)build.
-    let (trigram_ok, word_ok): (bool, bool) = conn
-        .query_row(
-            "SELECT
-               EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
-               EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
-            [url],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    if trigram_ok && word_ok {
-        return Ok(());
+/// Copies the url's `implicit_expansion_cache` rows into
+/// `implicit_expansion_fts` and `implicit_expansion_word_fts`, numbered inside
+/// a rowid block that `implicit_expansion_fts_built` assigns, so lookups and
+/// deletes seek the block instead of filtering on the `UNINDEXED` url column.
+fn ensure_implicit_fts(conn: &Connection, url: &str) -> Result<i64, HtsError> {
+    if let Some(block) = implicit_fts_block(conn, url)? {
+        return Ok(block);
     }
 
     // BEGIN IMMEDIATE acquires the write lock upfront so concurrent VUs don't
     // each rebuild the same 350K-row index independently (mirrors ensure_concepts_fts).
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    // Re-check inside the lock: another VU may have built the index while we waited.
-    let (still_no_trigram, still_no_word): (bool, bool) = match conn.query_row(
-        "SELECT
-           NOT EXISTS(SELECT 1 FROM implicit_expansion_fts      WHERE url = ?1 LIMIT 1),
-           NOT EXISTS(SELECT 1 FROM implicit_expansion_word_fts WHERE url = ?1 LIMIT 1)",
-        [url],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ) {
-        Ok(v) => v,
+    let built = (|| -> Result<i64, HtsError> {
+        // Re-check inside the lock: another VU may have built the index while we waited.
+        if let Some(block) = implicit_fts_block(conn, url)? {
+            return Ok(block);
+        }
+        let err = |e: rusqlite::Error| HtsError::StorageError(e.to_string());
+        conn.execute(
+            "INSERT INTO implicit_expansion_fts_built (url) VALUES (?1)",
+            [url],
+        )
+        .map_err(err)?;
+        let block = conn.last_insert_rowid();
+        let (base, _) = implicit_fts_rowids(block);
+        for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (rowid, url, system_url, code, display)
+                     SELECT ?2 + ROW_NUMBER() OVER (), url, system_url, code, display
+                     FROM implicit_expansion_cache
+                     WHERE url = ?1"
+                ),
+                rusqlite::params![url, base],
+            )
+            .map_err(err)?;
+        }
+        Ok(block)
+    })();
+    match built {
+        Ok(block) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(block)
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-    };
-
-    if !still_no_trigram && !still_no_word {
-        conn.execute_batch("COMMIT")
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        return Ok(());
-    }
-
-    if still_no_trigram {
-        if let Err(e) = conn.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url]) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-        if let Err(e) = conn.execute(
-            "INSERT INTO implicit_expansion_fts (url, system_url, code, display)
-             SELECT url, system_url, code, display
-             FROM implicit_expansion_cache
-             WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
+            Err(e)
         }
     }
-
-    if still_no_word {
-        if let Err(e) = conn.execute(
-            "DELETE FROM implicit_expansion_word_fts WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-        if let Err(e) = conn.execute(
-            "INSERT INTO implicit_expansion_word_fts (url, system_url, code, display)
-             SELECT url, system_url, code, display
-             FROM implicit_expansion_cache
-             WHERE url = ?1",
-            [url],
-        ) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-    }
-
-    conn.execute_batch("COMMIT")
-        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Ensure the FTS5 trigram index on `concepts_fts` is populated for `system_id`.
@@ -8302,9 +9132,12 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
         return Ok(());
     }
 
-    if let Err(e) = conn.execute("DELETE FROM concepts_fts WHERE system_id = ?1", [system_id]) {
+    // Clear leftovers by rowid: `system_id` is UNINDEXED in the FTS tables,
+    // so deleting by it scans every system's rows (millions with SNOMED CT and
+    // LOINC loaded) while this transaction holds the write lock.
+    if let Err(e) = crate::import::fhir_bundle::delete_concept_fts_rows(conn, system_id) {
         let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
+        return Err(e);
     }
 
     if let Err(e) = conn.execute(
@@ -8317,13 +9150,6 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
     }
 
     // Also populate the word-prefix FTS used for short (< 3 char) filter terms.
-    if let Err(e) = conn.execute(
-        "DELETE FROM concepts_word_fts WHERE system_id = ?1",
-        [system_id],
-    ) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_word_fts(rowid, system_id, code, display)
          SELECT id, system_id, code, display FROM concepts WHERE system_id = ?1",
@@ -8355,12 +9181,8 @@ fn populate_concepts_search_fts_for_system(
     conn: &Connection,
     system_id: &str,
 ) -> Result<(), HtsError> {
-    conn.execute(
-        "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-        [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
+    // Callers clear the system's previous rows by rowid first
+    // (`fhir_bundle::delete_concept_fts_rows`).
     conn.execute(
         "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
          SELECT id, system_id, code, display FROM concepts
@@ -8392,23 +9214,23 @@ fn implicit_cache_count(
 ) -> Result<u32, HtsError> {
     let n: i64 = match filter_lower {
         Some(f) if f.len() >= 3 => {
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let match_expr = fts5_quote(f);
             conn.query_row(
                 "SELECT COUNT(*) FROM implicit_expansion_fts
-                 WHERE implicit_expansion_fts MATCH ?1 AND url = ?2",
-                rusqlite::params![match_expr, url],
+                 WHERE implicit_expansion_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+                rusqlite::params![match_expr, lo, hi],
                 |r| r.get(0),
             )
         }
         Some(f) => {
             // Short filter (1–2 chars): word-prefix FTS count avoids O(N) LIKE scan.
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let prefix_expr = fts5_word_prefix(f);
             conn.query_row(
                 "SELECT COUNT(*) FROM implicit_expansion_word_fts
-                 WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2",
-                rusqlite::params![prefix_expr, url],
+                 WHERE implicit_expansion_word_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+                rusqlite::params![prefix_expr, lo, hi],
                 |r| r.get(0),
             )
         }
@@ -8435,7 +9257,7 @@ fn implicit_cache_page(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     match filter_lower {
         Some(f) if f.len() >= 3 => {
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let match_expr = fts5_quote(f);
             let mut stmt = conn
                 .prepare_cached(
@@ -8445,12 +9267,12 @@ fn implicit_cache_page(
                     // set is sorted in Rust below — O(N log N) on 20–100 rows.
                     "SELECT system_url, code, display
                      FROM implicit_expansion_fts
-                     WHERE implicit_expansion_fts MATCH ?1 AND url = ?2
-                     LIMIT ?3 OFFSET ?4",
+                     WHERE implicit_expansion_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3
+                     LIMIT ?4 OFFSET ?5",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let mut rows = stmt
-                .query_map(rusqlite::params![match_expr, url, limit, offset], |r| {
+                .query_map(rusqlite::params![match_expr, lo, hi, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
                         version: None,
@@ -8476,18 +9298,18 @@ fn implicit_cache_page(
         Some(f) => {
             // Short filter (1–2 chars): word-prefix FTS so `di*` matches any
             // token starting with "di" — O(log N) vs O(N) LIKE scan on 350K rows.
-            ensure_implicit_fts(conn, url)?;
+            let (lo, hi) = implicit_fts_rowids(ensure_implicit_fts(conn, url)?);
             let prefix_expr = fts5_word_prefix(f);
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT system_url, code, display
                      FROM implicit_expansion_word_fts
-                     WHERE implicit_expansion_word_fts MATCH ?1 AND url = ?2
-                     LIMIT ?3 OFFSET ?4",
+                     WHERE implicit_expansion_word_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3
+                     LIMIT ?4 OFFSET ?5",
                 )
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let mut rows = stmt
-                .query_map(rusqlite::params![prefix_expr, url, limit, offset], |r| {
+                .query_map(rusqlite::params![prefix_expr, lo, hi, limit, offset], |r| {
                     Ok(ExpansionContains {
                         system: r.get(0)?,
                         version: None,
@@ -8583,6 +9405,11 @@ fn populate_implicit_cache(
         return Ok(());
     }
 
+    // Stale FTS rows (built from earlier cache rows of this url) go too.
+    if let Err(e) = drop_implicit_fts(conn, url) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
     if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(HtsError::StorageError(e.to_string()));
@@ -9521,6 +10348,39 @@ mod tests {
         assert_eq!(resp.display, Some("Concept A".into()));
     }
 
+    // ── $validate-code: a value set taking all of UCUM ────────────────────────
+
+    #[tokio::test]
+    async fn validate_code_whole_ucum_value_set_accepts_well_formed_units() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [
+            { "resource": { "resourceType": "CodeSystem", "id": "ucum", "url": "http://unitsofmeasure.org",
+                            "name": "UCUM", "status": "active", "content": "not-present" } },
+            { "resource": { "resourceType": "ValueSet", "id": "units", "url": "http://example.org/vs-units",
+                            "name": "Units", "status": "active",
+                            "compose": { "include": [
+                              { "system": "http://snomed.info/sct", "concept": [{ "code": "733006000" }] },
+                              { "system": "http://unitsofmeasure.org" } ] } } }
+          ]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+        let check = |code: &str| ValidateCodeRequest {
+            url: Some("http://example.org/vs-units".into()),
+            system: Some("http://unitsofmeasure.org".into()),
+            code: code.into(),
+            ..Default::default()
+        };
+        for code in ["mg/m2", "{tbl}", "mm[Hg]"] {
+            let resp = b.validate_code(&ctx(), check(code)).await.unwrap();
+            assert!(resp.result, "{code}: {resp:?}");
+            assert_eq!(resp.system.as_deref(), Some("http://unitsofmeasure.org"));
+        }
+        let resp = b.validate_code(&ctx(), check("not-a-unit")).await.unwrap();
+        assert!(!resp.result, "{resp:?}");
+    }
+
     // ── $validate-code: code NOT in set ───────────────────────────────────────
 
     #[tokio::test]
@@ -10196,6 +11056,251 @@ mod tests {
             }
           }]
         }"#
+    }
+
+    /// A LOINC-shaped CodeSystem: part LP1-1 > part LP2-2 > term 2345-7, and
+    /// an unrelated term.
+    fn bundle_loinc_like() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "loinc",
+              "url": "http://loinc.org",
+              "version": "2.80",
+              "status": "active",
+              "content": "complete",
+              "concept": [
+                {
+                  "code": "LP1-1",
+                  "display": "Chemistry",
+                  "concept": [{
+                    "code": "LP2-2",
+                    "display": "Glucose",
+                    "concept": [{ "code": "2345-7", "display": "Glucose [Mass/volume] in Serum or Plasma" }]
+                  }]
+                },
+                { "code": "999-9", "display": "Unrelated term" }
+              ]
+            }
+          }]
+        }"#
+    }
+
+    /// Wait for the implicit-cache population a cold paged `$expand` starts
+    /// in the background. The in-memory test database is shared-cache, where
+    /// a concurrent writer fails readers with "table is locked" instead of
+    /// making them wait as WAL does.
+    fn wait_for_background_cache(b: &SqliteTerminologyBackend) {
+        for _ in 0..500 {
+            if b.bg_index_pending.lock().unwrap().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("background implicit cache population did not finish");
+    }
+
+    async fn expand_codes(
+        b: &SqliteTerminologyBackend,
+        url: &str,
+        count: Option<u32>,
+    ) -> Vec<String> {
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some(url.into()),
+                    count,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("expand {url}: {e:?}"));
+        wait_for_background_cache(b);
+        let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
+        codes.sort();
+        codes
+    }
+
+    async fn validates(b: &SqliteTerminologyBackend, url: &str, code: &str) -> bool {
+        b.validate_code(
+            &ctx(),
+            ValidateCodeRequest {
+                url: Some(url.into()),
+                code: code.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("validate {url} {code}: {e:?}"))
+        .result
+    }
+
+    /// `http://loinc.org/vs` is all of LOINC; `http://loinc.org/vs/<LP…>` the
+    /// codes under that part (not the part itself). Both the paged cold path
+    /// (`count`) and the cached full expansion.
+    #[tokio::test]
+    async fn loinc_implicit_value_sets_expand_and_validate() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_loinc_like().as_bytes())
+            .await
+            .unwrap();
+        let all = ["2345-7", "999-9", "LP1-1", "LP2-2"];
+        assert_eq!(expand_codes(&b, "http://loinc.org/vs", Some(10)).await, all);
+        assert_eq!(expand_codes(&b, "http://loinc.org/vs", None).await, all);
+        let part = ["2345-7", "LP2-2"];
+        assert_eq!(
+            expand_codes(&b, "http://loinc.org/vs/LP1-1", Some(10)).await,
+            part
+        );
+        assert_eq!(
+            expand_codes(&b, "http://loinc.org/vs/LP1-1", None).await,
+            part
+        );
+
+        assert!(validates(&b, "http://loinc.org/vs", "999-9").await);
+        assert!(!validates(&b, "http://loinc.org/vs", "0000-0").await);
+        assert!(validates(&b, "http://loinc.org/vs/LP1-1", "2345-7").await);
+        assert!(!validates(&b, "http://loinc.org/vs/LP1-1", "LP1-1").await);
+        assert!(!validates(&b, "http://loinc.org/vs/LP1-1", "999-9").await);
+    }
+
+    /// `?fhir_vs=ecl/<expr>` (percent-encoded or not) and
+    /// `?fhir_vs=refset/<id>` evaluate the ECL, for `$expand` and
+    /// `$validate-code`.
+    #[tokio::test]
+    async fn ecl_and_refset_implicit_value_sets() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+            .await
+            .unwrap();
+        let ecl = "http://example.org/cs-fvs?fhir_vs=ecl/%3C%3C%20root";
+        assert_eq!(
+            expand_codes(&b, ecl, Some(10)).await,
+            ["child1", "child2", "root"]
+        );
+        assert_eq!(
+            expand_codes(&b, "http://example.org/cs-fvs?fhir_vs=ecl/< root", None).await,
+            ["child1", "child2"]
+        );
+        assert!(validates(&b, ecl, "child2").await);
+        assert!(!validates(&b, ecl, "unrelated").await);
+
+        let refset = "http://example.org/cs-fvs?fhir_vs=refset/R1";
+        {
+            let conn = b.pool().get().unwrap();
+            let sid: String = conn
+                .query_row(
+                    "SELECT id FROM code_systems WHERE url = 'http://example.org/cs-fvs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO refset_members (system_id, refset_id, referenced_code)
+                 VALUES (?1, 'R1', 'child1'), (?1, 'R1', 'unrelated')",
+                [&sid],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            expand_codes(&b, refset, Some(10)).await,
+            ["child1", "unrelated"]
+        );
+        assert!(validates(&b, refset, "unrelated").await);
+        assert!(!validates(&b, refset, "child2").await);
+    }
+
+    /// A CodeSystem `http://example.org/cs-many` with `root` and `n` children
+    /// `item-<i>` ("Item number <i>").
+    fn bundle_many(n: usize) -> String {
+        let children: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"code":"item-{i}","display":"Item number {i}"}}"#))
+            .collect();
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                "resourceType":"CodeSystem","id":"cs-many","url":"http://example.org/cs-many",
+                "status":"active","content":"complete",
+                "concept":[{{"code":"root","display":"Root","concept":[{}]}}]}}}}]}}"#,
+            children.join(",")
+        )
+    }
+
+    async fn expand_req(b: &SqliteTerminologyBackend, req: ExpandRequest) -> ExpandResponse {
+        let resp = b.expand(&ctx(), req).await.expect("expand");
+        wait_for_background_cache(b);
+        resp
+    }
+
+    /// Filtered and CodeSystem-wide implicit expansions report
+    /// `expansion.total`: on the cold paged path (before the implicit cache
+    /// is built) and on the warm in-memory path, with and without a filter.
+    #[tokio::test]
+    async fn implicit_expansions_report_total_with_and_without_filter() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_many(30).as_bytes())
+            .await
+            .unwrap();
+        let page = |url: &str, filter: Option<&str>| ExpandRequest {
+            url: Some(url.into()),
+            filter: filter.map(Into::into),
+            count: Some(5),
+            offset: Some(5),
+            ..Default::default()
+        };
+        let all = "http://example.org/cs-many?fhir_vs";
+        let isa = "http://example.org/cs-many?fhir_vs=isa/root";
+        for _ in 0..2 {
+            // First round: cold paged path. Second: the cache is warm.
+            let r = expand_req(&b, page(all, None)).await;
+            assert_eq!((r.total, r.contains.len()), (Some(31), 5));
+            let r = expand_req(&b, page(all, Some("number 1"))).await;
+            // "Item number 1", "…10" … "…19".
+            assert_eq!(r.total, Some(11));
+            let r = expand_req(&b, page(isa, None)).await;
+            assert_eq!(r.total, Some(31));
+            let r = expand_req(&b, page(isa, Some("number 2"))).await;
+            assert_eq!(r.total, Some(11));
+            // The background population has finished (`expand_req`); make
+            // sure both caches exist for the warm round.
+            ensure_implicit_cache(&b.pool().get().unwrap(), all, None).unwrap();
+            ensure_implicit_cache(&b.pool().get().unwrap(), isa, None).unwrap();
+        }
+    }
+
+    /// A text filter combined with a hierarchy filter stops collecting
+    /// candidates at a limit derived from the requested window. The total
+    /// must still be exact, and later pages must still have rows: the total
+    /// used to be the truncated length (at most 1000 here) and the window
+    /// ignored `offset`.
+    #[tokio::test]
+    async fn filtered_inline_expansion_total_is_exact_past_the_candidate_limit() {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_many(1200).as_bytes())
+            .await
+            .unwrap();
+        let req = |offset: u32| ExpandRequest {
+            value_set: Some(serde_json::json!({
+                "resourceType": "ValueSet",
+                "compose": {"include": [{
+                    "system": "http://example.org/cs-many",
+                    "filter": [{"property": "concept", "op": "is-a", "value": "root"}]
+                }]}
+            })),
+            filter: Some("item".into()),
+            count: Some(10),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let first = expand_req(&b, req(0)).await;
+        assert_eq!(first.contains.len(), 10);
+        assert_eq!(first.total, Some(1200));
+        let last = expand_req(&b, req(1195)).await;
+        assert_eq!(last.contains.len(), 5, "page past the old candidate cap");
+        assert_eq!(last.total, Some(1200));
     }
 
     #[tokio::test]
@@ -11829,9 +12934,6 @@ mod tests {
             vec!["code2", "code2a", "code2aI", "code2aII", "code2b"],
             "is-a returns the full subtree including self"
         );
-        // `total` is intentionally not asserted — the BFS fast path used by
-        // single-include is-a expansions returns `total: None` to avoid the
-        // separate count round-trip when the caller only asked for a page.
     }
     // ── inline `#contained` ValueSet ref + canonical URL intersection ──────────
 
@@ -12011,8 +13113,7 @@ mod tests {
     }
 
     /// Cycle in `compose.include[].valueSet[]` resolution must not loop —
-    /// the visited-set guard breaks recursion. The non-cyclic include in
-    /// the same compose still resolves.
+    /// the visited-set guard breaks recursion and the expansion fails.
     #[tokio::test]
     async fn cyclic_value_set_reference_is_rejected_without_loop() {
         let b = backend();
@@ -12050,9 +13151,9 @@ mod tests {
             ]
         });
 
-        // Returns Ok rather than hanging. The non-cyclic include still
-        // resolves so the response is non-empty.
-        let resp = b
+        // Fails (vs-invalid) rather than hanging: a value set that includes
+        // itself has no defined expansion.
+        let err = b
             .expand(
                 &ctx(),
                 ExpandRequest {
@@ -12061,14 +13162,10 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-
-        let codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
-        assert!(codes.contains(&"code1"));
+            .unwrap_err();
         assert!(
-            resp.warnings.iter().any(|w| w.contains("Cyclic")),
-            "expected a vs-invalid cycle warning, got {:?}",
-            resp.warnings
+            matches!(&err, HtsError::VsInvalid(m) if m.starts_with("Cyclic reference detected when including #a")),
+            "{err:?}"
         );
     }
 
@@ -12258,7 +13355,8 @@ mod tests {
 
         let hits =
             fts_candidates_ranked_for_system(&conn, "sys1", "http://example.org/cs", "data", None)
-                .expect("ranked search must not error");
+                .expect("ranked search must not error")
+                .0;
 
         let mut codes: Vec<&str> = hits.iter().map(|c| c.code.as_str()).collect();
         codes.sort_unstable();
@@ -12269,6 +13367,91 @@ mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Implicit-expansion FTS rows live in a per-url rowid block, so a url's
+    /// rows are counted, paged and deleted by seeking its block instead of
+    /// filtering on the UNINDEXED `url` column (a scan of every url's rows).
+    #[test]
+    fn implicit_fts_rows_live_in_per_url_rowid_blocks() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        conn.execute_batch(
+            "INSERT INTO implicit_expansion_cache (url, system_url, code, display) VALUES
+                 ('u1', 'http://s', 'a1', 'Alpha one'),
+                 ('u1', 'http://s', 'a2', 'Beta'),
+                 ('u2', 'http://s', 'b1', 'Alpha two'),
+                 ('u2', 'http://s', 'b2', 'Alpine');",
+        )
+        .unwrap();
+
+        assert_eq!(implicit_cache_count(&conn, "u1", Some("alpha")).unwrap(), 1);
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("alp")).unwrap(), 2);
+        // 1–2 character filters use the word-prefix table, same blocks.
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("al")).unwrap(), 2);
+        let page = implicit_cache_page(&conn, "u2", Some("alp"), 10, 0).unwrap();
+        assert_eq!(
+            page.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            ["b1", "b2"]
+        );
+
+        let block = |url: &str| implicit_fts_block(&conn, url).unwrap().expect("built");
+        let (lo, hi) = implicit_fts_rowids(block("u1"));
+        assert_eq!(
+            count(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM implicit_expansion_fts WHERE rowid BETWEEN {lo} AND {hi}"
+                )
+            ),
+            2
+        );
+        assert_ne!(block("u1"), block("u2"));
+
+        drop_implicit_fts(&conn, "u1").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_fts"),
+            2
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_word_fts"),
+            2
+        );
+        assert!(implicit_fts_block(&conn, "u1").unwrap().is_none());
+        assert_eq!(implicit_cache_count(&conn, "u2", Some("alp")).unwrap(), 2);
+        // Rebuilt on the next filtered request.
+        assert_eq!(implicit_cache_count(&conn, "u1", Some("alpha")).unwrap(), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM implicit_expansion_fts"),
+            4
+        );
+    }
+
+    /// Replacing a url's cached expansion drops its FTS rows with it, so the
+    /// next filtered request indexes the new rows instead of the old ones.
+    #[test]
+    fn repopulating_an_implicit_cache_url_drops_its_fts_rows() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        let entry = |code: &str, display: &str| ExpansionContains {
+            system: "http://s".into(),
+            version: None,
+            code: code.into(),
+            display: Some(display.into()),
+            is_abstract: None,
+            inactive: None,
+            designations: vec![],
+            properties: vec![],
+            extensions: vec![],
+            contains: vec![],
+        };
+        populate_implicit_cache(&conn, "u", &[entry("a", "Old term")]).unwrap();
+        assert_eq!(implicit_cache_count(&conn, "u", Some("old")).unwrap(), 1);
+        conn.execute("DELETE FROM implicit_expansion_cache WHERE url = 'u'", [])
+            .unwrap();
+        populate_implicit_cache(&conn, "u", &[entry("a", "New term")]).unwrap();
+        assert_eq!(implicit_cache_count(&conn, "u", Some("old")).unwrap(), 0);
+        assert_eq!(implicit_cache_count(&conn, "u", Some("new")).unwrap(), 1);
     }
 
     /// #295: the startup FTS build must be incremental and idempotent — it
@@ -12381,4 +13564,14 @@ mod tests {
             sys2_rowid
         );
     }
+}
+
+/// True when a compose uses `exclude` or `include[].valueSet`, which the
+/// single-include / text-filter fast paths do not evaluate (upstream).
+fn compose_needs_general_path(compose: &serde_json::Value) -> bool {
+    compose["exclude"].as_array().is_some_and(|a| !a.is_empty())
+        || compose["include"].as_array().is_some_and(|incs| {
+            incs.iter()
+                .any(|i| i["valueSet"].as_array().is_some_and(|a| !a.is_empty()))
+        })
 }

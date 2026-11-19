@@ -55,6 +55,7 @@ use serde_json::Value;
 use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::storage::ResourceStorage;
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -68,10 +69,12 @@ pub mod audit {
     /// Record an audit event for a bulk submit lifecycle event.
     ///
     /// Call this at submission start, completion, abort, or rollback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_submit_event(
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         submission_id: &SubmissionId,
         phase: &str,
         outcome: &str,
@@ -91,6 +94,9 @@ pub mod audit {
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
         }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
+        }
         if let Some(d) = outcome_desc {
             builder = builder.outcome_desc(d);
         }
@@ -108,7 +114,7 @@ pub mod audit {
         async fn test_submit_event_includes_phase() {
             let sink = NullSink;
             let id = SubmissionId::new("client-a", "sub-123");
-            record_submit_event(&sink, "Device/hfs", None, &id, "start", "0", None).await;
+            record_submit_event(&sink, "Device/hfs", None, None, &id, "start", "0", None).await;
         }
 
         #[test]
@@ -623,8 +629,11 @@ pub struct ReceiptListingCursor {
 pub struct PagedEntryResult {
     /// The unchanged ingestion result, also used by persisted S3 objects.
     pub result: BulkEntryResult,
-    /// Always present for PostgreSQL, SQLite and MongoDB. S3 may omit this:
-    /// old S3 receipt objects do not retain a recoverable original file URL.
+    /// Always present for PostgreSQL, SQLite and MongoDB. S3 omits it for
+    /// receipt objects written before #2184, which kept only a digest of the
+    /// original file URL, and for receipts ingested without a file URL. On S3
+    /// it names the receipt's input only; the traversal resumes from its own
+    /// [`EntryResultContinuation::Listing`] cursor.
     pub stored_identity: Option<EntryResultCursor>,
 }
 
@@ -1047,10 +1056,24 @@ pub struct BulkProcessingOptions {
     /// at or below this number is skipped. Zero resumes nothing.
     #[serde(default)]
     pub resume_after_line: u64,
+    /// How many batches of one file the stream driver writes concurrently
+    /// (`HFS_BULK_SUBMIT_BATCH_WRITERS`). Bounded by the engine's
+    /// [`BulkSubmitProvider::max_batch_writers`] — one on SQLite — and forced
+    /// to one whenever `max_errors` or `continue_on_error` can stop the
+    /// stream mid-file. The engine default is one: a library caller opts in;
+    /// the server defaults to four on the concurrent-writer backends. See
+    /// [`crate::core::bulk_submit_stream`] for how the file watermark stays
+    /// correct with several batches in flight.
+    #[serde(default = "default_batch_writers")]
+    pub batch_writers: u32,
 }
 
 fn default_submit_batch_size() -> u32 {
     100
+}
+
+fn default_batch_writers() -> u32 {
+    1
 }
 
 fn default_continue_on_error() -> bool {
@@ -1083,7 +1106,15 @@ impl BulkProcessingOptions {
             batch_observers: Vec::new(),
             skip_unchanged: false,
             resume_after_line: 0,
+            batch_writers: default_batch_writers(),
         }
+    }
+
+    /// Sets how many batches of one file write concurrently (see
+    /// [`Self::batch_writers`]). Values below 1 are treated as 1.
+    pub fn with_batch_writers(mut self, batch_writers: u32) -> Self {
+        self.batch_writers = batch_writers.max(1);
+        self
     }
 
     /// Names the manifest output file the entries come from (#457).
@@ -1207,12 +1238,37 @@ impl BulkProcessingOptions {
         self
     }
 
-    /// Resolves the content to write when a submitted resource lands on an existing
-    /// one, applying [`Self::import_mode`].
-    pub fn content_for_update(&self, stored: &Value, submitted: &Value) -> Value {
-        match self.import_mode {
-            ImportMode::Replace => submitted.clone(),
-            ImportMode::Merge => merge_resource(stored, submitted),
+    /// Resolves the content to write for a submitted resource: [`Self::import_mode`]
+    /// applied onto `stored` when the resource already exists, then empty objects,
+    /// empty arrays, empty strings and `null` members removed (#2554).
+    ///
+    /// The submission is not cleaned before the mode is applied: under
+    /// [`ImportMode::Merge`] a `null` member removes the stored element and an empty
+    /// array replaces the stored one, and cleaning first would drop both requests.
+    /// An empty string is merged in the same way, so it also removes the stored
+    /// value.
+    pub fn content_to_write(&self, stored: Option<&Value>, submitted: &Value) -> Value {
+        let mut content = match (stored, self.import_mode) {
+            (Some(stored), ImportMode::Merge) => merge_resource(stored, submitted),
+            _ => submitted.clone(),
+        };
+        super::drop_empty_elements(&mut content);
+        content
+    }
+
+    /// [`Self::content_to_write`] for a resource the caller owns: a new
+    /// resource is cleaned in place, without a clone.
+    pub fn content_to_write_owned(&self, stored: Option<&Value>, mut submitted: Value) -> Value {
+        match (stored, self.import_mode) {
+            (Some(stored), ImportMode::Merge) => {
+                let mut content = merge_resource(stored, &submitted);
+                super::drop_empty_elements(&mut content);
+                content
+            }
+            _ => {
+                super::drop_empty_elements(&mut submitted);
+                submitted
+            }
         }
     }
 
@@ -1654,6 +1710,47 @@ pub trait BulkSubmitProvider: ResourceStorage {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>>;
+
+    /// The most batches of one file this engine lets the stream driver write
+    /// concurrently. One — the default — keeps a file's batches serial; an
+    /// engine returns more only when its [`Self::process_entries_ticketed`]
+    /// charges the file watermark through the ticket's ordered turn.
+    fn max_batch_writers(&self) -> u32 {
+        1
+    }
+
+    /// [`Self::process_entries`] for a batch that is part of a file stream
+    /// with other batches possibly in flight (see
+    /// [`crate::core::bulk_submit_stream`]).
+    ///
+    /// An engine that supports concurrent batches of one file signals
+    /// [`BatchTicket::began`] once it holds every lock the batch will hold,
+    /// writes the batch, and runs its charge step — file watermark, manifest
+    /// counters, and the commit carrying them where the two are tied — inside
+    /// the [`crate::core::bulk_submit_stream::ChargeTurn`] that
+    /// [`BatchTicket::wait_charge`] grants, completing it when the charge is
+    /// durable. A refused turn means an earlier batch failed: the engine must
+    /// leave the watermark alone (roll back where it can) and return the error.
+    ///
+    /// The default takes the turn around the whole batch, which is correct
+    /// for every engine but only ever contended when batches run serially —
+    /// which [`Self::max_batch_writers`]' default guarantees.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        let turn = ticket.wait_charge().await?;
+        let results = self
+            .process_entries(tenant, submission_id, manifest_id, entries, options)
+            .await?;
+        turn.complete();
+        Ok(results)
+    }
 
     /// Reads one bounded page of persisted receipts for a fixed scope and filter.
     ///
@@ -2184,17 +2281,59 @@ mod tests {
     }
 
     #[test]
-    fn test_content_for_update_follows_import_mode() {
+    fn test_content_to_write_follows_import_mode() {
         let stored = serde_json::json!({
             "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
         });
         let submitted = serde_json::json!({"resourceType": "Patient", "id": "p1"});
 
         let replace = BulkProcessingOptions::new();
-        assert_eq!(replace.content_for_update(&stored, &submitted), submitted);
+        assert_eq!(
+            replace.content_to_write(Some(&stored), &submitted),
+            submitted
+        );
 
         let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
-        let merged = merge.content_for_update(&stored, &submitted);
+        let merged = merge.content_to_write(Some(&stored), &submitted);
         assert_eq!(merged["gender"], serde_json::json!("female"));
+    }
+
+    /// #2554: under merge a `null` member removes the stored element and an empty
+    /// array clears the stored one; the merged result, not the submission, is what
+    /// is cleaned.
+    #[test]
+    fn test_content_to_write_merges_before_dropping_empty_elements() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "gender": "female",
+            "telecom": [{"system": "phone", "value": "1"}],
+            "name": [{"family": "Stale"}]
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient", "id": "p1",
+            "telecom": null, "name": [], "address": [{}], "active": true
+        });
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        assert_eq!(
+            merge.content_to_write(Some(&stored), &submitted),
+            serde_json::json!({
+                "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
+            })
+        );
+    }
+
+    /// #2554: replace mode and new resources (either mode) are cleaned too.
+    #[test]
+    fn test_content_to_write_drops_empty_elements_for_replace_and_new_resources() {
+        let stored = serde_json::json!({"resourceType": "Patient", "id": "p1", "gender": "female"});
+        let submitted = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "active": true,
+            "name": [{}], "telecom": [], "gender": null
+        });
+        let clean = serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true});
+        let replace = BulkProcessingOptions::new();
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        assert_eq!(replace.content_to_write(Some(&stored), &submitted), clean);
+        assert_eq!(replace.content_to_write(None, &submitted), clean);
+        assert_eq!(merge.content_to_write(None, &submitted), clean);
     }
 }

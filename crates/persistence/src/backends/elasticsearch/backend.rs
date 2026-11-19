@@ -72,7 +72,10 @@ impl std::fmt::Display for WriteRefreshPolicy {
 }
 
 /// Authentication configuration for Elasticsearch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password and token never reach a log line
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ElasticsearchAuth {
     /// Basic username/password authentication.
     Basic {
@@ -89,7 +92,11 @@ pub enum ElasticsearchAuth {
 }
 
 /// Configuration for the Elasticsearch backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written: node URLs are printed without userinfo, query or
+/// fragment, and `auth` through [`ElasticsearchAuth`]'s redacting `Debug`
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ElasticsearchConfig {
     /// Elasticsearch node URLs (e.g., `["http://localhost:9200"]`).
     /// Currently uses the first node (single-node connection pool).
@@ -154,33 +161,57 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_bulk_max_bytes")]
     pub bulk_max_bytes: usize,
 
-    /// How many `_bulk` requests of one page may be in flight at once
-    /// (default: 1, one request at a time).
+    /// How many `_bulk` requests of one page are in flight at once
+    /// (default: [`DEFAULT_BULK_CONCURRENCY`], 4).
     ///
     /// Requests of a page never touch the same document, so they can be sent
     /// together; what stays sequential is the chain a request produces — its
-    /// halves after a `413` or a timeout, and its `429` resends. Raising this
-    /// shortens a rebuild on a cluster that is not the bottleneck (#1125).
+    /// halves after a `413` or a timeout, and its `429` resends. The page is
+    /// cut into this many requests (at most one per 250 operations), so the
+    /// setting is what goes out: at 1 a 1,000-resource page is two sequential
+    /// requests of 500, at 4 it is four concurrent requests of 250. Measured
+    /// on the 72k Synthea mix: the `_bulk` wall of a page drops from ~100 ms
+    /// to ~30 ms and the deferred rebuild from 6.2k to ~11k resources/s
+    /// (#1125, #1749).
     #[serde(default = "default_bulk_concurrency")]
     pub bulk_concurrency: usize,
 
-    /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
-    /// writes (default: `None`, which follows [`Self::write_refresh`]).
+    /// Most contained-document sweeps (the `_delete_by_query` that removes a
+    /// container's stale `contained[]` documents) in flight at once
+    /// (default: `0` = the built-in 16).
     ///
-    /// Lets a rebuild skip the per-request refresh wait (`False`) while
-    /// ordinary writes keep read-after-write visibility (`WaitFor`).
+    /// Each sweep opens a scroll context on every shard of every index of the
+    /// tenant and the cluster allows `search.max_open_scroll_context` (500) in
+    /// all, so an unbounded burst of sweeps is answered with `429
+    /// too_many_scroll_contexts`.
+    #[serde(default)]
+    pub contained_sweep_concurrency: usize,
+
+    /// Refresh behavior for `$reindex`, the deferred rebuild and the
+    /// index-during-ingest sink's `_bulk` writes (default: `None` = no
+    /// per-request refresh, whatever [`Self::write_refresh`] says).
+    ///
+    /// A bulk path never inherits `wait_for`: that policy blocks each request
+    /// until the next scheduled refresh, so a rebuild with
+    /// `write_refresh = wait_for` paid one `refresh_interval` per `_bulk`
+    /// request — 13× slower at the default `1s`, and the "import takes
+    /// forever" of #1749 at `30s`. Ordinary writes keep their own policy; set
+    /// this explicitly to make bulk writes refresh too.
     #[serde(default)]
     pub reindex_refresh: Option<WriteRefreshPolicy>,
 
     /// Threads that extract search values for one `$reindex` page (default:
-    /// `0` = cores − 1, clamped to 1–4; an explicit value is capped at 64).
+    /// `0` = cores − 1, clamped to 1–[`REINDEX_PREPARE_AUTO_MAX`]; an
+    /// explicit value is capped at 64).
     ///
     /// The page writer is the composite deployments' search target, and its
     /// extraction is pure CPU: on a 16-core host the post-import rebuild
     /// left 12 cores idle while HFS spent one on it (#1250). `1` extracts on
     /// the page's own thread, as every release before this knob did. The
     /// pool is used only on a multi-thread Tokio runtime and for pages of
-    /// at least 16 resources; one page at a time is admitted to it.
+    /// at least 16 resources; up to as many pages as the pool has threads
+    /// share it at once (the index-during-ingest sink writes several pages
+    /// concurrently), any further page extracts on its own thread.
     #[serde(default)]
     pub reindex_prepare_threads: usize,
 
@@ -237,12 +268,108 @@ fn default_bulk_max_bytes() -> usize {
     DEFAULT_BULK_MAX_BYTES
 }
 
-/// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
-/// time, which is what every release before #1125 did.
-pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
+/// Default for [`ElasticsearchConfig::bulk_concurrency`]: four `_bulk`
+/// requests of a page in flight. One at a time (the default before #1749)
+/// left the cluster idle between requests; four is where a single-node
+/// cluster stopped gaining on the measured page sizes while its write pool
+/// stayed far from saturated.
+pub const DEFAULT_BULK_CONCURRENCY: usize = 4;
+
+/// Upper bound of the automatic (`reindex_prepare_threads = 0`) extraction
+/// width: cores − 1, clamped to 1–16. The former clamp of 4 mirrored the
+/// PostgreSQL writer, whose pages contend on the database; the Elasticsearch
+/// page writer is pure CPU until the `_bulk` send and halved its extraction
+/// time going from 4 to 8 threads (#1749).
+pub const REINDEX_PREPARE_AUTO_MAX: usize = 16;
+
+/// Built-in for [`ElasticsearchConfig::contained_sweep_concurrency`].
+pub(crate) const DEFAULT_CONTAINED_SWEEP_CONCURRENCY: usize = 16;
 
 fn default_bulk_concurrency() -> usize {
     DEFAULT_BULK_CONCURRENCY
+}
+
+/// Permits of the prepare pool's admission gate: one per pool thread (see
+/// [`ElasticsearchBackend::reindex_prepare_gate`]), never below one.
+fn prepare_gate_permits(config: &ElasticsearchConfig) -> usize {
+    crate::search::reindex_prepare::resolve_prepare_width_capped(
+        config.reindex_prepare_threads,
+        REINDEX_PREPARE_AUTO_MAX,
+    )
+    .max(1)
+}
+
+impl Debug for ElasticsearchAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElasticsearchAuth::Basic {
+                username,
+                password: _,
+            } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"[redacted]")
+                .finish(),
+            ElasticsearchAuth::Bearer { token: _ } => f
+                .debug_struct("Bearer")
+                .field("token", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+impl Debug for ElasticsearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            nodes,
+            index_prefix,
+            number_of_shards,
+            number_of_replicas,
+            refresh_interval,
+            write_refresh,
+            max_result_window,
+            max_terms_count,
+            nested_objects_limit,
+            request_timeout_ms,
+            bulk_max_bytes,
+            bulk_concurrency,
+            contained_sweep_concurrency,
+            reindex_refresh,
+            reindex_prepare_threads,
+            auth,
+            disable_certificate_validation,
+            fhir_version,
+        } = self;
+        let nodes: Vec<String> = nodes
+            .iter()
+            .map(|node| crate::core::backend::redact_connection_string(node))
+            .collect();
+        f.debug_struct("ElasticsearchConfig")
+            .field("nodes", &nodes)
+            .field("index_prefix", index_prefix)
+            .field("number_of_shards", number_of_shards)
+            .field("number_of_replicas", number_of_replicas)
+            .field("refresh_interval", refresh_interval)
+            .field("write_refresh", write_refresh)
+            .field("max_result_window", max_result_window)
+            .field("max_terms_count", max_terms_count)
+            .field("nested_objects_limit", nested_objects_limit)
+            .field("request_timeout_ms", request_timeout_ms)
+            .field("bulk_max_bytes", bulk_max_bytes)
+            .field("bulk_concurrency", bulk_concurrency)
+            .field("contained_sweep_concurrency", contained_sweep_concurrency)
+            .field("reindex_refresh", reindex_refresh)
+            .field("reindex_prepare_threads", reindex_prepare_threads)
+            .field("auth", auth)
+            .field(
+                "disable_certificate_validation",
+                disable_certificate_validation,
+            )
+            .field("fhir_version", fhir_version)
+            .finish()
+    }
 }
 
 impl Default for ElasticsearchConfig {
@@ -260,12 +387,60 @@ impl Default for ElasticsearchConfig {
             request_timeout_ms: default_request_timeout_ms(),
             bulk_max_bytes: default_bulk_max_bytes(),
             bulk_concurrency: default_bulk_concurrency(),
+            contained_sweep_concurrency: 0,
             reindex_refresh: None,
             reindex_prepare_threads: 0,
             auth: None,
             disable_certificate_validation: false,
             fhir_version: FhirVersion::default_enabled(),
         }
+    }
+}
+
+/// An Elasticsearch `index.refresh_interval`, once read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshInterval {
+    /// `-1`: no periodic refresh. A `wait_for` write then blocks until
+    /// something else refreshes the index.
+    Disabled,
+    /// Refresh every so often.
+    Every(std::time::Duration),
+}
+
+/// Reads an Elasticsearch time value such as `1s`, `500ms` or `-1`.
+///
+/// Accepts `-1` (disabled), `0`, and a whole number followed by one of
+/// `nanos`, `micros`, `ms`, `s`, `m`, `h` or `d`. Anything else, including a
+/// fractional number, is `None`. This does not validate the setting:
+/// Elasticsearch still rejects an invalid value when it is applied.
+pub fn parse_refresh_interval(value: &str) -> Option<RefreshInterval> {
+    let value = value.trim();
+    match value {
+        "-1" => return Some(RefreshInterval::Disabled),
+        "0" => return Some(RefreshInterval::Every(std::time::Duration::ZERO)),
+        _ => {}
+    }
+    let split = value.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = value.split_at(split);
+    let amount: u64 = digits.parse().ok()?;
+    let duration = match unit {
+        "nanos" => std::time::Duration::from_nanos(amount),
+        "micros" => std::time::Duration::from_micros(amount),
+        "ms" => std::time::Duration::from_millis(amount),
+        "s" => std::time::Duration::from_secs(amount),
+        "m" => std::time::Duration::from_secs(amount.checked_mul(60)?),
+        "h" => std::time::Duration::from_secs(amount.checked_mul(3_600)?),
+        "d" => std::time::Duration::from_secs(amount.checked_mul(86_400)?),
+        _ => return None,
+    };
+    Some(RefreshInterval::Every(duration))
+}
+
+impl ElasticsearchConfig {
+    /// [`Self::refresh_interval`] as a [`RefreshInterval`], or `None` when it
+    /// is not a time value this crate understands.
+    pub fn refresh_interval_parsed(&self) -> Option<RefreshInterval> {
+        parse_refresh_interval(&self.refresh_interval)
     }
 }
 
@@ -290,11 +465,15 @@ pub struct ElasticsearchBackend {
     /// a multi-thread runtime (#1250). `Err` remembers a failed build so the
     /// one warning fires once.
     prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
-    /// The one-permit admission gate for `prepare_pool` (#1250).
+    /// The admission gate for `prepare_pool`: one permit per pool thread
+    /// (#1250, #1749).
     prepare_gate: tokio::sync::Semaphore,
     /// Whether `elasticsearch reindex writer configuration` has already been
     /// logged for this instance (#1250).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// Admission gate of the contained-document sweeps; see
+    /// [`ElasticsearchConfig::contained_sweep_concurrency`].
+    pub(super) contained_sweeps: tokio::sync::Semaphore,
 }
 
 impl Debug for ElasticsearchBackend {
@@ -381,14 +560,17 @@ impl ElasticsearchBackend {
             );
         }
 
+        let prepare_gate = tokio::sync::Semaphore::new(prepare_gate_permits(&config));
+        let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
             config,
             registries,
             schema_checked: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
+            prepare_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
     }
 
@@ -404,15 +586,54 @@ impl ElasticsearchBackend {
         Self::validate_config(&config)?;
         let client = Self::build_client(&config)?;
 
+        let prepare_gate = tokio::sync::Semaphore::new(prepare_gate_permits(&config));
+        let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
             config,
             registries,
             schema_checked: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
+            prepare_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
+    }
+
+    /// Builds the backend like [`Self::with_shared_registry`] and runs its
+    /// startup initialization (index template, nested-object limit, mapping
+    /// reconcile) once, so existing indices are current before the first
+    /// request and the reindex warning is logged once per pass, not once per
+    /// index.
+    ///
+    /// Initialization never fails the start. A step that fails on a cluster
+    /// that answers is logged on its own and the other steps still run (see
+    /// [`Backend::initialize`]). A cluster that does not answer at all is
+    /// logged once on the startup line (after the shared unavailable line that
+    /// carries the transport error, see below), after at most one request
+    /// timeout ([`ElasticsearchConfig::request_timeout_ms`]; a refused
+    /// connection fails at once), and the server starts anyway: each index is then
+    /// reconciled on its first write (`ensure_index`), with the reindex
+    /// warning per index, and the nested-object limit of existing indices is
+    /// raised at the next start.
+    ///
+    /// The transport error is on the shared `Elasticsearch is temporarily
+    /// unavailable` warn line that precedes the startup one (#2385); the startup
+    /// line carries the client-safe text.
+    pub async fn start_with_shared_registry(
+        config: ElasticsearchConfig,
+        registries: Arc<TenantSearchRegistries>,
+    ) -> StorageResult<Self> {
+        let backend = Self::with_shared_registry(config, registries)?;
+        if let Err(e) = Backend::initialize(&backend).await {
+            tracing::warn!(
+                error = %e,
+                "Elasticsearch startup initialization failed; index mappings will be \
+                 reconciled lazily on first write, and the nested-object limit of \
+                 existing indices is raised at the next start"
+            );
+        }
+        Ok(backend)
     }
 
     /// Builds the Elasticsearch client from configuration.
@@ -423,6 +644,15 @@ impl ElasticsearchBackend {
             .cloned()
             .unwrap_or_else(|| "http://localhost:9200".to_string());
 
+        // The two `ConnectionFailed` texts below are safe to show as they are
+        // (#2385), and they are not routed through `elasticsearch_unavailable`:
+        // they fire at construction, where telling the client to "retry" would be
+        // wrong, and they are configuration errors, not an outage.
+        // - `url::ParseError`'s `Display` is a fixed phrase that never echoes its
+        //   input ("invalid port number"), so a `user:pass@` written into
+        //   `HFS_ELASTICSEARCH_NODES` cannot reach "Invalid URL: {e}".
+        // - The transport `BuildError` comes from reqwest's client builder. HFS sets
+        //   no proxy and no client certificate, so the node URL is not involved.
         let parsed_url: elasticsearch::http::Url = url.parse().map_err(|e| {
             crate::error::StorageError::Backend(BackendError::ConnectionFailed {
                 backend_name: "elasticsearch".to_string(),
@@ -486,13 +716,24 @@ impl ElasticsearchBackend {
     }
 
     /// The refresh policy a rebuild's `_bulk` writes use: the configured
-    /// [`ElasticsearchConfig::reindex_refresh`], or the ordinary write policy
-    /// when none is set.
+    /// [`ElasticsearchConfig::reindex_refresh`], or none when it is unset —
+    /// never the ordinary write policy, so `wait_for` on interactive writes
+    /// does not put one refresh wait on every bulk request (#1749).
     pub(crate) fn reindex_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
         self.config
             .reindex_refresh
-            .unwrap_or(self.config.write_refresh)
+            .unwrap_or(WriteRefreshPolicy::False)
             .as_refresh_param()
+    }
+
+    /// The extraction width the page writer runs at: the configured
+    /// [`ElasticsearchConfig::reindex_prepare_threads`], or cores − 1
+    /// clamped to 1–[`REINDEX_PREPARE_AUTO_MAX`] when it is `0`.
+    pub(crate) fn reindex_prepare_width(&self) -> usize {
+        crate::search::reindex_prepare::resolve_prepare_width_capped(
+            self.config.reindex_prepare_threads,
+            REINDEX_PREPARE_AUTO_MAX,
+        )
     }
 
     /// The byte budget of one `_bulk` request, or `usize::MAX` when the cap
@@ -504,9 +745,29 @@ impl ElasticsearchBackend {
         }
     }
 
+    /// Sets the configured `refresh_interval` on every existing index under
+    /// the index prefix that has a different one, and returns how many
+    /// indices changed.
+    ///
+    /// The interval is part of the settings each index is created with, so an
+    /// index created under an earlier value keeps it until this runs. It
+    /// overwrites a value an operator set by hand on any index matching
+    /// `{index_prefix}_*`.
+    pub async fn apply_refresh_interval(&self) -> crate::error::StorageResult<usize> {
+        super::schema::apply_refresh_interval(self).await
+    }
+
     /// The client's per-request timeout, as configured.
     pub(crate) fn request_timeout_ms(&self) -> u64 {
         self.config.request_timeout_ms
+    }
+
+    /// Permits of the contained-sweep gate, never below 1.
+    fn sweep_permits(config: &ElasticsearchConfig) -> usize {
+        match config.contained_sweep_concurrency {
+            0 => DEFAULT_CONTAINED_SWEEP_CONCURRENCY,
+            n => n,
+        }
     }
 
     /// How many `_bulk` requests of one page may be in flight, never below 1.
@@ -542,13 +803,16 @@ impl ElasticsearchBackend {
     pub(super) fn reindex_prepare_pool(&self) -> Option<&rayon::ThreadPool> {
         crate::search::reindex_prepare::prepare_pool(
             &self.prepare_pool,
-            self.config.reindex_prepare_threads,
+            self.reindex_prepare_width(),
             "hfs-es-reindex",
             "Elasticsearch",
         )
     }
 
-    /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1250).
+    /// The admission gate for [`Self::reindex_prepare_pool`] (#1250): one
+    /// permit per pool thread, so as many pages as the pool can spread share
+    /// it (the ingest sink's writers each bring one) and only pages beyond
+    /// that extract inline.
     pub(super) fn reindex_prepare_gate(&self) -> &tokio::sync::Semaphore {
         &self.prepare_gate
     }
@@ -561,7 +825,7 @@ impl ElasticsearchBackend {
             return;
         }
         let configured = self.config.reindex_prepare_threads;
-        let prepare_threads = crate::search::reindex_prepare::resolve_prepare_width(configured);
+        let prepare_threads = self.reindex_prepare_width();
         let pool = if prepare_threads < 2 {
             "none"
         } else if !multi_thread {
@@ -691,17 +955,14 @@ impl Backend for ElasticsearchBackend {
             .health(elasticsearch::cluster::ClusterHealthParts::None)
             .send()
             .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Health check failed: {}", e),
-            })?;
+            .map_err(|e| crate::error::elasticsearch_unavailable("Health check failed", &e))?;
 
         let status = response.status_code();
         if !status.is_success() {
-            return Err(BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Cluster health returned status {}", status),
-            });
+            return Err(crate::error::elasticsearch_unavailable(
+                &format!("Cluster health returned status {status}"),
+                &status,
+            ));
         }
 
         let body = response
@@ -719,24 +980,59 @@ impl Backend for ElasticsearchBackend {
             .unwrap_or("unknown");
 
         if cluster_status == "red" {
-            return Err(BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Cluster status is red: {:?}", body),
-            });
+            // The health body names the cluster and its node counts; it goes to
+            // the log, not to the client (#2385).
+            return Err(crate::error::elasticsearch_unavailable(
+                "Cluster status is red",
+                &body,
+            ));
         }
 
         Ok(())
     }
 
+    /// Writes the index template, raises the nested-object limit of existing
+    /// indices, and reconciles their mappings with `SCHEMA_VERSION`.
+    ///
+    /// Fails only when the cluster does not answer at all; then nothing else
+    /// is attempted. Otherwise each step is attempted even when another fails,
+    /// and each failure is logged where it happens.
     async fn initialize(&self) -> Result<(), BackendError> {
-        // Create index template for automatic index creation
-        super::schema::create_index_template(self)
-            .await
-            .map_err(|e| BackendError::Internal {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to create index template: {}", e),
-                source: None,
-            })?;
+        // The steps below are independent, so each is tried even when the one
+        // before it failed. On a cluster that never answers, that would wait
+        // out the request timeout once per step, so whether it answers is
+        // asked once, first. Any HTTP status is an answer (a `401`, a `403`, a
+        // proxy's `404`); only a transport failure — refused, unreachable,
+        // timed out — stops here.
+        self.client.ping().send().await.map_err(|e| {
+            // Lowercase on purpose: the startup line and its tests match
+            // "did not answer".
+            let context = if e.is_timeout() {
+                format!(
+                    "the cluster did not answer within the {} ms request timeout",
+                    self.config.request_timeout_ms
+                )
+            } else {
+                "the cluster did not answer".to_string()
+            };
+            crate::error::elasticsearch_unavailable(&context, &e)
+        })?;
+
+        // The template matters only for indices created from now on, and only
+        // as a net: HFS creates its own indices with the full mapping
+        // (`ensure_index`). The two steps after it act on indices that already
+        // exist, so a template the cluster refuses (an HFS user without the
+        // `manage_index_templates` cluster privilege, say) is logged and does
+        // not skip them. It used to, and the existing indices then kept their
+        // old mapping and nested-object limit for the life of the process.
+        if let Err(e) = super::schema::create_index_template(self).await {
+            tracing::warn!(
+                error = %e,
+                "could not create the Elasticsearch index template; carrying on with the \
+                 existing indices. HFS creates its own indices with the current mapping, so \
+                 only an index Elasticsearch auto-creates misses it"
+            );
+        }
 
         // The template only reaches indices created from now on. Indices that
         // already exist keep Elasticsearch's 10000 nested-object limit until
@@ -756,6 +1052,26 @@ impl Backend for ElasticsearchBackend {
                 limit,
                 "could not raise the Elasticsearch nested-object limit on existing indices; \
                  resources with more nested values than an index's current limit stay unsearchable"
+            ),
+        }
+
+        // `refresh_interval` is dynamic and, like the limit above, set only at
+        // creation (#1749): an index made under another value keeps it, and
+        // with `wait_for` writes that value is what every write waits out.
+        // Not fatal either.
+        let interval = self.config().refresh_interval.as_str();
+        match self.apply_refresh_interval().await {
+            Ok(0) => {}
+            Ok(changed) => tracing::info!(
+                indices = changed,
+                refresh_interval = interval,
+                "set the Elasticsearch refresh interval on existing indices"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                refresh_interval = interval,
+                "could not set the Elasticsearch refresh interval on existing indices; \
+                 they keep the one they were created with"
             ),
         }
 
@@ -891,20 +1207,18 @@ impl ElasticsearchBackend {
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
-            SearchParamType::Token => {
-                // `not-in` is intentionally omitted: it returns 501 (negated
-                // value-set filtering is unimplemented), so it must not be
-                // advertised as supported.
-                vec![
-                    "not",
-                    "text",
-                    "text-advanced",
-                    "code-text",
-                    "in",
-                    "of-type",
-                    "missing",
-                ]
-            }
+            SearchParamType::Token => vec![
+                "not",
+                "text",
+                "text-advanced",
+                "code-text",
+                "in",
+                "not-in",
+                "below",
+                "above",
+                "of-type",
+                "missing",
+            ],
             SearchParamType::Reference => vec![
                 "identifier",
                 "contains",
@@ -926,7 +1240,375 @@ impl ElasticsearchBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_debug_redacts_password_and_token() {
+        let basic = ElasticsearchAuth::Basic {
+            username: "elastic".to_string(),
+            password: "es-s3cret-pw".to_string(),
+        };
+        let out = format!("{basic:?}");
+        assert!(!out.contains("es-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("elastic"), "{out}");
+
+        let bearer = ElasticsearchAuth::Bearer {
+            token: "es-bearer-tok".to_string(),
+        };
+        let out = format!("{bearer:?}");
+        assert!(!out.contains("es-bearer-tok"), "token leaked: {out}");
+        assert!(out.contains("Bearer"), "{out}");
+    }
+
+    #[test]
+    fn config_debug_redacts_node_userinfo_and_auth() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["https://user:node-s3cret@es.internal:9200/?token=q-s3cret".to_string()],
+            auth: Some(ElasticsearchAuth::Bearer {
+                token: "es-bearer-tok".to_string(),
+            }),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        for secret in ["node-s3cret", "q-s3cret", "es-bearer-tok"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("es.internal"), "{out}");
+        assert!(out.contains("index_prefix"), "{out}");
+    }
+
+    /// #2385: the `ConnectionFailed` texts of `build_client` are shown as they
+    /// are. `url::ParseError`'s `Display` is a fixed phrase that never echoes its
+    /// input, so neither the `user:pass@` nor the host written into
+    /// `HFS_ELASTICSEARCH_NODES` can reach them.
+    #[test]
+    fn build_client_errors_never_echo_the_node_url() {
+        use crate::error::StorageError;
+
+        for node in [
+            // InvalidPort
+            "http://elastic:node-s3cret@es.internal:notaport/",
+            // InvalidIpv6Address
+            "http://elastic:node-s3cret@[es.internal]:9200/",
+            // InvalidDomainCharacter
+            "http://elastic:node-s3cret@es internal:9200/",
+            // RelativeUrlWithoutBase
+            "//elastic:node-s3cret@es.internal:9200",
+        ] {
+            let config = ElasticsearchConfig {
+                nodes: vec![node.to_string()],
+                ..Default::default()
+            };
+            // `Elasticsearch` is not `Debug`, so the result cannot be unwrapped.
+            let Err(StorageError::Backend(BackendError::ConnectionFailed { message, .. })) =
+                ElasticsearchBackend::build_client(&config)
+            else {
+                panic!("{node} must fail to parse");
+            };
+            assert!(message.starts_with("Invalid URL: "), "{message}");
+            for leaked in ["node-s3cret", "elastic:", "es.internal", "es internal"] {
+                assert!(
+                    !message.contains(leaked),
+                    "{leaked} leaked from {node}: {message}"
+                );
+            }
+        }
+
+        // The public constructor reports the same text.
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://elastic:node-s3cret@es.internal:notaport/".to_string()],
+            ..Default::default()
+        };
+        match ElasticsearchBackend::new(config) {
+            Err(StorageError::Backend(BackendError::ConnectionFailed { message, .. })) => {
+                assert!(message.starts_with("Invalid URL: "), "{message}");
+                assert!(!message.contains("node-s3cret"), "{message}");
+                assert!(!message.contains("es.internal"), "{message}");
+            }
+            Err(other) => panic!("expected ConnectionFailed, got {other:?}"),
+            Ok(_) => panic!("an unparseable node must fail the construction"),
+        }
+    }
+
+    /// #2385: `health_check` and `initialize` answer `Unavailable` with the
+    /// operation and the fixed sentence only. The transport error, which names the
+    /// node and the request path, goes to the shared `warn` line.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_check_and_initialize_leave_the_transport_error_to_the_log() {
+        // 127.0.0.1:1 refuses at once, but Windows takes about 2 s to say so; the
+        // generous timeout keeps a slow refusal from becoming a timeout. The
+        // assertions below do not depend on which of the two happened.
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://127.0.0.1:1".to_string()],
+            request_timeout_ms: 15_000,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .expect("backend");
+
+        let health = <ElasticsearchBackend as Backend>::health_check(&backend).await;
+        let Err(BackendError::Unavailable { message, .. }) = health else {
+            panic!("an unreachable cluster must read as Unavailable, got {health:?}");
+        };
+        assert_eq!(
+            message,
+            "Health check failed: the search index is temporarily unavailable; retry the request"
+        );
+        for leaked in ["127.0.0.1", "_cluster", "error sending request"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        let initialize = Backend::initialize(&backend).await;
+        let Err(BackendError::Unavailable { message, .. }) = initialize else {
+            panic!("an unreachable cluster must fail initialize, got {initialize:?}");
+        };
+        assert!(
+            message.starts_with("the cluster did not answer"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(": the search index is temporarily unavailable; retry the request"),
+            "{message}"
+        );
+        for leaked in ["127.0.0.1", "_cluster", "error sending request"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        // The operator keeps the transport error in the log. The closure returns
+        // `Err` instead of asserting: a panic under the global buffer lock would
+        // poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() < 2 {
+                return Err(format!("expected at least 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("127.0.0.1:1/_cluster/health"))
+            {
+                return Err(format!(
+                    "no line carries the health check's request URL: {found:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
     use serde_json::json;
+
+    /// An unreachable cluster must not stop the server from starting.
+    #[tokio::test]
+    async fn startup_constructor_survives_an_unreachable_cluster() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://127.0.0.1:1".to_string()],
+            request_timeout_ms: 500,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        assert!(started.is_ok());
+    }
+
+    /// A node that accepts connections and never answers (hung, or behind a
+    /// proxy that holds the request) costs the start one request timeout, not
+    /// one per initialization step: the reachability check is the only request
+    /// it is sent (#1506).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_unresponsive_cluster_costs_one_request_timeout_not_one_per_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let holder = tokio::spawn(async move {
+            // Held open and never answered.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{address}")],
+            request_timeout_ms: 300,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        holder.abort();
+
+        assert!(
+            started.is_ok(),
+            "an unresponsive cluster must not fail the start"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one request timed out, not one per initialization step"
+        );
+        logs_assert(|lines: &[&str]| {
+            let failed: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("startup initialization failed"))
+                .collect();
+            assert_eq!(failed.len(), 1, "{lines:?}");
+            assert!(
+                failed[0].contains("did not answer within the 300 ms request timeout"),
+                "{}",
+                failed[0]
+            );
+            Ok(())
+        });
+    }
+
+    /// A template the cluster refuses (a `403` for an HFS user without the
+    /// `manage_index_templates` cluster privilege) is logged, and the
+    /// nested-object limit and the mapping reconcile of the existing indices
+    /// still run, with the one reindex warning of the pass (#1506). It used to
+    /// end initialization, leaving every existing index on its old mapping and
+    /// limit until each was reconciled on its first write, with a warning each.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_template_does_not_skip_the_nested_limit_or_the_reconcile() {
+        use crate::backends::elasticsearch::SCHEMA_VERSION_META_KEY;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let acknowledged =
+            || ResponseTemplate::new(200).set_body_json(json!({ "acknowledged": true }));
+        let stub = |http_method: &'static str, url_path: &'static str, answer: ResponseTemplate| {
+            Mock::given(method(http_method))
+                .and(path(url_path))
+                .respond_with(answer)
+        };
+        // `HEAD /` is not stubbed: wiremock's `404` is an answer like any other.
+        stub(
+            "PUT",
+            "/_template/hfs_template",
+            ResponseTemplate::new(403).set_body_json(json!({
+                "error": {
+                    "type": "security_exception",
+                    "reason": "action [indices:admin/template/put] is unauthorized"
+                },
+                "status": 403
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub(
+            "GET",
+            "/hfs_*/_settings/index.mapping.nested_objects.limit",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": {
+                    "settings": {},
+                    "defaults": { "index.mapping.nested_objects.limit": "10000" }
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_settings", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_*/_mapping",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": { "mappings": {
+                    "_meta": { SCHEMA_VERSION_META_KEY: 1 },
+                    "properties": { "resource_type": { "type": "keyword" } }
+                } }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_mapping", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_t_patient/_stats/docs",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "indices": { "hfs_t_patient": { "primaries": { "docs": { "count": 3 } } } }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+        let config = ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await
+        .expect("a refused template must not fail the start");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is on");
+        let sent = |http_method: &str, url_path: &str| {
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == http_method && r.url.path() == url_path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sent("PUT", "/_template/hfs_template").len(), 1);
+        let raised = sent("PUT", "/hfs_t_patient/_settings");
+        assert_eq!(raised.len(), 1, "the nested-object limit is still raised");
+        let body: Value = serde_json::from_slice(&raised[0].body).expect("settings body");
+        assert_eq!(body["index.mapping.nested_objects.limit"], json!(50_000));
+        assert_eq!(
+            sent("PUT", "/hfs_t_patient/_mapping").len(),
+            1,
+            "the mapping is still reconciled"
+        );
+        assert!(
+            backend.is_schema_checked("hfs_t_patient"),
+            "the write path must not reconcile, nor warn about, the index again"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let warnings = |needle: &str| {
+                lines
+                    .iter()
+                    .filter(|l| l.contains("WARN") && l.contains(needle))
+                    .count()
+            };
+            assert_eq!(
+                warnings("could not create the Elasticsearch index template"),
+                1,
+                "{lines:?}"
+            );
+            assert_eq!(warnings("before #1391"), 1, "one per pass: {lines:?}");
+            assert_eq!(warnings("startup initialization failed"), 0, "{lines:?}");
+            Ok(())
+        });
+    }
 
     #[test]
     fn missing_is_not_advertised_for_composite_or_special_parameters() {
@@ -946,13 +1628,90 @@ mod tests {
         assert_eq!(config.nodes, vec!["http://localhost:9200"]);
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
+        assert_eq!(config.bulk_concurrency, DEFAULT_BULK_CONCURRENCY);
+        assert_eq!(config.bulk_concurrency, 4);
         assert_eq!(config.reindex_refresh, None);
+        assert_eq!(config.reindex_prepare_threads, 0);
+        assert_eq!(config.refresh_interval, "1s");
     }
 
-    /// A rebuild follows the ordinary write policy unless it is given its
-    /// own, and a byte cap of `0` means "no cap", not "nothing fits" (#1125).
+    /// Elasticsearch time values, as the `refresh_interval` setting takes them.
     #[test]
-    fn reindex_refresh_falls_back_to_write_refresh_and_zero_bytes_is_uncapped() {
+    fn parse_refresh_interval_reads_elasticsearch_time_values() {
+        use std::time::Duration;
+        let every = |d| Some(RefreshInterval::Every(d));
+        assert_eq!(
+            parse_refresh_interval("-1"),
+            Some(RefreshInterval::Disabled)
+        );
+        assert_eq!(parse_refresh_interval("0"), every(Duration::ZERO));
+        assert_eq!(parse_refresh_interval("1s"), every(Duration::from_secs(1)));
+        assert_eq!(
+            parse_refresh_interval(" 30s "),
+            every(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_refresh_interval("200ms"),
+            every(Duration::from_millis(200))
+        );
+        assert_eq!(
+            parse_refresh_interval("1000ms"),
+            parse_refresh_interval("1s")
+        );
+        assert_eq!(
+            parse_refresh_interval("500micros"),
+            every(Duration::from_micros(500))
+        );
+        assert_eq!(
+            parse_refresh_interval("7nanos"),
+            every(Duration::from_nanos(7))
+        );
+        assert_eq!(
+            parse_refresh_interval("2m"),
+            every(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_refresh_interval("1h"),
+            every(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            parse_refresh_interval("1d"),
+            every(Duration::from_secs(86_400))
+        );
+
+        for bad in ["", "s", "1", "1x", "1.5s", "-2", "-1s", "1 s", "abc", "30S"] {
+            assert_eq!(parse_refresh_interval(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            parse_refresh_interval(&format!("{}d", u64::MAX)),
+            None,
+            "an overflowing amount is not a value"
+        );
+    }
+
+    #[test]
+    fn config_exposes_its_parsed_refresh_interval() {
+        let config = ElasticsearchConfig {
+            refresh_interval: "30s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.refresh_interval_parsed(),
+            Some(RefreshInterval::Every(std::time::Duration::from_secs(30)))
+        );
+        let config = ElasticsearchConfig {
+            refresh_interval: "soon".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.refresh_interval_parsed(), None);
+    }
+
+    /// A rebuild never inherits the ordinary write policy: unset means no
+    /// per-request refresh even under `write_refresh = wait_for` (#1749),
+    /// an explicit policy is honoured, and a byte cap of `0` means "no cap",
+    /// not "nothing fits" (#1125).
+    #[test]
+    fn reindex_refresh_never_inherits_write_refresh_and_zero_bytes_is_uncapped() {
         let backend = |write_refresh, reindex_refresh, bulk_max_bytes| {
             ElasticsearchBackend::new(ElasticsearchConfig {
                 write_refresh,
@@ -962,16 +1721,27 @@ mod tests {
             })
             .expect("client construction is lazy")
         };
-        let follows = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        let unset = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        assert!(
+            unset.reindex_refresh_param().is_none(),
+            "a bulk path must not inherit wait_for"
+        );
         assert!(matches!(
-            follows.reindex_refresh_param(),
+            unset.write_refresh_param(),
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
+        assert_eq!(unset.bulk_max_bytes(), usize::MAX);
+
+        let explicit = backend(
+            WriteRefreshPolicy::False,
+            Some(WriteRefreshPolicy::WaitFor),
+            0,
+        );
         assert!(matches!(
-            follows.write_refresh_param(),
+            explicit.reindex_refresh_param(),
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
-        assert_eq!(follows.bulk_max_bytes(), usize::MAX);
+        assert!(explicit.write_refresh_param().is_none());
 
         let own = backend(
             WriteRefreshPolicy::WaitFor,
@@ -984,6 +1754,28 @@ mod tests {
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
         assert_eq!(own.bulk_max_bytes(), 4096);
+    }
+
+    /// The prepare pool's gate admits one page per pool thread, so the
+    /// ingest sink's concurrent writers share the pool instead of three of
+    /// four extracting on their own thread (#1749).
+    #[test]
+    fn prepare_gate_has_one_permit_per_pool_thread() {
+        let permits = |threads| {
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                reindex_prepare_threads: threads,
+                ..Default::default()
+            })
+            .expect("client construction is lazy")
+            .reindex_prepare_gate()
+            .available_permits()
+        };
+        assert_eq!(permits(1), 1);
+        assert_eq!(permits(6), 6);
+        let auto = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).clamp(1, REINDEX_PREPARE_AUTO_MAX))
+            .unwrap_or(1);
+        assert_eq!(permits(0), auto);
     }
 
     /// The method-level view of the injective derivation. The exhaustive
@@ -1060,7 +1852,9 @@ mod tests {
         assert!(backend.supports(BackendCapability::Sorting));
         assert!(!backend.supports(BackendCapability::Transactions));
         // Chained/`_has` search resolves via the backend-agnostic resolver over
-        // ES's `search()` (which honours `_id`), so ES declares it.
+        // ES's `search()` (which honours `_id`), so ES declares it. A `_has`
+        // hop reads its reference values in one aggregation
+        // (`search_reference_values`) instead of paging every source document.
         assert!(backend.supports(BackendCapability::ChainedSearch));
         assert!(backend.supports(BackendCapability::ReverseChaining));
         // No history/versioning on ES, and never a tenancy topology beyond

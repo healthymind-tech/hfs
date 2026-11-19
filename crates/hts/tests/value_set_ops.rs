@@ -10,9 +10,9 @@ use common::{TestApp, bundles};
 // ── $expand ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_returns_all_included_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::LIMBS_VS_URL)]);
@@ -40,9 +40,9 @@ async fn expand_returns_all_included_codes() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_unknown_value_set_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", "http://hts.test/vs/no-such-vs")]);
@@ -52,9 +52,9 @@ async fn expand_unknown_value_set_returns_404() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_with_count_limits_results() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // Request only 1 result
@@ -112,9 +112,9 @@ const ISA_HIERARCHY_BUNDLE: &str = r#"{
 /// ValueSet wholly includes an is-a CodeSystem, the expansion nests children
 /// under their parent (FHIR default; IG `version/vs-expand-versionless`).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_codesystem_nests_by_default() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -144,9 +144,9 @@ async fn expand_is_a_codesystem_nests_by_default() {
 
 /// `excludeNested=true` keeps the same is-a CodeSystem expansion FLAT.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_codesystem_flat_with_exclude_nested() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -171,9 +171,9 @@ async fn expand_is_a_codesystem_flat_with_exclude_nested() {
 /// An include carrying an `is-a` filter designates a hierarchy subtree, so an
 /// unpaged expansion of it nests by default (IG `search/search-filter-yes`).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_nests_by_default() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let (status, body) = app
@@ -203,9 +203,9 @@ async fn expand_is_a_filter_nests_by_default() {
 /// honour `count` — otherwise `count=10` over a SNOMED root reads ~10^5 concepts
 /// and returns all of them (regression guard for issue #227).
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_stays_flat_when_paged() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
 
     let req = isa_filter_expand(&[r#"{"name":"count","valueInteger":2}"#]);
@@ -224,9 +224,9 @@ async fn expand_is_a_filter_stays_flat_when_paged() {
 /// `search/search-filter-yes` fixture filters on `"data"` and still expects the
 /// matches nested under `data-exchange`. Mirrors that fixture locally.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_is_a_filter_with_text_filter_still_nests() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(DATA_EXCHANGE_BUNDLE).await;
 
     let req = r#"{"resourceType":"Parameters","parameter":[
@@ -305,9 +305,9 @@ fn isa_filter_expand(extra: &[&str]) -> String {
 // ── $validate-code (ValueSet) ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_included_code_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -331,9 +331,9 @@ async fn vs_validate_code_included_code_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_excluded_code_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // 'head' is NOT in the limbs ValueSet (which only includes limb, arm, leg)
@@ -357,6 +357,81 @@ async fn vs_validate_code_excluded_code_returns_false() {
     assert!(!result, "'head' should NOT be in the limbs ValueSet");
 }
 
+/// A `url|version` canonical, as profile bindings carry it, resolves the same
+/// stored ValueSet as `url` plus `valueSetVersion`; an unknown version does not.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+
+    for (code, expected) in [("arm", true), ("head", false)] {
+        let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+        let req = TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("code", "valueCode", code),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ]);
+        let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result(&body), Some(expected), "{code}: {body}");
+    }
+
+    let url = format!("{}|9.9", bundles::LIMBS_VS_URL);
+    let req = TestApp::params(&[
+        ("url", "valueUri", &url),
+        ("code", "valueCode", "arm"),
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+    ]);
+    let (_, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+    assert_ne!(
+        result(&body),
+        Some(true),
+        "unknown version must not validate: {body}"
+    );
+}
+
+/// A `url|version` canonical sent alongside a matching `valueSetVersion`
+/// still resolves; a disagreeing one is a 400 (fork rule).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_versioned_canonical_with_explicit_value_set_version() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+    let validate = |vs_version: &'static str| {
+        TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("valueSetVersion", "valueString", vs_version),
+            ("code", "valueCode", "arm"),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ])
+    };
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("1.0"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = body["parameter"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+        .and_then(|p| p["valueBoolean"].as_bool());
+    assert_eq!(result, Some(true), "{body}");
+
+    // Fork rule (9eab3e5d7): a disagreeing `valueSetVersion` is a 400
+    // (upstream lets the explicit parameter win).
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("9.9"))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// Regression: when a request specifies `version=1.0.0` and the CodeSystem
 /// exists at that version (even though a newer version also exists), the
 /// response `version` parameter must echo the *requested* version ("1.0.0"),
@@ -364,9 +439,9 @@ async fn vs_validate_code_excluded_code_returns_false() {
 ///
 /// Covers the IG `version-code-v10-vs10-response-parameters` fixture.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_code_version_echoes_requested_version() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
 
     // Import a bundle with two versions of the same CodeSystem plus a
     // ValueSet that pins version 1.0.0.
@@ -464,9 +539,9 @@ async fn vs_validate_code_version_echoes_requested_version() {
 // ── GET /ValueSet (search) ────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_no_filter_returns_bundle() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet").await;
@@ -479,9 +554,9 @@ async fn search_value_sets_no_filter_returns_bundle() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_by_url_returns_match() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let url = format!("/ValueSet?url={}", bundles::LIMBS_VS_URL);
@@ -494,9 +569,9 @@ async fn search_value_sets_by_url_returns_match() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_unknown_url_returns_empty() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app
@@ -509,9 +584,9 @@ async fn search_value_sets_unknown_url_returns_empty() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_by_name() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet?name=LimbsVS").await;
@@ -523,9 +598,9 @@ async fn search_value_sets_by_name() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn search_value_sets_pagination() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet?_count=1").await;
@@ -541,9 +616,9 @@ async fn search_value_sets_pagination() {
 // ── Instance-level: /ValueSet/{id}/$expand ────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_post_returns_same_as_system_level() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     // System-level
@@ -588,9 +663,9 @@ async fn expand_by_id_post_returns_same_as_system_level() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_get_returns_expansion() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, body) = app.get_fhir("/ValueSet/limbs/$expand").await;
@@ -602,9 +677,9 @@ async fn expand_by_id_get_returns_expansion() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let (status, _) = app
@@ -620,9 +695,9 @@ async fn expand_by_id_unknown_id_returns_404() {
 // ── Instance-level: /ValueSet/{id}/$validate-code ────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_by_id_post_included_code_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -645,9 +720,9 @@ async fn vs_validate_by_id_post_included_code_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_by_id_unknown_id_returns_404() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[
@@ -664,7 +739,7 @@ async fn vs_validate_by_id_unknown_id_returns_404() {
 // ── too-costly expansion limit ────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_exceeds_limit_returns_422_too_costly() {
     use axum::{body::Body, http::Request};
     use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
@@ -718,12 +793,96 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
     assert_eq!(issue_code, "too-costly");
 }
 
+/// An inline ValueSet that includes a whole code system too large to expand
+/// (all of SNOMED CT in practice; here max_expansion_size = 1 against the
+/// 5-code anatomy system) is still answered: membership in a compose of
+/// whole systems and enumerated concepts is decided code by code instead of
+/// failing as too costly. A compose with a filter still needs an expansion.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_whole_system_value_set_too_large_to_expand_still_validates() {
+    use axum::{body::Body, http::Request};
+    use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+    use tower::ServiceExt;
+
+    let backend = SqliteTerminologyBackend::in_memory().unwrap();
+    let state = AppState::new(backend).with_max_expansion_size(1);
+    let app = helios_hts::server::create_app(&HtsConfig::default(), state);
+    let post = |uri: &'static str, body: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/fhir+json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    let (status, _) = post("/import", bundles::r4_bundle().to_string()).await;
+    assert!(status.is_success());
+
+    let validate = |compose: serde_json::Value, code: &str| {
+        serde_json::json!({"resourceType": "Parameters", "parameter": [
+            {"name": "valueSet", "resource": {"resourceType": "ValueSet", "status": "active", "compose": compose}},
+            {"name": "coding", "valueCoding": {"system": bundles::ANATOMY_CS_URL, "code": code}}
+        ]})
+        .to_string()
+    };
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+    let whole = serde_json::json!({"include": [{"system": bundles::ANATOMY_CS_URL}]});
+
+    let (status, body) = post("/ValueSet/$validate-code", validate(whole.clone(), "arm")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(true), "{body}");
+
+    let (status, body) = post("/ValueSet/$validate-code", validate(whole, "tail")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(false), "{body}");
+
+    // Excluded by an enumerated exclude.
+    let minus_arm = serde_json::json!({
+        "include": [{"system": bundles::ANATOMY_CS_URL}],
+        "exclude": [{"system": bundles::ANATOMY_CS_URL, "concept": [{"code": "arm"}]}]
+    });
+    let (_, body) = post("/ValueSet/$validate-code", validate(minus_arm, "arm")).await;
+    assert_eq!(result(&body), Some(false), "{body}");
+
+    // A filtered include cannot be judged without an expansion.
+    let filtered = serde_json::json!({"include": [{"system": bundles::ANATOMY_CS_URL,
+        "filter": [{"property": "concept", "op": "is-a", "value": "body"}]}]});
+    let (status, body) = post("/ValueSet/$validate-code", validate(filtered, "arm")).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_coding_in_set_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -759,9 +918,9 @@ async fn vs_validate_coding_in_set_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_one_match_returns_true() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -796,9 +955,9 @@ async fn vs_validate_codeable_concept_one_match_returns_true() {
 }
 
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn vs_validate_codeable_concept_no_match_returns_false() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let body = serde_json::json!({
@@ -842,9 +1001,9 @@ async fn vs_validate_codeable_concept_no_match_returns_false() {
 /// Hierarchy: limb → arm, leg.  `body` (parent of `limb`) is not in the
 /// expansion, so `limb` becomes the single root with arm + leg nested under it.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_hierarchical_returns_nested_tree() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = serde_json::json!({
@@ -881,9 +1040,9 @@ async fn expand_hierarchical_returns_nested_tree() {
 
 /// $expand with `hierarchical=false` (or absent) returns the flat list unchanged.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_hierarchical_false_returns_flat_list() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = serde_json::json!({
@@ -912,9 +1071,9 @@ async fn expand_hierarchical_false_returns_flat_list() {
 
 /// $expand with `Accept: application/fhir+xml` should return valid FHIR XML.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_xml_response_contains_valueset_root() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::r4_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::LIMBS_VS_URL)]);
@@ -935,9 +1094,9 @@ async fn expand_xml_response_contains_valueset_root() {
 /// $expand with a URL that matches `CodeSystem.valueSet` (no explicit ValueSet
 /// resource) returns all codes in that CodeSystem.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_implicit_vs_returns_all_cs_codes() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::IMPLICIT_VS_URL)]);
@@ -960,9 +1119,9 @@ async fn expand_implicit_vs_returns_all_cs_codes() {
 
 /// The `total` in the expansion equals the number of codes in the CodeSystem.
 #[cfg(feature = "sqlite")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn expand_implicit_vs_total_matches_concept_count() {
-    let app = TestApp::new();
+    let app = TestApp::new().await;
     app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
 
     let req = TestApp::params(&[("url", "valueUri", bundles::IMPLICIT_VS_URL)]);
@@ -970,4 +1129,47 @@ async fn expand_implicit_vs_total_matches_concept_count() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["expansion"]["total"], 3);
+}
+
+/// NHI CI's `nhi-category` 1.0.2 includes its own code system and HL7's
+/// `condition-category` at version "1.0.2", which no release carries: the
+/// value set cannot be expanded, but a code of its own code system is still
+/// a member (tx.fhir.org and the HL7 validator accept Condition-con-min's
+/// category `01`). A code in neither stays out.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_version_of_another_systems_include_does_not_hide_members() {
+    let app = TestApp::new().await;
+    let bundle = serde_json::json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "CodeSystem", "id": "nhi-category", "url": "http://nhi.test/CodeSystem/nhi-category",
+            "version": "1.0.2", "status": "active", "content": "complete",
+            "concept": [{"code": "01", "display": "癌症"}, {"code": "02", "display": "先天性凝血因子異常"}]}},
+        {"resource": {"resourceType": "CodeSystem", "id": "condition-category", "url": "http://hl7.test/CodeSystem/condition-category",
+            "version": "4.0.1", "status": "active", "content": "complete",
+            "concept": [{"code": "problem-list-item"}, {"code": "encounter-diagnosis"}]}},
+        {"resource": {"resourceType": "ValueSet", "id": "nhi-category", "url": "http://nhi.test/ValueSet/nhi-category",
+            "version": "1.0.2", "status": "active", "compose": {"include": [
+                {"system": "http://nhi.test/CodeSystem/nhi-category"},
+                {"system": "http://hl7.test/CodeSystem/condition-category", "version": "1.0.2"}]}}}
+    ]});
+    app.import_bundle_ok(&bundle.to_string()).await;
+    let check = |code: &str| {
+        serde_json::json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://nhi.test/ValueSet/nhi-category"},
+            {"name": "codeableConcept", "valueCodeableConcept": {"coding": [
+                {"system": "http://nhi.test/CodeSystem/nhi-category", "code": code}]}}
+        ]})
+        .to_string()
+    };
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+    let (status, body) = app.post_fhir("/ValueSet/$validate-code", check("01")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(result(&body), Some(true), "{body}");
+    let (_, body) = app.post_fhir("/ValueSet/$validate-code", check("99")).await;
+    assert_eq!(result(&body), Some(false), "{body}");
 }
