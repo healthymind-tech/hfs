@@ -1913,6 +1913,14 @@
       "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID): RESTful fullUrls whose last segment is not the entry resource's id (e.g. .../Observation/lri-gramstain1 for id gramstain1)."
     },
     {
+      "file": "diagnosticreport-example-pgx.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: presentedForm.hash is a hex SHA-1 string, not the base64 SHA-1 of the data, so the Attachment hash check (69480fcb1) finds a mismatch; the HL7 validator checks Attachment.hash the same way."
+    },
+    {
       "file": "diagnosticreport-genetics-questionnaire.json",
       "issues": 9,
       "kinds": [
@@ -3185,6 +3193,14 @@
         "reference-invalid"
       ],
       "reason": "Genuine defect in the published example, not an engine bug: Observation.performer does not allow Encounter."
+    },
+    {
+      "file": "observation-example-f202-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: a body-temperature vital sign with no effective[x], which the mandatory vital-signs profile requires (1..1); the example's entered-in-error status does not exempt it."
     },
     {
       "file": "observation-example-genetics-brcapat.json",
