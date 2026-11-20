@@ -31,6 +31,7 @@ pub enum SyncApi {
 }
 
 impl SyncApi {
+    #[allow(clippy::result_large_err)] // the error is the ready response
     fn service(&self) -> Result<Arc<SyncService>, Response> {
         match self {
             SyncApi::Fixed(s) => Ok(s.clone()),
@@ -180,6 +181,7 @@ fn job_response(
 }
 
 /// Parses `If-Match: "3"` / `W/"3"`.
+#[allow(clippy::result_large_err)] // the error is the ready response
 pub fn if_match(headers: &HeaderMap) -> Result<Option<u64>, Response> {
     let Some(v) = headers.get(header::IF_MATCH) else {
         return Ok(None);

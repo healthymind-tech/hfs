@@ -713,7 +713,7 @@ async fn run_page(
     let csrf = status.csrf_token().map(str::to_string);
     render(SyncRunPage {
         status,
-        i18n: I18n::new(locale.clone()),
+        i18n: I18n::new(locale),
         active_page: "sync",
         job_id: run.job_id.clone(),
         job_name,

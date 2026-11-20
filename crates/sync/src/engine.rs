@@ -353,8 +353,12 @@ impl RunState<'_> {
             }
         }
         if !ops.is_empty() {
-            let (write_ops, meta): (Vec<WriteOp>, Vec<(&Change, Option<[u8; 32]>)>) =
-                ops.into_iter().map(|(o, c, h)| (o, (c, h))).unzip();
+            let mut write_ops = Vec::with_capacity(ops.len());
+            let mut meta = Vec::with_capacity(ops.len());
+            for (o, c, h) in ops {
+                write_ops.push(o);
+                meta.push((c, h));
+            }
             let results = target
                 .apply(write_ops)
                 .await
