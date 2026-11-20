@@ -47,38 +47,122 @@ thread_local! {
     static ON_LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Stack of the threads validation runs its recursive parts on.
+/// Stack of the threads validation runs its recursive parts on (virtual
+/// reservation; only the pages touched become resident).
 const VALIDATION_STACK: usize = 16 * 1024 * 1024;
 
-/// Run `f` on a thread with [`VALIDATION_STACK`] of stack, and wait for it.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A bounded pool of large-stack threads, grown on demand up to the number
+/// of CPUs (at least 2, at most 64). Threads stay alive, so their
+/// allocator caches stay warm and no thread is created per call.
+struct LargeStackPool {
+    state: std::sync::Mutex<PoolState>,
+    work: std::sync::Condvar,
+    limit: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    queue: std::collections::VecDeque<Job>,
+    threads: usize,
+    idle: usize,
+}
+
+impl LargeStackPool {
+    fn global() -> &'static LargeStackPool {
+        static POOL: std::sync::OnceLock<LargeStackPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| LargeStackPool {
+            state: Default::default(),
+            work: std::sync::Condvar::new(),
+            limit: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 64),
+        })
+    }
+
+    fn submit(&'static self, job: Job) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.queue.push_back(job);
+        if state.idle == 0 && state.threads < self.limit {
+            let spawned = std::thread::Builder::new()
+                .name("hfs-validation".to_string())
+                .stack_size(VALIDATION_STACK)
+                .spawn(move || self.run());
+            match spawned {
+                Ok(_) => state.threads += 1,
+                // No thread at all to run it (thread limits): run it here,
+                // on the caller's stack, as before the pool existed.
+                Err(_) if state.threads == 0 => {
+                    let job = state.queue.pop_back().expect("just queued");
+                    drop(state);
+                    job();
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        drop(state);
+        self.work.notify_one();
+    }
+
+    fn run(&'static self) {
+        ON_LARGE_STACK.with(|flag| flag.set(true));
+        loop {
+            let job = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = state.queue.pop_front() {
+                        break job;
+                    }
+                    state.idle += 1;
+                    state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                    state.idle -= 1;
+                }
+            };
+            job();
+        }
+    }
+}
+
+/// Run `f` on a large-stack thread of a bounded pool, and wait for it.
 ///
 /// The structural walk and above all the FHIRPath evaluator recurse with
 /// large frames: in a debug build validating a Bundle needed ~1.3 MiB of
 /// stack on its own (the walk ~260 KiB, FHIRPath invariants the rest),
 /// independent of the Bundle's size — too close to a Tokio worker's 2 MiB
 /// once the HTTP stack sits below it. The calling (async) thread now only
-/// waits; the recursion happens on a scoped thread whose stack does not
-/// depend on the caller's. The thread is not detached: `f` borrows from the
-/// caller, and a panic is re-raised on the caller. Calls already on such a
-/// thread run inline.
+/// waits (it blocked on this CPU-bound work before too); the recursion
+/// happens on a pool thread whose stack does not depend on the caller's.
+/// Calls already on a pool thread run inline, so nested validation never
+/// waits for the pool. A panic in `f` is re-raised on the caller.
 pub(crate) fn on_large_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if ON_LARGE_STACK.with(std::cell::Cell::get) {
         return f();
     }
-    std::thread::scope(|scope| {
-        let handle = std::thread::Builder::new()
-            .name("hfs-validation".to_string())
-            .stack_size(VALIDATION_STACK)
-            .spawn_scoped(scope, || {
-                ON_LARGE_STACK.with(|flag| flag.set(true));
-                f()
-            });
-        handle
-            .expect("spawn a validation thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
+    let (done, wait) = std::sync::mpsc::sync_channel::<std::thread::Result<R>>(1);
+    let job = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = done.send(result);
+    };
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
+    // SAFETY: `f` (and so the job) may borrow from this stack frame. This
+    // function does not return until the job has run to completion and sent
+    // its result (`catch_unwind` guarantees the send also after a panic),
+    // so nothing borrowed is used after the borrow ends. The `'static` is
+    // only what the pool's queue type asks for.
+    let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) };
+    LargeStackPool::global().submit(job);
+    match wait.recv() {
+        Ok(Ok(value)) => value,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        // The job was dropped unrun (cannot happen: the pool never drops
+        // queued jobs) — never return while a borrow could still be live.
+        Err(_) => std::process::abort(),
+    }
 }
+
 use crate::resolver::SchemaResolver;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
