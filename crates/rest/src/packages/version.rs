@@ -354,3 +354,7 @@ mod tests {
         assert_eq!(Range::parse("^1.0.0").pick(&available, None), Some("1.1.0"));
     }
 }
+
+#[cfg(test)]
+#[path = "version_hm_tests.rs"]
+mod hm_tests;

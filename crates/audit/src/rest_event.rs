@@ -807,3 +807,7 @@ mod tests {
         assert!(s.request_line.unwrap().len() <= MAX_QUERY_BYTES);
     }
 }
+
+#[cfg(test)]
+#[path = "rest_event_hm_tests.rs"]
+mod hm_tests;
