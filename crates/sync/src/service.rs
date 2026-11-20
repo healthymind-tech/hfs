@@ -182,6 +182,12 @@ impl SyncService {
         &self.runtime.env.store
     }
 
+    /// The job store, for read-only consumers (the manager console's
+    /// `StoreBackend::with_sync`).
+    pub fn sync_store(&self) -> Arc<dyn helios_endpoints::sync::SyncStore> {
+        self.runtime.env.store.clone()
+    }
+
     async fn audit(&self, action: &str, job: &SyncJob, actor: &str, ok: bool, desc: &str) {
         if let Some(a) = self.runtime.auditor() {
             a.record(action, &job.id, &job.spec.name, actor, ok, desc).await;

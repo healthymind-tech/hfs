@@ -18,7 +18,7 @@ use askama::Template;
 use axum::{
     Extension, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -34,6 +34,15 @@ use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
 
 /// The sync pages (merged into the console router).
 pub(crate) fn routes() -> Router<WebState> {
+    crate::manager::nav::register(crate::manager::nav::NavItem {
+        section: crate::manager::nav::NavSection::Server,
+        id: "sync",
+        label_key: "sync-title",
+        href: "/ui/sync",
+        icon: "sync",
+        min_role: helios_endpoints::ConsoleRole::Viewer,
+        order: 10,
+    });
     Router::new()
         .route("/ui/sync", get(list_page))
         .route("/ui/sync/new", get(new_page).post(create))
@@ -61,8 +70,44 @@ pub(crate) struct JobRow {
     pub enabled: bool,
     pub state: String,
     pub progress: String,
+    pub percent: Option<u8>,
     pub run_id: String,
     pub next_run: String,
+}
+
+/// Pill tone and icon of a run state (P5 `pill_raw`).
+fn state_look(state: &str) -> (&'static str, &'static str) {
+    match state {
+        "succeeded" => ("ok", "check-circle"),
+        "failed" => ("danger", "alert"),
+        "running" => ("info", "activity"),
+        "queued" => ("accent", "history"),
+        "cancelled" => ("muted", "stop-circle"),
+        _ => ("muted", "info"),
+    }
+}
+
+impl JobRow {
+    pub fn tone(&self) -> &'static str {
+        state_look(&self.state).0
+    }
+    pub fn icon(&self) -> &'static str {
+        state_look(&self.state).1
+    }
+}
+
+/// Progress percent: estimated when known, full when succeeded,
+/// indeterminate (`None`) while active without an estimate.
+fn run_percent(r: &SyncRun) -> Option<u8> {
+    let p = &r.progress;
+    match r.state {
+        SyncRunState::Succeeded => Some(100),
+        SyncRunState::Failed | SyncRunState::Cancelled => Some(0),
+        _ => p
+            .estimated_total
+            .filter(|t| *t > 0)
+            .map(|t| ((p.read * 100 / t).min(100)) as u8),
+    }
 }
 
 fn peer_label(p: &SyncPeer) -> String {
@@ -111,6 +156,7 @@ fn job_row(job: &SyncJob, last: Option<&SyncRun>) -> JobRow {
         enabled: job.spec.enabled,
         state: last.map(|r| state_label(r.state)).unwrap_or("never run").to_string(),
         progress: last.map(progress_label).unwrap_or_default(),
+        percent: last.and_then(run_percent),
         run_id: last.map(|r| r.id.clone()).unwrap_or_default(),
         next_run: job
             .next_run_at
@@ -214,9 +260,27 @@ impl SyncNewPage {
         self.is(&format!("{side}_{field}"), value, default)
     }
 
-    /// Whether `side` is the source fieldset.
-    pub fn is_source(&self, side: &str) -> bool {
-        side == "source"
+    /// Localized fieldset title of a side.
+    pub fn side_title(&self, side: &str) -> String {
+        if side == "source" { self.i18n.t("sync-source") } else { self.i18n.t("sync-target") }
+    }
+
+    /// `{side}_{field}` as a form field name.
+    pub fn side_field(&self, side: &str, field: &str) -> String {
+        format!("{side}_{field}")
+    }
+
+    /// A value with a default when absent / empty.
+    pub fn v_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
+        match self.v(key) {
+            "" => default,
+            v => v,
+        }
+    }
+
+    /// A checkbox: `default` on a fresh form, else whether it was sent.
+    pub fn checked_or(&self, key: &str, default: bool) -> bool {
+        if self.form.is_empty() { default } else { self.v(key) == "on" }
     }
 }
 
@@ -234,8 +298,21 @@ fn endpoint_options(s: &SyncService) -> Vec<EndpointOption> {
         .collect()
 }
 
-async fn new_page(State(state): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant) -> Response {
+async fn new_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let s = service();
+    // `/ui/sync/new?source=<endpoint>` (the endpoint's sync page) preselects
+    // the source.
+    let mut form = HashMap::new();
+    if let Some(src) = q.get("source").filter(|v| !v.is_empty()) {
+        form.insert("source_kind".to_string(), "endpoint".to_string());
+        form.insert("source_endpoint".to_string(), src.clone());
+    }
     render(SyncNewPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
@@ -243,7 +320,7 @@ async fn new_page(State(state): State<WebState>, locale: RequestLocale, rv: Requ
         available: s.is_some(),
         endpoints: s.as_deref().map(endpoint_options).unwrap_or_default(),
         errors: vec![],
-        form: HashMap::new(),
+        form,
     })
 }
 
@@ -378,6 +455,15 @@ pub(crate) struct RunRow {
     pub error: String,
 }
 
+impl RunRow {
+    pub fn tone(&self) -> &'static str {
+        state_look(&self.state).0
+    }
+    pub fn icon(&self) -> &'static str {
+        state_look(&self.state).1
+    }
+}
+
 fn run_row(r: &SyncRun) -> RunRow {
     RunRow {
         id: r.id.clone(),
@@ -395,6 +481,7 @@ pub(crate) struct SyncJobPage {
     pub status: crate::Status,
     pub i18n: I18n,
     pub active_page: &'static str,
+    pub lede: String,
     pub row: JobRow,
     pub definition: String,
     pub runs: Vec<RunRow>,
@@ -421,11 +508,17 @@ async fn job_page(
     let definition = serde_json::to_string_pretty(&helios_sync::secrets::redacted_job(&job)["spec"])
         .unwrap_or_default();
     let last = runs.first();
+    let row = job_row(&job, last);
+    let mut lede = format!("{} → {} · {}", row.source, row.target, row.trigger);
+    if !row.enabled {
+        lede.push_str(&format!(" · {}", i18n.t("sync-disabled")));
+    }
     render(SyncJobPage {
         status,
         i18n,
         active_page: "sync",
-        row: job_row(&job, last),
+        lede,
+        row,
         definition,
         active: last.is_some_and(|r| !r.state.is_terminal()),
         retryable: last.is_some_and(|r| matches!(r.state, SyncRunState::Failed | SyncRunState::Cancelled)),
@@ -489,6 +582,9 @@ pub(crate) struct RunStatusFragment {
     pub phase: String,
     pub current_type: String,
     pub live: bool,
+    pub percent: Option<u8>,
+    pub progress_label: String,
+    pub csrf: Option<String>,
     pub log: Vec<LogView>,
     pub conflicts: Vec<SyncConflict>,
 }
@@ -504,7 +600,7 @@ pub(crate) struct SyncRunPage {
     pub fragment_html: String,
 }
 
-async fn fragment(s: &SyncService, run: &SyncRun, i18n: I18n) -> RunStatusFragment {
+async fn fragment(s: &SyncService, run: &SyncRun, i18n: I18n, csrf: Option<String>) -> RunStatusFragment {
     let mut log = s.log(&run.id, 0, 1000).await.unwrap_or_default();
     let tail = log.len().saturating_sub(100);
     let log: Vec<LogView> = log.drain(tail..).rev().map(|l| log_view(&l)).collect();
@@ -524,6 +620,9 @@ async fn fragment(s: &SyncService, run: &SyncRun, i18n: I18n) -> RunStatusFragme
         phase: run.cursor.phase.clone(),
         current_type: run.cursor.current_type.clone().unwrap_or_default(),
         live: !run.state.is_terminal(),
+        percent: run_percent(run),
+        progress_label: progress_label(run),
+        csrf,
         log,
         conflicts: s.conflicts(&run.id, 200).await.unwrap_or_default(),
     }
@@ -544,22 +643,30 @@ async fn run_page(
         return crate::render_not_found(status, I18n::new(locale), "sync", "/ui/sync", "Sync");
     };
     let job_name = s.job(&run.job_id).await.map(|j| j.spec.name).unwrap_or_default();
+    let csrf = status.csrf_token().map(str::to_string);
     render(SyncRunPage {
         status,
         i18n: I18n::new(locale.clone()),
         active_page: "sync",
         job_id: run.job_id.clone(),
         job_name,
-        fragment_html: fragment(&s, &run, I18n::new(locale)).await.render().unwrap_or_default(),
+        fragment_html: fragment(&s, &run, I18n::new(locale), csrf).await.render().unwrap_or_default(),
     })
 }
 
-async fn run_status(locale: RequestLocale, Path(run_id): Path<String>) -> Response {
+async fn run_status(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(run_id): Path<String>,
+) -> Response {
     let Some(s) = service() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let csrf = current_status(&state, rv.0, &rt).csrf_token().map(str::to_string);
     match s.run(&run_id).await {
-        Ok(run) => render(fragment(&s, &run, I18n::new(locale)).await),
+        Ok(run) => render(fragment(&s, &run, I18n::new(locale), csrf).await),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

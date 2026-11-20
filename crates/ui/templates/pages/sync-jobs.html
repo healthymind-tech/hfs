@@ -1,47 +1,55 @@
 {% extends "layouts/base.html" %}
-
+{% import "partials/components.html" as ui %}
+{# Every sync job of the server (P6). Job pages: /ui/sync/{id}; runs: /ui/sync/runs/{run}. #}
 {% block title %}{{ i18n.t("sync-title") }} — {{ i18n.t("app-title") }}{% endblock %}
 
 {% block content %}
-<section class="page-head page-head--row">
-  <div>
-    <h1 class="page-head__title">{{ i18n.t("sync-title") }}</h1>
-    <p class="page-head__lede">{{ i18n.t("sync-lede") }}</p>
-  </div>
-  {% if available %}<a class="btn btn--primary" href="/ui/sync/new">{{ i18n.t("sync-new") }}</a>{% endif %}
-</section>
+{% call ui::page_header(i18n.t("sync-title"), i18n.t("sync-lede")) %}
+  {% if available %}<a class="btn btn--primary" href="/ui/sync/new">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("sync-new") }}</a>{% endif %}
+{% endcall %}
 
 {% if !available %}
-<section class="card notice" role="status"><p>{{ i18n.t("sync-unavailable") }}</p></section>
+<section class="card">
+  {% call ui::empty_state("sync", i18n.t("sync-title"), i18n.t("sync-unavailable")) %}{% endcall %}
+</section>
 {% else %}
 {% if let Some(e) = error %}<section class="card notice" role="alert"><p>{{ e }}</p></section>{% endif %}
 <section class="card table-card">
+  {% if rows.is_empty() %}
+    {% call ui::empty_state("sync", i18n.t("sync-empty"), i18n.t("sync-new-lede")) %}
+      <a class="btn btn--primary" href="/ui/sync/new">{{ i18n.t("sync-new") }}</a>
+    {% endcall %}
+  {% else %}
   <div class="table-wrap" tabindex="0">
-    <table class="data-table">
+    <table class="data-table data-table--stack">
       <thead>
         <tr>
-          <th>{{ i18n.t("sync-col-name") }}</th>
-          <th>{{ i18n.t("sync-col-route") }}</th>
-          <th>{{ i18n.t("sync-col-trigger") }}</th>
-          <th>{{ i18n.t("sync-col-last-run") }}</th>
-          <th>{{ i18n.t("sync-col-next-run") }}</th>
+          <th scope="col">{{ i18n.t("sync-col-name") }}</th>
+          <th scope="col">{{ i18n.t("sync-col-route") }}</th>
+          <th scope="col">{{ i18n.t("sync-col-trigger") }}</th>
+          <th scope="col">{{ i18n.t("sync-col-last-run") }}</th>
+          <th scope="col">{{ i18n.t("sync-col-next-run") }}</th>
         </tr>
       </thead>
       <tbody>
         {% for r in rows %}
         <tr>
-          <td><a href="/ui/sync/{{ r.id }}">{{ r.name }}</a>{% if !r.enabled %} <span class="field__hint">({{ i18n.t("sync-disabled") }})</span>{% endif %}</td>
-          <td>{{ r.source }} → {{ r.target }}</td>
-          <td>{{ r.trigger }}</td>
-          <td>{% if r.run_id.is_empty() %}{{ r.state }}{% else %}<a href="/ui/sync/runs/{{ r.run_id }}" data-state="{{ r.state }}">{{ r.state }}</a><br><span class="field__hint">{{ r.progress }}</span>{% endif %}</td>
-          <td>{{ r.next_run }}</td>
+          <td data-label="{{ i18n.t("sync-col-name") }}"><a href="/ui/sync/{{ r.id }}">{{ r.name }}</a>{% if !r.enabled %} <span class="tag tag--muted">{{ i18n.t("sync-disabled") }}</span>{% endif %}</td>
+          <td data-label="{{ i18n.t("sync-col-route") }}"><span class="sync-dir">{{ r.source }} {% call ui::icon("arrow-right") %}{% endcall %} {{ r.target }}</span></td>
+          <td data-label="{{ i18n.t("sync-col-trigger") }}">{{ r.trigger }}</td>
+          <td data-label="{{ i18n.t("sync-col-last-run") }}">
+            {% if r.run_id.is_empty() %}—{% else %}
+            <a href="/ui/sync/runs/{{ r.run_id }}">{% call ui::pill_raw(r.tone(), r.icon(), r.state) %}{% endcall %}</a>
+            {% call ui::job_progress(r.percent, r.progress) %}{% endcall %}
+            {% endif %}
+          </td>
+          <td data-label="{{ i18n.t("sync-col-next-run") }}">{% if r.next_run.is_empty() %}—{% else %}{{ r.next_run }}{% endif %}</td>
         </tr>
-        {% else %}
-        <tr class="data-table__empty"><td colspan="5">{{ i18n.t("sync-empty") }}</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  {% endif %}
 </section>
 {% endif %}
 {% endblock %}

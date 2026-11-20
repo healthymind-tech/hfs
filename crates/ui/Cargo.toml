@@ -178,9 +178,8 @@ helios-observability = { path = "../observability", version = "0.2.9" }
 helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
 
 # Sync console pages (FHIR server manager P6): server-rendered over the
-# sync service; the contracts crate for the job/run types.
+# sync service.
 helios-sync = { path = "../sync", version = "0.2.9", default-features = false }
-helios-endpoints = { path = "../endpoints", version = "0.2.9" }
 
 
 [dev-dependencies]

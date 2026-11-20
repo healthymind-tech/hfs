@@ -1,11 +1,13 @@
+{% import "partials/components.html" as ui %}
 {#- Live run status. While the run is active the block re-fetches itself
     every 2 s (htmx); a terminal run carries no trigger, so polling stops. -#}
 <div id="sync-run-status" aria-live="polite"
      {% if live %}hx-get="/ui/sync/runs/{{ run.id }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
   <section class="card">
     <div class="card-head">
-      <h3><span data-state="{{ run.state }}">{{ run.state }}</span> · {{ run.reason }} · {{ run.created }}</h3>
+      <h2>{% call ui::pill_raw(run.tone(), run.icon(), run.state) %}{% endcall %} {{ run.reason }} · {{ run.created }}</h2>
     </div>
+    {% if live %}{% call ui::job_progress(percent, progress_label) %}{% endcall %}{% endif %}
     <p>{{ i18n.t("sync-phase") }}: {{ phase }}{% if !current_type.is_empty() %} ({{ current_type }}){% endif %}</p>
     {% if !run.error.is_empty() %}<p role="alert">{{ run.error }}</p>{% endif %}
     <dl class="sync-counters">
@@ -16,9 +18,9 @@
   </section>
 
   <section class="card table-card">
-    <div class="card-head"><h3>{{ i18n.t("sync-conflicts") }}</h3></div>
+    <div class="card-head"><h2>{{ i18n.t("sync-conflicts") }}</h2></div>
     <div class="table-wrap" tabindex="0">
-      <table class="data-table">
+      <table class="data-table data-table--stack">
         <thead><tr><th>{{ i18n.t("sync-col-resource") }}</th><th>{{ i18n.t("sync-col-versions") }}</th><th>{{ i18n.t("sync-col-reason") }}</th><th></th></tr></thead>
         <tbody>
           {% for c in conflicts %}
@@ -27,8 +29,8 @@
             <td>{{ c.source_version.as_deref().unwrap_or("-") }} → {{ c.target_version.as_deref().unwrap_or("-") }}</td>
             <td>{{ c.reason }}</td>
             <td class="addbox__actions">
-              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/overwrite"><button class="btn" type="submit">{{ i18n.t("sync-overwrite") }}</button></form>
-              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/keep"><button class="btn" type="submit">{{ i18n.t("sync-keep") }}</button></form>
+              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/overwrite">{% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-overwrite") }}</button></form>
+              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/keep">{% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-keep") }}</button></form>
             </td>
           </tr>
           {% else %}
@@ -40,9 +42,9 @@
   </section>
 
   <section class="card table-card">
-    <div class="card-head"><h3>{{ i18n.t("sync-log") }}</h3></div>
+    <div class="card-head"><h2>{{ i18n.t("sync-log") }}</h2></div>
     <div class="table-wrap" tabindex="0">
-      <table class="data-table">
+      <table class="data-table data-table--stack">
         <tbody>
           {% for l in log %}
           <tr data-level="{{ l.level }}"><td>{{ l.at }}</td><td>{{ l.level }}</td><td>{{ l.message }}</td></tr>
