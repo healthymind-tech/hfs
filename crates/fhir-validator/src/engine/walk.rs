@@ -83,8 +83,33 @@ impl SchemaSet {
     }
 }
 
+/// See [`super::SyncOutcome::cascades`].
+#[derive(Debug, Clone)]
+pub(crate) struct Cascade {
+    /// The reference element.
+    pub(crate) path: String,
+    pub(crate) reference: String,
+    pub(crate) candidates: Vec<String>,
+    /// The target entry's resource (`Bundle.entry.3.resource`).
+    pub(crate) target_path: String,
+    /// The entry claims one of the candidates in `meta.profile`.
+    pub(crate) claims_candidate: bool,
+}
+
+/// A reference to an entry of the root Bundle that claims one of the
+/// reference's target profiles, judged once the walk is done (see
+/// [`resolve_pending_targets`]).
+pub(super) struct PendingTarget<'a> {
+    pub(super) cascade: Cascade,
+    pub(super) target: &'a Value,
+}
+
 pub(super) struct WalkCtx<'a> {
     resolver: &'a dyn SchemaResolver,
+    /// See [`Cascade`].
+    pub(super) cascades: Vec<Cascade>,
+    /// See [`PendingTarget`].
+    pub(super) pending_targets: Vec<PendingTarget<'a>>,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
@@ -249,6 +274,8 @@ impl<'a> WalkCtx<'a> {
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
+            cascades: Vec::new(),
+            pending_targets: Vec::new(),
             errors: Vec::new(),
             deferred: Vec::new(),
             path: PathTracker::new(
@@ -286,6 +313,23 @@ impl<'a> WalkCtx<'a> {
             .rev()
             .take(2)
             .any(|level| level.iter().any(|(cid, _)| cid == id))
+    }
+
+    /// The path of `target` when it is an entry resource of the root Bundle
+    /// of a top-level walk (`Bundle.entry.3.resource`).
+    pub(super) fn root_entry_path(&self, target: &Value) -> Option<String> {
+        if self.nesting > 0 {
+            return None;
+        }
+        let root = self.resources.first()?;
+        if root.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
+            return None;
+        }
+        root.get("entry")?
+            .as_array()?
+            .iter()
+            .position(|e| e.get("resource").is_some_and(|r| std::ptr::eq(r, target)))
+            .map(|i| format!("Bundle.entry.{i}.resource"))
     }
 
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
@@ -351,6 +395,41 @@ impl<'a> WalkCtx<'a> {
     }
 }
 
+/// Judge the deferred reference targets (Reference_REF_CantMatchChoice).
+/// The walk validated each such entry against the profiles it claims, a
+/// candidate among them: without an error-severity issue on the entry it
+/// conforms to the candidate. Only an entry with errors is walked again
+/// against each candidate, exactly as an immediate check would have.
+fn resolve_pending_targets(ctx: &mut WalkCtx<'_>) {
+    let pending = std::mem::take(&mut ctx.pending_targets);
+    for PendingTarget { cascade, target } in pending {
+        let prefix = format!("{}.", cascade.target_path);
+        let clean = !ctx.errors.iter().any(|e| {
+            e.severity == Severity::Error
+                && (e.path == cascade.target_path || e.path.starts_with(&prefix))
+        });
+        if clean || cascade.candidates.iter().any(|p| ctx.conforms_to(target, p)) {
+            ctx.cascades.push(cascade);
+        } else {
+            let message = format!(
+                "Unable to find a profile match for {} among choices: {}",
+                cascade.reference,
+                cascade.candidates.join(", ")
+            );
+            if ctx
+                .emitted
+                .insert((ErrorKind::ReferenceInvalid, Severity::Error, cascade.path.clone(), message.clone()))
+            {
+                ctx.errors.push(ValidationError::new(
+                    ErrorKind::ReferenceInvalid,
+                    cascade.path,
+                    message,
+                ));
+            }
+        }
+    }
+}
+
 /// See [`WalkCtx::invariants`].
 pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + 'a;
 
@@ -367,6 +446,8 @@ pub(super) fn validate<'a>(
 
     let mut ctx = WalkCtx {
         resolver,
+        cascades: Vec::new(),
+        pending_targets: Vec::new(),
         errors: Vec::new(),
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
@@ -424,10 +505,12 @@ fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions)
     }
 
     validate_node(ctx, &set, resource);
+    resolve_pending_targets(ctx);
 
     SyncOutcome {
         errors: std::mem::take(&mut ctx.errors),
         deferred: std::mem::take(&mut ctx.deferred),
+        cascades: std::mem::take(&mut ctx.cascades),
     }
 }
 

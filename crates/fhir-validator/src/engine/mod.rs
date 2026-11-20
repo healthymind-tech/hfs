@@ -131,6 +131,10 @@ pub struct SyncOutcome {
     pub errors: Vec<ValidationError>,
     /// Constraint/binding obligations for the async effects pass (Phase 4).
     pub deferred: Vec<Deferred>,
+    /// References to Bundle entries that conform structurally to one of
+    /// their target profiles; judged again once the effects pass has found
+    /// every issue of the entry (see [`Validator::validate`]).
+    pub(crate) cascades: Vec<walk::Cascade>,
 }
 
 /// `batch`/`transaction` entries whose `request.url` addresses a different
@@ -285,6 +289,44 @@ fn bundle_unresolved_urns(resource: &Value) -> Vec<ValidationError> {
     errors
 }
 
+/// The HL7 validator decides whether a Bundle entry matches a reference's
+/// target profile by validating it fully against the profile, invariants and
+/// terminology included, so an entry that fails on those is also reported at
+/// every reference to it (Reference_REF_CantMatchChoice). The walk can only
+/// judge structure; here, after the effects pass, a reference whose target
+/// entry ended up with error-severity issues of its own is reported the same
+/// way, when the entry claims one of the candidate profiles (so its issues
+/// were found against that profile) or has an issue no profile is blamed
+/// for. This never changes a verdict: the entry's own errors already make
+/// the resource invalid.
+fn cascade_target_failures(cascades: &[walk::Cascade], errors: &mut Vec<ValidationError>) {
+    let mut found = Vec::new();
+    for cascade in cascades {
+        let prefix = format!("{}.", cascade.target_path);
+        let failing = errors.iter().any(|e| {
+            e.severity == Severity::Error
+                && (e.path == cascade.target_path || e.path.starts_with(&prefix))
+                && (cascade.claims_candidate || e.source.is_none())
+        });
+        if failing
+            && !found
+                .iter()
+                .any(|f: &ValidationError| f.path == cascade.path && f.message.contains(&cascade.reference))
+        {
+            found.push(ValidationError::new(
+                ErrorKind::ReferenceInvalid,
+                cascade.path.clone(),
+                format!(
+                    "Unable to find a profile match for {} among choices: {}",
+                    cascade.reference,
+                    cascade.candidates.join(", ")
+                ),
+            ));
+        }
+    }
+    errors.extend(found);
+}
+
 /// The validator: a resolver plus the walk.
 pub struct Validator {
     resolver: Arc<dyn SchemaResolver>,
@@ -357,10 +399,15 @@ impl Validator {
             .constraints
             .is_some()
             .then_some(&check as &walk::InvariantCheck<'_>);
+        let timing =
+            tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::DEBUG);
+        let started = std::time::Instant::now();
         let SyncOutcome {
             mut errors,
             deferred,
+            cascades,
         } = self.validate_sync_with(resource, opts, invariants);
+        let walk = started.elapsed();
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
         }
@@ -373,6 +420,7 @@ impl Validator {
         if let Some(signatures) = effects.signatures {
             errors.extend(crate::signature::signature_issues(resource, signatures));
         }
+        let rules = started.elapsed() - walk;
         let resolver = Arc::clone(&self.resolver);
         let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {
             let opts = ValidationOptions {
@@ -400,6 +448,24 @@ impl Validator {
             &mut errors,
         )
         .await;
+        cascade_target_failures(&cascades, &mut errors);
+        if timing {
+            let resource_type = resource
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "helios_fhir_validator::timing",
+                resource_type,
+                walk_us = walk.as_micros() as u64,
+                rules_us = rules.as_micros() as u64,
+                effects_us = (started.elapsed() - walk - rules).as_micros() as u64,
+                total_us = started.elapsed().as_micros() as u64,
+                deferred = deferred.len(),
+                issues = errors.len(),
+                "validation stages"
+            );
+        }
         errors
     }
 }

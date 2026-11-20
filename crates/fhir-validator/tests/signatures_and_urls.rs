@@ -312,3 +312,130 @@ async fn empty_invariant_results_fail_only_when_asked() {
     );
 }
 
+
+/// mCODE / genomics bundles (Java: Reference_REF_CantMatchChoice at every
+/// reference to an entry that fails its profile on an invariant): the entry's
+/// own failure is repeated at the references once the effects pass found it.
+#[tokio::test]
+async fn references_to_entries_failing_their_profile_on_invariants_are_reported() {
+    use helios_fhir_validator::{CompositeResolver, SchemaRegistry};
+    let pat = json!({
+        "resourceType": "StructureDefinition", "url": "http://example.org/StructureDefinition/pat-p",
+        "name": "PatP", "status": "active", "kind": "resource", "abstract": false, "type": "Patient",
+        "derivation": "constraint", "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient", "path": "Patient",
+            "constraint": [{"key": "pat-p-1", "severity": "error", "human": "a name", "expression": "name.exists()"}]}]}
+    });
+    let obs = json!({
+        "resourceType": "StructureDefinition", "url": "http://example.org/StructureDefinition/obs-p",
+        "name": "ObsP", "status": "active", "kind": "resource", "abstract": false, "type": "Observation",
+        "derivation": "constraint", "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "differential": {"element": [{"id": "Observation.subject", "path": "Observation.subject",
+            "type": [{"code": "Reference", "targetProfile": ["http://example.org/StructureDefinition/pat-p"]}]}]}
+    });
+    let mut overlay = SchemaRegistry::new();
+    for sd in [&pat, &obs] {
+        assert!(overlay.insert(helios_fhir_validator::converter::convert(sd).unwrap().schema));
+    }
+    let resolver: std::sync::Arc<dyn SchemaResolver> = std::sync::Arc::new(CompositeResolver::new(vec![
+        std::sync::Arc::new(overlay),
+        core_registry(FhirVersion::R4),
+    ]));
+    let validator = Validator::new(resolver);
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let handlers = EffectHandlers {
+        constraints: Some(&evaluator),
+        ..Default::default()
+    };
+    let bundle = |name: Value| {
+        let mut patient = json!({"resourceType": "Patient", "id": "1",
+            "meta": {"profile": ["http://example.org/StructureDefinition/pat-p"]}});
+        if !name.is_null() {
+            patient["name"] = name;
+        }
+        json!({"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": "http://example.org/fhir/Observation/1", "resource": {
+                "resourceType": "Observation", "id": "1", "status": "final", "code": {"text": "x"},
+                "meta": {"profile": ["http://example.org/StructureDefinition/obs-p"]},
+                "subject": {"reference": "Patient/1"}}},
+            {"fullUrl": "http://example.org/fhir/Patient/1", "resource": patient}
+        ]})
+    };
+    let opts = ValidationOptions::default();
+    let bad = validator.validate(&bundle(Value::Null), FhirVersion::R4, &opts, &handlers).await;
+    assert!(bad.iter().any(|e| e.message.contains("pat-p-1")), "{bad:#?}");
+    assert!(
+        bad.iter().any(|e| e.path == "Bundle.entry.0.resource.subject"
+            && e.message == "Unable to find a profile match for Patient/1 among choices: http://example.org/StructureDefinition/pat-p"),
+        "{bad:#?}"
+    );
+    let good = validator.validate(&bundle(json!([{"family": "X"}])), FhirVersion::R4, &opts, &handlers).await;
+    assert!(!good.iter().any(|e| e.message.contains("Unable to find a profile match")), "{good:#?}");
+}
+
+/// The invariants decided natively (ele-1, ext-1, dom-2/4/5, bdl-1..5/7/8)
+/// give the same verdicts as their FHIRPath.
+#[tokio::test]
+async fn natively_decided_invariants_agree_with_fhirpath() {
+    use helios_fhir_validator::{ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint};
+    let cases = [
+        json!({"resourceType": "Bundle", "type": "collection", "total": 3, "entry": [
+            {"fullUrl": "http://x/Patient/1", "resource": {"resourceType": "Patient", "id": "1",
+                "contained": [{"resourceType": "Organization", "id": "o", "meta": {"versionId": "2"},
+                    "contained": [{"resourceType": "Organization", "id": "p"}]}],
+                "managingOrganization": {"reference": "#o"},
+                "name": [{"given": ["A", null], "_given": [null, {"extension": [{"url": "http://x/e", "valueString": "x"}]}]}],
+                "_birthDate": {"id": "only"},
+                "extension": [{"url": "http://x/e", "valueString": "x", "extension": [{"url": "a", "valueBoolean": true}]}]}},
+            {"fullUrl": "http://x/Patient/1", "request": {"method": "POST", "url": "Patient"},
+             "search": {"mode": "match"}, "response": {"status": "201"}},
+            {"fullUrl": "http://x/Patient/2/_history/1"},
+            {}
+        ]}),
+        json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"fullUrl": "urn:uuid:1", "resource": {"resourceType": "Patient", "active": true},
+             "request": {"method": "POST", "url": "Patient"}},
+            {"fullUrl": "urn:uuid:2", "resource": {"resourceType": "Patient", "active": true}}
+        ]}),
+    ];
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let evaluator = FhirPathConstraintEvaluator::new();
+    for resource in &cases {
+        let outcome = validator.validate_sync(resource, &ValidationOptions::default());
+        let native_ids = ["ele-1", "ext-1", "dom-2", "dom-4", "dom-5", "bdl-1", "bdl-2", "bdl-3", "bdl-4", "bdl-5", "bdl-7", "bdl-8"];
+        let constraints: Vec<DeferredConstraint<'_>> = outcome
+            .deferred
+            .iter()
+            .filter_map(|d| match d {
+                Deferred::Constraint { path, id, expression, own_resource, .. }
+                    if native_ids.contains(&id.as_str()) =>
+                {
+                    Some(DeferredConstraint { path, id, expression, own_resource: *own_resource })
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(constraints.len() > 10);
+        let by_fhirpath = evaluator.evaluate_all(resource, FhirVersion::R4, &constraints);
+        // The effects pass (native) reports a failure exactly where FHIRPath fails.
+        let handlers = EffectHandlers { constraints: Some(&evaluator), ..Default::default() };
+        let issues = validator.validate(resource, FhirVersion::R4, &ValidationOptions::default(), &handlers).await;
+        for (c, outcome) in constraints.iter().zip(&by_fhirpath) {
+            let reported = issues.iter().any(|e| {
+                e.path == c.path && e.extra.get("constraint").and_then(Value::as_str) == Some(c.id)
+            });
+            // `_birthDate` with only an id: the walk reports ele-1 itself
+            // (the typed model never sees it), FHIRPath passes it.
+            if c.path.ends_with("_birthDate") {
+                continue;
+            }
+            assert_eq!(
+                reported,
+                matches!(outcome, ConstraintOutcome::Failed),
+                "{} at {}: fhirpath {outcome:?}, native reported {reported}",
+                c.id,
+                c.path
+            );
+        }
+    }
+}
