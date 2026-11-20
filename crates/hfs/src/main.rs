@@ -3184,6 +3184,19 @@ async fn start_sqlite(
     .await?;
     // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
     let manager = manager::init(&config, None).await?;
+    manager::sync::install_sync(
+        manager.as_ref(),
+        manager::sync::SyncInstall {
+            local: backend.clone(),
+            cluster: backend.cluster_job_store(),
+            pg_store: None,
+            copier: None,
+            observer: Some(observability.observers.clone()),
+            audit: audit_state.clone(),
+            pg: None,
+        },
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -4441,6 +4454,21 @@ async fn start_postgres(
     .await?;
     // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
     let manager = manager::init(&config, Some(manager::PgHandle::from_backend(&backend))).await?;
+    manager::sync::install_sync(
+        manager.as_ref(),
+        manager::sync::SyncInstall {
+            local: backend.clone(),
+            cluster: backend.cluster_job_store(),
+            pg_store: Some(Arc::new(helios_endpoints::pg_sync::PgSyncStore::new(
+                backend.shared_pool(),
+            ))),
+            copier: Some(backend.clone()),
+            observer: Some(observability.observers.clone()),
+            audit: audit_state.clone(),
+            pg: Some(manager::PgHandle::from_backend(&backend)),
+        },
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),

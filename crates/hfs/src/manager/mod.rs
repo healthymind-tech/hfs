@@ -17,6 +17,7 @@
 
 pub mod console_auth;
 pub mod endpoints;
+pub mod sync;
 #[cfg(feature = "ui")]
 pub mod ui;
 

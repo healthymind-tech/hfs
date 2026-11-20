@@ -70,6 +70,7 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
 #[doc(hidden)]
@@ -2320,6 +2321,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        .merge(sync_pages::routes())
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
         .route("/ui/version", axum::routing::post(set_version))
         // The tenant selector (#344): lazily-loaded options and the persisted

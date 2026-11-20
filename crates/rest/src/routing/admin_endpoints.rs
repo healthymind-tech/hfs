@@ -88,6 +88,8 @@ where
                 state.default_tenant(),
             )
             .server_base(state.base_url())
+            .duplicate(Arc::new(crate::handlers::admin_sync::SyncDuplicate))
+            .rewrap_participant(Arc::new(crate::handlers::admin_sync::SyncRewrap))
             .build();
     // Publish it for the manager console (one state for both, so console
     // writes reach the same audit sink, statistics and audit search); a

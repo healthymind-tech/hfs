@@ -29,8 +29,8 @@ tracing = "0.1"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
-# PostgreSQL store implementations (feature `postgres`: P1 EndpointStore + LISTEN
-# task, P3 ConsoleStore) over the server's shared pool.
+# PostgreSQL store implementations (feature `postgres`) over the server's shared
+# pool: P1 EndpointStore + LISTEN task, P3 ConsoleStore, P6 SyncStore.
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }
 

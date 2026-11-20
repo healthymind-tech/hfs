@@ -1,0 +1,43 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ row.name }} — {{ i18n.t("sync-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+{% call ui::page_header(row.name, lede) %}
+  {% if active %}
+  <form method="post" action="/ui/sync/{{ row.id }}/cancel">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{% call ui::icon("stop-circle") %}{% endcall %}{{ i18n.t("sync-action-cancel") }}</button></form>
+  {% else %}
+  <form method="post" action="/ui/sync/{{ row.id }}/run">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn btn--primary" type="submit">{% call ui::icon("sync") %}{% endcall %}{{ i18n.t("sync-action-run") }}</button></form>
+  {% if retryable %}<form method="post" action="/ui/sync/{{ row.id }}/retry">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-action-retry") }}</button></form>{% endif %}
+  {% endif %}
+  <form method="post" action="/ui/sync/{{ row.id }}/delete" data-confirm="{{ i18n.t("sync-delete-confirm") }}">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn btn--danger" type="submit">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("sync-action-delete") }}</button></form>
+{% endcall %}
+
+<section class="card table-card">
+  <div class="card-head"><h2>{{ i18n.t("sync-runs") }}</h2></div>
+  {% if runs.is_empty() %}
+  {% call ui::empty_state("history", i18n.t("sync-no-runs"), row.trigger) %}{% endcall %}
+  {% else %}
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack">
+      <thead><tr><th scope="col">{{ i18n.t("sync-col-started") }}</th><th scope="col">{{ i18n.t("sync-col-state") }}</th><th scope="col">{{ i18n.t("sync-col-reason") }}</th><th scope="col">{{ i18n.t("sync-col-progress") }}</th></tr></thead>
+      <tbody>
+        {% for r in runs %}
+        <tr>
+          <td data-label="{{ i18n.t("sync-col-started") }}"><a href="/ui/sync/runs/{{ r.id }}">{{ r.created }}</a></td>
+          <td data-label="{{ i18n.t("sync-col-state") }}">{% call ui::pill_raw(r.tone(), r.icon(), r.state) %}{% endcall %}</td>
+          <td data-label="{{ i18n.t("sync-col-reason") }}">{{ r.reason }}</td>
+          <td data-label="{{ i18n.t("sync-col-progress") }}">{{ r.progress }}{% if !r.error.is_empty() %}<br><span class="mfield__hint">{{ r.error }}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>{{ i18n.t("sync-definition") }}</h2></div>
+  <pre class="code-block">{{ definition }}</pre>
+</section>
+{% endblock %}

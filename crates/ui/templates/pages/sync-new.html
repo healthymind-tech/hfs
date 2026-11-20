@@ -1,0 +1,96 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Create a sync job (P6). Credentials go to the server's sealing path and are never rendered back. #}
+{% block title %}{{ i18n.t("sync-new") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+{% call ui::page_header(i18n.t("sync-new"), i18n.t("sync-new-lede")) %}
+  <a class="btn" href="/ui/sync">{{ i18n.t("sync-cancel-form") }}</a>
+{% endcall %}
+{% if !available %}
+<section class="card">{% call ui::empty_state("sync", i18n.t("sync-title"), i18n.t("sync-unavailable")) %}{% endcall %}</section>
+{% else %}
+{% if !errors.is_empty() %}
+<section class="card notice" role="alert">
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+<form method="post" action="/ui/sync/new" autocomplete="off" class="stack">
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+  {% call ui::form_section("sync-basics", i18n.t("sync-step-basics")) %}
+    {% call ui::field_text(i18n.t("sync-col-name"), "name", v("name"), "", "", "text", true) %}{% endcall %}
+    {% call ui::field_text(i18n.t("sync-description"), "description", v("description")) %}{% endcall %}
+  {% endcall %}
+  {% for side in ["source", "target"] %}
+  {% call ui::form_section(side, side_title(side)) %}
+    <div class="mfield">
+      <label class="mfield__label" for="f-{{ side }}_kind">{{ i18n.t("sync-peer-kind") }}</label>
+      <select class="mfield__input" id="f-{{ side }}_kind" name="{{ side }}_kind">
+        <option value="endpoint"{% if fis(side, "kind", "endpoint", "endpoint") %} selected{% endif %}>{{ i18n.t("sync-peer-endpoint") }}</option>
+        <option value="external"{% if fis(side, "kind", "external", "endpoint") %} selected{% endif %}>{{ i18n.t("sync-peer-external") }}</option>
+      </select>
+    </div>
+    <div class="mfield">
+      <label class="mfield__label" for="f-{{ side }}_endpoint">{{ i18n.t("sync-peer-endpoint") }}</label>
+      <select class="mfield__input" id="f-{{ side }}_endpoint" name="{{ side }}_endpoint">
+        {% for e in endpoints %}<option value="{{ e.name }}"{% if fv(side, "endpoint") == e.name %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
+      </select>
+    </div>
+    {% call ui::field_text(i18n.t("sync-base-url"), side_field(side, "url"), fv(side, "url"), "", i18n.t("sync-base-url-hint"), "url", false, "https://fhir.example.org/fhir", false, true) %}{% endcall %}
+    <div class="mfield">
+      <label class="mfield__label" for="f-{{ side }}_auth">{{ i18n.t("sync-auth") }}</label>
+      <select class="mfield__input" id="f-{{ side }}_auth" name="{{ side }}_auth">
+        {% for a in ["none", "bearer", "basic", "client-credentials"] %}
+        <option value="{{ a }}"{% if fis(side, "auth", a, "none") %} selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% call ui::field_text(i18n.t("sync-username"), side_field(side, "username"), fv(side, "username")) %}{% endcall %}
+    {% call ui::field_text(i18n.t("sync-token-url"), side_field(side, "token_url"), fv(side, "token_url"), "", "", "url") %}{% endcall %}
+    {% call ui::field_text(i18n.t("sync-client-id"), side_field(side, "client_id"), fv(side, "client_id")) %}{% endcall %}
+    {% call ui::field_text(i18n.t("sync-scope"), side_field(side, "scope"), fv(side, "scope")) %}{% endcall %}
+    {% call ui::secret_field(i18n.t("sync-secret"), side_field(side, "secret"), false, i18n.t("sync-secret-hint")) %}{% endcall %}
+  {% endcall %}
+  {% endfor %}
+  {% call ui::form_section("sync-data", i18n.t("sync-step-data")) %}
+    {% call ui::field_text(i18n.t("sync-resource-types"), "resource_types", v("resource_types"), "", i18n.t("sync-resource-types-hint"), "text", false, "Patient, Observation") %}{% endcall %}
+    <div class="mfield">
+      <label class="mfield__label" for="f-initial_load">{{ i18n.t("sync-initial-load") }}</label>
+      <select class="mfield__input" id="f-initial_load" name="initial_load">
+        {% for o in ["paged-read", "storage-copy", "bulk-export", "none"] %}
+        <option value="{{ o }}"{% if is("initial_load", o, "paged-read") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% call ui::checkbox(i18n.t("sync-include-history"), "include_history", v("include_history") == "on") %}{% endcall %}
+  {% endcall %}
+  {% call ui::form_section("sync-schedule", i18n.t("sync-step-schedule")) %}
+    <div class="mfield">
+      <label class="mfield__label" for="f-trigger">{{ i18n.t("sync-col-trigger") }}</label>
+      <select class="mfield__input" id="f-trigger" name="trigger">
+        {% for o in ["manual", "interval", "continuous", "subscription"] %}
+        <option value="{{ o }}"{% if is("trigger", o, "manual") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% call ui::field_text(i18n.t("sync-every-secs"), "every_secs", v_or("every_secs", "3600"), "", "", "number") %}{% endcall %}
+    {% call ui::field_text(i18n.t("sync-poll-secs"), "poll_secs", v_or("poll_secs", "30"), "", "", "number") %}{% endcall %}
+    <div class="mfield">
+      <label class="mfield__label" for="f-conflict">{{ i18n.t("sync-conflict") }}</label>
+      <select class="mfield__input" id="f-conflict" name="conflict">
+        {% for o in ["source-wins", "skip-if-target-newer", "fail"] %}
+        <option value="{{ o }}"{% if is("conflict", o, "source-wins") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% call ui::field_text(i18n.t("sync-batch-size"), "batch_size", v_or("batch_size", "200"), "", "", "number") %}{% endcall %}
+    {% call ui::checkbox(i18n.t("sync-propagate-deletes"), "propagate_deletes", checked_or("propagate_deletes", true)) %}{% endcall %}
+    {% call ui::checkbox(i18n.t("sync-enabled"), "enabled", checked_or("enabled", true)) %}{% endcall %}
+  {% endcall %}
+  <div class="form-actions">
+    <a class="btn" href="/ui/sync">{{ i18n.t("sync-cancel-form") }}</a>
+    <button type="submit" class="btn btn--primary">{{ i18n.t("sync-create") }}</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

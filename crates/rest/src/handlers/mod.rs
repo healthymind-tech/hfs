@@ -19,6 +19,7 @@
 
 pub mod admin_endpoints;
 pub mod admin_packages;
+pub mod admin_sync;
 pub mod admin_tenants;
 pub mod batch;
 pub mod bulk_common;
