@@ -1,0 +1,56 @@
+{% import "partials/components.html" as ui %}
+{#
+  Manager console sidebar (design §10.1): the endpoint switcher, then the
+  sections built by `manager::nav::build` — Overview, the current endpoint's
+  Data / Configure / Operate groups, server Settings. Other packages add
+  entries with `manager::nav::register`, never by editing this file.
+#}
+    <details class="menu endpoint-switch">
+      <summary class="selector" aria-label="{{ i18n.t("mgr-switch-endpoint") }}">
+        {% if let Some(ep) = status.current_endpoint() %}
+        <span class="avatar avatar--brand">{{ ep.initials }}</span>
+        <span class="selector__label">
+          <span class="endpoint-switch__name">{{ ep.display }}</span>
+          <span class="endpoint-switch__path">{{ ep.path }}</span>
+        </span>
+        {% else %}
+        <span class="avatar avatar--brand">{% include "icons/grid.svg" %}</span>
+        <span class="selector__label">
+          <span class="endpoint-switch__name">{{ i18n.t("mgr-all-endpoints") }}</span>
+          <span class="endpoint-switch__path">{{ i18n.t_arg("mgr-endpoint-count", "count", status.endpoint_options().len()) }}</span>
+        </span>
+        {% endif %}
+        <span class="selector__chevrons">
+          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+        </span>
+      </summary>
+      <div class="menu__panel">
+        <div class="menu__heading">{{ i18n.t("mgr-switch-endpoint") }}</div>
+        <a class="menu__option" href="/ui"{% if status.current_endpoint().is_none() %} aria-current="true"{% endif %}>
+          <span class="avatar">{% include "icons/grid.svg" %}</span>
+          {{ i18n.t("mgr-all-endpoints") }}
+        </a>
+        {% for ep in status.endpoint_options() %}
+        <a class="menu__option" href="{{ ep.href }}"{% if let Some(cur) = status.current_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
+          <span class="avatar">{{ ep.initials }}</span>
+          <span class="menu__option-text">{{ ep.display }} <small>{{ ep.path }}</small></span>
+          {% if !ep.serving %}<span class="tag tag--{{ ep.tone }}">{{ i18n.t(ep.status_key) }}</span>{% endif %}
+        </a>
+        {% endfor %}
+      </div>
+    </details>
+
+    <hr class="divider">
+
+    <nav class="nav" aria-label="{{ i18n.t("nav-main") }}">
+      {% for group in status.nav_groups() %}
+      <div class="nav__section">{{ i18n.t(group.label_key) }}</div>
+      {% for link in group.links %}
+      <a class="nav-item" href="{{ link.href }}"{% if status.nav_current(link.id, active_page) %} aria-current="page"{% endif %} title="{{ i18n.t(link.label_key) }}">
+        <span class="icon">{% call ui::icon(link.icon) %}{% endcall %}</span>
+        <span class="nav-item__label">{{ i18n.t(link.label_key) }}</span>
+      </a>
+      {% endfor %}
+      {% endfor %}
+    </nav>

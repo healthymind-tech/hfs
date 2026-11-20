@@ -1862,7 +1862,7 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
-    assert!(html.contains("<title>Search Parameters — Helios FHIR Server</title>"));
+    assert!(html.contains("<title>Search Parameters — HealthyMind FHIR Server Manager</title>"));
     assert!(html.contains(r#"<h1 class="page-head__title">Search Parameters</h1>"#));
     assert!(html.contains(
         r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#

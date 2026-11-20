@@ -27,10 +27,10 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # this crate's `R4B`, because helios-persistence/R5|R6 -> helios-audit/R5|R6 ->
 # helios-fhir/R4B (the BALP baseline), mirroring helios-audit's own R5/R6.
 default = ["R4"]
-R4 = ["helios-fhir/R4", "helios-fhir-validator/R4", "helios-sof/R4", "helios-persistence/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B", "helios-persistence/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhir-validator/R5", "helios-sof/R5", "helios-persistence/R5", "R4B"]
-R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6", "helios-persistence/R6", "R4B"]
+R4 = ["helios-fhir/R4", "helios-sync/R4", "helios-fhir-validator/R4", "helios-sof/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-sync/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-sync/R5", "helios-fhir-validator/R5", "helios-sof/R5", "helios-persistence/R5", "R4B"]
+R6 = ["helios-fhir/R6", "helios-sync/R6", "helios-fhir-validator/R6", "helios-sof/R6", "helios-persistence/R6", "R4B"]
 
 [dependencies]
 # Read paths into the rest of the workspace: the SearchParameter spec loader
@@ -124,9 +124,14 @@ askama = "0.16"
 # they did before — see crates/ui-chrome/README.md.
 helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
 
+# The FHIR server manager contracts (package P0): endpoint model, routing
+# snapshot/registry, store traits, console roles and sync job model. The
+# manager console (src/manager) reads endpoints only through these types.
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+
 # Administrator sign-in for the console's admin pages (`/ui/admin/login`, the
 # guard on IG Packages, Tenants, Bulk and SQL export), shared with HTS.
-helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
 
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
@@ -171,6 +176,10 @@ helios-observability = { path = "../observability", version = "0.2.9" }
 # features above forward to it: a pinned `R4` here switched helios-fhir/R4 on in
 # every build with the UI, including R5-only and R4B-only builds (#2051).
 helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
+
+# Sync console pages (FHIR server manager P6): server-rendered over the
+# sync service.
+helios-sync = { path = "../sync", version = "0.2.9", default-features = false }
 
 
 [dev-dependencies]

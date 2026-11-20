@@ -1,0 +1,11 @@
+{# SHARED CHROME -- attribution footer of both consoles (design §10.2). #}      <footer class="site-footer">
+        <span>{{ i18n.t("mgr-footer-brand") }}</span>
+        <span class="site-footer__sep" aria-hidden="true">·</span>
+        <span>{{ i18n.t("mgr-footer-based-on") }}</span>
+        {%- if !about_href.is_empty() %}
+        <span class="site-footer__sep" aria-hidden="true">·</span>
+        <a href="{{ about_href }}">{{ i18n.t("mgr-nav-about") }}</a>
+        {%- endif %}
+        <span class="site-footer__version">{{ links.version }}</span>
+      </footer>
+{#- -#}

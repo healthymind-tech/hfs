@@ -1,0 +1,13 @@
+{# The new-endpoint review step: what will be created, and warnings. #}
+{% if !errors.is_empty() %}
+<div class="notice notice--danger" role="alert">
+  <span>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}</span>
+</div>
+<ul class="diff-preview__errors">{% for (field, msg) in errors %}<li><code>{{ field }}</code> {{ msg }}</li>{% endfor %}</ul>
+{% else %}
+{% for w in warnings %}
+<div class="notice {% if w.starts_with("mgr-warn") %}notice--warn{% else %}notice--info{% endif %}"><span>{{ i18n.t(w) }}</span></div>
+{% endfor %}
+{% if duplicate %}<p class="muted">{{ i18n.t("mgr-new-preview-duplicate") }}</p>{% endif %}
+<pre class="json-preview" tabindex="0" aria-label="{{ i18n.t("mgr-new-preview-json") }}">{{ json }}</pre>
+{% endif %}

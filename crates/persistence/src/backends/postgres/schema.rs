@@ -71,7 +71,23 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_PACKAGE_JOBS,
     FORK_SEARCH_INDEX_STATISTICS,
     FORK_BULK_MANIFEST_INDEX_PENDING,
+    FORK_ENDPOINTS,
+    FORK_CONSOLE_AUTH,
+    FORK_ENDPOINT_SYNC,
 ];
+
+/// FHIR server manager: endpoint registry `hfs_endpoints`, its change
+/// history and the cluster-wide configuration epochs
+/// (docs/design/fhir-server-manager.md §4.1; contract in `helios-endpoints`).
+pub const FORK_ENDPOINTS: &str = "hm-0008-endpoints";
+
+/// FHIR server manager: console sign-in settings, built-in console users and
+/// per-endpoint role bindings (design §4.2).
+pub const FORK_CONSOLE_AUTH: &str = "hm-0009-console-auth";
+
+/// FHIR server manager: sync jobs, runs, logs, conflicts and per-item state
+/// (design §4.3).
+pub const FORK_ENDPOINT_SYNC: &str = "hm-0010-endpoint-sync";
 
 /// Fork migration replacing the `search_index` extended statistics with
 /// dependency-only objects and lowering the token column's statistics
@@ -403,6 +419,9 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_PACKAGE_JOBS => fork_package_jobs(client).await?,
             FORK_SEARCH_INDEX_STATISTICS => fork_search_index_statistics(client).await?,
             FORK_BULK_MANIFEST_INDEX_PENDING => fork_bulk_manifest_index_pending(client).await?,
+            FORK_ENDPOINTS => fork_endpoints(client).await?,
+            FORK_CONSOLE_AUTH => fork_console_auth(client).await?,
+            FORK_ENDPOINT_SYNC => fork_endpoint_sync(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client
@@ -5202,6 +5221,228 @@ async fn fork_bulk_manifest_index_pending(client: &deadpool_postgres::Client) ->
         })
 }
 
+/// Fork migration `hm-0008-endpoints` (FHIR server manager, design §4.1).
+///
+/// * `hfs_endpoints`: one row per endpoint; `spec` is the JSON of
+///   `helios_endpoints::EndpointSpec` (secrets sealed). `name`, `path`,
+///   `tenant_id` and `status` are denormalized from it for the unique
+///   indexes, which hold among non-deleted rows only so a deleted endpoint
+///   frees its name, path and tenant.
+/// * `hfs_endpoint_revisions`: append-only change history (redacted spec).
+/// * `hfs_config_epochs`: one counter per configuration scope
+///   (`endpoints`, `console`), bumped by statement triggers, polled by every
+///   instance (`HFS_CLUSTER_SYNC_INTERVAL_MS`) and announced with
+///   `NOTIFY hfs_config, '<scope>'` for low-latency reloads.
+///
+/// The default endpoint row is created by the application at startup
+/// (`helios_endpoints::ensure_default_endpoint`), not here.
+async fn fork_endpoints(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hfs_config_epochs (
+                 scope      TEXT PRIMARY KEY,
+                 epoch      BIGINT NOT NULL DEFAULT 0,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             INSERT INTO hfs_config_epochs (scope) VALUES ('endpoints'), ('console'), ('sync')
+                 ON CONFLICT (scope) DO NOTHING;
+             CREATE OR REPLACE FUNCTION hfs_bump_config_epoch() RETURNS trigger AS $$
+             BEGIN
+                 UPDATE hfs_config_epochs
+                    SET epoch = epoch + 1, updated_at = NOW()
+                  WHERE scope = TG_ARGV[0];
+                 PERFORM pg_notify('hfs_config', TG_ARGV[0]);
+                 RETURN NULL;
+             END
+             $$ LANGUAGE plpgsql;
+
+             CREATE TABLE IF NOT EXISTS hfs_endpoints (
+                 id         TEXT PRIMARY KEY,
+                 name       TEXT NOT NULL,
+                 path       TEXT NOT NULL,
+                 tenant_id  TEXT NOT NULL,
+                 status     TEXT NOT NULL
+                            CHECK (status IN ('enabled','disabled','provisioning','deleted')),
+                 managed_by TEXT NOT NULL DEFAULT 'ui' CHECK (managed_by IN ('ui','env')),
+                 spec       JSONB NOT NULL,
+                 revision   BIGINT NOT NULL DEFAULT 1,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_by TEXT,
+                 updated_by TEXT,
+                 deleted_at TIMESTAMPTZ
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_endpoints_name
+                 ON hfs_endpoints (name) WHERE status <> 'deleted';
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_endpoints_path
+                 ON hfs_endpoints (path) WHERE status <> 'deleted';
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_endpoints_tenant
+                 ON hfs_endpoints (tenant_id) WHERE status <> 'deleted';
+
+             CREATE TABLE IF NOT EXISTS hfs_endpoint_revisions (
+                 endpoint_id TEXT NOT NULL REFERENCES hfs_endpoints (id),
+                 revision    BIGINT NOT NULL,
+                 change      TEXT NOT NULL CHECK (change IN ('create','update','status')),
+                 status      TEXT NOT NULL,
+                 spec        JSONB NOT NULL,
+                 changed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 changed_by  TEXT,
+                 PRIMARY KEY (endpoint_id, revision)
+             );
+
+             DROP TRIGGER IF EXISTS trg_hfs_endpoints_epoch ON hfs_endpoints;
+             CREATE TRIGGER trg_hfs_endpoints_epoch
+                 AFTER INSERT OR UPDATE OR DELETE ON hfs_endpoints
+                 FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('endpoints');",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration {FORK_ENDPOINTS} failed: {e}")))
+}
+
+/// Fork migration `hm-0009-console-auth` (FHIR server manager, design §4.2).
+///
+/// Console sessions reuse upstream's `login_sessions` (v44, `kind =
+/// 'console'`) and the sign-in lockout reuses `admin_login_failures` (scope
+/// `HFS-CONSOLE`), so only settings, users and role bindings are new.
+async fn fork_console_auth(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hfs_console_settings (
+                 id         SMALLINT PRIMARY KEY CHECK (id = 1),
+                 settings   JSONB NOT NULL,
+                 revision   BIGINT NOT NULL DEFAULT 1,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_by TEXT
+             );
+             CREATE TABLE IF NOT EXISTS hfs_console_users (
+                 id                   TEXT PRIMARY KEY,
+                 username             TEXT NOT NULL,
+                 display_name         TEXT,
+                 email                TEXT,
+                 role                 TEXT NOT NULL CHECK (role IN ('viewer','editor','admin')),
+                 password_hash        TEXT,
+                 disabled             BOOLEAN NOT NULL DEFAULT FALSE,
+                 must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+                 revision             BIGINT NOT NULL DEFAULT 1,
+                 created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 last_login_at        TIMESTAMPTZ
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_console_users_username
+                 ON hfs_console_users (lower(username));
+             CREATE TABLE IF NOT EXISTS hfs_console_role_bindings (
+                 subject     TEXT NOT NULL,
+                 endpoint_id TEXT NOT NULL REFERENCES hfs_endpoints (id) ON DELETE CASCADE,
+                 role        TEXT NOT NULL CHECK (role IN ('viewer','editor','admin')),
+                 created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_by  TEXT,
+                 PRIMARY KEY (subject, endpoint_id)
+             );
+             DROP TRIGGER IF EXISTS trg_hfs_console_settings_epoch ON hfs_console_settings;
+             CREATE TRIGGER trg_hfs_console_settings_epoch
+                 AFTER INSERT OR UPDATE OR DELETE ON hfs_console_settings
+                 FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('console');
+             DROP TRIGGER IF EXISTS trg_hfs_console_users_epoch ON hfs_console_users;
+             CREATE TRIGGER trg_hfs_console_users_epoch
+                 AFTER INSERT OR UPDATE OR DELETE ON hfs_console_users
+                 FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('console');
+             DROP TRIGGER IF EXISTS trg_hfs_console_bindings_epoch ON hfs_console_role_bindings;
+             CREATE TRIGGER trg_hfs_console_bindings_epoch
+                 AFTER INSERT OR UPDATE OR DELETE ON hfs_console_role_bindings
+                 FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('console');",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration {FORK_CONSOLE_AUTH} failed: {e}")))
+}
+
+/// Fork migration `hm-0010-endpoint-sync` (FHIR server manager, design §4.3).
+///
+/// Runs are claimed through `cluster_jobs` (kind `endpoint-sync`, lease +
+/// fencing token); `hfs_sync_runs.fencing_token` mirrors the claiming lease
+/// so a checkpoint from a worker that lost its lease is refused.
+async fn fork_endpoint_sync(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS hfs_sync_jobs (
+                 id                 TEXT PRIMARY KEY,
+                 name               TEXT NOT NULL,
+                 spec               JSONB NOT NULL,
+                 enabled            BOOLEAN NOT NULL DEFAULT TRUE,
+                 source_endpoint_id TEXT,
+                 target_endpoint_id TEXT,
+                 next_run_at        TIMESTAMPTZ,
+                 revision           BIGINT NOT NULL DEFAULT 1,
+                 created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 created_by         TEXT,
+                 updated_by         TEXT
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_sync_jobs_name ON hfs_sync_jobs (name);
+             CREATE INDEX IF NOT EXISTS idx_hfs_sync_jobs_due
+                 ON hfs_sync_jobs (next_run_at) WHERE enabled;
+
+             CREATE TABLE IF NOT EXISTS hfs_sync_runs (
+                 id             TEXT PRIMARY KEY,
+                 job_id         TEXT NOT NULL REFERENCES hfs_sync_jobs (id) ON DELETE CASCADE,
+                 cluster_job_id TEXT,
+                 state          TEXT NOT NULL
+                                CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
+                 reason         TEXT NOT NULL,
+                 cursor         JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 progress       JSONB NOT NULL DEFAULT '{}'::jsonb,
+                 error          TEXT,
+                 fencing_token  BIGINT NOT NULL DEFAULT 0,
+                 created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 started_at     TIMESTAMPTZ,
+                 finished_at    TIMESTAMPTZ,
+                 updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             CREATE INDEX IF NOT EXISTS idx_hfs_sync_runs_job
+                 ON hfs_sync_runs (job_id, created_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_sync_runs_active
+                 ON hfs_sync_runs (job_id) WHERE state IN ('queued','running');
+
+             CREATE TABLE IF NOT EXISTS hfs_sync_log (
+                 run_id  TEXT NOT NULL REFERENCES hfs_sync_runs (id) ON DELETE CASCADE,
+                 seq     BIGSERIAL,
+                 at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 level   TEXT NOT NULL CHECK (level IN ('info','warn','error')),
+                 message TEXT NOT NULL,
+                 PRIMARY KEY (run_id, seq)
+             );
+
+             CREATE TABLE IF NOT EXISTS hfs_sync_conflicts (
+                 run_id         TEXT NOT NULL REFERENCES hfs_sync_runs (id) ON DELETE CASCADE,
+                 resource_type  TEXT NOT NULL,
+                 resource_id    TEXT NOT NULL,
+                 source_version TEXT,
+                 target_version TEXT,
+                 reason         TEXT NOT NULL,
+                 at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 PRIMARY KEY (run_id, resource_type, resource_id)
+             );
+
+             CREATE TABLE IF NOT EXISTS hfs_sync_item_state (
+                 job_id         TEXT NOT NULL REFERENCES hfs_sync_jobs (id) ON DELETE CASCADE,
+                 resource_type  TEXT NOT NULL,
+                 resource_id    TEXT NOT NULL,
+                 source_version TEXT,
+                 target_version TEXT,
+                 content_sha256 BYTEA,
+                 deleted        BOOLEAN NOT NULL DEFAULT FALSE,
+                 applied_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 PRIMARY KEY (job_id, resource_type, resource_id)
+             );
+
+             DROP TRIGGER IF EXISTS trg_hfs_sync_jobs_epoch ON hfs_sync_jobs;
+             CREATE TRIGGER trg_hfs_sync_jobs_epoch
+                 AFTER INSERT OR UPDATE OR DELETE ON hfs_sync_jobs
+                 FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('sync');",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Fork migration {FORK_ENDPOINT_SYNC} failed: {e}")))
+}
+
 /// v46 -> v47: `idx_resources_reindex_id`, the id-range `$reindex` walk's
 /// index (#1767).
 ///
@@ -7069,6 +7310,138 @@ mod postgres_integration_migrations {
             .await
             .expect("to_regclass")
             .get(0)
+    }
+
+    /// hm-0008..hm-0010 (FHIR server manager): tables exist, the partial
+    /// unique indexes free a deleted endpoint's name/path/tenant, the epoch
+    /// trigger counts every statement, and a rerun is a no-op.
+    #[tokio::test]
+    async fn postgres_integration_manager_tables_and_epochs() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = fresh_backend("fork_manager").await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client).await.expect("initialize");
+        for t in [
+            "hfs_endpoints",
+            "hfs_endpoint_revisions",
+            "hfs_config_epochs",
+            "hfs_console_settings",
+            "hfs_console_users",
+            "hfs_console_role_bindings",
+            "hfs_sync_jobs",
+            "hfs_sync_runs",
+            "hfs_sync_log",
+            "hfs_sync_conflicts",
+            "hfs_sync_item_state",
+        ] {
+            assert!(regclass_exists(&client, t).await, "{t} missing");
+        }
+        let epoch = |c: &'static str| {
+            let client = &client;
+            async move {
+                let v: i64 = client
+                    .query_one(
+                        "SELECT epoch FROM hfs_config_epochs WHERE scope = $1",
+                        &[&c],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                v
+            }
+        };
+        let e0 = epoch("endpoints").await;
+        let insert = "INSERT INTO hfs_endpoints (id, name, path, tenant_id, status, spec)
+                      VALUES ($1, $2, $3, $4, $5, '{}'::jsonb)";
+        client
+            .execute(insert, &[&"a", &"lab", &"lab", &"lab", &"enabled"])
+            .await
+            .unwrap();
+        assert_eq!(epoch("endpoints").await, e0 + 1);
+        // Same name / path / tenant while live: refused.
+        assert!(
+            client
+                .execute(insert, &[&"b", &"lab", &"lab2", &"lab2", &"enabled"])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .execute(insert, &[&"b", &"lab2", &"lab", &"lab2", &"enabled"])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .execute(insert, &[&"b", &"lab2", &"lab2", &"lab", &"enabled"])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .execute(insert, &[&"b", &"lab2", &"lab2", &"lab2", &"bogus"])
+                .await
+                .is_err()
+        );
+        // Deleted frees them.
+        client
+            .execute(
+                "UPDATE hfs_endpoints SET status = 'deleted' WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(insert, &[&"b", &"lab", &"lab", &"lab", &"enabled"])
+            .await
+            .unwrap();
+        assert_eq!(epoch("endpoints").await, e0 + 3);
+        // Console tables bump their own scope.
+        let c0 = epoch("console").await;
+        client
+            .execute(
+                "INSERT INTO hfs_console_users (id, username, role) VALUES ('u1', 'Alice', 'admin')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            client
+                .execute(
+                    "INSERT INTO hfs_console_users (id, username, role) VALUES ('u2', 'alice', 'viewer')",
+                    &[],
+                )
+                .await
+                .is_err(),
+            "usernames are unique case-insensitively"
+        );
+        assert_eq!(epoch("console").await, c0 + 1);
+        // One active run per job.
+        client
+            .batch_execute(
+                "INSERT INTO hfs_sync_jobs (id, name, spec) VALUES ('j1', 'job', '{}'::jsonb);
+                 INSERT INTO hfs_sync_runs (id, job_id, state, reason) VALUES ('r1', 'j1', 'running', 'manual');",
+            )
+            .await
+            .unwrap();
+        assert!(
+            client
+                .execute(
+                    "INSERT INTO hfs_sync_runs (id, job_id, state, reason) VALUES ('r2', 'j1', 'queued', 'manual')",
+                    &[],
+                )
+                .await
+                .is_err()
+        );
+        // Idempotent rerun of the fork migrations' bodies.
+        fork_endpoints(&client).await.unwrap();
+        fork_console_auth(&client).await.unwrap();
+        fork_endpoint_sync(&client).await.unwrap();
+        initialize_schema(&mut client).await.expect("reinitialize");
+        assert_eq!(
+            applied_fork_migrations(&client).await.unwrap().len(),
+            FORK_MIGRATIONS.len()
+        );
     }
 
     #[tokio::test]

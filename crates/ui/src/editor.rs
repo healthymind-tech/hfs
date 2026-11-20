@@ -693,6 +693,7 @@ fn analyze(
     let SyncOutcome {
         mut errors,
         deferred,
+        ..
     } = validator.validate_sync(document, &ValidationOptions::default());
     // The editor's issue count blocks saving, so only error-severity issues
     // belong in it — warnings (e.g. extension context, #615) are $validate

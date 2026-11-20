@@ -1,0 +1,39 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Duplicate an endpoint (design §9.3): new name/path, which data, packages, auth, keep in sync. #}
+{% block title %}{{ i18n.t("mgr-action-duplicate") }} — {{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+{% call ui::ep_head(head, i18n.t("mgr-action-duplicate"), false, false, false) %}{% endcall %}
+{% if !errors.is_empty() %}
+<div class="notice notice--danger" role="alert" tabindex="-1" data-autofocus>{% call ui::icon("alert") %}{% endcall %}<span>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}{% if !self.err("").is_empty() %} — {{ self.err("") }}{% endif %}</span></div>
+{% endif %}
+{% if !can_admin %}
+<div class="notice notice--info">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t("mgr-locked-role") }}</span></div>
+{% else %}
+<form method="post" action="/ui/e/{{ head.name }}/duplicate" class="config-form" novalidate>
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+  {% call ui::form_section("dup-target", i18n.t("mgr-dup-target"), i18n.t("mgr-dup-target-desc")) %}
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("mgr-field-name"), "name", suggested, self.err("name"), i18n.t("mgr-field-name-rules"), "text", true, "", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-display-name"), "display_name", suggested_display, self.err("displayName"), "", "text", true) %}{% endcall %}
+    </div>
+  {% endcall %}
+  {% call ui::form_section("dup-data", i18n.t("mgr-dup-data"), i18n.t("mgr-dup-data-desc")) %}
+    <fieldset class="checks">
+      <legend class="visually-hidden">{{ i18n.t("mgr-dup-data") }}</legend>
+      <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-none" name="duplicate_data" value="none" checked><label class="mcheck__label" for="dd-none">{{ i18n.t("mgr-dup-data-none") }}</label></div>
+      <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-current" name="duplicate_data" value="current"><label class="mcheck__label" for="dd-current">{{ i18n.t("mgr-dup-data-current") }}</label></div>
+      <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-history" name="duplicate_data" value="history"><label class="mcheck__label" for="dd-history">{{ i18n.t("mgr-dup-data-history") }}</label></div>
+    </fieldset>
+    {% call ui::checkbox(i18n.t("mgr-dup-packages"), "duplicate_packages", true) %}{% endcall %}
+    {% call ui::checkbox(i18n.t("mgr-dup-auth"), "duplicate_auth", true, i18n.t("mgr-dup-auth-hint")) %}{% endcall %}
+    {% call ui::checkbox(i18n.t("mgr-dup-keep-in-sync"), "duplicate_keep_in_sync", false, i18n.t("mgr-dup-keep-in-sync-hint")) %}{% endcall %}
+  {% endcall %}
+  <div class="save-bar">
+    <a class="btn" href="/ui/e/{{ head.name }}">{{ i18n.t("action-cancel") }}</a>
+    <span class="save-bar__spacer"></span>
+    <button type="submit" class="btn btn--primary">{% call ui::icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

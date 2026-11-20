@@ -27,6 +27,8 @@
 
 pub mod auth;
 pub mod client;
+#[cfg(feature = "console")]
+pub mod console;
 pub mod settings;
 pub mod store;
 
@@ -200,6 +202,36 @@ pub struct Guard {
 /// claimed.
 pub async fn guard(State(guard): State<Guard>, mut request: Request, next: Next) -> Response {
     let protected = (guard.protects)(request.method(), request.uri().path());
+    // Console sign-in installed (the server put `Arc<ConsoleAuth>` in the
+    // request extensions): console admin sessions are the credential of the
+    // admin API, with the CSRF token rule; password credentials still go to
+    // the break-glass gate below.
+    #[cfg(feature = "console")]
+    if protected
+        && matches!(guard.style, Style::Api { .. })
+        && let Some(console) = request
+            .extensions()
+            .get::<Arc<console::ConsoleAuth>>()
+            .cloned()
+    {
+        match console::guard::admin_api(&console, request).await {
+            console::guard::AdminApiDecision::Admit(admitted) => return next.run(admitted).await,
+            console::guard::AdminApiDecision::Refuse(response) => return response,
+            console::guard::AdminApiDecision::PasswordGate(back) => request = back,
+        }
+    }
+    // The console gate already decided every `/ui` request (it runs before
+    // this guard in the UI's layer stack): the legacy admin-pages gate steps
+    // aside.
+    #[cfg(feature = "console")]
+    if matches!(guard.style, Style::Browser { .. })
+        && request
+            .extensions()
+            .get::<Arc<console::ConsoleAuth>>()
+            .is_some()
+    {
+        return next.run(request).await;
+    }
     match &guard.gate {
         AdminGate::Open => next.run(request).await,
         AdminGate::Locked(message) => {

@@ -1,0 +1,37 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Configuration revisions of this endpoint with field diffs. #}
+{% block title %}{{ i18n.t("mgr-nav-history") }} — {{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+{% call ui::ep_head(head, i18n.t("mgr-nav-history"), false, false, false) %}{% endcall %}
+{% if !error.is_empty() %}
+<div class="notice notice--danger" role="alert">{% call ui::icon("alert") %}{% endcall %}<span>{{ error }}</span></div>
+{% else if rows.is_empty() %}
+<section class="card">{% call ui::empty_state("history", i18n.t("mgr-history-empty"), i18n.t("mgr-history-empty-text")) %}{% endcall %}</section>
+{% else %}
+<ol class="timeline" role="list">
+  {% for r in rows %}
+  <li class="timeline__item card">
+    <div class="timeline__head">
+      <span class="status-pill status-pill--info">{% call ui::icon("pencil") %}{% endcall %}<span>{{ i18n.t(r.change_key) }}</span></span>
+      <strong>r{{ r.revision }}</strong>
+      <span class="muted">{{ r.by }}</span>
+      <time class="muted mono">{{ r.at }}</time>
+    </div>
+    {% if !r.diff.is_empty() %}
+    <div class="table-wrap" tabindex="0">
+      <table class="data-table diff-table">
+        <thead><tr><th scope="col">{{ i18n.t("mgr-diff-field") }}</th><th scope="col">{{ i18n.t("mgr-diff-before") }}</th><th scope="col">{{ i18n.t("mgr-diff-after") }}</th></tr></thead>
+        <tbody>
+          {% for d in r.diff %}
+          <tr><td class="mono">{{ d.path }}</td><td class="mono diff-table__before">{{ d.before }}</td><td class="mono diff-table__after">{{ d.after }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% endif %}
+{% endblock %}

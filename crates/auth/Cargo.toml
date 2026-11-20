@@ -12,6 +12,11 @@ description = "Authentication and authorization for the Helios FHIR Server"
 default = []
 
 [dependencies]
+# Per-endpoint auth settings and the outbound (SSRF) policy of the FHIR server
+# manager (docs/design/fhir-server-manager.md §6). A light crate with no
+# workspace dependencies of its own.
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+
 # JWT validation
 jsonwebtoken = "9"
 
@@ -26,7 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Async runtime
-tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "macros", "net"] }
 async-trait = "0.1"
 
 # Time

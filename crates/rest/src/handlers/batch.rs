@@ -672,7 +672,9 @@ where
                         ) {
                             entry_compartment = PatientCompartment::confined_to(patient_id)
                                 .with_shared_types(
-                                    state.auth_config().patient_shared_read_types().to_vec(),
+                                    crate::patient_compartment::request_shared_types(
+                                        state.auth_config().patient_shared_read_types(),
+                                    ),
                                 );
                         } else {
                             return Err(RestError::Forbidden {
@@ -1402,8 +1404,11 @@ where
                         ),
                     });
                 }
-                compartment = PatientCompartment::confined_to(patient_id)
-                    .with_shared_types(state.auth_config().patient_shared_read_types().to_vec());
+                compartment = PatientCompartment::confined_to(patient_id).with_shared_types(
+                    crate::patient_compartment::request_shared_types(
+                        state.auth_config().patient_shared_read_types(),
+                    ),
+                );
             }
             Err(_) => {
                 // `forbidden` is a child of `security`; `processing` is not an
