@@ -18,9 +18,15 @@ use axum::{
 use helios_audit::AuditAction;
 use helios_endpoints::Actor;
 
+use std::sync::Arc;
+
+use helios_persistence::core::{ResourceStorage, SearchProvider};
+
 use crate::handlers::admin_endpoints::audit::AdminEvent;
 use crate::handlers::admin_endpoints::authz::AdminRequest;
 use crate::handlers::admin_endpoints::{AdminEndpointsState, endpoints as h, packages as p};
+use crate::packages::PackageManager;
+use crate::state::AppState;
 
 /// Every route of this router: `(method, path template)`.
 pub const ROUTES: &[(&str, &str)] = &[
@@ -49,6 +55,42 @@ pub const ROUTES: &[(&str, &str)] = &[
     ),
     ("POST", "/admin/secrets/$rewrap"),
 ];
+
+/// The endpoint admin routes of the application (`build_app`): mounted only
+/// when the FHIR server manager is on (`HFS_MANAGER=on`, the app state holds
+/// the endpoint runtime); an empty router otherwise. Key ring, outbound
+/// policy and authorizer come from the environment
+/// ([`AdminEndpointsStateBuilder::env_defaults`](crate::handlers::admin_endpoints::AdminEndpointsStateBuilder::env_defaults));
+/// the administrator credential reaches the authorizer through the server's
+/// admin guard (`AdminUser`) or the admin tier's auth layer (`Principal`).
+pub fn app_routes<S>(
+    state: &AppState<S>,
+    packages: &Arc<PackageManager>,
+    package_upload_limit: usize,
+) -> Router
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    let Some(runtime) = state.endpoint_runtime() else {
+        return Router::new();
+    };
+    let admin =
+        AdminEndpointsState::builder(Arc::clone(&runtime.store), Arc::clone(&runtime.registry))
+            .env_defaults(None)
+            .packages(Arc::clone(packages), package_upload_limit)
+            .storage(
+                state.storage_arc(),
+                Some(Arc::clone(state.write_observer())),
+            )
+            .audit(
+                state.audit_sink().cloned(),
+                state.audit_source_observer(),
+                state.default_tenant(),
+            )
+            .server_base(state.base_url())
+            .build();
+    routes(admin)
+}
 
 /// The endpoint admin routes over `state`.
 pub fn routes(state: AdminEndpointsState) -> Router {
