@@ -22,6 +22,23 @@ pub struct JwksCache {
     last_refresh: Arc<RwLock<Instant>>,
     min_refresh_interval: Duration,
     max_ttl: Duration,
+    /// The background refresher, aborted when the cache is dropped (a
+    /// per-endpoint verifier that is no longer used must not keep polling
+    /// its IdP forever).
+    background: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl Drop for JwksCache {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .background
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 impl JwksCache {
@@ -39,7 +56,25 @@ impl JwksCache {
             )),
             min_refresh_interval: Duration::from_secs(min_refresh_interval_secs),
             max_ttl: DEFAULT_CACHE_TTL,
+            background: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Fetches through `client` instead of the default one (an outbound
+    /// policy enforcing client for administrator-entered JWKS URLs).
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.fetcher = JwksFetcher::with_client(client);
+        self
+    }
+
+    /// The JWKS URL this cache fetches.
+    pub fn jwks_url(&self) -> &str {
+        &self.jwks_url
+    }
+
+    /// Whether a key set has been fetched at least once and holds keys.
+    pub async fn has_keys(&self) -> bool {
+        !self.keys.read().await.is_empty()
     }
 
     /// Caps how long a fetched key set is trusted before it is refetched,
@@ -70,10 +105,10 @@ impl JwksCache {
     /// first unknown `kid`, or the background retry — reaches the JWKS. Use
     /// [`initial_fetch`](Self::initial_fetch) to fail fast instead.
     pub async fn start(&self) {
-        info!(url = %self.jwks_url, "Performing initial JWKS fetch");
+        info!(url = %redact_url(&self.jwks_url), "Performing initial JWKS fetch");
         if let Err(err) = self.refresh().await {
             warn!(
-                url = %self.jwks_url,
+                url = %redact_url(&self.jwks_url),
                 error = %err,
                 "Initial JWKS fetch failed; starting anyway and retrying in the background"
             );
@@ -153,7 +188,11 @@ impl JwksCache {
         let min_interval = self.min_refresh_interval;
         let max_ttl = self.max_ttl;
 
-        tokio::spawn(async move {
+        let mut slot = self.background.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let task = tokio::spawn(async move {
             loop {
                 // Sleep until shortly before expiry
                 let sleep_duration = {
@@ -195,5 +234,6 @@ impl JwksCache {
                 }
             }
         });
+        *slot = Some(task.abort_handle());
     }
 }

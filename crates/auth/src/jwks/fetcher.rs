@@ -55,6 +55,12 @@ impl JwksFetcher {
         Self { client }
     }
 
+    /// A fetcher that uses `client` (e.g. one whose DNS resolver enforces an
+    /// outbound policy, see [`crate::discovery::OutboundGuard`]).
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+
     /// Fetch and parse a JWKS document from the given URL.
     pub async fn fetch(&self, url: &str) -> Result<JwksResponse, AuthError> {
         debug!(url = %redact_url(url), "Fetching JWKS");

@@ -96,6 +96,186 @@ fn is_jwt_bearer(value: &str) -> bool {
         .is_some_and(|t| t.starts_with("eyJ") && t.split('.').count() == 3 && !t.contains(' '))
 }
 
+/// The scope policy of the endpoint a request addresses, stored in the
+/// request extensions by the per-endpoint auth layer
+/// (`crate::endpoint::auth`). [`authenticate`] filters a validated token's
+/// scopes by it. Absent for the environment-configured (inherited) auth,
+/// which applies no policy.
+#[derive(Debug, Clone)]
+pub struct EndpointScopePolicy(pub helios_endpoints::model::ScopePolicy);
+
+/// The context (`patient`, `user`, `system`) of a SMART scope string, or
+/// `None` for a scope that is not context-qualified (`openid`, `fhirUser`,
+/// `launch/patient`, `offline_access`, …).
+fn scope_context(raw: &str) -> Option<&str> {
+    let (context, _) = raw.split_once('/')?;
+    matches!(context, "patient" | "user" | "system").then_some(context)
+}
+
+/// Whether a SMART scope uses the v1 permission syntax (`.read`, `.write`,
+/// `.*`).
+fn is_v1_scope(raw: &str) -> bool {
+    let head = raw.split('?').next().unwrap_or(raw);
+    head.rsplit_once('.')
+        .is_some_and(|(_, perm)| matches!(perm, "read" | "write" | "*"))
+}
+
+/// Filters a principal's scopes by an endpoint's [`ScopePolicy`]
+/// (`docs/design/fhir-server-manager.md` §6):
+///
+/// * scopes of a context the endpoint does not allow (`allowPatient`,
+///   `allowUser`, `allowSystem` = false) are ignored, operation scopes
+///   (`system/purge`, …) included;
+/// * SMART v1 scopes are ignored when `acceptV1` is false;
+/// * scopes that are not context-qualified (`openid`, `launch/patient`) stay.
+///
+/// A token that held context-qualified scopes and keeps none is refused
+/// (`Err` with the reason, answered `403`): every scope it carries is of a
+/// kind this endpoint does not accept.
+///
+/// [`ScopePolicy`]: helios_endpoints::model::ScopePolicy
+pub fn apply_scope_policy(
+    principal: &mut Principal,
+    policy: &helios_endpoints::model::ScopePolicy,
+) -> Result<(), String> {
+    let allowed = |context: &str| match context {
+        "patient" => policy.allow_patient,
+        "user" => policy.allow_user,
+        "system" => policy.allow_system,
+        _ => true,
+    };
+    let raw = principal.scopes.raw().to_vec();
+    let qualified = raw.iter().filter(|s| scope_context(s).is_some()).count();
+    let kept: Vec<String> = raw
+        .iter()
+        .filter(|s| match scope_context(s) {
+            None => true,
+            Some(ctx) => allowed(ctx) && (policy.accept_v1 || !is_v1_scope(s)),
+        })
+        .cloned()
+        .collect();
+    if kept.len() == raw.len() {
+        return Ok(());
+    }
+    let kept_qualified = kept.iter().filter(|s| scope_context(s).is_some()).count();
+    if qualified > 0 && kept_qualified == 0 {
+        let mut refused = Vec::new();
+        for (ctx, on) in [
+            ("patient/", policy.allow_patient),
+            ("user/", policy.allow_user),
+            ("system/", policy.allow_system),
+        ] {
+            if !on {
+                refused.push(ctx);
+            }
+        }
+        let mut why = if refused.is_empty() {
+            String::new()
+        } else {
+            format!("{} scopes are not accepted", refused.join(", "))
+        };
+        if !policy.accept_v1 {
+            if !why.is_empty() {
+                why.push_str("; ");
+            }
+            why.push_str("SMART v1 scopes are not accepted");
+        }
+        return Err(format!(
+            "none of the token's scopes is accepted by this endpoint ({why})"
+        ));
+    }
+    principal.scopes = helios_auth::ScopeSet::parse_array(&kept);
+    Ok(())
+}
+
+/// The principal a console session stands for on an endpoint
+/// (`docs/design/fhir-server-manager.md` D-10): issuer
+/// [`helios_endpoints::CONSOLE_ISSUER`], the console subject, and the scopes
+/// of `scopes` (from [`helios_endpoints::ConsoleRole::data_scopes`]).
+pub fn console_principal(console: &helios_endpoints::ConsolePrincipal, scopes: &str) -> Principal {
+    let mut claims = serde_json::Map::new();
+    claims.insert("console".to_string(), serde_json::Value::Bool(true));
+    claims.insert(
+        "name".to_string(),
+        serde_json::Value::String(console.display_name.clone()),
+    );
+    Principal {
+        subject: console.subject.clone(),
+        issuer: helios_endpoints::CONSOLE_ISSUER.to_string(),
+        tenant_id: None,
+        scopes: helios_auth::ScopeSet::parse(scopes),
+        jti: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        custom_claims: claims,
+        launch_context: None,
+    }
+}
+
+/// The scope `/admin/**` APIs of the FHIR server manager (endpoints, sync,
+/// console users) require of a JWT (`HFS_ADMIN_TOKEN_SCOPE`, default
+/// `system/*.cruds`; design §6). The older `/admin/packages` and
+/// `/admin/tenants` keep [`admin_authz_middleware`]'s `system/*.r` rule.
+#[derive(Debug, Clone)]
+pub struct AdminTokenScope(pub String);
+
+impl AdminTokenScope {
+    /// From `HFS_ADMIN_TOKEN_SCOPE` (blank = `system/*.cruds`).
+    pub fn from_env() -> Self {
+        Self(
+            std::env::var("HFS_ADMIN_TOKEN_SCOPE")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "system/*.cruds".to_string()),
+        )
+    }
+
+    /// Whether `principal` holds every scope of this requirement: the
+    /// administrator credential always does; a resource scope is satisfied
+    /// by an unconstrained `system/` scope covering its type with at least
+    /// its permissions; an operation scope (`system/purge`) by itself.
+    pub fn satisfied_by(&self, principal: &Principal) -> bool {
+        if principal.issuer == ADMIN_ISSUER {
+            return true;
+        }
+        self.0.split_whitespace().all(|required| {
+            match helios_auth::scope::SmartScope::parse(required) {
+                Some(req) => principal.scopes.scopes().iter().any(|have| {
+                    have.context == helios_auth::scope::ScopeContext::System
+                        && have.constraints.is_empty()
+                        && have.permissions.contains(req.permissions)
+                        && match (&have.resource_type, &req.resource_type) {
+                            (helios_auth::scope::ResourceTypeSpec::Wildcard, _) => true,
+                            (a, b) => a == b,
+                        }
+                }),
+                None => principal.scopes.raw().iter().any(|s| s == required),
+            }
+        })
+    }
+}
+
+/// Authorization for the manager's admin APIs: a principal (JWT of the
+/// environment's issuer, console session, administrator credential) must
+/// satisfy [`AdminTokenScope`]; `403` otherwise. Without a principal (auth
+/// off: the admin guard in front decides) the request passes.
+pub async fn admin_token_scope_middleware(
+    State(required): State<Arc<AdminTokenScope>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match request.extensions().get::<Principal>() {
+        Some(p) if !required.satisfied_by(p) => {
+            warn!(sub = %p.subject(), "Admin API refused: token lacks the admin scope");
+            forbidden_response(&format!(
+                "this administration API requires the scope {}",
+                required.0
+            ))
+        }
+        _ => next.run(request).await,
+    }
+}
+
 /// Whether an anonymous request may proceed in write-protect mode: reads and
 /// searches, `$validate` and `$everything` (also in their POST forms) — but
 /// not bulk export, job status/output, or per-user settings, which act for
@@ -183,6 +363,22 @@ async fn session_bearer(
 /// Exempt paths (health, metadata, SMART discovery) bypass authentication.
 pub async fn auth_middleware(
     State(auth_state): State<Arc<AuthMiddlewareState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate(&auth_state, request, next).await
+}
+
+/// The body of [`auth_middleware`] for a given state. The per-endpoint auth
+/// layer (`crate::endpoint::auth`) runs it with the state of the endpoint a
+/// request addresses; [`auth_middleware`] with the one state it was given.
+///
+/// When the request carries an [`EndpointScopePolicy`] (the endpoint's scope
+/// policy, set by the per-endpoint layer), a validated token's scopes are
+/// filtered by it before the principal is stored (see
+/// [`apply_scope_policy`]).
+pub async fn authenticate(
+    auth_state: &AuthMiddlewareState,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -209,7 +405,7 @@ pub async fn auth_middleware(
     // for a cross-site request, so another origin cannot ride the cookie.
     let auth_header = match auth_header {
         Some(h) => Some(h),
-        None => match session_bearer(&auth_state, request.headers()).await {
+        None => match session_bearer(auth_state, request.headers()).await {
             Some(bearer) => {
                 if let Ok(value) = bearer.parse() {
                     request.headers_mut().insert(header::AUTHORIZATION, value);
@@ -312,6 +508,24 @@ pub async fn auth_middleware(
                     &auth_state.config.fhir_user_claim,
                 );
             }
+            if let Some(policy) = request.extensions().get::<EndpointScopePolicy>().cloned()
+                && let Err(reason) = apply_scope_policy(&mut principal, &policy.0)
+            {
+                warn!(sub = %principal.subject(), path = %path, "Token refused by the endpoint's scope policy");
+                if !auth_state
+                    .audit_exclusion_filter
+                    .is_excluded(&path, &method)
+                {
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("8")
+                        .outcome_desc(format!("Forbidden: {reason}"))
+                        .principal(&principal)
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                }
+                return forbidden_response(&reason);
+            }
             debug!(
                 sub = %principal.subject(),
                 iss = %principal.issuer(),
@@ -379,6 +593,15 @@ pub async fn auth_middleware(
 /// the request passes through.
 pub async fn authz_middleware(
     State(auth_state): State<Arc<AuthMiddlewareState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authorize(&auth_state, request, next).await
+}
+
+/// The body of [`authz_middleware`] for a given state (see [`authenticate`]).
+pub async fn authorize(
+    auth_state: &AuthMiddlewareState,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -387,6 +610,22 @@ pub async fn authz_middleware(
         Some(p) => p.clone(),
         None => return next.run(request).await,
     };
+
+    // The shared reference types a `patient/`-confined request may read, for
+    // every request of a token holding `patient/` scopes: the single-resource
+    // handlers and the batch/transaction handler (which confines per entry)
+    // read them from here, so they follow the endpoint's policy.
+    let shared_types = principal
+        .scopes
+        .has_patient_scopes()
+        .then(|| auth_state.config.patient_shared_read_types().to_vec());
+    if let Some(types) = &shared_types {
+        request
+            .extensions_mut()
+            .insert(crate::patient_compartment::PatientSharedTypes(
+                types.clone(),
+            ));
+    }
 
     let path = request.uri().path().to_string();
     let method = request.method().clone();
@@ -418,14 +657,8 @@ pub async fn authz_middleware(
     let routed = routed_path(&path, auth_state.tenant_url_routing);
     match extract_operation(&routed, method.as_str()) {
         Some((resource_type, operation)) => {
-            let shared = auth_state.config.patient_shared_read_types();
             match SmartScopePolicy::check(&principal, &resource_type, operation) {
                 Ok(scope) => {
-                    if scope.is_patient_compartment() {
-                        request.extensions_mut().insert(
-                            crate::patient_compartment::PatientSharedTypes(shared.to_vec()),
-                        );
-                    }
                     if let AccessScope::PatientCompartment { patient_id } = &scope
                         && let Err(reason) =
                             patient_compartment_path_check(&routed, method.as_str(), patient_id)
@@ -510,7 +743,12 @@ pub async fn authz_middleware(
         None => {}
     }
 
-    next.run(request).await
+    match shared_types {
+        Some(types) => {
+            crate::patient_compartment::with_request_shared_types(types, next.run(request)).await
+        }
+        None => next.run(request).await,
+    }
 }
 
 /// The refusal for an endpoint a `patient/` scope cannot reach.
@@ -869,7 +1107,7 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     Some((resource_type, operation))
 }
 
-fn unauthorized_response(message: &str) -> Response {
+pub(crate) fn unauthorized_response(message: &str) -> Response {
     unauthorized_response_with(message, None)
 }
 
@@ -910,7 +1148,7 @@ pub(crate) fn unauthorized_response_with(message: &str, error: Option<&str>) -> 
         .into_response()
 }
 
-fn service_unavailable_response(message: &str) -> Response {
+pub(crate) fn service_unavailable_response(message: &str) -> Response {
     let body = serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -930,7 +1168,7 @@ fn service_unavailable_response(message: &str) -> Response {
         .into_response()
 }
 
-fn forbidden_response(message: &str) -> Response {
+pub(crate) fn forbidden_response(message: &str) -> Response {
     let body = serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -957,6 +1195,92 @@ fn forbidden_response(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_scopes(scopes: &str) -> Principal {
+        Principal {
+            subject: "s".into(),
+            issuer: "https://idp".into(),
+            scopes: helios_auth::ScopeSet::parse(scopes),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scope_policy_filters_contexts_and_v1() {
+        use helios_endpoints::model::ScopePolicy;
+        let all = ScopePolicy::default();
+        let mut p = with_scopes("openid patient/*.rs user/Observation.read");
+        assert!(apply_scope_policy(&mut p, &all).is_ok());
+        assert_eq!(
+            p.scopes.raw().len(),
+            3,
+            "the default policy keeps everything"
+        );
+
+        let no_patient = ScopePolicy {
+            allow_patient: false,
+            ..ScopePolicy::default()
+        };
+        let mut p = with_scopes("openid launch/patient patient/*.rs user/Observation.rs");
+        assert!(apply_scope_policy(&mut p, &no_patient).is_ok());
+        assert_eq!(
+            p.scopes.raw(),
+            ["openid", "launch/patient", "user/Observation.rs"]
+        );
+        assert!(!p.scopes.has_patient_scopes());
+
+        let mut p = with_scopes("openid patient/*.rs patient/Observation.read");
+        let err = apply_scope_policy(&mut p, &no_patient).unwrap_err();
+        assert!(err.contains("patient/ scopes are not accepted"), "{err}");
+
+        let v2_only = ScopePolicy {
+            accept_v1: false,
+            allow_system: false,
+            ..ScopePolicy::default()
+        };
+        let mut p = with_scopes("system/*.cruds user/*.read user/Patient.rs?gender=female");
+        assert!(apply_scope_policy(&mut p, &v2_only).is_ok());
+        assert_eq!(p.scopes.raw(), ["user/Patient.rs?gender=female"]);
+        let mut p = with_scopes("system/*.read system/purge");
+        let err = apply_scope_policy(&mut p, &v2_only).unwrap_err();
+        assert!(err.contains("system/") && err.contains("SMART v1"), "{err}");
+        // Only non-qualified scopes: nothing to refuse.
+        let mut p = with_scopes("openid profile");
+        assert!(apply_scope_policy(&mut p, &v2_only).is_ok());
+        assert!(is_v1_scope("patient/*.*") && is_v1_scope("user/Observation.write"));
+        assert!(!is_v1_scope("user/Observation.rs?code=a.read"));
+    }
+
+    #[test]
+    fn admin_token_scope_requires_an_unconstrained_system_scope() {
+        let rule = AdminTokenScope("system/*.cruds".into());
+        assert!(rule.satisfied_by(&with_scopes("system/*.cruds")));
+        assert!(rule.satisfied_by(&with_scopes("openid system/*.*")));
+        assert!(!rule.satisfied_by(&with_scopes("system/*.rs")));
+        assert!(!rule.satisfied_by(&with_scopes("user/*.cruds")));
+        assert!(!rule.satisfied_by(&with_scopes("system/Patient.cruds")));
+        assert!(!rule.satisfied_by(&with_scopes("system/*.cruds?_tag=x")));
+        assert!(rule.satisfied_by(&admin_principal("admin")));
+        let typed = AdminTokenScope("system/Endpoint.rs system/purge".into());
+        assert!(typed.satisfied_by(&with_scopes("system/*.rs system/purge")));
+        assert!(typed.satisfied_by(&with_scopes("system/Endpoint.cruds system/purge")));
+        assert!(!typed.satisfied_by(&with_scopes("system/*.rs")));
+        let console = console_principal(
+            &helios_endpoints::ConsolePrincipal {
+                subject: "local:ann".into(),
+                display_name: "Ann".into(),
+                role: helios_endpoints::ConsoleRole::Admin,
+                endpoint_roles: Default::default(),
+                via: helios_endpoints::console::ConsoleVia::Local,
+            },
+            helios_endpoints::ConsoleRole::Admin
+                .data_scopes(helios_endpoints::ConsoleAccess::RoleBased)
+                .unwrap(),
+        );
+        assert_eq!(console.issuer, helios_endpoints::CONSOLE_ISSUER);
+        assert!(rule.satisfied_by(&console));
+        assert!(console.scopes.grants_operation("purge"));
+    }
 
     #[test]
     fn test_exempt_paths() {

@@ -1,7 +1,20 @@
-use serde::Serialize;
+//! SMART discovery documents and, for endpoints configured at runtime
+//! (FHIR server manager, `docs/design/fhir-server-manager.md` §6), the
+//! outbound-policy-guarded HTTP access to administrator-entered IdP URLs:
+//! [`OutboundGuard`], the cached issuer discovery ([`IssuerDiscovery`]) and
+//! the `$test-auth` probe ([`EndpointAuthProbe`]).
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use helios_endpoints::OutboundPolicy;
+use helios_endpoints::model::{AuthMode as EndpointAuthMode, EndpointAuth};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::AuthConfig;
+use crate::config::{AuthConfig, redact_url};
 
 /// SMART on FHIR configuration document served at
 /// `/.well-known/smart-configuration`.
@@ -23,6 +36,10 @@ pub struct SmartConfiguration {
     pub registration_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation_endpoint: Option<String>,
+    /// RP-initiated logout; only set for endpoints configured in the manager
+    /// (the environment-configured document never carried it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_session_endpoint: Option<String>,
     pub scopes_supported: Vec<String>,
     pub response_types_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
@@ -110,6 +127,7 @@ impl SmartConfiguration {
             management_endpoint: config.smart_management_endpoint.clone(),
             registration_endpoint: config.smart_registration_endpoint.clone(),
             revocation_endpoint: config.smart_revocation_endpoint.clone(),
+            end_session_endpoint: None,
             scopes_supported: config
                 .smart_scopes_supported
                 .clone()
@@ -138,9 +156,695 @@ impl SmartConfiguration {
     }
 }
 
+impl SmartConfiguration {
+    /// The document of an endpoint configured in the manager: `config` is
+    /// the endpoint's [`AuthConfig::from_endpoint`]; endpoints it leaves
+    /// unset are filled from the issuer's OpenID configuration when one was
+    /// discovered.
+    pub fn for_endpoint(
+        config: &AuthConfig,
+        discovered: Option<&OidcMetadata>,
+        end_session_endpoint: Option<&str>,
+    ) -> Self {
+        let mut filled = config.clone();
+        if let Some(meta) = discovered {
+            fill(
+                &mut filled.smart_authorize_endpoint,
+                &meta.authorization_endpoint,
+            );
+            fill(&mut filled.smart_token_endpoint, &meta.token_endpoint);
+            fill(
+                &mut filled.smart_introspection_endpoint,
+                &meta.introspection_endpoint,
+            );
+            fill(
+                &mut filled.smart_revocation_endpoint,
+                &meta.revocation_endpoint,
+            );
+            fill(
+                &mut filled.smart_registration_endpoint,
+                &meta.registration_endpoint,
+            );
+            fill(&mut filled.smart_jwks_url, &meta.jwks_uri);
+        }
+        let mut doc = Self::from_config(&filled);
+        doc.end_session_endpoint = end_session_endpoint
+            .map(str::to_string)
+            .or_else(|| discovered.and_then(|m| m.end_session_endpoint.clone()));
+        doc
+    }
+}
+
+fn fill(slot: &mut Option<String>, value: &Option<String>) {
+    if slot.is_none() {
+        slot.clone_from(value);
+    }
+}
+
+// ------------------------------------------------------------ outbound guard
+
+/// How URLs of one endpoint's auth configuration may be fetched.
+///
+/// Endpoints declared by the operator (`HFS_ENDPOINTS_FILE`, `managedBy=env`)
+/// and the environment configuration are trusted like `HFS_AUTH_JWKS_URL`
+/// today; endpoints edited in the console go through the SSRF policy
+/// ([`OutboundPolicy`], `HFS_OUTBOUND_ALLOW`): the URL is checked before
+/// every request and the client's DNS resolver refuses internal addresses,
+/// so the connection always goes to a checked address (no DNS rebinding);
+/// redirects are not followed.
+#[derive(Debug, Clone)]
+pub enum OutboundGuard {
+    /// Operator-configured URLs: no policy.
+    Trusted,
+    /// Administrator-entered URLs: the policy applies.
+    Policy(Arc<OutboundPolicy>),
+}
+
+impl OutboundGuard {
+    /// Syntax check of `url` (scheme, user-info, metadata hosts, literal
+    /// internal addresses). Always `Ok` for [`OutboundGuard::Trusted`].
+    pub fn check_url(&self, url: &str) -> Result<(), String> {
+        match self {
+            OutboundGuard::Trusted => Ok(()),
+            OutboundGuard::Policy(policy) => policy
+                .check_url(url)
+                .map(|_| ())
+                .map_err(|e| format!("{} refused by the outbound policy: {e}", redact_url(url))),
+        }
+    }
+
+    /// An HTTP client for this guard: the policy's DNS resolver and no
+    /// redirects under [`OutboundGuard::Policy`].
+    pub fn client(&self, timeout: Duration) -> reqwest::Client {
+        let builder = reqwest::Client::builder().timeout(timeout);
+        let builder = match self {
+            OutboundGuard::Trusted => builder,
+            OutboundGuard::Policy(policy) => builder
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(PolicyResolver {
+                    policy: Arc::clone(policy),
+                })),
+        };
+        builder.build().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "building the outbound HTTP client failed; using defaults");
+            reqwest::Client::new()
+        })
+    }
+}
+
+/// DNS resolver that drops every address the outbound policy refuses (and
+/// fails when none is left), so a connection can only go to a checked
+/// address.
+struct PolicyResolver {
+    policy: Arc<OutboundPolicy>,
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = Arc::clone(&self.policy);
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let mut refused = None;
+            let allowed: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| match policy.check_ip(&host, a.ip()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        refused = Some(e);
+                        false
+                    }
+                })
+                .collect();
+            if allowed.is_empty() {
+                let why = refused
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| format!("{host} did not resolve"));
+                return Err(why.into());
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+// ---------------------------------------------------------- issuer discovery
+
+/// The parts of an OpenID Provider configuration
+/// (`{issuer}/.well-known/openid-configuration`) SMART discovery uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OidcMetadata {
+    /// `issuer` as the IdP states it.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// `authorization_endpoint`.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// `token_endpoint`.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    /// `jwks_uri`.
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
+    /// `introspection_endpoint`.
+    #[serde(default)]
+    pub introspection_endpoint: Option<String>,
+    /// `revocation_endpoint`.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    /// `registration_endpoint`.
+    #[serde(default)]
+    pub registration_endpoint: Option<String>,
+    /// `end_session_endpoint`.
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
+}
+
+/// The discovery document URL of an issuer.
+pub fn openid_configuration_url(issuer: &str) -> String {
+    format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    )
+}
+
+/// Fetches an issuer's OpenID configuration through `guard`.
+pub async fn fetch_oidc_metadata(
+    issuer: &str,
+    guard: &OutboundGuard,
+) -> Result<OidcMetadata, String> {
+    let url = openid_configuration_url(issuer);
+    guard.check_url(&url)?;
+    let response = guard
+        .client(Duration::from_secs(10))
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("fetching {}: {}", redact_url(&url), e.without_url()))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{} answered {}",
+            redact_url(&url),
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("reading {}: {}", redact_url(&url), e.without_url()))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(format!("{} is larger than 1 MiB", redact_url(&url)));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not an OpenID configuration: {e}", redact_url(&url)))
+}
+
+/// How long a discovered (or failed) issuer configuration is reused.
+const DISCOVERY_TTL: Duration = Duration::from_secs(300);
+const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(30);
+
+type DiscoveryEntry = (Instant, Result<Arc<OidcMetadata>, String>);
+
+/// Process-wide cache of issuer discovery documents, keyed by issuer (and
+/// whether the fetch was policy-guarded), so endpoints sharing an IdP fetch
+/// its configuration once. Successes are kept 5 minutes, failures 30 s.
+#[derive(Default)]
+pub struct IssuerDiscovery {
+    entries: Mutex<HashMap<(String, bool), DiscoveryEntry>>,
+}
+
+impl IssuerDiscovery {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The issuer's configuration, from the cache or fetched now.
+    pub async fn get(
+        &self,
+        issuer: &str,
+        guard: &OutboundGuard,
+    ) -> Result<Arc<OidcMetadata>, String> {
+        let key = (
+            issuer.to_string(),
+            matches!(guard, OutboundGuard::Policy(_)),
+        );
+        {
+            let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((at, result)) = entries.get(&key) {
+                let ttl = if result.is_ok() {
+                    DISCOVERY_TTL
+                } else {
+                    DISCOVERY_FAILURE_TTL
+                };
+                if at.elapsed() < ttl {
+                    return result.clone();
+                }
+            }
+        }
+        let result = fetch_oidc_metadata(issuer, guard).await.map(Arc::new);
+        if let Err(e) = &result {
+            tracing::warn!(error = %e, "issuer discovery failed");
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, (Instant::now(), result.clone()));
+        result
+    }
+
+    /// Drops entries of issuers no longer configured.
+    pub fn retain_issuers(&self, live: &std::collections::HashSet<String>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(issuer, _), _| live.contains(issuer));
+    }
+}
+
+// ------------------------------------------------------------------- probe
+
+/// One step of a [`ProbeReport`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeStep {
+    /// Whether the step succeeded.
+    pub ok: bool,
+    /// The URL fetched (credentials redacted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// What happened.
+    pub detail: String,
+    /// Signing keys found (JWKS step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_count: Option<usize>,
+    /// Time taken.
+    pub elapsed_ms: u64,
+}
+
+/// What `POST /admin/endpoints/{name}/$test-auth` answers: whether the
+/// issuer's discovery document and the JWKS can be fetched (through the
+/// outbound policy) and are coherent, plus configuration warnings.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeReport {
+    /// Every step succeeded (warnings do not count).
+    pub ok: bool,
+    /// The auth mode probed.
+    pub mode: String,
+    /// Issuer discovery (`None` when auth is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<ProbeStep>,
+    /// JWKS fetch (`None` when auth is off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<ProbeStep>,
+    /// Non-blocking findings (no audience, admin credential accepted, …).
+    pub warnings: Vec<String>,
+}
+
+/// Probes an endpoint's auth configuration (package P2's contract for the
+/// admin API's `$test-auth`, package P4).
+#[derive(Debug, Clone)]
+pub struct EndpointAuthProbe {
+    guard: OutboundGuard,
+}
+
+impl EndpointAuthProbe {
+    /// A probe fetching through `guard`.
+    pub fn new(guard: OutboundGuard) -> Self {
+        Self { guard }
+    }
+
+    /// Runs the probe.
+    pub async fn test(&self, auth: &EndpointAuth) -> ProbeReport {
+        let mode = match auth.mode {
+            EndpointAuthMode::Off => "off",
+            EndpointAuthMode::WriteProtect => "write-protect",
+            EndpointAuthMode::Full => "full",
+        };
+        let warnings = auth_warnings(auth);
+        if auth.mode == EndpointAuthMode::Off {
+            return ProbeReport {
+                ok: true,
+                mode: mode.into(),
+                issuer: None,
+                jwks: None,
+                warnings,
+            };
+        }
+        let issuer = self.issuer_step(auth.issuer.as_deref()).await;
+        let jwks = self.jwks_step(auth.jwks_url.as_deref()).await;
+        ProbeReport {
+            ok: issuer.ok && jwks.ok,
+            mode: mode.into(),
+            issuer: Some(issuer),
+            jwks: Some(jwks),
+            warnings,
+        }
+    }
+
+    async fn issuer_step(&self, issuer: Option<&str>) -> ProbeStep {
+        let started = Instant::now();
+        let Some(issuer) = issuer.map(str::trim).filter(|i| !i.is_empty()) else {
+            return step(false, None, "no issuer configured".into(), None, started);
+        };
+        let url = openid_configuration_url(issuer);
+        match fetch_oidc_metadata(issuer, &self.guard).await {
+            Ok(meta) => {
+                let stated = meta.issuer.as_deref().unwrap_or("");
+                if stated.trim_end_matches('/') != issuer.trim_end_matches('/') {
+                    step(
+                        false,
+                        Some(&url),
+                        format!(
+                            "the IdP states issuer {stated:?}, the endpoint expects {issuer:?}; tokens would be refused"
+                        ),
+                        None,
+                        started,
+                    )
+                } else {
+                    let mut found = Vec::new();
+                    if meta.authorization_endpoint.is_some() {
+                        found.push("authorization_endpoint");
+                    }
+                    if meta.token_endpoint.is_some() {
+                        found.push("token_endpoint");
+                    }
+                    step(
+                        true,
+                        Some(&url),
+                        format!("discovered ({})", found.join(", ")),
+                        None,
+                        started,
+                    )
+                }
+            }
+            Err(e) => step(false, Some(&url), e, None, started),
+        }
+    }
+
+    async fn jwks_step(&self, jwks_url: Option<&str>) -> ProbeStep {
+        let started = Instant::now();
+        let Some(url) = jwks_url.map(str::trim).filter(|u| !u.is_empty()) else {
+            return step(false, None, "no JWKS URL configured".into(), None, started);
+        };
+        if let Err(e) = self.guard.check_url(url) {
+            return step(false, Some(url), e, None, started);
+        }
+        let fetcher = crate::jwks::fetcher::JwksFetcher::with_client(
+            self.guard.client(Duration::from_secs(10)),
+        );
+        match fetcher.fetch(url).await {
+            Ok(resp) if resp.keys.is_empty() => step(
+                false,
+                Some(url),
+                "the JWKS holds no usable signing key".into(),
+                Some(0),
+                started,
+            ),
+            Ok(resp) => {
+                let n = resp.keys.len();
+                step(
+                    true,
+                    Some(url),
+                    format!("{n} signing key(s)"),
+                    Some(n),
+                    started,
+                )
+            }
+            Err(e) => step(false, Some(url), e.to_string(), None, started),
+        }
+    }
+}
+
+fn step(
+    ok: bool,
+    url: Option<&str>,
+    detail: String,
+    key_count: Option<usize>,
+    started: Instant,
+) -> ProbeStep {
+    ProbeStep {
+        ok,
+        url: url.map(redact_url),
+        detail,
+        key_count,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Non-blocking warnings about one endpoint's auth settings (design §6):
+/// auth on without an audience; the administrator credential accepted under
+/// write-protect (informational, normal for break-glass); plain-http URLs.
+pub fn auth_warnings(auth: &EndpointAuth) -> Vec<String> {
+    let mut out = Vec::new();
+    if auth.mode == EndpointAuthMode::Off {
+        return out;
+    }
+    if auth.audience.as_deref().is_none_or(|a| a.trim().is_empty()) {
+        out.push(
+            "no audience: any token of this issuer is accepted, including tokens minted for other endpoints or services"
+                .into(),
+        );
+    }
+    for (field, url) in [("jwksUrl", &auth.jwks_url), ("issuer", &auth.issuer)] {
+        if url.as_deref().is_some_and(|u| u.starts_with("http://")) {
+            out.push(format!(
+                "{field} uses plain http: it is fetched only when its host is in HFS_OUTBOUND_ALLOW"
+            ));
+        }
+    }
+    if auth.mode == EndpointAuthMode::WriteProtect && auth.accept_admin_credential {
+        out.push(
+            "info: the administrator credential (HFS_ADMIN_PASSWORD) is accepted for writes".into(),
+        );
+    }
+    out
+}
+
+/// Warnings across endpoints: two endpoints with auth on, the same issuer and
+/// the same (or no) audience accept each other's tokens. Input: `(endpoint
+/// name, auth)`; output: `(endpoint name, warning)`.
+pub fn shared_audience_warnings<'a>(
+    endpoints: impl IntoIterator<Item = (&'a str, &'a EndpointAuth)>,
+) -> Vec<(String, String)> {
+    let live: Vec<(&str, &EndpointAuth)> = endpoints
+        .into_iter()
+        .filter(|(_, a)| a.mode != EndpointAuthMode::Off)
+        .collect();
+    let mut out = Vec::new();
+    for (i, (name, a)) in live.iter().enumerate() {
+        for (j, (other, b)) in live.iter().enumerate() {
+            if i == j || a.issuer != b.issuer {
+                continue;
+            }
+            let aud = |x: &EndpointAuth| x.audience.clone().filter(|s| !s.trim().is_empty());
+            if aud(a).is_none() || aud(a) == aud(b) {
+                out.push((
+                    name.to_string(),
+                    format!(
+                        "shares issuer {} with endpoint {other} and its audience does not tell them apart: a token for one is accepted by the other",
+                        a.issuer.as_deref().unwrap_or("")
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const N: &str = "zbeWVBfqrPsdF1phb2EB5hxjz1EMb5WT4MnhMatFnNFquEZIcgXG1DBAUICEZLQM8gRj9kZ83YA1cFhUtkgUx1qMio8YkKweLV6r8RAqnuxrS5Khm4a25M85qB5MhGoCLZgGtla9lJ79mjVN5XBqD7sPL0ENN1GPcnus1I6WF-E-5Uiih-QWsQVlGeUqMH81vTBLemDxvMQv-TiKZP3LHH_T41G1FfyF-rlbkj7WXGkbqG_WvR4FKeRm1X2_RRVw87h2j1lfK4AiUKs4h_DqwqZju3fgOH_0MHj2RKCu0wo0cTx8mQGbLCNSb-sRoWRnWGpGPphI9xVS8znuPB1JYQ";
+
+    async fn idp(stated_issuer: Option<&str>) -> (MockServer, String) {
+        let server = MockServer::start().await;
+        let issuer = format!("{}/realms/t", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/realms/t/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": stated_issuer.unwrap_or(&issuer),
+                "authorization_endpoint": format!("{issuer}/auth"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/certs"),
+                "end_session_endpoint": format!("{issuer}/logout"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/realms/t/certs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{"kty": "RSA", "kid": "k", "use": "sig", "n": N, "e": "AQAB"}]
+            })))
+            .mount(&server)
+            .await;
+        (server, issuer)
+    }
+
+    fn loopback_policy() -> OutboundGuard {
+        OutboundGuard::Policy(Arc::new(OutboundPolicy::parse("127.0.0.1")))
+    }
+
+    #[tokio::test]
+    async fn issuer_discovery_is_cached_and_fills_the_endpoint_document() {
+        let (server, issuer) = idp(None).await;
+        let cache = IssuerDiscovery::new();
+        let meta = cache.get(&issuer, &loopback_policy()).await.unwrap();
+        assert_eq!(
+            meta.token_endpoint.as_deref(),
+            Some(&*format!("{issuer}/token"))
+        );
+        let _ = cache.get(&issuer, &loopback_policy()).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "cached");
+
+        let config = AuthConfig {
+            enabled: true,
+            expected_issuer: Some(issuer.clone()),
+            jwks_url: Some("http://internal/certs".into()),
+            smart_token_endpoint: Some("https://explicit/token".into()),
+            ..AuthConfig::default()
+        };
+        let doc = SmartConfiguration::for_endpoint(&config, Some(&meta), None);
+        assert_eq!(
+            doc.token_endpoint.as_deref(),
+            Some("https://explicit/token"),
+            "explicit wins"
+        );
+        assert_eq!(
+            doc.authorization_endpoint.as_deref(),
+            Some(&*format!("{issuer}/auth"))
+        );
+        assert_eq!(
+            doc.jwks_uri.as_deref(),
+            Some(&*format!("{issuer}/certs")),
+            "public JWKS"
+        );
+        assert_eq!(
+            doc.end_session_endpoint.as_deref(),
+            Some(&*format!("{issuer}/logout"))
+        );
+        let json = doc.to_json();
+        assert_eq!(json["end_session_endpoint"], format!("{issuer}/logout"));
+        // The environment's document never carries end_session_endpoint.
+        assert!(
+            SmartConfiguration::from_config(&config)
+                .to_json()
+                .get("end_session_endpoint")
+                .is_none()
+        );
+
+        cache.retain_issuers(&std::collections::HashSet::new());
+        let _ = cache.get(&issuer, &loopback_policy()).await.unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "dropped, refetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_policy_refuses_internal_addresses_before_connecting() {
+        let (server, issuer) = idp(None).await;
+        let strict = OutboundGuard::Policy(Arc::new(OutboundPolicy::strict()));
+        let err = fetch_oidc_metadata(&issuer, &strict).await.unwrap_err();
+        assert!(err.contains("outbound policy"), "{err}");
+        // A host name resolving to loopback is refused by the resolver too.
+        let by_name = issuer.replace("127.0.0.1", "localhost");
+        let https = by_name.replace("http://", "https://");
+        let err = fetch_oidc_metadata(&https, &strict).await.unwrap_err();
+        assert!(!err.is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(OutboundGuard::Trusted.check_url("http://anything/").is_ok());
+        assert!(strict.check_url("https://user:pw@idp.example/").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_issuer_jwks_and_warnings() {
+        let (_server, issuer) = idp(None).await;
+        let probe = EndpointAuthProbe::new(loopback_policy());
+        let mut auth = EndpointAuth {
+            mode: EndpointAuthMode::WriteProtect,
+            issuer: Some(issuer.clone()),
+            jwks_url: Some(format!("{issuer}/certs")),
+            ..EndpointAuth::default()
+        };
+        let report = probe.test(&auth).await;
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.jwks.as_ref().unwrap().key_count, Some(1));
+        assert!(report.warnings.iter().any(|w| w.contains("no audience")));
+        assert!(report.warnings.iter().any(|w| w.contains("plain http")));
+        assert!(report.warnings.iter().any(|w| w.starts_with("info:")));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["jwks"]["keyCount"], 1);
+
+        auth.jwks_url = Some(format!("{issuer}/missing"));
+        let report = probe.test(&auth).await;
+        assert!(!report.ok);
+        assert!(!report.jwks.unwrap().ok);
+
+        let strict =
+            EndpointAuthProbe::new(OutboundGuard::Policy(Arc::new(OutboundPolicy::strict())));
+        let report = strict.test(&auth).await;
+        assert!(!report.ok);
+        assert!(report.issuer.unwrap().detail.contains("outbound policy"));
+
+        auth.mode = EndpointAuthMode::Off;
+        let report = probe.test(&auth).await;
+        assert!(report.ok && report.issuer.is_none() && report.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_probe_flags_an_issuer_mismatch() {
+        let (_server, issuer) = idp(Some("https://somebody-else")).await;
+        let probe = EndpointAuthProbe::new(loopback_policy());
+        let auth = EndpointAuth {
+            mode: EndpointAuthMode::Full,
+            issuer: Some(issuer.clone()),
+            jwks_url: Some(format!("{issuer}/certs")),
+            audience: Some("x".into()),
+            ..EndpointAuth::default()
+        };
+        let report = probe.test(&auth).await;
+        assert!(!report.ok);
+        assert!(report.issuer.unwrap().detail.contains("somebody-else"));
+        let missing = EndpointAuth {
+            mode: EndpointAuthMode::Full,
+            ..EndpointAuth::default()
+        };
+        let report = probe.test(&missing).await;
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn shared_audiences_are_flagged() {
+        let on = |iss: &str, aud: Option<&str>| EndpointAuth {
+            mode: EndpointAuthMode::Full,
+            issuer: Some(iss.into()),
+            jwks_url: Some(format!("{iss}/certs")),
+            audience: aud.map(str::to_string),
+            ..EndpointAuth::default()
+        };
+        let a = on("https://idp", Some("a"));
+        let b = on("https://idp", Some("b"));
+        let c = on("https://idp", Some("a"));
+        let d = on("https://other", None);
+        let off = EndpointAuth::default();
+        assert!(
+            shared_audience_warnings([("a", &a), ("b", &b), ("d", &d), ("off", &off)]).is_empty()
+        );
+        let w = shared_audience_warnings([("a", &a), ("c", &c)]);
+        assert_eq!(w.len(), 2);
+        assert!(w[0].1.contains("endpoint c"));
+        let e = on("https://other", None);
+        assert_eq!(shared_audience_warnings([("d", &d), ("e", &e)]).len(), 2);
+    }
 
     #[test]
     fn test_smart_config_from_default() {
