@@ -3373,6 +3373,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-endpoints"
+version = "0.2.9"
+dependencies = [
+ "aes-gcm",
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "helios-fhir"
 version = "0.2.9"
 dependencies = [
