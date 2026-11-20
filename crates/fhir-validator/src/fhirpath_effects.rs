@@ -59,11 +59,21 @@ pub struct FhirPathConstraintEvaluator {
     /// snapshot reuses the AST parsed for the first one. Read-mostly, so a
     /// `RwLock`: concurrent validations only share read access once warm.
     asts: RwLock<HashMap<String, Arc<Expression>>>,
+    /// Treat an empty result as a failed invariant, as the HL7 Java
+    /// validator's `evaluateToBoolean` does (default: empty passes, the
+    /// FHIRPath boolean coercion).
+    empty_fails: bool,
 }
 
 impl FhirPathConstraintEvaluator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// See [`Self::empty_fails`](FhirPathConstraintEvaluator).
+    pub fn with_empty_fails(mut self, empty_fails: bool) -> Self {
+        self.empty_fails = empty_fails;
+        self
     }
 
     /// Number of distinct expressions parsed so far (cache size).
@@ -252,6 +262,7 @@ impl FhirPathConstraintEvaluator {
                             own_resource: c.own_resource,
                             expression: &expression,
                             raw: resource,
+                            empty_fails: self.empty_fails,
                         },
                         &context,
                         &mut nodes,
@@ -324,6 +335,12 @@ fn step(
     if matches!(base, EvaluationResult::Empty) {
         return Ok(EvaluationResult::Empty);
     }
+    // A primitive's `_name` sidecar (its id and extensions) is the primitive
+    // itself in FHIRPath: `_display.extension` is `display.extension`.
+    // Navigating `_display` as a member found nothing, so every invariant
+    // below a sidecar (rendering-xhtml's xhtml-ext-1, ext-1 on a primitive
+    // extension) silently passed.
+    let segment = segment.strip_prefix('_').unwrap_or(segment);
     let member = Expression::Term(Term::Invocation(Invocation::Member(segment.to_string())));
     helios_fhirpath::evaluator::evaluate(&member, context, Some(base)).map_err(|e| e.to_string())
 }
@@ -339,6 +356,7 @@ struct Scope<'a> {
     own_resource: bool,
     expression: &'a str,
     raw: &'a Value,
+    empty_fails: bool,
 }
 
 /// `context` with `%resource` / `%rootResource` bound for a node below the
@@ -419,7 +437,7 @@ fn evaluate_at(
     let relative = path.split_once('.').map(|(_, rest)| rest).unwrap_or("");
     if relative.is_empty() {
         return match helios_fhirpath::evaluator::evaluate(ast, context, None) {
-            Ok(result) => coerce(result),
+            Ok(result) => coerce(result, scope.empty_fails),
             Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
         };
     }
@@ -463,6 +481,9 @@ fn evaluate_at(
             EvaluationResult::Empty => &[],
             single => std::slice::from_ref(single),
         };
+        if values.is_empty() && scope.empty_fails {
+            return ConstraintOutcome::Failed;
+        }
         for value in values {
             match value {
                 EvaluationResult::Boolean(true, ..) => {}
@@ -532,9 +553,14 @@ fn combine(path: &str, expression: &str) -> String {
 }
 
 /// FHIRPath 5.1.1 boolean coercion with FHIR invariant semantics.
-fn coerce(result: EvaluationResult) -> ConstraintOutcome {
+fn coerce(result: EvaluationResult, empty_fails: bool) -> ConstraintOutcome {
+    let empty = if empty_fails {
+        ConstraintOutcome::Failed
+    } else {
+        ConstraintOutcome::Passed
+    };
     match result {
-        EvaluationResult::Empty => ConstraintOutcome::Passed,
+        EvaluationResult::Empty => empty,
         EvaluationResult::Boolean(b, ..) => {
             if b {
                 ConstraintOutcome::Passed
@@ -543,7 +569,7 @@ fn coerce(result: EvaluationResult) -> ConstraintOutcome {
             }
         }
         EvaluationResult::Collection { items, .. } => match items.as_slice() {
-            [] => ConstraintOutcome::Passed,
+            [] => empty,
             [EvaluationResult::Boolean(b, ..)] => {
                 if *b {
                     ConstraintOutcome::Passed
@@ -611,7 +637,7 @@ mod tests {
                 let combined = combine(c.path, &effective_expression(c.id, c.expression));
                 match helios_fhirpath::parse_expression(&combined) {
                     Ok(ast) => match helios_fhirpath::evaluator::evaluate(&ast, &context, None) {
-                        Ok(result) => super::coerce(result),
+                        Ok(result) => super::coerce(result, false),
                         Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
                     },
                     Err(e) => ConstraintOutcome::NotEvaluable(format!("parse error: {e}")),

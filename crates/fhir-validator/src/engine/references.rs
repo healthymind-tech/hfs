@@ -145,6 +145,35 @@ pub(super) fn check_reference<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: 
             if !judgeable || candidates.is_empty() {
                 continue;
             }
+            let claimed: Vec<&str> = target
+                .get("meta")
+                .and_then(|m| m.get("profile"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|p| p.split('|').next().unwrap_or(p))
+                .collect();
+            let claims_candidate = candidates
+                .iter()
+                .any(|c| claimed.contains(&c.split('|').next().unwrap_or(c)));
+            // An entry of the Bundle being validated that claims a candidate
+            // is walked against it anyway; decide after the walk, from that
+            // walk's issues, instead of walking the entry a second time.
+            if claims_candidate && let Some(target_path) = ctx.root_entry_path(target) {
+                let path = ctx.path.render_dotted();
+                ctx.pending_targets.push(super::walk::PendingTarget {
+                    cascade: super::walk::Cascade {
+                        path,
+                        reference: reference.to_string(),
+                        candidates: candidates.clone(),
+                        target_path,
+                        claims_candidate,
+                    },
+                    target,
+                });
+                continue;
+            }
             if !candidates.iter().any(|p| ctx.conforms_to(target, p)) {
                 ctx.error(
                     ErrorKind::ReferenceInvalid,
@@ -154,6 +183,16 @@ pub(super) fn check_reference<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: 
                     ),
                 );
                 return;
+            }
+            if let Some(target_path) = ctx.root_entry_path(target) {
+                let path = ctx.path.render_dotted();
+                ctx.cascades.push(super::walk::Cascade {
+                    path,
+                    reference: reference.to_string(),
+                    candidates: candidates.clone(),
+                    target_path,
+                    claims_candidate,
+                });
             }
         }
     }

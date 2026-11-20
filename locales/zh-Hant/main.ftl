@@ -1,4 +1,4 @@
-# Helios FHIR Server — UI 訊息目錄
+# HealthyMind FHIR Server Manager (based on Helios FHIR Server) — UI 訊息目錄
 # 語系：繁體中文（台灣）(zh-Hant)
 #
 # 鍵名與 `en/main.ftl`（來源語系）完全相同。缺少的鍵依 docs/multi-language.md
@@ -7,13 +7,15 @@
 
 ## Brand / shared terms
 
--app-name = Helios FHIR Server
--org-name = Helios Software
+-app-name = 療心智能 FHIR 伺服器管理平台
+-org-name = HealthyMind Tech
 
 ## Page chrome
 
 app-title = { -app-name }
-app-tagline = 快速、支援多版本的FHIR伺服器
+app-short-name = 療心智能 FHIR
+app-product-line = FHIR 伺服器管理平台
+app-tagline = 多個 FHIR endpoint，一個管理平台 — 基於 Helios FHIR Server
 
 nav-dashboard = 儀表板
 nav-terminology = 術語
@@ -1314,8 +1316,10 @@ sql-param-default = 預設值
 ## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
 ## slice. They must be kept in parity with es/de/main.ftl.
 
--hts-app-name = Helios Terminology Server
+-hts-app-name = 療心智能 術語伺服器
 hts-app-title = { -hts-app-name }
+hts-app-short-name = 療心智能 術語
+hts-app-product-line = 術語伺服器
 
 hts-nav-section-work = 術語
 hts-nav-section-tools = 工具

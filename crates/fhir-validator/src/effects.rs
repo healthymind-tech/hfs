@@ -481,6 +481,9 @@ pub struct EffectHandlers<'a> {
     /// The HL7 validator's best-practice warnings (an Observation without
     /// a subject or performer).
     pub best_practice: bool,
+    /// Verify `Bundle.signature` (JWS) as the HL7 validator does; `None`
+    /// skips signatures.
+    pub signatures: Option<&'a crate::signature::SignatureOptions>,
 }
 
 impl Default for EffectHandlers<'_> {
@@ -495,8 +498,379 @@ impl Default for EffectHandlers<'_> {
             narrative_links: false,
             resource_rules: false,
             best_practice: false,
+            signatures: None,
         }
     }
+}
+
+const ELE_1: &str = "hasValue() or (children().count() > id.count())";
+const EXT_1: &str = "extension.exists() != value.exists()";
+
+/// ele-1 / ext-1 (with their standard expressions) decided on the JSON at
+/// `path`, as their FHIRPath evaluates on the typed model; `None` for any
+/// other invariant. A path that names nothing passes (an empty focus).
+///
+/// - ele-1 `hasValue() or (children().count() > id.count())`: a primitive
+///   with a value passes; otherwise the node needs a child other than `id`
+///   (a primitive's children are its sidecar's extensions).
+/// - ext-1 `extension.exists() != value.exists()`: exactly one of nested
+///   extensions and a `value[x]` (a value carried only by its `_valueX`
+///   sidecar exists too).
+fn native_outcome(
+    resource: &Value,
+    version: FhirVersion,
+    path: &str,
+    id: &str,
+    expression: &str,
+) -> Option<ConstraintOutcome> {
+    let ele1 = id == "ele-1" && expression == ELE_1;
+    let ext1 = id == "ext-1" && expression == EXT_1;
+    if !ele1 && !ext1 {
+        return native_resource_rule(resource, path, id, expression)
+            .or_else(|| native_type_rule(resource, version, path, id, expression));
+    }
+    // Navigate; remember the parent object and key for primitives.
+    let mut segments = path.split('.');
+    segments.next(); // the resource type
+    let mut node = resource;
+    let mut parent: Option<(&Value, &str, Option<usize>)> = None;
+    for segment in segments {
+        if let Ok(index) = segment.parse::<usize>() {
+            let Some(item) = node.as_array().and_then(|a| a.get(index)) else {
+                return Some(ConstraintOutcome::Passed);
+            };
+            if let Some((p, k, None)) = parent {
+                parent = Some((p, k, Some(index)));
+            }
+            node = item;
+            continue;
+        }
+        let Some(obj) = node.as_object() else {
+            return Some(ConstraintOutcome::Passed);
+        };
+        // `_name` is the primitive `name` (value + sidecar).
+        let name = segment.strip_prefix('_').unwrap_or(segment);
+        let child = obj.get(name).or_else(|| obj.get(&format!("_{name}")));
+        let Some(child) = child else {
+            return Some(ConstraintOutcome::Passed);
+        };
+        parent = Some((node, name, None));
+        node = child;
+    }
+    let items: Vec<(&Value, Option<&Value>)> = match (node, parent) {
+        // A whole array as focus: every item.
+        (Value::Array(items), Some((p, name, None))) => {
+            let side = p.get(format!("_{name}")).and_then(Value::as_array);
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (item, side.and_then(|s| s.get(i))))
+                .collect()
+        }
+        (node, Some((p, name, index))) => {
+            let side = p.get(format!("_{name}"));
+            let side = match index {
+                Some(i) => side.and_then(Value::as_array).and_then(|s| s.get(i)),
+                None => side.filter(|s| s.is_object()),
+            };
+            // Reached through the sidecar key itself: the value may sit
+            // under the plain name.
+            let value = match (
+                node.is_object() && side.is_some_and(|s| std::ptr::eq(s, node)),
+                index,
+            ) {
+                (true, None) => p.get(name).unwrap_or(&Value::Null),
+                (true, Some(i)) => p
+                    .get(name)
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.get(i))
+                    .unwrap_or(&Value::Null),
+                _ => node,
+            };
+            vec![(value, side)]
+        }
+        (node, None) => vec![(node, None)],
+    };
+    let passes = |value: &Value, side: Option<&Value>| -> bool {
+        let non_id_member = |v: &Value| {
+            v.as_object().is_some_and(|o| {
+                o.iter().any(|(k, v)| {
+                    k != "id"
+                        && k != "fhir_comments"
+                        && !v.is_null()
+                        && !(v.is_array() && v.as_array().is_some_and(|a| a.is_empty()))
+                })
+            })
+        };
+        if ele1 {
+            match value {
+                Value::String(_) | Value::Number(_) | Value::Bool(_) => true,
+                Value::Object(_) => non_id_member(value),
+                // A primitive without a value: its sidecar's extensions are
+                // its children. A sidecar with only an id is reported by the
+                // walk itself (it is an ele-1 failure the typed model never
+                // sees), so it passes here rather than twice.
+                _ => side.is_none_or(|s| {
+                    non_id_member(s) || s.as_object().is_some_and(|o| o.keys().all(|k| k == "id"))
+                }),
+            }
+        } else {
+            let Some(obj) = value.as_object() else {
+                return true;
+            };
+            let has_extension = obj
+                .get("extension")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+            let has_value = obj.keys().any(|k| {
+                let k = k.strip_prefix('_').unwrap_or(k);
+                k.strip_prefix("value")
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+            });
+            has_extension != has_value
+        }
+    };
+    if items.iter().all(|(v, side)| passes(v, *side)) {
+        Some(ConstraintOutcome::Passed)
+    } else {
+        Some(ConstraintOutcome::Failed)
+    }
+}
+
+/// The Bundle and DomainResource invariants (R4 expressions) decided on
+/// the JSON; their FHIRPath navigates whole entries and contained resources
+/// through the typed model, which copies them (bdl-3 alone measured 1.4 ms
+/// on a 9-entry document Bundle).
+fn native_resource_rule(
+    resource: &Value,
+    path: &str,
+    id: &str,
+    expression: &str,
+) -> Option<ConstraintOutcome> {
+    type Rule = fn(&Value) -> bool;
+    fn has(v: &Value, k: &str) -> bool {
+        v.get(k).is_some_and(|x| match x {
+            Value::Null => false,
+            Value::Array(a) => !a.is_empty(),
+            _ => true,
+        })
+    }
+    fn items<'v>(v: &'v Value, k: &str) -> &'v [Value] {
+        v.get(k)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+    fn bundle_type(v: &Value) -> &str {
+        v.get("type").and_then(Value::as_str).unwrap_or_default()
+    }
+    let rule: Rule = match (id, expression) {
+        ("dom-2", "contained.contained.empty()") => {
+            |r| items(r, "contained").iter().all(|c| !has(c, "contained"))
+        }
+        ("dom-4", "contained.meta.versionId.empty() and contained.meta.lastUpdated.empty()") => {
+            |r| {
+                items(r, "contained").iter().all(|c| {
+                    c.get("meta")
+                        .is_none_or(|m| !has(m, "versionId") && !has(m, "lastUpdated"))
+                })
+            }
+        }
+        ("dom-5", "contained.meta.security.empty()") => |r| {
+            items(r, "contained")
+                .iter()
+                .all(|c| c.get("meta").is_none_or(|m| !has(m, "security")))
+        },
+        ("bdl-1", "total.empty() or (type = 'searchset') or (type = 'history')") => {
+            |b| !has(b, "total") || matches!(bundle_type(b), "searchset" | "history")
+        }
+        ("bdl-2", "entry.search.empty() or (type = 'searchset')") => {
+            |b| bundle_type(b) == "searchset" || items(b, "entry").iter().all(|e| !has(e, "search"))
+        }
+        (
+            "bdl-3",
+            "entry.all(request.exists() = (%resource.type = 'batch' or %resource.type = 'transaction' or %resource.type = 'history'))",
+        ) => |b| {
+            let wanted = matches!(bundle_type(b), "batch" | "transaction" | "history");
+            items(b, "entry")
+                .iter()
+                .all(|e| has(e, "request") == wanted)
+        },
+        (
+            "bdl-4",
+            "entry.all(response.exists() = (%resource.type = 'batch-response' or %resource.type = 'transaction-response' or %resource.type = 'history'))",
+        ) => |b| {
+            let wanted = matches!(
+                bundle_type(b),
+                "batch-response" | "transaction-response" | "history"
+            );
+            items(b, "entry")
+                .iter()
+                .all(|e| has(e, "response") == wanted)
+        },
+        ("bdl-5", "resource.exists() or request.exists() or response.exists()") => {
+            |e| has(e, "resource") || has(e, "request") || has(e, "response")
+        }
+        (
+            "bdl-7",
+            "(type = 'history') or entry.where(fullUrl.exists()).select(fullUrl&resource.meta.versionId).isDistinct()",
+        ) => |b| {
+            if bundle_type(b) == "history" {
+                return true;
+            }
+            let mut seen = HashSet::new();
+            items(b, "entry")
+                .iter()
+                .filter_map(|e| e.get("fullUrl").and_then(Value::as_str).map(|f| (f, e)))
+                .all(|(full_url, e)| {
+                    let version = e
+                        .get("resource")
+                        .and_then(|r| r.get("meta"))
+                        .and_then(|m| m.get("versionId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    seen.insert(format!("{full_url}{version}"))
+                })
+        },
+        ("bdl-8", "fullUrl.contains('/_history/').not()") => |e| {
+            e.get("fullUrl")
+                .and_then(Value::as_str)
+                .is_none_or(|f| !f.contains("/_history/"))
+        },
+        _ => return None,
+    };
+    let mut node = resource;
+    for segment in path.split('.').skip(1) {
+        let next = match segment.parse::<usize>() {
+            Ok(index) => node.as_array().and_then(|a| a.get(index)),
+            Err(_) => node.get(segment),
+        };
+        match next {
+            Some(n) => node = n,
+            None => return Some(ConstraintOutcome::Passed),
+        }
+    }
+    // bdl-8 on an entry without fullUrl evaluates to empty (`{}.not()`),
+    // which only the evaluator's empty-result policy can decide.
+    if id == "bdl-8" {
+        let entries: &[Value] = match node {
+            Value::Array(a) => a,
+            other => std::slice::from_ref(other),
+        };
+        if entries.iter().any(|e| e.get("fullUrl").is_none()) {
+            return None;
+        }
+    }
+    let ok = match node {
+        Value::Array(nodes) => nodes.iter().all(rule),
+        Value::Object(_) => rule(node),
+        _ => true,
+    };
+    Some(if ok {
+        ConstraintOutcome::Passed
+    } else {
+        ConstraintOutcome::Failed
+    })
+}
+
+/// ref-1 and the narrative invariants txt-1 / txt-2 (R4 expressions)
+/// decided without FHIRPath. ref-1 needs `%rootResource` (the resource
+/// holding the Reference, or its container when that one is contained), as
+/// the evaluator binds it; a Reference without `reference` evaluates to empty
+/// and is left to the evaluator's empty-result policy.
+fn native_type_rule(
+    resource: &Value,
+    version: FhirVersion,
+    path: &str,
+    id: &str,
+    expression: &str,
+) -> Option<ConstraintOutcome> {
+    const REF_1: &str = "reference.startsWith('#').not() or (reference.substring(1).trace('url') in %rootResource.contained.id.trace('ids'))";
+    let txt = matches!((id, expression), ("txt-1" | "txt-2", "htmlChecks()"));
+    if !(txt || (id == "ref-1" && expression == REF_1)) {
+        return None;
+    }
+    #[cfg(not(feature = "fhirpath"))]
+    if txt {
+        return None;
+    }
+    #[cfg(feature = "R6")]
+    if txt && matches!(version, FhirVersion::R6) {
+        return None; // R6 folds the content rule into txt-1
+    }
+    let _ = version;
+    // Navigate, remembering the resources passed and how each was reached.
+    let mut node = resource;
+    let mut resources: Vec<(&Value, bool)> = vec![(resource, false)];
+    let mut last_key = "";
+    for segment in path.split('.').skip(1) {
+        let next = match segment.parse::<usize>() {
+            Ok(index) => node.as_array().and_then(|a| a.get(index)),
+            Err(_) => {
+                last_key = segment;
+                node.get(segment)
+            }
+        };
+        let Some(next) = next else {
+            return Some(ConstraintOutcome::Passed);
+        };
+        node = next;
+        if node.get("resourceType").and_then(Value::as_str).is_some() {
+            resources.push((node, last_key == "contained"));
+        }
+    }
+    let items: &[Value] = match node {
+        Value::Array(a) => a,
+        other => std::slice::from_ref(other),
+    };
+    if txt {
+        #[cfg(feature = "fhirpath")]
+        {
+            let check: fn(&str) -> bool = if id == "txt-1" {
+                helios_fhirpath::check_html_names
+            } else {
+                helios_fhirpath::check_html_content
+            };
+            // `htmlChecks()` on anything but one xhtml string is false.
+            let ok = items.iter().all(|v| v.as_str().is_some_and(check));
+            return Some(if ok {
+                ConstraintOutcome::Passed
+            } else {
+                ConstraintOutcome::Failed
+            });
+        }
+        #[cfg(not(feature = "fhirpath"))]
+        return None;
+    }
+    // ref-1
+    let at = resources.len() - 1;
+    let root = if resources[at].1 && at > 0 {
+        resources[at - 1].0
+    } else {
+        resources[at].0
+    };
+    let contained: Vec<&str> = root
+        .get("contained")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(Value::as_str))
+        .collect();
+    let mut ok = true;
+    for item in items {
+        match item.get("reference").and_then(Value::as_str) {
+            // No reference, or a bare `#` (`'#'.substring(1)` is empty):
+            // the expression evaluates to empty.
+            None | Some("#") => return None,
+            Some(r) if !r.starts_with('#') => {}
+            Some(r) => ok &= contained.contains(&&r[1..]),
+        }
+    }
+    Some(if ok {
+        ConstraintOutcome::Passed
+    } else {
+        ConstraintOutcome::Failed
+    })
 }
 
 /// Execute the deferred obligations, appending issues to `errors`.
@@ -519,8 +893,20 @@ pub async fn execute_with(
     conformance: Option<Conformance>,
     errors: &mut Vec<ValidationError>,
 ) {
+    let timing = tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::DEBUG);
+    let started = std::time::Instant::now();
     execute_constraints(resource, version, deferred, handlers, conformance, errors).await;
+    let constraints = started.elapsed();
     execute_terminology(resource, deferred, handlers, errors).await;
+    if timing {
+        tracing::debug!(
+            target: "helios_fhir_validator::timing",
+            deferred = deferred.len(),
+            constraints_us = constraints.as_micros() as u64,
+            terminology_us = (started.elapsed() - constraints).as_micros() as u64,
+            "validation effects"
+        );
+    }
 }
 
 async fn execute_constraints(
@@ -575,10 +961,20 @@ async fn execute_constraints(
         return;
     }
 
+    // ele-1 and ext-1 sit on almost every element; they are decided on the
+    // JSON directly (same semantics as their FHIRPath, see `native_outcome`),
+    // which keeps them off the FHIRPath engine — on a document Bundle they
+    // are most of the invariants evaluated.
+    let native: Vec<Option<ConstraintOutcome>> = selected
+        .iter()
+        .map(|(path, id, expression, ..)| native_outcome(resource, version, path, id, expression))
+        .collect();
     let refs: Vec<DeferredConstraint<'_>> = selected
         .iter()
+        .zip(&native)
+        .filter(|(_, n)| n.is_none())
         .map(
-            |(path, id, expression, _, _, own_resource)| DeferredConstraint {
+            |((path, id, expression, _, _, own_resource), _)| DeferredConstraint {
                 path,
                 id,
                 expression,
@@ -588,7 +984,9 @@ async fn execute_constraints(
         .collect();
     let wants_conformance =
         conformance.is_some() && refs.iter().any(|c| c.expression.contains("conformsTo("));
-    let outcomes = if let Some(tx) = handlers.terminology
+    let evaluated = if refs.is_empty() {
+        Vec::new()
+    } else if let Some(tx) = handlers.terminology
         && refs.iter().any(|c| c.expression.contains("memberOf("))
     {
         // Two passes: the first records the memberOf() questions, the
@@ -597,7 +995,9 @@ async fn execute_constraints(
             conformance: conformance.clone(),
             ..Default::default()
         });
-        let outcomes = evaluator.evaluate_all_with_members(resource, version, &refs, &first);
+        let outcomes = crate::engine::on_large_stack(|| {
+            evaluator.evaluate_all_with_members(resource, version, &refs, &first)
+        });
         let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
         if asked.is_empty() {
             outcomes
@@ -616,18 +1016,44 @@ async fn execute_constraints(
                 missed: Mutex::default(),
                 conformance,
             });
-            evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+            crate::engine::on_large_stack(|| {
+                evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+            })
         }
     } else if wants_conformance {
         let answers = Arc::new(MemberOfAnswers {
             conformance,
             ..Default::default()
         });
-        evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
+        crate::engine::on_large_stack(|| {
+            evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
+        })
     } else {
-        evaluator.evaluate_all(resource, version, &refs)
+        crate::engine::on_large_stack(|| evaluator.evaluate_all(resource, version, &refs))
     };
-    debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
+    debug_assert_eq!(evaluated.len(), refs.len(), "evaluator must align outcomes");
+    // A resource that does not parse into the typed model leaves every
+    // FHIRPath invariant not evaluable for the same reason; the natively
+    // decided ones follow, so the report collapses to one issue as before.
+    let parse_failure = match evaluated.first() {
+        Some(ConstraintOutcome::NotEvaluable(first))
+            if evaluated
+                .iter()
+                .all(|o| matches!(o, ConstraintOutcome::NotEvaluable(d) if d == first)) =>
+        {
+            Some(first.clone())
+        }
+        _ => None,
+    };
+    let mut evaluated = evaluated.into_iter();
+    let outcomes: Vec<ConstraintOutcome> = native
+        .into_iter()
+        .map(|n| match (n, &parse_failure) {
+            (Some(_), Some(detail)) => ConstraintOutcome::NotEvaluable(detail.clone()),
+            (Some(outcome), None) => outcome,
+            (None, _) => evaluated.next().unwrap_or(ConstraintOutcome::Passed),
+        })
+        .collect();
 
     // When nothing could be evaluated for the same reason (the resource does
     // not parse into the typed model — its structural errors are already on

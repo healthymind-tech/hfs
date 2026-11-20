@@ -271,6 +271,10 @@ mod contains_function;
 mod conversion_functions;
 mod format_functions;
 mod html_checks;
+/// The narrative rules behind `htmlChecks()` (txt-1) and `htmlChecks2()`
+/// (txt-2), for callers that decide those invariants without evaluating
+/// FHIRPath (helios-fhir-validator).
+pub use html_checks::{check_html_content, check_html_names};
 mod interval_functions;
 mod json_utils;
 pub mod ucum;

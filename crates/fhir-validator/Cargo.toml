@@ -47,8 +47,15 @@ roxmltree = { version = "0.20", optional = true }
 # Attachment.data checks (base64 validity, SHA-1 hash).
 base64 = "0.22"
 sha1 = "0.10"
+# Bundle.signature (JWS) verification: RSA / ECDSA with keys from X.509
+# certificates or JWKs (already in the dependency tree via rustls).
+ring = "0.17"
+# Per-stage validation timings (debug level, target helios_fhir_validator::timing).
+tracing = "0.1"
 
 [dev-dependencies]
+# tests/bench_document.rs: BENCH_TRACE=<filter> prints the timing spans.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }

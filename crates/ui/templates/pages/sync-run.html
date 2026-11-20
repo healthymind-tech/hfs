@@ -1,0 +1,11 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("sync-run") }} — {{ job_name }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+{% call ui::page_header(i18n.t("sync-run"), job_name) %}
+  <a class="btn" href="/ui/sync/{{ job_id }}">{{ job_name }}</a>
+{% endcall %}
+{# Server-rendered by the same template the htmx poll answers with. #}
+{{ fragment_html|safe }}
+{% endblock %}

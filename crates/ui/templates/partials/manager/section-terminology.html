@@ -1,0 +1,23 @@
+{% call ui::form_section("sec-terminology", i18n.t("mgr-sec-terminology"), i18n.t("mgr-sec-terminology-desc")) %}
+  {% call ui::inherit_toggle("term_inherit", v.term_inherit, "term-fields", i18n.t_arg("mgr-inherit-terminology", "url", env.terminology_server.clone())) %}{% endcall %}
+  <fieldset class="inherit-target" id="term-fields"{% if v.term_inherit %} disabled{% endif %}>
+    <legend class="visually-hidden">{{ i18n.t("mgr-sec-terminology") }}</legend>
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("mgr-term-server"), "term_server_url", v.term_server_url, self.err("terminology.serverUrl"), i18n.t("mgr-term-server-hint"), "url", false, "http://hts:8090", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-term-public"), "term_public_url", v.term_public_url, self.err("terminology.publicUrl"), i18n.t("mgr-term-public-hint"), "url", false, "/ui/hts", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-term-timeout"), "term_timeout", v.term_timeout, self.err("terminology.timeoutSecs"), i18n.t("mgr-term-timeout-hint"), "number") %}{% endcall %}
+    </div>
+    {% call ui::secret_field(i18n.t("mgr-term-token"), "term_token", v.term_token_set, i18n.t("mgr-term-token-hint")) %}{% endcall %}
+    {% if self.bad("terminology.token") %}<p class="mfield__error">{{ self.err("terminology.token") }}</p>{% endif %}
+  </fieldset>
+{% endcall %}
+
+<section class="card form-section" aria-labelledby="sec-hts-title">
+  <header class="form-section__head">
+    <h2 class="form-section__title" id="sec-hts-title">{{ i18n.t("mgr-sec-hts") }}</h2>
+    <p class="form-section__desc">{{ i18n.t("mgr-sec-hts-desc") }}</p>
+  </header>
+  <div class="form-section__body form-section__body--row">
+    <a class="btn" href="/ui/hts">{% call ui::icon("book") %}{% endcall %}{{ i18n.t("mgr-open-hts") }}</a>
+  </div>
+</section>

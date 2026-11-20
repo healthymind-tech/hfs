@@ -361,6 +361,19 @@ impl SqliteBackend {
             if enable_foreign_keys {
                 conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             }
+            // In-memory databases are shared through `cache=shared`, where
+            // SQLite locks whole tables: a reader meeting another
+            // connection's write lock fails at once with SQLITE_LOCKED
+            // ("database table is locked"), and `busy_timeout` does not
+            // cover shared-cache locks. Readers in read-uncommitted mode take
+            // no table read locks, so they neither fail against an open write
+            // transaction nor block writers. The price is that they may see
+            // that transaction's uncommitted rows; read isolation is only
+            // guaranteed on file-backed (WAL) databases, as before — where
+            // in-memory readers used to get an error instead.
+            if is_memory {
+                conn.execute_batch("PRAGMA read_uncommitted = true;")?;
+            }
             // 64 MiB page cache (negative = KiB). SQLite's 2 MiB default
             // thrashes once the search_index B-trees outgrow it: during a
             // bulk import every index INSERT and batch commit evicts and
@@ -1309,3 +1322,7 @@ mod tests {
         assert!(SqliteBackend::modifiers_for_type(SearchParamType::Special).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "backend_hm_tests.rs"]
+mod hm_tests;

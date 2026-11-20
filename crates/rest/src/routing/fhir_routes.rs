@@ -172,7 +172,18 @@ where
 }
 
 /// Strips tenant prefix from request URL and stores it in extensions.
+///
+/// A request the endpoint dispatcher already routed to a named endpoint is
+/// left alone: its prefix was the endpoint's, and a named endpoint never
+/// re-strips a second segment as a tenant (design §4.4).
 fn strip_tenant_prefix(mut request: Request<Body>) -> Request<Body> {
+    if request
+        .extensions()
+        .get::<helios_endpoints::ResolvedEndpoint>()
+        .is_some_and(|r| !r.is_default())
+    {
+        return request;
+    }
     let path = request.uri().path().to_string();
 
     // Use the default FHIR version for resource type checking

@@ -74,6 +74,7 @@ pub async fn capabilities_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    effective_auth: Option<axum::Extension<std::sync::Arc<crate::endpoint::EffectiveAuth>>>,
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
@@ -97,8 +98,24 @@ where
 
     let base_url = state.public_base_url_for_request(&tenant);
 
-    let capability_statement =
+    let mut capability_statement =
         build_capability_statement(&state, tenant.context(), fhir_version, &base_url);
+
+    // An endpoint with its own auth section (FHIR server manager P2)
+    // describes its own IdP in `rest.security`, SMART endpoints it leaves
+    // unset discovered from its issuer (the statement above only knows the
+    // configured ones). The `cors` flag stays the one computed above.
+    if let Some(axum::Extension(auth)) = effective_auth
+        && !auth.inherited
+        && let Some(rest) = capability_statement
+            .get_mut("rest")
+            .and_then(|r| r.get_mut(0))
+    {
+        let cors = rest["security"]["cors"]
+            .as_bool()
+            .unwrap_or(state.config().enable_cors);
+        rest["security"] = auth.capability_security(cors).await;
+    }
 
     // Negotiate response format
     let negotiated = negotiate_format(&req_headers, None);
@@ -117,6 +134,16 @@ where
         &capability_statement,
         negotiated.format,
     )
+}
+
+/// The SMART endpoints advertised in `rest.security` (`oauth-uris`).
+struct SmartUris {
+    authorize: String,
+    token: String,
+    introspect: Option<String>,
+    revoke: Option<String>,
+    register: Option<String>,
+    manage: Option<String>,
 }
 
 /// Builds a CapabilityStatement describing server capabilities for a specific FHIR version.
@@ -240,15 +267,58 @@ where
     // *and* both required oauth-uris (authorize, token) are configured — a plain
     // bearer deployment with no SMART endpoints is not SMART-on-FHIR and stays
     // `cors`-only rather than publishing an incomplete profile.
+    //
+    // FHIR server manager: an endpoint with its own `auth` section advertises
+    // its own SMART endpoints (and nothing while its auth is off), and its own
+    // `cors` section decides the `cors` flag; inherited sections keep the
+    // server-wide behaviour above.
+    let effective = crate::endpoint::EffectiveConfig::current();
+    let cors_enabled = effective
+        .cors
+        .as_ref()
+        .map_or(state.config().enable_cors, |c| c.enabled);
     let mut security = serde_json::json!({
-        "cors": state.config().enable_cors,
+        "cors": cors_enabled,
         "description": "This server supports CORS for cross-origin requests"
     });
-    let auth = state.auth_config();
-    if auth.enabled
-        && auth.smart_authorize_endpoint.is_some()
-        && auth.smart_token_endpoint.is_some()
+    let smart_uris = match effective
+        .endpoint
+        .as_ref()
+        .and_then(|e| e.spec.auth.as_ref())
     {
+        Some(endpoint_auth) => (endpoint_auth.mode != helios_endpoints::AuthMode::Off)
+            .then(|| {
+                let smart = &endpoint_auth.smart;
+                Some(SmartUris {
+                    authorize: smart.authorization_endpoint.clone()?,
+                    token: smart.token_endpoint.clone()?,
+                    introspect: smart.introspection_endpoint.clone(),
+                    revoke: smart.revocation_endpoint.clone(),
+                    register: smart.registration_endpoint.clone(),
+                    manage: smart.management_endpoint.clone(),
+                })
+            })
+            .flatten(),
+        None => {
+            let auth = state.auth_config();
+            match (
+                auth.enabled,
+                &auth.smart_authorize_endpoint,
+                &auth.smart_token_endpoint,
+            ) {
+                (true, Some(authorize), Some(token)) => Some(SmartUris {
+                    authorize: authorize.clone(),
+                    token: token.clone(),
+                    introspect: auth.smart_introspection_endpoint.clone(),
+                    revoke: auth.smart_revocation_endpoint.clone(),
+                    register: auth.smart_registration_endpoint.clone(),
+                    manage: auth.smart_management_endpoint.clone(),
+                }),
+                _ => None,
+            }
+        }
+    };
+    if let Some(uris) = smart_uris {
         security["service"] = serde_json::json!([{
             "coding": [{
                 "system": "http://terminology.hl7.org/CodeSystem/restful-security-service",
@@ -259,29 +329,21 @@ where
         }]);
 
         // `oauth-uris` sub-extensions, in SMART's documented order. `authorize`
-        // and `token` are always present here (guarded above); the rest are
-        // added only when configured.
+        // and `token` are always present; the rest are added only when
+        // configured.
         let mut oauth_uris = vec![
-            serde_json::json!({
-                "url": "authorize",
-                "valueUri": auth.smart_authorize_endpoint.as_deref().unwrap()
-            }),
-            serde_json::json!({
-                "url": "token",
-                "valueUri": auth.smart_token_endpoint.as_deref().unwrap()
-            }),
+            serde_json::json!({ "url": "authorize", "valueUri": uris.authorize }),
+            serde_json::json!({ "url": "token", "valueUri": uris.token }),
         ];
-        if let Some(uri) = auth.smart_introspection_endpoint.as_deref() {
-            oauth_uris.push(serde_json::json!({ "url": "introspect", "valueUri": uri }));
-        }
-        if let Some(uri) = auth.smart_revocation_endpoint.as_deref() {
-            oauth_uris.push(serde_json::json!({ "url": "revoke", "valueUri": uri }));
-        }
-        if let Some(uri) = auth.smart_registration_endpoint.as_deref() {
-            oauth_uris.push(serde_json::json!({ "url": "register", "valueUri": uri }));
-        }
-        if let Some(uri) = auth.smart_management_endpoint.as_deref() {
-            oauth_uris.push(serde_json::json!({ "url": "manage", "valueUri": uri }));
+        for (name, uri) in [
+            ("introspect", uris.introspect),
+            ("revoke", uris.revoke),
+            ("register", uris.register),
+            ("manage", uris.manage),
+        ] {
+            if let Some(uri) = uri {
+                oauth_uris.push(serde_json::json!({ "url": name, "valueUri": uri }));
+            }
         }
         security["extension"] = serde_json::json!([{
             "url": "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris",

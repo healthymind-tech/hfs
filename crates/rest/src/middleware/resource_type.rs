@@ -66,10 +66,16 @@ where
         return next.run(request).await;
     };
 
+    // The request's endpoint release (FHIR server manager) is its default.
     let version = effective_version(
         request.method(),
         request.headers(),
-        state.config().default_fhir_version,
+        crate::endpoint::effective_fhir_version(
+            request
+                .extensions()
+                .get::<helios_endpoints::ResolvedEndpoint>(),
+            state.config().default_fhir_version,
+        ),
     );
     if is_valid_resource_type_for_version(&resource_type, version) {
         return next.run(request).await;

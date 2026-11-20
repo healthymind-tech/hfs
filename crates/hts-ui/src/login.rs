@@ -55,10 +55,67 @@ pub(crate) fn signed_in() -> Option<String> {
     SIGNED_IN.try_with(|user| user.clone()).ok().flatten()
 }
 
+/// `HTS_CONSOLE_REQUIRE_LOGIN` (FHIR server manager P3, design §7.2): when
+/// on, **all** of `/ui/hts` needs the administrator session, so the visible
+/// console has no public area while the HFS console runs in mode `oidc` or
+/// `local`. Default: on when `HFS_CONSOLE_AUTH_MODE` (if HTS shares that
+/// environment) is `oidc` or `local`, else off — today's behaviour.
+pub(crate) fn require_login() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        require_login_from(
+            std::env::var("HTS_CONSOLE_REQUIRE_LOGIN").ok().as_deref(),
+            std::env::var("HFS_CONSOLE_AUTH_MODE").ok().as_deref(),
+        )
+    })
+}
+
+fn require_login_from(explicit: Option<&str>, hfs_mode: Option<&str>) -> bool {
+    match explicit.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if !v.is_empty() => matches!(v.as_str(), "true" | "1" | "yes" | "on"),
+        _ => matches!(
+            hfs_mode.map(|m| m.trim().to_ascii_lowercase()).as_deref(),
+            Some("oidc" | "local")
+        ),
+    }
+}
+
+/// The gate the console applies: with [`require_login`] on, a gate that
+/// would be open (no password, administration off) is locked instead — the
+/// console never runs open when it was asked to require a sign-in.
+pub fn effective_gate(gate: AdminGate) -> AdminGate {
+    effective_gate_with(gate, require_login())
+}
+
+fn effective_gate_with(gate: AdminGate, require: bool) -> AdminGate {
+    match gate {
+        AdminGate::Open if require => {
+            tracing::warn!(
+                "HTS_CONSOLE_REQUIRE_LOGIN is on but HTS_ADMIN_PASSWORD is not set: the \
+                 terminology console refuses every page (503) until it is"
+            );
+            AdminGate::Locked(Arc::from(
+                "the terminology console requires sign-in: set HTS_ADMIN_PASSWORD or \
+                 HTS_ADMIN_PASSWORD_FILE",
+            ))
+        }
+        other => other,
+    }
+}
+
 /// Paths (inside the `/ui` mount) that need the administrator.
 pub(crate) fn protects(method: &Method, path: &str) -> bool {
+    protects_with(require_login(), method, path)
+}
+
+fn protects_with(require_login: bool, method: &Method, path: &str) -> bool {
     if under(path, "/hts/api/admin") {
         return false;
+    }
+    if require_login {
+        return !["/hts/login", "/hts/logout", "/hts/assets"]
+            .iter()
+            .any(|prefix| under(path, prefix));
     }
     if ["/hts/terminology", "/hts/jobs", "/hts/import"]
         .iter()
@@ -289,6 +346,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn require_login_protects_everything_but_the_sign_in() {
+        let get = Method::GET;
+        for path in [
+            "/hts",
+            "/hts/code-systems",
+            "/hts/value-sets/x",
+            "/hts/capability-statement",
+        ] {
+            assert!(protects_with(true, &get, path), "{path}");
+            assert!(!protects_with(false, &get, path), "{path}");
+        }
+        for path in ["/hts/login", "/hts/assets/app.css", "/hts/api/admin/jobs"] {
+            assert!(!protects_with(true, &get, path), "{path}");
+        }
+        assert!(!protects_with(true, &Method::POST, "/hts/logout"));
+        assert!(require_login_from(Some("true"), None));
+        assert!(!require_login_from(Some("false"), Some("local")));
+        assert!(require_login_from(None, Some("oidc")));
+        assert!(require_login_from(Some(""), Some("LOCAL")));
+        assert!(!require_login_from(None, Some("none")));
+        assert!(!require_login_from(None, None));
+        assert!(effective_gate_with(AdminGate::Open, true).is_locked());
+        assert!(matches!(
+            effective_gate_with(AdminGate::Open, false),
+            AdminGate::Open
+        ));
+    }
+
+    #[test]
     fn management_pages_and_writes_are_protected() {
         let get = Method::GET;
         let post = Method::POST;
@@ -300,7 +386,7 @@ mod tests {
             "/hts/import",
             "/hts/import/registry",
         ] {
-            assert!(protects(&get, path), "{path}");
+            assert!(protects_with(false, &get, path), "{path}");
         }
         for path in [
             "/hts/terminology/compact",
@@ -308,7 +394,7 @@ mod tests {
             "/hts/import/job",
             "/hts/whatever",
         ] {
-            assert!(protects(&post, path), "{path}");
+            assert!(protects_with(false, &post, path), "{path}");
         }
         for path in [
             "/hts",
@@ -317,7 +403,7 @@ mod tests {
             "/hts/concepts",
             "/hts/login",
         ] {
-            assert!(!protects(&get, path), "{path}");
+            assert!(!protects_with(false, &get, path), "{path}");
         }
         for path in [
             "/hts/code-systems/x/lookup",
@@ -328,7 +414,7 @@ mod tests {
             "/hts/logout",
             "/hts/api/admin/imports",
         ] {
-            assert!(!protects(&post, path), "{path}");
+            assert!(!protects_with(false, &post, path), "{path}");
         }
     }
 }

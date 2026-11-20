@@ -194,6 +194,8 @@ pub fn router_with_admin(
     admin: Option<Router>,
     gate: helios_admin_auth::AdminGate,
 ) -> Router {
+    // HTS_CONSOLE_REQUIRE_LOGIN (P3): never open when sign-in is required.
+    let gate = login::effective_gate(gate);
     let base = match admin {
         Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
         None => Router::new(),
@@ -354,6 +356,36 @@ impl Chrome<'_> {
     /// The inline first-paint theme stamp for `<head>` (shared with HFS).
     pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
         helios_ui_chrome::theme_boot()
+    }
+
+    fn brand_links<'b>(&self, version: &'b str) -> helios_ui_chrome::BrandLinks<'b> {
+        helios_ui_chrome::BrandLinks {
+            home: helios_ui_chrome::HTS_CONSOLE_PATH,
+            assets: "/ui/hts/assets",
+            title_key: "hts-app-title",
+            product_line_key: "hts-app-product-line",
+            version,
+            home_key: "hts-nav-home",
+        }
+    }
+
+    /// The HealthyMind sidebar brand, shared with HFS (design §10.2).
+    pub(crate) fn brand(&self) -> Result<String, askama::Error> {
+        let version = format!("hts v{}", self.version);
+        helios_ui_chrome::brand(&self.i18n, self.brand_links(&version))
+    }
+
+    /// Favicon / app-icon links for `<head>`, shared with HFS.
+    pub(crate) fn brand_head(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::brand_head("/ui/hts/assets")
+    }
+
+    /// The attribution footer, shared with HFS; links HFS's About page when
+    /// an HFS console shares this origin.
+    pub(crate) fn site_footer(&self) -> Result<String, askama::Error> {
+        let version = format!("hts v{}", self.version);
+        let about = if hfs_console_known() { "/ui/about" } else { "" };
+        helios_ui_chrome::site_footer(&self.i18n, self.brand_links(&version), about)
     }
 }
 

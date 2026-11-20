@@ -1,0 +1,16 @@
+{# The save bar's "Review changes" fragment. #}
+<div class="diff-preview">
+  {% if !errors.is_empty() %}
+  <p class="diff-preview__error" role="alert">{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}</p>
+  <ul class="diff-preview__errors">{% for (field, msg) in errors %}<li><code>{{ field }}</code> {{ msg }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if rows.is_empty() %}
+  <p class="muted">{{ i18n.t("mgr-diff-none") }}</p>
+  {% else %}
+  <p class="diff-preview__title">{{ i18n.t_arg("mgr-changed-fields", "count", rows.len()) }}</p>
+  <ul class="diff-preview__list">
+    {% for d in rows %}<li><code>{{ d.path }}</code>: <del>{{ d.before }}</del> → <ins>{{ d.after }}</ins></li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% for w in warnings %}<p class="diff-preview__warn">{{ i18n.t(w) }}</p>{% endfor %}
+</div>

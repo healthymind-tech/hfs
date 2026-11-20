@@ -38,10 +38,14 @@ pub mod principal;
 pub mod provider;
 pub mod scope;
 pub mod session;
+pub mod verifier_cache;
 
 // Re-export commonly used types
 pub use config::{AuthConfig, AuthMode, DEFAULT_PATIENT_SHARED_TYPES, NonCompartmentPolicy};
-pub use discovery::SmartConfiguration;
+pub use discovery::{
+    EndpointAuthProbe, IssuerDiscovery, OidcMetadata, OutboundGuard, ProbeCheck, ProbeReport,
+    ProbeStep, SmartConfiguration,
+};
 pub use error::{AuthError, FhirOperation};
 pub use jwks::JwksCache;
 pub use outbound::{
@@ -53,7 +57,9 @@ pub use principal::{LaunchContext, Principal};
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};
 pub use scope::{Access, Grant, ScopeSet, SmartPermissions};
 pub use session::{
-    AccessOutcome, LoginConfig, PENDING_COOKIE, PersistedPending, PersistedSession, SESSION_COOKIE,
-    SaveOutcome, Session, SessionPersistence, SessionPrincipal, SessionStore, cookie_value,
-    discover_endpoints, is_cross_site, store_timestamp,
+    AccessOutcome, LoginConfig, OidcCodeClient, OidcEndpoints, OidcTokens, PENDING_COOKIE,
+    PersistedPending, PersistedSession, SESSION_COOKIE, SaveOutcome, Session, SessionPersistence,
+    SessionPrincipal, SessionStore, check_id_claims, code_challenge_s256, cookie_value,
+    discover_endpoints, discover_with, is_cross_site, random_token, store_timestamp,
 };
+pub use verifier_cache::{VerifierCache, VerifierKey};

@@ -1,0 +1,120 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+
+{#
+  Endpoint home (design §10.3): identity header with quick actions, KPI
+  tiles, configuration at a glance, top resource types, recent activity
+  (audit + configuration changes), sync jobs, warnings.
+#}
+
+{% block title %}{{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+
+{% block content %}
+{% call ui::ep_head(head, head.display_name.clone(), true, can_admin) %}{% endcall %}
+
+{% for w in warnings %}
+<div class="notice {% if w.starts_with("mgr-warn") %}notice--warn{% else %}notice--info{% endif %}">{% if w.starts_with("mgr-warn") %}{% call ui::icon("alert") %}{% endcall %}{% else %}{% call ui::icon("info") %}{% endcall %}{% endif %}<span>{{ i18n.t(w) }}</span></div>
+{% endfor %}
+
+<section class="kpi-grid" aria-label="{{ i18n.t("mgr-kpi-title") }}">
+  <a class="card kpi" href="/ui/e/{{ head.name }}/data/resources">
+    <span class="kpi__label">{{ i18n.t("mgr-stat-resources") }}</span>
+    <span class="kpi__value">{% if let Some(n) = resources %}{{ i18n.num(n) }}{% else %}—{% endif %}</span>
+    <span class="kpi__sub">{% if let Some(t) = types %}{{ i18n.t_arg("mgr-kpi-types", "count", t.clone()) }}{% else %}{{ i18n.t("mgr-kpi-pending") }}{% endif %}</span>
+  </a>
+  <a class="card kpi" href="/ui/e/{{ head.name }}/data/bulk-export">
+    <span class="kpi__label">{{ i18n.t("mgr-kpi-export") }}</span>
+    <span class="kpi__value">{% if let Some(n) = export_jobs %}{{ i18n.num(n) }}{% else %}—{% endif %}</span>
+    <span class="kpi__sub">{{ i18n.t("mgr-kpi-active") }}</span>
+  </a>
+  <a class="card kpi" href="/ui/e/{{ head.name }}/data/bulk-import">
+    <span class="kpi__label">{{ i18n.t("mgr-kpi-import") }}</span>
+    <span class="kpi__value">{% if let Some(n) = import_jobs %}{{ i18n.num(n) }}{% else %}—{% endif %}</span>
+    <span class="kpi__sub">{{ i18n.t("mgr-kpi-active") }}</span>
+  </a>
+  <a class="card kpi" href="{{ data_href }}">
+    <span class="kpi__label">{{ i18n.t("mgr-kpi-dashboard") }}</span>
+    <span class="kpi__value kpi__value--icon">{% call ui::icon("activity") %}{% endcall %}</span>
+    <span class="kpi__sub">{{ i18n.t("mgr-kpi-dashboard-sub") }}</span>
+  </a>
+</section>
+
+<div class="ep-home-grid">
+  <section class="card" aria-labelledby="cfg-title">
+    <div class="card-head"><h2 id="cfg-title">{{ i18n.t("mgr-home-config") }}</h2><a class="btn btn--small" href="/ui/e/{{ head.name }}/config">{{ i18n.t("mgr-action-edit") }}</a></div>
+    <dl class="summary-list">
+      {% for row in summary %}
+      <div class="summary-list__row">
+        <dt>{{ i18n.t(row.label_key) }}</dt>
+        <dd>
+          <a href="{{ row.href }}">{% if !row.value_key.is_empty() %}{{ i18n.t(row.value_key) }}{% endif %}{% if !row.value.is_empty() %} <span class="summary-list__mono">{{ row.value }}</span>{% endif %}{% if row.value_key.is_empty() && row.value.is_empty() %}{{ i18n.t("mgr-server-default") }}{% endif %}</a>
+          {% if row.inherited %}<span class="status-pill status-pill--muted status-pill--sm">{% call ui::icon("server") %}{% endcall %}<span>{{ i18n.t("mgr-inherited-short") }}</span></span>{% endif %}
+        </dd>
+      </div>
+      {% endfor %}
+    </dl>
+  </section>
+
+  <section class="card" aria-labelledby="types-title">
+    <div class="card-head"><h2 id="types-title">{{ i18n.t("mgr-home-types") }}</h2></div>
+    {% if top_types.is_empty() %}
+    <div class="card__body"><p class="muted">{{ i18n.t("mgr-home-types-empty") }}</p></div>
+    {% else %}
+    <ul class="bar-list" role="list">
+      {% for t in top_types %}
+      <li class="bar-list__row">
+        <a class="bar-list__name" href="{{ t.href }}">{{ t.name }}</a>
+        <span class="bar-list__track" aria-hidden="true"><span class="bar-list__bar" style="width: {{ t.percent }}%"></span></span>
+        <span class="bar-list__value">{{ i18n.num(t.total) }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="audit-title">
+    <div class="card-head"><h2 id="audit-title">{{ i18n.t("mgr-home-activity") }}</h2><a class="btn btn--small" href="/ui/e/{{ head.name }}/audit">{{ i18n.t("mgr-action-view-all") }}</a></div>
+    {% if audit_error %}
+    <div class="card__body"><p class="muted">{{ i18n.t("mgr-audit-unavailable") }}</p></div>
+    {% else if audit.is_empty() %}
+    <div class="card__body"><p class="muted">{{ i18n.t("mgr-audit-empty") }}</p></div>
+    {% else %}
+    <ul class="activity-list" role="list">
+      {% for a in audit %}
+      <li class="activity-list__row">
+        <span class="activity-list__dot activity-list__dot--{% if a.outcome_ok %}ok{% else %}danger{% endif %}" aria-hidden="true"></span>
+        <span class="activity-list__main"><strong>{{ a.kind }}</strong> {{ a.what }}<span class="visually-hidden">{% if a.outcome_ok %}{{ i18n.t("mgr-outcome-ok") }}{% else %}{{ i18n.t("mgr-outcome-failed") }}{% endif %}</span></span>
+        <span class="activity-list__meta">{{ a.agent }} · <time>{{ a.at }}</time></span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="rev-title">
+    <div class="card-head"><h2 id="rev-title">{{ i18n.t("mgr-home-changes") }}</h2><a class="btn btn--small" href="/ui/e/{{ head.name }}/history">{{ i18n.t("mgr-action-view-all") }}</a></div>
+    {% if revisions.is_empty() %}
+    <div class="card__body"><p class="muted">{{ i18n.t("mgr-history-empty") }}</p></div>
+    {% else %}
+    <ul class="activity-list" role="list">
+      {% for r in revisions %}
+      <li class="activity-list__row">
+        <span class="activity-list__dot activity-list__dot--info" aria-hidden="true"></span>
+        <span class="activity-list__main"><strong>{{ i18n.t(r.change_key) }}</strong> r{{ r.revision }}{% if !r.diff.is_empty() %} · {{ i18n.t_arg("mgr-changed-fields", "count", r.diff.len()) }}{% endif %}</span>
+        <span class="activity-list__meta">{{ r.by }} · <time>{{ r.at }}</time></span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="card ep-home-grid__wide" aria-labelledby="sync-title">
+    <div class="card-head"><h2 id="sync-title">{{ i18n.t("mgr-nav-sync") }}</h2><a class="btn btn--small" href="/ui/e/{{ head.name }}/sync">{{ i18n.t("mgr-action-view-all") }}</a></div>
+    {% if sync_rows.is_empty() %}
+    <div class="card__body"><p class="muted">{% if sync_available %}{{ i18n.t("mgr-sync-none") }}{% else %}{{ i18n.t("mgr-sync-unavailable") }}{% endif %}</p></div>
+    {% else %}
+    {% include "partials/manager/sync-table.html" %}
+    {% endif %}
+  </section>
+</div>
+{% endblock %}
