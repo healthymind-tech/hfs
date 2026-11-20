@@ -10,7 +10,7 @@
       <p class="muted">{% if head.enabled %}{{ i18n.t("mgr-danger-disable-desc") }}{% else %}{{ i18n.t("mgr-danger-enable-desc") }}{% endif %}</p>
     </div>
     <form method="post" action="/ui/e/{{ head.name }}/status">
-      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
       <input type="hidden" name="revision" value="{{ head.revision }}">
       <input type="hidden" name="back" value="/ui/e/{{ head.name }}/config">
       {% if head.enabled %}
@@ -28,7 +28,7 @@
       <p class="muted">{{ i18n.t("mgr-danger-delete-desc") }}</p>
     </div>
     <form method="post" action="/ui/e/{{ head.name }}/status" class="danger-zone__confirm" data-typed-confirm="{{ head.name }}">
-      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
       <input type="hidden" name="revision" value="{{ head.revision }}">
       <input type="hidden" name="action" value="delete">
       <label class="mfield__label" for="f-confirm">{{ i18n.t_arg("mgr-danger-type-name", "endpoint", head.name.clone()) }}</label>

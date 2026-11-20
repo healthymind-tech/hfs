@@ -11,7 +11,7 @@
 <div class="notice notice--info">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t("mgr-locked-role") }}</span></div>
 {% else %}
 <form method="post" action="/ui/e/{{ head.name }}/duplicate" class="config-form" novalidate>
-  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   {% call ui::form_section("dup-target", i18n.t("mgr-dup-target"), i18n.t("mgr-dup-target-desc")) %}
     <div class="form-grid">
       {% call ui::field_text(i18n.t("mgr-field-name"), "name", suggested, self.err("name"), i18n.t("mgr-field-name-rules"), "text", true, "", false, true) %}{% endcall %}

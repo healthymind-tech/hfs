@@ -415,3 +415,6 @@ mgr-about-licenses = 開放原始碼元件
 mgr-about-component = 元件
 mgr-about-license = 授權
 mgr-updated-at = 最後變更於 { $at }
+mgr-nav-settings-auth = 主控台登入
+mgr-nav-settings-users = 使用者與角色
+mgr-nav-account = 我的帳號

@@ -48,7 +48,7 @@
         <dt>{{ i18n.t(row.label_key) }}</dt>
         <dd>
           <a href="{{ row.href }}">{% if !row.value_key.is_empty() %}{{ i18n.t(row.value_key) }}{% endif %}{% if !row.value.is_empty() %} <span class="summary-list__mono">{{ row.value }}</span>{% endif %}{% if row.value_key.is_empty() && row.value.is_empty() %}{{ i18n.t("mgr-server-default") }}{% endif %}</a>
-          {% if row.inherited %}<span class="pill pill--muted pill--sm">{% call ui::icon("server") %}{% endcall %}<span>{{ i18n.t("mgr-inherited-short") }}</span></span>{% endif %}
+          {% if row.inherited %}<span class="status-pill status-pill--muted status-pill--sm">{% call ui::icon("server") %}{% endcall %}<span>{{ i18n.t("mgr-inherited-short") }}</span></span>{% endif %}
         </dd>
       </div>
       {% endfor %}

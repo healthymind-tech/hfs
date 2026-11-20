@@ -194,7 +194,7 @@ async fn overview_lists_endpoints_with_badges_and_filters() {
         "env=test",
         r#"href="/ui/endpoints/new""#,
         "health-strip",
-        "pill--muted",
+        "status-pill--muted",
     ] {
         assert!(html.contains(needle), "overview lacks {needle}");
     }

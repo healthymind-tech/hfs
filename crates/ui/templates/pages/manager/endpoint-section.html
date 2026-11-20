@@ -42,7 +42,7 @@
 {% endfor %}
 
 <form method="post" action="/ui/e/{{ head.name }}/{{ section }}" class="config-form" id="config-form" novalidate data-unsaved-form>
-  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   <input type="hidden" name="revision" value="{{ revision }}">
   <fieldset class="config-form__fields"{% if !can_edit %} disabled{% endif %}>
     <legend class="visually-hidden">{{ i18n.t(title_key) }}</legend>

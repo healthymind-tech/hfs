@@ -9995,7 +9995,7 @@ body.app-shell .pane {
 }
 
 /* Status / mode pill: icon + text, never colour alone. */
-.pill {
+.status-pill {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -10009,26 +10009,26 @@ body.app-shell .pane {
   white-space: nowrap;
 }
 
-.pill svg {
+.status-pill svg {
   width: 13px;
   height: 13px;
   flex: none;
 }
 
-.pill--sm {
+.status-pill--sm {
   min-height: 20px;
   font-size: 11px;
   font-weight: 500;
 }
 
-.pill--ok { background: var(--ok-soft); color: var(--ok-text); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
-.pill--warn { background: var(--warn-soft); color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
-.pill--danger { background: var(--danger-soft); color: var(--danger-text); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
-.pill--info { background: var(--color-info-soft); color: var(--color-info-text); border-color: color-mix(in srgb, var(--color-info) 30%, transparent); }
-.pill--accent { background: var(--color-accent-soft); color: var(--color-accent); border-color: color-mix(in srgb, var(--color-accent) 30%, transparent); }
-.pill--muted { background: var(--muted-soft); color: var(--muted-text); border-color: var(--surface-border); }
+.status-pill--ok { background: var(--ok-soft); color: var(--ok-text); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.status-pill--warn { background: var(--warn-soft); color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+.status-pill--danger { background: var(--danger-soft); color: var(--danger-text); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
+.status-pill--info { background: var(--color-info-soft); color: var(--color-info-text); border-color: color-mix(in srgb, var(--color-info) 30%, transparent); }
+.status-pill--accent { background: var(--color-accent-soft); color: var(--color-accent); border-color: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+.status-pill--muted { background: var(--muted-soft); color: var(--muted-text); border-color: var(--surface-border); }
 
-.pill__note {
+.status-pill__note {
   padding-left: 6px;
   margin-left: 2px;
   border-left: 1px solid currentColor;
@@ -10413,6 +10413,7 @@ body.app-shell .pane {
 }
 
 .radio-cards__grid {
+  margin-bottom: 16px;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
   gap: 10px;
