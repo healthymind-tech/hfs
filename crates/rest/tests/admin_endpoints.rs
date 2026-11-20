@@ -10,9 +10,9 @@ mod suite;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use helios_endpoints::SecretKeyRing;
+use helios_endpoints::{OutboundPolicy, SecretKeyRing};
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
-use suite::{FakeDuplicate, Harness, OkProbe, Options};
+use suite::{FakeDuplicate, Harness, Options};
 
 fn sqlite() -> Arc<SqliteBackend> {
     let backend = SqliteBackend::with_config(
@@ -174,12 +174,18 @@ async fn test_auth_without_probe_is_501() {
 async fn test_auth_runs_the_probe() {
     suite::test_auth_probe(
         &harness(Options {
-            probe: Some(Arc::new(OkProbe)),
+            probe: Some(suite::p2_probe("127.0.0.1")),
+            outbound: OutboundPolicy::parse("keycloak,127.0.0.1"),
             ..Options::default()
         })
         .await,
     )
     .await;
+}
+
+#[tokio::test]
+async fn probe_trusts_only_env_managed_endpoints() {
+    suite::probe_guards().await;
 }
 
 #[tokio::test]

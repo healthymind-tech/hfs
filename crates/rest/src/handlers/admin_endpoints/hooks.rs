@@ -3,7 +3,7 @@
 //! | Trait | Implemented by | Until then |
 //! |---|---|---|
 //! | [`DuplicateService`] | P6 (sync jobs, `StorageCopy`) | [`UnavailableDuplicate`] → `501` |
-//! | [`EndpointAuthProbe`] | P2 (issuer discovery + JWKS through the outbound policy) | [`UnavailableProbe`] → `501` |
+//! | [`EndpointAuthProbe`] | P2 (issuer discovery + JWKS through the outbound policy): [`P2Probe`] | [`UnavailableProbe`] → `501` |
 //! | [`TenantOps`] | here, over the server's storage ([`StorageTenantOps`]) | — |
 //! | [`AuditSearch`] | here, over the server's storage ([`StorageAuditSearch`]) | — |
 //!
@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use helios_auth::OutboundGuard;
 use helios_endpoints::model::EndpointAuth;
 use helios_endpoints::sync::DuplicateRequest;
-use helios_endpoints::{Actor, Endpoint};
+use helios_endpoints::{Actor, Endpoint, ManagedBy, OutboundPolicy};
 use helios_persistence::core::{
     ErasedScope, ResourceStorage, SearchProvider, WriteEvent, WriteObserver, WriteObservers,
 };
@@ -77,64 +78,134 @@ impl DuplicateService for UnavailableDuplicate {
 
 // ------------------------------------------------------------------ auth probe
 
-/// One check of an auth probe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub use helios_auth::{ProbeReport, ProbeStep};
+
+/// What `$test-auth` answers: P2's [`ProbeReport`] (mode, issuer discovery
+/// step, JWKS step, warnings) plus, when a token was sent, a `token` step
+/// (signature, issuer, audience, expiry checked as the endpoint would).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProbeCheck {
-    /// What was checked (`issuer-discovery`, `jwks`, `algorithms`…).
-    pub name: String,
-    /// Whether it passed.
-    pub ok: bool,
-    /// Details or the error.
-    #[serde(default)]
-    pub detail: Option<String>,
+pub struct AuthTestReport {
+    /// The probe; its `ok` covers the token step too.
+    #[serde(flatten)]
+    pub report: ProbeReport,
+    /// The token check, when a token was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<ProbeStep>,
 }
 
-/// Result of `POST /admin/endpoints/{name}/$test-auth`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProbeReport {
-    /// All checks passed.
-    pub ok: bool,
-    /// The checks.
-    pub checks: Vec<ProbeCheck>,
-}
-
-/// Fetches an endpoint's issuer discovery and JWKS (through the outbound
-/// policy) and reports what works.
+/// Probes an endpoint's auth section (P2 implements it; [`P2Probe`]).
 #[async_trait]
 pub trait EndpointAuthProbe: Send + Sync {
-    /// Probes `auth`.
-    async fn test(&self, auth: &EndpointAuth) -> ProbeReport;
+    /// Probes `auth` of an endpoint managed by `managed_by` (env-managed
+    /// endpoints are operator-trusted; console-edited ones go through the
+    /// outbound policy), validating `token` (a bare JWT) when given.
+    async fn test(
+        &self,
+        auth: &EndpointAuth,
+        managed_by: ManagedBy,
+        token: Option<&str>,
+    ) -> Result<AuthTestReport, ApiError>;
 }
 
-/// Placeholder until the per-endpoint auth package is installed.
+/// Placeholder: `501`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableProbe;
 
 #[async_trait]
 impl EndpointAuthProbe for UnavailableProbe {
-    async fn test(&self, _auth: &EndpointAuth) -> ProbeReport {
-        ProbeReport {
-            ok: false,
-            checks: vec![ProbeCheck {
-                name: "probe".into(),
-                ok: false,
-                detail: Some("the auth probe is not installed in this server".into()),
-            }],
+    async fn test(
+        &self,
+        _auth: &EndpointAuth,
+        _managed_by: ManagedBy,
+        _token: Option<&str>,
+    ) -> Result<AuthTestReport, ApiError> {
+        Err(ApiError::not_implemented(
+            "the auth probe is not installed in this server",
+        ))
+    }
+}
+
+/// The P2 probe (`helios_auth::EndpointAuthProbe`) behind [`EndpointAuthProbe`]:
+/// issuer discovery and JWKS fetched through the outbound policy
+/// (`HFS_OUTBOUND_ALLOW`) for console-edited endpoints, trusted for
+/// env-managed ones; a token is verified with the verifier P2 builds for the
+/// endpoint (`AuthConfig::from_endpoint`).
+#[derive(Debug, Clone)]
+pub struct P2Probe {
+    policy: OutboundGuard,
+}
+
+impl P2Probe {
+    /// Console-edited endpoints are fetched under `policy`.
+    pub fn new(policy: Arc<OutboundPolicy>) -> Self {
+        Self {
+            policy: OutboundGuard::Policy(policy),
+        }
+    }
+
+    fn guard(&self, managed_by: ManagedBy) -> OutboundGuard {
+        match managed_by {
+            ManagedBy::Env => OutboundGuard::Trusted,
+            ManagedBy::Ui => self.policy.clone(),
+        }
+    }
+
+    async fn token_step(&self, auth: &EndpointAuth, guard: &OutboundGuard, jwt: &str) -> ProbeStep {
+        let started = std::time::Instant::now();
+        let step = |ok: bool, detail: String| ProbeStep {
+            ok,
+            url: None,
+            detail,
+            key_count: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        };
+        if auth.mode == helios_endpoints::model::AuthMode::Off {
+            return step(
+                false,
+                "auth is off for this endpoint: tokens are not checked".into(),
+            );
+        }
+        let config =
+            helios_auth::AuthConfig::from_endpoint(auth, &helios_auth::AuthConfig::default());
+        let provider = helios_auth::VerifierCache::new().provider(&config, guard);
+        let jwt = jwt.trim();
+        let jwt = jwt.strip_prefix("Bearer ").unwrap_or(jwt);
+        match provider.authenticate(&format!("Bearer {jwt}")).await {
+            Ok(p) => step(
+                true,
+                format!(
+                    "valid token: sub {}, issuer {}, {} scope(s)",
+                    p.subject,
+                    p.issuer,
+                    p.scopes.scopes().len()
+                ),
+            ),
+            Err(e) => step(false, format!("token refused: {e}")),
         }
     }
 }
 
-impl UnavailableProbe {
-    /// Whether `report` is the placeholder's (so the API can answer `501`).
-    pub fn is_placeholder(report: &ProbeReport) -> bool {
-        report.checks.len() == 1
-            && report.checks[0].name == "probe"
-            && report.checks[0]
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.contains("not installed"))
+#[async_trait]
+impl EndpointAuthProbe for P2Probe {
+    async fn test(
+        &self,
+        auth: &EndpointAuth,
+        managed_by: ManagedBy,
+        token: Option<&str>,
+    ) -> Result<AuthTestReport, ApiError> {
+        let guard = self.guard(managed_by);
+        let mut report = helios_auth::EndpointAuthProbe::new(guard.clone())
+            .test(auth)
+            .await;
+        let token = match token {
+            Some(jwt) => Some(self.token_step(auth, &guard, jwt).await),
+            None => None,
+        };
+        if token.as_ref().is_some_and(|t| !t.ok) {
+            report.ok = false;
+        }
+        Ok(AuthTestReport { report, token })
     }
 }
 
@@ -341,12 +412,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.status, axum::http::StatusCode::NOT_IMPLEMENTED);
-        let r = UnavailableProbe.test(&EndpointAuth::default()).await;
-        assert!(!r.ok);
-        assert!(UnavailableProbe::is_placeholder(&r));
-        assert!(!UnavailableProbe::is_placeholder(&ProbeReport {
-            ok: true,
-            checks: vec![]
-        }));
+        let e = UnavailableProbe
+            .test(&EndpointAuth::default(), ManagedBy::Ui, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.status, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 }

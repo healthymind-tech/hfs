@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod mock_idp;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::IpAddr;
@@ -34,7 +36,7 @@ use helios_rest::handlers::admin_endpoints::AdminEndpointsState;
 use helios_rest::handlers::admin_endpoints::authz::AdminCredentialAuthorizer;
 use helios_rest::handlers::admin_endpoints::error::ApiError;
 use helios_rest::handlers::admin_endpoints::hooks::{
-    DuplicateService, DuplicateStarted, EndpointAuthProbe, ProbeCheck, ProbeReport,
+    DuplicateService, DuplicateStarted, EndpointAuthProbe, P2Probe,
 };
 use helios_rest::handlers::admin_endpoints::outbound::HostResolver;
 use helios_rest::packages::{ManagerDeps, PackageManager};
@@ -139,21 +141,9 @@ impl DuplicateService for FakeDuplicate {
     }
 }
 
-/// A probe that passes.
-pub struct OkProbe;
-
-#[async_trait]
-impl EndpointAuthProbe for OkProbe {
-    async fn test(&self, auth: &EndpointAuth) -> ProbeReport {
-        ProbeReport {
-            ok: true,
-            checks: vec![ProbeCheck {
-                name: "issuer-discovery".into(),
-                ok: true,
-                detail: auth.issuer.clone(),
-            }],
-        }
-    }
+/// The real P2 probe, fetching under `allow` (the mock IdP is on loopback).
+pub fn p2_probe(allow: &str) -> Arc<dyn EndpointAuthProbe> {
+    Arc::new(P2Probe::new(Arc::new(OutboundPolicy::parse(allow))))
 }
 
 /// A store whose next `update` loses a race to a concurrent writer.
@@ -1268,16 +1258,105 @@ pub async fn test_auth_unavailable(h: &Harness) {
 }
 
 pub async fn test_auth_probe(h: &Harness) {
+    // A healthy IdP: discovery and JWKS pass, token checked.
+    let idp = mock_idp::start(true, true).await;
+    let auth = json!({"mode": "full", "issuer": idp.issuer, "jwksUrl": idp.jwks_url,
+                      "audience": "lab-api"});
+    let (s, o) = scan(
+        &h.post("/admin/endpoints/default/$test-auth", auth.clone())
+            .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["ok"], true, "{o}");
+    assert_eq!(o["mode"], "full");
+    assert_eq!(o["issuer"]["ok"], true, "{o}");
+    assert_eq!(o["jwks"]["ok"], true, "{o}");
+    assert_eq!(o["jwks"]["keyCount"], 1);
+    assert!(o.get("token").is_none());
+
+    let good = mock_idp::token(&idp.issuer, "lab-api", 300);
     let (s, o) = scan(
         &h.post(
             "/admin/endpoints/default/$test-auth",
-            json!({"mode": "full", "issuer": "https://idp.example.org/realms/a",
-                   "jwksUrl": "https://idp.example.org/certs"}),
+            json!({"auth": auth, "token": good}),
         )
         .await,
     );
     assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["token"]["ok"], true, "{o}");
+    assert!(
+        o["token"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("svc-client")
+    );
     assert_eq!(o["ok"], true);
+
+    let expired = mock_idp::token(&idp.issuer, "lab-api", -3600);
+    let (_, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"auth": auth, "token": expired}),
+        )
+        .await,
+    );
+    assert_eq!(o["token"]["ok"], false, "{o}");
+    assert_eq!(o["ok"], false);
+    let other_aud = mock_idp::token(&idp.issuer, "someone-else", 300);
+    let (_, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"auth": auth, "token": other_aud}),
+        )
+        .await,
+    );
+    assert_eq!(o["token"]["ok"], false, "{o}");
+    let (s, _) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"auth": auth, "token": 5}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Discovery down / JWKS down.
+    let down = mock_idp::start(false, true).await;
+    let (s, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"mode": "full", "issuer": down.issuer, "jwksUrl": down.jwks_url}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(o["ok"], false, "{o}");
+    assert_eq!(o["issuer"]["ok"], false);
+    assert_eq!(o["jwks"]["ok"], true);
+    assert!(o["warnings"].to_string().contains("audience"), "{o}");
+    let nokeys = mock_idp::start(true, false).await;
+    let (_, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"mode": "full", "issuer": nokeys.issuer, "jwksUrl": nokeys.jwks_url}),
+        )
+        .await,
+    );
+    assert_eq!(o["issuer"]["ok"], true, "{o}");
+    assert_eq!(o["jwks"]["ok"], false, "{o}");
+
+    // Auth off: nothing fetched, a token cannot be checked.
+    let (_, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$test-auth",
+            json!({"auth": {"mode": "off"}, "token": "x.y.z"}),
+        )
+        .await,
+    );
+    assert_eq!(o["mode"], "off", "{o}");
+    assert_eq!(o["token"]["ok"], false);
+
+    // SSRF before probing; issuer required.
     let (s, o) = scan(
         &h.post(
             "/admin/endpoints/default/$test-auth",
@@ -1296,14 +1375,35 @@ pub async fn test_auth_probe(h: &Harness) {
         .await,
     );
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-    // Stored auth section.
-    let (s, _, _) = h
+    let (s, _) = scan(&h.post_empty("/admin/endpoints/default/$test-auth").await);
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The stored auth section of an endpoint.
+    let (s, o, _) = h
         .create(json!({"name": "authd", "auth": {"mode": "full",
-            "issuer": "https://idp.example.org/realms/a", "jwksUrl": "https://idp.example.org/certs"}}))
+            "issuer": idp.issuer, "jwksUrl": idp.jwks_url, "audience": "authd-api"}}))
         .await;
-    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(s, StatusCode::CREATED, "{o}");
     let (s, o) = scan(&h.post_empty("/admin/endpoints/authd/$test-auth").await);
     assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["ok"], true, "{o}");
+}
+
+/// Env-managed endpoints are operator-trusted: their stored URLs are probed
+/// without the outbound policy; console-edited ones are not.
+pub async fn probe_guards() {
+    let idp = mock_idp::start(true, true).await;
+    let auth: EndpointAuth = serde_json::from_value(json!({"mode": "full",
+        "issuer": idp.issuer, "jwksUrl": idp.jwks_url, "audience": "a"}))
+    .unwrap();
+    let strict = p2_probe("");
+    let r = strict.test(&auth, ManagedBy::Env, None).await.unwrap();
+    assert!(r.report.ok, "{r:?}");
+    let r = strict.test(&auth, ManagedBy::Ui, None).await.unwrap();
+    assert!(
+        !r.report.ok,
+        "loopback must be refused for console-edited endpoints: {r:?}"
+    );
 }
 
 /// Stats, audit search and delete with purge over real storage.

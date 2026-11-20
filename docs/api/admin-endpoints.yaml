@@ -357,13 +357,28 @@ paths:
     post:
       tags: [endpoints]
       operationId: testEndpointAuth
-      summary: Probe issuer discovery and JWKS
-      description: Tests the stored `auth` section, or an unsaved one sent as the body. URLs pass the outbound policy first. `501` while the probe is not installed.
+      summary: Probe issuer discovery, JWKS and optionally a token
+      description: |
+        Probes the stored `auth` section, or an unsaved one sent as the body
+        (the console's "Test" button before saving), with the per-endpoint
+        auth probe: the issuer's `.well-known/openid-configuration` (the
+        stated issuer must match) and the JWKS (at least one signing key).
+        With `token`, the JWT is also verified as the endpoint would
+        (signature, issuer, audience, expiry). URLs of console-edited
+        endpoints pass the outbound policy first (`422 security`) and are
+        fetched through it; env-managed endpoints' stored URLs are trusted.
+        Probe failures are reported in the body (`ok: false`), not as an error status.
       requestBody:
         required: false
         content:
           application/json:
-            schema: {$ref: "#/components/schemas/EndpointAuth"}
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/EndpointAuth"
+                - type: object
+                  properties:
+                    auth: {$ref: "#/components/schemas/EndpointAuth"}
+                    token: {type: string, description: "A bearer JWT (with or without `Bearer `)."}
       responses:
         "200":
           description: Probe report.
@@ -371,16 +386,14 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [ok, mode, warnings]
                 properties:
-                  ok: {type: boolean}
-                  checks:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        name: {type: string}
-                        ok: {type: boolean}
-                        detail: {type: [string, "null"]}
+                  ok: {type: boolean, description: Every step (including the token check) passed.}
+                  mode: {enum: ["off", write-protect, full]}
+                  issuer: {$ref: "#/components/schemas/ProbeStep"}
+                  jwks: {$ref: "#/components/schemas/ProbeStep"}
+                  token: {$ref: "#/components/schemas/ProbeStep"}
+                  warnings: {type: array, items: {type: string}}
         "401": {$ref: "#/components/responses/Unauthorized"}
         "404": {$ref: "#/components/responses/NotFound"}
         "422": {$ref: "#/components/responses/Unprocessable"}
@@ -845,6 +858,16 @@ components:
         spec: {$ref: "#/components/schemas/EndpointSpec"}
         changedAt: {type: string, format: date-time}
         changedBy: {type: [string, "null"]}
+
+    ProbeStep:
+      type: object
+      required: [ok, detail, elapsedMs]
+      properties:
+        ok: {type: boolean}
+        url: {type: string, description: URL fetched (credentials redacted).}
+        detail: {type: string}
+        keyCount: {type: integer}
+        elapsedMs: {type: integer}
 
     DuplicateRequest:
       type: object

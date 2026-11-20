@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use super::audit::AdminEvent;
 use super::error::{ApiError, ApiResult, Issue};
-use super::hooks::{AuditPage, DuplicateStarted, ProbeReport, TenantStats, UnavailableProbe};
+use super::hooks::{AuditPage, AuthTestReport, DuplicateStarted, TenantStats};
 use super::spec_input::SecretInputs;
 use super::{AdminEndpointsState, RewrapReport, outbound, secrets};
 
@@ -598,19 +598,23 @@ impl AdminEndpointsState {
         Ok(started)
     }
 
-    /// Probes `auth` (or, when `None`, the stored auth section of `endpoint`).
-    /// With no endpoint (the new-endpoint wizard) an `auth` must be given.
-    /// URLs pass the SSRF policy first, changed or not (the probe connects now).
+    /// Probes `auth` (or, when `None`, the stored auth section of `endpoint`):
+    /// issuer discovery, JWKS and, with `token`, a token check. With no
+    /// endpoint (the new-endpoint wizard) an `auth` must be given. URLs pass
+    /// the SSRF policy first, changed or not (the probe connects now); an
+    /// env-managed endpoint's stored URLs are operator-trusted.
     pub async fn test_endpoint_auth(
         &self,
         endpoint: Option<&str>,
         auth: Option<EndpointAuth>,
-    ) -> ApiResult<ProbeReport> {
+        token: Option<&str>,
+    ) -> ApiResult<AuthTestReport> {
         let i = self.inner();
         let current = match endpoint {
             Some(name) => Some(self.get_endpoint(name).await?),
             None => None,
         };
+        let stored = auth.is_none();
         let auth = match (auth, &current) {
             (Some(a), _) => a,
             (None, Some(e)) => e.spec.auth.clone().ok_or_else(|| {
@@ -620,30 +624,35 @@ impl AdminEndpointsState {
                 )
             })?,
             (None, None) => {
-                return Err(ApiError::invalid_field("auth", "an auth section is required"));
+                return Err(ApiError::invalid_field(
+                    "auth",
+                    "an auth section is required",
+                ));
             }
         };
-        if auth.issuer.as_deref().is_none_or(|s| s.trim().is_empty()) {
-            return Err(ApiError::unprocessable(vec![Issue::field(
-                "required",
-                "auth.issuer",
-                "an issuer is required to test authentication",
-            )]));
-        }
-        let mut probe_spec = match &current {
-            Some(e) => e.spec.clone(),
-            None => EndpointSpec::default_endpoint("probe", FhirRelease::R4),
+        let managed_by = match &current {
+            Some(e) if stored => e.spec.managed_by,
+            _ => ManagedBy::Ui,
         };
-        probe_spec.auth = Some(auth.clone());
-        probe_spec.terminology = None;
-        outbound::check_spec(&i.outbound, i.resolver.as_ref(), &probe_spec, None).await?;
-        let report = i.auth_probe.test(&auth).await;
-        if UnavailableProbe::is_placeholder(&report) {
-            return Err(ApiError::not_implemented(
-                "the auth probe is not installed in this server",
-            ));
+        if auth.mode != helios_endpoints::model::AuthMode::Off {
+            if auth.issuer.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                return Err(ApiError::unprocessable(vec![Issue::field(
+                    "required",
+                    "auth.issuer",
+                    "an issuer is required to test authentication",
+                )]));
+            }
+            if managed_by == ManagedBy::Ui {
+                let mut probe_spec = match &current {
+                    Some(e) => e.spec.clone(),
+                    None => EndpointSpec::default_endpoint("probe", FhirRelease::R4),
+                };
+                probe_spec.auth = Some(auth.clone());
+                probe_spec.terminology = None;
+                outbound::check_spec(&i.outbound, i.resolver.as_ref(), &probe_spec, None).await?;
+            }
         }
-        Ok(report)
+        i.auth_probe.test(&auth, managed_by, token).await
     }
 
     /// Counts, last write and this instance's traffic over `window` seconds
@@ -970,21 +979,29 @@ mod tests {
     async fn wizard_auth_test_without_an_endpoint() {
         let (s, _) = state(false).await;
         assert!(!s.secrets_available());
-        let e = s.test_endpoint_auth(None, None).await.unwrap_err();
+        let e = s.test_endpoint_auth(None, None, None).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Invalid);
         let auth = EndpointAuth {
+            mode: helios_endpoints::AuthMode::Full,
             issuer: Some("https://idp.example.org/r".into()),
             jwks_url: Some("https://idp.example.org/c".into()),
             ..Default::default()
         };
         // SSRF passes, the placeholder probe answers not-implemented.
-        let e = s.test_endpoint_auth(None, Some(auth)).await.unwrap_err();
+        let e = s
+            .test_endpoint_auth(None, Some(auth), None)
+            .await
+            .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::NotImplemented);
         let bad = EndpointAuth {
+            mode: helios_endpoints::AuthMode::Full,
             issuer: Some("https://10.0.0.1/r".into()),
             ..Default::default()
         };
-        let e = s.test_endpoint_auth(None, Some(bad)).await.unwrap_err();
+        let e = s
+            .test_endpoint_auth(None, Some(bad), None)
+            .await
+            .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Invalid);
         // No key ring: rewrap refused.
         assert_eq!(

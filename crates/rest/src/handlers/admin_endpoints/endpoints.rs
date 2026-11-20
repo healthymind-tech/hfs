@@ -354,19 +354,40 @@ pub async fn duplicate_handler(
     Ok(r)
 }
 
-/// `POST /admin/endpoints/{name}/$test-auth` — the stored auth section, or
-/// an unsaved `EndpointAuth` sent as the body.
+/// `POST /admin/endpoints/{name}/$test-auth`. Body: empty (the stored auth
+/// section), an `EndpointAuth` (unsaved settings), or
+/// `{"auth": EndpointAuth?, "token": "<jwt>"?}` to also check a token.
 pub async fn test_auth_handler(
     State(state): State<AdminEndpointsState>,
     Path(name): Path<String>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    let auth: Option<EndpointAuth> = if body.iter().all(u8::is_ascii_whitespace) {
-        None
+    let (auth, token) = if body.iter().all(u8::is_ascii_whitespace) {
+        (None, None)
     } else {
-        Some(json_body(&body, "auth section")?)
+        let obj = spec_input::json_object(&body)?;
+        if obj.contains_key("token") || obj.contains_key("auth") {
+            let token = match obj.get("token") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(t)) if !t.trim().is_empty() => Some(t.clone()),
+                Some(_) => {
+                    return Err(ApiError::invalid_field("token", "must be a JWT string"));
+                }
+            };
+            let auth = match obj.get("auth") {
+                None | Some(Value::Null) => None,
+                Some(a) => Some(serde_json::from_value::<EndpointAuth>(a.clone()).map_err(
+                    |e| ApiError::invalid_field("auth", format!("invalid auth section: {e}")),
+                )?),
+            };
+            (auth, token)
+        } else {
+            (Some(json_body(&body, "auth section")?), None)
+        }
     };
-    let report = state.test_endpoint_auth(Some(&name), auth).await?;
+    let report = state
+        .test_endpoint_auth(Some(&name), auth, token.as_deref())
+        .await?;
     Ok(Json(json!(report)).into_response())
 }
 
