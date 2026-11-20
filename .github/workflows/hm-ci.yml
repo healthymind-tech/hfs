@@ -77,16 +77,19 @@ jobs:
           - name: production features
             args: --all-targets -p helios-hfs -p helios-hts --features "$PROD_FEATURES"
             jobs: 4
+            swap: ""
           - name: all features
             args: --all-targets --all-features
-            # helios-fhir with all four FHIR versions is the memory peak.
-            jobs: 3
+            # helios-fhir with all four FHIR versions is the memory peak; at 3
+            # jobs without swap the runner was killed (out of memory).
+            jobs: 2
+            swap: --swap 16
     env:
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v5
       - name: Free disk space
-        run: .github/scripts/hm-free-disk.sh
+        run: .github/scripts/hm-free-disk.sh ${{ matrix.swap }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.100.0"
