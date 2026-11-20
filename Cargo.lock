@@ -3887,6 +3887,7 @@ dependencies = [
  "futures-lite",
  "helios-admin-auth",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
  "helios-observability",

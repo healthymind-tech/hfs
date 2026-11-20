@@ -1,0 +1,131 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+
+{#
+  Overview of every FHIR endpoint (design §10.3): health strip, filter bar,
+  responsive grid of endpoint cards (3 / 2 / 1 columns), empty state.
+#}
+
+{% block title %}{{ i18n.t("mgr-overview-title") }} — {{ i18n.t("app-short-name") }}{% endblock %}
+
+{% block content %}
+<div class="brand-band" aria-hidden="true"></div>
+{% call ui::page_header(i18n.t("mgr-overview-title"), i18n.t("mgr-overview-lede")) %}
+  {% if can_admin %}
+  <a class="btn btn--primary" href="/ui/endpoints/new">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("mgr-action-new-endpoint") }}</a>
+  {% endif %}
+{% endcall %}
+
+{% if !flash_key.is_empty() %}
+<div class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t_arg(flash_key, "endpoint", flash_arg.clone()) }}</span></div>
+{% endif %}
+
+<section class="health-strip" aria-label="{{ i18n.t("mgr-health-title") }}">
+  {% for tile in health %}
+  <div class="health-tile health-tile--{{ tile.tone }}">
+    <span class="health-tile__icon" aria-hidden="true">{% call ui::icon(tile.icon) %}{% endcall %}</span>
+    <span class="health-tile__text">
+      <span class="health-tile__label">{{ i18n.t(tile.label_key) }}</span>
+      <span class="health-tile__value">{% if !tile.value_key.is_empty() %}{{ i18n.t(tile.value_key) }}{% endif %}{% if !tile.value.is_empty() %} <span class="health-tile__figure">{{ tile.value }}</span>{% endif %}</span>
+    </span>
+  </div>
+  {% endfor %}
+</section>
+
+<form class="filter-bar" method="get" action="/ui" role="search" aria-label="{{ i18n.t("mgr-filter-label") }}">
+  <div class="filter-bar__search">
+    <label class="visually-hidden" for="ov-q">{{ i18n.t("mgr-filter-search") }}</label>
+    <span class="filter-bar__icon" aria-hidden="true">{% call ui::icon("search") %}{% endcall %}</span>
+    <input id="ov-q" class="mfield__input" type="search" name="q" value="{{ q }}" placeholder="{{ i18n.t("mgr-filter-search") }}"
+           hx-get="/ui" hx-trigger="input changed delay:250ms, search" hx-target="#endpoint-grid" hx-select="#endpoint-grid" hx-swap="outerHTML" hx-push-url="true" hx-include="closest form">
+  </div>
+  <div class="segmented" role="radiogroup" aria-label="{{ i18n.t("mgr-filter-status") }}">
+    <a class="segmented__item" href="/ui?q={{ q }}"{% if status_filter.is_empty() || status_filter == "all" %} aria-current="true"{% endif %}>{{ i18n.t("mgr-filter-all") }} <span class="segmented__count">{{ total }}</span></a>
+    <a class="segmented__item" href="/ui?status=enabled&amp;q={{ q }}"{% if status_filter == "enabled" %} aria-current="true"{% endif %}>{{ i18n.t("mgr-status-enabled") }} <span class="segmented__count">{{ enabled }}</span></a>
+    <a class="segmented__item" href="/ui?status=disabled&amp;q={{ q }}"{% if status_filter == "disabled" %} aria-current="true"{% endif %}>{{ i18n.t("mgr-status-disabled") }} <span class="segmented__count">{{ disabled }}</span></a>
+  </div>
+  <input type="hidden" name="status" value="{{ status_filter }}">
+  <noscript><button type="submit" class="btn">{{ i18n.t("mgr-filter-apply") }}</button></noscript>
+</form>
+
+<div id="endpoint-grid" class="endpoint-grid-wrap">
+  {% if cards.is_empty() %}
+    {% if total == 0 %}
+    {% call ui::empty_state("server", i18n.t("mgr-empty-title"), i18n.t("mgr-empty-text")) %}
+      {% if can_admin %}<a class="btn btn--primary" href="/ui/endpoints/new">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("mgr-action-new-endpoint") }}</a>{% endif %}
+    {% endcall %}
+    {% else %}
+    {% call ui::empty_state("search", i18n.t("mgr-nomatch-title"), i18n.t("mgr-nomatch-text")) %}
+      <a class="btn" href="/ui">{{ i18n.t("mgr-filter-clear") }}</a>
+    {% endcall %}
+    {% endif %}
+  {% else %}
+  <p class="visually-hidden" role="status">{{ i18n.t_arg("mgr-showing", "count", shown) }}</p>
+  <ul class="endpoint-grid" role="list">
+    {% for card in cards %}
+    <li class="card endpoint-card endpoint-card--{{ card.status_slug }}">
+      <div class="endpoint-card__head">
+        <div class="endpoint-card__titles">
+          <h2 class="endpoint-card__title"><a href="/ui/e/{{ card.name }}" class="endpoint-card__link">{{ card.display_name }}</a></h2>
+          <span class="endpoint-card__name">{% if card.is_default %}{{ i18n.t("mgr-default-endpoint") }}{% else %}/{{ card.name }}{% endif %}</span>
+        </div>
+        {% call ui::pill(card.status) %}{% endcall %}
+      </div>
+      {% if !card.description.is_empty() %}<p class="endpoint-card__desc">{{ card.description }}</p>{% endif %}
+      {% call ui::copy_field(card.base_url, i18n.t("mgr-copy-base-url")) %}{% endcall %}
+      <div class="endpoint-card__badges">
+        <span class="chip chip--version">FHIR {{ card.fhir_version }}</span>
+        {% call ui::pill(card.auth) %}{% endcall %}
+        {% call ui::pill(card.validation) %}{% endcall %}
+        {% if let Some(sync) = card.sync %}{% call ui::pill(sync) %}{% endcall %}{% endif %}
+        {% if card.env_managed %}{% call ui::pill_raw("warn", "lock", i18n.t("mgr-env-managed")) %}{% endcall %}{% endif %}
+      </div>
+      <dl class="endpoint-card__stats">
+        <div><dt>{{ i18n.t("mgr-stat-resources") }}</dt><dd>{% if let Some(n) = card.resources %}{{ i18n.num(n) }}{% else %}—{% endif %}</dd></div>
+        <div><dt>{{ i18n.t("mgr-stat-types") }}</dt><dd>{% if let Some(n) = card.types %}{{ i18n.num(n) }}{% else %}—{% endif %}</dd></div>
+        <div><dt>{{ i18n.t("mgr-stat-rpm") }}</dt><dd>{% if let Some(s) = card.stats %}{% if let Some(r) = s.requests_per_minute %}{{ i18n.dec(r, 1) }}{% else %}—{% endif %}{% else %}—{% endif %}</dd></div>
+        <div><dt>{{ i18n.t("mgr-stat-last-write") }}</dt><dd>{% if let Some(w) = card.last_write %}{{ w }}{% else %}—{% endif %}</dd></div>
+      </dl>
+      {% if !card.sparkline.is_empty() %}
+      <svg class="sparkline" viewBox="0 0 120 28" preserveAspectRatio="none" role="img" aria-label="{{ i18n.t("mgr-sparkline-label") }}">
+        <polyline points="{{ card.sparkline }}" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+      </svg>
+      {% endif %}
+      {% if !card.labels.is_empty() %}
+      <ul class="endpoint-card__labels" role="list" aria-label="{{ i18n.t("mgr-field-labels") }}">
+        {% for label in card.labels %}<li class="chip">{{ label }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+      <div class="endpoint-card__actions">
+        <a class="btn btn--primary btn--small" href="/ui/e/{{ card.name }}">{{ i18n.t("mgr-action-open") }}</a>
+        <a class="btn btn--small" href="/ui/e/{{ card.name }}/data/resources">{{ i18n.t("mgr-action-browse-data") }}</a>
+        {% if can_admin %}
+        <details class="menu menu--end endpoint-card__more">
+          <summary class="icon-button" aria-label="{{ i18n.t_arg("mgr-more-actions", "endpoint", card.display_name.clone()) }}">{% include "icons/dots-vertical.svg" %}</summary>
+          <div class="menu__panel">
+            <a class="menu__option" href="/ui/e/{{ card.name }}/config">{% call ui::icon("sliders") %}{% endcall %}{{ i18n.t("mgr-nav-config") }}</a>
+            <a class="menu__option" href="/ui/e/{{ card.name }}/duplicate">{% call ui::icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
+            {% if card.can_toggle %}
+            <form method="post" action="/ui/e/{{ card.name }}/status">
+              {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+              <input type="hidden" name="revision" value="{{ card.revision }}">
+              <input type="hidden" name="back" value="/ui?changed={{ card.name }}">
+              {% if card.status_slug == "enabled" %}
+              <input type="hidden" name="action" value="disable">
+              <button type="submit" class="menu__option" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", card.name.clone()) }}">{% call ui::icon("power") %}{% endcall %}{{ i18n.t("mgr-action-disable") }}</button>
+              {% else %}
+              <input type="hidden" name="action" value="enable">
+              <button type="submit" class="menu__option">{% call ui::icon("power") %}{% endcall %}{{ i18n.t("mgr-action-enable") }}</button>
+              {% endif %}
+            </form>
+            {% endif %}
+          </div>
+        </details>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,85 @@
+{% call ui::form_section("sec-auth", i18n.t("mgr-sec-auth"), i18n.t("mgr-sec-auth-desc")) %}
+  {% call ui::inherit_toggle("auth_inherit", v.auth_inherit, "auth-fields", i18n.t_arg("mgr-inherit-auth", "mode", i18n.t(env.auth_mode_key))) %}{% endcall %}
+  <fieldset class="inherit-target" id="auth-fields"{% if v.auth_inherit %} disabled{% endif %}>
+    <legend class="mfield__label">{{ i18n.t("mgr-field-auth-mode") }}</legend>
+    <div class="radio-cards__grid">
+      <label class="radio-card">
+        <input type="radio" name="auth_mode" value="off"{% if v.auth_mode == "off" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-auth-mode-off") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-off-desc") }}</span>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="auth_mode" value="write-protect"{% if v.auth_mode == "write-protect" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-auth-mode-write-protect") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-write-protect-desc") }}</span>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="auth_mode" value="full"{% if v.auth_mode == "full" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-auth-mode-full") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-full-desc") }}</span>
+      </label>
+    </div>
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("mgr-field-issuer"), "auth_issuer", v.auth_issuer, self.err("auth.issuer"), i18n.t("mgr-field-issuer-hint"), "url", false, "https://idp.example.org/realms/fhir", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint"), "url", false, "", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-audience"), "auth_audience", v.auth_audience, self.err("auth.audience"), i18n.t("mgr-field-audience-hint"), "text", false, "", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-algorithms"), "auth_algorithms", v.auth_algorithms, self.err("auth.algorithms"), i18n.t("mgr-field-algorithms-hint"), "text", false, "RS256, ES256", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-clock-skew"), "auth_clock_skew", v.auth_clock_skew, self.err("auth.clockSkewSecs"), i18n.t("mgr-field-seconds-default-60"), "number", false, "60") %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-jwks-max-age"), "auth_jwks_max_age", v.auth_jwks_max_age, self.err("auth.jwksMaxAgeSecs"), i18n.t("mgr-field-seconds-default-300"), "number", false, "300") %}{% endcall %}
+    </div>
+    <div class="probe">
+      <button type="button" class="btn btn--small" hx-post="/ui/e/{{ head.name }}/security/test" hx-include="#auth-fields" hx-target="#probe-result" hx-swap="innerHTML">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("mgr-test-auth") }}</button>
+      <div id="probe-result" class="probe__result" aria-live="polite"></div>
+    </div>
+    <fieldset class="checks{% if self.bad("auth.scopes") %} checks--error{% endif %}">
+      <legend class="mfield__label">{{ i18n.t("mgr-field-scopes") }}</legend>
+      {% call ui::checkbox(i18n.t("mgr-scope-patient"), "scopes_allow_patient", v.scopes_allow_patient) %}{% endcall %}
+      {% call ui::checkbox(i18n.t("mgr-scope-user"), "scopes_allow_user", v.scopes_allow_user) %}{% endcall %}
+      {% call ui::checkbox(i18n.t("mgr-scope-system"), "scopes_allow_system", v.scopes_allow_system) %}{% endcall %}
+      {% call ui::checkbox(i18n.t("mgr-scope-v1"), "scopes_accept_v1", v.scopes_accept_v1, i18n.t("mgr-scope-v1-hint")) %}{% endcall %}
+      {% if self.bad("auth.scopes") %}<p class="mfield__error">{{ self.err("auth.scopes") }}</p>{% endif %}
+      <div class="mfield">
+        <label class="mfield__label" for="f-scopes_non_compartment">{{ i18n.t("mgr-field-non-compartment") }}</label>
+        <select class="mfield__input" id="f-scopes_non_compartment" name="scopes_non_compartment">
+          <option value="allow"{% if !v.scopes_non_compartment_deny %} selected{% endif %}>{{ i18n.t("mgr-non-compartment-allow") }}</option>
+          <option value="deny"{% if v.scopes_non_compartment_deny %} selected{% endif %}>{{ i18n.t("mgr-non-compartment-deny") }}</option>
+        </select>
+      </div>
+    </fieldset>
+    <details class="disclosure">
+      <summary>{{ i18n.t("mgr-sec-smart") }}</summary>
+      <div class="disclosure__body">
+        {% call ui::checkbox(i18n.t("mgr-smart-discover"), "smart_discover", v.smart_discover, i18n.t("mgr-smart-discover-hint")) %}{% endcall %}
+        <div class="form-grid">
+          {% call ui::field_text(i18n.t("mgr-smart-authorize"), "smart_authorization_endpoint", v.smart_authorization_endpoint, self.err("auth.smart.authorizationEndpoint"), "", "url", false, "", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-smart-token"), "smart_token_endpoint", v.smart_token_endpoint, self.err("auth.smart.tokenEndpoint"), "", "url", false, "", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-smart-jwks"), "smart_jwks_uri", v.smart_jwks_uri, self.err("auth.smart.jwksUri"), "", "url", false, "", false, true) %}{% endcall %}
+        </div>
+      </div>
+    </details>
+    {% call ui::checkbox(i18n.t("mgr-accept-admin"), "accept_admin", v.accept_admin, i18n.t("mgr-accept-admin-hint")) %}{% endcall %}
+  </fieldset>
+{% endcall %}
+
+{% call ui::form_section("sec-cors", i18n.t("mgr-sec-cors"), i18n.t("mgr-sec-cors-desc")) %}
+  {% call ui::inherit_toggle("cors_inherit", v.cors_inherit, "cors-fields", i18n.t_arg("mgr-inherit-cors", "origins", env.cors_origins.clone())) %}{% endcall %}
+  <fieldset class="inherit-target" id="cors-fields"{% if v.cors_inherit %} disabled{% endif %}>
+    <legend class="visually-hidden">{{ i18n.t("mgr-sec-cors") }}</legend>
+    {% call ui::checkbox(i18n.t("mgr-cors-enabled"), "cors_enabled", v.cors_enabled) %}{% endcall %}
+    {% call ui::field_area(i18n.t("mgr-cors-origins"), "cors_origins", v.cors_origins, self.err("cors.allowedOrigins"), i18n.t("mgr-cors-origins-hint"), 3, "https://app.example.org") %}{% endcall %}
+    {% call ui::checkbox(i18n.t("mgr-cors-credentials"), "cors_credentials", v.cors_credentials, self.err("cors.allowCredentials")) %}{% endcall %}
+    {% call ui::field_text(i18n.t("mgr-cors-headers"), "cors_headers", v.cors_headers, "", i18n.t("mgr-cors-headers-hint"), "text", false, "", false, true) %}{% endcall %}
+  </fieldset>
+{% endcall %}
+
+{% call ui::form_section("sec-rate", i18n.t("mgr-sec-rate"), i18n.t("mgr-sec-rate-desc")) %}
+  {% call ui::inherit_toggle("rl_inherit", v.rl_inherit, "rl-fields", i18n.t_arg("mgr-inherit-rate", "limits", env.rate_limit.clone())) %}{% endcall %}
+  <fieldset class="inherit-target" id="rl-fields"{% if v.rl_inherit %} disabled{% endif %}>
+    <legend class="visually-hidden">{{ i18n.t("mgr-sec-rate") }}</legend>
+    <div class="form-grid form-grid--3">
+      {% call ui::field_text(i18n.t("mgr-rate-anonymous"), "rl_anonymous", v.rl_anonymous, self.err("rateLimit.anonymousPerMinute"), i18n.t("mgr-rate-zero-unlimited"), "number") %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-rate-authenticated"), "rl_authenticated", v.rl_authenticated, self.err("rateLimit.authenticatedPerMinute"), i18n.t("mgr-rate-zero-unlimited"), "number") %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-rate-burst"), "rl_burst", v.rl_burst, self.err("rateLimit.burstSeconds"), i18n.t("mgr-rate-burst-hint"), "number") %}{% endcall %}
+    </div>
+  </fieldset>
+{% endcall %}
