@@ -1,0 +1,12 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("sync-run") }} — {{ job_name }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sync-run") }}</h1>
+  <p class="page-head__lede"><a href="/ui/sync/{{ job_id }}">{{ job_name }}</a></p>
+</section>
+{# Server-rendered by the same template the htmx poll answers with. #}
+{{ fragment_html|safe }}
+{% endblock %}

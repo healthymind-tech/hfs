@@ -99,6 +99,7 @@ mod subscription_outbox;
 mod subscription_state;
 mod subscription_ws_tokens;
 mod sync_failures;
+mod tenant_copy;
 mod transaction;
 mod user_settings;
 
@@ -108,4 +109,5 @@ pub use backend::{PostgresBackend, PostgresConfig};
 /// deadpool dependency.
 pub use deadpool_postgres::Status as PoolStatus;
 
+pub use tenant_copy::{TenantCopyOptions, TenantCopyReport};
 pub use transaction::PostgresTransaction;

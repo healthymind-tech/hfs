@@ -19,6 +19,8 @@
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 mod cluster;
+// FHIR server manager wiring (P1 owns `manager/mod.rs`; P6 adds `sync.rs`).
+mod manager;
 
 use std::sync::Arc;
 
@@ -3161,6 +3163,19 @@ async fn start_sqlite(
         observability.observers.clone(),
     )
     .await?;
+    manager::sync::install_sync(
+        &config,
+        manager::sync::SyncInstall {
+            local: backend.clone(),
+            cluster: backend.cluster_job_store(),
+            pg_store: None,
+            copier: None,
+            observer: Some(observability.observers.clone()),
+            audit: audit_state.clone(),
+            endpoints: None,
+        },
+    )
+    .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -4408,6 +4423,21 @@ async fn start_postgres(
         backend.clone(),
         reindex_hook,
         observability.observers.clone(),
+    )
+    .await?;
+    manager::sync::install_sync(
+        &config,
+        manager::sync::SyncInstall {
+            local: backend.clone(),
+            cluster: backend.cluster_job_store(),
+            pg_store: Some(Arc::new(helios_endpoints::pg_sync::PgSyncStore::new(
+                backend.shared_pool(),
+            ))),
+            copier: Some(backend.clone()),
+            observer: Some(observability.observers.clone()),
+            audit: audit_state.clone(),
+            endpoints: None,
+        },
     )
     .await?;
     let app = create_app_with_auth_bulk_settings_and_ops(

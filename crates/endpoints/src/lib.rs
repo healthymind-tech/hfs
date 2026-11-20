@@ -22,6 +22,8 @@ pub mod console;
 pub mod model;
 pub mod name;
 pub mod outbound;
+#[cfg(feature = "postgres")]
+pub mod pg_sync;
 pub mod registry;
 pub mod secret;
 pub mod snapshot;
@@ -43,4 +45,4 @@ pub use registry::{EndpointRegistry, ReloadError, run_watcher};
 pub use secret::{SealedSecret, SecretInput, SecretKeyRing};
 pub use snapshot::{EndpointSnapshot, Resolution, ResolvedEndpoint};
 pub use store::{Actor, EndpointStore, MemoryEndpointStore, StoreError, ensure_default_endpoint};
-pub use sync::{SyncJob, SyncJobSpec, SyncRun, SyncStore};
+pub use sync::{SyncItemState, SyncJob, SyncJobSpec, SyncRun, SyncStore};

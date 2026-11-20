@@ -1184,6 +1184,7 @@ where
     let router = router.merge(routing::console_metrics::public_routes(
         console_public_state,
     ));
+    let router = router.merge(routing::admin_sync::notify_routes());
 
     // Tenant-scoped console metrics sit behind the same bearer-token auth as the
     // FHIR routes. The tenant is taken authoritatively from the JWT claim (see
@@ -1223,6 +1224,7 @@ where
     // tier as `console/metrics/tenants`: system-context scope + authentication.
     let admin_console = routing::console_metrics::admin_routes(console_admin_state)
         .merge(routing::admin_tenants::routes(admin_tenants_state))
+        .merge(routing::admin_sync::routes())
         .merge(routing::admin_packages::routes(
             package_manager,
             package_upload_limit,

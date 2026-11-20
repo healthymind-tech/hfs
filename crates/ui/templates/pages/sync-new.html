@@ -1,0 +1,138 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("sync-new") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sync-new") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("sync-new-lede") }}</p>
+</section>
+{% if !available %}
+<section class="card notice" role="status"><p>{{ i18n.t("sync-unavailable") }}</p></section>
+{% else %}
+{% if !errors.is_empty() %}
+<section class="card notice" role="alert">
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+<form class="card" method="post" action="/ui/sync/new" autocomplete="off">
+  <fieldset>
+    <legend>1 · {{ i18n.t("sync-step-basics") }}</legend>
+    <div class="field">
+      <label class="field__label" for="name">{{ i18n.t("sync-col-name") }}</label>
+      <input class="field__input" id="name" name="name" required maxlength="120" value="{{ v("name") }}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="description">{{ i18n.t("sync-description") }}</label>
+      <input class="field__input" id="description" name="description" value="{{ v("description") }}">
+    </div>
+  </fieldset>
+  {% for side in ["source", "target"] %}
+  <fieldset>
+    <legend>{% if is_source(side) %}2 · {{ i18n.t("sync-source") }}{% else %}3 · {{ i18n.t("sync-target") }}{% endif %}</legend>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_kind">{{ i18n.t("sync-peer-kind") }}</label>
+      <select class="field__input" id="{{ side }}_kind" name="{{ side }}_kind">
+        <option value="endpoint"{% if fis(side, "kind", "endpoint", "endpoint") %} selected{% endif %}>{{ i18n.t("sync-peer-endpoint") }}</option>
+        <option value="external"{% if fis(side, "kind", "external", "endpoint") %} selected{% endif %}>{{ i18n.t("sync-peer-external") }}</option>
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_endpoint">{{ i18n.t("sync-peer-endpoint") }}</label>
+      <select class="field__input" id="{{ side }}_endpoint" name="{{ side }}_endpoint">
+        {% for e in endpoints %}<option value="{{ e.name }}"{% if fv(side, "endpoint") == e.name %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_url">{{ i18n.t("sync-base-url") }}</label>
+      <input class="field__input" id="{{ side }}_url" name="{{ side }}_url" type="url" placeholder="https://fhir.example.org/fhir" value="{{ fv(side, "url") }}">
+      <p class="field__hint">{{ i18n.t("sync-base-url-hint") }}</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_auth">{{ i18n.t("sync-auth") }}</label>
+      <select class="field__input" id="{{ side }}_auth" name="{{ side }}_auth">
+        {% for a in ["none", "bearer", "basic", "client-credentials"] %}
+        <option value="{{ a }}"{% if fis(side, "auth", a, "none") %} selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_username">{{ i18n.t("sync-username") }}</label>
+      <input class="field__input" id="{{ side }}_username" name="{{ side }}_username" value="{{ fv(side, "username") }}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_token_url">{{ i18n.t("sync-token-url") }}</label>
+      <input class="field__input" id="{{ side }}_token_url" name="{{ side }}_token_url" type="url" value="{{ fv(side, "token_url") }}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_client_id">{{ i18n.t("sync-client-id") }}</label>
+      <input class="field__input" id="{{ side }}_client_id" name="{{ side }}_client_id" value="{{ fv(side, "client_id") }}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_scope">{{ i18n.t("sync-scope") }}</label>
+      <input class="field__input" id="{{ side }}_scope" name="{{ side }}_scope" value="{{ fv(side, "scope") }}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ side }}_secret">{{ i18n.t("sync-secret") }}</label>
+      <input class="field__input" id="{{ side }}_secret" name="{{ side }}_secret" type="password" autocomplete="new-password">
+      <p class="field__hint">{{ i18n.t("sync-secret-hint") }}</p>
+    </div>
+  </fieldset>
+  {% endfor %}
+  <fieldset>
+    <legend>4 · {{ i18n.t("sync-step-data") }}</legend>
+    <div class="field">
+      <label class="field__label" for="resource_types">{{ i18n.t("sync-resource-types") }}</label>
+      <input class="field__input" id="resource_types" name="resource_types" placeholder="Patient, Observation" value="{{ v("resource_types") }}">
+      <p class="field__hint">{{ i18n.t("sync-resource-types-hint") }}</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="initial_load">{{ i18n.t("sync-initial-load") }}</label>
+      <select class="field__input" id="initial_load" name="initial_load">
+        {% for o in ["paged-read", "storage-copy", "bulk-export", "none"] %}
+        <option value="{{ o }}"{% if is("initial_load", o, "paged-read") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <label><input type="checkbox" name="include_history"{% if v("include_history") == "on" %} checked{% endif %}> {{ i18n.t("sync-include-history") }}</label>
+  </fieldset>
+  <fieldset>
+    <legend>5 · {{ i18n.t("sync-step-schedule") }}</legend>
+    <div class="field">
+      <label class="field__label" for="trigger">{{ i18n.t("sync-col-trigger") }}</label>
+      <select class="field__input" id="trigger" name="trigger">
+        {% for o in ["manual", "interval", "continuous", "subscription"] %}
+        <option value="{{ o }}"{% if is("trigger", o, "manual") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="every_secs">{{ i18n.t("sync-every-secs") }}</label>
+      <input class="field__input" id="every_secs" name="every_secs" type="number" min="60" value="{% if v("every_secs").is_empty() %}3600{% else %}{{ v("every_secs") }}{% endif %}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="poll_secs">{{ i18n.t("sync-poll-secs") }}</label>
+      <input class="field__input" id="poll_secs" name="poll_secs" type="number" min="1" value="{% if v("poll_secs").is_empty() %}30{% else %}{{ v("poll_secs") }}{% endif %}">
+    </div>
+    <div class="field">
+      <label class="field__label" for="conflict">{{ i18n.t("sync-conflict") }}</label>
+      <select class="field__input" id="conflict" name="conflict">
+        {% for o in ["source-wins", "skip-if-target-newer", "fail"] %}
+        <option value="{{ o }}"{% if is("conflict", o, "source-wins") %} selected{% endif %}>{{ o }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="batch_size">{{ i18n.t("sync-batch-size") }}</label>
+      <input class="field__input" id="batch_size" name="batch_size" type="number" min="1" max="1000" value="{% if v("batch_size").is_empty() %}200{% else %}{{ v("batch_size") }}{% endif %}">
+    </div>
+    <label><input type="checkbox" name="propagate_deletes" checked> {{ i18n.t("sync-propagate-deletes") }}</label>
+    <label><input type="checkbox" name="enabled" checked> {{ i18n.t("sync-enabled") }}</label>
+  </fieldset>
+  <div class="addbox__actions">
+    <a class="btn" href="/ui/sync">{{ i18n.t("sync-cancel-form") }}</a>
+    <button type="submit" class="btn btn--primary">{{ i18n.t("sync-create") }}</button>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

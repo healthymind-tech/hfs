@@ -1,0 +1,58 @@
+[package]
+name = "helios-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/sync"
+description = "FHIR server manager: one-way sync jobs between FHIR endpoints and external FHIR servers, and endpoint duplication"
+keywords = ["helios-software", "fhir", "sync"]
+
+# Package P6 of docs/design/fhir-server-manager.md. Depends on the contracts
+# crate (helios-endpoints) and on persistence for in-process access to local
+# endpoints; never on helios-rest (rest depends on this crate for its admin
+# API). Every third-party dependency below is already in the workspace lock.
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5", "R4B"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6", "R4B"]
+# PostgreSQL sync store, storage-copy initial load and endpoint duplication
+# with data.
+postgres = ["helios-persistence/postgres", "helios-endpoints/postgres"]
+
+[dependencies]
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "net"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+url = "2.5"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# SMART Backend Services client assertions (private_key_jwt).
+jsonwebtoken = "9"
+p384 = { version = "0.14", features = ["pem", "pkcs8"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
+axum = "0.8"
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false, features = ["R4", "sqlite"] }
+# A second, real HFS instance for the two-instance tests (dev-dependency
+# cycle with helios-rest is fine: tests only talk to it over HTTP).
+helios-rest = { path = "../rest", version = "0.2.9" }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

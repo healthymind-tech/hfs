@@ -1,0 +1,47 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ row.name }} — {{ i18n.t("sync-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ row.name }}</h1>
+    <p class="page-head__lede">{{ row.source }} → {{ row.target }} · {{ row.trigger }}{% if !row.enabled %} · {{ i18n.t("sync-disabled") }}{% endif %}</p>
+  </div>
+  <div class="addbox__actions">
+    {% if active %}
+    <form method="post" action="/ui/sync/{{ row.id }}/cancel"><button class="btn" type="submit">{{ i18n.t("sync-action-cancel") }}</button></form>
+    {% else %}
+    <form method="post" action="/ui/sync/{{ row.id }}/run"><button class="btn btn--primary" type="submit">{{ i18n.t("sync-action-run") }}</button></form>
+    {% if retryable %}<form method="post" action="/ui/sync/{{ row.id }}/retry"><button class="btn" type="submit">{{ i18n.t("sync-action-retry") }}</button></form>{% endif %}
+    {% endif %}
+    <form method="post" action="/ui/sync/{{ row.id }}/delete" data-confirm="{{ i18n.t("sync-delete-confirm") }}"><button class="btn" type="submit">{{ i18n.t("sync-action-delete") }}</button></form>
+  </div>
+</section>
+
+<section class="card table-card">
+  <div class="card-head"><h3>{{ i18n.t("sync-runs") }}</h3></div>
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table">
+      <thead><tr><th>{{ i18n.t("sync-col-started") }}</th><th>{{ i18n.t("sync-col-state") }}</th><th>{{ i18n.t("sync-col-reason") }}</th><th>{{ i18n.t("sync-col-progress") }}</th></tr></thead>
+      <tbody>
+        {% for r in runs %}
+        <tr>
+          <td><a href="/ui/sync/runs/{{ r.id }}">{{ r.created }}</a></td>
+          <td data-state="{{ r.state }}">{{ r.state }}</td>
+          <td>{{ r.reason }}</td>
+          <td>{{ r.progress }}{% if !r.error.is_empty() %}<br><span class="field__hint">{{ r.error }}</span>{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr class="data-table__empty"><td colspan="4">{{ i18n.t("sync-no-runs") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-head"><h3>{{ i18n.t("sync-definition") }}</h3></div>
+  <pre class="code-block">{{ definition }}</pre>
+</section>
+{% endblock %}

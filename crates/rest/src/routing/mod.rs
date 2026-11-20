@@ -4,6 +4,7 @@
 //! to handlers.
 
 pub mod admin_packages;
+pub mod admin_sync;
 pub mod admin_tenants;
 pub mod console_metrics;
 pub mod fhir_routes;
