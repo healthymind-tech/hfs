@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use helios_endpoints::store::EndpointRevision;
 use helios_endpoints::sync::DuplicateRequest;
 use helios_endpoints::{Actor, Endpoint, EndpointAuth, EndpointSpec, EndpointStatus, SecretInput};
+use helios_rest::endpoint::AdminApiSlot;
 use helios_rest::handlers::admin_endpoints::AdminEndpointsState;
 use helios_rest::handlers::admin_endpoints::error::{ApiError, ErrorKind};
 use helios_rest::handlers::admin_endpoints::spec_input::SecretInputs;
@@ -29,13 +30,18 @@ use super::ManagerContext;
 
 /// Installs the console runtime for this process.
 pub fn install_ui(ctx: &ManagerContext) {
-    let admin = AdminEndpointsState::builder(ctx.store.clone(), ctx.registry.clone())
+    // Until the app is built (and whenever it is built without the manager
+    // runtime) a store-only service stands in; afterwards every call goes
+    // through the service the app published (`ctx.admin_api`), the very
+    // state behind `/admin/endpoints`: audit sink, statistics, audit search.
+    let fallback = AdminEndpointsState::builder(ctx.store.clone(), ctx.registry.clone())
         .env_defaults(None)
         .key_ring(ctx.key_ring.clone())
         .server_base(ctx.config.base_url.clone())
         .build();
     let backend = AdminApiBackend {
-        admin,
+        shared: Arc::clone(&ctx.admin_api),
+        fallback,
         store: StoreBackend::new(ctx.store.clone()).with_registry(ctx.registry.clone()),
         key_ring: ctx.key_ring.is_some(),
     };
@@ -47,10 +53,19 @@ pub fn install_ui(ctx: &ManagerContext) {
 
 /// [`ManagerBackend`] over P4's admin service.
 pub struct AdminApiBackend {
-    admin: AdminEndpointsState,
+    /// The service `build_app` published (P4's `EndpointRuntime::admin_api`).
+    shared: AdminApiSlot,
+    /// Used only before the app published its service.
+    fallback: AdminEndpointsState,
     /// For the health probe only (store round trip).
     store: StoreBackend,
     key_ring: bool,
+}
+
+impl AdminApiBackend {
+    fn admin(&self) -> &AdminEndpointsState {
+        self.shared.get().unwrap_or(&self.fallback)
+    }
 }
 
 /// Maps a P4 error onto the console's error (1:1, see P4's report).
@@ -82,11 +97,11 @@ fn inputs(changes: SecretChanges) -> SecretInputs {
 #[async_trait]
 impl ManagerBackend for AdminApiBackend {
     async fn list(&self) -> Result<Vec<Endpoint>, BackendError> {
-        self.admin.list_endpoints(false).await.map_err(map)
+        self.admin().list_endpoints(false).await.map_err(map)
     }
 
     async fn get(&self, name: &str) -> Result<Option<Endpoint>, BackendError> {
-        match self.admin.get_endpoint(name).await {
+        match self.admin().get_endpoint(name).await {
             Ok(e) => Ok(Some(e)),
             Err(e) if matches!(e.kind(), ErrorKind::NotFound) => Ok(None),
             Err(e) => Err(map(e)),
@@ -99,7 +114,7 @@ impl ManagerBackend for AdminApiBackend {
         secrets: SecretChanges,
         actor: &Actor,
     ) -> Result<Endpoint, BackendError> {
-        self.admin
+        self.admin()
             .create_endpoint(spec, inputs(secrets), actor)
             .await
             .map(|w| w.endpoint)
@@ -114,7 +129,7 @@ impl ManagerBackend for AdminApiBackend {
         secrets: SecretChanges,
         actor: &Actor,
     ) -> Result<Endpoint, BackendError> {
-        self.admin
+        self.admin()
             .update_endpoint(
                 name,
                 expected_revision,
@@ -137,20 +152,20 @@ impl ManagerBackend for AdminApiBackend {
     ) -> Result<Endpoint, BackendError> {
         if status == EndpointStatus::Deleted {
             return self
-                .admin
+                .admin()
                 .delete_endpoint(name, Some(expected_revision), false, actor)
                 .await
                 .map(|d| d.endpoint)
                 .map_err(map);
         }
-        self.admin
+        self.admin()
             .set_endpoint_status(name, Some(expected_revision), status, actor)
             .await
             .map_err(map)
     }
 
     async fn history(&self, name: &str) -> Result<Vec<EndpointRevision>, BackendError> {
-        self.admin
+        self.admin()
             .endpoint_history(name, 50)
             .await
             .map(|(_, revs)| revs)
@@ -164,7 +179,7 @@ impl ManagerBackend for AdminApiBackend {
         actor: &Actor,
     ) -> Result<DuplicateOutcome, BackendError> {
         let name = request.name.clone();
-        self.admin
+        self.admin()
             .duplicate_endpoint(source, request, actor)
             .await
             .map(|started| DuplicateOutcome {
@@ -175,27 +190,37 @@ impl ManagerBackend for AdminApiBackend {
     }
 
     async fn test_auth(&self, auth: &EndpointAuth) -> Result<Vec<ProbeLine>, BackendError> {
-        self.admin
-            .test_endpoint_auth(None, Some(auth.clone()))
+        self.admin()
+            .test_endpoint_auth(None, Some(auth.clone()), None)
             .await
-            .map(|report| {
-                report
-                    .checks
-                    .into_iter()
-                    .map(|c| ProbeLine {
-                        ok: c.ok,
-                        message: match c.detail {
-                            Some(d) => format!("{}: {d}", c.name),
-                            None => c.name,
-                        },
-                    })
-                    .collect()
+            .map(|r| {
+                let mut lines = vec![ProbeLine {
+                    ok: r.report.ok,
+                    message: format!("mode: {}", r.report.mode),
+                }];
+                for (name, step) in [
+                    ("issuer-discovery", &r.report.issuer),
+                    ("jwks", &r.report.jwks),
+                    ("token", &r.token),
+                ] {
+                    if let Some(step) = step {
+                        lines.push(ProbeLine {
+                            ok: step.ok,
+                            message: format!("{name}: {}", step.detail),
+                        });
+                    }
+                }
+                lines.extend(r.report.warnings.iter().map(|w| ProbeLine {
+                    ok: true,
+                    message: format!("warning: {w}"),
+                }));
+                lines
             })
             .map_err(map)
     }
 
     async fn stats(&self, name: &str) -> Option<EndpointStats> {
-        let view = self.admin.endpoint_stats(name, 300).await.ok()?;
+        let view = self.admin().endpoint_stats(name, 300).await.ok()?;
         let has_traffic = view.traffic.samples > 0;
         Some(EndpointStats {
             requests_per_minute: has_traffic.then_some(view.traffic.requests_per_minute),
@@ -216,7 +241,9 @@ impl ManagerBackend for AdminApiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helios_endpoints::{EndpointName, EndpointRegistry, FhirRelease, MemoryEndpointStore};
+    use helios_endpoints::{
+        EndpointName, EndpointRegistry, EndpointStore as _, FhirRelease, MemoryEndpointStore,
+    };
 
     fn admin() -> Actor {
         Actor {
@@ -237,7 +264,8 @@ mod tests {
             .unwrap();
         let registry = Arc::new(EndpointRegistry::load(store.as_ref()).await.unwrap());
         AdminApiBackend {
-            admin: AdminEndpointsState::builder(store.clone(), registry.clone()).build(),
+            shared: Default::default(),
+            fallback: AdminEndpointsState::builder(store.clone(), registry.clone()).build(),
             store: StoreBackend::new(store).with_registry(registry),
             key_ring: false,
         }
@@ -295,5 +323,71 @@ mod tests {
             .unwrap_err(),
             BackendError::NotImplemented
         );
+    }
+
+    /// Keeps admin events.
+    #[derive(Default)]
+    struct Capture(std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>);
+
+    #[async_trait]
+    impl helios_audit::AuditSink for Capture {
+        async fn record(&self, event: helios_audit::AuditEvent) {
+            self.record_in(None, event).await;
+        }
+        async fn record_in(&self, tenant: Option<&str>, event: helios_audit::AuditEvent) {
+            self.0.lock().unwrap().push((
+                tenant.map(str::to_string),
+                serde_json::to_value(&event).unwrap(),
+            ));
+        }
+        async fn flush(&self) {}
+        fn name(&self) -> &str {
+            "capture"
+        }
+    }
+
+    /// The console uses the service the app published, so its writes land in
+    /// the same audit sink as the API's (not the log-only fallback).
+    #[tokio::test]
+    async fn console_writes_use_the_published_service_and_its_audit_sink() {
+        let fallback = backend().await;
+        let store = Arc::new(MemoryEndpointStore::new());
+        store
+            .create(
+                EndpointSpec::default_endpoint("default", FhirRelease::R4),
+                &Actor::bootstrap(),
+            )
+            .await
+            .unwrap();
+        let registry = Arc::new(EndpointRegistry::load(store.as_ref()).await.unwrap());
+        let sink = Arc::new(Capture::default());
+        let slot = AdminApiSlot::default();
+        assert!(
+            slot.set(
+                AdminEndpointsState::builder(store.clone(), registry)
+                    .audit(Some(sink.clone()), "Device/hfs", "default")
+                    .build(),
+            )
+            .is_ok()
+        );
+        let b = AdminApiBackend {
+            shared: slot,
+            ..fallback
+        };
+        let spec = EndpointSpec::named(EndpointName::parse("lab").unwrap(), "Lab");
+        b.create(spec, SecretChanges::new(), &admin())
+            .await
+            .unwrap();
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "the console write reached the published sink"
+        );
+        assert_eq!(events[0].0.as_deref(), Some("default"));
+        assert!(events[0].1.to_string().contains("Endpoint/lab"));
+        // It went to the published store, not the fallback's.
+        assert!(store.get("lab").await.unwrap().is_some());
+        assert!(b.fallback.get_endpoint("lab").await.is_err());
     }
 }
