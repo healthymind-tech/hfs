@@ -132,7 +132,7 @@
     nav.hidden = false;
     back.hidden = false;
     next.hidden = false;
-    function show(n) {
+    function show(n, focus) {
       current = Math.max(0, Math.min(steps.length - 1, n));
       for (var i = 0; i < steps.length; i++) steps[i].hidden = i !== current;
       var buttons = nav.querySelectorAll("[data-wizard-go]");
@@ -150,17 +150,17 @@
         if (preview) window.htmx.trigger(preview, "click");
       }
       var heading = steps[current].querySelector("h2");
-      if (heading) {
+      if (heading && focus) {
         heading.setAttribute("tabindex", "-1");
         heading.focus({ preventScroll: false });
       }
     }
     nav.addEventListener("click", function (e) {
       var b = e.target.closest("[data-wizard-go]");
-      if (b) show(parseInt(b.getAttribute("data-wizard-go"), 10));
+      if (b) show(parseInt(b.getAttribute("data-wizard-go"), 10), true);
     });
     back.addEventListener("click", function () {
-      show(current - 1);
+      show(current - 1, true);
     });
     next.addEventListener("click", function () {
       // Native constraint check of the visible step before moving on.
@@ -171,9 +171,9 @@
           return;
         }
       }
-      show(current + 1);
+      show(current + 1, true);
     });
-    show(current);
+    show(current, false);
   }
 
   function init() {

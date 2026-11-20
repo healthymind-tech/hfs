@@ -1910,7 +1910,8 @@ pub(crate) async fn duplicate(
         Ok(NewEndpoint::Duplicate { source, request }) => {
             match c.runtime.backend.duplicate(&source, request, &actor).await {
                 Ok(o) => {
-                    return Redirect::to(&format!("/ui/e/{}?created=1", o.endpoint)).into_response();
+                    return Redirect::to(&format!("/ui/e/{}?created=1", o.endpoint))
+                        .into_response();
                 }
                 Err(BackendError::NotImplemented) => {
                     let mut m = FieldErrors::new();
