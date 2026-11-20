@@ -123,6 +123,12 @@ pub async fn build(
     console
 }
 
+/// The console sign-in runtime of this process, once [`build`] ran (`None`
+/// when console sign-in is off).
+pub fn current() -> Option<Arc<ConsoleAuth>> {
+    CONSOLE.get().cloned().flatten()
+}
+
 async fn build_runtime(
     env: EnvBootstrap,
     base_url: &str,

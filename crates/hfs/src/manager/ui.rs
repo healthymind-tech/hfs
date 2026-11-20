@@ -234,6 +234,10 @@ impl ManagerBackend for AdminApiBackend {
     async fn health(&self) -> ServerHealth {
         let mut health = self.store.health().await;
         health.key_ring = self.key_ring;
+        // The live console sign-in mode (the store's view has none).
+        if let Some(console) = super::console_auth::current() {
+            health.console_mode = console.mode();
+        }
         health
     }
 }
