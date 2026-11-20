@@ -28,11 +28,44 @@ async-trait = "0.1"
 # PostgreSQL session store (feature `postgres`), for multi-instance deployments.
 deadpool-postgres = { version = "0.14", optional = true }
 
+# ---- feature `console`: the web console sign-in (none / oidc / local modes,
+# roles, CSRF tokens, local accounts) of docs/design/fhir-server-manager.md
+# §7 (package P3). HTS keeps the plain password gate and does not enable it.
+helios-endpoints = { path = "../endpoints", version = "0.2.9", optional = true }
+# The OIDC Authorization Code + PKCE client (#1449) is reused for the console.
+helios-auth = { path = "../auth", version = "0.2.9", optional = true }
+# Local account passwords: argon2id (OWASP 2024 parameters). The only new
+# third-party dependency of the server manager design.
+argon2 = { version = "0.5", optional = true, features = ["std"] }
+serde = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "net", "rt"], optional = true }
+url = { version = "2.5", optional = true }
+form_urlencoded = { version = "1", optional = true }
+
 [features]
 default = []
 postgres = ["dep:deadpool-postgres"]
+console = [
+    "dep:helios-endpoints",
+    "dep:helios-auth",
+    "dep:argon2",
+    "dep:serde",
+    "dep:chrono",
+    "dep:uuid",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:url",
+    "dep:form_urlencoded",
+]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[[test]]
+name = "pg_console_sessions"
+required-features = ["console", "postgres"]

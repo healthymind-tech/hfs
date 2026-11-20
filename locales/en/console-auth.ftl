@@ -1,0 +1,121 @@
+# Console sign-in, users and roles (package P3, crates/ui/src/{login,account,
+# console_settings,console_users}.rs). en is the source; zh-Hant must define
+# the same keys (checked by a test); de and es fall back to en.
+
+console-product = HealthyMind FHIR Server Manager
+console-product-short = HealthyMind FHIR
+console-login-title = Sign in
+console-login-lede-oidc = Sign in with your organization's account.
+console-login-lede-local = Sign in with your console account.
+console-login-lede-break-glass = Administrator (break-glass) sign-in.
+console-login-with-idp = Sign in with single sign-on
+console-login-break-glass = Administrator sign-in (break-glass)
+console-login-back-to-idp = Back to single sign-on
+console-login-signed-out = You have signed out.
+console-login-no-oidc = Single sign-on is not available: { $reason }
+console-login-failed-title = Sign-in failed
+console-back = Back
+console-sign-out = Sign out
+console-sign-out-idp = Sign out of the identity provider
+
+console-forbidden-title = Not allowed
+console-forbidden-text = This page needs the { $role } role. Ask an administrator if you need access.
+console-noaccess-title = No access to this console
+console-noaccess-text = { $user } signed in, but no console role is assigned to this account.
+console-csrf-title = Request refused
+console-csrf-text = The request did not come from this console page (or the page is out of date). Reload the page and try again.
+
+console-mode-none = None — the console is open (visitors get the anonymous role)
+console-mode-oidc = OpenID Connect single sign-on — every page needs a session
+console-mode-local = Built-in accounts — every page needs a session
+
+console-settings-auth-title = Console sign-in
+console-settings-auth-lede = How people sign in to this console, and what they may do.
+console-settings-users-title = Users and roles
+console-settings-users-lede = Built-in accounts, per-endpoint roles and live sessions. Roles: viewer (browse), editor (+ write data), admin (+ server administration).
+console-settings-not-persistent = This server has no PostgreSQL database: settings, accounts and sessions are kept in memory until restart.
+console-settings-no-break-glass = No break-glass administrator: HFS_ADMIN_PASSWORD is not set or break-glass is off. A broken configuration can then only be repaired through the environment.
+console-settings-mode = Sign-in mode
+console-settings-pinned = set by
+console-settings-anonymous-role = Role of anonymous visitors (mode none)
+console-settings-break-glass = Allow the HFS_ADMIN_PASSWORD administrator to sign in (break-glass)
+console-settings-oidc = OpenID Connect client
+console-settings-oidc-issuer = Issuer URL
+console-settings-oidc-client-id = Client id
+console-settings-oidc-scopes = Scopes
+console-settings-oidc-role-claim = Role claim (dotted path, e.g. realm_access.roles or groups)
+console-settings-oidc-admin-values = Claim values granting admin (comma separated)
+console-settings-oidc-editor-values = Claim values granting editor
+console-settings-oidc-viewer-values = Claim values granting viewer
+console-settings-oidc-secret = Client secret (confidential clients)
+console-settings-secret-set = set
+console-settings-secret-unset = not set
+console-settings-secret-no-keyring = Storing a secret needs HFS_SECRET_KEYS.
+console-settings-secret-clear = Remove the stored client secret
+console-settings-oidc-default-role = Role when no claim value matches
+console-settings-local = Accounts and sessions
+console-settings-min-length = Minimum password length
+console-settings-lockout-failures = Failed sign-ins before lockout
+console-settings-lockout-minutes = Lockout and failure window (minutes)
+console-settings-session-idle = Session idle lifetime (minutes)
+console-settings-session-absolute = Session absolute lifetime (hours)
+console-settings-allowed-origins = Extra origins accepted on writes (comma separated)
+console-settings-saved = Settings saved.
+console-settings-test-title = Test sign-in
+console-settings-test-lede = Before switching to OpenID Connect, save the client and run a test sign-in with it.
+console-settings-test-passed = A test sign-in with the saved OpenID Connect client passed. You may switch the mode.
+console-settings-test-button = Test sign-in
+console-settings-test-ok = Test sign-in passed for { $user } (role: { $role }).
+console-settings-test-no-role = Test sign-in worked for { $user }, but no role maps for that account.
+console-save = Save
+
+console-users-one-time = One-time password (shown once; the user must change it at first sign-in):
+console-users-not-local = Built-in accounts sign in only when the mode is "Built-in accounts".
+console-users-list = Accounts
+console-users-name = Name
+console-users-role = Role
+console-users-status = Status
+console-users-last-login = Last sign-in
+console-users-disabled = disabled
+console-users-reset = Reset password
+console-users-delete = Delete
+console-users-delete-confirm = Delete this account?
+console-users-create = Create account
+console-users-email = E-mail
+console-users-initial-password = Initial password (empty = generate one)
+console-users-initial-password-hint = At least { $min } characters; not a common password; not containing the user name.
+console-users-created = Account created.
+console-users-updated = Account updated.
+console-users-deleted = Account deleted.
+console-users-reset-done = Password reset.
+console-bindings-title = Per-endpoint roles
+console-bindings-lede = A binding replaces the global role on one endpoint (raise or lower). Server administration always needs the global admin role.
+console-bindings-subject = Subject
+console-bindings-endpoint = Endpoint
+console-bindings-add = Add binding
+console-bindings-saved = Binding saved.
+console-sessions-title = Live sessions
+console-sessions-via = Signed in with
+console-sessions-client = Client
+console-sessions-last-seen = Last seen
+console-sessions-current = this session
+console-sessions-revoke = End session
+console-sessions-revoked = Session ended.
+
+console-account-title = Account
+console-account-must-change = Choose a new password before continuing.
+console-account-password = Change password
+console-account-current = Current password
+console-account-new = New password
+console-account-confirm = Repeat the new password
+console-account-change = Change password
+console-account-changed = Password changed.
+console-account-mismatch = The new passwords do not match.
+
+console-password-too-short = The password must have at least { $min } characters.
+console-password-too-long = The password is too long.
+console-password-username = The password must not contain the user name.
+console-password-repetitive = The password must not repeat one character.
+console-password-common = This password is on the list of common passwords.
+console-error-conflict = Someone changed this meanwhile. Reload and try again.
+console-error-unavailable = The console store is unavailable: { $detail }

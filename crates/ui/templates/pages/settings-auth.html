@@ -1,0 +1,113 @@
+{% extends "layouts/base.html" %}
+
+{#
+  Settings → Authentication (package P3, crates/ui/src/console_settings.rs).
+  Console sign-in mode, OIDC client, local account policy, session
+  lifetimes, break-glass. Fields set by environment variables are pinned:
+  shown disabled with the variable named. Switching to OIDC needs a passed
+  "Test sign-in" of the saved OIDC client; switching to local needs an
+  enabled admin account.
+#}
+
+{% block title %}{{ i18n.t("console-settings-auth-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("console-settings-auth-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("console-settings-auth-lede") }}</p>
+  <p><a href="/ui/settings/users">{{ i18n.t("console-settings-users-title") }}</a></p>
+</header>
+{% if let Some(message) = notice %}<div class="card notice" role="status" id="settings-notice">{{ message }}</div>{% endif %}
+{% if let Some(message) = error %}<div class="alert" role="alert" id="settings-error">{{ message }}</div>{% endif %}
+{% if !persistent %}<div class="card notice notice--warn">{{ i18n.t("console-settings-not-persistent") }}</div>{% endif %}
+{% if !break_glass_available %}<div class="card notice notice--warn">{{ i18n.t("console-settings-no-break-glass") }}</div>{% endif %}
+
+<form method="post" action="/ui/settings/auth" class="card" id="settings-auth-form">
+  {{ csrf_html|safe }}
+  <input type="hidden" name="revision" value="{{ revision }}">
+
+  <fieldset class="field">
+    <legend class="field__label">{{ i18n.t("console-settings-mode") }}{% if self.pinned("mode") %} 🔒 <small>{{ i18n.t("console-settings-pinned") }} HFS_CONSOLE_AUTH_MODE</small>{% endif %}</legend>
+    {% for (value, key) in modes %}
+    <label class="field--choice">
+      <input type="radio" name="mode" value="{{ value }}"{% if form.mode == *value %} checked{% endif %}{% if self.pinned("mode") %} disabled{% endif %}>
+      <span>{{ i18n.t(key) }}</span>
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <label class="field">
+    <span class="field__label">{{ i18n.t("console-settings-anonymous-role") }}{% if self.pinned("anonymousRole") %} 🔒 <small>HFS_CONSOLE_ANONYMOUS_ROLE</small>{% endif %}</span>
+    <select class="field__input" name="anonymousRole"{% if self.pinned("anonymousRole") %} disabled{% endif %}>
+      {% for value in ["none", "viewer", "editor"] %}
+      <option value="{{ value }}"{% if form.anonymous_role == *value %} selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="field--choice">
+    <input type="checkbox" name="breakGlass" value="true"{% if form.break_glass %} checked{% endif %}{% if self.pinned("breakGlass") %} disabled{% endif %}>
+    <span>{{ i18n.t("console-settings-break-glass") }}{% if self.pinned("breakGlass") %} 🔒 <small>HFS_CONSOLE_BREAK_GLASS</small>{% endif %}</span>
+  </label>
+
+  <h2>{{ i18n.t("console-settings-oidc") }}</h2>
+  {% for (name, label, var, value) in oidc_fields %}
+  <label class="field">
+    <span class="field__label">{{ i18n.t(label) }}{% if self.pinned(name) %} 🔒 <small>{{ var }}</small>{% endif %}</span>
+    <input class="field__input" type="text" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %} autocomplete="off" spellcheck="false">
+  </label>
+  {% endfor %}
+  <label class="field">
+    <span class="field__label">{{ i18n.t("console-settings-oidc-secret") }}{% if self.pinned("oidc.clientSecret") %} 🔒 <small>HFS_CONSOLE_OIDC_CLIENT_SECRET</small>{% endif %}
+      — {% if secret_set %}{{ i18n.t("console-settings-secret-set") }}{% else %}{{ i18n.t("console-settings-secret-unset") }}{% endif %}</span>
+    <input class="field__input" type="password" name="oidc.clientSecret" value="" autocomplete="new-password"{% if self.pinned("oidc.clientSecret") || !key_ring %} disabled{% endif %}>
+    {% if !key_ring %}<span class="field__hint">{{ i18n.t("console-settings-secret-no-keyring") }}</span>{% endif %}
+  </label>
+  {% if secret_set && !self.pinned("oidc.clientSecret") %}
+  <label class="field--choice"><input type="checkbox" name="oidc.clientSecret.clear" value="true"> <span>{{ i18n.t("console-settings-secret-clear") }}</span></label>
+  {% endif %}
+  <label class="field">
+    <span class="field__label">{{ i18n.t("console-settings-oidc-default-role") }}{% if self.pinned("oidc.defaultRole") %} 🔒 <small>HFS_CONSOLE_OIDC_DEFAULT_ROLE</small>{% endif %}</span>
+    <select class="field__input" name="oidc.defaultRole"{% if self.pinned("oidc.defaultRole") %} disabled{% endif %}>
+      {% for value in ["none", "viewer", "editor", "admin"] %}
+      <option value="{{ value }}"{% if form.default_role == *value %} selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <h2>{{ i18n.t("console-settings-local") }}</h2>
+  {% for (name, label, var, value) in number_fields %}
+  <label class="field">
+    <span class="field__label">{{ i18n.t(label) }}{% if self.pinned(name) %} 🔒 <small>{{ var }}</small>{% endif %}</span>
+    <input class="field__input" type="number" min="1" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %}>
+  </label>
+  {% endfor %}
+  <label class="field">
+    <span class="field__label">{{ i18n.t("console-settings-allowed-origins") }}{% if self.pinned("allowedOrigins") %} 🔒 <small>HFS_CONSOLE_ALLOWED_ORIGINS</small>{% endif %}</span>
+    <input class="field__input" type="text" name="allowedOrigins" value="{{ form.allowed_origins }}"{% if self.pinned("allowedOrigins") %} disabled{% endif %} spellcheck="false">
+  </label>
+
+  {% if !field_errors.is_empty() %}
+  <ul class="alert" role="alert" id="settings-field-errors">
+    {% for (f, m) in field_errors %}<li><code>{{ f }}</code>: {{ m }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+
+  <div class="form-actions form-actions--start">
+    <button class="btn btn--primary" type="submit">{{ i18n.t("console-save") }}</button>
+  </div>
+</form>
+
+{% if oidc_configured %}
+<section class="card" id="oidc-test">
+  <h2>{{ i18n.t("console-settings-test-title") }}</h2>
+  <p>{% if test_passed %}✔ {{ i18n.t("console-settings-test-passed") }}{% else %}{{ i18n.t("console-settings-test-lede") }}{% endif %}</p>
+  <form method="post" action="/ui/settings/auth/test">
+    {{ csrf_html|safe }}
+    <button class="btn" type="submit">{{ i18n.t("console-settings-test-button") }}</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}
