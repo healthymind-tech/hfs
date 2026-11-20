@@ -65,7 +65,7 @@ fn manager_error(e: ManagerError) -> Response {
     }
 }
 
-fn gate(manager: &PackageManager) -> Option<Response> {
+pub(crate) fn gate(manager: &PackageManager) -> Option<Response> {
     if manager.admin_enabled() {
         None
     } else {
@@ -148,7 +148,12 @@ pub async fn list_handler(
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match manager.list(&tenant).await {
+    list_in(&manager, &tenant).await
+}
+
+/// Installed packages of `tenant` (shared with the endpoint-scoped routes).
+pub(crate) async fn list_in(manager: &PackageManager, tenant: &str) -> Response {
+    match manager.list(tenant).await {
         Ok(packages) => Json(json!({"tenant": tenant, "packages": packages})).into_response(),
         Err(e) => manager_error(e),
     }
@@ -183,13 +188,35 @@ pub async fn create_handler(
         Ok(t) => t,
         Err(r) => return *r,
     };
-    let requested_by = who(principal.as_deref());
-    let request = if is_archive(&headers) {
+    install_in(
+        &manager,
+        &tenant,
+        &headers,
+        query.dry_run,
+        query.wait,
+        who(principal.as_deref()),
+        body,
+    )
+    .await
+}
+
+/// Starts an install (JSON request or `.tgz` upload) into `tenant` (shared
+/// with the endpoint-scoped routes).
+pub(crate) async fn install_in(
+    manager: &Manager,
+    tenant: &str,
+    headers: &HeaderMap,
+    dry_run: Option<bool>,
+    wait: Option<u64>,
+    requested_by: Option<String>,
+    body: Bytes,
+) -> Response {
+    let request = if is_archive(headers) {
         // Upload: validate and cache, then plan (or install with
         // ?dryRun=false). Works with the registry off.
         let bytes = body.to_vec();
         let accepted = {
-            let manager = Arc::clone(&manager);
+            let manager = Arc::clone(manager);
             tokio::task::spawn_blocking(move || manager.accept_upload(&bytes)).await
         };
         let manifest = match accepted {
@@ -205,13 +232,13 @@ pub async fn create_handler(
         };
         InstallRequest {
             package: Some(manifest.key()),
-            dry_run: query.dry_run.unwrap_or(true),
+            dry_run: dry_run.unwrap_or(true),
             ..InstallRequest::default()
         }
     } else {
         match serde_json::from_slice::<InstallRequest>(&body) {
             Ok(mut r) => {
-                if let Some(d) = query.dry_run {
+                if let Some(d) = dry_run {
                     r.dry_run = d;
                 }
                 r
@@ -225,8 +252,8 @@ pub async fn create_handler(
             }
         }
     };
-    match manager.start_install(&tenant, request, requested_by) {
-        Ok(job) => job_response(job, query.wait).await,
+    match manager.start_install(tenant, request, requested_by) {
+        Ok(job) => job_response(job, wait).await,
         Err(e) => manager_error(e),
     }
 }
@@ -245,10 +272,25 @@ pub async fn detail_handler(
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match manager
-        .detail(&tenant, &name, &version, query.resources.unwrap_or(true))
-        .await
-    {
+    detail_in(
+        &manager,
+        &tenant,
+        &name,
+        &version,
+        query.resources.unwrap_or(true),
+    )
+    .await
+}
+
+/// One installed package of `tenant` (shared with the endpoint-scoped routes).
+pub(crate) async fn detail_in(
+    manager: &PackageManager,
+    tenant: &str,
+    name: &str,
+    version: &str,
+    resources: bool,
+) -> Response {
+    match manager.detail(tenant, name, version, resources).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => manager_error(e),
     }
@@ -269,11 +311,31 @@ pub async fn delete_handler(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    uninstall_in(
+        &manager,
+        &tenant,
+        &name,
+        &version,
+        query.wait,
+        who(principal.as_deref()),
+    )
+    .await
+}
+
+/// Starts an uninstall from `tenant` (shared with the endpoint-scoped routes).
+pub(crate) async fn uninstall_in(
+    manager: &Manager,
+    tenant: &str,
+    name: &str,
+    version: &str,
+    wait: Option<u64>,
+    requested_by: Option<String>,
+) -> Response {
     match manager
-        .start_uninstall(&tenant, &name, &version, who(principal.as_deref()))
+        .start_uninstall(tenant, name, version, requested_by)
         .await
     {
-        Ok(job) => job_response(job, query.wait).await,
+        Ok(job) => job_response(job, wait).await,
         Err(e) => manager_error(e),
     }
 }
