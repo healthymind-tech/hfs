@@ -394,9 +394,13 @@ mod tests {
     fn tamper_and_wrong_key() {
         let r = ring();
         let s = r.seal_str("v", "a");
-        let mut env = s.envelope().to_string();
-        let last = env.pop().unwrap();
-        env.push(if last == 'A' { 'B' } else { 'A' });
+        // Flip a character inside the ciphertext, not the last one: the last
+        // base64url character of a 17-byte ciphertext carries padding bits,
+        // and a non-canonical value there is a decode error, not a tamper.
+        let mut env: Vec<char> = s.envelope().chars().collect();
+        let i = env.len() - 5;
+        env[i] = if env[i] == 'A' { 'B' } else { 'A' };
+        let env: String = env.into_iter().collect();
         let t = SealedSecret::from_envelope(env).unwrap();
         assert_eq!(r.open(&t, "a"), Err(SecretError::Open));
         let other = SecretKeyRing::parse(&SecretKeyRing::generate_spec("k1")).unwrap();
