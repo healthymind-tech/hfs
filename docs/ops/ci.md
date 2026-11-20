@@ -37,7 +37,7 @@ backends are compiled by the all-features clippy):
 | rest-postgres | helios-rest `postgres` | the Docker-backed targets except MongoDB / Elasticsearch / MinIO / S3; testcontainers on the runner's Docker |
 | hts-sqlite / hts-postgres | helios-hts (`postgres`) | the PostgreSQL run uses `HTS_TEST_PG_URL` (service container) |
 | fhir-validator | helios-fhir-validator `fhirpath,xml` | |
-| services+ui | helios-auth, -admin-auth, -audit, -subscriptions, -ui, -ui-chrome, -hts-ui | admin-auth / subscriptions with `postgres`; the email suite starts mailpit with testcontainers |
+| services+ui | helios-auth, -admin-auth, -audit, -subscriptions, -ui, -ui-chrome, -hts-ui | admin-auth / subscriptions with `postgres`; the email suite starts mailpit with testcontainers; also `helios-endpoints` on branches that have `crates/endpoints` (matrix `optional`) |
 
 Not run here: MongoDB, Elasticsearch, MinIO/S3 container suites (production
 uses none of them), the Playwright browser suites, release builds, Inferno and
@@ -53,6 +53,8 @@ Android, GHC, CodeQL, … — about 30 GB more), builds without debuginfo
 Toolchain: pinned to **1.100.0** with `RUSTUP_TOOLCHAIN` (rust-toolchain.toml
 says `stable`; the variable wins). To bump: change `RUSTUP_TOOLCHAIN` and the
 three `toolchain:` inputs in `hm-ci.yml`, fix any new clippy lints in the same PR.
+A newer local `stable` (or an older one: 1.99's clippy reports ~80 `collapsible_if` /
+doc-list findings in untouched code) can disagree with CI; reproduce with `cargo +1.100.0 clippy …`.
 
 ### Reproduce a shard locally
 
