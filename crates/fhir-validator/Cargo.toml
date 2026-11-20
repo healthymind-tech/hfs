@@ -50,6 +50,8 @@ sha1 = "0.10"
 # Bundle.signature (JWS) verification: RSA / ECDSA with keys from X.509
 # certificates or JWKs (already in the dependency tree via rustls).
 ring = "0.17"
+# Per-stage validation timings (debug level, target helios_fhir_validator::timing).
+tracing = "0.1"
 
 [dev-dependencies]
 serde = { workspace = true }

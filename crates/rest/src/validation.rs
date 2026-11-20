@@ -455,16 +455,27 @@ impl ValidationService {
         resource_type: &str,
         resource: &mut Value,
     ) -> Result<(), RestError> {
-        if self.mode == ValidationMode::Enforce {
-            self.check_write(tenant, version, resource_type, resource)
-                .await?;
-            drop_empty_elements(resource);
+        let started = std::time::Instant::now();
+        let result = if self.mode == ValidationMode::Enforce {
+            let checked = self
+                .check_write(tenant, version, resource_type, resource)
+                .await;
+            if checked.is_ok() {
+                drop_empty_elements(resource);
+            }
+            checked
         } else {
             drop_empty_elements(resource);
             self.check_write(tenant, version, resource_type, resource)
-                .await?;
-        }
-        Ok(())
+                .await
+        };
+        debug!(
+            target: "helios_fhir_validator::timing",
+            resource_type = %resource_type,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "write-path validation (prepare_write)"
+        );
+        result
     }
 
     /// Write-path gate. `Ok(())` = proceed with the write; `Err` = reject
