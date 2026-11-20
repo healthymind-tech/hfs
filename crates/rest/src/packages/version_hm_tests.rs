@@ -49,7 +49,10 @@ fn range_parse_forms_and_whitespace() {
     );
     assert_eq!(Range::parse("2.*"), Range::Wildcard(vec!["2".into()]));
     assert_eq!(Range::parse("x.x"), Range::Wildcard(vec![]));
-    assert_eq!(Range::parse("1.0.0-ballot"), Range::Exact("1.0.0-ballot".into()));
+    assert_eq!(
+        Range::parse("1.0.0-ballot"),
+        Range::Exact("1.0.0-ballot".into())
+    );
 }
 
 #[test]
@@ -136,7 +139,10 @@ fn pick_prefers_releases_and_honours_exact_forms() {
 #[test]
 fn dependency_policy_serialises_kebab_case_and_defaults_to_newer() {
     assert_eq!(DependencyPolicy::default(), DependencyPolicy::Newer);
-    assert_eq!(serde_json::to_string(&DependencyPolicy::Exact).unwrap(), "\"exact\"");
+    assert_eq!(
+        serde_json::to_string(&DependencyPolicy::Exact).unwrap(),
+        "\"exact\""
+    );
     let p: DependencyPolicy = serde_json::from_str("\"newer\"").unwrap();
     assert_eq!(p, DependencyPolicy::Newer);
     assert!(serde_json::from_str::<DependencyPolicy>("\"Newer\"").is_err());

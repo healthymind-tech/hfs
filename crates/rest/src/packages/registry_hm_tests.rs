@@ -165,7 +165,11 @@ async fn a_listed_archive_is_downloaded_verified_and_cached() {
     let (bytes, info) = reg.fetch("acme.ig", "1.0.0").await.unwrap();
     assert_eq!(bytes, fx.good);
     assert!(info.verified, "the registry published a shasum");
-    assert!(info.source.ends_with("/files/acme-1.tgz"), "{}", info.source);
+    assert!(
+        info.source.ends_with("/files/acme-1.tgz"),
+        "{}",
+        info.source
+    );
     // Now served from the cache.
     assert_eq!(reg.cached_versions("acme.ig"), ["1.0.0"]);
     let (_, info) = reg.fetch("acme.ig", "1.0.0").await.unwrap();
@@ -192,7 +196,10 @@ async fn an_archive_of_another_package_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let reg = registry(dir.path(), vec![fx.base.clone()], None);
     let err = reg.fetch("acme.ig", "3.0.0").await.unwrap_err();
-    assert!(err.contains("archive is other.ig#3.0.0 not acme.ig#3.0.0"), "{err}");
+    assert!(
+        err.contains("archive is other.ig#3.0.0 not acme.ig#3.0.0"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -222,7 +229,10 @@ async fn archives_over_the_size_limit_are_refused() {
         },
     );
     let err = reg.fetch("acme.ig", "1.0.0").await.unwrap_err();
-    assert!(err.contains("larger than the 16-byte package limit"), "{err}");
+    assert!(
+        err.contains("larger than the 16-byte package limit"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +269,8 @@ async fn registry_documents_merge_cached_versions_and_report_unknown_names() {
     assert!(err.contains("HTTP 404"), "{err}");
 
     // Only cached versions and every registry failing: the cache answers.
-    reg.store(&package("local.only", "1.2.3", &[], &[])).unwrap();
+    reg.store(&package("local.only", "1.2.3", &[], &[]))
+        .unwrap();
     let doc = reg.doc("local.only").await.unwrap();
     assert_eq!(doc.source, "cache");
     assert_eq!(doc.latest.as_deref(), Some("1.2.3"));

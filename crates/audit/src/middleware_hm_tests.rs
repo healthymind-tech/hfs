@@ -9,8 +9,17 @@ fn read_request_classification_edge_cases() {
     assert!(is_read_request("POST", "/Patient/_search/"));
     assert!(is_read_request("POST", "/Patient/1/$everything"));
     assert!(is_read_request("post", "/$meta"));
-    for op in ["$lookup", "$translate", "$subsumes", "$validate", "$versions"] {
-        assert!(is_read_request("POST", &format!("/CodeSystem/{op}")), "{op}");
+    for op in [
+        "$lookup",
+        "$translate",
+        "$subsumes",
+        "$validate",
+        "$versions",
+    ] {
+        assert!(
+            is_read_request("POST", &format!("/CodeSystem/{op}")),
+            "{op}"
+        );
     }
     assert!(!is_read_request("PUT", "/Patient/1"));
     assert!(!is_read_request("PATCH", "/Patient/1"));
@@ -43,8 +52,14 @@ fn location_header_parsing() {
 
 #[test]
 fn site_of_base_urls() {
-    assert_eq!(site_of("https://fhir.example.org/r4").as_deref(), Some("fhir.example.org"));
-    assert_eq!(site_of("http://localhost:8080").as_deref(), Some("localhost:8080"));
+    assert_eq!(
+        site_of("https://fhir.example.org/r4").as_deref(),
+        Some("fhir.example.org")
+    );
+    assert_eq!(
+        site_of("http://localhost:8080").as_deref(),
+        Some("localhost:8080")
+    );
     assert_eq!(site_of("http://h?x").as_deref(), Some("h"));
     assert_eq!(site_of("no-scheme/path"), None);
     assert_eq!(site_of("https:///path"), None);
@@ -58,7 +73,10 @@ fn strip_tenant_cases() {
         ..Default::default()
     };
     // Resolved from the URL but the path does not start with it: unchanged.
-    assert_eq!(strip_tenant("/other/Patient", &url_tenant, true), "/other/Patient");
+    assert_eq!(
+        strip_tenant("/other/Patient", &url_tenant, true),
+        "/other/Patient"
+    );
     assert_eq!(strip_tenant("/acme", &url_tenant, true), "/");
     // Resolved from a header: never stripped.
     let header_tenant = Captured {
@@ -66,7 +84,10 @@ fn strip_tenant_cases() {
         tenant_from_url: false,
         ..Default::default()
     };
-    assert_eq!(strip_tenant("/acme/Patient", &header_tenant, true), "/acme/Patient");
+    assert_eq!(
+        strip_tenant("/acme/Patient", &header_tenant, true),
+        "/acme/Patient"
+    );
     // Unresolved under URL routing: FHIR surface segments are not tenants,
     // and a lone segment is not stripped.
     let none = Captured::default();
@@ -87,7 +108,8 @@ fn request(xff: Option<&str>, peer: Option<&str>) -> axum::extract::Request {
         .body(Body::empty())
         .unwrap();
     if let Some(x) = xff {
-        r.headers_mut().insert("x-forwarded-for", x.parse().unwrap());
+        r.headers_mut()
+            .insert("x-forwarded-for", x.parse().unwrap());
     }
     if let Some(p) = peer {
         r.extensions_mut()

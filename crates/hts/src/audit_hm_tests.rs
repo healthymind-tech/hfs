@@ -7,10 +7,13 @@ use axum::body::Body;
 use helios_audit::context::RequestAudit;
 use tower::ServiceExt;
 
+type SearchFn = fn(&[(String, String)]) -> Result<Vec<Value>, AuditSearchError>;
+type ReadFn = fn(&str) -> Result<Option<Value>, AuditSearchError>;
+
 /// A search that answers from a script.
 struct Scripted {
-    search: fn(&[(String, String)]) -> Result<Vec<Value>, AuditSearchError>,
-    read: fn(&str) -> Result<Option<Value>, AuditSearchError>,
+    search: SearchFn,
+    read: ReadFn,
 }
 
 #[async_trait::async_trait]
@@ -28,11 +31,7 @@ impl AuditEventSearch for Scripted {
 
 async fn fetch(router: Router, uri: &str) -> (StatusCode, String, Value) {
     let resp = router
-        .oneshot(
-            axum::http::Request::get(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(axum::http::Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -57,9 +56,7 @@ fn ok_search() -> Scripted {
                 .map(|(k, v)| json!({"resourceType": "AuditEvent", "id": format!("{k}={v}")}))
                 .collect())
         },
-        read: |id| {
-            Ok((id == "known").then(|| json!({"resourceType": "AuditEvent", "id": "known"})))
-        },
+        read: |id| Ok((id == "known").then(|| json!({"resourceType": "AuditEvent", "id": "known"}))),
     }
 }
 
@@ -112,7 +109,10 @@ async fn read_returns_the_event_404_or_500() {
     let (status, _, body) = fetch(router(Arc::new(ok_search())), "/AuditEvent/nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["issue"][0]["code"], "not-found");
-    assert_eq!(body["issue"][0]["diagnostics"], "AuditEvent/nope is not known");
+    assert_eq!(
+        body["issue"][0]["diagnostics"],
+        "AuditEvent/nope is not known"
+    );
 
     let broken = Scripted {
         search: |_| Ok(vec![]),
@@ -127,10 +127,14 @@ async fn read_returns_the_event_404_or_500() {
 async fn a_dedicated_sqlite_audit_database_is_opened_and_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.db");
-    let (_storage, search, retention) = open_dedicated(path.to_str().unwrap(), &AuditConfig::default())
-        .await
-        .expect("open the dedicated SQLite audit database");
-    assert!(retention.is_some(), "retention runs against the dedicated store");
+    let (_storage, search, retention) =
+        open_dedicated(path.to_str().unwrap(), &AuditConfig::default())
+            .await
+            .expect("open the dedicated SQLite audit database");
+    assert!(
+        retention.is_some(),
+        "retention runs against the dedicated store"
+    );
     assert!(path.exists(), "the database file was created");
     let found = search
         .search_audit_events(&[])

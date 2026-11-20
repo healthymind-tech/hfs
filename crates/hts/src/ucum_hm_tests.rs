@@ -3,8 +3,8 @@
 //! (whole grammar, enumerations, `canonical =` filters, excludes).
 
 use super::*;
-use serde_json::json;
 use SubsumptionOutcome::*;
+use serde_json::json;
 
 fn close(a: f64, b: f64) -> bool {
     same_magnitude(a, b)
@@ -39,7 +39,10 @@ fn products_quotients_and_parentheses() {
     assert_eq!(n.dims, p.dims);
     assert!(close(n.factor, p.factor));
     // A leading division.
-    assert_eq!(canonical("/s").unwrap().dims, canonical("s-1").unwrap().dims);
+    assert_eq!(
+        canonical("/s").unwrap().dims,
+        canonical("s-1").unwrap().dims
+    );
     // An exponent on a parenthesised term.
     let sq = canonical("(m/s)2").unwrap();
     assert_eq!(canonical_unit(&sq), "m2.s-2");
@@ -108,7 +111,10 @@ fn canonical_unit_lists_every_base_dimension() {
 #[test]
 fn descriptions_cover_numbers_exponents_and_groups() {
     assert_eq!(description("m2"), "(meter) ^ 2");
-    assert_eq!(description("kg.m/s2"), "(kilogram) * (meter) / (second) ^ 2");
+    assert_eq!(
+        description("kg.m/s2"),
+        "(kilogram) * (meter) / (second) ^ 2"
+    );
     assert_eq!(description("10*3/uL"), "10*3 / (microliter)");
     assert_eq!(description("{tbl}"), "1");
     assert_eq!(description("(m/s)"), "((meter) / (second))");
@@ -166,7 +172,9 @@ fn grammar_value_set_classification() {
         json!([{ "system": UCUM_URL, "valueSet": ["http://x/vs"] }]),
         None
     )));
-    assert!(!is_ucum_grammar_value_set(&json!({ "resourceType": "ValueSet" })));
+    assert!(!is_ucum_grammar_value_set(
+        &json!({ "resourceType": "ValueSet" })
+    ));
     // An exclude from another system disqualifies it too.
     assert!(!is_ucum_grammar_value_set(&vs(
         json!([{ "system": UCUM_URL }]),
@@ -208,7 +216,9 @@ fn membership_in_ucum_value_sets() {
     // Whole grammar minus a canonical class.
     let not_volume = vs(
         json!([{ "system": UCUM_URL }]),
-        Some(json!([{ "system": UCUM_URL, "filter": [{ "property": "canonical", "op": "=", "value": "L" }] }])),
+        Some(
+            json!([{ "system": UCUM_URL, "filter": [{ "property": "canonical", "op": "=", "value": "L" }] }]),
+        ),
     );
     assert!(in_value_set(&not_volume, "mg"));
     assert!(!in_value_set(&not_volume, "mL"));

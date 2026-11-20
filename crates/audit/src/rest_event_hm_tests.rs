@@ -5,7 +5,10 @@ use super::*;
 
 #[test]
 fn normalize_patient_ref_forms() {
-    assert_eq!(normalize_patient_ref("Patient/1").as_deref(), Some("Patient/1"));
+    assert_eq!(
+        normalize_patient_ref("Patient/1").as_deref(),
+        Some("Patient/1")
+    );
     assert_eq!(
         normalize_patient_ref("http://h/fhir/Patient/abc").as_deref(),
         Some("Patient/abc")
@@ -14,7 +17,10 @@ fn normalize_patient_ref_forms() {
         normalize_patient_ref("Patient/abc/_history/3").as_deref(),
         Some("Patient/abc")
     );
-    assert_eq!(normalize_patient_ref("//Patient//x//").as_deref(), Some("Patient/x"));
+    assert_eq!(
+        normalize_patient_ref("//Patient//x//").as_deref(),
+        Some("Patient/x")
+    );
     // Not a patient instance.
     assert_eq!(normalize_patient_ref("Group/1"), None);
     assert_eq!(normalize_patient_ref("Patient"), None);
@@ -62,21 +68,33 @@ fn patient_parameters_in_queries() {
     assert!(p(Some("Observation"), "patient:missing=true").is_empty());
     assert!(p(Some("Observation"), "patient.name=smith").is_empty());
     // subject only when it points at a Patient.
-    assert_eq!(p(Some("Observation"), "subject=Patient/3"), vec!["Patient/3"]);
+    assert_eq!(
+        p(Some("Observation"), "subject=Patient/3"),
+        vec!["Patient/3"]
+    );
     assert!(p(Some("Observation"), "subject=Group/3").is_empty());
     assert!(p(Some("Observation"), "subject=3").is_empty());
-    assert_eq!(p(Some("Observation"), "subject:Patient=4"), vec!["Patient/4"]);
+    assert_eq!(
+        p(Some("Observation"), "subject:Patient=4"),
+        vec!["Patient/4"]
+    );
     assert_eq!(
         p(Some("Observation"), "subject:Patient=http://h/Patient/5"),
         vec!["Patient/5"]
     );
     // _id names patients only on a Patient search.
-    assert_eq!(p(Some("Patient"), "_id=a,b"), vec!["Patient/a", "Patient/b"]);
+    assert_eq!(
+        p(Some("Patient"), "_id=a,b"),
+        vec!["Patient/a", "Patient/b"]
+    );
     assert!(p(Some("Observation"), "_id=a").is_empty());
     assert!(p(None, "_id=a").is_empty());
     // Empty values, empty items and bare keys are ignored.
     assert!(p(Some("Observation"), "patient=&patient&patient=,").is_empty());
-    assert_eq!(p(Some("Observation"), "patient= 1 , ,2"), vec!["Patient/1", "Patient/2"]);
+    assert_eq!(
+        p(Some("Observation"), "patient= 1 , ,2"),
+        vec!["Patient/1", "Patient/2"]
+    );
     // A versioned reference names the patient, not the version.
     assert_eq!(
         p(Some("Observation"), "patient=Patient/8/_history/2"),

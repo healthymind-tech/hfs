@@ -36,7 +36,10 @@ async fn backend(name: &str) -> Option<Arc<PostgresBackend>> {
         format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
         format!("CREATE DATABASE {db}"),
     ] {
-        client.batch_execute(&sql).await.expect("create test database");
+        client
+            .batch_execute(&sql)
+            .await
+            .expect("create test database");
     }
     drop(client);
     let _ = driver.await;
@@ -108,17 +111,28 @@ async fn cancel_is_requested_only_for_running_jobs() {
     let running = format!("job-c1-{}", uuid::Uuid::new_v4());
     let finished = format!("job-c2-{}", uuid::Uuid::new_v4());
     c.save_job(&job(&running, "running", false)).await.unwrap();
-    c.save_job(&job(&finished, "completed", true)).await.unwrap();
+    c.save_job(&job(&finished, "completed", true))
+        .await
+        .unwrap();
 
     assert!(!c.cancel_requested(&running).await.unwrap());
     assert!(c.request_cancel(&running).await.unwrap());
     assert!(c.cancel_requested(&running).await.unwrap());
-    assert!(c.load_job(&running).await.unwrap().unwrap().cancel_requested);
+    assert!(
+        c.load_job(&running)
+            .await
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
     // A later progress save keeps the request.
     c.save_job(&job(&running, "running", false)).await.unwrap();
     assert!(c.cancel_requested(&running).await.unwrap());
 
-    assert!(!c.request_cancel(&finished).await.unwrap(), "already terminal");
+    assert!(
+        !c.request_cancel(&finished).await.unwrap(),
+        "already terminal"
+    );
     assert!(!c.cancel_requested(&finished).await.unwrap());
     assert!(!c.request_cancel("no-such-job").await.unwrap());
     assert!(!c.cancel_requested("no-such-job").await.unwrap());

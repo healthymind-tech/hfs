@@ -52,7 +52,12 @@ fn change(tenant: &str, rt: &str, id: &str) -> ResourceChange {
 
 async fn create_sd(storage: &SqliteBackend, t: &str, id: &str, url: &str) {
     storage
-        .create(&tenant(t), "StructureDefinition", sd(id, url), FhirVersion::default())
+        .create(
+            &tenant(t),
+            "StructureDefinition",
+            sd(id, url),
+            FhirVersion::default(),
+        )
         .await
         .expect("create");
 }
@@ -71,7 +76,13 @@ fn sd_change(t: &str, id: &str) -> ResourceChange {
 async fn a_stored_profile_is_applied() {
     let storage = storage();
     let svc = ValidationService::new();
-    create_sd(&storage, "t1", "sd-a", "http://example.org/StructureDefinition/sync-a").await;
+    create_sd(
+        &storage,
+        "t1",
+        "sd-a",
+        "http://example.org/StructureDefinition/sync-a",
+    )
+    .await;
     assert!(apply_profile_change(storage.as_ref(), &svc, &sd_change("t1", "sd-a")).await);
     assert!(registered(&svc, "t1", "sd-a"));
 }
@@ -80,7 +91,13 @@ async fn a_stored_profile_is_applied() {
 async fn a_deleted_profile_is_removed() {
     let storage = storage();
     let svc = ValidationService::new();
-    create_sd(&storage, "t1", "sd-d", "http://example.org/StructureDefinition/sync-d").await;
+    create_sd(
+        &storage,
+        "t1",
+        "sd-d",
+        "http://example.org/StructureDefinition/sync-d",
+    )
+    .await;
     assert!(apply_profile_change(storage.as_ref(), &svc, &sd_change("t1", "sd-d")).await);
     storage
         .delete(&tenant("t1"), "StructureDefinition", "sd-d")
@@ -106,7 +123,13 @@ async fn a_change_to_a_row_that_never_existed_is_a_harmless_delete() {
 async fn the_change_is_read_in_its_own_tenant() {
     let storage = storage();
     let svc = ValidationService::new();
-    create_sd(&storage, "t2", "sd-t", "http://example.org/StructureDefinition/sync-t").await;
+    create_sd(
+        &storage,
+        "t2",
+        "sd-t",
+        "http://example.org/StructureDefinition/sync-t",
+    )
+    .await;
     // A feed row for t1 does not see t2's resource.
     assert!(apply_profile_change(storage.as_ref(), &svc, &sd_change("t1", "sd-t")).await);
     assert!(!registered(&svc, "t1", "sd-t"));
@@ -138,7 +161,11 @@ impl ClusterChangeFeed for ScriptedFeed {
     }
     async fn poll(&self, _cursor: &mut ChangeCursor) -> StorageResult<Vec<ResourceChange>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
-        self.batches.lock().unwrap().pop().unwrap_or_else(|| Ok(Vec::new()))
+        self.batches
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
     async fn prune(&self, _older_than: Duration) -> StorageResult<u64> {
         Ok(0)
@@ -159,7 +186,13 @@ async fn eventually(mut f: impl FnMut() -> bool) -> bool {
 async fn the_sync_loop_applies_profile_changes_and_survives_feed_errors() {
     let storage = storage();
     let svc = Arc::new(ValidationService::new());
-    create_sd(&storage, "t1", "sd-loop", "http://example.org/StructureDefinition/sync-loop").await;
+    create_sd(
+        &storage,
+        "t1",
+        "sd-loop",
+        "http://example.org/StructureDefinition/sync-loop",
+    )
+    .await;
     let feed = ScriptedFeed::new(vec![
         // A failing poll is logged and retried on the next tick.
         Err(StorageError::Backend(BackendError::Unavailable {

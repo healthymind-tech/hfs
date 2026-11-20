@@ -20,10 +20,7 @@ fn app(limiter: Arc<ClientRateLimiter>) -> Router {
     Router::new()
         .route("/Patient", get(|| async { "ok" }))
         .route("/health", get(|| async { "up" }))
-        .route(
-            "/.well-known/smart-configuration",
-            get(|| async { "{}" }),
-        )
+        .route("/.well-known/smart-configuration", get(|| async { "{}" }))
         .layer(axum::middleware::from_fn_with_state(
             limiter,
             client_rate_limit_middleware,
@@ -101,10 +98,7 @@ fn trusted_proxies_list_parsing() {
     let blank = RateLimitConfig::from_lookup(|k| {
         (k == "HFS_RATE_LIMIT_TRUSTED_PROXIES").then(|| "  ".into())
     });
-    assert_eq!(
-        blank.trusted_proxies.len(),
-        IpNet::default_trusted().len()
-    );
+    assert_eq!(blank.trusted_proxies.len(), IpNet::default_trusted().len());
 }
 
 #[test]
@@ -225,8 +219,14 @@ async fn forwarded_clients_behind_a_trusted_proxy_get_separate_buckets() {
             .insert("x-forwarded-for", xff.parse().unwrap());
         r
     };
-    assert_eq!(status(&app, with_xff("203.0.113.1")).await.0, StatusCode::OK);
-    assert_eq!(status(&app, with_xff("203.0.113.2")).await.0, StatusCode::OK);
+    assert_eq!(
+        status(&app, with_xff("203.0.113.1")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&app, with_xff("203.0.113.2")).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         status(&app, with_xff("203.0.113.1")).await.0,
         StatusCode::TOO_MANY_REQUESTS
@@ -245,16 +245,22 @@ async fn authenticated_clients_are_billed_to_their_oauth_client() {
     let b1 = principal("https://idp", "bob", Some("app-1"));
     let a2 = principal("https://idp", "alice", Some("app-2"));
     assert_eq!(
-        status(&app, req("/Patient", "198.51.100.1:1", Some(a1))).await.0,
+        status(&app, req("/Patient", "198.51.100.1:1", Some(a1)))
+            .await
+            .0,
         StatusCode::OK
     );
     // Same client_id, different user, different address: same bucket.
     assert_eq!(
-        status(&app, req("/Patient", "198.51.100.9:1", Some(b1))).await.0,
+        status(&app, req("/Patient", "198.51.100.9:1", Some(b1)))
+            .await
+            .0,
         StatusCode::TOO_MANY_REQUESTS
     );
     assert_eq!(
-        status(&app, req("/Patient", "198.51.100.1:1", Some(a2))).await.0,
+        status(&app, req("/Patient", "198.51.100.1:1", Some(a2)))
+            .await
+            .0,
         StatusCode::OK
     );
     // Without client_id/azp the issuer + subject is the key.
@@ -267,17 +273,23 @@ async fn authenticated_clients_are_billed_to_their_oauth_client() {
         StatusCode::OK
     );
     assert_eq!(
-        status(&app, req("/Patient", "198.51.100.1:1", Some(s2))).await.0,
+        status(&app, req("/Patient", "198.51.100.1:1", Some(s2)))
+            .await
+            .0,
         StatusCode::OK
     );
     assert_eq!(
-        status(&app, req("/Patient", "198.51.100.1:1", Some(s1))).await.0,
+        status(&app, req("/Patient", "198.51.100.1:1", Some(s1)))
+            .await
+            .0,
         StatusCode::TOO_MANY_REQUESTS
     );
     // Anonymous traffic is unlimited when only the authenticated limit is on.
     for _ in 0..5 {
         assert_eq!(
-            status(&app, req("/Patient", "198.51.100.1:1", None)).await.0,
+            status(&app, req("/Patient", "198.51.100.1:1", None))
+                .await
+                .0,
             StatusCode::OK
         );
     }
