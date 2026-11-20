@@ -448,7 +448,7 @@ fn resolve_pending_targets(ctx: &mut WalkCtx<'_>) {
 }
 
 /// See [`WalkCtx::invariants`].
-pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + 'a;
+pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + Sync + 'a;
 
 pub(super) fn validate<'a>(
     resolver: &'a dyn SchemaResolver,

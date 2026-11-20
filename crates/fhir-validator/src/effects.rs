@@ -977,7 +977,9 @@ async fn execute_constraints(
             conformance: conformance.clone(),
             ..Default::default()
         });
-        let outcomes = evaluator.evaluate_all_with_members(resource, version, &refs, &first);
+        let outcomes = crate::engine::on_large_stack(|| {
+            evaluator.evaluate_all_with_members(resource, version, &refs, &first)
+        });
         let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
         if asked.is_empty() {
             outcomes
@@ -996,16 +998,20 @@ async fn execute_constraints(
                 missed: Mutex::default(),
                 conformance,
             });
-            evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+            crate::engine::on_large_stack(|| {
+                evaluator.evaluate_all_with_members(resource, version, &refs, &second)
+            })
         }
     } else if wants_conformance {
         let answers = Arc::new(MemberOfAnswers {
             conformance,
             ..Default::default()
         });
-        evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
+        crate::engine::on_large_stack(|| {
+            evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
+        })
     } else {
-        evaluator.evaluate_all(resource, version, &refs)
+        crate::engine::on_large_stack(|| evaluator.evaluate_all(resource, version, &refs))
     };
     debug_assert_eq!(evaluated.len(), refs.len(), "evaluator must align outcomes");
     // A resource that does not parse into the typed model leaves every

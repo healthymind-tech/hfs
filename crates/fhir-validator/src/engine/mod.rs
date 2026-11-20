@@ -42,6 +42,43 @@ pub(crate) mod messages {
 }
 
 use crate::effects::{Deferred, EffectHandlers};
+
+thread_local! {
+    static ON_LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Stack of the threads validation runs its recursive parts on.
+const VALIDATION_STACK: usize = 16 * 1024 * 1024;
+
+/// Run `f` on a thread with [`VALIDATION_STACK`] of stack, and wait for it.
+///
+/// The structural walk and above all the FHIRPath evaluator recurse with
+/// large frames: in a debug build validating a Bundle needed ~1.3 MiB of
+/// stack on its own (the walk ~260 KiB, FHIRPath invariants the rest),
+/// independent of the Bundle's size — too close to a Tokio worker's 2 MiB
+/// once the HTTP stack sits below it. The calling (async) thread now only
+/// waits; the recursion happens on a scoped thread whose stack does not
+/// depend on the caller's. The thread is not detached: `f` borrows from the
+/// caller, and a panic is re-raised on the caller. Calls already on such a
+/// thread run inline.
+pub(crate) fn on_large_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if ON_LARGE_STACK.with(std::cell::Cell::get) {
+        return f();
+    }
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("hfs-validation".to_string())
+            .stack_size(VALIDATION_STACK)
+            .spawn_scoped(scope, || {
+                ON_LARGE_STACK.with(|flag| flag.set(true));
+                f()
+            });
+        handle
+            .expect("spawn a validation thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
 use crate::resolver::SchemaResolver;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
@@ -341,7 +378,7 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        self.validate_sync_with(resource, opts, None)
+        on_large_stack(|| self.validate_sync_with(resource, opts, None))
     }
 
     /// [`Self::validate_sync`], with invariants evaluated where the walk
@@ -402,12 +439,17 @@ impl Validator {
         let timing =
             tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::DEBUG);
         let started = std::time::Instant::now();
-        let SyncOutcome {
-            mut errors,
-            deferred,
-            cascades,
-        } = self.validate_sync_with(resource, opts, invariants);
-        let walk = started.elapsed();
+        let (
+            SyncOutcome {
+                mut errors,
+                deferred,
+                cascades,
+            },
+            walk,
+        ) = on_large_stack(|| {
+            let outcome = self.validate_sync_with(resource, opts, invariants);
+            (outcome, started.elapsed())
+        });
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
         }
