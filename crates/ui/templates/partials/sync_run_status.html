@@ -29,8 +29,8 @@
             <td>{{ c.source_version.as_deref().unwrap_or("-") }} → {{ c.target_version.as_deref().unwrap_or("-") }}</td>
             <td>{{ c.reason }}</td>
             <td class="addbox__actions">
-              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/overwrite">{% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-overwrite") }}</button></form>
-              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/keep">{% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-keep") }}</button></form>
+              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/overwrite">{% if let Some(token) = csrf %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-overwrite") }}</button></form>
+              <form method="post" action="/ui/sync/runs/{{ run.id }}/conflicts/{{ c.resource_type }}/{{ c.resource_id }}/keep">{% if let Some(token) = csrf %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-keep") }}</button></form>
             </td>
           </tr>
           {% else %}

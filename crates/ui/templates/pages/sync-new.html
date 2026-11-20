@@ -16,7 +16,7 @@
 </section>
 {% endif %}
 <form method="post" action="/ui/sync/new" autocomplete="off" class="stack">
-  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   {% call ui::form_section("sync-basics", i18n.t("sync-step-basics")) %}
     {% call ui::field_text(i18n.t("sync-col-name"), "name", v("name"), "", "", "text", true) %}{% endcall %}
     {% call ui::field_text(i18n.t("sync-description"), "description", v("description")) %}{% endcall %}

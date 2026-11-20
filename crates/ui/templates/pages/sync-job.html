@@ -5,12 +5,12 @@
 {% block content %}
 {% call ui::page_header(row.name, lede) %}
   {% if active %}
-  <form method="post" action="/ui/sync/{{ row.id }}/cancel">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{% call ui::icon("stop-circle") %}{% endcall %}{{ i18n.t("sync-action-cancel") }}</button></form>
+  <form method="post" action="/ui/sync/{{ row.id }}/cancel">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{% call ui::icon("stop-circle") %}{% endcall %}{{ i18n.t("sync-action-cancel") }}</button></form>
   {% else %}
-  <form method="post" action="/ui/sync/{{ row.id }}/run">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn btn--primary" type="submit">{% call ui::icon("sync") %}{% endcall %}{{ i18n.t("sync-action-run") }}</button></form>
-  {% if retryable %}<form method="post" action="/ui/sync/{{ row.id }}/retry">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-action-retry") }}</button></form>{% endif %}
+  <form method="post" action="/ui/sync/{{ row.id }}/run">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn btn--primary" type="submit">{% call ui::icon("sync") %}{% endcall %}{{ i18n.t("sync-action-run") }}</button></form>
+  {% if retryable %}<form method="post" action="/ui/sync/{{ row.id }}/retry">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn" type="submit">{{ i18n.t("sync-action-retry") }}</button></form>{% endif %}
   {% endif %}
-  <form method="post" action="/ui/sync/{{ row.id }}/delete" data-confirm="{{ i18n.t("sync-delete-confirm") }}">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}<button class="btn btn--danger" type="submit">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("sync-action-delete") }}</button></form>
+  <form method="post" action="/ui/sync/{{ row.id }}/delete" data-confirm="{{ i18n.t("sync-delete-confirm") }}">{% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}<button class="btn btn--danger" type="submit">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("sync-action-delete") }}</button></form>
 {% endcall %}
 
 <section class="card table-card">
