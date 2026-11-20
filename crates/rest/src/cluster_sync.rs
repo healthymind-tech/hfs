@@ -142,3 +142,7 @@ where
     );
     true
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "cluster_sync_hm_tests.rs"]
+mod hm_tests;

@@ -861,3 +861,7 @@ mod tests {
         assert_eq!(info.source, "cache");
     }
 }
+
+#[cfg(test)]
+#[path = "registry_hm_tests.rs"]
+mod hm_tests;
