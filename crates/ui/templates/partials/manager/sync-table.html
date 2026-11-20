@@ -1,0 +1,26 @@
+{% import "partials/components.html" as ui %}
+{# Sync jobs touching one endpoint; expects `sync_rows`. Job pages are P6's /ui/sync/{id}. #}
+<div class="table-wrap" tabindex="0">
+  <table class="data-table data-table--stack">
+    <thead>
+      <tr>
+        <th scope="col">{{ i18n.t("mgr-sync-col-job") }}</th>
+        <th scope="col">{{ i18n.t("mgr-sync-col-direction") }}</th>
+        <th scope="col">{{ i18n.t("mgr-sync-col-trigger") }}</th>
+        <th scope="col">{{ i18n.t("mgr-sync-col-last-run") }}</th>
+        <th scope="col">{{ i18n.t("mgr-sync-col-progress") }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in sync_rows %}
+      <tr>
+        <td data-label="{{ i18n.t("mgr-sync-col-job") }}"><a href="/ui/sync/{{ row.id }}">{{ row.name }}</a>{% if !row.enabled %} <span class="tag tag--muted">{{ i18n.t("mgr-disabled-short") }}</span>{% endif %}</td>
+        <td data-label="{{ i18n.t("mgr-sync-col-direction") }}"><span class="sync-dir">{{ row.source }} {% call ui::icon("arrow-right") %}{% endcall %} {{ row.target }}</span></td>
+        <td data-label="{{ i18n.t("mgr-sync-col-trigger") }}">{{ i18n.t(row.trigger_key) }}</td>
+        <td data-label="{{ i18n.t("mgr-sync-col-last-run") }}">{% if let Some(b) = row.last_run %}{% call ui::pill(b) %}{% endcall %}{% else %}—{% endif %}</td>
+        <td data-label="{{ i18n.t("mgr-sync-col-progress") }}">{% call ui::job_progress(row.percent, i18n.t_arg("mgr-sync-written", "count", row.written)) %}{% endcall %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

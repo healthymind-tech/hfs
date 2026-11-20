@@ -1,0 +1,40 @@
+{#- The General page's danger zone: disable, delete (type the name to confirm). -#}
+<section class="card danger-zone" aria-labelledby="danger-title">
+  <header class="form-section__head">
+    <h2 class="form-section__title" id="danger-title">{{ i18n.t("mgr-danger-title") }}</h2>
+    <p class="form-section__desc">{{ i18n.t("mgr-danger-desc") }}</p>
+  </header>
+  <div class="danger-zone__row">
+    <div>
+      <h3 class="danger-zone__heading">{% if head.enabled %}{{ i18n.t("mgr-action-disable") }}{% else %}{{ i18n.t("mgr-action-enable") }}{% endif %}</h3>
+      <p class="muted">{% if head.enabled %}{{ i18n.t("mgr-danger-disable-desc") }}{% else %}{{ i18n.t("mgr-danger-enable-desc") }}{% endif %}</p>
+    </div>
+    <form method="post" action="/ui/e/{{ head.name }}/status">
+      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+      <input type="hidden" name="revision" value="{{ head.revision }}">
+      <input type="hidden" name="back" value="/ui/e/{{ head.name }}/config">
+      {% if head.enabled %}
+      <input type="hidden" name="action" value="disable">
+      <button type="submit" class="btn btn--danger-outline" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", head.name.clone()) }}">{{ i18n.t("mgr-action-disable") }}</button>
+      {% else %}
+      <input type="hidden" name="action" value="enable">
+      <button type="submit" class="btn">{{ i18n.t("mgr-action-enable") }}</button>
+      {% endif %}
+    </form>
+  </div>
+  <div class="danger-zone__row">
+    <div>
+      <h3 class="danger-zone__heading">{{ i18n.t("mgr-action-delete") }}</h3>
+      <p class="muted">{{ i18n.t("mgr-danger-delete-desc") }}</p>
+    </div>
+    <form method="post" action="/ui/e/{{ head.name }}/status" class="danger-zone__confirm" data-typed-confirm="{{ head.name }}">
+      {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+      <input type="hidden" name="revision" value="{{ head.revision }}">
+      <input type="hidden" name="action" value="delete">
+      <label class="mfield__label" for="f-confirm">{{ i18n.t_arg("mgr-danger-type-name", "endpoint", head.name.clone()) }}</label>
+      <input class="mfield__input mfield__input--mono" id="f-confirm" name="confirm" autocomplete="off"{% if self.bad("confirm") %} aria-invalid="true" aria-describedby="f-confirm-err"{% endif %}>
+      {% if self.bad("confirm") %}<p class="mfield__error" id="f-confirm-err">{{ self.err("confirm") }}</p>{% endif %}
+      <button type="submit" class="btn btn--danger" data-typed-confirm-submit>{{ i18n.t("mgr-action-delete") }}</button>
+    </form>
+  </div>
+</section>

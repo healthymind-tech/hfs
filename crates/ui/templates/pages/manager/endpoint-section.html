@@ -1,0 +1,74 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+
+{#
+  One configuration section of an endpoint (design §10.3): General, Security
+  (FHIR auth + SMART + CORS + rate limits), Validation, Terminology. Each
+  policy section has an "Inherit from server" switch showing the effective
+  inherited value; field errors from the server (422) land on their inputs;
+  the sticky save bar previews the change as a field diff; a stale revision
+  shows a conflict banner with reload / overwrite.
+#}
+
+{% block title %}{{ i18n.t(title_key) }} — {{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+
+{% block content %}
+{% call ui::ep_head(head, i18n.t(title_key), false, can_edit) %}{% endcall %}
+
+{% if saved %}
+<div class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("mgr-saved") }}</span></div>
+{% endif %}
+{% if let Some(current) = conflict %}
+<div class="notice notice--warn" role="alert">
+  {% call ui::icon("alert") %}{% endcall %}
+  <span>{{ i18n.t_arg("mgr-conflict", "revision", current.clone()) }}</span>
+  <a class="btn btn--small" href="/ui/e/{{ head.name }}/{{ section }}">{{ i18n.t("mgr-conflict-reload") }}</a>
+</div>
+{% endif %}
+{% if !locked_key.is_empty() %}
+<div class="notice notice--info">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t(locked_key) }}</span></div>
+{% endif %}
+{% if self.bad("") %}
+<div class="notice notice--danger" role="alert">{% call ui::icon("alert") %}{% endcall %}<span>{{ self.err("") }}</span></div>
+{% endif %}
+{% if errors.len() > 0 %}
+<div class="notice notice--danger" role="alert" tabindex="-1" data-autofocus>
+  {% call ui::icon("alert") %}{% endcall %}
+  <span>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}</span>
+</div>
+{% endif %}
+{% for w in warnings %}
+<div class="notice {% if w.starts_with("mgr-warn") %}notice--warn{% else %}notice--info{% endif %}">{% if w.starts_with("mgr-warn") %}{% call ui::icon("alert") %}{% endcall %}{% else %}{% call ui::icon("info") %}{% endcall %}{% endif %}<span>{{ i18n.t(w) }}</span></div>
+{% endfor %}
+
+<form method="post" action="/ui/e/{{ head.name }}/{{ section }}" class="config-form" id="config-form" novalidate data-unsaved-form>
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+  <input type="hidden" name="revision" value="{{ revision }}">
+  <fieldset class="config-form__fields"{% if !can_edit %} disabled{% endif %}>
+    <legend class="visually-hidden">{{ i18n.t(title_key) }}</legend>
+    {% if section == "config" %}{% include "partials/manager/section-general.html" %}
+    {% else if section == "security" %}{% include "partials/manager/section-security.html" %}
+    {% else if section == "validation" %}{% include "partials/manager/section-validation.html" %}
+    {% else %}{% include "partials/manager/section-terminology.html" %}
+    {% endif %}
+  </fieldset>
+  {% if can_edit %}
+  <div class="save-bar" role="region" aria-label="{{ i18n.t("mgr-save-bar") }}">
+    <div class="save-bar__preview" id="diff-preview" aria-live="polite"></div>
+    <div class="save-bar__actions">
+      <span class="save-bar__rev">r{{ revision }}</span>
+      <button type="button" class="btn" hx-post="/ui/e/{{ head.name }}/{{ section }}/preview" hx-include="#config-form" hx-target="#diff-preview" hx-swap="innerHTML">{% call ui::icon("eye") %}{% endcall %}{{ i18n.t("mgr-review-changes") }}</button>
+      {% if let Some(current) = conflict %}
+      <button type="submit" class="btn btn--danger" name="revision" value="{{ current }}">{{ i18n.t("mgr-conflict-overwrite") }}</button>
+      {% else %}
+      <button type="submit" class="btn btn--primary">{% call ui::icon("check") %}{% endcall %}{{ i18n.t("mgr-save") }}</button>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</form>
+
+{% if section == "config" && can_edit && !head.is_default %}
+{% include "partials/manager/danger-zone.html" %}
+{% endif %}
+{% endblock %}

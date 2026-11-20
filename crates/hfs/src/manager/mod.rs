@@ -17,6 +17,8 @@
 
 pub mod console_auth;
 pub mod endpoints;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 use std::sync::Arc;
 
@@ -216,6 +218,8 @@ pub async fn init_with(
     // Package hooks, in integration order (P1 → P6). Each package adds one
     // `install_*` line here.
     endpoints::install(&mut ctx, listen, persistent);
+    #[cfg(feature = "ui")]
+    ui::install_ui(&ctx);
 
     info!(
         endpoints = ctx.registry.snapshot().endpoints().len(),

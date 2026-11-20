@@ -1,0 +1,46 @@
+{% call ui::form_section("sec-validation", i18n.t("mgr-sec-validation"), i18n.t("mgr-sec-validation-desc")) %}
+  {% call ui::inherit_toggle("val_inherit", v.val_inherit, "val-fields", i18n.t_arg("mgr-inherit-validation", "mode", i18n.t(env.validation_key))) %}{% endcall %}
+  <fieldset class="inherit-target" id="val-fields"{% if v.val_inherit %} disabled{% endif %}>
+    <legend class="mfield__label">{{ i18n.t("mgr-field-validation-mode") }}</legend>
+    <div class="radio-cards__grid">
+      <label class="radio-card">
+        <input type="radio" name="val_mode" value="off"{% if v.val_mode == "off" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-validation-mode-off") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-off-desc") }}</span>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="val_mode" value="log"{% if v.val_mode == "log" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-validation-mode-log") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-log-desc") }}</span>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="val_mode" value="enforce"{% if v.val_mode == "enforce" %} checked{% endif %}>
+        <span class="radio-card__title">{{ i18n.t("mgr-validation-mode-enforce") }}</span>
+        <span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-enforce-desc") }}</span>
+      </label>
+    </div>
+    <div class="mfield">
+      <label class="mfield__label" for="f-val_terminology">{{ i18n.t("mgr-field-terminology-check") }}</label>
+      <select class="mfield__input" id="f-val_terminology" name="val_terminology">
+        <option value="off"{% if v.val_terminology == "off" %} selected{% endif %}>{{ i18n.t("mgr-term-check-off") }}</option>
+        <option value="embedded"{% if v.val_terminology == "embedded" %} selected{% endif %}>{{ i18n.t("mgr-term-check-embedded") }}</option>
+        <option value="remote"{% if v.val_terminology == "remote" %} selected{% endif %}>{{ i18n.t("mgr-term-check-remote") }}</option>
+        <option value="remote-only"{% if v.val_terminology == "remote-only" %} selected{% endif %}>{{ i18n.t("mgr-term-check-remote-only") }}</option>
+      </select>
+      <p class="mfield__hint">{{ i18n.t("mgr-field-terminology-check-hint") }}</p>
+    </div>
+    {% call ui::checkbox(i18n.t("mgr-stored-profiles"), "val_stored_profiles", v.val_stored_profiles, i18n.t("mgr-stored-profiles-hint")) %}{% endcall %}
+    {% call ui::field_area(i18n.t("mgr-required-profiles"), "val_required", v.val_required, self.err("validation.requiredProfiles"), i18n.t("mgr-required-profiles-hint"), 4, "Patient http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient") %}{% endcall %}
+  </fieldset>
+{% endcall %}
+
+<section class="card form-section" aria-labelledby="sec-igs-title">
+  <header class="form-section__head">
+    <h2 class="form-section__title" id="sec-igs-title">{{ i18n.t("mgr-sec-igs") }}</h2>
+    <p class="form-section__desc">{{ i18n.t("mgr-sec-igs-desc") }}</p>
+  </header>
+  <div class="form-section__body form-section__body--row">
+    <a class="btn" href="{{ data_href }}/packages">{% call ui::icon("package") %}{% endcall %}{{ i18n.t("mgr-igs-manage") }}</a>
+    <a class="btn" href="{{ data_href }}/validate">{% call ui::icon("check-circle") %}{% endcall %}{{ i18n.t("mgr-igs-validate") }}</a>
+  </div>
+</section>

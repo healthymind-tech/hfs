@@ -790,13 +790,12 @@ pub async fn delete(
     _principal: Option<Extension<helios_auth::Principal>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(store) = &state.bulk_provider {
-        if let Err(e) = store
+    if let Some(store) = &state.bulk_provider
+        && let Err(e) = store
             .delete_provider_submission(&tenant_ctx(&rt), &id)
             .await
-        {
-            tracing::warn!(submission = %id, error = %e, "failed to delete bulk-import submission");
-        }
+    {
+        tracing::warn!(submission = %id, error = %e, "failed to delete bulk-import submission");
     }
     Redirect::to("/ui/bulk-import").into_response()
 }

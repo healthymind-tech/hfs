@@ -1,0 +1,39 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# About (design §10.2): product, version, HealthyMind brand, Helios attribution, licenses. #}
+{% block title %}{{ i18n.t("mgr-nav-about") }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+<section class="about-hero card">
+  <div class="brand-band brand-band--card" aria-hidden="true"></div>
+  <img class="about-hero__logo" src="/ui/assets/brand/healthymind-logo-square.png" alt="HealthyMind" width="120" height="120">
+  <div class="about-hero__text">
+    <h1 class="page-head__title">{{ i18n.t("app-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("app-tagline") }}</p>
+    <dl class="about-facts">
+      <div><dt>{{ i18n.t("mgr-about-version") }}</dt><dd class="mono">v{{ status.version }}</dd></div>
+      <div><dt>{{ i18n.t("mgr-about-default-fhir") }}</dt><dd>FHIR {{ default_version }}</dd></div>
+      <div><dt>{{ i18n.t("mgr-about-endpoints") }}</dt><dd>{{ i18n.num(endpoints) }}</dd></div>
+    </dl>
+  </div>
+</section>
+<section class="card form-section" aria-labelledby="attr-title">
+  <header class="form-section__head"><h2 class="form-section__title" id="attr-title">{{ i18n.t("mgr-about-attribution") }}</h2></header>
+  <div class="form-section__body">
+    <p>{{ i18n.t("mgr-about-attribution-text") }}</p>
+    <p><a href="https://github.com/HeliosSoftware/hfs" rel="noopener noreferrer">{% call ui::icon("external") %}{% endcall %}github.com/HeliosSoftware/hfs</a></p>
+  </div>
+</section>
+<section class="card table-card" aria-labelledby="lic-title">
+  <div class="card-head"><h2 id="lic-title">{{ i18n.t("mgr-about-licenses") }}</h2></div>
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack">
+      <thead><tr><th scope="col">{{ i18n.t("mgr-about-component") }}</th><th scope="col">{{ i18n.t("mgr-about-license") }}</th></tr></thead>
+      <tbody>
+        {% for l in licenses %}
+        <tr><td data-label="{{ i18n.t("mgr-about-component") }}"><a href="{{ l.url }}" rel="noopener noreferrer">{{ l.name }}</a></td><td data-label="{{ i18n.t("mgr-about-license") }}">{{ l.license }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
