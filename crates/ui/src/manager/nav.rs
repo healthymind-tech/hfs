@@ -425,7 +425,7 @@ mod tests {
             href: "/ui/settings/extra",
             icon: "users",
             min_role: ConsoleRole::Admin,
-            order: 10,
+            order: 1,
         });
         let admin = build(None, ConsoleRole::Admin);
         let settings = admin

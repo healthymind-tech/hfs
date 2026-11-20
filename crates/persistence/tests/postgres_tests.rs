@@ -6072,7 +6072,14 @@ mod postgres_integration {
             }
         }
 
-        let tables = tenant_id_tables(&client).await;
+        // `hfs_endpoints.tenant_id` is the FHIR server manager's endpoint ->
+        // tenant binding (configuration, not tenant data): deleting an
+        // endpoint with `purge=true` purges the data, then tombstones the row.
+        let tables: Vec<String> = tenant_id_tables(&client)
+            .await
+            .into_iter()
+            .filter(|t| t != "hfs_endpoints")
+            .collect();
         assert!(
             tables.iter().any(|t| t == "bulk_submission_changes"),
             "schema enumeration found nothing: {tables:?}"
