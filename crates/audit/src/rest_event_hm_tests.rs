@@ -106,3 +106,20 @@ fn truncate_keeps_char_boundaries() {
     assert_eq!(truncate("a心b".into(), 4), "a心");
     assert_eq!(truncate(String::new(), 0), "");
 }
+
+#[test]
+fn subject_patient_modifier_with_a_versioned_reference() {
+    // `subject:Patient` must name the same patient as `patient=` does for a
+    // versioned or absolute reference, not the version number.
+    assert_eq!(
+        patients_in_params(Some("Observation"), "subject:Patient=Patient/8/_history/2"),
+        vec!["Patient/8"]
+    );
+    assert_eq!(
+        patients_in_params(
+            Some("Observation"),
+            "subject:Patient=https://h/fhir/Patient/9/_history/1"
+        ),
+        vec!["Patient/9"]
+    );
+}

@@ -255,7 +255,11 @@ fn patients_in_params(resource_type: Option<&str>, params: &str) -> Vec<String> 
                     }
                 }
                 "subject" if typed_patient => {
-                    found.push(format!("Patient/{}", v.rsplit('/').next().unwrap_or(v)))
+                    if v.contains('/') {
+                        found.extend(normalize_patient_ref(v));
+                    } else {
+                        found.push(format!("Patient/{v}"));
+                    }
                 }
                 "subject" if modifier.is_none() => found.extend(normalize_patient_ref(v)),
                 "_id" if resource_type == Some("Patient") && modifier.is_none() => {
