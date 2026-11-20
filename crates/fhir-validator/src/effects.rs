@@ -841,7 +841,9 @@ fn native_type_rule(
     let mut ok = true;
     for item in items {
         match item.get("reference").and_then(Value::as_str) {
-            None => return None,
+            // No reference, or a bare `#` (`'#'.substring(1)` is empty):
+            // the expression evaluates to empty.
+            None | Some("#") => return None,
             Some(r) if !r.starts_with('#') => {}
             Some(r) => ok &= contained.contains(&&r[1..]),
         }

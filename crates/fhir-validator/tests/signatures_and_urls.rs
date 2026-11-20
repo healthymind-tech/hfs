@@ -402,6 +402,8 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
             {"fullUrl": "urn:uuid:2", "resource": {"resourceType": "Patient", "active": true,
                 "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><script>x</script></div>"},
                 "contained": [{"resourceType": "Organization", "id": "o2", "partOf": {"reference": "#o3"}},
+                              {"resourceType": "Provenance", "id": "pv", "recorded": "2020-01-01T00:00:00Z",
+                               "target": [{"reference": "#"}], "agent": [{"who": {"display": "x"}}]},
                               {"resourceType": "Organization", "id": "o3",
                                "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"> </div>"}}],
                 "managingOrganization": {"reference": "#o2"}}}
