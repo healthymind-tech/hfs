@@ -169,6 +169,8 @@ http-body = "1"
 wiremock = "0.6" # terminology server stub for SQL query terminology dependencies
 # HTTP testing
 axum-test = "18.0"
+# The real console session resolver (P3) for the console-principal tests.
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
 
 # Inject synthetic request-log traffic in console-metrics tests (the same
 # in-process request log the handlers read for per-tenant traffic).

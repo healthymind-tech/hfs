@@ -16,8 +16,17 @@
 //!   modes oidc/local), the admin API guard (console admin sessions + CSRF
 //!   token) and the console pages on.
 //!
-//! When package P1's `ManagerContext` lands, `install_console_auth(&mut ctx)`
-//! becomes the single call site and these functions its body.
+//! * installs the runtime as P2's console session resolver
+//!   (`helios_rest::endpoint::auth::install_console_resolver`), so a console
+//!   session is a credential on the FHIR API with the scopes of the user's
+//!   role and the endpoint's `consoleAccess` (design D-10);
+//! * admin bearer tokens on `/admin/console/**` are validated with the FHIR
+//!   auth state and need `HFS_ADMIN_TOKEN_SCOPE` (P2's [`AdminTokenScope`],
+//!   default `system/*.cruds`).
+//!
+//! Console sign-in also works without `HFS_MANAGER` (explicit
+//! `HFS_CONSOLE_AUTH_MODE`), so it is wired from `serve` rather than from
+//! the manager context's `install_*` list.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -39,6 +48,15 @@ pub fn record_pool(pool: helios_endpoints::pg::deadpool_postgres::Pool) {
 }
 
 static CONSOLE: OnceLock<Option<Arc<ConsoleAuth>>> = OnceLock::new();
+
+/// The FHIR auth state (when `HFS_AUTH_*` is on), for admin bearer tokens.
+static AUTH_STATE: OnceLock<Arc<helios_rest::middleware::auth::AuthMiddlewareState>> =
+    OnceLock::new();
+
+/// Records the FHIR auth state (called where it is built).
+pub fn record_auth_state(state: Arc<helios_rest::middleware::auth::AuthMiddlewareState>) {
+    let _ = AUTH_STATE.set(state);
+}
 
 fn env_on(name: &str) -> bool {
     std::env::var(name)
@@ -89,6 +107,13 @@ pub async fn build(
     } else {
         Some(build_runtime(env, base_url, break_glass).await)
     };
+    if let Some(c) = &console {
+        // P2: console sessions act on the FHIR API as console principals.
+        let resolver: Arc<dyn helios_endpoints::ConsoleSessionResolver> = c.clone();
+        if !helios_rest::endpoint::auth::install_console_resolver(resolver) {
+            warn!("a console session resolver was installed already");
+        }
+    }
     let _ = CONSOLE.set(console.clone());
     console
 }
@@ -183,9 +208,73 @@ async fn build_runtime(
 /// Merges the console admin API. Call **before** the admin guard layer.
 pub fn routes(app: axum::Router, console: Option<&Arc<ConsoleAuth>>) -> axum::Router {
     match console {
-        Some(c) => app.merge(helios_admin_auth::console::api::router(c.clone())),
+        Some(c) => app.merge(helios_admin_auth::console::api::router(c.clone()).layer(
+            axum::middleware::from_fn_with_state(
+                Arc::new(helios_rest::middleware::auth::AdminTokenScope::from_env()),
+                admin_token,
+            ),
+        )),
         None => app,
     }
+}
+
+fn bearer_jwt(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| t.starts_with("eyJ") && t.split('.').count() == 3 && !t.contains(' '))
+}
+
+/// Admin bearer tokens (JWTs skip the password guard): validated with the
+/// FHIR auth state and admitted only with the admin token scope, as the
+/// administrator `token:{sub}`. Everything else passes to the console API's
+/// own check (console admin session or break-glass, stamped by the guard).
+async fn admin_token(
+    axum::extract::State(scope): axum::extract::State<
+        Arc<helios_rest::middleware::auth::AdminTokenScope>,
+    >,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !bearer_jwt(request.headers()) {
+        return next.run(request).await;
+    }
+    let Some(state) = AUTH_STATE.get() else {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "bearer tokens are not accepted: SMART/OIDC authentication is off",
+        )
+            .into_response();
+    };
+    let mut request =
+        match helios_rest::middleware::auth::authenticate_request(state, request).await {
+            Ok(r) => r,
+            Err(response) => return response,
+        };
+    let Some(principal) = request
+        .extensions()
+        .get::<helios_auth::Principal>()
+        .cloned()
+    else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    };
+    if !scope.satisfied_by(&principal) {
+        warn!(sub = %principal.subject(), "console admin API refused: token lacks the admin scope");
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            format!("this administration API requires the scope {}", scope.0),
+        )
+            .into_response();
+    }
+    request
+        .extensions_mut()
+        .insert(helios_admin_auth::AdminUser(format!(
+            "token:{}",
+            principal.subject()
+        )));
+    next.run(request).await
 }
 
 /// Makes the runtime visible to every layer. Call **last** (outermost).

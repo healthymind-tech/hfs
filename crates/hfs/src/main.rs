@@ -2155,6 +2155,8 @@ async fn init_auth_with_audit(
         sessions,
         admin: Some(admin).filter(|gate| gate.auth().is_some()),
     });
+    // Admin tokens on the console admin API are validated with this state.
+    manager::console_auth::record_auth_state(Arc::clone(&auth_state));
 
     Ok((auth_config, Some(auth_state)))
 }

@@ -147,11 +147,27 @@ GET     /admin/console/bindings ; PUT|DELETE /admin/console/bindings/{subject}/{
 GET     /admin/console/sessions ; DELETE /admin/console/sessions/{key}
 ```
 
-Credentials: a console admin session (with the CSRF token on writes) or the
-break-glass `Authorization: Basic`/`Bearer`. Errors are OperationOutcomes
-(`422` per field with `expression`, `409` rule/conflict, `412` stale
-`If-Match`, `428` without it). Admin JWTs on these routes come with package
-P2.
+Credentials: a console admin session (with the CSRF token on writes), the
+break-glass `Authorization: Basic`/`Bearer <password>`, or — with
+SMART/OIDC on — a bearer JWT validated like a FHIR token that holds
+`HFS_ADMIN_TOKEN_SCOPE` (default `system/*.cruds`; it acts as
+`token:{sub}`). Errors are OperationOutcomes (`422` per field with
+`expression`, `409` rule/conflict, `412` stale `If-Match`, `428` without
+it).
+
+The endpoint admin API (`/admin/endpoints/**`) admits console sessions by
+role: viewers read (redacted), endpoint writes need admin on that endpoint
+(a binding may grant it), creating/deleting endpoints, `$rewrap` and
+everything else need the global admin role.
+
+## The FHIR API from the console
+
+A console session is also a credential on the FHIR API (`/{endpoint}/…`)
+when the request carries no `Authorization`: the console principal gets
+the scopes of `role_for(endpoint)` limited by the endpoint's
+`consoleAccess` (`off` = no credential, `read-only` = `system/*.rs`,
+`role-based` = viewer `*.rs`, editor `*.cruds`, admin `*.cruds` + purge,
+reindex, bulk-submit). Writes need a same-site `Origin`.
 
 ## HTS console
 
